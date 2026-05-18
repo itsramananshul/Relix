@@ -75,3 +75,11 @@ Full bringup (memory / AI / tool / web nodes — M7+ work, not in M5): see `ops/
 ## Reporting Security Issues
 
 See [`SECURITY.md`](SECURITY.md).
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE).
+
+## Minimum Supported Rust Version
+
+Rust 1.95 (pinned in `rust-toolchain.toml`). Earlier versions are not tested.

@@ -31,3 +31,24 @@ This document lists every third-party dependency whose compromise, misbehavior, 
 | Crate | Last Reviewed | Reviewer |
 |---|---|---|
 | (initial entries) | 2026-05-18 | (alpha kickoff) |
+
+## License Exceptions
+
+### CDLA-Permissive-2.0 (`webpki-roots`)
+
+**How it enters the tree:**
+
+```
+relix-runtime → reqwest 0.12 → hyper-rustls 0.27 → webpki-roots 1.0
+relix-runtime → reqwest 0.12 → webpki-roots 1.0
+```
+
+`reqwest` is enabled with the `rustls-tls` feature (no native-tls), so TLS terminates through the rustls + webpki-roots stack. `webpki-roots` is the Mozilla CA bundle re-published under the Community Data License Agreement — Permissive 2.0.
+
+**Why we accept it:**
+
+- The licence is a permissive data-distribution licence (analogous to MIT for code), explicitly compatible with redistribution under our Apache-2.0 project licence.
+- It only governs the *root certificate bundle data*, not source code that we modify.
+- The chain is unavoidable in the modern rustls ecosystem without bringing in `native-tls` (which we explicitly rejected for security/portability reasons).
+
+**Allowed in** `deny.toml` `[licenses] allow = [..., "CDLA-Permissive-2.0", ...]` with an in-file comment pointing here.

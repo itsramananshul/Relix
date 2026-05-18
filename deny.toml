@@ -1,23 +1,28 @@
-# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
-# Enforced in CI per CONTRIBUTING.md.
+# cargo-deny configuration. Enforced in CI per CONTRIBUTING.md.
+# See https://embarkstudios.github.io/cargo-deny/
 
 [graph]
 all-features = false
 
 [licenses]
+# Allowed only — explicit list. Adding a new license requires PR review + an
+# entry in docs/security-critical-deps.md or docs/dependency-licenses.md
+# explaining why the project accepts it.
 allow = [
-    "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
-    "MPL-2.0",
     "CC0-1.0",
-    "OpenSSL",
+    # Community Data License Agreement (permissive). Enters the tree via
+    # `webpki-roots` (via `reqwest` → `hyper-rustls`). Compatible with the
+    # project's Apache-2.0 license and reviewed for distribution implications.
+    # Document chain in docs/security-critical-deps.md.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
@@ -30,6 +35,9 @@ deny = []
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked  = "warn"
+# Advisory-by-advisory exceptions belong in docs/security-advisories.md with
+# rationale + review condition. Keep this list short and revisited often.
+ignore = []
 
 [sources]
 unknown-registry = "deny"

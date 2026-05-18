@@ -13,12 +13,18 @@ members = [
 edition = "2024"
 rust-version = "1.95"
 version = "0.1.0"
-license = "TBD"
+license = "Apache-2.0"
 publish = false
+repository = "https://github.com/itsramananshul/Relix"
+authors = ["Anshul Raman <ramanal@mail.uc.edu>"]
 
 # Pinned dependency versions. Per CONTRIBUTING.md, security-critical bumps require review.
 # See docs/security-critical-deps.md for rationale per crate.
 [workspace.dependencies]
+
+# Internal crates — version pinned so cargo-deny does not treat them as wildcards.
+relix-core    = { path = "crates/relix-core",    version = "0.1.0" }
+relix-runtime = { path = "crates/relix-runtime", version = "0.1.0" }
 # Cryptography
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core", "zeroize"] }
 blake3        = { version = "1.5", default-features = false, features = ["std"] }
