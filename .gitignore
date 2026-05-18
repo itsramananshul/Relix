@@ -1,0 +1,39 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Fuzz outputs
+fuzz/target
+fuzz/corpus/*
+!fuzz/corpus/seed/
+fuzz/artifacts
+
+# Local secrets / keys (no secrets are ever committed; this is belt-and-braces)
+*.key
+*.pem
+*.der
+secrets/
+.env
+.env.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Reference material used during architecture analysis; not part of the project.
+# See docs/architecture-overview.md for what was learned from these.
+reference/
+
+# Build artifacts from tools
+*.profraw
+*.profdata
+coverage/
+
+# Claude harness scratch
+.claude/

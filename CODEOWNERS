@@ -1,0 +1,28 @@
+# Relix Code Owners
+#
+# Lines later in this file take precedence. A CODEOWNERS match designates the
+# required reviewer for PRs touching the matched path. Two-reviewer rule applies
+# to security-critical paths (see CONTRIBUTING.md).
+
+*                                    @itsramananshul
+
+# Specs (separate PRs from implementation per CONTRIBUTING.md)
+/specs/                              @itsramananshul
+
+# Security-critical (two-reviewer + explicit security sign-off)
+/crates/relix-core/src/identity/     @itsramananshul
+/crates/relix-core/src/bundle/       @itsramananshul
+/crates/relix-core/src/policy/       @itsramananshul
+/crates/relix-core/src/eventlog/     @itsramananshul
+/crates/relix-core/src/codec/        @itsramananshul
+/crates/relix-runtime/src/dispatch/  @itsramananshul
+
+# Conformance vectors (public contract — mutation requires security review)
+/conformance/                        @itsramananshul
+
+# Tooling — secrets-adjacent
+/tools/relix-cli/src/identity/       @itsramananshul
+
+# CI configuration
+/.github/                            @itsramananshul
+/deny.toml                           @itsramananshul
