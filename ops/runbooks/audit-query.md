@@ -39,10 +39,39 @@ Prints a readable trace: `FlowStarted`, each `RemoteCallIssued` + matched `Remot
 ```sh
 cargo run -p relix-flow-inspect -- \
     --flow ~/.relix/web-bridge/flows/F.log \
-    --replay-verify
+    --replay-verify \
+    --signer-key dev-keys/flow-runner.key
 ```
 
-Walks the hash chain, verifies each event's signature, prints `INTEGRITY OK` or detailed failure.
+Walks the hash chain, verifies each event's signature against the supplied owner signing key, prints `INTEGRITY OK` or detailed failure.
+
+### "What happened in this flow, end to end?"
+
+```sh
+cargo run -p relix-flow-inspect -- --flow <path> --human
+```
+
+`--human` mode prints each event as a header line plus its payload key=value lines, indented:
+
+```text
+seq=2   ts=... kind=RemoteCallCompleted  (18 ms)
+    peer=memory
+    method=memory.recent_for_session
+    request_id=...
+    latency_ms=18
+    body_bytes=...
+```
+
+The `(N ms)` annotation is pulled from the payload's `latency_ms=` line and is present on `RemoteCallCompleted` / `RemoteCallFailed` events.
+
+### "Pull only this trace from a responder audit"
+
+```sh
+cargo run -p relix-flow-inspect -- --audit <path> --trace <trace_id_hex>
+cargo run -p relix-flow-inspect -- --audit <path> --rid   <request_id_hex>
+```
+
+Combine with `--human` for the indented form. The header now reports `audit records: N (filtered from M)` when a filter is active.
 
 ### "Who denied this request?"
 
