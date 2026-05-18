@@ -1,0 +1,111 @@
+name: heavy-ci
+
+# Strict checks. Run manually before milestone completion or before merging
+# a substrate-touching PR. Not on every push.
+# - cargo clippy --workspace --all-targets -D warnings
+# - cargo deny check (licenses, bans, sources)
+# - cargo audit (advisories — visibility; failure handled per advisory policy)
+# - end-to-end integration scripts (where available)
+#
+# See docs/ci-strategy.md.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    # Only run on PRs labeled `heavy` to keep most PRs in fast-ci.
+    types: [labeled, opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  # rustsec/audit-check needs `checks: write` to publish check-run output;
+  # without it the action errors out with "Resource not accessible by integration".
+  checks: write
+  # security-events write lets advisory results show up in the GitHub
+  # Security tab (Code Scanning); harmless when unused.
+  security-events: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Skip the job unless this is workflow_dispatch OR the PR carries `heavy`.
+  filter:
+    name: filter
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - id: decide
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ contains(github.event.pull_request.labels.*.name, 'heavy') }}" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::heavy-ci skipped (label 'heavy' not present); fast-ci runs in parallel."
+          fi
+
+  clippy:
+    name: cargo clippy --all-targets
+    needs: filter
+    if: needs.filter.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: heavy-ci
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  deny:
+    name: cargo deny check
+    needs: filter
+    if: needs.filter.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # Pin to a known-good action version; binaries cached internally.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Run all categories — licenses/bans/sources are hard gates;
+          # advisories category is handled by the nightly workflow with
+          # per-advisory ignore rationale in docs/security-advisories.md.
+          command: check licenses bans sources
+
+  audit:
+    name: cargo audit (advisory visibility)
+    needs: filter
+    if: needs.filter.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Audit non-fatal in heavy CI: visibility for reviewers, no merge block.
+    # Hard enforcement lives in nightly-security.yml.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  integration:
+    name: end-to-end M5 demo
+    needs: filter
+    if: needs.filter.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: heavy-ci
+      - run: bash scripts/alpha-bringup-m5.sh

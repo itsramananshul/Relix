@@ -17,7 +17,7 @@ name = "relix-flow-inspect"
 path = "src/main.rs"
 
 [dependencies]
-relix-core = { path = "../relix-core" }
+relix-core.workspace = true
 
 clap.workspace = true
 hex.workspace = true

@@ -1,0 +1,59 @@
+name: nightly-security
+
+# Strict security pass. Runs:
+# - daily at 06:00 UTC against `main`
+# - on manual dispatch
+#
+# Failures here open an issue (and fail the workflow) — these are the gates
+# that catch newly-published advisories or license drift. Per-advisory
+# exceptions live in `docs/security-advisories.md` and are mirrored in
+# `deny.toml` `[advisories] ignore` with rationale + review condition.
+#
+# See docs/ci-strategy.md.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  security-events: write
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deny-strict:
+    name: cargo deny check (strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  audit-strict:
+    name: cargo audit (advisories — hard gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  full-tests:
+    name: cargo test --workspace (full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly
+      - run: cargo test --workspace --release

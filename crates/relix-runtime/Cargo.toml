@@ -13,7 +13,7 @@ authors.workspace = true
 unsafe_code = "forbid"
 
 [dependencies]
-relix-core = { path = "../relix-core" }
+relix-core.workspace = true
 
 # Async runtime + transport (libp2p inherited from OpenPrem INFRA reuse)
 tokio.workspace = true

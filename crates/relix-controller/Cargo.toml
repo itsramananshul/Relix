@@ -17,8 +17,8 @@ name = "relix-controller"
 path = "src/main.rs"
 
 [dependencies]
-relix-core    = { path = "../relix-core" }
-relix-runtime = { path = "../relix-runtime" }
+relix-core.workspace    = true
+relix-runtime.workspace = true
 
 tokio.workspace = true
 serde.workspace = true

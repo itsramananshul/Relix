@@ -35,9 +35,19 @@ deny = []
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked  = "warn"
-# Advisory-by-advisory exceptions belong in docs/security-advisories.md with
-# rationale + review condition. Keep this list short and revisited often.
-ignore = []
+# Advisory-by-advisory exceptions. Every entry has a matching record in
+# docs/security-advisories.md with rationale + review condition. No silent
+# suppressions.
+ignore = [
+    # Transitive via libp2p → libp2p-dns → hickory-resolver → hickory-proto.
+    # Alpha M5 demo uses static multiaddrs; no DNS lookups exercised.
+    # Review when libp2p ships a fix-bearing release.
+    "RUSTSEC-2026-0119",
+    # `paste` unmaintained; transitive via libp2p-tcp → if-watch → netlink chain.
+    # Macro-only crate; no runtime security impact.
+    # Review when if-watch migrates off `paste`.
+    "RUSTSEC-2024-0436",
+]
 
 [sources]
 unknown-registry = "deny"
