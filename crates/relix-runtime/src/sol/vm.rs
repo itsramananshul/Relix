@@ -1,6 +1,13 @@
 use crate::sol::bytecode::Inst;
+use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError};
 use crate::sol::parser::Ast;
 use std::io::{self, Write};
+use std::sync::Arc;
+
+/// Sentinel returned by `run()` when the program halted due to an unhandled
+/// `RemoteCall` failure (or any other runtime error introduced by Relix
+/// extensions). Distinguishable from normal SOL exit codes by being u64::MAX.
+pub const VM_ERROR_SENTINEL: u64 = u64::MAX;
 
 #[derive(Debug, Clone)]
 pub enum HeapObject {
@@ -22,6 +29,13 @@ pub struct VM {
     fp: usize,
     program: Vec<Inst>,
     done: bool,
+    /// Relix extension (M6): optional host-side dispatcher for `Inst::RemoteCall`.
+    /// `None` means remote calls are forbidden — encountering `RemoteCall` halts
+    /// the VM with a `local_dispatch_error`.
+    dispatcher: Option<Arc<dyn RemoteCallDispatcher>>,
+    /// Relix extension (M6): structured error from the last failed
+    /// `RemoteCall`, if any. Cleared on successful step.
+    last_error: Option<RemoteCallError>,
 }
 
 impl VM {
@@ -34,6 +48,8 @@ impl VM {
             fp: 0,
             program: Vec::new(),
             done: false,
+            dispatcher: None,
+            last_error: None,
         }
     }
 
@@ -42,6 +58,19 @@ impl VM {
             program: program.to_vec(),
             ..Self::new()
         }
+    }
+
+    /// Relix extension: attach a `RemoteCallDispatcher` so the VM can execute
+    /// `Inst::RemoteCall`. Builder-style.
+    pub fn with_dispatcher(mut self, dispatcher: Arc<dyn RemoteCallDispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Relix extension: the structured error from the last failed `RemoteCall`,
+    /// or `None` if the VM has not produced one. Cleared each successful step.
+    pub fn last_error(&self) -> Option<&RemoteCallError> {
+        self.last_error.as_ref()
     }
 
     #[inline]
@@ -461,6 +490,83 @@ impl VM {
                 }
                 let _ = io::stdout().flush();
                 self.push(0);
+            }
+
+            // ---- Relix extensions (M6) ----
+            //
+            // RemoteCall pops three heap-string refs (arg, method, peer in
+            // pop-order — i.e. peer was pushed first, arg last), invokes the
+            // attached dispatcher, and pushes the response as a fresh
+            // HeapObject::String. On any failure the VM halts with
+            // VM_ERROR_SENTINEL and `last_error()` carries the cause.
+            Inst::RemoteCall => {
+                // Pop in reverse-push order.
+                let arg_ref = self.pop() as usize;
+                let method_ref = self.pop() as usize;
+                let peer_ref = self.pop() as usize;
+
+                let arg_str = match self.heap.get(arg_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<unresolved>",
+                            "<unresolved>",
+                            "remote_call: arg is not a heap string",
+                        ));
+                        self.done = true;
+                        return Some(VM_ERROR_SENTINEL);
+                    }
+                };
+                let method_str = match self.heap.get(method_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<unresolved>",
+                            "<unresolved>",
+                            "remote_call: method is not a heap string",
+                        ));
+                        self.done = true;
+                        return Some(VM_ERROR_SENTINEL);
+                    }
+                };
+                let peer_str = match self.heap.get(peer_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<unresolved>",
+                            method_str.clone(),
+                            "remote_call: peer is not a heap string",
+                        ));
+                        self.done = true;
+                        return Some(VM_ERROR_SENTINEL);
+                    }
+                };
+
+                let Some(dispatcher) = self.dispatcher.clone() else {
+                    self.last_error = Some(RemoteCallError::local(
+                        peer_str,
+                        method_str,
+                        "no RemoteCallDispatcher attached to VM",
+                    ));
+                    self.done = true;
+                    return Some(VM_ERROR_SENTINEL);
+                };
+
+                match dispatcher.remote_call(&peer_str, &method_str, arg_str.as_bytes()) {
+                    Ok(body) => {
+                        let response = String::from_utf8(body).unwrap_or_else(|e| {
+                            format!("<binary response: {} bytes; {}>", e.as_bytes().len(), e)
+                        });
+                        self.heap.push(HeapObject::String(response));
+                        self.push((self.heap.len() - 1) as u64);
+                        self.last_error = None;
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e);
+                        self.done = true;
+                        return Some(VM_ERROR_SENTINEL);
+                    }
+                }
             }
         }
 

@@ -79,6 +79,30 @@ pub enum Inst {
     PrintFloat,
     PrintChar,
     PrintString,
+
+    // ---- Relix extensions (M6) ----
+    //
+    // RemoteCall: invoke a capability on a remote peer.
+    //
+    // Stack contract (matching the verbatim port's `Call(target, argc)`
+    // convention, pushed left-to-right):
+    //   ... arg
+    //   ... arg, method   (top)
+    //   ... arg, method, peer
+    //
+    // Wait — convention is: push peer, then method, then arg. Top of stack
+    // is the last-pushed value (arg). Pop order: arg, then method, then peer.
+    //
+    // All three are heap-string refs (`HeapObject::String`). The VM pops
+    // them, resolves to strings, and dispatches via the registered
+    // `RemoteCallDispatcher`. The response (bytes from the remote handler)
+    // is pushed back as a new `HeapObject::String` ref.
+    //
+    // On failure the VM halts and `last_error()` returns the cause; `run()`
+    // returns the error sentinel (`u64::MAX`).
+    //
+    // See `crate::sol::dispatcher` and `docs/sol-runtime-analysis.md`.
+    RemoteCall,
 }
 
 pub struct Codegen {

@@ -25,3 +25,13 @@ pub mod lexer;
 pub mod parser;
 pub mod util;
 pub mod vm;
+
+// ---- Relix-specific (not under the module-wide port allow) ----
+
+// Override the port-wide allow for this file only — new code must remain
+// clippy-clean.
+#[allow(clippy::pub_use)]
+pub mod dispatcher;
+
+#[cfg(test)]
+mod remote_call_tests;
