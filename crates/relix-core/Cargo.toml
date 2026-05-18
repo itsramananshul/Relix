@@ -1,0 +1,34 @@
+[package]
+name = "relix-core"
+description = "Shared substrate primitives for Relix: codec, types, bundle, identity, policy, eventlog, audit, capability descriptors."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+# Per CONTRIBUTING.md: unwrap/expect forbidden in non-test code, fine in tests.
+# Scoped via lib.rs cfg_attr rather than blanket workspace lints (which would also
+# fire in `#[cfg(test)]` modules).
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+time.workspace = true
+hex.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

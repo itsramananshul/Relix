@@ -1,0 +1,24 @@
+[package]
+name = "relix-flow-inspect"
+description = "Read-only inspector for Relix flow event logs and audit logs."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "relix-flow-inspect"
+path = "src/main.rs"
+
+[dependencies]
+relix-core = { path = "../relix-core" }
+
+clap.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+thiserror.workspace = true
+serde.workspace = true

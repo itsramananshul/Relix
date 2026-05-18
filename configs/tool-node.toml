@@ -1,0 +1,33 @@
+# Tool node — registers tool.web_fetch with a URL allowlist.
+
+[controller]
+name = "tool-node"
+node_type = "tool"
+listen_port = 9003
+
+[identity]
+key_path = "dev-keys/tool.key"
+
+[trust]
+org_root_key_path = "dev-keys/org-root.pub"
+
+[policy]
+file = "configs/policies/tool.toml"
+
+[tool]
+# URL allowlist (host patterns). Requests to URLs outside this list are rejected
+# at the handler before any HTTP call is made.
+url_allowlist = [
+    "https://example.com/*",
+    "https://example.org/*",
+    "https://www.rust-lang.org/*",
+    "https://docs.rs/*",
+]
+
+# Outbound request timeout in seconds.
+timeout_secs = 15
+
+# Maximum bytes returned per fetch.
+max_body_bytes = 524288
+
+[peers]

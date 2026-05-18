@@ -1,0 +1,31 @@
+# AI node — registers ai.chat (Anthropic provider). API key local to this node only.
+
+[controller]
+name = "ai-node"
+node_type = "ai"
+listen_port = 9002
+
+[identity]
+key_path = "dev-keys/ai.key"
+
+[trust]
+org_root_key_path = "dev-keys/org-root.pub"
+
+[policy]
+file = "configs/policies/ai.toml"
+
+[ai]
+# THE ONLY PLACE THE ANTHROPIC API KEY APPEARS.
+#
+# Format: a file containing the raw API key string (no newline).
+# Permissions: 0600. Path is gitignored via .gitignore patterns.
+api_key_path = "dev-keys/anthropic.key"
+
+# Model identifier passed to Anthropic. Alpha hardcodes one model.
+model = "claude-sonnet-4-6"
+
+# Request timeout in seconds.
+timeout_secs = 60
+
+[peers]
+# AI node typically has no outgoing peer needs.

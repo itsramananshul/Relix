@@ -1,0 +1,14 @@
+# AI node policy.
+
+[admit]
+groups = ["chat-users", "web-bridge-svc"]
+
+[[rules]]
+name = "chat_users_chat"
+method = "ai.chat"
+allow_groups = ["chat-users", "web-bridge-svc"]
+
+[[rules]]
+name = "any_caller_health"
+method = "node.health"
+allow_groups = ["chat-users", "web-bridge-svc", "memory-admin", "tool-svc", "guest"]

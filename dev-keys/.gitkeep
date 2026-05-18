@@ -1,0 +1,2 @@
+# This directory holds development-only keys (org root, node identities, AI provider key).
+# All real key files are gitignored via patterns in /.gitignore. Only this marker is committed.

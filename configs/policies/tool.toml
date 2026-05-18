@@ -1,0 +1,14 @@
+# Tool node policy. Only tool-users may invoke tools.
+
+[admit]
+groups = ["tool-users", "web-bridge-svc"]
+
+[[rules]]
+name = "tool_users_fetch"
+method = "tool.web_fetch"
+allow_groups = ["tool-users", "web-bridge-svc"]
+
+[[rules]]
+name = "any_caller_health"
+method = "node.health"
+allow_groups = ["tool-users", "web-bridge-svc", "guest", "chat-users"]

@@ -1,0 +1,48 @@
+[package]
+name = "relix-runtime"
+description = "Relix runtime: transport (libp2p), SOL VM with RemoteCall, dispatch bridge, capability registry, manifest exchange, node implementations."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+relix-core = { path = "../relix-core" }
+
+# Async runtime + transport (libp2p inherited from OpenPrem INFRA reuse)
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+libp2p.workspace = true
+
+# Codec / errors / time / serde
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+time.workspace = true
+hex.workspace = true
+toml.workspace = true
+rand.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+bytes.workspace = true
+
+# Node implementations (memory / ai / tool / web_bridge are modules of this crate)
+rusqlite.workspace = true
+reqwest.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+
+# Logging
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

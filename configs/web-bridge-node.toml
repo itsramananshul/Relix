@@ -1,0 +1,38 @@
+# Web bridge node — the Relix Web entry point.
+# Exposes a local HTTP/SSE endpoint that POSTs to a SOL flow and streams back
+# tokens. Relix Web's backend points its RELIX_BRIDGE_URL at this node's
+# [bridge] http_port.
+
+[controller]
+name = "web-bridge"
+node_type = "web_bridge"
+listen_port = 9100
+
+[identity]
+key_path = "dev-keys/web-bridge.key"
+
+[trust]
+org_root_key_path = "dev-keys/org-root.pub"
+
+[policy]
+file = "configs/policies/web-bridge.toml"
+
+[bridge]
+# Loopback-only HTTP server for Relix Web. NEVER bind to a non-loopback address
+# in production; the web peer is presentation only and must not be a network edge.
+http_addr = "127.0.0.1:9080"
+
+# SOL flows callable via POST /chat.
+default_flow = "chat"
+
+[peers]
+# Peer aliases used by SOL `remote_call(...)`.
+memory = { port = 9001 }
+ai     = { port = 9002 }
+tool   = { port = 9003 }
+
+[session.chat]
+source = "flows/chat.sol"
+
+[session.chat_with_tool]
+source = "flows/chat_with_tool.sol"

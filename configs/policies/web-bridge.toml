@@ -1,0 +1,22 @@
+# Web bridge node policy.
+# The web bridge accepts inbound chat invocations from the local HTTP server
+# (which presents the logged-in user's identity to the controller), then
+# initiates outbound RPCs to memory / AI / tool peers under that identity.
+
+[admit]
+groups = ["chat-users", "tool-users", "guest"]
+
+[[rules]]
+name = "chat_users_chat"
+method = "chat"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "tool_users_chat_with_tool"
+method = "chat_with_tool"
+allow_groups = ["tool-users"]
+
+[[rules]]
+name = "any_caller_health"
+method = "node.health"
+allow_groups = ["chat-users", "tool-users", "guest", "memory-admin", "web-bridge-svc"]

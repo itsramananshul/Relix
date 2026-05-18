@@ -1,0 +1,29 @@
+# Memory node — registers memory.search / memory.write_turn / memory.recent_for_session.
+
+[controller]
+name = "memory-node"
+node_type = "memory"
+# Listen on this libp2p TCP port.
+listen_port = 9001
+
+[identity]
+# Path to the node's Ed25519 secret key (32 raw bytes). Generated on first start
+# if missing. Must NOT be committed (see .gitignore).
+key_path = "dev-keys/memory.key"
+
+[trust]
+# Org-root public key hash (= org_id). Identity bundles from this org are accepted.
+# Populate after running `relix-cli identity init-org`.
+org_root_key_path = "dev-keys/org-root.pub"
+
+[policy]
+# Path to the node's allowlist policy file.
+file = "configs/policies/memory.toml"
+
+[memory]
+# Where the SQLite session database lives.
+db_path = "dev-data/memory/sessions.db"
+
+[peers]
+# Peer aliases used by SOL `remote_call("memory", ...)` — memory node typically has no peers it dials.
+# Other nodes (web-bridge, etc.) include `memory = { port = 9001 }` in their [peers].

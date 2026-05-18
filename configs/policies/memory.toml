@@ -1,0 +1,24 @@
+# Memory node policy. Default deny; allow only chat-users for read/write.
+
+[admit]
+groups = ["chat-users", "memory-admin", "web-bridge-svc"]
+
+[[rules]]
+name = "chat_users_read_recent"
+method = "memory.recent_for_session"
+allow_groups = ["chat-users", "web-bridge-svc"]
+
+[[rules]]
+name = "chat_users_search"
+method = "memory.search"
+allow_groups = ["chat-users", "web-bridge-svc"]
+
+[[rules]]
+name = "chat_users_write"
+method = "memory.write_turn"
+allow_groups = ["chat-users", "web-bridge-svc"]
+
+[[rules]]
+name = "any_caller_health"
+method = "node.health"
+allow_groups = ["chat-users", "memory-admin", "web-bridge-svc", "ai-svc", "tool-svc", "guest"]
