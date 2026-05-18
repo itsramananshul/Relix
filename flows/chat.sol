@@ -1,35 +1,31 @@
-// flows/chat.sol — canonical Relix alpha agent flow.
+// flows/chat.sol — first end-to-end SOL agent flow (M7).
 //
-// Signature (logical, alpha): chat(session_id: string, user_text: string) -> string
+// Routing lives entirely in SOL: this file is the only place that knows
+// "fetch recent → call AI → persist both turns." Rust code in the controller
+// does not encode this ordering anywhere; it just dispatches the registered
+// capabilities. That preserves the architectural invariant that orchestration
+// is in SOL flows.
 //
-// Behavior:
-//   1. Retrieve recent conversation history from the Memory peer.
-//   2. Invoke the AI peer's ai.chat with the assembled prompt.
-//   3. Stream the AI's response back to the caller and accumulate it.
-//   4. Persist the user turn and the assistant turn to the Memory peer.
-//
-// Alpha simplifications (SIMP-001, SIMP-006): SOL `remote_call` is synchronous;
-// streaming is consumed via a yield loop that blocks the VM thread. Imports here
-// are placeholders — until the SOL compiler's remote_call resolution lands in M6,
-// the controller's dispatch bridge invokes the equivalent Rust-coded path.
+// The AI peer runs the M7 stub responder (`ai.chat mode = "stub"`), which
+// returns a deterministic placeholder. M8 swaps the stub for an Anthropic
+// call without changing this file.
 
-import Memory.RecentForSession
-import Memory.WriteTurn
-import Ai.Chat
+function start() -> str {
+    let session: str  = "chat-session";
+    let user_msg: str = "hello from alice";
 
-fn chat(session_id: string, user_text: string) -> string {
-    // 1. Recent history (alpha: returns concatenated history as a string).
-    let history: string = remote_call("memory", "memory.recent_for_session", session_id);
+    // 1. Retrieve recent history for context (alpha: SOL has no varargs so
+    //    the AI does not yet receive the history; the call still serves to
+    //    write the audit record and prove the flow event log shape).
+    let history: str = remote_call("memory", "memory.recent_for_session", "chat-session");
 
-    // 2. Compose the prompt for the AI.
-    let prompt: string = history + "\n\nuser: " + user_text;
+    // 2. Invoke the AI peer. Stub responds with a deterministic string.
+    let reply: str = remote_call("ai", "ai.chat", "chat-session|" + user_msg);
 
-    // 3. Invoke AI; stream consumption returns the accumulated reply.
-    let reply: string = remote_call("ai", "ai.chat", prompt);
+    // 3. Persist both turns (user first, then assistant).
+    remote_call("memory", "memory.write_turn", "chat-session|user|" + user_msg);
+    remote_call("memory", "memory.write_turn", "chat-session|assistant|" + reply);
 
-    // 4. Persist both turns.
-    remote_call("memory", "memory.write_turn", session_id + "|user|" + user_text);
-    remote_call("memory", "memory.write_turn", session_id + "|assistant|" + reply);
-
+    print(reply);
     return reply;
 }

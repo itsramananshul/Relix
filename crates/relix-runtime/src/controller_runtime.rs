@@ -233,7 +233,19 @@ fn register_node_type_handlers(
             "memory node: registered memory.write_turn / memory.recent_for_session / memory.search"
         );
     }
-    // ai / tool / web_bridge / demo node types are no-ops today; their handlers
+    if cfg.controller.node_type == "ai" {
+        let ai_cfg: crate::nodes::ai::AiConfig = match &cfg.ai {
+            Some(raw) => raw
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| format!("[ai] parse: {e}"))?,
+            None => crate::nodes::ai::AiConfig::default(),
+        };
+        let mode = ai_cfg.mode.clone();
+        crate::nodes::ai::register(bridge, ai_cfg);
+        tracing::info!(mode = %mode, "ai node: registered ai.chat");
+    }
+    // tool / web_bridge / demo node types are no-ops today; their handlers
     // ship in later milestones. node.health is always available via builtins.
     Ok(())
 }

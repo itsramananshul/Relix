@@ -302,9 +302,13 @@ impl Analyzer {
                             );
                             std::process::exit(1);
                         }
-                        // Arithmetic usually only works on numeric types
+                        // Arithmetic on numerics; Plus on strings is
+                        // concatenation (codegen already emits ConcatStr).
+                        let is_string_plus =
+                            matches!((&lhs_type, &op), (Type::String, Token::Plus));
                         match lhs_type {
                             Type::Integer | Type::Float => Some(lhs_type),
+                            Type::String if is_string_plus => Some(Type::String),
                             _ => {
                                 eprintln!(
                                     "arithmetic operation {op:?} not supported for type {lhs_type:?}"

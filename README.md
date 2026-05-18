@@ -81,15 +81,18 @@ cargo run -p relix-cli -- ping \
 
 `alpha-bringup-m6-chained.sh` runs `flows/chained_health.sol` against two real controller processes (memory + ai) in sequence. Alice's happy-path flow log has 6 events (`FlowStarted` → `RemoteCallIssued(memory)` → `RemoteCallCompleted` → `RemoteCallIssued(ai)` → `RemoteCallCompleted` → `FlowCompleted`); Bob's denied flow short-circuits at the first call with 4 events.
 
-### M7 — memory node (working today)
+### M7 — memory node + first chat orchestration (working today)
 
 ```sh
-./scripts/alpha-bringup-m7-memory.sh
+./scripts/alpha-bringup-m7-memory.sh    # memory CRUD over the M5 admission pipeline
+./scripts/alpha-bringup-m7-chat.sh      # first end-to-end agent flow: memory + AI stub
 ```
 
-`flows/memory_demo.sol` writes two turns to a real SQLite + FTS5 backend behind the M5 admission pipeline, then reads history back. Three capabilities (`memory.write_turn`, `memory.recent_for_session`, `memory.search`), all under policy + audit. Alice's flow has 8 events; bob denied at first call with a 4-event log.
+The memory demo writes two turns to a real SQLite + FTS5 backend and reads history back. The chat demo orchestrates **two real controller processes** (memory + AI) from a 5-call SOL flow: fetch recent history → call AI → persist user turn → persist assistant turn. Alice's flow log has 10 events in exact order; bob (guest) is denied at the first call.
 
-Full bringup (AI / tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
+The AI node runs a deterministic stub responder for M7 (`[ai] mode = "stub"`). M8 swaps in Anthropic behind the same `ai.chat` capability without changing the SOL flow.
+
+Full bringup (tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 
 ## Reporting Security Issues
 

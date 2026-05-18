@@ -45,7 +45,7 @@ Demo: two controllers exchange a signed RPC; invalid identity rejected.
 Build: extend SOL VM with `RemoteCall` opcode + dispatcher callback; capability registry; memory node (Hermes FTS5 schema) registering `memory.search`, `memory.write_turn`, `memory.recent_for_session`; first SOL flow.
 Demo: SOL flow on controller A invokes memory node B's capability; flow log shows issued+completed events.
 
-**Status:** SOL `RemoteCall` opcode + dispatcher + flow-log tracing landed in M6/S4. `flows/ping.sol` is the M6 single-peer demo; `flows/chained_health.sol` is the M6/S7 multi-peer demo (two real controller processes, sequential `remote_call`s, 6-event happy path + short-circuit denied path). M7 ships the first real node: the memory node (`memory.write_turn` / `memory.recent_for_session` / `memory.search`) backed by SQLite + FTS5, demonstrated by `flows/memory_demo.sol`.
+**Status:** SOL `RemoteCall` opcode + dispatcher + flow-log tracing landed in M6/S4. `flows/ping.sol` is the M6 single-peer demo; `flows/chained_health.sol` is the M6/S7 multi-peer demo. M7 ships the first two real nodes: memory (SQLite + FTS5) and AI (stub responder; M8 swaps in Anthropic). `flows/chat.sol` is the first real distributed agent flow — 5 `remote_call`s across two controllers, 10-event happy-path flow log, both responders audit independently.
 
 ### Day 3 — AI Node + Streaming + Chat Flow
 Build: streaming substream protocol (simplified); AI node wrapping Anthropic with token stream; `flows/chat.sol`; web bridge HTTP server with SSE.

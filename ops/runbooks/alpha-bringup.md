@@ -272,6 +272,49 @@ max_n   = 100   # max N for recent/search regardless of caller request
 
 The controller's `register_node_type_handlers` automatically registers the three capabilities. Combine with a policy file allowing `memory.write_turn` / `memory.recent_for_session` / `memory.search` to the appropriate caller groups (see `configs/policies/memory.toml`).
 
+## M7 first chat orchestration — `flows/chat.sol`
+
+`flows/chat.sol` is the first end-to-end agent flow on the Relix mesh. Two real controller processes (memory + AI stub) and a 5-call SOL flow:
+
+```sol
+function start() -> str {
+    let session: str  = "chat-session";
+    let user_msg: str = "hello from alice";
+
+    let history: str = remote_call("memory", "memory.recent_for_session", "chat-session");
+    let reply:   str = remote_call("ai",     "ai.chat",                   "chat-session|" + user_msg);
+    remote_call("memory", "memory.write_turn", "chat-session|user|"      + user_msg);
+    remote_call("memory", "memory.write_turn", "chat-session|assistant|" + reply);
+
+    print(reply);
+    return reply;
+}
+```
+
+Alice's happy-path flow log has **10 events** in order: `FlowStarted` → `Issued/Completed (recent)` → `Issued/Completed (ai.chat)` → `Issued/Completed (write user)` → `Issued/Completed (write assistant)` → `FlowCompleted`. Bob (`guest`) is denied at the first call with a 4-event flow log.
+
+For M7 the AI node runs a deterministic stub responder (`[ai] mode = "stub"`). M8 swaps in Anthropic behind the same `ai.chat` capability without changing the SOL flow.
+
+Single-command demo:
+
+```sh
+./scripts/alpha-bringup-m7-chat.sh
+```
+
+Enable a controller as the AI node with:
+
+```toml
+[controller]
+name      = "ai-node"
+node_type = "ai"
+
+[ai]
+mode = "stub"          # M7
+# mode = "anthropic"   # M8 (returns RESPONDER_INTERNAL "not yet implemented" today)
+```
+
+The AI node's `register_node_type_handlers` registers `ai.chat`. Arg format: `session_id|user_message`. Returns: the model's reply text.
+
 ## Smoke Test (Acceptance, full alpha — M7+ work)
 
 The acceptance criteria from `docs/alpha-plan.md` are verified by:
