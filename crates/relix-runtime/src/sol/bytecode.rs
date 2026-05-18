@@ -481,6 +481,14 @@ impl Codegen {
                         Type::String => insts.push(Inst::PrintString),
                         _ => insts.push(Inst::PrintInt),
                     }
+                } else if name == "remote_call" {
+                    // Relix M6 extension: emit each arg expression in source order
+                    // (peer, method, arg), then a single RemoteCall opcode. The
+                    // analyzer has already validated arity (3) and arg types (all str).
+                    for arg in args {
+                        self.compile(insts, arg);
+                    }
+                    insts.push(Inst::RemoteCall);
                 } else if let Some(&target_address) = self.functions.get(&name) {
                     let count = args.len();
                     for arg in args {
@@ -644,6 +652,10 @@ impl Codegen {
                 _ => Type::Integer,
             },
             Ast::ExprFuncCall { name, .. } => {
+                // Relix M6: `remote_call` is a known builtin that returns String.
+                if name == "remote_call" {
+                    return Type::String;
+                }
                 self.fn_returns.get(name).cloned().unwrap_or(Type::Integer)
             }
             _ => Type::Integer,

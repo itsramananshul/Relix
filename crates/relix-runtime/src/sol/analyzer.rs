@@ -415,6 +415,30 @@ impl Analyzer {
                     }
                     return Some(Type::Void);
                 }
+                // Relix M6 extension: `remote_call(peer: str, method: str, arg: str) -> str`
+                // is a built-in known to the codegen (emits Inst::RemoteCall). Validate
+                // arity and arg types so a SOL author gets a real error message instead
+                // of the generic "undefined function" panic.
+                if name == "remote_call" {
+                    if args.len() != 3 {
+                        eprintln!(
+                            "remote_call expects 3 arguments (peer, method, arg) but received {}",
+                            args.len()
+                        );
+                        std::process::exit(1);
+                    }
+                    for (i, arg) in args.iter_mut().enumerate() {
+                        let arg_type = self.check(arg)?;
+                        if type_eq(arg_type.clone(), Type::String).is_err() {
+                            eprintln!(
+                                "remote_call expected str in position {i} but was passed {:?}",
+                                arg_type
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    return Some(Type::String);
+                }
                 // 1. Fetch and clone the signature in a temporary scope
                 let (params, ret) = {
                     let entry = self.get_entry(&name).unwrap_or_else(|| {
