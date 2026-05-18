@@ -1,0 +1,6 @@
+# Test policy: chat-users may call node.health.
+
+[[rules]]
+name = "chat_users_health"
+method = "node.health"
+allow_groups = ["chat-users"]

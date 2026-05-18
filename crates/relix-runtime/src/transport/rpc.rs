@@ -1,7 +1,327 @@
-//! libp2p RPC transport. M5 deliverable. Stubbed for M1 workspace bootstrap.
+//! libp2p RPC transport — ported from OpenPrem `network/rpc.rs` per
+//! `docs/code-reuse-map.md`. Uses `/relix/rpc/1` protocol identifier (replaces
+//! `/rpc/1`) but otherwise inherits the transport stack: TCP + Noise XK + Yamux
+//! + CBOR `request_response` + Kademlia DHT.
 //!
-//! Will be ported from `D:\DATA\WORK\OpenPrem\Apps\INFRA\open-prem-main\src\network\rpc.rs`
-//! per `docs/code-reuse-map.md`.
+//! The wire payload here is the raw [`WireRpc::Request`] / [`WireRpc::Response`]
+//! pair carrying RELIX-1 envelopes (see `super::envelope`). The transport is
+//! envelope-agnostic; admission is performed by the dispatch bridge.
 
-/// Placeholder transport handle. Replaced in M5 with a real libp2p Client wrapper.
-pub struct Transport;
+use std::collections::HashMap;
+use std::time::Duration;
+
+use futures::StreamExt;
+use libp2p::{
+    StreamProtocol, identity, kad, noise,
+    request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel},
+    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
+    tcp, yamux,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
+
+pub use libp2p::{PeerId, core::Multiaddr};
+
+/// Wire payload — opaque bytes carrying a CBOR-encoded RELIX-1 envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireRequest {
+    /// Caller's CBOR-encoded `RequestEnvelope`.
+    pub envelope: Vec<u8>,
+}
+
+/// Wire payload — opaque bytes carrying a CBOR-encoded RELIX-1 response envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireResponse {
+    /// Responder's CBOR-encoded `ResponseEnvelope`.
+    pub envelope: Vec<u8>,
+}
+
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    rpc: request_response::cbor::Behaviour<WireRequest, WireResponse>,
+    kademlia: kad::Behaviour<kad::store::MemoryStore>,
+}
+
+/// Inbound RPC event surfaced to the application loop.
+pub enum Event {
+    /// Inbound request — application MUST call `Responder::respond` exactly once.
+    Request {
+        /// Encoded RELIX-1 envelope from the caller.
+        envelope: Vec<u8>,
+        /// Source peer (verified at transport layer by Noise).
+        from: PeerId,
+        /// Reply channel.
+        respond: Responder,
+    },
+    /// A peer connected. Useful for manifest-exchange triggers.
+    PeerConnected {
+        /// The peer.
+        peer_id: PeerId,
+        /// The address it was reached at.
+        address: Multiaddr,
+    },
+}
+
+/// Reply handle for an inbound request.
+pub struct Responder {
+    channel: ResponseChannel<WireResponse>,
+    cmd_tx: mpsc::Sender<SwarmCommand>,
+}
+
+impl Responder {
+    /// Send the encoded response envelope. Drops the channel on completion.
+    pub async fn respond(self, envelope: Vec<u8>) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::Respond {
+                envelope,
+                channel: self.channel,
+            })
+            .await;
+    }
+}
+
+/// Cloneable handle for making outbound RPC calls and dialing peers.
+#[derive(Clone)]
+pub struct Client {
+    peer_id: PeerId,
+    cmd_tx: mpsc::Sender<SwarmCommand>,
+}
+
+impl Client {
+    /// Our peer id (= libp2p Ed25519 pubkey hash).
+    pub fn peer_id(&self) -> PeerId {
+        self.peer_id
+    }
+
+    /// Issue an outbound RPC. Returns the encoded response envelope.
+    pub async fn call(&self, peer: PeerId, envelope: Vec<u8>) -> Result<Vec<u8>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Call {
+                peer,
+                envelope,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| "RPC channel closed".to_string())?;
+        rx.await.map_err(|_| "reply cancelled".to_string())?
+    }
+
+    /// Dial a known peer address (e.g. a bootstrap or peer listed in config).
+    pub async fn dial(&self, addr: Multiaddr) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Dial { addr, reply: tx })
+            .await
+            .map_err(|_| "RPC channel closed".to_string())?;
+        rx.await.map_err(|_| "dial cancelled".to_string())?
+    }
+
+    /// Trigger Kademlia bootstrap.
+    pub async fn bootstrap_kademlia(&self) {
+        let _ = self.cmd_tx.send(SwarmCommand::BootstrapKademlia).await;
+    }
+}
+
+#[allow(dead_code)]
+enum SwarmCommand {
+    Dial {
+        addr: Multiaddr,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Call {
+        peer: PeerId,
+        envelope: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    Respond {
+        envelope: Vec<u8>,
+        channel: ResponseChannel<WireResponse>,
+    },
+    BootstrapKademlia,
+}
+
+/// Swarm event loop. Spawn `.run()` as a Tokio task.
+pub struct EventLoop {
+    swarm: Swarm<Behaviour>,
+    cmd_tx: mpsc::Sender<SwarmCommand>,
+    command_receiver: mpsc::Receiver<SwarmCommand>,
+    event_sender: mpsc::Sender<Event>,
+    pending_calls: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
+}
+
+impl EventLoop {
+    /// Run the event loop until both the command channel and event sender close.
+    pub async fn run(mut self) {
+        loop {
+            tokio::select! {
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event).await;
+                }
+                command = self.command_receiver.recv() => {
+                    match command {
+                        Some(cmd) => self.handle_command(cmd).await,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+        match event {
+            SwarmEvent::Behaviour(BehaviourEvent::Rpc(rpc_event)) => {
+                use request_response::Event as RrEvent;
+                match rpc_event {
+                    RrEvent::Message { message, peer, .. } => match message {
+                        request_response::Message::Request {
+                            request, channel, ..
+                        } => {
+                            let respond = Responder {
+                                channel,
+                                cmd_tx: self.cmd_tx.clone(),
+                            };
+                            let _ = self
+                                .event_sender
+                                .send(Event::Request {
+                                    envelope: request.envelope,
+                                    from: peer,
+                                    respond,
+                                })
+                                .await;
+                        }
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                            ..
+                        } => {
+                            if let Some(sender) = self.pending_calls.remove(&request_id) {
+                                let _ = sender.send(Ok(response.envelope));
+                            }
+                        }
+                    },
+                    RrEvent::OutboundFailure {
+                        request_id, error, ..
+                    } => {
+                        if let Some(sender) = self.pending_calls.remove(&request_id) {
+                            let _ = sender.send(Err(format!("{error:?}")));
+                        }
+                    }
+                    RrEvent::ResponseSent { .. } => {}
+                    RrEvent::InboundFailure { .. } => {}
+                }
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                let addr = endpoint.get_remote_address().clone();
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
+                let _ = self
+                    .event_sender
+                    .send(Event::PeerConnected {
+                        peer_id,
+                        address: addr,
+                    })
+                    .await;
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(_)) => {}
+            SwarmEvent::NewListenAddr { .. } => {}
+            SwarmEvent::IncomingConnection { .. } => {}
+            SwarmEvent::ConnectionClosed { .. } => {}
+            SwarmEvent::OutgoingConnectionError { .. } => {}
+            _ => {}
+        }
+    }
+
+    async fn handle_command(&mut self, cmd: SwarmCommand) {
+        match cmd {
+            SwarmCommand::Dial { addr, reply } => {
+                let result = match self.swarm.dial(addr) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(format!("{e:?}")),
+                };
+                let _ = reply.send(result);
+            }
+            SwarmCommand::Call {
+                peer,
+                envelope,
+                reply,
+            } => {
+                let request_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .rpc
+                    .send_request(&peer, WireRequest { envelope });
+                self.pending_calls.insert(request_id, reply);
+            }
+            SwarmCommand::Respond { envelope, channel } => {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .rpc
+                    .send_response(channel, WireResponse { envelope });
+            }
+            SwarmCommand::BootstrapKademlia => {
+                let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+            }
+        }
+    }
+}
+
+/// Bring up a transport instance.
+///
+/// `keypair_bytes` — caller-provided Ed25519 secret (32 raw bytes) so the
+/// transport's libp2p `PeerId` matches `relix_core::types::NodeId` derived
+/// from the same key. The alpha controller loads this from its identity file.
+pub async fn new(
+    keypair_bytes: [u8; 32],
+    port: u16,
+) -> Result<(Client, mpsc::Receiver<Event>, EventLoop), Box<dyn std::error::Error>> {
+    let id_keys: identity::Keypair = identity::Keypair::ed25519_from_bytes(keypair_bytes)?;
+    let peer_id = id_keys.public().to_peer_id();
+
+    let mut swarm: Swarm<Behaviour> = libp2p::SwarmBuilder::with_existing_identity(id_keys)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_behaviour(|key| Behaviour {
+            rpc: request_response::cbor::Behaviour::new(
+                [(StreamProtocol::new("/relix/rpc/1"), ProtocolSupport::Full)],
+                request_response::Config::default(),
+            ),
+            kademlia: kad::Behaviour::new(
+                key.public().to_peer_id(),
+                kad::store::MemoryStore::new(key.public().to_peer_id()),
+            ),
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+
+    let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse()?;
+    swarm.listen_on(addr.clone())?;
+    tracing::info!(addr = %addr, peer = %peer_id, "transport listening");
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SwarmCommand>(64);
+    let (event_tx, event_rx) = mpsc::channel::<Event>(64);
+
+    let client = Client {
+        peer_id,
+        cmd_tx: cmd_tx.clone(),
+    };
+    let event_loop = EventLoop {
+        swarm,
+        cmd_tx,
+        command_receiver: cmd_rx,
+        event_sender: event_tx,
+        pending_calls: HashMap::new(),
+    };
+
+    Ok((client, event_rx, event_loop))
+}

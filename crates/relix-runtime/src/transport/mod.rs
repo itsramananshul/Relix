@@ -1,6 +1,7 @@
 //! Transport layer — RELIX-1 wire over libp2p.
 //!
-//! Wraps OpenPrem `network/rpc.rs` (`/rpc/1` request_response over TCP+Noise+Yamux).
-//! Stubbed in M1; filled in during M5.
+//! - [`rpc`] — ported libp2p `request_response` from OpenPrem; carries opaque envelopes.
+//! - [`envelope`] — RELIX-1 request/response envelope shapes carried in the wire payload.
 
+pub mod envelope;
 pub mod rpc;

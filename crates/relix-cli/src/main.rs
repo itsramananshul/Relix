@@ -1,12 +1,7 @@
 //! relix-cli — developer and operator CLI.
-//!
-//! Subcommands (alpha set):
-//! - `identity init-org` — generate org-root keypair (kept under `dev-keys/`).
-//! - `identity mint` — sign an IdentityBundle for a subject.
-//! - `identity inspect` — print bundle contents.
-//! - `ping` — call a peer's `node.health` (M5+).
 
 mod identity;
+mod ping;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -25,34 +20,36 @@ enum Cmd {
         #[command(subcommand)]
         cmd: identity::Cmd,
     },
-    /// Ping a peer's `node.health` capability. (M5+; M1 prints a stub message.)
+    /// Call a peer's `node.health` capability and print the result.
     Ping {
-        /// Peer node id (hex) or alias.
-        peer: String,
-        /// Path to the caller's identity bundle file.
+        /// Target peer's libp2p multiaddr (e.g. `/ip4/127.0.0.1/tcp/9001`).
+        peer_addr: String,
+        /// Path to caller's identity bundle (raw CBOR).
         #[arg(long)]
-        identity: Option<PathBuf>,
+        identity_bundle: PathBuf,
+        /// Path to a 32-byte signing key used as the local libp2p PeerId
+        /// (does NOT need to match the identity subject — alpha SIMP).
+        #[arg(long)]
+        client_key: PathBuf,
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
 
     let args = Args::parse();
     match args.cmd {
         Cmd::Identity { cmd } => identity::run(cmd),
-        Cmd::Ping { peer, identity } => {
-            tracing::warn!(
-                peer = %peer,
-                identity = ?identity,
-                "ping not yet wired (M5)"
-            );
-            Ok(())
-        }
+        Cmd::Ping {
+            peer_addr,
+            identity_bundle,
+            client_key,
+        } => ping::run(&peer_addr, &identity_bundle, &client_key).await,
     }
 }

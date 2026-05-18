@@ -1,0 +1,18 @@
+# Test config for live two-process ping. Mirrors configs/memory-node.toml shape
+# but points at the test keys created during the M5 smoke check.
+
+[controller]
+name = "test-memory"
+node_type = "memory"
+listen_port = 19001
+
+[identity]
+key_path = "dev-keys/test-memory.key"
+
+[trust]
+org_root_key_path = "dev-keys/test-org-root.pub"
+
+[policy]
+file = "configs/policies/test-allow-health.toml"
+
+[peers]

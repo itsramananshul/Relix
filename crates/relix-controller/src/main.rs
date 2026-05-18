@@ -1,10 +1,8 @@
-//! Relix controller daemon entry point. M1 skeleton — bootstrap config + identity load
-//! only. M5 wires the transport, registry, and dispatch bridge into a running mesh.
+//! Relix controller daemon. Thin wrapper around `relix_runtime::controller_runtime::run`.
 
 use clap::Parser;
 use std::path::PathBuf;
 
-/// Command-line arguments for the controller daemon.
 #[derive(Parser, Debug)]
 #[command(name = "relix-controller", version, about = "Relix controller daemon")]
 struct Args {
@@ -13,7 +11,8 @@ struct Args {
     config: PathBuf,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -22,11 +21,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    tracing::info!(config = %args.config.display(), "relix-controller booting (M1 skeleton)");
-
-    // M5 will: load config, load/generate identity, build manifest, start transport,
-    // register capabilities per node-type modules in relix-runtime::nodes::*,
-    // and enter the inbound RPC event loop.
-    tracing::warn!("M1 skeleton: no transport started; see specs/alpha-simplifications.md");
-    Ok(())
+    relix_runtime::controller_runtime::run(&args.config).await
 }
