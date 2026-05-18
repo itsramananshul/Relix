@@ -1,0 +1,625 @@
+//! Real `RemoteCallDispatcher` wired to libp2p RPC + per-flow event log (M6/S4).
+//!
+//! This module is the integration seam between the SOL VM and the M5 transport
+//! layer. A `relix-cli flow-run` invocation (or any future host) builds a
+//! [`FlowRunner`] and calls [`FlowRunner::run`]. The runner:
+//!
+//! 1. Brings up an ephemeral libp2p client (a `relix-runtime::transport::rpc`
+//!    instance bound to a random local port).
+//! 2. Resolves the configured peer aliases to libp2p `PeerId`s by dialing each
+//!    and waiting for `PeerConnected`.
+//! 3. Opens a per-flow event log keyed by a fresh `flow_id`.
+//! 4. Compiles the SOL source through the verbatim port pipeline
+//!    (lexer → parser → analyzer → codegen).
+//! 5. Spawns the VM on `tokio::task::spawn_blocking` so the synchronous SOL
+//!    interpreter can safely `block_on` the async libp2p client without
+//!    poisoning the tokio worker pool — the [SIMP-014] bridge.
+//! 6. Attaches a [`RealDispatcher`] that, for each `Inst::RemoteCall`,
+//!    writes a `RemoteCallIssued` event **before** sending (log-before-act),
+//!    issues the RPC through the real M5 path, decodes the response envelope,
+//!    and writes either `RemoteCallCompleted` or `RemoteCallFailed`.
+//! 7. Writes the terminal `FlowCompleted` / `FlowFailed` event and returns the
+//!    final VM result.
+//!
+//! No mock transport, no policy bypass, no direct handler invocation. The
+//! responder runs the full M5 admission pipeline (decode → deadline → identity
+//! → capability lookup → policy → handler → audit) on every call.
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use ed25519_dalek::SigningKey;
+use serde::{Deserialize, Serialize};
+
+use relix_core::bundle::Bundle;
+use relix_core::codec;
+use relix_core::eventlog::{EventLog, EventType};
+use relix_core::types::{FlowId, RequestId, TraceId};
+
+use crate::dispatch::{build_request, decode_response};
+use crate::sol::analyzer::Analyzer;
+use crate::sol::bytecode::Codegen;
+use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError, RemoteCallResult};
+use crate::sol::lexer::Lexer;
+use crate::sol::parser::Parser;
+use crate::sol::vm::{VM, VM_ERROR_SENTINEL};
+use crate::transport::envelope::ResponseResult;
+use crate::transport::rpc::{self, Event as TransportEvent, Multiaddr, PeerId};
+
+// ──────────────────────────── Peer alias config ────────────────────────────
+
+/// `--peers <file>` content. A small TOML keyed by alias.
+///
+/// ```toml
+/// [peers.memory]
+/// addr = "/ip4/127.0.0.1/tcp/9001"
+///
+/// [peers.ai]
+/// addr = "/ip4/127.0.0.1/tcp/9002"
+/// ```
+///
+/// SIMP: alpha-only abstraction. Production (Gate 2+) resolves peers via
+/// gossipsub'd manifests instead of a flat file.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PeersFile {
+    /// `[peers.<alias>]` table.
+    #[serde(default)]
+    pub peers: HashMap<String, PeerEntry>,
+}
+
+/// One alias entry.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PeerEntry {
+    /// Full libp2p multiaddr to dial. `/ip4/127.0.0.1/tcp/9001` for alpha demos.
+    pub addr: String,
+}
+
+impl PeersFile {
+    /// Load from a TOML file on disk.
+    pub fn from_path(path: &Path) -> Result<Self, FlowRunnerError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| FlowRunnerError::Config(format!("{}: {}", path.display(), e)))?;
+        let file: PeersFile = toml::from_str(&text)
+            .map_err(|e| FlowRunnerError::Config(format!("{}: {}", path.display(), e)))?;
+        Ok(file)
+    }
+}
+
+// ──────────────────────────── FlowRunner ────────────────────────────────────
+
+/// Options for a single `flow-run` invocation.
+pub struct FlowRunOptions {
+    /// Path to the `.sol` source file.
+    pub flow_path: PathBuf,
+    /// Caller's signed identity bundle (`relix-cli identity mint` output).
+    pub identity_bundle: Bundle,
+    /// 32-byte Ed25519 secret used as the local libp2p PeerId AND as the
+    /// signer for the per-flow event log records. The libp2p PeerId is
+    /// independent of the caller's identity subject_id (alpha SIMP — see
+    /// docs/sol-runtime-analysis.md §6).
+    pub client_key: [u8; 32],
+    /// Peer alias map.
+    pub peers: PeersFile,
+    /// Where the per-flow event log goes. Defaults to
+    /// `<RELIX_DATA_DIR or ~/.relix>/flow-runner/flows/<flow_id>.log`.
+    pub data_dir: Option<PathBuf>,
+    /// Per-call deadline in seconds (default 30).
+    pub deadline_secs: i64,
+}
+
+/// What `FlowRunner::run` returns to the caller (and `relix-cli flow-run`
+/// prints).
+pub struct FlowRunResult {
+    /// New flow id.
+    pub flow_id: FlowId,
+    /// Path of the flow log on disk.
+    pub flow_log_path: PathBuf,
+    /// Trace id (for cross-node audit correlation).
+    pub trace_id: TraceId,
+    /// VM exit value. For successful flows whose final value is a heap-string
+    /// reference, the resolved string is in `final_string`.
+    pub vm_exit: u64,
+    /// Resolved final value as a UTF-8 string when the program returned a
+    /// heap-string ref. None for non-string results (or for VM_ERROR_SENTINEL).
+    pub final_string: Option<String>,
+    /// Last RemoteCall error from the dispatcher, when the flow halted with
+    /// VM_ERROR_SENTINEL.
+    pub last_error: Option<String>,
+}
+
+/// One run. Constructed and `.run()` consumes it.
+pub struct FlowRunner {
+    opts: FlowRunOptions,
+}
+
+impl FlowRunner {
+    /// Wrap options.
+    pub fn new(opts: FlowRunOptions) -> Self {
+        Self { opts }
+    }
+
+    /// Execute the flow. Must run on a multi-threaded tokio runtime; the VM
+    /// is moved onto `spawn_blocking` so the dispatcher can `block_on` libp2p.
+    pub async fn run(self) -> Result<FlowRunResult, FlowRunnerError> {
+        let Self { opts } = self;
+
+        // 1. libp2p ephemeral peer (alpha SIMP: random high port; avoids the
+        //    libp2p 0.54 `tcp/0` parse oddity).
+        let local_port = 21_000 + (rand::random::<u16>() % 8_000);
+        let (client, mut events, event_loop) = rpc::new(opts.client_key, local_port)
+            .await
+            .map_err(|e| FlowRunnerError::Transport(format!("rpc::new: {e}")))?;
+        tokio::spawn(event_loop.run());
+
+        // 2. Dial each configured peer and capture its libp2p PeerId.
+        let peer_ids = dial_all_peers(&client, &mut events, &opts.peers).await?;
+
+        // 3. Compile the SOL source.
+        let bytecode = compile_sol(&opts.flow_path)?;
+
+        // 4. Open the per-flow event log. The flow_log_signer = the local
+        //    client_key; the log records are signed by whoever ran the flow
+        //    (alpha-equivalent of "the owning controller" per RELIX-3 §3.2).
+        let flow_id = FlowId::new();
+        let trace_id = TraceId::new();
+        let signer = SigningKey::from_bytes(&opts.client_key);
+        let flow_log_path = resolve_flow_log_path(&opts.data_dir, flow_id);
+        let event_log = EventLog::open(&flow_log_path, flow_id, signer.clone())
+            .map_err(|e| FlowRunnerError::EventLog(format!("open: {e}")))?;
+        let event_log = Arc::new(Mutex::new(event_log));
+
+        // 5. Write FlowStarted (log-before-act: VM execution about to begin).
+        let started_payload = encode_flow_started_payload(&opts, trace_id);
+        append_log(&event_log, EventType::FlowStarted, started_payload)?;
+
+        // 6. Build dispatcher.
+        let dispatcher: Arc<dyn RemoteCallDispatcher> = Arc::new(RealDispatcher {
+            client: client.clone(),
+            peer_ids,
+            identity: opts.identity_bundle.clone(),
+            trace_id,
+            event_log: event_log.clone(),
+            handle: tokio::runtime::Handle::current(),
+            deadline_secs: opts.deadline_secs,
+        });
+
+        // 7. Spawn the VM on blocking so dispatcher.block_on(...) is safe.
+        let bytecode_for_vm = bytecode.clone();
+        let dispatcher_for_vm = dispatcher.clone();
+        let vm_result = tokio::task::spawn_blocking(move || {
+            let mut vm = VM::from(&bytecode_for_vm).with_dispatcher(dispatcher_for_vm);
+            let exit = vm.run();
+            let last_err = vm.last_error().cloned();
+            // If the program returned a heap-string ref, resolve it for display.
+            let final_string = if exit == VM_ERROR_SENTINEL {
+                None
+            } else {
+                vm.heap_string(exit).map(|s| s.to_string())
+            };
+            (exit, last_err, final_string)
+        })
+        .await
+        .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))?;
+
+        let (vm_exit, last_err, final_string) = vm_result;
+
+        // 8. Terminal event.
+        if vm_exit == VM_ERROR_SENTINEL {
+            let cause = last_err
+                .as_ref()
+                .map(|e| format!("{e}"))
+                .unwrap_or_else(|| "vm halted with sentinel".to_string());
+            append_log(&event_log, EventType::FlowFailed, cause.as_bytes().to_vec())?;
+        } else {
+            let payload = final_string
+                .clone()
+                .unwrap_or_else(|| format!("vm_exit={vm_exit}"));
+            append_log(&event_log, EventType::FlowCompleted, payload.into_bytes())?;
+        }
+
+        Ok(FlowRunResult {
+            flow_id,
+            flow_log_path,
+            trace_id,
+            vm_exit,
+            final_string,
+            last_error: last_err.map(|e| e.to_string()),
+        })
+    }
+}
+
+// ──────────────────────────── Dispatcher impl ───────────────────────────────
+
+struct RealDispatcher {
+    client: rpc::Client,
+    peer_ids: HashMap<String, PeerId>,
+    identity: Bundle,
+    trace_id: TraceId,
+    event_log: Arc<Mutex<EventLog>>,
+    handle: tokio::runtime::Handle,
+    deadline_secs: i64,
+}
+
+impl RemoteCallDispatcher for RealDispatcher {
+    fn remote_call(&self, peer_alias: &str, method: &str, arg: &[u8]) -> RemoteCallResult {
+        // a) Resolve peer alias.
+        let Some(peer_id) = self.peer_ids.get(peer_alias).copied() else {
+            return Err(RemoteCallError::local(
+                peer_alias,
+                method,
+                format!("unknown peer alias '{peer_alias}' (not in [peers] config)"),
+            ));
+        };
+
+        // b) Build envelope. We extract the request_id afterwards so logs and
+        //    errors can correlate to the responder's audit record.
+        let envelope_bytes = build_request(
+            method.to_string(),
+            arg.to_vec(),
+            self.identity.clone(),
+            self.deadline_secs,
+        );
+        let request_id = peek_request_id(&envelope_bytes);
+
+        // c) RemoteCallIssued — log-before-act.
+        let issued =
+            encode_remote_call_issued_payload(peer_alias, method, arg, self.trace_id, request_id);
+        if let Err(e) = append_log(&self.event_log, EventType::RemoteCallIssued, issued) {
+            return Err(RemoteCallError::local(
+                peer_alias,
+                method,
+                format!("event log append (issued): {e}"),
+            ));
+        }
+
+        // d) Dispatch. We are on a spawn_blocking thread; block_on is safe.
+        let started_at = std::time::Instant::now();
+        let resp_bytes_result = self.handle.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs((self.deadline_secs + 5) as u64),
+                self.client.call(peer_id, envelope_bytes),
+            )
+            .await
+        });
+        let latency_ms = started_at.elapsed().as_millis() as u64;
+
+        // e) Surface outcomes.
+        let outcome = match resp_bytes_result {
+            Ok(Ok(resp_bytes)) => match decode_response(&resp_bytes) {
+                Ok(resp) => match resp.res {
+                    ResponseResult::Ok(body) => Ok(body.to_vec()),
+                    ResponseResult::Err(env) => {
+                        Err(RemoteCallError::from_envelope(peer_alias, method, &env))
+                    }
+                    ResponseResult::StreamHandle(_) => Err(RemoteCallError::local(
+                        peer_alias,
+                        method,
+                        "stream response not supported by alpha synchronous dispatcher",
+                    )),
+                },
+                Err(e) => Err(RemoteCallError::local(
+                    peer_alias,
+                    method,
+                    format!("response decode: {e}"),
+                )),
+            },
+            Ok(Err(transport_err)) => Err(RemoteCallError::local(
+                peer_alias,
+                method,
+                format!("transport: {transport_err}"),
+            )),
+            Err(_elapsed) => Err(RemoteCallError::local(
+                peer_alias,
+                method,
+                "outbound RPC timed out at dispatcher",
+            )),
+        };
+
+        // f) Terminal event for this call.
+        match &outcome {
+            Ok(body) => {
+                let completed = encode_remote_call_completed_payload(
+                    peer_alias, method, request_id, latency_ms, body,
+                );
+                let _ = append_log(&self.event_log, EventType::RemoteCallCompleted, completed);
+            }
+            Err(err) => {
+                let failed = encode_remote_call_failed_payload(
+                    peer_alias, method, request_id, latency_ms, err,
+                );
+                let _ = append_log(&self.event_log, EventType::RemoteCallFailed, failed);
+            }
+        }
+
+        outcome
+    }
+}
+
+// ──────────────────────────── Helpers ───────────────────────────────────────
+
+fn append_log(
+    log: &Arc<Mutex<EventLog>>,
+    kind: EventType,
+    payload: Vec<u8>,
+) -> Result<u64, FlowRunnerError> {
+    let mut guard = log
+        .lock()
+        .map_err(|_| FlowRunnerError::EventLog("log mutex poisoned".into()))?;
+    guard
+        .append(kind, payload)
+        .map_err(|e| FlowRunnerError::EventLog(e.to_string()))
+}
+
+fn compile_sol(path: &Path) -> Result<Vec<crate::sol::bytecode::Inst>, FlowRunnerError> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| FlowRunnerError::Config(format!("non-UTF-8 path: {}", path.display())))?;
+    if !path.exists() {
+        return Err(FlowRunnerError::Config(format!(
+            "flow file not found: {}",
+            path.display()
+        )));
+    }
+    let mut lexer = Lexer::from(path_str);
+    let tokens = lexer.tokens();
+    let mut parser = Parser::from(tokens);
+    let mut program = parser.run();
+    let mut analyzer = Analyzer::new();
+    analyzer.run(&mut program);
+    let mut codegen = Codegen::from(analyzer.tt_arena);
+    Ok(codegen.gen_bcode(&program))
+}
+
+async fn dial_all_peers(
+    client: &rpc::Client,
+    events: &mut tokio::sync::mpsc::Receiver<TransportEvent>,
+    peers: &PeersFile,
+) -> Result<HashMap<String, PeerId>, FlowRunnerError> {
+    if peers.peers.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // Issue every dial first, then collect PeerConnected events for each one.
+    // We resolve aliases by remembering the dial order: each PeerConnected
+    // event carries the peer's libp2p PeerId; matching addr ↔ alias happens
+    // here since libp2p does not surface the dialed multiaddr on the event.
+    //
+    // Alpha simplification: dial sequentially and pair PeerConnected with the
+    // dial whose addr matches the event's reported address (the libp2p Event
+    // carries the remote multiaddr).
+    let mut want: HashMap<String, Multiaddr> = HashMap::new();
+    for (alias, entry) in &peers.peers {
+        let addr: Multiaddr = entry.addr.parse().map_err(|e| {
+            FlowRunnerError::Config(format!("peer '{alias}' invalid multiaddr: {e:?}"))
+        })?;
+        client
+            .dial(addr.clone())
+            .await
+            .map_err(|e| FlowRunnerError::Transport(format!("dial '{alias}': {e}")))?;
+        want.insert(alias.clone(), addr);
+    }
+
+    let mut out = HashMap::new();
+    let timeout = Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + timeout;
+    while out.len() < want.len() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let missing: Vec<&String> = want
+                .keys()
+                .filter(|k| !out.contains_key(k.as_str()))
+                .collect();
+            return Err(FlowRunnerError::Transport(format!(
+                "timed out connecting to peers: {missing:?}"
+            )));
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Some(TransportEvent::PeerConnected { peer_id, address })) => {
+                if let Some((alias, _)) = want
+                    .iter()
+                    .find(|(_, addr)| ends_with_addr(address.clone(), addr))
+                {
+                    out.entry(alias.clone()).or_insert(peer_id);
+                }
+            }
+            Ok(Some(_)) => {} // other events ignored during the dial-window
+            Ok(None) => {
+                return Err(FlowRunnerError::Transport(
+                    "transport event stream closed during dial".into(),
+                ));
+            }
+            Err(_) => {
+                let missing: Vec<&String> = want
+                    .keys()
+                    .filter(|k| !out.contains_key(k.as_str()))
+                    .collect();
+                return Err(FlowRunnerError::Transport(format!(
+                    "timed out connecting to peers: {missing:?}"
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Match a `PeerConnected` event's reported address against a wanted dial
+/// address by checking the trailing `/tcp/<port>` segment. libp2p sometimes
+/// adds extra protocol segments to the reported address, but the dialed
+/// `/ip4/.../tcp/<port>` is always a prefix.
+fn ends_with_addr(reported: Multiaddr, wanted: &Multiaddr) -> bool {
+    let reported_s = reported.to_string();
+    let wanted_s = wanted.to_string();
+    reported_s.starts_with(&wanted_s)
+}
+
+fn peek_request_id(envelope_bytes: &[u8]) -> RequestId {
+    // Cheap: decode the envelope and read rid. Not a hot path (called once
+    // per remote_call); the envelope decode is the same one the responder
+    // does, so any decode failure here would mean the responder fails too.
+    match codec::decode::<crate::transport::envelope::RequestEnvelope>(envelope_bytes) {
+        Ok(env) => env.rid,
+        Err(_) => RequestId([0u8; 16]),
+    }
+}
+
+fn resolve_flow_log_path(data_dir: &Option<PathBuf>, flow_id: FlowId) -> PathBuf {
+    let base = data_dir.clone().unwrap_or_else(|| {
+        std::env::var("RELIX_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".relix")
+            })
+    });
+    base.join("flow-runner")
+        .join("flows")
+        .join(format!("{flow_id}.log"))
+}
+
+// ──────────────────────────── Event payloads ────────────────────────────────
+//
+// Alpha payloads are simple text — typed/CBOR payloads land at Gate 2 along
+// with the replay-mode VM. `relix-flow-inspect` already prints these as UTF-8.
+
+fn encode_flow_started_payload(opts: &FlowRunOptions, trace_id: TraceId) -> Vec<u8> {
+    format!(
+        "flow={}\ntrace_id={}\nidentity_issuer={}\n",
+        opts.flow_path.display(),
+        trace_id,
+        opts.identity_bundle.header.kid
+    )
+    .into_bytes()
+}
+
+fn encode_remote_call_issued_payload(
+    peer: &str,
+    method: &str,
+    arg: &[u8],
+    trace_id: TraceId,
+    request_id: RequestId,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128 + arg.len());
+    let _ = writeln!(buf, "peer={peer}");
+    let _ = writeln!(buf, "method={method}");
+    let _ = writeln!(buf, "trace_id={trace_id}");
+    let _ = writeln!(buf, "request_id={request_id}");
+    let _ = writeln!(buf, "arg_bytes={}", arg.len());
+    buf
+}
+
+fn encode_remote_call_completed_payload(
+    peer: &str,
+    method: &str,
+    request_id: RequestId,
+    latency_ms: u64,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128 + body.len());
+    let _ = writeln!(buf, "peer={peer}");
+    let _ = writeln!(buf, "method={method}");
+    let _ = writeln!(buf, "request_id={request_id}");
+    let _ = writeln!(buf, "latency_ms={latency_ms}");
+    let _ = writeln!(buf, "body_bytes={}", body.len());
+    buf
+}
+
+fn encode_remote_call_failed_payload(
+    peer: &str,
+    method: &str,
+    request_id: RequestId,
+    latency_ms: u64,
+    err: &RemoteCallError,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(192);
+    let _ = writeln!(buf, "peer={peer}");
+    let _ = writeln!(buf, "method={method}");
+    let _ = writeln!(buf, "request_id={request_id}");
+    let _ = writeln!(buf, "latency_ms={latency_ms}");
+    let _ = writeln!(buf, "error_kind={}", err.kind);
+    let _ = writeln!(buf, "cause={}", err.cause);
+    buf
+}
+
+// ──────────────────────────── Errors ────────────────────────────────────────
+
+/// FlowRunner-layer errors.
+#[derive(Debug, thiserror::Error)]
+pub enum FlowRunnerError {
+    /// Config (peer file, paths) parse / load failure.
+    #[error("config: {0}")]
+    Config(String),
+    /// Transport (libp2p) failure.
+    #[error("transport: {0}")]
+    Transport(String),
+    /// Event log failure.
+    #[error("event log: {0}")]
+    EventLog(String),
+    /// VM-runner (spawn_blocking, compile) failure.
+    #[error("vm: {0}")]
+    Vm(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn peers_file_parses() {
+        let toml = r#"
+            [peers.memory]
+            addr = "/ip4/127.0.0.1/tcp/9001"
+
+            [peers.ai]
+            addr = "/ip4/127.0.0.1/tcp/9002"
+        "#;
+        let file: PeersFile = toml::from_str(toml).expect("parse");
+        assert_eq!(file.peers.len(), 2);
+        assert_eq!(file.peers["memory"].addr, "/ip4/127.0.0.1/tcp/9001");
+    }
+
+    #[test]
+    fn flow_log_path_uses_data_dir() {
+        let p = resolve_flow_log_path(&Some(PathBuf::from("/tmp/relix-test")), FlowId([0u8; 16]));
+        assert!(p.ends_with("00000000000000000000000000000000.log"));
+        assert!(p.to_string_lossy().contains("/tmp/relix-test"));
+    }
+
+    /// Stub dispatcher used to exercise dispatcher-replacement plumbing without
+    /// a real libp2p stack. The real path is exercised by the integration
+    /// script in `scripts/alpha-bringup-m6.sh`.
+    struct CountingDispatcher {
+        called: std::sync::atomic::AtomicU32,
+        peer_map: HashMap<String, ()>,
+    }
+
+    impl RemoteCallDispatcher for CountingDispatcher {
+        fn remote_call(&self, peer: &str, _method: &str, _arg: &[u8]) -> RemoteCallResult {
+            if !self.peer_map.contains_key(peer) {
+                return Err(RemoteCallError::local(peer, "any", "unknown peer alias"));
+            }
+            self.called
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(b"ok".to_vec())
+        }
+    }
+
+    #[test]
+    fn unknown_peer_alias_surfaces_local_error() {
+        let mut map = HashMap::new();
+        map.insert("memory".to_string(), ());
+        let d = CountingDispatcher {
+            called: 0.into(),
+            peer_map: map,
+        };
+        let err = d
+            .remote_call("nonexistent", "x", b"")
+            .expect_err("must fail");
+        assert_eq!(err.kind, 0);
+        assert!(err.cause.contains("unknown peer alias"));
+    }
+}

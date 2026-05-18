@@ -1,5 +1,6 @@
 //! relix-cli — developer and operator CLI.
 
+mod flow_run;
 mod identity;
 mod ping;
 
@@ -22,27 +23,47 @@ enum Cmd {
     },
     /// Call a peer's capability and print the response.
     ///
-    /// Default method is `node.health`. For the alpha, `--peer` is a libp2p
-    /// multiaddr (e.g. `/ip4/127.0.0.1/tcp/9001`). Alias-based dialing lands
-    /// when capability gossip arrives at M6+.
+    /// Default method is `node.health`. `--peer` is a libp2p multiaddr.
     Ping {
         /// Target peer's libp2p multiaddr.
         #[arg(long)]
         peer: String,
-        /// Path to caller's identity bundle (raw CBOR from `relix-cli identity mint`).
+        /// Path to caller's identity bundle.
         #[arg(long)]
         identity: PathBuf,
         /// Method to call. Default `node.health`.
         #[arg(long, default_value = "node.health")]
         method: String,
         /// Path to a 32-byte signing key used as the local libp2p PeerId.
-        /// (Does NOT need to match the identity subject — alpha SIMP.)
         #[arg(long)]
         client_key: PathBuf,
     },
+    /// Execute a SOL flow file against a real Relix mesh (M6).
+    ///
+    /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
+    /// dials every peer named in the `--peers` file, runs the VM, and
+    /// prints the result + the flow log path.
+    FlowRun {
+        /// Path to the `.sol` source file.
+        #[arg(long)]
+        flow: PathBuf,
+        /// Caller's identity bundle (from `relix-cli identity mint`).
+        #[arg(long)]
+        identity: PathBuf,
+        /// 32-byte signing key used as the local libp2p PeerId AND as the
+        /// signer for the per-flow event log.
+        #[arg(long)]
+        client_key: PathBuf,
+        /// TOML file with `[peers.<alias>] addr = "..."` entries.
+        #[arg(long)]
+        peers: PathBuf,
+        /// Per-call deadline in seconds (default 30).
+        #[arg(long, default_value_t = 30)]
+        deadline_secs: i64,
+    },
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -60,5 +81,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             method,
             client_key,
         } => ping::run(&peer, &identity, &method, &client_key).await,
+        Cmd::FlowRun {
+            flow,
+            identity,
+            client_key,
+            peers,
+            deadline_secs,
+        } => flow_run::run(&flow, &identity, &client_key, &peers, deadline_secs).await,
     }
 }

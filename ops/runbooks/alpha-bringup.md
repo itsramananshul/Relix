@@ -150,6 +150,66 @@ Two ready-made wrappers at the repo root:
 - `scripts/alpha-bringup-m5.sh` — sets up keys + starts the controller + runs both ping cases (POSIX / git-bash).
 - `scripts/alpha-bringup-m5.ps1` — same flow as a PowerShell script.
 
+## M6 SOL Flow Demo — `flow-run` (alpha-current)
+
+The M6/S4 milestone adds **real SOL `remote_call` orchestration** through the same libp2p RPC path proven in M5. A `.sol` file is compiled in `relix-cli`, attached to a libp2p-backed `RemoteCallDispatcher`, and executed against a real controller process.
+
+```sh
+# Single-command demo: mints alice + bob, starts the controller, runs
+# flows/ping.sol as both identities, prints flow log + responder audit.
+./scripts/alpha-bringup-m6.sh
+```
+
+Manual command shape:
+
+```sh
+cargo run -p relix-cli -- flow-run \
+    --flow flows/ping.sol \
+    --identity dev-keys/alice.aic \
+    --client-key dev-keys/org.key \
+    --peers configs/peers.toml \
+    --deadline-secs 30
+```
+
+Where `configs/peers.toml` declares the peers the SOL flow may target:
+
+```toml
+[peers.controller]
+addr = "/ip4/127.0.0.1/tcp/19501"
+```
+
+And the SOL flow itself (`flows/ping.sol`):
+
+```sol
+function start() -> str {
+    let result: str = remote_call("controller", "node.health", "");
+    print(result);
+    return result;
+}
+```
+
+The runner outputs:
+
+```text
+# Relix flow run
+flow_id:       <16 hex bytes>
+trace_id:      <16 hex bytes>
+flow_log:      dev-data/flow-runner/flows/<flow_id>.log
+status:        ok
+return:        name=<node>
+               type=<type>
+               status=ok
+               runtime=<semver>
+```
+
+Each invocation writes a flow log (`dev-data/flow-runner/flows/<flow_id>.log`) with `FlowStarted` → `RemoteCallIssued` → (`RemoteCallCompleted` or `RemoteCallFailed`) → (`FlowCompleted` or `FlowFailed`). Inspect with:
+
+```sh
+cargo run -p relix-flow-inspect -- --flow <path> --human
+```
+
+The responder's audit log shows one record per RPC, joinable across nodes by `request_id`.
+
 ## Smoke Test (Acceptance, full alpha — M7+ work)
 
 The acceptance criteria from `docs/alpha-plan.md` are verified by:

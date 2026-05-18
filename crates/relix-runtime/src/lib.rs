@@ -17,6 +17,7 @@
 pub mod controller_runtime;
 pub mod coordinator;
 pub mod dispatch;
+pub mod flow_runner;
 pub mod manifest;
 pub mod nodes;
 pub mod sol;

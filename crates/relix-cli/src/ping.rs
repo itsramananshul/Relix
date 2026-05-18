@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use relix_core::bundle::Bundle;
 use relix_core::codec;
-use relix_runtime::controller_runtime::NodeHealth;
 use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use relix_runtime::transport::rpc::{self, Event, Multiaddr};
@@ -71,24 +70,21 @@ pub async fn run(
         ResponseResult::Ok(body) => {
             println!("OK from {}", resp.responder);
             println!("aid (request_id):  {}", hex::encode(resp.aid.as_ref()));
-            if method == "node.health" {
-                match codec::decode::<NodeHealth>(body.as_ref()) {
-                    Ok(h) => {
-                        println!("node.name:         {}", h.name);
-                        println!("node.type:         {}", h.node_type);
-                        println!("node.status:       {}", h.status);
-                        println!("node.runtime:      {}", h.runtime_version);
-                    }
-                    Err(e) => {
-                        println!("(payload decode failed: {e}; raw {} bytes)", body.len());
+            // SIMP-016: alpha capabilities return UTF-8 strings.
+            match std::str::from_utf8(body.as_ref()) {
+                Ok(text) => {
+                    println!("body ({} bytes):", body.len());
+                    for line in text.lines() {
+                        println!("  {line}");
                     }
                 }
-            } else {
-                println!(
-                    "body ({} bytes): {}",
-                    body.len(),
-                    hex::encode(body.as_ref())
-                );
+                Err(_) => {
+                    println!(
+                        "body ({} bytes, binary): {}",
+                        body.len(),
+                        hex::encode(body.as_ref())
+                    );
+                }
             }
         }
         ResponseResult::Err(e) => {

@@ -113,9 +113,12 @@ The VM's bytecode execution is deterministic in the operand-stack sense (no wall
 
 ## 8. Alpha simplifications introduced by M6
 
-- **SIMP-014 — Sync block_on inside the dispatcher.** The dispatcher impl wraps async libp2p calls with `tokio::task::block_in_place(|| Handle::current().block_on(...))`. Requires a multi-threaded tokio runtime (which the controller binary uses by default). Pure sync VM execution; no yield model yet. Resolution gate: Gate 2 (alongside SIMP-001).
-- **SIMP-015 — Client-side flow execution.** For the alpha, SOL flows are compiled and executed by the *caller's* controller (or by `relix-cli flow-run`), not by a remote `node.run_flow` capability. This is honest peer-to-peer: the caller's controller orchestrates by initiating real outbound RPCs to other peers. Future revisions may add a `node.run_flow` capability that lets one node ask another to run a SOL flow on its behalf; the wire path is the same. Resolution gate: post-alpha.
-- **SIMP-016 — `remote_call` args and returns are strings.** The wire-side `args` is `[u8]` in RELIX-1 §1.4; the SOL-side argument is `string` for the alpha (one positional string arg). The dispatcher passes the string's UTF-8 bytes verbatim as `args`. Multi-argument or typed-struct argument support is post-alpha. Resolution gate: Gate 2 (with CDDL stdlib).
+Authoritative copies live in `specs/alpha-simplifications.md`:
+
+- **SIMP-014** — synchronous dispatcher. M6/S4 implementation uses `tokio::task::spawn_blocking` for the VM thread and `Handle::current().block_on(...)` inside the dispatcher (NOT `block_in_place`, which would panic on the current-thread runtime; the spawn_blocking pattern is the tokio-recommended way to mix sync and async). Requires a multi-threaded tokio runtime, which both `relix-controller` and `relix-cli` use.
+- **SIMP-015** — client-side flow execution. SOL flows compile and execute in `relix-cli flow-run`; the runner's libp2p PeerId becomes the originating peer for outbound RPCs. The caller's AIC still flows through every `RequestEnvelope`, so responder-side policy decisions are unchanged.
+- **SIMP-016** — UTF-8 string args and returns for `remote_call`. The alpha `node.health` body is rewritten to a multi-line `key=value\n` text format to interoperate cleanly with this constraint.
+- **SIMP-017** — peer aliases via a flat `peers.toml` file (`--peers configs/peers.toml`). Signed-manifest gossip per RELIX-5 lands at Gate 2.
 
 ## 9. What stays out of scope for M6
 

@@ -33,8 +33,11 @@ pub enum EventType {
     FlowStarted,
     /// An outbound RPC was issued.
     RemoteCallIssued,
-    /// An outbound RPC completed (success or error).
+    /// An outbound RPC completed successfully.
     RemoteCallCompleted,
+    /// An outbound RPC failed (transport, policy, application, or local
+    /// dispatch error). Payload carries the failure cause.
+    RemoteCallFailed,
     /// A stream chunk was received by the flow.
     StreamChunkReceived,
     /// Flow reached `Completed` terminal state.

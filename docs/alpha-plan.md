@@ -45,6 +45,8 @@ Demo: two controllers exchange a signed RPC; invalid identity rejected.
 Build: extend SOL VM with `RemoteCall` opcode + dispatcher callback; capability registry; memory node (Hermes FTS5 schema) registering `memory.search`, `memory.write_turn`, `memory.recent_for_session`; first SOL flow.
 Demo: SOL flow on controller A invokes memory node B's capability; flow log shows issued+completed events.
 
+**Status:** SOL `RemoteCall` opcode + dispatcher + flow-log tracing landed in M6/S4 (commits up to the M6 push). Memory node deferred to M7. `flows/ping.sol` against `node.health` is the M6 demo; chained orchestration (`chat.sol`) ships in M6/S7 once memory + AI handlers exist.
+
 ### Day 3 — AI Node + Streaming + Chat Flow
 Build: streaming substream protocol (simplified); AI node wrapping Anthropic with token stream; `flows/chat.sol`; web bridge HTTP server with SSE.
 Demo: `curl` against the bridge produces a real streamed Anthropic response routed via SOL.

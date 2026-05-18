@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use relix_core::policy::PolicyEngine;
@@ -178,44 +178,30 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Typed payload returned by `node.health`. Carries enough for an operator to
-/// confirm a node is alive, identify what it is, and see its runtime version.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NodeHealth {
-    /// `node_name` from `[controller]`.
-    pub name: String,
-    /// `node_type` from `[controller]` (`memory` / `ai` / `tool` / `web_bridge` / ...).
-    pub node_type: String,
-    /// Operational status string. Currently always `"ok"`; future health checks
-    /// may report `"degraded"` or `"draining"`.
-    pub status: String,
-    /// Relix runtime semver (compile-time crate version).
-    pub runtime_version: String,
+/// Payload returned by `node.health` — a multi-line `key=value\n` string.
+///
+/// SIMP-016: alpha capabilities take and return strings only. The plain-text
+/// format keeps the response readable both for `relix-cli ping` (which prints
+/// it verbatim) and for SOL flows (`let h: str = remote_call("controller",
+/// "node.health", ""); print(h);`). Typed CBOR payloads land at Gate 2 with
+/// the CDDL stdlib.
+fn node_health_body(cfg: &ControllerConfig) -> String {
+    format!(
+        "name={}\ntype={}\nstatus=ok\nruntime={}\n",
+        cfg.controller.name,
+        cfg.controller.node_type,
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// Register capabilities every node serves by default.
 fn register_builtins(bridge: &mut DispatchBridge, cfg: &ControllerConfig) {
-    let payload = NodeHealth {
-        name: cfg.controller.name.clone(),
-        node_type: cfg.controller.node_type.clone(),
-        status: "ok".to_string(),
-        runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-    };
+    let body = node_health_body(cfg);
     bridge.register(
         "node.health",
         Arc::new(FnHandler(move |_ctx: InvocationCtx| {
-            let payload = payload.clone();
-            async move {
-                match relix_core::codec::encode(&payload) {
-                    Ok(bytes) => HandlerOutcome::Ok(bytes),
-                    Err(e) => HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
-                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
-                        cause: format!("node.health encode: {e}"),
-                        retry_hint: 1,
-                        retry_after: None,
-                    }),
-                }
-            }
+            let body = body.clone();
+            async move { HandlerOutcome::Ok(body.into_bytes()) }
         })),
     );
     // node.manifest, ping, etc. land in M6 once registry is wired.

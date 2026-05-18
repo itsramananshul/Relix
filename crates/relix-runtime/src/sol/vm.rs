@@ -73,6 +73,16 @@ impl VM {
         self.last_error.as_ref()
     }
 
+    /// Relix extension: resolve a `HeapObject::String` by its heap index.
+    /// Used by `flow_runner` after `run()` to surface a SOL flow's return
+    /// value (heap-string ref) as a real string.
+    pub fn heap_string(&self, idx: u64) -> Option<&str> {
+        match self.heap.get(idx as usize) {
+            Some(HeapObject::String(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
     #[inline]
     fn push(&mut self, val: u64) {
         self.stack.push(val);

@@ -70,7 +70,15 @@ cargo run -p relix-cli -- ping \
     --client-key dev-keys/org-root.key
 ```
 
-Full bringup (memory / AI / tool / web nodes — M7+ work, not in M5): see `ops/runbooks/alpha-bringup.md`.
+### M6 — SOL flow `remote_call` (also working today)
+
+```sh
+./scripts/alpha-bringup-m6.sh
+```
+
+Compiles `flows/ping.sol`, attaches a libp2p-backed dispatcher, runs the VM against a real controller, prints the flow log + responder audit. The denied path (Bob with `guest` group) exits 2 with a structured `RemoteCallError`.
+
+Full bringup (memory / AI / tool / web nodes — M7+ work): see `ops/runbooks/alpha-bringup.md`.
 
 ## Reporting Security Issues
 

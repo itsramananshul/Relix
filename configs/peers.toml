@@ -1,0 +1,11 @@
+# Peer alias map for `relix-cli flow-run --peers configs/peers.toml`.
+#
+# Each entry names a libp2p multiaddr that the SOL flow can refer to by
+# alias in `remote_call("<alias>", ...)`. The flow runner dials every alias
+# at startup and resolves it to the responder's libp2p PeerId.
+#
+# This file is alpha-specific: production (Gate 2+) discovers peers via
+# gossipsub'd manifests instead of a flat file (specs/RELIX-5-manifest.md).
+
+[peers.controller]
+addr = "/ip4/127.0.0.1/tcp/19501"

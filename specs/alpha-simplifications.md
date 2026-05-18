@@ -150,6 +150,54 @@ If a behavior in the running code does not match a spec, either:
 
 **Resolution gate:** Gate 2.
 
+## SIMP-014 — Synchronous dispatcher (`block_on` bridge)
+
+**Spec target:** RELIX-7 §7.4 (yield opcodes with durable suspension).
+
+**Alpha behavior:** `relix-runtime::flow_runner::RealDispatcher` implements `RemoteCallDispatcher::remote_call` synchronously. The VM runs on `tokio::task::spawn_blocking`, and the dispatcher uses the captured `tokio::runtime::Handle::current().block_on(async { client.call(...).await })` to issue the libp2p RPC. Requires a multi-threaded tokio runtime (the controller binary and `relix-cli` are both configured for that).
+
+**Why:** the full yield/replay-equivalence model from RELIX-7 needs CPS-style compiler restructuring + durable promise state. The synchronous bridge gets a real distributed SOL flow running in one milestone.
+
+**Consequence:** a slow remote call (e.g., approval pending) blocks the flow's VM thread. Many concurrent long-running flows would exhaust the blocking pool. Acceptable for alpha; unacceptable for production.
+
+**Resolution gate:** Gate 2 (paired with SIMP-001).
+
+## SIMP-015 — Client-side flow execution (no `node.run_flow` capability)
+
+**Spec target:** any node can host a SOL flow on behalf of any other.
+
+**Alpha behavior:** SOL flows are compiled and executed by the caller's process (`relix-cli flow-run`), not by a remote `node.run_flow` capability on the target. The dispatcher initiates real outbound RPCs from the caller's libp2p PeerId.
+
+**Why:** a `node.run_flow` capability adds responder-side compilation, identity propagation, and replay-mode VM concerns. The alpha proves the routing-in-SOL invariant without that extra layer.
+
+**Consequence:** flows orchestrated this way have the caller's libp2p PeerId as their initiator. The originating AIC still flows through every per-call `RequestEnvelope` so the responder's policy decisions are unaffected.
+
+**Resolution gate:** post-alpha.
+
+## SIMP-016 — `remote_call` args and returns are UTF-8 strings
+
+**Spec target:** RELIX-1 §1.4 — `args: ByteBuf` (opaque CBOR), capability-typed via CDDL.
+
+**Alpha behavior:** SOL `remote_call(peer: str, method: str, arg: str) -> str`. The SOL string is passed verbatim as the RPC `args` bytes; the responder's `Ok(body)` bytes are decoded as UTF-8 and pushed back as a `HeapObject::String`. Non-UTF-8 responses become a synthetic placeholder string.
+
+**Why:** CDDL-typed args + the CDDL stdlib are Gate-2 substrate work. Strings are sufficient for the M6 demo (the alpha `node.health` capability is rewritten to return a plain `key=value\n` body for this same reason).
+
+**Consequence:** capability authors targeting SOL flows must encode their response as UTF-8 text. The alpha `node.health` does this; future memory / AI / tool nodes will too until typed wire support lands.
+
+**Resolution gate:** Gate 2 (with CDDL stdlib).
+
+## SIMP-017 — Peer aliases via flat `peers.toml`
+
+**Spec target:** RELIX-5 capability advertisement via signed manifests gossipped across the mesh.
+
+**Alpha behavior:** `relix-cli flow-run --peers configs/peers.toml` loads a small flat-TOML map of `alias → libp2p multiaddr`. `remote_call("alias", ...)` resolves to the dialed `PeerId`. Unknown aliases return a structured `RemoteCallError`.
+
+**Why:** signed-manifest gossip is RELIX-5 work; far beyond M6 scope.
+
+**Consequence:** alias maps are not signed and not authenticated. Production deployments must NOT use the flat file; the manifest layer at Gate 2 supersedes it cleanly.
+
+**Resolution gate:** Gate 2 (with manifest gossip).
+
 ## SIMP-013 — Single AI provider (Anthropic), single model
 
 **Spec target:** Provider-agnostic `ai.chat` capability.
