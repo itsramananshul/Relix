@@ -210,6 +210,34 @@ cargo run -p relix-flow-inspect -- --flow <path> --human
 
 The responder's audit log shows one record per RPC, joinable across nodes by `request_id`.
 
+### M6 chained orchestration — two-controller demo
+
+`flows/chained_health.sol` calls `node.health` on a `memory` peer and then on an `ai` peer in sequence, proving real multi-peer SOL orchestration with trace continuity and per-call audit on each responder.
+
+```sh
+./scripts/alpha-bringup-m6-chained.sh
+```
+
+The script:
+1. Mints alice (`chat-users`) and bob (`guest`).
+2. Starts two controller processes — `m6chained-memory` on tcp/19501 and `m6chained-ai` on tcp/19502 — sharing the same trust root.
+3. Runs `flows/chained_health.sol` as alice; expects success with a 6-event flow log:
+   `FlowStarted` → `RemoteCallIssued(memory)` → `RemoteCallCompleted(memory)` → `RemoteCallIssued(ai)` → `RemoteCallCompleted(ai)` → `FlowCompleted`.
+4. Runs the same flow as bob; expects exit 2 and a 4-event flow log:
+   `FlowStarted` → `RemoteCallIssued(memory)` → `RemoteCallFailed` → `FlowFailed`. The flow short-circuits at the first denied call; the ai responder is never reached.
+5. Prints each responder's audit log. Both records correlate to the flow events by `request_id`.
+
+Peer alias map used by the SOL flow:
+
+```toml
+# configs/peers-chained.toml
+[peers.memory]
+addr = "/ip4/127.0.0.1/tcp/19501"
+
+[peers.ai]
+addr = "/ip4/127.0.0.1/tcp/19502"
+```
+
 ## Smoke Test (Acceptance, full alpha — M7+ work)
 
 The acceptance criteria from `docs/alpha-plan.md` are verified by:

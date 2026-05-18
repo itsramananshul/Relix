@@ -1,0 +1,11 @@
+# Peer map for `flows/chained_health.sol` (M6/S7).
+#
+# Two controller processes; one aliased `memory`, one aliased `ai`. Both run
+# the same controller binary configured to expose `node.health`. M7 replaces
+# the methods (memory.* and ai.chat) without changing this alias file.
+
+[peers.memory]
+addr = "/ip4/127.0.0.1/tcp/19501"
+
+[peers.ai]
+addr = "/ip4/127.0.0.1/tcp/19502"

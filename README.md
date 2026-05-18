@@ -73,10 +73,13 @@ cargo run -p relix-cli -- ping \
 ### M6 — SOL flow `remote_call` (also working today)
 
 ```sh
-./scripts/alpha-bringup-m6.sh
+./scripts/alpha-bringup-m6.sh           # single peer
+./scripts/alpha-bringup-m6-chained.sh   # two peers, two sequential remote_calls
 ```
 
-Compiles `flows/ping.sol`, attaches a libp2p-backed dispatcher, runs the VM against a real controller, prints the flow log + responder audit. The denied path (Bob with `guest` group) exits 2 with a structured `RemoteCallError`.
+`alpha-bringup-m6.sh` compiles `flows/ping.sol` and runs it against one controller; the denied path (Bob with `guest` group) exits 2.
+
+`alpha-bringup-m6-chained.sh` runs `flows/chained_health.sol` against two real controller processes (memory + ai) in sequence. Alice's happy-path flow log has 6 events (`FlowStarted` → `RemoteCallIssued(memory)` → `RemoteCallCompleted` → `RemoteCallIssued(ai)` → `RemoteCallCompleted` → `FlowCompleted`); Bob's denied flow short-circuits at the first call with 4 events.
 
 Full bringup (memory / AI / tool / web nodes — M7+ work): see `ops/runbooks/alpha-bringup.md`.
 

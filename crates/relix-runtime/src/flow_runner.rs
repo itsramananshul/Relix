@@ -622,4 +622,102 @@ mod tests {
         assert_eq!(err.kind, 0);
         assert!(err.cause.contains("unknown peer alias"));
     }
+
+    /// Dispatcher that records every (peer, method) call and replies according
+    /// to a scripted response sequence. Used to exercise sequential SOL
+    /// orchestration in isolation; the real two-process path is the M6/S7
+    /// bringup script.
+    struct ScriptedDispatcher {
+        calls: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+        responses: std::sync::Mutex<Vec<RemoteCallResult>>,
+    }
+
+    impl ScriptedDispatcher {
+        fn new(responses: Vec<RemoteCallResult>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                responses: std::sync::Mutex::new(responses.into_iter().rev().collect()),
+            })
+        }
+        fn calls(&self) -> Vec<(String, String, Vec<u8>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl RemoteCallDispatcher for ScriptedDispatcher {
+        fn remote_call(&self, peer: &str, method: &str, arg: &[u8]) -> RemoteCallResult {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((peer.to_string(), method.to_string(), arg.to_vec()));
+            self.responses.lock().unwrap().pop().unwrap_or_else(|| {
+                Err(RemoteCallError::local(peer, method, "no scripted response"))
+            })
+        }
+    }
+
+    fn compile_chained_health() -> Vec<crate::sol::bytecode::Inst> {
+        use crate::sol::analyzer::Analyzer;
+        use crate::sol::bytecode::Codegen;
+        use crate::sol::lexer::Lexer;
+        use crate::sol::parser::Parser;
+
+        // Tests run with the workspace as cwd, so the repo-root flow path
+        // is reachable as `../../flows/...` from `crates/relix-runtime/`.
+        let path = PathBuf::from("../../flows/chained_health.sol");
+        assert!(
+            path.exists(),
+            "fixture not found: {} (run from workspace root)",
+            path.display()
+        );
+        let mut lex = Lexer::from(path.to_str().unwrap());
+        let tokens = lex.tokens();
+        let mut parser = Parser::from(tokens);
+        let mut program = parser.run();
+        let mut analyzer = Analyzer::new();
+        analyzer.run(&mut program);
+        Codegen::from(analyzer.tt_arena).gen_bcode(&program)
+    }
+
+    #[test]
+    fn chained_flow_compiles_and_dispatches_in_order() {
+        let bc = compile_chained_health();
+        let remote_count = bc
+            .iter()
+            .filter(|i| matches!(i, crate::sol::bytecode::Inst::RemoteCall))
+            .count();
+        assert_eq!(remote_count, 2, "expected exactly two RemoteCall opcodes");
+
+        let disp = ScriptedDispatcher::new(vec![Ok(b"memory=ok".to_vec()), Ok(b"ai=ok".to_vec())]);
+        let mut vm = crate::sol::vm::VM::from(&bc).with_dispatcher(disp.clone());
+        let _ = vm.run();
+        let calls = disp.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "memory");
+        assert_eq!(calls[1].0, "ai");
+        assert!(vm.last_error().is_none(), "VM must not have errored");
+    }
+
+    #[test]
+    fn first_call_failure_short_circuits_chain() {
+        let bc = compile_chained_health();
+        let disp = ScriptedDispatcher::new(vec![
+            Err(RemoteCallError {
+                kind: 6,
+                peer: "memory".into(),
+                method: "node.health".into(),
+                cause: "policy denied".into(),
+            }),
+            // Should NEVER be popped — VM halts after first failure.
+            Ok(b"ai=ok".to_vec()),
+        ]);
+        let mut vm = crate::sol::vm::VM::from(&bc).with_dispatcher(disp.clone());
+        let exit = vm.run();
+        assert_eq!(exit, crate::sol::vm::VM_ERROR_SENTINEL);
+        let calls = disp.calls();
+        assert_eq!(calls.len(), 1, "second remote_call must not have run");
+        assert_eq!(calls[0].0, "memory");
+        let err = vm.last_error().expect("must have error");
+        assert_eq!(err.kind, 6);
+    }
 }
