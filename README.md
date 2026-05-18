@@ -81,16 +81,16 @@ cargo run -p relix-cli -- ping \
 
 `alpha-bringup-m6-chained.sh` runs `flows/chained_health.sol` against two real controller processes (memory + ai) in sequence. Alice's happy-path flow log has 6 events (`FlowStarted` → `RemoteCallIssued(memory)` → `RemoteCallCompleted` → `RemoteCallIssued(ai)` → `RemoteCallCompleted` → `FlowCompleted`); Bob's denied flow short-circuits at the first call with 4 events.
 
-### M7 — memory node + first chat orchestration (working today)
+### M7 — memory node + conversational orchestration (working today)
 
 ```sh
 ./scripts/alpha-bringup-m7-memory.sh    # memory CRUD over the M5 admission pipeline
-./scripts/alpha-bringup-m7-chat.sh      # first end-to-end agent flow: memory + AI stub
+./scripts/alpha-bringup-m7-chat.sh      # first end-to-end agent flow: memory + AI
 ```
 
-The memory demo writes two turns to a real SQLite + FTS5 backend and reads history back. The chat demo orchestrates **two real controller processes** (memory + AI) from a 5-call SOL flow: fetch recent history → call AI → persist user turn → persist assistant turn. Alice's flow log has 10 events in exact order; bob (guest) is denied at the first call.
+The memory demo writes two turns to a real SQLite + FTS5 backend and reads history back. The chat demo orchestrates **two real controller processes** (memory + AI) from a 4-call SOL flow in a conversational state machine: persist user turn → read recent history → AI call → persist assistant turn. Alice's flow log has 10 events in exact order; bob (`guest`) is denied at the first call. A fifth verification call confirms both turns landed in the SQLite store.
 
-The AI node runs a deterministic stub responder for M7 (`[ai] mode = "stub"`). M8 swaps in Anthropic behind the same `ai.chat` capability without changing the SOL flow.
+The AI node selects its provider via `[ai] provider = "mock"` (default; deterministic; no secrets) or `"anthropic"` (real Claude via `reqwest`; API key from `$ANTHROPIC_API_KEY` or the gitignored `api_key_path` file). The SOL flow is identical for both — adding a new provider is an `impl ChatProvider` + a `build_provider` arm, not an architectural change.
 
 Full bringup (tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 

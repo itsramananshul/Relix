@@ -97,7 +97,11 @@ org_root_key_path = "$ORG_PUB"
 file = "$POLICY"
 
 [ai]
-mode = "stub"
+# Use the deterministic mock provider for the default demo.
+# To run against real Anthropic, set provider = "anthropic" here and
+# either export ANTHROPIC_API_KEY in the shell or set
+# [ai.anthropic] api_key_path = "dev-keys/anthropic.key".
+provider = "mock"
 
 [peers]
 EOF
@@ -230,6 +234,28 @@ cargo run -q -p relix-flow-inspect -- --audit dev-data/m7chat-memory/audit.log
 echo
 echo "=== ai responder audit ==="
 cargo run -q -p relix-flow-inspect -- --audit dev-data/m7chat-ai/audit.log
+
+# Memory-persistence verification: ask the memory peer directly for the
+# session's recent history. After two successful alice runs we expect at
+# least four turns (user+assistant × 2). Uses a tiny throwaway flow so the
+# verification itself goes through the same admission pipeline + audit, not
+# a back-door query.
+echo
+echo "=== memory persistence verification (recent_for_session via SOL) ==="
+VERIFY_FLOW=$DATA_BASE/verify_recent.sol
+cat > "$VERIFY_FLOW" <<'EOF'
+function start() -> str {
+    let h: str = remote_call("memory", "memory.recent_for_session", "chat-session");
+    print(h);
+    return h;
+}
+EOF
+RELIX_DATA_DIR=dev-data \
+    cargo run -q -p relix-cli -- flow-run \
+        --flow "$VERIFY_FLOW" \
+        --identity "$ALICE" \
+        --client-key "$ORG_KEY" \
+        --peers "$PEERS"
 
 echo
 echo "M7 chat orchestration OK."

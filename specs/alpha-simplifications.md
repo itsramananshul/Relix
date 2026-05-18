@@ -198,17 +198,9 @@ If a behavior in the running code does not match a spec, either:
 
 **Resolution gate:** Gate 2 (with manifest gossip).
 
-## SIMP-013 — Single AI provider (Anthropic), single model
+## SIMP-013 — Single AI provider (Anthropic), single model (RESOLVED)
 
-**Spec target:** Provider-agnostic `ai.chat` capability.
-
-**Alpha behavior:** AI node hardcodes Anthropic API endpoint and one model. Capability surface (`ai.chat`) is provider-agnostic; the implementation isn't.
-
-**Why:** Multi-provider abstraction has no demo value when only one provider is wired.
-
-**Consequence:** Adding OpenAI or Ollama post-alpha is a per-provider implementation, not an architectural change.
-
-**Resolution gate:** Post-alpha (Phase 3 territory).
+**Status:** Resolved by the M7 `ChatProvider` abstraction. The `ai.chat` capability is now provider-agnostic at the trait level (`crates/relix-runtime/src/nodes/ai/provider.rs`); two implementations ship: `MockProvider` (deterministic default) and `AnthropicProvider` (`claude` via reqwest). Adding OpenAI / Ollama is a new `impl ChatProvider` + a `build_provider` arm, not an architectural change. Single-model assumption (`claude-3-5-sonnet-latest` default) is documented as a per-provider knob in `[ai.anthropic] model`.
 
 ---
 

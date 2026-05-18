@@ -309,11 +309,27 @@ name      = "ai-node"
 node_type = "ai"
 
 [ai]
-mode = "stub"          # M7
-# mode = "anthropic"   # M8 (returns RESPONDER_INTERNAL "not yet implemented" today)
+provider = "mock"          # default; deterministic; no secrets
+# provider = "anthropic"   # real model
+[ai.anthropic]
+api_key_path = "dev-keys/anthropic.key"
+model        = "claude-3-5-sonnet-latest"
+max_tokens   = 1024
+timeout_secs = 60
 ```
 
-The AI node's `register_node_type_handlers` registers `ai.chat`. Arg format: `session_id|user_message`. Returns: the model's reply text.
+The AI node's `register_node_type_handlers` builds the configured provider (a `ChatProvider` trait object — see `crates/relix-runtime/src/nodes/ai/provider.rs`) and registers `ai.chat`. Arg format: `session_id|prompt|history` (history may be empty). Returns: the model's reply text.
+
+**API key handling (`anthropic` provider).** The key is loaded from `$ANTHROPIC_API_KEY` first; if unset, from the `api_key_path` file. Both options exist so CI can use env vars and local dev can use a gitignored file. The file path is never committed; `dev-keys/*.key` is excluded by `.gitignore`. Switching back to `mock` requires no secret at all.
+
+**Flow contract.** The `chat.sol` flow performs four sequential `remote_call`s, in this order:
+
+1. `memory.write_turn` — persist user turn FIRST (crash-safe: a mid-flow failure does not lose user input).
+2. `memory.recent_for_session` — readback now includes the just-written user turn.
+3. `ai.chat` — pass `session_id|prompt|history` to the AI peer.
+4. `memory.write_turn` — persist assistant reply.
+
+The script appends a fifth verification call (a tiny ad-hoc SOL flow) that re-reads `memory.recent_for_session` so operators can confirm both turns landed.
 
 ## Smoke Test (Acceptance, full alpha — M7+ work)
 

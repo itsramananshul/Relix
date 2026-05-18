@@ -241,9 +241,13 @@ fn register_node_type_handlers(
                 .map_err(|e: toml::de::Error| format!("[ai] parse: {e}"))?,
             None => crate::nodes::ai::AiConfig::default(),
         };
-        let mode = ai_cfg.mode.clone();
-        crate::nodes::ai::register(bridge, ai_cfg);
-        tracing::info!(mode = %mode, "ai node: registered ai.chat");
+        let provider = crate::nodes::ai::build_provider(&ai_cfg)?;
+        let provider_name = provider.provider_name();
+        crate::nodes::ai::register(bridge, provider.clone());
+        tracing::info!(
+            provider = %provider_name,
+            "ai node: registered ai.chat"
+        );
     }
     // tool / web_bridge / demo node types are no-ops today; their handlers
     // ship in later milestones. node.health is always available via builtins.

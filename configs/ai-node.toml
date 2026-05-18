@@ -1,4 +1,9 @@
-# AI node — registers ai.chat (Anthropic provider). API key local to this node only.
+# AI node — registers `ai.chat`.
+#
+# Two providers ship today: `mock` (deterministic; default; no secrets) and
+# `anthropic` (real model). Provider selection is here in config; the SOL
+# chat flow does NOT change between providers — it always calls
+# `ai.chat(session_id|prompt|history)` and gets back UTF-8 text.
 
 [controller]
 name = "ai-node"
@@ -15,16 +20,19 @@ org_root_key_path = "dev-keys/org-root.pub"
 file = "configs/policies/ai.toml"
 
 [ai]
-# THE ONLY PLACE THE ANTHROPIC API KEY APPEARS.
-#
-# Format: a file containing the raw API key string (no newline).
-# Permissions: 0600. Path is gitignored via .gitignore patterns.
+# `mock` (default) or `anthropic`.
+provider = "mock"
+
+# Provider-specific settings. Only consulted when `provider = "anthropic"`.
+[ai.anthropic]
+# The API key is loaded from $ANTHROPIC_API_KEY first; if unset, this
+# file path is read. The path file must contain the raw key (whitespace
+# stripped on read) and MUST be excluded from version control.
 api_key_path = "dev-keys/anthropic.key"
 
-# Model identifier passed to Anthropic. Alpha hardcodes one model.
-model = "claude-sonnet-4-6"
-
-# Request timeout in seconds.
+# Model + request budget.
+model        = "claude-3-5-sonnet-latest"
+max_tokens   = 1024
 timeout_secs = 60
 
 [peers]
