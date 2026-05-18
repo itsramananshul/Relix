@@ -1,13 +1,16 @@
-//! `relix-cli ping <addr> --identity-bundle <path> --client-key <path>`
+//! `relix-cli ping --peer <addr> --identity <path> --method <m> --client-key <path>`
 //!
 //! Spins up an ephemeral libp2p peer, dials the given multiaddr, and invokes
-//! `node.health` on the remote node using the supplied identity bundle.
+//! the named capability on the remote node using the supplied identity bundle.
+//! When `--method` is `node.health` (the default), the structured response is
+//! decoded and pretty-printed.
 
 use std::path::Path;
 use std::time::Duration;
 
 use relix_core::bundle::Bundle;
 use relix_core::codec;
+use relix_runtime::controller_runtime::NodeHealth;
 use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use relix_runtime::transport::rpc::{self, Event, Multiaddr};
@@ -15,6 +18,7 @@ use relix_runtime::transport::rpc::{self, Event, Multiaddr};
 pub async fn run(
     peer_addr: &str,
     identity_bundle_path: &Path,
+    method: &str,
     client_key_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bundle_bytes = std::fs::read(identity_bundle_path)?;
@@ -55,7 +59,7 @@ pub async fn run(
     .ok_or("timeout waiting for peer connection")?;
 
     // Build envelope; deadline 10s.
-    let envelope = build_request("node.health", b"ping".to_vec(), bundle, 10);
+    let envelope = build_request(method, b"".to_vec(), bundle, 10);
 
     // Issue RPC.
     let resp_bytes = client
@@ -65,19 +69,35 @@ pub async fn run(
     let resp = decode_response(&resp_bytes)?;
     match resp.res {
         ResponseResult::Ok(body) => {
-            println!(
-                "OK from {}: {}",
-                resp.responder,
-                String::from_utf8_lossy(body.as_ref())
-            );
-            println!("aid: {}", hex::encode(resp.aid.as_ref()));
+            println!("OK from {}", resp.responder);
+            println!("aid (request_id):  {}", hex::encode(resp.aid.as_ref()));
+            if method == "node.health" {
+                match codec::decode::<NodeHealth>(body.as_ref()) {
+                    Ok(h) => {
+                        println!("node.name:         {}", h.name);
+                        println!("node.type:         {}", h.node_type);
+                        println!("node.status:       {}", h.status);
+                        println!("node.runtime:      {}", h.runtime_version);
+                    }
+                    Err(e) => {
+                        println!("(payload decode failed: {e}; raw {} bytes)", body.len());
+                    }
+                }
+            } else {
+                println!(
+                    "body ({} bytes): {}",
+                    body.len(),
+                    hex::encode(body.as_ref())
+                );
+            }
         }
         ResponseResult::Err(e) => {
-            println!("ERR kind={} cause={}", e.kind, e.cause);
+            eprintln!("ERR kind={} cause={}", e.kind, e.cause);
+            eprintln!("aid (request_id):  {}", hex::encode(resp.aid.as_ref()));
             std::process::exit(2);
         }
         ResponseResult::StreamHandle(_) => {
-            println!("unexpected stream-handle response from node.health");
+            eprintln!("unexpected stream-handle response from method '{method}'");
             std::process::exit(2);
         }
     }

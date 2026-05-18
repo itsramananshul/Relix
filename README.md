@@ -42,9 +42,35 @@ These are deferred per the alpha plan, not negotiated away.
 | `ops/runbooks/` | Operator procedures. |
 | `docs/` | Architecture, code-reuse map, security-critical deps, alpha plan. |
 
-## Quickstart
+## Quickstart (M5 — what works today)
 
-See `ops/runbooks/alpha-bringup.md`.
+Two real OS processes (controller + CLI) talking over libp2p with signed identity, per-call policy, and audited responses:
+
+```sh
+# One command runs the whole demo (POSIX / git-bash).
+./scripts/alpha-bringup-m5.sh
+# Or on Windows PowerShell:
+./scripts/alpha-bringup-m5.ps1
+```
+
+The script:
+1. Mints an org root, plus an `alice` AIC (`chat-users`) and a `bob` AIC (`guest`).
+2. Starts a controller on `tcp/19501` with `node.health` policy that admits `chat-users`.
+3. Pings as alice → expects `OK` + structured `node.health` payload.
+4. Pings as bob → expects `policy_denied`.
+5. Prints the responder's audit log (both records joinable by `request_id`).
+
+Manual command shape:
+
+```sh
+cargo run -p relix-cli -- ping \
+    --peer /ip4/127.0.0.1/tcp/9001 \
+    --identity dev-keys/alice.aic \
+    --method node.health \
+    --client-key dev-keys/org-root.key
+```
+
+Full bringup (memory / AI / tool / web nodes — M7+ work, not in M5): see `ops/runbooks/alpha-bringup.md`.
 
 ## Reporting Security Issues
 

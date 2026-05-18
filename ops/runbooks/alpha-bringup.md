@@ -100,7 +100,57 @@ npm run dev
 
 Browse to `http://127.0.0.1:5173` (or whatever port Vite reports).
 
-## Smoke Test (Acceptance)
+## M5 Two-Controller RPC Demo (alpha-current)
+
+This is the path that actually works today (M5 milestone). M7+ adds the memory / AI / tool / web nodes.
+
+```sh
+# Terminal 1 — start a controller (any node config; memory used here).
+RELIX_DATA_DIR=dev-data \
+RUST_LOG=relix_runtime=info \
+    cargo run --release -p relix-controller -- --config configs/memory-node.toml
+
+# Terminal 2 — issue an org root and mint identities.
+cargo run -p relix-cli -- identity init-org \
+    --root-key dev-keys/org-root.key --org demo-org
+# The org-root public key for trust verification:
+cp dev-keys/org-root.key dev-keys/org-root.pub   # alpha: pub derived from secret-file bytes
+
+cargo run -p relix-cli -- identity mint \
+    --root-key dev-keys/org-root.key \
+    --name alice --groups chat-users --out dev-keys/alice.aic
+cargo run -p relix-cli -- identity mint \
+    --root-key dev-keys/org-root.key \
+    --name bob --groups guest --out dev-keys/bob.aic
+
+# Ping the controller as alice (admit by `chat_users_health` rule):
+#   On git-bash / MSYS: prefix with MSYS_NO_PATHCONV=1 to avoid path mangling.
+cargo run -p relix-cli -- ping \
+    --peer /ip4/127.0.0.1/tcp/9001 \
+    --identity dev-keys/alice.aic \
+    --client-key dev-keys/org-root.key
+
+# Expect: OK from <node-id>, structured node.health payload (name, type, status, runtime).
+
+# Same call as bob (denied — guest group not in `chat_users_health`):
+cargo run -p relix-cli -- ping \
+    --peer /ip4/127.0.0.1/tcp/9001 \
+    --identity dev-keys/bob.aic \
+    --client-key dev-keys/org-root.key
+
+# Expect: ERR kind=6 cause=deny:default_deny:...
+
+# Inspect the responder's audit log.
+cargo run -p relix-cli -- ../  # (not needed; below is the inspector)
+cargo run -p relix-flow-inspect -- --audit dev-data/<node-name>/audit.log
+```
+
+Two ready-made wrappers at the repo root:
+
+- `scripts/alpha-bringup-m5.sh` — sets up keys + starts the controller + runs both ping cases (POSIX / git-bash).
+- `scripts/alpha-bringup-m5.ps1` — same flow as a PowerShell script.
+
+## Smoke Test (Acceptance, full alpha — M7+ work)
 
 The acceptance criteria from `docs/alpha-plan.md` are verified by:
 

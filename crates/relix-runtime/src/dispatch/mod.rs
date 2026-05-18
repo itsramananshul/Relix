@@ -518,6 +518,202 @@ mod tests {
         }
     }
 
+    /// Build a (caller-key, signed-bundle) pair for tests.
+    fn mk_identity(org_root: &SigningKey, name: &str, groups: &[&str]) -> Bundle {
+        let caller_key = SigningKey::generate(&mut OsRng);
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&caller_key.verifying_key().to_bytes()),
+            name: name.into(),
+            org_id: NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: groups.iter().map(|s| s.to_string()).collect(),
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        issue_identity(id, org_root, 3600).unwrap()
+    }
+
+    /// Build a permissive bridge that always allows `node.health`.
+    fn fresh_bridge(audit_dir: &TempDir) -> (DispatchBridge, SigningKey) {
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let policy = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "anyone_health"
+            method = "node.health"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let bridge = DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &audit_dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        (bridge, org_root)
+    }
+
+    #[tokio::test]
+    async fn response_rid_echoes_request_rid() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        // Pluck rid out of the envelope we just built.
+        let parsed: RequestEnvelope = codec::decode(&envelope).unwrap();
+        let sent_rid = parsed.rid;
+
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert_eq!(sent_rid, resp.rid, "response rid must echo request rid");
+    }
+
+    #[tokio::test]
+    async fn audit_record_written_on_success() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+
+        let _ = bridge.handle_inbound(envelope).await;
+        let recs = relix_core::audit::read_audit_records(dir.path().join("audit.log")).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].status, "ok");
+        assert_eq!(recs[0].method, "node.health");
+        assert!(recs[0].policy_decision.starts_with("allow:"));
+    }
+
+    #[tokio::test]
+    async fn audit_record_written_on_denial() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+
+        let bundle = mk_identity(&org_root, "bob", &["guest"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+
+        let _ = bridge.handle_inbound(envelope).await;
+        let recs = relix_core::audit::read_audit_records(dir.path().join("audit.log")).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].status, "denied");
+        assert_eq!(recs[0].method, "node.health");
+        assert!(recs[0].policy_decision.starts_with("deny:"));
+        assert_eq!(recs[0].error_kind, Some(error_kinds::POLICY_DENIED));
+    }
+
+    #[tokio::test]
+    async fn handler_not_called_when_policy_denies() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+
+        // Handler increments a counter every time it's invoked. If admission
+        // is correct, the counter MUST stay at zero for a denied identity.
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_for_handler = counter.clone();
+        bridge.register(
+            "node.health",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let c = counter_for_handler.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    HandlerOutcome::Ok(b"ran".to_vec())
+                }
+            })),
+        );
+
+        let bundle = mk_identity(&org_root, "bob", &["guest"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::POLICY_DENIED),
+            other => panic!("expected denial, got {:?}", other),
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "handler must not have been called when policy denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_not_called_when_identity_invalid() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let real_root = SigningKey::generate(&mut OsRng);
+        let attacker_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let mut bridge = DispatchBridge::new(
+            PolicyEngine::permissive(),
+            real_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_for_handler = counter.clone();
+        bridge.register(
+            "node.health",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let c = counter_for_handler.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    HandlerOutcome::Ok(b"ran".to_vec())
+                }
+            })),
+        );
+
+        // Identity bundle signed by attacker_root — bridge trusts real_root.
+        let bundle = mk_identity(&attacker_root, "intruder", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::IDENTITY_INVALID),
+            other => panic!("expected identity_invalid, got {:?}", other),
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "handler must not have been called when identity invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_identity_bundle_rejected() {
+        use serde_bytes::ByteBuf;
+        let dir = TempDir::new().unwrap();
+        let (bridge, org_root) = fresh_bridge(&dir);
+
+        // Issue a valid bundle, then flip a payload byte.
+        let mut bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let mut payload = bundle.payload.to_vec();
+        let mid = payload.len() / 2;
+        payload[mid] ^= 0xFF;
+        bundle.payload = ByteBuf::from(payload);
+
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::IDENTITY_INVALID),
+            other => panic!("expected identity_invalid, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn admission_wrong_trust_root() {
         let dir = TempDir::new().unwrap();

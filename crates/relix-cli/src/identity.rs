@@ -106,13 +106,33 @@ fn init_org(root_key_path: &Path, org_label: &str) -> Result<(), Box<dyn std::er
         fs::create_dir_all(parent)?;
     }
     write_secret_key(root_key_path, &key)?;
+
+    // Also write the companion .pub file (32-byte Ed25519 public key) next to
+    // the secret. Trust-root config (`[trust] org_root_key_path = ...`) MUST
+    // point at the .pub file, never the .key file.
+    let pub_path = pub_sibling(root_key_path);
+    fs::write(&pub_path, key.verifying_key().to_bytes())?;
+
     let org_id = NodeId::from_pubkey(&key.verifying_key().to_bytes());
     println!("# Relix org bootstrap");
     println!("org-label: {}", org_label);
     println!("org-id:    {}", org_id);
     println!("key-path:  {}", root_key_path.display());
-    println!("# Keep the key file private. It is gitignored.");
+    println!("pub-path:  {}", pub_path.display());
+    println!("# Keep the .key file private. It is gitignored. Trust files reference the .pub.");
     Ok(())
+}
+
+/// Derive the conventional sibling pubkey path from a secret-key path.
+/// `foo.key` → `foo.pub`; anything else → `<path>.pub`.
+fn pub_sibling(key_path: &Path) -> std::path::PathBuf {
+    if key_path.extension().and_then(|s| s.to_str()) == Some("key") {
+        key_path.with_extension("pub")
+    } else {
+        let mut p = key_path.as_os_str().to_owned();
+        p.push(".pub");
+        std::path::PathBuf::from(p)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

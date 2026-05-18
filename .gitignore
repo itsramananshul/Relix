@@ -37,3 +37,9 @@ coverage/
 
 # Claude harness scratch
 .claude/
+
+# Demo state — created by scripts/alpha-bringup-m5.sh, never committed.
+dev-data/
+dev-keys/*.key
+dev-keys/*.pub
+dev-keys/*.aic

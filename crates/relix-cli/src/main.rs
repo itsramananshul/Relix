@@ -20,15 +20,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: identity::Cmd,
     },
-    /// Call a peer's `node.health` capability and print the result.
+    /// Call a peer's capability and print the response.
+    ///
+    /// Default method is `node.health`. For the alpha, `--peer` is a libp2p
+    /// multiaddr (e.g. `/ip4/127.0.0.1/tcp/9001`). Alias-based dialing lands
+    /// when capability gossip arrives at M6+.
     Ping {
-        /// Target peer's libp2p multiaddr (e.g. `/ip4/127.0.0.1/tcp/9001`).
-        peer_addr: String,
-        /// Path to caller's identity bundle (raw CBOR).
+        /// Target peer's libp2p multiaddr.
         #[arg(long)]
-        identity_bundle: PathBuf,
-        /// Path to a 32-byte signing key used as the local libp2p PeerId
-        /// (does NOT need to match the identity subject — alpha SIMP).
+        peer: String,
+        /// Path to caller's identity bundle (raw CBOR from `relix-cli identity mint`).
+        #[arg(long)]
+        identity: PathBuf,
+        /// Method to call. Default `node.health`.
+        #[arg(long, default_value = "node.health")]
+        method: String,
+        /// Path to a 32-byte signing key used as the local libp2p PeerId.
+        /// (Does NOT need to match the identity subject — alpha SIMP.)
         #[arg(long)]
         client_key: PathBuf,
     },
@@ -47,9 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.cmd {
         Cmd::Identity { cmd } => identity::run(cmd),
         Cmd::Ping {
-            peer_addr,
-            identity_bundle,
+            peer,
+            identity,
+            method,
             client_key,
-        } => ping::run(&peer_addr, &identity_bundle, &client_key).await,
+        } => ping::run(&peer, &identity, &method, &client_key).await,
     }
 }

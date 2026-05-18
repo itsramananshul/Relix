@@ -64,6 +64,53 @@ The designated security reviewer (rotating responsibility within the team) must 
 
 Commits land locally during alpha development. `git push` happens only on explicit instruction.
 
+## Documentation Is Part of the Change
+
+Relix docs must stay real and current. **Every meaningful change updates the relevant docs in the same commit, or in an immediately adjacent commit.** Docs are not marketing text; they are operational truth.
+
+Required doc discipline:
+
+- Architecture changes → update `docs/architecture-overview.md` (and `docs/code-reuse-map.md` if reuse boundaries shift).
+- Alpha-scope changes → update `docs/alpha-plan.md`.
+- Implementation deviates from a frozen spec → add or amend an entry in `specs/alpha-simplifications.md` with a gate for resolution.
+- Commands change (CLI subcommand, flag, binary name) → update `README.md` and `ops/runbooks/alpha-bringup.md`.
+- Audit / inspection behavior changes → update `ops/runbooks/audit-query.md`.
+- Code reused from OpenPrem / OpenClaw / Hermes / Open WebUI changes (added, removed, retargeted) → update `docs/code-reuse-map.md`.
+- Security behavior changes (key handling, trust model, signing) → update `SECURITY.md` and/or `specs/threat-model.md`.
+- Dependencies change (add / remove / version bump security-critical) → update `docs/security-critical-deps.md`.
+
+Pre-push checklist (every commit, every push):
+
+1. Did this change affect architecture, behavior, commands, security, setup, or scope?
+2. If yes, were docs updated?
+3. If no, the push report explains why no doc update was needed.
+
+CI does not enforce this rule directly (yet); reviewers and the on-disk pre-push report do.
+
+## Repo Hygiene
+
+The repo holds the project's intentional artifacts. **Reference material, scratch notes, vendor copies, and temporary working files do NOT belong on `main`.**
+
+Allowed:
+
+- Actual Relix source code, configs actively used by the runtime, production-relevant docs, specs, runbooks, tests, CI, assets actually used by the app, migrations/schemas actually used, flow files actually used, scripts actually used.
+
+Not allowed:
+
+- Copied OpenPrem / OpenClaw / Hermes / Open WebUI source unless actively wired into Relix.
+- Random reference repos, transcript dumps, AI brainstorming text files, scratch notes, downloaded documentation, screenshots not used by the app.
+- Local logs / databases, build artifacts, temporary generated test files, experimental dead-end code, staging folders.
+
+If reference material is useful: document it in `docs/code-reuse-map.md`, name the upstream path/repo, and import only the necessary code.
+
+Pre-push hygiene check (every push):
+
+1. `git status` — review staged additions.
+2. Identify accidental files (logs, keys, vendor copies, scratch dirs).
+3. Remove them and update `.gitignore` if a pattern recurs.
+
+A new engineer should be able to clone `main` and understand the project quickly. Junk on `main` actively erodes that property.
+
 ## What This Project Refuses
 
 - AI co-author tags in commits.
