@@ -1,0 +1,128 @@
+# SOL Runtime — Integration Analysis (M6)
+
+This document maps the ported OpenPrem SOL runtime, explains how `remote_call` integrates without rewriting the VM, and records the alpha simplifications M6 introduces.
+
+## 1. Where the runtime lives
+
+The full OpenPrem SOL toolchain — lexer, parser, semantic analyzer, bytecode codegen, and stack-based VM — was ported verbatim from `Apps/INFRA/open-prem-main/src/sol/` into `crates/relix-runtime/src/sol/`. Only the standalone `main.rs` (a CLI entry point for OpenPrem's `sol` binary) was dropped; `cli.rs` (a small argument parser used by it) is unused-but-kept until M11 cleanup. All other files are unchanged at port time so the diff against upstream is reviewable.
+
+```
+crates/relix-runtime/src/sol/
+  mod.rs           # pub mod bytecode; pub mod analyzer; ...
+  lexer.rs         (383 LOC)   Token / source → Token stream
+  parser.rs        (707 LOC)   Tokens → Program AST
+  analyzer.rs      (457 LOC)   Symbol table + type checking
+  bytecode.rs      (641 LOC)   AST → Vec<Inst>; Inst enum
+  vm.rs            (318 LOC)   Stack-based VM; pub fn step() / run()
+  init.rs          (25  LOC)   Pipeline: sources → Vec<VM>
+  util.rs          (57  LOC)
+  cli.rs           (56  LOC, unused; kept for upstream parity)
+```
+
+## 2. VM model
+
+Pure stack machine. Per-VM state:
+
+| Field          | Type                  | Purpose                                |
+|----------------|-----------------------|----------------------------------------|
+| `stack`        | `Vec<u64>`            | Operand stack — every value is a `u64`. |
+| `heap`         | `Vec<HeapObject>`     | String / Struct / Array store; values on the operand stack referencing the heap are `u64` indices. |
+| `call_stack`   | `Vec<Frame>`          | SOL-function call frames.              |
+| `inst_ptr`     | `usize`               | Instruction pointer into the program.  |
+| `fp`           | `usize`               | Frame pointer (operand-stack base for the current call). |
+| `program`      | `Vec<Inst>`           | Compiled bytecode.                     |
+| `done`         | `bool`                | Halt flag (program reached its end).   |
+
+`HeapObject::String(String)` carries Rust UTF-8 strings.
+
+The exec loop is `pub fn step(&mut self) -> Option<u64>`. It returns `None` while still running, `Some(value)` when the program terminates. `run()` is the obvious driver. No async; no yield.
+
+## 3. Instruction set (relevant subset)
+
+```
+PushConst(Ast)              # immediate value (int / float / char / bool / string-ref)
+LoadLocal(isize)            # push local at fp+offset
+StoreLocal(isize)           # pop into local at fp+offset
+Pop / Dup
+Int* / Float* / Char*       # arithmetic + comparisons
+LogOr / LogAnd / LogNot
+BitXor / BitAnd / BitOr / ...
+NewStruct(n) / GetField(i) / SetField(i)
+NewArray / ArrayLen / GetElem / SetElem
+ConcatStr / EqStr
+Jump(t) / JumpFalse(t)
+Call(target, argc)          # SOL-function call
+Ret / RetVal
+PrintInt / PrintFloat / PrintChar / PrintString
+```
+
+`Inst::PushConst(Ast::ExprString(s))` pushes a string by allocating a `HeapObject::String(s)` and pushing its heap index.
+
+## 4. Stack conventions for builtins
+
+The existing `Call(target, argc)` opcode expects the caller to push `argc` args left-to-right, then jump. We follow the same convention for `RemoteCall`: caller pushes three string heap-refs (`peer`, `method`, `arg`) in order, then a single `RemoteCall` opcode pops them, performs the call, and pushes the result (a heap-ref to a new `HeapObject::String`).
+
+## 5. How `remote_call` integrates cleanly
+
+The cleanest integration without rewriting any of the OpenPrem layers:
+
+| Layer    | Change                                                                                              |
+|----------|-----------------------------------------------------------------------------------------------------|
+| **lexer**    | None. `remote_call` is a regular identifier.                                                  |
+| **parser**   | None. `remote_call("x", "y", "z")` is already a valid `Ast::ExprCall { name, args }`.          |
+| **analyzer** | One small hook: treat `remote_call` as a known built-in returning `string`, taking three strings, so we don't error with "undefined function." |
+| **bytecode (codegen)** | When emitting a call whose callee name is `remote_call`, emit code for the three args + a single new `Inst::RemoteCall` opcode (replacing the usual `Inst::Call`). |
+| **vm**   | One new arm in `step()` for `Inst::RemoteCall`: pop three heap-string refs, dispatch via a registered `Arc<dyn RemoteCallDispatcher>` held on the VM, push the response string. |
+
+The string-table aspect of M6/Step 2 ("peer name from string table, method name from string table") is satisfied implicitly: the args live as `HeapObject::String` in the VM heap, so the dispatcher reads them out of the heap when handling the opcode. No separate string table is introduced — the heap is already the only string store the VM has.
+
+## 6. Host-call architecture
+
+A new trait lives in `crates/relix-runtime/src/sol/dispatcher.rs`:
+
+```rust
+pub trait RemoteCallDispatcher: Send + Sync {
+    /// Synchronous from the VM's perspective. Returns response bytes or a
+    /// typed error. Implementations may block on async I/O internally.
+    fn remote_call(
+        &self,
+        peer_alias: &str,
+        method: &str,
+        arg: &[u8],
+    ) -> Result<Vec<u8>, RemoteCallError>;
+}
+```
+
+The VM holds `Option<Arc<dyn RemoteCallDispatcher>>` (None = no remote calls permitted; a flow that hits `RemoteCall` without a dispatcher errors out cleanly). The default `Vm::new()` / `Vm::from(&bytecode)` constructors leave it `None`; a new `Vm::with_dispatcher(...)` builder attaches it.
+
+The production implementation lives outside the SOL module, in `relix-runtime::controller_runtime`, and wraps the `transport::rpc::Client` plus the caller's identity bundle. The implementation is responsible for:
+
+1. Looking up the peer alias against a `peers: BTreeMap<String, PeerAddr>` (configured via `[peers]` in TOML).
+2. Building a `RequestEnvelope` (RELIX-1 §1.4) carrying the caller's `IdentityBundle`, `method`, `args`, deadline.
+3. Sending via `Client::call(peer_id, envelope_bytes)` after establishing the connection.
+4. Decoding the `ResponseEnvelope` and returning the `Ok(body)` payload or a `RemoteCallError` derived from the error envelope.
+5. Emitting `RemoteCallIssued` / `RemoteCallCompleted` / `RemoteCallFailed` events to the per-flow event log (M6/Step 5).
+
+Because the VM is sync and the dispatcher's underlying RPC client is async, the impl uses `tokio::task::block_in_place(|| Handle::current().block_on(future))` so the VM thread blocks safely on the multi-threaded runtime without poisoning other tasks. This is the alpha simplification recorded as **SIMP-001** in `specs/alpha-simplifications.md` (sync `remote_call`); the durable yield model from RELIX-7 lands at Gate 2.
+
+## 7. Deterministic-execution concerns
+
+The VM's bytecode execution is deterministic in the operand-stack sense (no wall clock, no RNG inside SOL programs). `RemoteCall` introduces a single source of non-determinism: the remote node's response. For replay-equivalence (RELIX-7 §7.15 target — SIMP-008), the dispatcher's `RemoteCallCompleted` event records the *result bytes*, and a future replay-mode dispatcher would return logged bytes instead of re-issuing the RPC. The alpha does not implement replay mode (SIMP-008); event logs are structural (RELIX-3 invariants) but the VM is not yet replay-driven. The schema permits the upgrade without breaking older flow logs.
+
+`Time.now`, `Random.bytes`, and other deterministic-replay primitives are out of M6 scope.
+
+## 8. Alpha simplifications introduced by M6
+
+- **SIMP-014 — Sync block_on inside the dispatcher.** The dispatcher impl wraps async libp2p calls with `tokio::task::block_in_place(|| Handle::current().block_on(...))`. Requires a multi-threaded tokio runtime (which the controller binary uses by default). Pure sync VM execution; no yield model yet. Resolution gate: Gate 2 (alongside SIMP-001).
+- **SIMP-015 — Client-side flow execution.** For the alpha, SOL flows are compiled and executed by the *caller's* controller (or by `relix-cli flow-run`), not by a remote `node.run_flow` capability. This is honest peer-to-peer: the caller's controller orchestrates by initiating real outbound RPCs to other peers. Future revisions may add a `node.run_flow` capability that lets one node ask another to run a SOL flow on its behalf; the wire path is the same. Resolution gate: post-alpha.
+- **SIMP-016 — `remote_call` args and returns are strings.** The wire-side `args` is `[u8]` in RELIX-1 §1.4; the SOL-side argument is `string` for the alpha (one positional string arg). The dispatcher passes the string's UTF-8 bytes verbatim as `args`. Multi-argument or typed-struct argument support is post-alpha. Resolution gate: Gate 2 (with CDDL stdlib).
+
+## 9. What stays out of scope for M6
+
+- No `try / catch` in SOL — a `RemoteCallError` aborts the flow with `FlowFailed{error}`. SOL programs cannot recover.
+- No `parallel { }` blocks — calls are strictly sequential.
+- No `Time.now` / `Random.bytes` capability surfaces yet.
+- No replay-mode VM execution.
+- No SOL-side typed structs across the wire — strings only.
+
+These remain documented as future work in `specs/alpha-simplifications.md` and `specs/RELIX-7-sol.md`.
