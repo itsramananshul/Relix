@@ -238,6 +238,40 @@ addr = "/ip4/127.0.0.1/tcp/19501"
 addr = "/ip4/127.0.0.1/tcp/19502"
 ```
 
+## M7 memory node — `memory_demo.sol`
+
+The first real Relix node ships in M7: a SQLite + FTS5 memory store registered behind the M5 admission pipeline. Three capabilities:
+
+| Method                       | Arg (UTF-8, `|`-delimited)        | Return                                     |
+|------------------------------|-----------------------------------|--------------------------------------------|
+| `memory.write_turn`          | `session_id|role|body`            | `ok\n`                                     |
+| `memory.recent_for_session`  | `session_id` or `session_id|N`    | One `role: body\n` per turn, oldest first  |
+| `memory.search`              | `query` or `query|N`              | One `session_id\trole\tbody\n` per match   |
+
+`body` may contain `|` since `write_turn` uses `splitn(3)`. SOL strings are taken verbatim per SIMP-016; typed CBOR plumbing lands at Gate 2.
+
+Single-command demo:
+
+```sh
+./scripts/alpha-bringup-m7-memory.sh
+```
+
+The script mints alice + bob, starts a single memory controller (`m7memory-memory` on tcp/19501) with the SQLite database at `dev-data/m7memory/memory.db`, runs `flows/memory_demo.sol` as alice (writes two turns, reads history back, 8-event flow log), then runs the same flow as bob (denied at first `memory.write_turn`, 4-event flow log).
+
+Enable a controller as a memory node by setting in its config:
+
+```toml
+[controller]
+name      = "memory-node"
+node_type = "memory"
+
+[memory]
+db_path = "dev-data/memory/sessions.db"
+max_n   = 100   # max N for recent/search regardless of caller request
+```
+
+The controller's `register_node_type_handlers` automatically registers the three capabilities. Combine with a policy file allowing `memory.write_turn` / `memory.recent_for_session` / `memory.search` to the appropriate caller groups (see `configs/policies/memory.toml`).
+
 ## Smoke Test (Acceptance, full alpha — M7+ work)
 
 The acceptance criteria from `docs/alpha-plan.md` are verified by:

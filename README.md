@@ -81,7 +81,15 @@ cargo run -p relix-cli -- ping \
 
 `alpha-bringup-m6-chained.sh` runs `flows/chained_health.sol` against two real controller processes (memory + ai) in sequence. Alice's happy-path flow log has 6 events (`FlowStarted` → `RemoteCallIssued(memory)` → `RemoteCallCompleted` → `RemoteCallIssued(ai)` → `RemoteCallCompleted` → `FlowCompleted`); Bob's denied flow short-circuits at the first call with 4 events.
 
-Full bringup (memory / AI / tool / web nodes — M7+ work): see `ops/runbooks/alpha-bringup.md`.
+### M7 — memory node (working today)
+
+```sh
+./scripts/alpha-bringup-m7-memory.sh
+```
+
+`flows/memory_demo.sol` writes two turns to a real SQLite + FTS5 backend behind the M5 admission pipeline, then reads history back. Three capabilities (`memory.write_turn`, `memory.recent_for_session`, `memory.search`), all under policy + audit. Alice's flow has 8 events; bob denied at first call with a 4-event log.
+
+Full bringup (AI / tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 
 ## Reporting Security Issues
 

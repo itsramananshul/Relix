@@ -131,6 +131,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch bridge.
     let mut bridge = DispatchBridge::new(policy, trust_root, &audit_path, node_signer.clone())?;
     register_builtins(&mut bridge, &cfg);
+    register_node_type_handlers(&mut bridge, &cfg)?;
 
     let bridge = Arc::new(bridge);
 
@@ -205,6 +206,36 @@ fn register_builtins(bridge: &mut DispatchBridge, cfg: &ControllerConfig) {
         })),
     );
     // node.manifest, ping, etc. land in M6 once registry is wired.
+}
+
+/// Register node-type-specific capabilities based on `[controller] node_type`.
+///
+/// - `memory` → SQLite + FTS5 memory store (M7).
+/// - Other types (`ai`, `tool`, `web_bridge`, `demo`, ...) are no-ops until
+///   their handlers ship in later milestones; the controller still serves
+///   the default `node.health` capability so it can participate in chained
+///   orchestration today.
+fn register_node_type_handlers(
+    bridge: &mut DispatchBridge,
+    cfg: &ControllerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if cfg.controller.node_type == "memory" {
+        let raw = cfg.memory.clone().ok_or_else(|| {
+            "node_type=memory requires a [memory] section with db_path".to_string()
+        })?;
+        let mem_cfg: crate::nodes::memory::MemoryConfig = raw
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("[memory] parse: {e}"))?;
+        let store = std::sync::Arc::new(crate::nodes::memory::MemoryStore::open(&mem_cfg)?);
+        crate::nodes::memory::register(bridge, store);
+        tracing::info!(
+            db = %mem_cfg.db_path.display(),
+            "memory node: registered memory.write_turn / memory.recent_for_session / memory.search"
+        );
+    }
+    // ai / tool / web_bridge / demo node types are no-ops today; their handlers
+    // ship in later milestones. node.health is always available via builtins.
+    Ok(())
 }
 
 /// Hook for node-specific modules to register their capabilities. Called by
