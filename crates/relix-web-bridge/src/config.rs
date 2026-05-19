@@ -67,6 +67,12 @@ pub struct FlowSection {
     /// Path to the SOL chat template file. Two placeholders are substituted
     /// at request time: `{{SESSION}}` and `{{MESSAGE}}`.
     pub template_path: PathBuf,
+    /// Optional second template that adds a `tool.web_fetch` step before the
+    /// AI call (M9). Three placeholders: `{{SESSION}}`, `{{MESSAGE}}`,
+    /// `{{TOOL_URL}}`. When unset, `/chat_with_tool` is 404 and the OpenAI
+    /// shim never auto-routes to it.
+    #[serde(default)]
+    pub tool_template_path: Option<PathBuf>,
 }
 
 /// Bridge-level SSE knobs. See `docs/streaming-and-openai-shim.md`.
@@ -133,6 +139,10 @@ pub struct AppState {
     pub client_key: [u8; 32],
     pub peers: PeersFile,
     pub template: String,
+    /// Pre-validated tool-flow template when `[flow] tool_template_path` is
+    /// set. `None` ⇒ `/chat_with_tool` returns 404 and the OpenAI shim
+    /// never auto-routes to the tool flow.
+    pub tool_template: Option<String>,
 }
 
 impl AppState {
@@ -163,12 +173,31 @@ impl AppState {
             ));
         }
 
+        let tool_template = if let Some(path) = cfg.flow.tool_template_path.as_ref() {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                BridgeError::Config(format!("read tool flow template {}: {e}", path.display()))
+            })?;
+            if !text.contains("{{SESSION}}")
+                || !text.contains("{{MESSAGE}}")
+                || !text.contains("{{TOOL_URL}}")
+            {
+                return Err(BridgeError::Config(
+                    "tool flow template must contain {{SESSION}}, {{MESSAGE}} and {{TOOL_URL}} placeholders"
+                        .to_string(),
+                ));
+            }
+            Some(text)
+        } else {
+            None
+        };
+
         Ok(Self {
             cfg: Arc::new(cfg),
             identity_bundle,
             client_key,
             peers,
             template,
+            tool_template,
         })
     }
 }

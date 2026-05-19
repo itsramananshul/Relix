@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppState;
-use crate::flow::{FlowExecError, execute_chat_flow};
+use crate::flow::{FlowExecError, execute_chat_flow, execute_chat_with_tool_flow};
 use crate::sse::build_chunked_sse;
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +44,47 @@ pub async fn chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     match execute_chat_flow(&state, &req.session_id, &req.message).await {
+        Ok(o) => Ok(Json(ChatResponse {
+            reply: o.reply,
+            flow_id: o.flow_id,
+            trace_id: o.trace_id,
+            flow_log: o.flow_log_path,
+        })),
+        Err(e) => Err(exec_error_to_http(e)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatWithToolRequest {
+    pub session_id: String,
+    pub message: String,
+    /// External http(s) URL the tool node will fetch. The bridge applies its
+    /// own substitution-boundary validator; the SSRF gate lives on the tool
+    /// node (`tool::security::resolve_safe_url`).
+    pub url: String,
+}
+
+/// `POST /chat_with_tool` — tool-augmented chat flow.
+///
+/// Returns 404 when the bridge is not configured with `[flow]
+/// tool_template_path`. Bridge responsibility is template selection ONLY: SOL
+/// owns orchestration (memory.write → memory.read → tool.web_fetch →
+/// ai.chat → memory.write).
+pub async fn chat_with_tool(
+    State(state): State<AppState>,
+    Json(req): Json<ChatWithToolRequest>,
+) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if state.tool_template.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "tool flow not configured (set [flow] tool_template_path)".into(),
+                flow_id: None,
+                flow_log: None,
+            }),
+        ));
+    }
+    match execute_chat_with_tool_flow(&state, &req.session_id, &req.message, &req.url).await {
         Ok(o) => Ok(Json(ChatResponse {
             reply: o.reply,
             flow_id: o.flow_id,

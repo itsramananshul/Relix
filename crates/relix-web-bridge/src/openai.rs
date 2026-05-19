@@ -46,9 +46,9 @@ use serde_json::Value;
 
 use crate::chat::{ErrorResponse, exec_error_to_http};
 use crate::config::AppState;
-use crate::flow::execute_chat_flow;
+use crate::flow::{execute_chat_flow, execute_chat_with_tool_flow};
 use crate::sse::split_utf8_into_chunks;
-use crate::validate::sanitize_openai_message;
+use crate::validate::{detect_url_in_message, sanitize_openai_message};
 
 // ─────────────────────────── Request / response types ──────────────────────
 
@@ -169,9 +169,28 @@ pub async fn chat_completions(
     let translated = translate_request(&req).map_err(invalid_input)?;
     let model_label = resolve_model_label(&state, &req.model);
 
-    let outcome = execute_chat_flow(&state, &translated.session_id, &translated.prompt)
-        .await
-        .map_err(exec_error_to_http)?;
+    // Template selection — bridge does this and ONLY this. The decision is:
+    // if the user message contains an http(s) URL AND the tool-flow template
+    // is configured, use that template. Otherwise fall back to the regular
+    // chat template. The tool node still runs its own admission pipeline
+    // (identity → policy → SSRF check → fetch → audit) regardless of how
+    // it got invoked.
+    let tool_url = if state.tool_template.is_some() {
+        detect_url_in_message(&translated.prompt)
+    } else {
+        None
+    };
+
+    let outcome = match tool_url.as_deref() {
+        Some(url) => {
+            execute_chat_with_tool_flow(&state, &translated.session_id, &translated.prompt, url)
+                .await
+                .map_err(exec_error_to_http)?
+        }
+        None => execute_chat_flow(&state, &translated.session_id, &translated.prompt)
+            .await
+            .map_err(exec_error_to_http)?,
+    };
 
     if req.stream {
         let stream = build_openai_sse(

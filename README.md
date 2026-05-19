@@ -14,7 +14,7 @@ This repository is the broad alpha: every major platform piece is present and ho
 - **SOL** as the routing source of truth. Synchronous `remote_call` opcode in the alpha; durable yield model at Gate 2.
 - **Memory node** (`memory.search` / `memory.write_turn` / `memory.recent_for_session`) backed by SQLite + FTS5, ported from Hermes's session-storage approach.
 - **AI node** (`ai.chat`) wrapping Anthropic; Anthropic key lives only in the AI node's local config.
-- **Tool node** (`tool.web_fetch`) with URL allowlist and tool-users group requirement.
+- **Tool node** (`tool.web_fetch`) — distributed external-action peer that fetches a single URL with an SSRF guard (scheme + literal-IP + DNS-resolved-address + redirect cap + body cap, all fail-closed). HTTPS by default; `http` opt-in. See [`docs/tool-node-security.md`](docs/tool-node-security.md).
 - **Web bridge** exposing local SSE to **Relix Web** (an Open WebUI fork in `relix-web/`) — the web peer never holds AI provider keys.
 - A canonical agent flow (`flows/chat.sol`) and a tool-aware variant (`flows/chat_with_tool.sol`).
 
@@ -120,6 +120,41 @@ Two new endpoint shapes ship on the same bridge so any OpenAI-compatible client 
 - `POST /v1/chat/completions` (+ `GET /v1/models`) — OpenAI Chat Completions shape, supporting both non-streaming JSON and `stream:true` SSE. A stable `session_id` is derived from the first system + user message so the same conversation lands in the same Relix-memory bucket as it grows.
 
 Streaming is **bridge-level chunking** of an already-materialised reply (SIMP-019), not true provider-native token streaming. That arrives with the durable yield model at Gate 2. Full integration story + Open WebUI setup steps: [`docs/streaming-and-openai-shim.md`](docs/streaming-and-openai-shim.md).
+
+### M9 — tool node + first external action (working today)
+
+```powershell
+# Windows: brings up memory + ai + tool + bridge, parks until Ctrl-C.
+.\scripts\relix-mesh-up.ps1
+```
+
+The tool node registers `tool.web_fetch` (HTTPS GET, UTF-8 bodies, body-cap
++ deadline + redirect-cap). It runs the same admission pipeline as every
+other peer — identity → policy → handler → audit — and adds an
+**SSRF guard** that rejects loopback, RFC 1918, link-local (incl. cloud
+metadata endpoints), ULA, multicast, broadcast, documentation / benchmark
+ranges, IPv4-mapped IPv6, `file://`, `ftp://`, and any non-http(s) scheme
+**before** the network call. Failures surface as `policy_denied` so the
+bridge returns 502 with the exact reason.
+
+Two ways to drive the tool flow (both run `flows/chat_with_tool.sol` —
+SOL owns the orchestration, the bridge only selects the template):
+
+```powershell
+# Native endpoint
+Invoke-RestMethod -Method Post http://127.0.0.1:19791/chat_with_tool `
+    -ContentType 'application/json' `
+    -Body (@{ session_id='demo'; message='summarize this'; url='https://example.com/' } | ConvertTo-Json)
+
+# OpenAI shim auto-routes to the tool flow when the user message contains an http(s) URL.
+Invoke-RestMethod -Method Post http://127.0.0.1:19791/v1/chat/completions `
+    -ContentType 'application/json' `
+    -Body (@{ model='relix-mock'; messages=@(@{role='user';content='Please fetch https://example.com/ and summarize.'}) } | ConvertTo-Json)
+```
+
+Security details, descriptor metadata, and honest limitations (DNS rebind
+between guard and connect; per-hop redirect re-validation) live in
+[`docs/tool-node-security.md`](docs/tool-node-security.md).
 
 Full bringup (tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 

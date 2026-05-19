@@ -1,36 +1,59 @@
-// flows/chat_with_tool.sol — chat flow with web.fetch tool integration.
+// flows/chat_with_tool.sol — chat flow with a `tool.web_fetch` step (M9).
 //
-// Alpha tool-call convention (SIMP-010): AI replies containing
-//   <tool>web.fetch url="..."</tool>
-// are detected by the controller's flow runner, which calls the tool peer,
-// splices the result into the conversation, and re-invokes ai.chat.
+// Bridge-rendered template (same substitution mechanism as flows/chat_template.sol).
+// Three placeholders the web bridge substitutes at request time:
 //
-// The text-marker convention is a one-evening implementation that exercises
-// the architecture (AI -> SOL -> tool node -> AI). Real Anthropic tool-use
-// integration is post-alpha.
+//   {{SESSION}}    →  session id
+//   {{MESSAGE}}    →  user's message
+//   {{TOOL_URL}}   →  validated https URL (validate_input enforces character set)
+//
+// Orchestration is here, in SOL. The bridge selects the template and renders
+// the substitutions; it does NOT plan or execute the fetch — the tool peer
+// runs its own admission pipeline (identity → policy → SSRF check → fetch
+// → audit) just like memory and ai.
+//
+// Order of operations (everything in SOL — no Rust glue):
+//
+//   1. Persist user turn (memory.write_turn).
+//   2. Read recent history (memory.recent_for_session).
+//   3. Fetch the URL (tool.web_fetch, capped at 16 KiB so the prompt stays small).
+//   4. Build a prompt that includes the fetched body verbatim.
+//   5. AI call (ai.chat) with prompt + history.
+//   6. Persist assistant reply.
+//
+// If any step fails (e.g. tool.web_fetch returns policy_denied for an
+// SSRF-rejected URL), the VM halts with VM_ERROR_SENTINEL and the bridge
+// surfaces a 502/400; subsequent steps do not run — confirmed by the
+// existing `first_call_failure_short_circuits_chain` test in
+// crates/relix-runtime/src/flow_runner.rs.
 
-import Memory.RecentForSession
-import Memory.WriteTurn
-import Ai.Chat
-import Tool.WebFetch
+function start() -> str {
+    let user_msg: str = "{{MESSAGE}}";
 
-fn chat_with_tool(session_id: string, user_text: string) -> string {
-    let history: string = remote_call("memory", "memory.recent_for_session", session_id);
-    let prompt: string = history + "\n\nuser: " + user_text;
+    // 1. Persist user turn FIRST so recent-history readback includes it and
+    //    so a crash between steps does not lose the user input.
+    remote_call("memory", "memory.write_turn", "{{SESSION}}|user|" + user_msg);
 
-    // First AI pass — may emit <tool>...</tool> marker.
-    let first_reply: string = remote_call("ai", "ai.chat", prompt);
+    // 2. Read recent history (now includes the just-written user turn).
+    let history: str = remote_call("memory", "memory.recent_for_session", "{{SESSION}}");
 
-    // (The host coordinator inspects first_reply for the marker and, if present,
-    // performs: tool.web_fetch -> ai.chat re-prompt -> final reply. The SOL flow
-    // surface here is what the host re-invokes with the tool result inlined.)
-    //
-    // For the alpha, this flow exists as a placeholder; the host's
-    // chat_with_tool dispatcher (relix-runtime::nodes::web_bridge) handles the
-    // detect/splice loop and writes the same flow events to the log so audit
-    // still reflects the full sequence.
+    // 3. Fetch external URL. The "|16384" suffix asks the tool node to cap
+    //    the body at 16 KiB — well within the configured maximum and small
+    //    enough to keep the AI prompt under typical provider context limits.
+    let fetched: str = remote_call("tool", "tool.web_fetch", "{{TOOL_URL}}|16384");
 
-    remote_call("memory", "memory.write_turn", session_id + "|user|" + user_text);
-    remote_call("memory", "memory.write_turn", session_id + "|assistant|" + first_reply);
-    return first_reply;
+    // 4. Build a single prompt string carrying the user message, the URL,
+    //    and the fetched body verbatim. SOL string literals have no escapes
+    //    (SIMP-016 alpha) so we use plain ASCII delimiters.
+    let prompt: str = "user asked: " + user_msg
+        + "  ---  fetched_from {{TOOL_URL}}: "
+        + fetched;
+
+    // 5. AI call: session_id | prompt | history (SIMP-016).
+    let reply: str = remote_call("ai", "ai.chat", "{{SESSION}}|" + prompt + "|" + history);
+
+    // 6. Persist assistant turn.
+    remote_call("memory", "memory.write_turn", "{{SESSION}}|assistant|" + reply);
+
+    return reply;
 }

@@ -251,8 +251,29 @@ fn register_node_type_handlers(
             "ai node: registered ai.chat"
         );
     }
-    // tool / web_bridge / demo node types are no-ops today; their handlers
-    // ship in later milestones. node.health is always available via builtins.
+    if cfg.controller.node_type == "tool" {
+        let tool_cfg: crate::nodes::tool::ToolConfig = match &cfg.tool {
+            Some(raw) => raw
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| format!("[tool] parse: {e}"))?,
+            None => crate::nodes::tool::ToolConfig::default(),
+        };
+        let backend = std::sync::Arc::new(crate::nodes::tool::ToolBackend::new(tool_cfg.clone())?);
+        crate::nodes::tool::register(bridge, backend);
+        let desc = crate::nodes::tool::capability_descriptor();
+        tracing::info!(
+            max_bytes = tool_cfg.max_bytes,
+            timeout_secs = tool_cfg.timeout_secs,
+            max_redirects = tool_cfg.max_redirects,
+            allow_http = tool_cfg.allow_http,
+            method = %desc.method_name,
+            sensitivity = ?desc.sensitivity_tags,
+            "tool node: registered tool.web_fetch"
+        );
+    }
+    // web_bridge / demo node types are no-ops today; their handlers ship in
+    // later milestones. node.health is always available via builtins.
     Ok(())
 }
 

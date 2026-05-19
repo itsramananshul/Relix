@@ -1,13 +1,19 @@
-# scripts/relix-mesh-up.ps1
+﻿# scripts/relix-mesh-up.ps1
 #
-# Windows-safe PowerShell port of scripts/relix-mesh-up.sh. Brings up the
-# 3-node local mesh (memory controller, ai controller, web bridge) and
-# BLOCKS until the operator presses Ctrl-C.
+# Windows-safe PowerShell driver. Brings up the local Relix mesh and BLOCKS
+# until the operator presses Ctrl-C.
+#
+# Nodes started (each is a normal peer; nothing is a "central gateway"):
+#
+#   memory controller  - SQLite + FTS5 session store
+#   ai controller      - provider-agnostic ai.chat
+#   tool controller    - tool.web_fetch (M9), SSRF-guarded
+#   relix-web-bridge   - local HTTP -> SOL flow (/chat, /chat_with_tool, /v1/*)
 #
 # Safety contract:
-#   * Launches pre-built binaries directly (target\debug\*.exe), so the
-#     PIDs returned by Start-Process ARE the controller / bridge themselves
-#     — not a `cargo run` wrapper. That lets us stop exactly what we started.
+#   * Launches pre-built binaries directly (target\debug\*.exe), so the PIDs
+#     returned by Start-Process ARE the controller / bridge themselves - not
+#     a `cargo run` wrapper. That lets us stop exactly what we started.
 #   * On Ctrl-C, ONLY Stop-Process the PIDs collected during this run.
 #     No taskkill /IM, no Get-Process | Where-Object name match, nothing that
 #     could touch unrelated relix-*.exe instances, Claude Code, or terminals.
@@ -19,16 +25,21 @@
 #   .\scripts\relix-mesh-up.ps1 -Provider anthropic
 #   .\scripts\relix-mesh-up.ps1 -Provider local      -BaseUrl http://localhost:11434/v1
 #   .\scripts\relix-mesh-up.ps1 -Run myrun -BridgePort 19800
+#   .\scripts\relix-mesh-up.ps1 -ToolAllowHttp        # accept http:// (default https-only)
+#   .\scripts\relix-mesh-up.ps1 -NoTool                # skip tool node + tool flow
 
 [CmdletBinding()]
 param(
     [ValidateSet('mock','openai','openrouter','xai','anthropic','gemini','local')]
-    [string]$Provider   = 'mock',
-    [string]$BaseUrl    = '',
-    [string]$Run        = 'local',
-    [int]$BridgePort    = 19791,
-    [int]$MemPort       = 19711,
-    [int]$AiPort        = 19712
+    [string]$Provider     = 'mock',
+    [string]$BaseUrl      = '',
+    [string]$Run          = 'local',
+    [int]$BridgePort      = 19791,
+    [int]$MemPort         = 19711,
+    [int]$AiPort          = 19712,
+    [int]$ToolPort        = 19713,
+    [switch]$ToolAllowHttp,
+    [switch]$NoTool
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,13 +62,14 @@ $OrgPub     = "dev-keys/$Run-org-root.pub"
 $BridgeAic  = "dev-keys/$Run-bridge.aic"
 $MemKey     = "dev-keys/$Run-memory.key"
 $AiKey      = "dev-keys/$Run-ai.key"
+$ToolKey    = "dev-keys/$Run-tool.key"
 $BridgeKey  = "dev-keys/$Run-bridge.key"
 $Policy     = "configs/policies/$Run.toml"
 $BridgeHttp = "127.0.0.1:$BridgePort"
 
 New-Item -ItemType Directory -Force -Path 'dev-keys', $DataBase, 'configs/policies' | Out-Null
 
-# 1) Identities — idempotent: only mint if missing so restarts are cheap.
+# 1) Identities - idempotent: only mint if missing so restarts are cheap.
 if (-not (Test-Path $OrgKey) -or -not (Test-Path $OrgPub)) {
     Write-Host "minting org root ..."
     & $Cli identity init-org --root-key $OrgKey --org $Run
@@ -71,6 +83,7 @@ if (-not (Test-Path $BridgeAic)) {
 
 $MemConfig    = "$DataBase/memory.toml"
 $AiConfig     = "$DataBase/ai.toml"
+$ToolConfig   = "$DataBase/tool.toml"
 $BridgeConfig = "$DataBase/bridge.toml"
 $Peers        = "$DataBase/peers.toml"
 
@@ -96,7 +109,7 @@ db_path = "$DataBase/memory.db"
 [peers]
 "@ | Set-Content -Encoding utf8 $MemConfig
 
-# 3) AI controller config — base + provider-specific tail.
+# 3) AI controller config - base + provider-specific tail.
 $aiBase = @"
 [controller]
 name = "$Run-ai"
@@ -176,7 +189,38 @@ api_key_env   = "GEMINI_API_KEY"
 }
 ($aiBase + $providerTail) | Set-Content -Encoding utf8 $AiConfig
 
-# 4) Shared policy.
+# 4) Tool controller config (M9). The HTTP client lives inside the tool node;
+#    the bridge never talks to external URLs directly.
+if (-not $NoTool) {
+    $allowHttp = if ($ToolAllowHttp) { 'true' } else { 'false' }
+@"
+[controller]
+name = "$Run-tool"
+node_type = "tool"
+listen_port = $ToolPort
+
+[identity]
+key_path = "$ToolKey"
+
+[trust]
+org_root_key_path = "$OrgPub"
+
+[policy]
+file = "$Policy"
+
+[tool]
+max_bytes     = 262144
+timeout_secs  = 15
+max_redirects = 3
+allow_http    = $allowHttp
+user_agent    = "Relix-tool/0.1.0"
+
+[peers]
+"@ | Set-Content -Encoding utf8 $ToolConfig
+}
+
+# 5) Shared policy. Tool capability requires chat-users (same as ai/memory),
+#    so the bridge's existing identity bundle is sufficient.
 @"
 [admit]
 groups = ["chat-users"]
@@ -200,18 +244,34 @@ allow_groups = ["chat-users"]
 name = "ai_chat"
 method = "ai.chat"
 allow_groups = ["chat-users"]
+
+[[rules]]
+name = "tool_web_fetch"
+method = "tool.web_fetch"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
-# 5) Peer alias map consumed by the bridge.
-@"
+# 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.
+$peersToml = @"
 [peers.memory]
 addr = "/ip4/127.0.0.1/tcp/$MemPort"
 
 [peers.ai]
 addr = "/ip4/127.0.0.1/tcp/$AiPort"
-"@ | Set-Content -Encoding utf8 $Peers
+"@
+if (-not $NoTool) {
+    $peersToml += @"
 
-# 6) Bridge config — OpenAI shim on with one cosmetic model id.
+
+[peers.tool]
+addr = "/ip4/127.0.0.1/tcp/$ToolPort"
+"@
+}
+$peersToml | Set-Content -Encoding utf8 $Peers
+
+# 7) Bridge config - OpenAI shim on; tool template wired only when the tool
+#    node is up so the bridge fails 404 cleanly when there's no peer.
+$toolTemplateLine = if ($NoTool) { '' } else { 'tool_template_path = "flows/chat_with_tool.sol"' }
 @"
 [bridge]
 listen_addr = "$BridgeHttp"
@@ -226,6 +286,7 @@ deadline_secs = 60
 
 [flow]
 template_path = "flows/chat_template.sol"
+$toolTemplateLine
 
 [sse]
 chunk_bytes    = 24
@@ -241,9 +302,11 @@ description = "Relix mesh route - AI node currently set to $Provider"
 
 $MemLog    = "$DataBase/memory.log"
 $AiLog     = "$DataBase/ai.log"
+$ToolLog   = "$DataBase/tool.log"
 $BridgeLog = "$DataBase/bridge.log"
 $MemErr    = "$DataBase/memory.err.log"
 $AiErr     = "$DataBase/ai.err.log"
+$ToolErr   = "$DataBase/tool.err.log"
 $BridgeErr = "$DataBase/bridge.err.log"
 
 $env:RELIX_DATA_DIR = 'dev-data'
@@ -293,12 +356,17 @@ Write-Host "  run:           $Run"
 Write-Host "  provider:      $Provider"
 Write-Host "  memory port:   tcp/$MemPort"
 Write-Host "  ai port:       tcp/$AiPort"
+if (-not $NoTool) {
+    Write-Host ("  tool port:     tcp/{0}  (allow_http={1})" -f $ToolPort, $ToolAllowHttp.IsPresent)
+} else {
+    Write-Host "  tool port:     (disabled - -NoTool)"
+}
 Write-Host "  bridge HTTP:   http://$BridgeHttp"
 Write-Host "  data dir:      $DataBase"
 Write-Host ""
 
 # Track ONLY the processes this script started. Stop-Process on shutdown
-# is restricted to this exact list — never a name-based sweep.
+# is restricted to this exact list - never a name-based sweep.
 $started = New-Object System.Collections.ArrayList
 
 try {
@@ -308,8 +376,16 @@ try {
     Write-Host "starting ai controller ..."
     [void]$started.Add( (Start-Node -Exe $Controller -Cfg $AiConfig  -OutLog $AiLog  -ErrLog $AiErr  -RustLog 'relix_runtime=info') )
 
+    if (-not $NoTool) {
+        Write-Host "starting tool controller ..."
+        [void]$started.Add( (Start-Node -Exe $Controller -Cfg $ToolConfig -OutLog $ToolLog -ErrLog $ToolErr -RustLog 'relix_runtime=info') )
+    }
+
     if (-not (Wait-Log -Path $MemLog -Needle 'transport listening' -Desc 'memory controller')) { throw 'memory controller never came up' }
     if (-not (Wait-Log -Path $AiLog  -Needle 'transport listening' -Desc 'ai controller'))     { throw 'ai controller never came up' }
+    if (-not $NoTool) {
+        if (-not (Wait-Log -Path $ToolLog -Needle 'transport listening' -Desc 'tool controller')) { throw 'tool controller never came up' }
+    }
     Start-Sleep -Milliseconds 400
 
     Write-Host "starting web bridge ..."
@@ -325,22 +401,36 @@ try {
     Write-Host "  http://127.0.0.1:$BridgePort/health"
     Write-Host "  http://127.0.0.1:$BridgePort/v1/models"
     Write-Host "  http://127.0.0.1:$BridgePort/v1/chat/completions"
+    if (-not $NoTool) {
+        Write-Host "  http://127.0.0.1:$BridgePort/chat_with_tool   (POST: {session_id, message, url})"
+    }
     Write-Host ""
     Write-Host "Open WebUI config:"
     Write-Host "  API Base URL: http://127.0.0.1:$BridgePort/v1"
     Write-Host "  API Key:      anything non-empty"
     Write-Host "  model:        relix-$Provider"
+    if (-not $NoTool) {
+        Write-Host "  Note:         messages containing an http(s) URL auto-route through the tool flow."
+    }
     Write-Host ""
-    Write-Host "Smoke test (new PowerShell window):"
+    Write-Host "Smoke tests:"
     Write-Host "  Invoke-RestMethod http://127.0.0.1:$BridgePort/health"
     Write-Host "  Invoke-RestMethod http://127.0.0.1:$BridgePort/v1/models"
     Write-Host "  Invoke-RestMethod -Method Post http://127.0.0.1:$BridgePort/v1/chat/completions ``"
     Write-Host "    -ContentType 'application/json' ``"
     Write-Host "    -Body (@{ model='relix-$Provider'; messages=@(@{role='user';content='hello'}) } | ConvertTo-Json)"
+    if (-not $NoTool) {
+        Write-Host ""
+        Write-Host "  # Tool flow:"
+        Write-Host "  Invoke-RestMethod -Method Post http://127.0.0.1:$BridgePort/chat_with_tool ``"
+        Write-Host "    -ContentType 'application/json' ``"
+        Write-Host "    -Body (@{ session_id='demo'; message='summarize this page'; url='https://example.com/' } | ConvertTo-Json)"
+    }
     Write-Host ""
     Write-Host "Logs:"
     Write-Host "  $MemLog"
     Write-Host "  $AiLog"
+    if (-not $NoTool) { Write-Host "  $ToolLog" }
     Write-Host "  $BridgeLog"
     Write-Host ""
     Write-Host "PIDs (this script will only stop these on Ctrl-C):"
@@ -351,7 +441,7 @@ try {
 
     # Intercept Ctrl-C so cleanup runs exactly once, hits only our PIDs, and
     # leaves the parent terminal untouched. In non-interactive hosts (jobs,
-    # hidden windows) there's no key input — fall back to blocking on the
+    # hidden windows) there's no key input - fall back to blocking on the
     # bridge process; Stop-Process from outside will trigger the finally.
     $interactive = $true
     try { $null = [Console]::TreatControlCAsInput } catch { $interactive = $false }
