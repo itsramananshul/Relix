@@ -64,15 +64,19 @@ has no real DNS, and the control test
 `unpinned_hostname_fails_dns_proving_pin_is_load_bearing` confirms the
 same hostname fails when no pin is set.
 
-Remaining honest gap: **per-hop redirect re-validation**. If the
-configured `max_redirects > 0` and the first hop returns `302 Location:
-http://attacker-rebind/`, reqwest's own redirect policy follows it
-without re-running `security::resolve_safe_url`. The follow inherits
-*this* request's pinning, so it still can't reach an address we have
-already validated as forbidden via the same hostname — but a redirect
-to a *different* hostname is currently re-resolved by reqwest with no
-pin. Tracked for a future milestone; the safest interim posture is
-`max_redirects = 0` for high-blast-radius deployments.
+Per-hop redirect handling: the original M9 cut left this as a documented
+limitation. It's now closed by a `reqwest::redirect::Policy::custom`
+closure that (a) enforces `[tool] max_redirects` as a hard cap and
+(b) re-runs `resolve_safe_url_blocking` (the sync twin of the async
+guard) on every redirect target — same-hostname or cross-hostname.
+A `Location:` pointing at `127.0.0.1`, an RFC 1918 literal, or a
+hostname that resolves to a forbidden range is rejected before reqwest
+follows it. The closure is synchronous (reqwest's API requires it) and
+blocks briefly on `std::net::ToSocketAddrs` for the DNS-needing case;
+acceptable because redirects are rare. Verified by
+`redirect_to_loopback_literal_is_rejected_per_hop`,
+`redirect_to_rfc1918_literal_is_rejected_per_hop`, and
+`redirect_cap_zero_blocks_any_redirect`.
 
 ## SSRF Defence (`security::resolve_safe_url`)
 
@@ -120,13 +124,16 @@ embeddings of any of the IPv4 forbidden ranges.
   `pin_forces_connect_to_validated_ip_not_dns` /
   `pin_to_one_ip_ignores_other_addresses_in_dns` and the control
   `unpinned_hostname_fails_dns_proving_pin_is_load_bearing`.
-- **Per-hop redirect re-validation: still open.** Redirects within the
-  same hostname inherit this request's pin and therefore can only land
-  on validated IPs. *Cross-hostname* redirects (e.g. `Location:
-  http://attacker.example/`) are re-resolved by reqwest without a pin
-  and not re-checked by `resolve_safe_url`. Operators worried about
-  this should set `[tool] max_redirects = 0` until a `Policy::custom`
-  is wired in a future milestone.
+- **Per-hop redirect re-validation: closed.** A
+  `reqwest::redirect::Policy::custom` closure re-runs
+  `resolve_safe_url_blocking` on every redirect target before reqwest
+  follows it. Cross-hostname `Location: http://attacker.example/`,
+  literal-IP `Location: http://127.0.0.1/`, and RFC 1918 targets are
+  all rejected. The closure also enforces `[tool] max_redirects` as a
+  hard cap. The closure is sync (reqwest's API requires it) and blocks
+  the calling Tokio worker briefly on `std::net::ToSocketAddrs`; this
+  is acceptable since redirects are rare. Operators who still prefer
+  zero redirect-follow ambiguity should set `[tool] max_redirects = 0`.
 - **OS-level egress filtering** is not configured by the tool node.
   On a shared host, operators should add an iptables / Windows-Firewall
   outbound deny for RFC 1918 networks to the tool node's user account.

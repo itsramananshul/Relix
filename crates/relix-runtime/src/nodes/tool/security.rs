@@ -24,19 +24,21 @@
 //!
 //! ## Honest limitations
 //!
-//! - **DNS rebinding** is partially mitigated only. We resolve the hostname
-//!   and verify every returned address is safe, but the subsequent reqwest
-//!   call re-resolves and could in principle receive a different result.
-//!   At Gate 2 we plan to pin the connection to a single inspected
-//!   `SocketAddr` via a custom hyper resolver. Documented in
-//!   `docs/tool-node-security.md`.
-//! - **Network egress filtering** at the host OS level is not configured by
-//!   the tool node; operators on shared hosts should add an iptables /
-//!   Windows-Firewall outbound deny for RFC1918 to the tool node's UID.
-//! - **Redirect targets** are validated by `reqwest`'s redirect policy
-//!   (capped at `max_redirects`) but each follow is *not* re-screened by
-//!   this module — a later milestone replaces reqwest's default policy with
-//!   a `Policy::custom` that re-runs `validate_host`. Tracked as M11.
+//! - **DNS rebinding** between the guard and the connect is **closed**.
+//!   `ToolBackend::fetch` pins reqwest's resolver to the IPs validated by
+//!   [`resolve_safe_url`] via `ClientBuilder::resolve_to_addrs`, so the
+//!   TCP connect cannot diverge from the inspected address. The URL
+//!   keeps the hostname so `Host` header + TLS SNI keep working.
+//!   See `docs/tool-node-security.md`.
+//! - **Per-hop redirect re-validation** is **closed**. The tool's reqwest
+//!   client uses a `reqwest::redirect::Policy::custom` closure that runs
+//!   [`resolve_safe_url_blocking`] on every redirect target — same-host
+//!   or cross-host — before the follow. `Location:` pointing at
+//!   loopback / RFC 1918 / metadata / forbidden-resolution hosts is
+//!   rejected pre-connect.
+//! - **Network egress filtering** at the host OS level is not configured
+//!   by the tool node; operators on shared hosts should add an iptables /
+//!   Windows-Firewall outbound deny for RFC 1918 to the tool node's UID.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
@@ -92,16 +94,69 @@ pub enum SsrfError {
 /// Validate a URL string and (if it has a hostname) resolve it. Returns
 /// either a `SafeUrl` describing what is safe to fetch, or an `SsrfError`
 /// that the handler surfaces as `policy_denied`.
+///
+/// The DNS lookup is delegated to a blocking thread via
+/// [`tokio::task::spawn_blocking`] so we don't stall the runtime when the
+/// system resolver decides to be slow. The synchronous twin
+/// [`resolve_safe_url_blocking`] is used by reqwest's redirect policy
+/// closure (which cannot await).
 pub async fn resolve_safe_url(raw: &str, allow_http: bool) -> Result<SafeUrl, SsrfError> {
+    let (url, lower_host) = match validate_url_pre_dns(raw, allow_http)? {
+        ValidatedHost::LiteralIp { url, ip } => {
+            return Ok(SafeUrl {
+                normalized_url: url,
+                resolved: vec![ip],
+            });
+        }
+        ValidatedHost::NeedsDns { url, lower_host } => (url, lower_host),
+    };
+
+    let host_for_lookup = lower_host.clone();
+    let resolved = tokio::task::spawn_blocking(move || resolve_host_blocking(&host_for_lookup))
+        .await
+        .map_err(|e| SsrfError::DnsFailed {
+            host: lower_host.clone(),
+            cause: e.to_string(),
+        })??;
+    finalise_dns_check(url, lower_host, resolved)
+}
+
+/// Synchronous counterpart of [`resolve_safe_url`]. Used by reqwest's
+/// `redirect::Policy::custom` closure (which is sync). Blocks the calling
+/// thread on the system resolver; acceptable for redirects because they
+/// are rare and short-lived. Returns the same [`SafeUrl`] on success.
+pub fn resolve_safe_url_blocking(raw: &str, allow_http: bool) -> Result<SafeUrl, SsrfError> {
+    let (url, lower_host) = match validate_url_pre_dns(raw, allow_http)? {
+        ValidatedHost::LiteralIp { url, ip } => {
+            return Ok(SafeUrl {
+                normalized_url: url,
+                resolved: vec![ip],
+            });
+        }
+        ValidatedHost::NeedsDns { url, lower_host } => (url, lower_host),
+    };
+    let resolved = resolve_host_blocking(&lower_host)?;
+    finalise_dns_check(url, lower_host, resolved)
+}
+
+/// Intermediate decision from the cheap, sync, pre-DNS part of the check.
+enum ValidatedHost {
+    /// URL host is already a literal IP that passed the range check.
+    LiteralIp { url: Url, ip: IpAddr },
+    /// URL host is a hostname that passed scheme + denylist; DNS still owed.
+    NeedsDns { url: Url, lower_host: String },
+}
+
+/// Cheap, sync, pre-DNS checks: parse URL, scheme allowlist, literal-IP
+/// range check, hostname denylist. No I/O.
+fn validate_url_pre_dns(raw: &str, allow_http: bool) -> Result<ValidatedHost, SsrfError> {
     let url = Url::parse(raw.trim()).map_err(|e| SsrfError::BadUrl(e.to_string()))?;
 
     let scheme = url.scheme().to_ascii_lowercase();
     match scheme.as_str() {
         "https" => {}
         "http" if allow_http => {}
-        _ => {
-            return Err(SsrfError::SchemeDenied { scheme, allow_http });
-        }
+        _ => return Err(SsrfError::SchemeDenied { scheme, allow_http }),
     }
 
     let host = url
@@ -109,16 +164,11 @@ pub async fn resolve_safe_url(raw: &str, allow_http: bool) -> Result<SafeUrl, Ss
         .ok_or_else(|| SsrfError::NoHost(raw.to_string()))?
         .to_string();
 
-    // Layer 1: literal IP or forbidden DNS name? IPv4-mapped-IPv6 is
-    // unwrapped so we don't accept `[::ffff:127.0.0.1]` as "external".
     if let Some(parsed) = parse_literal_ip(&host) {
         if let Some(reason) = forbidden_ip_reason(parsed) {
             return Err(SsrfError::IpForbidden { ip: parsed, reason });
         }
-        return Ok(SafeUrl {
-            normalized_url: url,
-            resolved: vec![parsed],
-        });
+        return Ok(ValidatedHost::LiteralIp { url, ip: parsed });
     }
     let lower_host = host.to_ascii_lowercase();
     if let Some(reason) = forbidden_hostname_reason(&lower_host) {
@@ -127,26 +177,27 @@ pub async fn resolve_safe_url(raw: &str, allow_http: bool) -> Result<SafeUrl, Ss
             reason,
         });
     }
+    Ok(ValidatedHost::NeedsDns { url, lower_host })
+}
 
-    // Layer 2: resolve. Use a blocking call inside spawn_blocking — the
-    // tokio std-resolver lives behind `tokio::net::lookup_host`, but that
-    // requires a port. We synthesize one (port 0 is fine for resolution).
-    let host_for_lookup = lower_host.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        (host_for_lookup.as_str(), 0u16)
-            .to_socket_addrs()
-            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
-    })
-    .await
-    .map_err(|e| SsrfError::DnsFailed {
-        host: lower_host.clone(),
-        cause: e.to_string(),
-    })?
-    .map_err(|e| SsrfError::DnsFailed {
-        host: lower_host.clone(),
-        cause: e.to_string(),
-    })?;
+/// Blocking DNS resolver. Used by both the async (via spawn_blocking) and
+/// the sync entry points.
+fn resolve_host_blocking(lower_host: &str) -> Result<Vec<IpAddr>, SsrfError> {
+    (lower_host, 0u16)
+        .to_socket_addrs()
+        .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
+        .map_err(|e| SsrfError::DnsFailed {
+            host: lower_host.to_string(),
+            cause: e.to_string(),
+        })
+}
 
+/// Final post-DNS range check shared by both sync and async paths.
+fn finalise_dns_check(
+    url: Url,
+    lower_host: String,
+    resolved: Vec<IpAddr>,
+) -> Result<SafeUrl, SsrfError> {
     if resolved.is_empty() {
         return Err(SsrfError::DnsEmpty { host: lower_host });
     }
@@ -159,7 +210,6 @@ pub async fn resolve_safe_url(raw: &str, allow_http: bool) -> Result<SafeUrl, Ss
             });
         }
     }
-
     Ok(SafeUrl {
         normalized_url: url,
         resolved,

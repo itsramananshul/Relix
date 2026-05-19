@@ -155,9 +155,12 @@ Invoke-RestMethod -Method Post http://127.0.0.1:19791/v1/chat/completions `
 The tool node also **pins** the outbound connection to the IPs the SSRF
 guard validated (via `reqwest::ClientBuilder::resolve_to_addrs`), so the
 TCP connect cannot diverge from the inspected address (DNS-rebind window
-closed; same-hostname redirects inherit the pin). `Host` header + TLS
-SNI keep targeting the original hostname. Cross-hostname redirects are
-still re-resolved by reqwest and not re-screened — see SIMP-021 and
+closed). `Host` header + TLS SNI keep targeting the original hostname.
+**Every redirect target** is re-screened by a
+`reqwest::redirect::Policy::custom` closure that runs the SSRF guard
+again before the follow — cross-hostname `Location:` hops to
+loopback / RFC 1918 / link-local / metadata are rejected pre-connect.
+See SIMP-021 and
 [`docs/tool-node-security.md`](docs/tool-node-security.md).
 
 ### M10 — runtime capability discovery (working today)

@@ -58,7 +58,7 @@ use relix_core::capability::{CapabilityDescriptor, CapabilityKind, CostClass, Id
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
-use security::{SsrfError, resolve_safe_url};
+use security::{SsrfError, resolve_safe_url, resolve_safe_url_blocking};
 
 /// Per-node tool configuration parsed from `[tool]` in the controller TOML.
 #[derive(Clone, Debug, Deserialize)]
@@ -138,11 +138,45 @@ impl ToolBackend {
             .user_agent(cfg.user_agent.clone())
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .connect_timeout(Duration::from_secs(cfg.timeout_secs.min(10)))
-            .redirect(reqwest::redirect::Policy::limited(cfg.max_redirects));
+            .redirect(Self::ssrf_redirect_policy(cfg));
         if let Some((host, addrs)) = pin {
             b = b.resolve_to_addrs(host, addrs);
         }
         b.build()
+    }
+
+    /// Build a `reqwest::redirect::Policy::custom` that:
+    ///
+    /// 1. Enforces `cfg.max_redirects` as a hard cap (matching the old
+    ///    `Policy::limited` behaviour).
+    /// 2. Re-runs the SSRF guard against every redirect target via
+    ///    [`resolve_safe_url_blocking`]. The closure is sync; the DNS
+    ///    lookup blocks the calling thread briefly. Redirects are rare
+    ///    and short, so the practical cost is small and the closure
+    ///    catches `Location: http://127.0.0.1/`, `Location:
+    ///    http://localhost/`, cross-hostname rebinds, etc. — the
+    ///    cross-host gap previously documented in SIMP-021.
+    ///
+    /// On rejection the closure returns `Action::error`, which surfaces
+    /// from `client.get(...).send()` as a `reqwest::Error` and the handler
+    /// maps it to a `transport`-class error envelope. The original safe
+    /// fetch (the first hop) still succeeded fully — we just stop before
+    /// following an unsafe redirect.
+    fn ssrf_redirect_policy(cfg: &ToolConfig) -> reqwest::redirect::Policy {
+        let max_redirects = cfg.max_redirects;
+        let allow_http = cfg.allow_http;
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= max_redirects {
+                return attempt.error(SsrfError::BadUrl(format!(
+                    "tool.web_fetch: redirect cap ({max_redirects}) reached"
+                )));
+            }
+            let target_str = attempt.url().to_string();
+            match resolve_safe_url_blocking(&target_str, allow_http) {
+                Ok(_) => attempt.follow(),
+                Err(e) => attempt.error(e),
+            }
+        })
     }
 
     /// Run the configured capability against a single URL.
@@ -608,6 +642,113 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(body, "validated-host\n");
+    }
+
+    #[tokio::test]
+    async fn redirect_to_loopback_literal_is_rejected_per_hop() {
+        use axum::{Router, response::Redirect, routing::get};
+        // First hop returns 302 -> http://127.0.0.1:9/  (the literal IP
+        // is in a forbidden range; the closure's literal-IP check rejects
+        // synchronously without needing DNS for the redirect target).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            get(|| async { Redirect::temporary("http://127.0.0.1:9/loopback-target") }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let cfg = ToolConfig {
+            allow_http: true,
+            max_redirects: 3,
+            ..ToolConfig::default()
+        };
+        let client = ToolBackend::build_client(&cfg, Some(("redirector.invalid", &[addr])))
+            .expect("client builds");
+        let url = format!("http://redirector.invalid:{}/", addr.port());
+        let r = client.get(&url).send().await;
+        assert!(
+            r.is_err(),
+            "redirect to loopback literal must be rejected, got: {:?}",
+            r
+        );
+        let err_str = format!("{:?}", r.err().unwrap());
+        // reqwest wraps our SsrfError; the chain should still mention the
+        // SSRF reason somewhere. We assert a substring rather than an
+        // enum variant to avoid coupling tests to reqwest's error wrapping.
+        assert!(
+            err_str.contains("loopback") || err_str.contains("forbidden"),
+            "expected SSRF reason in redirect error, got: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_to_rfc1918_literal_is_rejected_per_hop() {
+        use axum::{Router, response::Redirect, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            get(|| async { Redirect::temporary("http://10.0.0.1/private") }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let cfg = ToolConfig {
+            allow_http: true,
+            max_redirects: 3,
+            ..ToolConfig::default()
+        };
+        let client = ToolBackend::build_client(&cfg, Some(("private-redirect.invalid", &[addr])))
+            .expect("client builds");
+        let url = format!("http://private-redirect.invalid:{}/", addr.port());
+        let r = client.get(&url).send().await;
+        assert!(
+            r.is_err(),
+            "redirect to rfc1918 literal must be rejected, got: {:?}",
+            r
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_cap_zero_blocks_any_redirect() {
+        use axum::{Router, response::Redirect, routing::get};
+        // Server redirects to another safe-ish literal URL; the cap should
+        // fire before the SSRF check runs on the target. We pick a public
+        // literal IP for the redirect target so a "broken cap" wouldn't be
+        // hidden by an SSRF rejection of a forbidden target.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            get(|| async { Redirect::temporary("http://1.1.1.1/somepath") }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+
+        let cfg = ToolConfig {
+            allow_http: true,
+            max_redirects: 0,
+            ..ToolConfig::default()
+        };
+        let client = ToolBackend::build_client(&cfg, Some(("nofollow.invalid", &[addr])))
+            .expect("client builds");
+        let url = format!("http://nofollow.invalid:{}/", addr.port());
+        let r = client.get(&url).send().await;
+        assert!(
+            r.is_err(),
+            "max_redirects=0 must block any redirect, got: {:?}",
+            r
+        );
+        let err_str = format!("{:?}", r.err().unwrap());
+        assert!(
+            err_str.contains("redirect cap"),
+            "expected 'redirect cap' in error, got: {err_str}"
+        );
     }
 
     #[tokio::test]
