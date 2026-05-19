@@ -235,15 +235,6 @@ policy that admits `chat-users` for every alpha method; if you wrote
 your own policy you need explicit rules for `node.health`,
 `node.manifest`, every memory method, `ai.chat`, and `tool.web_fetch`.
 
-### First request after boot returns `kind=0 cause=transport: DialFailure`
-
-A libp2p timing race that can hit when the very first chat request
-lands within ~1 second of the script printing `mesh is UP`. The pooled
-connection slots from the discovery pass have not fully settled.
-Retry the request, or pause ~1 second after boot before the first
-call. Steady-state behaviour is unaffected; this is a one-shot at the
-start of a process.
-
 ### Bridge prints `bridge discovery did not return a mesh client`
 
 The bridge's startup discovery pass failed to dial any peer (every

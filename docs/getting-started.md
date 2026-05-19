@@ -101,12 +101,6 @@ Logs live at `dev-data/local/{memory,ai,tool,bridge}.log`. A clean
 shutdown (Ctrl-C) stops only the four PIDs the script printed; nothing
 else is touched.
 
-> **Tip.** The first chat request after a fresh boot occasionally hits
-> a libp2p dial race if it lands within a second of "mesh is UP".
-> Give the mesh ~1 second before the first request, or retry once if
-> you see `kind=0 cause=transport: DialFailure` — steady-state
-> behaviour is fine.
-
 ## First chat
 
 In another terminal:

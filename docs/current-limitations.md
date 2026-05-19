@@ -24,16 +24,6 @@ flow halts with a transport error and the bridge returns a 502. There
 is a stub `coordinator/` module in `relix-runtime`; it has no
 production implementation today.
 
-### First-request dial race on a freshly-booted mesh
-
-A libp2p timing detail. The bridge's startup discovery pass
-establishes connections to every peer; sometimes a chat request that
-arrives within ~1 second of "mesh is UP" loses a race with the swarm
-settling and fails with `kind=0 cause=transport: DialFailure`.
-Retrying the request always succeeds, and the steady-state behaviour
-is unaffected. Documented; an explicit "swarm-ready" gate in the
-bringup script is the planned cleanup.
-
 ### The bridge's `MeshClient` does not auto-reconnect
 
 The bridge dials every peer once at startup, caches the libp2p
