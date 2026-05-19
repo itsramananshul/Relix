@@ -72,6 +72,7 @@ pub async fn execute_chat_flow(
         data_dir: state.cfg.transport.data_dir.clone(),
         deadline_secs: state.cfg.transport.deadline_secs,
         capability_cache: Some(state.manifest_cache.clone()),
+        mesh_client: state.mesh_client.clone(),
     };
 
     finalize_flow_run(FlowRunner::new(opts).run().await)
@@ -151,6 +152,7 @@ pub async fn execute_chat_with_tool_flow(
         data_dir: state.cfg.transport.data_dir.clone(),
         deadline_secs: state.cfg.transport.deadline_secs,
         capability_cache: Some(state.manifest_cache.clone()),
+        mesh_client: state.mesh_client.clone(),
     };
 
     finalize_flow_run(FlowRunner::new(opts).run().await)

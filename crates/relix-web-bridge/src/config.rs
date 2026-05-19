@@ -12,7 +12,7 @@ use serde::Deserialize;
 use relix_core::bundle::Bundle;
 use relix_core::codec;
 use relix_runtime::flow_runner::PeersFile;
-use relix_runtime::manifest::ManifestCache;
+use relix_runtime::manifest::{ManifestCache, MeshClient};
 
 use crate::BridgeError;
 
@@ -149,6 +149,10 @@ pub struct AppState {
     /// to work. Read by `/v1/models` and (optionally) by the flow runner's
     /// `capability:` resolver.
     pub manifest_cache: Arc<ManifestCache>,
+    /// Long-lived libp2p client with peers pre-dialled. `Some` after a
+    /// successful discovery pass; `None` if discovery failed (in which case
+    /// FlowRunner falls back to the per-request ephemeral peer path).
+    pub mesh_client: Option<Arc<MeshClient>>,
 }
 
 impl AppState {
@@ -205,6 +209,7 @@ impl AppState {
             template,
             tool_template,
             manifest_cache: Arc::new(ManifestCache::new()),
+            mesh_client: None,
         })
     }
 }

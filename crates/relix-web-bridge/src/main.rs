@@ -79,10 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut state = AppState::try_new(cfg.clone())?;
 
-    // M10: best-effort discovery pass. Dials each peer and pulls their
-    // NodeManifest so `/v1/models` and capability-prefixed remote_calls
-    // know what the mesh actually exposes. Static aliases keep working
-    // either way — a failed discovery just leaves the cache empty.
+    // M10 + M11: discovery pass that *also* hands back a long-lived
+    // MeshClient. The libp2p transport + dial cost is now paid once at
+    // startup; every /chat thereafter reuses it.
     let discovery_opts = relix_runtime::manifest::DiscoveryOptions {
         identity_bundle: state.identity_bundle.clone(),
         client_key: state.client_key,
@@ -91,14 +90,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         overall_timeout: std::time::Duration::from_secs(6),
         local_port: None,
     };
-    let discovered = relix_runtime::manifest::discover_peers(discovery_opts).await;
-    let entries = discovered.entries();
-    tracing::info!(
-        peers = entries.len(),
-        methods = ?discovered.all_methods(),
-        "bridge discovery complete"
-    );
-    state.manifest_cache = std::sync::Arc::new(discovered);
+    match relix_runtime::manifest::discover_and_pin(discovery_opts).await {
+        Some((discovered, mesh_client)) => {
+            let entries = discovered.entries();
+            tracing::info!(
+                peers = entries.len(),
+                methods = ?discovered.all_methods(),
+                pooled_peer_ids = mesh_client.peer_ids().len(),
+                "bridge discovery complete (transport pooled for M11)"
+            );
+            state.manifest_cache = std::sync::Arc::new(discovered);
+            state.mesh_client = Some(std::sync::Arc::new(mesh_client));
+        }
+        None => {
+            tracing::warn!(
+                "bridge discovery did not return a mesh client; chat requests will fall back to per-request transport"
+            );
+        }
+    }
     let addr: SocketAddr = state
         .cfg
         .bridge

@@ -186,6 +186,34 @@ cache, the bridge logs a warning, and static aliases keep working. The
 manifest payload is *not* signed in the alpha (that lands at Gate 2 along
 with full gossip-based propagation).
 
+### M11 — connection pooling (working today)
+
+Pre-M11, every `/chat` request brought up a fresh libp2p swarm, dialled
+all peers, performed TCP + Noise + Yamux handshakes, then dropped the
+transport on completion. Logs showed N+1 `transport listening` lines for
+N requests.
+
+M11 lifts the discovery transport into a long-lived `MeshClient` that is
+stored in `AppState` and reused for every chat. `FlowRunner` now takes
+`Option<Arc<MeshClient>>`; when set, it skips its own transport setup.
+The standalone `relix-cli flow-run` path (no bridge) keeps the original
+per-call transport — the option is `None` for that caller.
+
+Local benchmark on a clean mesh (mock provider, 10 sequential `POST /chat`
+calls, warm cache):
+
+```
+samples ms : 106, 51, 50, 50, 49, 49, 49, 49, 50, 50
+min  : 49 ms     avg : 55 ms     p50 : 50 ms
+transport listening lines in bridge.log : 1   (was N+1 = 11 pre-M11)
+```
+
+The first request is slightly slower because it warms up libp2p's
+request-response state for each peer; from request 2 onward the path is
+steady-state. Workload-realistic numbers (real provider, larger bodies)
+will look different — this is just a baseline confirming the pool reuses
+the same connection.
+
 Full bringup (tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 
 ## Reporting Security Issues

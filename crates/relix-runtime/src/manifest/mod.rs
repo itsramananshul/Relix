@@ -208,6 +208,40 @@ impl ManifestCache {
     }
 }
 
+// ────────────────────────── Long-lived MeshClient ──────────────────────────
+
+/// A persistent libp2p client with the configured peers already dialled
+/// and their `PeerId`s cached by alias. The bridge constructs one of these
+/// at startup (during the discovery pass) and reuses it for every chat
+/// request — avoiding the per-request TCP + Noise + Yamux handshake the
+/// FlowRunner used to perform on each call (M11).
+#[derive(Clone)]
+pub struct MeshClient {
+    client: crate::transport::rpc::Client,
+    peer_ids: std::collections::HashMap<String, crate::transport::rpc::PeerId>,
+}
+
+impl MeshClient {
+    /// Build by hand (used by tests; production builds happen via
+    /// [`discover_and_pin`]).
+    pub fn new(
+        client: crate::transport::rpc::Client,
+        peer_ids: std::collections::HashMap<String, crate::transport::rpc::PeerId>,
+    ) -> Self {
+        Self { client, peer_ids }
+    }
+
+    /// Clone the underlying RPC client (cheap).
+    pub fn client(&self) -> crate::transport::rpc::Client {
+        self.client.clone()
+    }
+
+    /// Snapshot the alias -> PeerId map.
+    pub fn peer_ids(&self) -> std::collections::HashMap<String, crate::transport::rpc::PeerId> {
+        self.peer_ids.clone()
+    }
+}
+
 // ────────────────────────── Discovery client ───────────────────────────────
 
 /// Options for the bridge's one-shot manifest discovery pass.
@@ -246,17 +280,46 @@ fn panic_no_identity() -> Bundle {
 /// Dial every peer in `opts.peers`, call `node.manifest` against each, and
 /// populate a fresh [`ManifestCache`]. Peers that never reply within the
 /// overall budget are simply absent from the cache — the caller decides
-/// how to react (the bridge logs a warning but stays up so static aliases
-/// still work).
+/// how to react.
 ///
-/// This spawns a one-shot libp2p client that is dropped on return; the
-/// long-lived `/chat` request path continues to use per-request clients
-/// (`FlowRunner`). The bridge holds the resulting cache for the lifetime of
-/// the process.
+/// Back-compat shim — kept so callers that only need the cache stay valid.
+/// New callers should prefer [`discover_and_pin`], which also returns the
+/// long-lived [`MeshClient`] so chat requests can avoid re-dialling on
+/// every call (M11).
 pub async fn discover_peers(opts: DiscoveryOptions) -> ManifestCache {
+    discover_and_pin(opts)
+        .await
+        .map(|(cache, _)| cache)
+        .unwrap_or_default()
+}
+
+/// Same as [`discover_peers`] but additionally hands back a [`MeshClient`]
+/// pinned to the dialled peers. The caller is expected to keep the
+/// `MeshClient` alive for the lifetime of the host (the bridge stashes it
+/// in `AppState`). The underlying libp2p swarm task is spawned internally
+/// and stays running as long as the `client` handle has any clone.
+pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, MeshClient)> {
     let cache = ManifestCache::new();
     if opts.peers.peers.is_empty() {
-        return cache;
+        return Some((
+            cache,
+            MeshClient {
+                client: {
+                    // Build a no-peer client so the bridge still has a usable
+                    // libp2p instance for future discovery refreshes.
+                    let local_port = opts
+                        .local_port
+                        .unwrap_or_else(|| 30_000 + (rand::random::<u16>() % 5_000));
+                    let (client, _events, event_loop) =
+                        rpc::new(opts.client_key, local_port).await.ok()?;
+                    // Detach the swarm loop; we deliberately don't await its
+                    // JoinHandle. `drop` silences clippy::let_underscore_future.
+                    drop(tokio::spawn(event_loop.run()));
+                    client
+                },
+                peer_ids: std::collections::HashMap::new(),
+            },
+        ));
     }
 
     let local_port = opts
@@ -267,7 +330,7 @@ pub async fn discover_peers(opts: DiscoveryOptions) -> ManifestCache {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "discovery: rpc::new failed; cache stays empty");
-            return cache;
+            return None;
         }
     };
     let _spawned = tokio::spawn(event_loop.run());
@@ -289,8 +352,12 @@ pub async fn discover_peers(opts: DiscoveryOptions) -> ManifestCache {
         want_alias_by_addr.insert(entry.addr.clone(), alias.clone());
     }
 
-    // Collect PeerConnected events for the duration of the budget.
+    // Collect PeerConnected events for the duration of the budget. We use the
+    // resolved PeerIds as the *single* place the bridge later dispatches to
+    // (M11), so we save them into a peer_ids map alongside the (alias, peer_id)
+    // list used for the in-pass node.manifest call.
     let mut peer_aliases: Vec<(PeerId, String)> = Vec::new();
+    let mut peer_ids: std::collections::HashMap<String, PeerId> = std::collections::HashMap::new();
     let deadline = tokio::time::Instant::now() + opts.overall_timeout;
     while tokio::time::Instant::now() < deadline && peer_aliases.len() < want_alias_by_addr.len() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -300,13 +367,13 @@ pub async fn discover_peers(opts: DiscoveryOptions) -> ManifestCache {
         match tokio::time::timeout(remaining, events.recv()).await {
             Ok(Some(TransportEvent::PeerConnected { peer_id, address })) => {
                 let reported = address.to_string();
-                if let Some((wanted_addr, alias)) = want_alias_by_addr
+                if let Some((_, alias)) = want_alias_by_addr
                     .iter()
                     .find(|(want, _)| reported.starts_with(want.as_str()))
                 {
                     let alias = alias.clone();
-                    let _ = wanted_addr; // borrow checker
-                    peer_aliases.push((peer_id, alias));
+                    peer_aliases.push((peer_id, alias.clone()));
+                    peer_ids.insert(alias, peer_id);
                 }
             }
             Ok(Some(_)) => {}
@@ -314,9 +381,19 @@ pub async fn discover_peers(opts: DiscoveryOptions) -> ManifestCache {
         }
     }
 
+    // After discovery, drop the events receiver so the swarm task's
+    // back-pressure on `event_sender` becomes a fast no-op (Sender::send sees
+    // a closed channel and returns Err immediately, which the swarm ignores).
+    drop(events);
+
+    let mesh_client = MeshClient {
+        client: client.clone(),
+        peer_ids: peer_ids.clone(),
+    };
+
     if peer_aliases.is_empty() {
         tracing::warn!("discovery: no peers connected within budget; cache stays empty");
-        return cache;
+        return Some((cache, mesh_client));
     }
 
     // Call node.manifest on each connected peer.
@@ -373,7 +450,7 @@ pub async fn discover_peers(opts: DiscoveryOptions) -> ManifestCache {
         );
         cache.insert(Some(alias), manifest);
     }
-    cache
+    Some((cache, mesh_client))
 }
 
 /// Convenience: discover with sensible defaults for tests that already have

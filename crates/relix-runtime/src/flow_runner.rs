@@ -40,7 +40,7 @@ use relix_core::eventlog::{EventLog, EventType};
 use relix_core::types::{FlowId, RequestId, TraceId};
 
 use crate::dispatch::{build_request, decode_response};
-use crate::manifest::ManifestCache;
+use crate::manifest::{ManifestCache, MeshClient};
 use crate::sol::analyzer::Analyzer;
 use crate::sol::bytecode::Codegen;
 use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError, RemoteCallResult};
@@ -115,6 +115,12 @@ pub struct FlowRunOptions {
     /// `remote_call("memory", ...)` calls are unaffected. (M10.3)
     #[allow(missing_docs)]
     pub capability_cache: Option<std::sync::Arc<ManifestCache>>,
+    /// Optional pre-built [`MeshClient`] — when present, FlowRunner reuses
+    /// the existing libp2p transport and the already-resolved peer ids
+    /// instead of bringing up its own ephemeral peer per request. This is
+    /// the main M11 speedup; CLI standalone callers leave it `None`.
+    #[allow(missing_docs)]
+    pub mesh_client: Option<std::sync::Arc<MeshClient>>,
 }
 
 /// What `FlowRunner::run` returns to the caller (and `relix-cli flow-run`
@@ -150,19 +156,27 @@ impl FlowRunner {
 
     /// Execute the flow. Must run on a multi-threaded tokio runtime; the VM
     /// is moved onto `spawn_blocking` so the dispatcher can `block_on` libp2p.
+    ///
+    /// When [`FlowRunOptions::mesh_client`] is `Some`, the persistent
+    /// libp2p client is reused — the TCP + Noise + Yamux handshake is paid
+    /// **once** at bridge startup instead of per chat request. Otherwise the
+    /// runner brings up its own ephemeral peer (used by `relix-cli flow-run`).
     pub async fn run(self) -> Result<FlowRunResult, FlowRunnerError> {
         let Self { opts } = self;
 
-        // 1. libp2p ephemeral peer (alpha SIMP: random high port; avoids the
-        //    libp2p 0.54 `tcp/0` parse oddity).
-        let local_port = 21_000 + (rand::random::<u16>() % 8_000);
-        let (client, mut events, event_loop) = rpc::new(opts.client_key, local_port)
-            .await
-            .map_err(|e| FlowRunnerError::Transport(format!("rpc::new: {e}")))?;
-        tokio::spawn(event_loop.run());
-
-        // 2. Dial each configured peer and capture its libp2p PeerId.
-        let peer_ids = dial_all_peers(&client, &mut events, &opts.peers).await?;
+        let (client, peer_ids) = if let Some(mesh) = opts.mesh_client.clone() {
+            // M11 fast path: zero per-request handshakes.
+            (mesh.client(), mesh.peer_ids())
+        } else {
+            // Fallback path (CLI standalone).
+            let local_port = 21_000 + (rand::random::<u16>() % 8_000);
+            let (client, mut events, event_loop) = rpc::new(opts.client_key, local_port)
+                .await
+                .map_err(|e| FlowRunnerError::Transport(format!("rpc::new: {e}")))?;
+            tokio::spawn(event_loop.run());
+            let peer_ids = dial_all_peers(&client, &mut events, &opts.peers).await?;
+            (client, peer_ids)
+        };
 
         // 3. Compile the SOL source.
         let bytecode = compile_sol(&opts.flow_path)?;
