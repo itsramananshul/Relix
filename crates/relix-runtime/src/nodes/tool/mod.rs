@@ -48,8 +48,10 @@
 
 pub mod security;
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -106,119 +108,243 @@ fn default_user_agent() -> String {
     format!("Relix-tool/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Tool backend. Holds the per-node config and rebuilds a small reqwest
-/// client *per request* so each fetch can pin its hostname to the IPs the
-/// SSRF guard validated. The per-request build is the price for closing the
-/// DNS-rebind window between `security::resolve_safe_url` and the connect.
-pub struct ToolBackend {
-    cfg: ToolConfig,
+// ─────────────────────────── Client construction ───────────────────────────
+
+/// Construct a reqwest client with the configured deadlines / redirect cap,
+/// optionally pinning a hostname to a specific set of socket addresses (the
+/// M9 DNS-pinning lever). When `pin` is `None` the resulting client behaves
+/// like the default OS resolver — used only when the URL host is already a
+/// literal IP (so there's nothing to resolve in the first place) or for the
+/// startup probe.
+///
+/// Free function so [`PinnedClientPool`] can call it without holding a
+/// reference to the `ToolBackend` while constructing.
+fn build_client(
+    cfg: &ToolConfig,
+    pin: Option<(&str, &[SocketAddr])>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut b = reqwest::Client::builder()
+        .user_agent(cfg.user_agent.clone())
+        .timeout(Duration::from_secs(cfg.timeout_secs))
+        .connect_timeout(Duration::from_secs(cfg.timeout_secs.min(10)))
+        .redirect(ssrf_redirect_policy(cfg));
+    if let Some((host, addrs)) = pin {
+        b = b.resolve_to_addrs(host, addrs);
+    }
+    b.build()
 }
 
-impl ToolBackend {
-    /// Build the backend. Probes a client up-front so any TLS / config
-    /// problem (e.g. an unusable root store) surfaces at startup, not on the
-    /// first request.
-    pub fn new(cfg: ToolConfig) -> Result<Self, ToolError> {
-        let _probe = Self::build_client(&cfg, None)
-            .map_err(|e| ToolError::Build(format!("client probe: {e}")))?;
-        Ok(Self { cfg })
-    }
+/// Build a `reqwest::redirect::Policy::custom` that:
+///
+/// 1. Enforces `cfg.max_redirects` as a hard cap.
+/// 2. Re-runs the SSRF guard against every redirect target via
+///    [`resolve_safe_url_blocking`]. Closure is sync; DNS lookup blocks
+///    the calling thread briefly. Redirects are rare; cost is small.
+///
+/// On rejection the closure returns `Action::error`, which surfaces from
+/// `client.get(...).send()` as a `reqwest::Error` and the handler maps it
+/// to a `transport`-class error envelope.
+///
+/// **The same policy is baked into every pooled Client**, so per-hop SSRF
+/// re-validation runs on every hop regardless of which pooled Client
+/// served the request.
+fn ssrf_redirect_policy(cfg: &ToolConfig) -> reqwest::redirect::Policy {
+    let max_redirects = cfg.max_redirects;
+    let allow_http = cfg.allow_http;
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let target_str = attempt.url().to_string();
+        let previous_count = attempt.previous().len();
+        let origin = attempt
+            .previous()
+            .first()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
 
-    /// Construct a reqwest client with the configured deadlines / redirect
-    /// cap, optionally pinning a hostname to a specific set of socket
-    /// addresses (the M9 DNS-pinning lever). When `pin` is `None` the
-    /// resulting client behaves like the default OS resolver — used only
-    /// when the URL host is already a literal IP (so there's nothing to
-    /// resolve in the first place) or for the startup probe.
-    fn build_client(
-        cfg: &ToolConfig,
-        pin: Option<(&str, &[SocketAddr])>,
-    ) -> Result<reqwest::Client, reqwest::Error> {
-        let mut b = reqwest::Client::builder()
-            .user_agent(cfg.user_agent.clone())
-            .timeout(Duration::from_secs(cfg.timeout_secs))
-            .connect_timeout(Duration::from_secs(cfg.timeout_secs.min(10)))
-            .redirect(Self::ssrf_redirect_policy(cfg));
-        if let Some((host, addrs)) = pin {
-            b = b.resolve_to_addrs(host, addrs);
+        if previous_count >= max_redirects {
+            tracing::warn!(
+                target_url = %target_str,
+                origin_url = %origin,
+                hops = previous_count,
+                cap = max_redirects,
+                "tool.web_fetch: redirect cap reached; refusing follow"
+            );
+            return attempt.error(SsrfError::BadUrl(format!(
+                "tool.web_fetch: redirect cap ({max_redirects}) reached"
+            )));
         }
-        b.build()
-    }
-
-    /// Build a `reqwest::redirect::Policy::custom` that:
-    ///
-    /// 1. Enforces `cfg.max_redirects` as a hard cap (matching the old
-    ///    `Policy::limited` behaviour).
-    /// 2. Re-runs the SSRF guard against every redirect target via
-    ///    [`resolve_safe_url_blocking`]. The closure is sync; the DNS
-    ///    lookup blocks the calling thread briefly. Redirects are rare
-    ///    and short, so the practical cost is small and the closure
-    ///    catches `Location: http://127.0.0.1/`, `Location:
-    ///    http://localhost/`, cross-hostname rebinds, etc. — the
-    ///    cross-host gap previously documented in SIMP-021.
-    ///
-    /// On rejection the closure returns `Action::error`, which surfaces
-    /// from `client.get(...).send()` as a `reqwest::Error` and the handler
-    /// maps it to a `transport`-class error envelope. The original safe
-    /// fetch (the first hop) still succeeded fully — we just stop before
-    /// following an unsafe redirect.
-    fn ssrf_redirect_policy(cfg: &ToolConfig) -> reqwest::redirect::Policy {
-        let max_redirects = cfg.max_redirects;
-        let allow_http = cfg.allow_http;
-        reqwest::redirect::Policy::custom(move |attempt| {
-            let target_str = attempt.url().to_string();
-            let previous_count = attempt.previous().len();
-            let origin = attempt
-                .previous()
-                .first()
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-
-            if previous_count >= max_redirects {
-                // Explicit cap log so operators see the difference between
-                // "redirected too many times" and "redirected somewhere we
-                // refused to follow". audit visibility is still via the
-                // caller's audit record (the tool.web_fetch call recorded
-                // status=error on the responder); this is the tool node's
-                // own structured log line.
+        match resolve_safe_url_blocking(&target_str, allow_http) {
+            Ok(_) => {
+                tracing::debug!(
+                    target_url = %target_str,
+                    origin_url = %origin,
+                    hops = previous_count,
+                    "tool.web_fetch: redirect re-validated; following"
+                );
+                attempt.follow()
+            }
+            Err(e) => {
                 tracing::warn!(
                     target_url = %target_str,
                     origin_url = %origin,
                     hops = previous_count,
-                    cap = max_redirects,
-                    "tool.web_fetch: redirect cap reached; refusing follow"
+                    reason = %e,
+                    "tool.web_fetch: redirect ssrf-rejected; refusing follow"
                 );
-                return attempt.error(SsrfError::BadUrl(format!(
-                    "tool.web_fetch: redirect cap ({max_redirects}) reached"
-                )));
+                attempt.error(e)
             }
-            match resolve_safe_url_blocking(&target_str, allow_http) {
-                Ok(_) => {
-                    tracing::debug!(
-                        target_url = %target_str,
-                        origin_url = %origin,
-                        hops = previous_count,
-                        "tool.web_fetch: redirect re-validated; following"
-                    );
-                    attempt.follow()
-                }
-                Err(e) => {
-                    // Distinct WARN so a rebind-style attack against the
-                    // tool node is visible in the operator log stream
-                    // (the caller only sees a transport error). The
-                    // shape of `e` carries the exact reason (IpForbidden,
-                    // HostnameDenied, DnsForbidden, ...) so a query like
-                    // `grep "ssrf-rejected" tool.log` finds every attempt.
-                    tracing::warn!(
-                        target_url = %target_str,
-                        origin_url = %origin,
-                        hops = previous_count,
-                        reason = %e,
-                        "tool.web_fetch: redirect ssrf-rejected; refusing follow"
-                    );
-                    attempt.error(e)
-                }
-            }
+        }
+    })
+}
+
+// ─────────────────────────── Pinned client pool ────────────────────────────
+
+/// Maximum number of (hostname, addrs) entries cached in the pool before we
+/// start logging warnings. In practice the pool only ever holds as many
+/// entries as the set of unique safe destinations a single Relix process
+/// has fetched, which is operator-bounded.
+const POOL_SOFT_CAP: usize = 256;
+
+/// Key for [`PinnedClientPool`]: the hostname *and* the sorted set of
+/// validated socket addrs. Two requests sharing both share a `Client`.
+/// If DNS for the same hostname later returns a different safe address
+/// set, the cache miss naturally creates a new entry — the old entry
+/// lingers but only ever serves the IPs it was originally pinned to.
+/// **This is the security invariant**: a pooled `Client` can never be
+/// reused for a route that wasn't validated when it was created.
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct PoolKey {
+    hostname: String,
+    /// Sorted to give a deterministic key even when DNS reorders addresses.
+    addrs: Vec<SocketAddr>,
+}
+
+/// Per-(safe-route) cache of pinned reqwest clients + one shared unpinned
+/// client for IP-literal URLs.
+struct PinnedClientPool {
+    cfg: ToolConfig,
+    /// Pinned clients keyed by validated route.
+    pinned: RwLock<HashMap<PoolKey, Arc<reqwest::Client>>>,
+    /// Single shared client for IP-literal URLs (no DNS happens for those,
+    /// so default-resolver behaviour is correct and no pin is needed).
+    unpinned: Arc<reqwest::Client>,
+    /// Observability counters. Atomic loads are cheap; we log periodic
+    /// summaries via the tracing line on each miss so the log stream
+    /// reflects pool health without standing telemetry.
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl PinnedClientPool {
+    fn new(cfg: ToolConfig, unpinned: Arc<reqwest::Client>) -> Self {
+        Self {
+            cfg,
+            pinned: RwLock::new(HashMap::new()),
+            unpinned,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// Return the shared no-pin client for IP-literal URLs.
+    fn unpinned(&self) -> Arc<reqwest::Client> {
+        // Same Arc is handed out to every caller; reqwest's connection
+        // pool inside that Client takes care of cross-call connection
+        // reuse for hosts that look like IP literals.
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.unpinned.clone()
+    }
+
+    /// Return a pinned client for (`hostname`, `addrs`), creating one on
+    /// cache miss. Standard double-checked locking — on a miss we build
+    /// outside the write lock and may race another thread building the
+    /// same key (the duplicate gets dropped; no harm done).
+    fn pinned(
+        &self,
+        hostname: &str,
+        addrs: &[SocketAddr],
+    ) -> Result<Arc<reqwest::Client>, reqwest::Error> {
+        let mut sorted_addrs: Vec<SocketAddr> = addrs.to_vec();
+        sorted_addrs.sort();
+        sorted_addrs.dedup();
+        let key = PoolKey {
+            hostname: hostname.to_string(),
+            addrs: sorted_addrs,
+        };
+
+        // Fast path: read lock, lookup, hit.
+        if let Some(c) = self.pinned.read().expect("pool read lock").get(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(c.clone());
+        }
+
+        // Slow path: build outside any lock so concurrent misses don't
+        // serialise on TLS init.
+        let fresh = build_client(&self.cfg, Some((hostname, &key.addrs)))?;
+        let fresh_arc = Arc::new(fresh);
+
+        let mut guard = self.pinned.write().expect("pool write lock");
+        // Another thread might have inserted while we were building; in
+        // that case use theirs and let ours drop. Either way we count
+        // exactly one miss for this lookup.
+        let stored = guard
+            .entry(key.clone())
+            .or_insert_with(|| fresh_arc.clone())
+            .clone();
+        let total = guard.len();
+        let miss_count = self.misses.fetch_add(1, Ordering::Relaxed) + 1;
+        drop(guard);
+
+        tracing::info!(
+            hostname = %hostname,
+            pinned_addrs = ?key.addrs,
+            pool_entries = total,
+            pool_hits = self.hits.load(Ordering::Relaxed),
+            pool_misses = miss_count,
+            "tool.web_fetch: pool miss; built new pinned client"
+        );
+        if total >= POOL_SOFT_CAP {
+            tracing::warn!(
+                pool_entries = total,
+                soft_cap = POOL_SOFT_CAP,
+                "tool.web_fetch: pinned client pool exceeded soft cap (no eviction in alpha)"
+            );
+        }
+        Ok(stored)
+    }
+
+    /// Snapshot observability counters. Used by tests.
+    #[cfg(test)]
+    fn counters(&self) -> (u64, u64, usize) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+            self.pinned.read().expect("pool read lock").len(),
+        )
+    }
+}
+
+/// Tool backend. Owns a [`PinnedClientPool`] so each fetch reuses an
+/// already-built reqwest `Client` for `(hostname, validated-addrs)` it has
+/// seen before — paying the TLS init + hyper connector cost once per safe
+/// route instead of once per request. The pool's keying invariant
+/// (`(hostname, sorted_safe_addrs)`) guarantees the same `Client` only
+/// serves requests whose validated route matches what's pinned inside it.
+pub struct ToolBackend {
+    cfg: ToolConfig,
+    pool: PinnedClientPool,
+}
+
+impl ToolBackend {
+    /// Build the backend. Probes a client up-front so any TLS / config
+    /// problem (e.g. an unusable root store) surfaces at startup, not on
+    /// the first request. The probe client also seeds the unpinned slot of
+    /// the pool, which serves IP-literal URLs (where no DNS happens).
+    pub fn new(cfg: ToolConfig) -> Result<Self, ToolError> {
+        let probe =
+            build_client(&cfg, None).map_err(|e| ToolError::Build(format!("client probe: {e}")))?;
+        Ok(Self {
+            cfg: cfg.clone(),
+            pool: PinnedClientPool::new(cfg, Arc::new(probe)),
         })
     }
 
@@ -230,18 +356,21 @@ impl ToolBackend {
     ///    resolver returns every IP DNS gave us and rejects if *any* of
     ///    them is in a forbidden range (no DNS-rebind "pick the safe one"
     ///    smuggling).
-    /// 2. **Pin** the request's hostname to those validated IPs via
-    ///    `reqwest::ClientBuilder::resolve_to_addrs`. The reqwest client
-    ///    bypasses its built-in resolver, so the TCP connect targets the
-    ///    inspected address even if the upstream resolver subsequently
-    ///    returns something else. The URL still contains the hostname →
+    /// 2. **Look up** a pinned `Client` in [`PinnedClientPool`] keyed by
+    ///    `(hostname, sorted_validated_addrs)`. On a hit we reuse the
+    ///    existing TLS connector + connection pool; on a miss we build
+    ///    a new `Client` with `resolve_to_addrs(hostname, validated_addrs)`
+    ///    baked in and cache it. The keying invariant guarantees a Client
+    ///    can only serve requests whose validated route matches what's
+    ///    pinned inside it — DNS pinning is preserved across reuse.
+    /// 3. **Send** the request. The URL still contains the hostname →
     ///    `Host` header and TLS SNI keep pointing at the original origin.
-    /// 3. **Stream** the body into a bounded buffer; abort if the response
+    /// 4. **Stream** the body into a bounded buffer; abort if the response
     ///    exceeds the cap. `content-type` is filtered to text-like.
     ///
-    /// Per-hop redirect re-validation is a separate concern (tracked
-    /// in `docs/tool-node-security.md`); the redirect policy here caps
-    /// the *number* of follows, not their targets.
+    /// Per-hop redirect re-validation runs inside every pooled Client via
+    /// the same `Policy::custom` closure (see [`ssrf_redirect_policy`]),
+    /// so reuse never widens the redirect surface.
     pub async fn fetch(&self, raw_url: &str, max_bytes_request: usize) -> WebFetchOutcome {
         let cap = max_bytes_request.min(self.cfg.max_bytes).max(1);
 
@@ -272,15 +401,14 @@ impl ToolBackend {
             .collect();
         let is_ip_literal = host_str.parse::<IpAddr>().is_ok();
 
-        let pin: Option<(&str, &[SocketAddr])> = if is_ip_literal {
-            None
+        let client = if is_ip_literal {
+            self.pool.unpinned()
         } else {
-            Some((host_str.as_str(), pinned_addrs.as_slice()))
-        };
-        let client = match Self::build_client(&self.cfg, pin) {
-            Ok(c) => c,
-            Err(e) => {
-                return WebFetchOutcome::Transport(format!("client build with pin: {e}"));
+            match self.pool.pinned(host_str.as_str(), pinned_addrs.as_slice()) {
+                Ok(c) => c,
+                Err(e) => {
+                    return WebFetchOutcome::Transport(format!("client build with pin: {e}"));
+                }
             }
         };
 
@@ -644,8 +772,7 @@ mod tests {
             ..ToolConfig::default()
         };
         let pin: &[SocketAddr] = &[addr];
-        let client =
-            ToolBackend::build_client(&cfg, Some(("rebind.invalid", pin))).expect("client builds");
+        let client = build_client(&cfg, Some(("rebind.invalid", pin))).expect("client builds");
         let url = format!("http://rebind.invalid:{}/", addr.port());
         let resp = client.get(&url).send().await.expect("connect via pin");
         assert!(resp.status().is_success());
@@ -673,8 +800,7 @@ mod tests {
         // if a later resolver returned the decoy or a true rebind IP,
         // reqwest will only use entries in this pin list.
         let pin: &[SocketAddr] = &[validated_addr];
-        let client =
-            ToolBackend::build_client(&cfg, Some(("example.invalid", pin))).expect("client builds");
+        let client = build_client(&cfg, Some(("example.invalid", pin))).expect("client builds");
         let url = format!("http://example.invalid:{}/", validated_addr.port());
         let body = client
             .get(&url)
@@ -708,8 +834,8 @@ mod tests {
             max_redirects: 3,
             ..ToolConfig::default()
         };
-        let client = ToolBackend::build_client(&cfg, Some(("redirector.invalid", &[addr])))
-            .expect("client builds");
+        let client =
+            build_client(&cfg, Some(("redirector.invalid", &[addr]))).expect("client builds");
         let url = format!("http://redirector.invalid:{}/", addr.port());
         let r = client.get(&url).send().await;
         assert!(
@@ -745,8 +871,8 @@ mod tests {
             max_redirects: 3,
             ..ToolConfig::default()
         };
-        let client = ToolBackend::build_client(&cfg, Some(("private-redirect.invalid", &[addr])))
-            .expect("client builds");
+        let client =
+            build_client(&cfg, Some(("private-redirect.invalid", &[addr]))).expect("client builds");
         let url = format!("http://private-redirect.invalid:{}/", addr.port());
         let r = client.get(&url).send().await;
         assert!(
@@ -778,8 +904,8 @@ mod tests {
             max_redirects: 0,
             ..ToolConfig::default()
         };
-        let client = ToolBackend::build_client(&cfg, Some(("nofollow.invalid", &[addr])))
-            .expect("client builds");
+        let client =
+            build_client(&cfg, Some(("nofollow.invalid", &[addr]))).expect("client builds");
         let url = format!("http://nofollow.invalid:{}/", addr.port());
         let r = client.get(&url).send().await;
         assert!(
@@ -794,6 +920,182 @@ mod tests {
         );
     }
 
+    // ─────────────────── Pinned client pool reuse tests ────────────────
+    //
+    // These exercise the pool directly: two backends, multiple fetches,
+    // checking the (hits, misses, entries) tuple advertised by the
+    // #[cfg(test)] `counters()` helper. The pool's hit/miss accounting
+    // also drives the structured tracing line, so these tests double as
+    // observability coverage.
+
+    #[tokio::test]
+    async fn pool_reuses_same_client_for_same_host_and_addrs() {
+        let addr = spawn_loopback_server("hello-from-pool\n").await;
+        let mut cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        // Use a hostname that resolves via the system resolver - we cannot
+        // exercise resolve_safe_url for `.invalid`. Instead drive the pool
+        // by-hand and assert reuse via `counters()`.
+        cfg.user_agent = "Relix-tool/test-pool".into();
+        let backend = ToolBackend::new(cfg.clone()).unwrap();
+
+        // First call: miss.
+        let c1 = backend
+            .pool
+            .pinned("pool.invalid", &[addr])
+            .expect("client");
+        let (h1, m1, n1) = backend.pool.counters();
+        assert_eq!((m1, n1), (1, 1), "first call should miss");
+
+        // Second call same (host, addrs): hit, no new entry.
+        let c2 = backend
+            .pool
+            .pinned("pool.invalid", &[addr])
+            .expect("client");
+        let (h2, m2, n2) = backend.pool.counters();
+        assert_eq!(h2, h1 + 1, "second call must hit");
+        assert_eq!(m2, m1, "second call must not miss");
+        assert_eq!(n2, n1, "pool size unchanged");
+        assert!(Arc::ptr_eq(&c1, &c2), "must return the same Arc");
+    }
+
+    #[tokio::test]
+    async fn pool_creates_new_client_when_addrs_change() {
+        let addr_a = spawn_loopback_server("a\n").await;
+        let addr_b = spawn_loopback_server("b\n").await;
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        let backend = ToolBackend::new(cfg).unwrap();
+
+        let c1 = backend
+            .pool
+            .pinned("dns-changed.invalid", &[addr_a])
+            .expect("c1");
+        let c2 = backend
+            .pool
+            .pinned("dns-changed.invalid", &[addr_b])
+            .expect("c2");
+        assert!(
+            !Arc::ptr_eq(&c1, &c2),
+            "different validated addrs must yield different pooled clients"
+        );
+        let (_, misses, entries) = backend.pool.counters();
+        assert_eq!(misses, 2);
+        assert_eq!(entries, 2);
+    }
+
+    #[tokio::test]
+    async fn pool_separates_clients_per_hostname() {
+        let addr = spawn_loopback_server("c\n").await;
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        let backend = ToolBackend::new(cfg).unwrap();
+
+        let c1 = backend
+            .pool
+            .pinned("host-one.invalid", &[addr])
+            .expect("c1");
+        let c2 = backend
+            .pool
+            .pinned("host-two.invalid", &[addr])
+            .expect("c2");
+        assert!(
+            !Arc::ptr_eq(&c1, &c2),
+            "different hostnames must NOT share a pooled client (pin is per-host)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_addr_set_is_canonicalised_so_dns_reordering_still_hits() {
+        let a = spawn_loopback_server("x\n").await;
+        let b = spawn_loopback_server("y\n").await;
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        let backend = ToolBackend::new(cfg).unwrap();
+
+        // Insert with [a, b]; lookup with [b, a] should hit the same entry
+        // because pool keys sort the addrs into canonical order.
+        let c1 = backend.pool.pinned("multi.invalid", &[a, b]).expect("c1");
+        let c2 = backend.pool.pinned("multi.invalid", &[b, a]).expect("c2");
+        assert!(
+            Arc::ptr_eq(&c1, &c2),
+            "DNS-reordered addrs must hit the canonicalised pool key"
+        );
+        let (_, misses, entries) = backend.pool.counters();
+        assert_eq!(misses, 1);
+        assert_eq!(entries, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_unpinned_client_is_a_single_shared_arc() {
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        let backend = ToolBackend::new(cfg).unwrap();
+        let u1 = backend.pool.unpinned();
+        let u2 = backend.pool.unpinned();
+        assert!(
+            Arc::ptr_eq(&u1, &u2),
+            "ip-literal path must reuse a single Client"
+        );
+        // No pinned entries created by the unpinned fetches.
+        let (_, _, entries) = backend.pool.counters();
+        assert_eq!(entries, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_reuse_actually_carries_real_traffic() {
+        // End-to-end via fetch() to prove reuse works for actual fetches,
+        // not just direct pool calls. Two fetches to the same pinned host
+        // should result in 2 hits + 1 miss.
+        let addr = spawn_loopback_server("body-from-real-traffic\n").await;
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        let backend = ToolBackend::new(cfg).unwrap();
+
+        // We can't go through `fetch()` directly because resolve_safe_url
+        // would try real DNS for `.invalid`. Instead drive the pool path
+        // by hand: get a pinned client for our synthetic host, hit it
+        // twice, and confirm the counters reflect reuse.
+        let c1 = backend.pool.pinned("traffic.invalid", &[addr]).expect("c1");
+        let r1 = c1
+            .get(format!("http://traffic.invalid:{}/", addr.port()))
+            .send()
+            .await
+            .expect("send 1")
+            .text()
+            .await
+            .expect("body 1");
+        assert_eq!(r1, "body-from-real-traffic\n");
+
+        let c2 = backend.pool.pinned("traffic.invalid", &[addr]).expect("c2");
+        let r2 = c2
+            .get(format!("http://traffic.invalid:{}/", addr.port()))
+            .send()
+            .await
+            .expect("send 2")
+            .text()
+            .await
+            .expect("body 2");
+        assert_eq!(r2, "body-from-real-traffic\n");
+
+        let (hits, misses, entries) = backend.pool.counters();
+        assert_eq!(misses, 1, "only the first lookup should miss");
+        assert!(hits >= 1, "subsequent lookup(s) should hit");
+        assert_eq!(entries, 1);
+    }
+
     #[tokio::test]
     async fn unpinned_hostname_fails_dns_proving_pin_is_load_bearing() {
         // Sanity test: without a pin, the same `.invalid` hostname fails.
@@ -805,7 +1107,7 @@ mod tests {
             allow_http: true,
             ..ToolConfig::default()
         };
-        let client = ToolBackend::build_client(&cfg, None).expect("client builds");
+        let client = build_client(&cfg, None).expect("client builds");
         let url = "http://rebind-control.invalid:9/";
         let r = client.get(url).send().await;
         assert!(

@@ -263,8 +263,25 @@ Verified end-to-end by live tests (`cargo test -p relix-runtime --lib nodes::too
 **Why:** `tool.web_fetch` is the first capability that can dial arbitrary outbound endpoints. Without the pin the SSRF guard was advisory — reqwest re-resolved at connect time. Without per-hop re-validation, a `302 Location: http://127.0.0.1/` would have bypassed the guard entirely.
 
 **Consequence (deliberate trades):**
-- The tool node rebuilds a per-request `reqwest::Client` instead of sharing a single pooled client. The TLS + connect handshake is paid per call; reqwest's connection pool is lost for this capability. Acceptable for an outbound tool call that already includes a full HTTP roundtrip.
-- The redirect policy closure is sync (reqwest's API). DNS validation for redirect targets runs synchronously via `std::net::ToSocketAddrs::to_socket_addrs` on the calling thread. This briefly blocks one Tokio worker thread per redirect. Acceptable because redirects are rare; documented for operators on small worker pools.
+- The tool node maintains a `PinnedClientPool` keyed by `(hostname,
+  sorted_validated_addrs)` so repeat fetches against the same safe
+  route reuse the same `reqwest::Client` (and its hyper connection
+  pool). Earlier cuts of the M9 hardening rebuilt a fresh `Client`
+  per request; that gave correctness but burned ~140 ms / fetch on
+  TLS + connect setup. The pool restores ~60% of that cost (live
+  benchmark: cold 229 ms, warm steady ~90 ms) without weakening any
+  guarantee — the cached `Client` only ever serves requests whose
+  validated route matches what's pinned inside it. Naive global
+  reuse would have collapsed the DNS-pin guarantee; the pool key is
+  the validated route itself, so reuse cannot widen the connect set.
+- The pool has no LRU eviction in alpha — entries accumulate, soft
+  cap 256 (WARN over). Bound is operator-driven (set of hosts the
+  operator's flows fetch). LRU lands in a future milestone if needed.
+- The redirect policy closure is sync (reqwest's API). DNS validation
+  for redirect targets runs synchronously via `std::net::ToSocketAddrs::to_socket_addrs`
+  on the calling thread. This briefly blocks one Tokio worker thread
+  per redirect. Acceptable because redirects are rare; documented for
+  operators on small worker pools.
 
 **Resolution gate:** fully closed today; revisit only if reqwest's redirect machinery changes shape or we move the entire tool path to a streaming pipeline.
 

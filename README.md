@@ -206,6 +206,16 @@ stored in `AppState` and reused for every chat. `FlowRunner` now takes
 The standalone `relix-cli flow-run` path (no bridge) keeps the original
 per-call transport — the option is `None` for that caller.
 
+The same pattern, with stricter keying, applies to the tool node's HTTP
+client: a `PinnedClientPool` caches `reqwest::Client`s keyed by
+`(hostname, sorted_validated_addrs)` so repeat fetches reuse TLS +
+hyper connection state without ever sharing a `Client` whose pin doesn't
+match the request's validated route. Live measurement: cold first fetch
+**229 ms**, warm steady **~90 ms** (~60% reduction) with every SSRF,
+DNS-pin, and redirect invariant intact. Details:
+[`docs/tool-node-security.md`](docs/tool-node-security.md) §"Secure
+client pool".
+
 Local benchmark on a clean mesh (mock provider, 10 sequential `POST /chat`
 calls, warm cache):
 

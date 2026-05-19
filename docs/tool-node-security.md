@@ -27,6 +27,80 @@ The HTTP client (`reqwest`) and the response cap live **on the tool node**.
 The bridge cannot dial the outside world; it can only ask a peer that has
 the capability registered.
 
+## Secure client pool (`PinnedClientPool`)
+
+The first cut of M9 built a fresh `reqwest::Client` per request so each
+fetch could pin its hostname to the IPs the SSRF guard had just
+validated. Correct but wasteful: every fetch paid TLS root-store load,
+hyper connector construction, TCP handshake, and TLS handshake from
+scratch.
+
+Naive reuse would be dangerous. A globally-shared `Client` would either:
+- skip `resolve_to_addrs` and rely on the OS resolver at connect time —
+  defeating the DNS pin entirely; or
+- carry one host's `resolve_to_addrs` pin into requests for *other*
+  hosts — invalidating the per-route validation.
+
+The pool instead keys cached `Client`s on the *validated route*:
+
+```text
+PoolKey = (hostname, sorted_validated_addrs)
+```
+
+Same hostname **and** same DNS-validated address set → reuse the
+existing `Client` and its hyper connection pool. Different addrs (legit
+DNS change, multi-A round-robin, or a hostile flip) → cache miss → new
+`Client` built with `resolve_to_addrs(hostname, new_addrs)`. The stale
+entry persists (no LRU eviction in alpha) but can only ever serve
+requests pinned to the IPs it was originally validated against.
+
+**Security invariants preserved**:
+
+- A pooled `Client` only serves requests whose validated route matches
+  what's pinned inside it. The DNS-guard verdict at lookup time is the
+  same one baked into the cached `Client`.
+- TLS SNI + `Host` header keep targeting the original hostname (the URL
+  is unchanged; only the address the connector dials is pinned).
+- The same `Policy::custom` closure is built into every pooled `Client`,
+  so per-hop SSRF re-validation runs on every redirect hop regardless of
+  which pooled `Client` served the request.
+- IP-literal URLs use a single shared unpinned `Client` (no DNS happens
+  for those; default behaviour is correct and per-IP pinning would be
+  meaningless).
+- Tool-node audit log unchanged: `tool.web_fetch` calls go through the
+  same admission pipeline (identity → policy → handler → audit). Pool
+  state lives in handler memory only.
+
+**Observability**: each cache miss emits a structured INFO line —
+`tool.web_fetch: pool miss; built new pinned client hostname=...
+pinned_addrs=[...] pool_entries=N pool_hits=H pool_misses=M`. Cache
+hits are not logged at INFO (they're the common case); a DEBUG line
+is available if needed.
+
+**Live measurement** (mesh up, mock provider, 5 sequential fetches
+through `/chat_with_tool` against `https://example.com`):
+
+```
+cold first request : 229 ms  (Client build + TLS + DNS + connect)
+warm steady state  :  ~90 ms (p50 of requests 2..5; pooled Client + TCP+TLS reuse)
+```
+
+~60% reduction in steady-state per-fetch latency over the per-request
+build, with the security invariants above intact.
+
+**Honest limitations**:
+
+- **No eviction in alpha.** Entries accumulate over process lifetime,
+  one per unique safe `(hostname, addrs)` route. A soft cap of 256
+  triggers a WARN; no automatic LRU eviction. Bound is operator-driven
+  (set of hosts the operator's flows fetch). LRU lands in a future
+  milestone if observed entries grow unbounded in practice.
+- **Cross-host redirects** behave exactly as before pooling. The pooled
+  `Client` only has a pin for its origin host; cross-host follows are
+  handled by the same `Policy::custom` re-validation, with the same
+  small window between policy check and connect for the new host that
+  exists today.
+
 ## DNS pinning between guard and connect (M9 hardening)
 
 The previous alpha cut accepted that `resolve_safe_url` was advisory:

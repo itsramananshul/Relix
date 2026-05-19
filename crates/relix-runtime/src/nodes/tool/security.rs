@@ -28,8 +28,11 @@
 //!   `ToolBackend::fetch` pins reqwest's resolver to the IPs validated by
 //!   [`resolve_safe_url`] via `ClientBuilder::resolve_to_addrs`, so the
 //!   TCP connect cannot diverge from the inspected address. The URL
-//!   keeps the hostname so `Host` header + TLS SNI keep working.
-//!   See `docs/tool-node-security.md`.
+//!   keeps the hostname so `Host` header + TLS SNI keep working. The
+//!   pinned `reqwest::Client` is cached in a per-(hostname, validated-addrs)
+//!   pool so repeat fetches reuse the same TLS+connection state; the
+//!   cache key IS the validated route, so reuse cannot widen the
+//!   permitted connect set. See `docs/tool-node-security.md`.
 //! - **Per-hop redirect re-validation** is **closed**. The tool's reqwest
 //!   client uses a `reqwest::redirect::Policy::custom` closure that runs
 //!   [`resolve_safe_url_blocking`] on every redirect target — same-host
