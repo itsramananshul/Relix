@@ -166,15 +166,58 @@ impl ToolBackend {
         let max_redirects = cfg.max_redirects;
         let allow_http = cfg.allow_http;
         reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= max_redirects {
+            let target_str = attempt.url().to_string();
+            let previous_count = attempt.previous().len();
+            let origin = attempt
+                .previous()
+                .first()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+
+            if previous_count >= max_redirects {
+                // Explicit cap log so operators see the difference between
+                // "redirected too many times" and "redirected somewhere we
+                // refused to follow". audit visibility is still via the
+                // caller's audit record (the tool.web_fetch call recorded
+                // status=error on the responder); this is the tool node's
+                // own structured log line.
+                tracing::warn!(
+                    target_url = %target_str,
+                    origin_url = %origin,
+                    hops = previous_count,
+                    cap = max_redirects,
+                    "tool.web_fetch: redirect cap reached; refusing follow"
+                );
                 return attempt.error(SsrfError::BadUrl(format!(
                     "tool.web_fetch: redirect cap ({max_redirects}) reached"
                 )));
             }
-            let target_str = attempt.url().to_string();
             match resolve_safe_url_blocking(&target_str, allow_http) {
-                Ok(_) => attempt.follow(),
-                Err(e) => attempt.error(e),
+                Ok(_) => {
+                    tracing::debug!(
+                        target_url = %target_str,
+                        origin_url = %origin,
+                        hops = previous_count,
+                        "tool.web_fetch: redirect re-validated; following"
+                    );
+                    attempt.follow()
+                }
+                Err(e) => {
+                    // Distinct WARN so a rebind-style attack against the
+                    // tool node is visible in the operator log stream
+                    // (the caller only sees a transport error). The
+                    // shape of `e` carries the exact reason (IpForbidden,
+                    // HostnameDenied, DnsForbidden, ...) so a query like
+                    // `grep "ssrf-rejected" tool.log` finds every attempt.
+                    tracing::warn!(
+                        target_url = %target_str,
+                        origin_url = %origin,
+                        hops = previous_count,
+                        reason = %e,
+                        "tool.web_fetch: redirect ssrf-rejected; refusing follow"
+                    );
+                    attempt.error(e)
+                }
             }
         })
     }
