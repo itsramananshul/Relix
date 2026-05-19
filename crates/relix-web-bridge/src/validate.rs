@@ -1,0 +1,122 @@
+//! Input validation against the SIMP-018 substitution boundary.
+//!
+//! SOL string literals are `"..."` with no escape sequences (SIMP-016).
+//! Anything that breaks out of the literal or collides with the SIMP-016
+//! pipe-delimiter is rejected. Production-typed flow inputs (Gate 2)
+//! supersede this.
+
+/// Reject inputs that would corrupt the rendered SOL string literal.
+pub fn validate_input(session_id: &str, message: &str) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Err("session_id required".into());
+    }
+    if message.trim().is_empty() {
+        return Err("message required".into());
+    }
+    for (field_name, field) in [("session_id", session_id), ("message", message)] {
+        for ch in field.chars() {
+            match ch {
+                '"' => {
+                    return Err(format!(
+                        "{field_name}: '\"' forbidden (SOL has no string escapes)"
+                    ));
+                }
+                '|' => {
+                    return Err(format!(
+                        "{field_name}: '|' forbidden (collides with wire delimiter)"
+                    ));
+                }
+                '\r' | '\n' => {
+                    return Err(format!("{field_name}: newline forbidden"));
+                }
+                _ => {}
+            }
+        }
+    }
+    if session_id.len() > 256 || message.len() > 4096 {
+        return Err("input too long".into());
+    }
+    Ok(())
+}
+
+/// Best-effort sanitiser for inputs arriving through the OpenAI-compatible
+/// shim, where multi-line user content is common.
+///
+/// Rules (intentionally narrow so callers stay aware of the boundary):
+///   * `\r\n` and `\n` ⇒ single space.
+///   * Tabs ⇒ single space.
+///   * `"` and `|` are still rejected — silently rewriting either would
+///     surprise the user (their message would no longer say what they typed).
+pub fn sanitize_openai_message(s: &str) -> Result<String, String> {
+    if s.contains('"') {
+        return Err(
+            "message contains '\"' (SOL has no string escapes; ask client to remove)".into(),
+        );
+    }
+    if s.contains('|') {
+        return Err("message contains '|' (collides with wire delimiter)".into());
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\r' | '\n' | '\t' => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    Ok(out.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_input_rejects_empty() {
+        assert!(validate_input("", "x").is_err());
+        assert!(validate_input("s", "").is_err());
+        assert!(validate_input("   ", "x").is_err());
+    }
+
+    #[test]
+    fn validate_input_rejects_quotes_pipes_and_newlines() {
+        assert!(validate_input(r#"s"x"#, "msg").is_err());
+        assert!(validate_input("s|x", "msg").is_err());
+        assert!(validate_input("s\nx", "msg").is_err());
+        assert!(validate_input("session", r#"msg"with"quote"#).is_err());
+        assert!(validate_input("session", "msg|delim").is_err());
+        assert!(validate_input("session", "msg\nline").is_err());
+    }
+
+    #[test]
+    fn validate_input_rejects_too_long() {
+        let long = "a".repeat(257);
+        assert!(validate_input(&long, "x").is_err());
+        let long_msg = "b".repeat(4097);
+        assert!(validate_input("s", &long_msg).is_err());
+    }
+
+    #[test]
+    fn validate_input_accepts_normal_text() {
+        assert!(validate_input("demo-session", "hello world").is_ok());
+        assert!(validate_input("s_1", "punctuation? yes!").is_ok());
+    }
+
+    #[test]
+    fn sanitize_openai_message_replaces_newlines_and_tabs() {
+        let s = "line one\nline two\r\nline three\tindented";
+        let out = sanitize_openai_message(s).expect("ok");
+        assert_eq!(out, "line one line two  line three indented");
+    }
+
+    #[test]
+    fn sanitize_openai_message_rejects_quotes_and_pipes() {
+        assert!(sanitize_openai_message(r#"hi "there""#).is_err());
+        assert!(sanitize_openai_message("a|b").is_err());
+    }
+
+    #[test]
+    fn sanitize_openai_message_trims_outer_whitespace() {
+        let out = sanitize_openai_message("   hello   ").expect("ok");
+        assert_eq!(out, "hello");
+    }
+}

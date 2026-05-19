@@ -1,0 +1,120 @@
+//! Native chat endpoints: `POST /chat` (JSON) and `POST /chat/stream` (SSE).
+
+use std::time::Duration;
+
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Sse, sse::KeepAlive},
+};
+use serde::{Deserialize, Serialize};
+
+use crate::config::AppState;
+use crate::flow::{FlowExecError, execute_chat_flow};
+use crate::sse::build_chunked_sse;
+
+#[derive(Debug, Deserialize)]
+pub struct ChatRequest {
+    pub session_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatResponse {
+    pub reply: String,
+    pub flow_id: String,
+    pub trace_id: String,
+    pub flow_log: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+    pub flow_id: Option<String>,
+    pub flow_log: Option<String>,
+}
+
+pub async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok\n")
+}
+
+pub async fn chat(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match execute_chat_flow(&state, &req.session_id, &req.message).await {
+        Ok(o) => Ok(Json(ChatResponse {
+            reply: o.reply,
+            flow_id: o.flow_id,
+            trace_id: o.trace_id,
+            flow_log: o.flow_log_path,
+        })),
+        Err(e) => Err(exec_error_to_http(e)),
+    }
+}
+
+/// `POST /chat/stream` — bridge-level SSE (SIMP-019).
+///
+/// Output frames:
+///
+/// ```text
+/// event: chunk
+/// data: <slice of the final reply>
+///
+/// event: done
+/// data: {"flow_id":"…","trace_id":"…","flow_log":"…"}
+/// ```
+pub async fn chat_stream(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let outcome = execute_chat_flow(&state, &req.session_id, &req.message)
+        .await
+        .map_err(exec_error_to_http)?;
+
+    let done_payload = serde_json::json!({
+        "flow_id": outcome.flow_id,
+        "trace_id": outcome.trace_id,
+        "flow_log": outcome.flow_log_path,
+    })
+    .to_string();
+
+    let stream = build_chunked_sse(
+        outcome.reply,
+        state.cfg.sse.chunk_bytes,
+        Duration::from_millis(state.cfg.sse.chunk_delay_ms),
+        done_payload,
+    );
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+pub fn exec_error_to_http(e: FlowExecError) -> (StatusCode, Json<ErrorResponse>) {
+    match e {
+        FlowExecError::InvalidInput(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: msg,
+                flow_id: None,
+                flow_log: None,
+            }),
+        ),
+        FlowExecError::Transport(msg) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!("mesh transport: {msg}"),
+                flow_id: None,
+                flow_log: None,
+            }),
+        ),
+        FlowExecError::Internal(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: msg,
+                flow_id: None,
+                flow_log: None,
+            }),
+        ),
+    }
+}

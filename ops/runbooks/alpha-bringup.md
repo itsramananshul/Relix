@@ -401,6 +401,51 @@ Acceptance demonstrated by the bringup script:
 - `caller=web-bridge` on every audit entry — the bridge's identity, not a sneaky pseudo-user.
 - `grep` over the bridge crate + bridge config rejects any reference to `ANTHROPIC_API_KEY` or `sk-ant-` — secret containment proven.
 
+## M8/S2 streaming bridge + Open WebUI integration
+
+The bridge ships three extra endpoints — `POST /chat/stream`, `POST /v1/chat/completions`, and `GET /v1/models` — so any OpenAI-compatible client (Open WebUI, the official `openai` SDKs, LangChain's OpenAI provider, etc.) can talk to Relix unchanged. **No Open WebUI fork required.**
+
+Single-command demo (mock provider so it runs offline):
+
+```sh
+./scripts/alpha-bringup-m8-openwebui.sh --keep
+```
+
+Endpoint catalogue:
+
+| Method | Path                     | Body / Output                                            | SIMP |
+|--------|--------------------------|----------------------------------------------------------|------|
+| `GET`  | `/health`                | `ok\n`                                                   |      |
+| `POST` | `/chat`                  | JSON in / JSON out                                       | 018  |
+| `POST` | `/chat/stream`           | JSON in / `text/event-stream` (Relix-native frames)      | 019  |
+| `GET`  | `/v1/models`             | OpenAI-style models list                                 | 020  |
+| `POST` | `/v1/chat/completions`   | OpenAI request → JSON or OpenAI-style SSE                | 019 + 020 |
+
+Honest scope:
+
+- **Streaming is bridge-level** (SIMP-019). The chat flow completes via the synchronous SOL dispatcher (SIMP-001 + SIMP-014); the bridge then slices the materialised reply into SSE chunks. UX matches Open WebUI's typewriter effect; latency-to-first-chunk is full flow latency.
+- **OpenAI shim is request/response translation only** (SIMP-020). Bridge derives a stable `session_id` from `blake3(first_system || 0x00 || first_user)`, extracts the last `user` message as the prompt, sanitises `\n`/`\t` to spaces, rejects `"`/`|`, ignores `temperature`/`top_p`/etc., and runs the same SOL flow `/chat` uses. Provider keys live only on the AI node — the bridge does not authenticate the `Authorization` header. Bind to loopback only.
+- **`GET /v1/models`** lists whatever the operator put under `[[openai_compat.models]]` in `configs/web-bridge.toml`. The model id is cosmetic — provider selection lives on the AI node.
+
+Open WebUI configuration:
+
+1. Run the bringup script with `--keep`.
+2. Run Open WebUI locally (Docker is easiest):
+
+   ```sh
+   docker run -d -p 3000:8080 \
+       -v open-webui:/app/backend/data \
+       --name open-webui \
+       ghcr.io/open-webui/open-webui:main
+   ```
+3. In Open WebUI: **Settings → Connections → OpenAI API**.
+   - API Base URL: `http://host.docker.internal:19791/v1` (Docker on macOS/Windows) or `http://127.0.0.1:19791/v1` (native).
+   - API Key: any non-empty string.
+   - Save.
+4. The model picker shows the configured ids (default demo ships `relix-mock`). Chat normally; each turn round-trips memory → ai → memory through the mesh and the same audit/flow-log infrastructure as the native `/chat` path.
+
+Full integration story + curl examples + limitations: [`docs/streaming-and-openai-shim.md`](../../docs/streaming-and-openai-shim.md).
+
 ## Smoke Test (Acceptance, full alpha — M7+ work)
 
 The acceptance criteria from `docs/alpha-plan.md` are verified by:

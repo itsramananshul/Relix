@@ -100,6 +100,19 @@ The AI node is **provider-agnostic**: pick one of `mock` (default; deterministic
 
 A small axum service on `127.0.0.1:9100` exposes `POST /chat` and `GET /health`. The bridge is a normal Relix peer with its own identity bundle — it holds **no** AI provider key, never bypasses identity/policy, and never orchestrates in Rust. Each request renders `flows/chat_template.sol` with the JSON-supplied `session_id`/`message` and runs it through the existing `FlowRunner`, returning `{reply, flow_id, trace_id, flow_log}` JSON. Input validation rejects `"`, `|`, and newlines (the only characters that could break out of a SOL string literal under SIMP-018).
 
+### M8/S2 — streaming + Open WebUI (working today)
+
+```sh
+./scripts/alpha-bringup-m8-openwebui.sh --keep
+```
+
+Two new endpoint shapes ship on the same bridge so any OpenAI-compatible client can talk to Relix unchanged:
+
+- `POST /chat/stream` — Relix-native SSE (`event: chunk` × N, then `event: done` with a provenance JSON payload).
+- `POST /v1/chat/completions` (+ `GET /v1/models`) — OpenAI Chat Completions shape, supporting both non-streaming JSON and `stream:true` SSE. A stable `session_id` is derived from the first system + user message so the same conversation lands in the same Relix-memory bucket as it grows.
+
+Streaming is **bridge-level chunking** of an already-materialised reply (SIMP-019), not true provider-native token streaming. That arrives with the durable yield model at Gate 2. Full integration story + Open WebUI setup steps: [`docs/streaming-and-openai-shim.md`](docs/streaming-and-openai-shim.md).
+
 Full bringup (tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 
 ## Reporting Security Issues

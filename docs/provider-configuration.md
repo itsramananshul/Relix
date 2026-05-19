@@ -168,3 +168,9 @@ to the active `ChatProvider`. The reply text comes back as UTF-8.
 
 Typed CBOR `ChatInput` over the wire lands at Gate 2 with the CDDL stdlib.
 Until then, string `|` delimiting is the alpha contract.
+
+## Where the web bridge fits
+
+`relix-web-bridge` accepts both native (`POST /chat`, `POST /chat/stream`) and OpenAI-compatible (`POST /v1/chat/completions`, `GET /v1/models`) requests on `127.0.0.1`. None of these endpoints select a provider — they all run the same SOL chat flow, which delegates to whichever provider the AI node is configured with. The `model` field in OpenAI requests is cosmetic; the bridge advertises it back unchanged so OpenAI clients show something useful in their picker.
+
+This means switching providers on the AI node (mock → openrouter → anthropic) requires zero changes to Open WebUI's settings or to any other OpenAI-compatible client pointed at the bridge. See `docs/streaming-and-openai-shim.md`.

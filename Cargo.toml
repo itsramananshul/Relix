@@ -77,6 +77,9 @@ tempfile = "3.13"
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
+# SSE / streaming helpers (bridge)
+async-stream = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

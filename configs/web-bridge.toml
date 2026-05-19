@@ -38,3 +38,36 @@ deadline_secs = 30
 [flow]
 # SOL chat template. Two placeholders: `{{SESSION}}` and `{{MESSAGE}}`.
 template_path = "flows/chat_template.sol"
+
+# ──────────────────────────── SSE knobs (M8/S2) ───────────────────────────
+# Bridge-level streaming (SIMP-019): the chat flow completes in full and the
+# resulting reply is sliced into SSE chunks at the HTTP boundary. NOT true
+# per-token streaming — that arrives with the durable yield model at Gate 2.
+[sse]
+chunk_bytes    = 32   # bytes per emitted chunk (UTF-8 safe)
+chunk_delay_ms = 25   # delay between chunks; 0 ⇒ immediate flush
+
+# ─────────────────────── OpenAI-compatible shim (M8/S2) ───────────────────
+# `POST /v1/chat/completions` + `GET /v1/models` translate OpenAI-format
+# requests into the same SOL chat flow `/chat` uses. The bridge holds NO
+# provider key — provider selection happens on the AI node (see
+# `docs/provider-configuration.md`). The model ids below are advisory and
+# appear in OpenAI-client model pickers (Open WebUI, etc.).
+[openai_compat]
+default_model = "relix"
+
+[[openai_compat.models]]
+id          = "relix"
+description = "Default Relix mesh route (whichever provider is on the AI node)"
+
+[[openai_compat.models]]
+id          = "relix-mock"
+description = "Mesh route — AI node currently set to mock"
+
+[[openai_compat.models]]
+id          = "relix-openrouter"
+description = "Mesh route — AI node currently set to openrouter"
+
+[[openai_compat.models]]
+id          = "relix-anthropic"
+description = "Mesh route — AI node currently set to anthropic"

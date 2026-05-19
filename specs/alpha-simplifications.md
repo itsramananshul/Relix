@@ -209,6 +209,43 @@ If a behavior in the running code does not match a spec, either:
 
 Provider selection is one config line (`[ai] provider = "..."`); per-provider settings live in `[ai.providers.<name>]` and the key is loaded from a named env var (`api_key_env`). The web bridge and other presentation peers never hold keys. See `docs/provider-configuration.md`.
 
+## SIMP-019 — Bridge-level SSE chunking (not provider-native token streaming)
+
+**Spec target:** `RELIX-2` full credit-controlled bidirectional substream protocol + `RELIX-7` §7.4 durable yield model (so the AI provider's token stream can flow back through the VM frame-by-frame).
+
+**Alpha behavior:** The chat flow completes fully via the synchronous SOL dispatcher (SIMP-001 + SIMP-014). The bridge then slices the materialised reply into UTF-8-safe chunks and emits them over SSE. Two endpoint shapes exist:
+
+- `POST /chat/stream` — Relix-native (`event: chunk` × N, then `event: done` with a JSON payload carrying `flow_id` / `trace_id` / `flow_log`).
+- `POST /v1/chat/completions` with `stream:true` — OpenAI shape (`data: {role…}`, `data: {content…}` × N, `data: {finish_reason:stop, relix:{…}}`, `data: [DONE]`).
+
+Per-chunk size and inter-chunk delay are configurable under `[sse]` in `configs/web-bridge.toml`.
+
+**Why:** True token-by-token streaming requires (a) the AI node's provider implementations to surface a stream, and (b) the SOL VM to yield mid-flow so chunks can traverse `RemoteCall` while the flow is still running. (b) is Gate-2 work paired with SIMP-001. Until then, "stream-shaped" output at the HTTP edge buys real UX value (Open WebUI's typewriter effect works today) at zero substrate cost.
+
+**Consequence:** Latency to first chunk = full flow latency. The UI animates a reply that has already been computed. Documented in `docs/streaming-and-openai-shim.md`.
+
+**Resolution gate:** Gate 2 (with SIMP-001 + SIMP-014 + RELIX-2 substream protocol).
+
+## SIMP-020 — OpenAI-compatible shim is request/response translation only
+
+**Spec target:** None — the OpenAI shape is not a Relix substrate concern. Tracked here because the shim is the smallest stable integration path with Open WebUI.
+
+**Alpha behavior:** `POST /v1/chat/completions` and `GET /v1/models` accept OpenAI-shape JSON and translate to/from a single Relix chat turn:
+
+- **Session id derivation.** OpenAI requests carry the full message history every turn. The bridge derives a stable `session_id` = `oa-<12 hex>` from `blake3(first_system_content || 0x00 || first_user_content)`. As the conversation grows, the prefix stays constant, so subsequent turns land in the same memory bucket on the memory node.
+- **Prompt extraction.** Only the *last* `user` message becomes the SOL prompt. Prior history sent by the client is acknowledged but ignored — Relix memory (`memory.recent_for_session`) is the source of truth for what the AI sees.
+- **Sanitisation.** Newlines and tabs in user content collapse to single spaces (so the SIMP-018 SOL string boundary holds). `"` and `|` are rejected with 400 because silently rewriting them would change what the user said.
+- **Ignored OpenAI fields.** `temperature`, `top_p`, `max_tokens`, `n`, `presence_penalty`, `tool_choice`, `logprobs`, etc. are parsed and dropped — those are provider-side concerns on the AI node.
+- **Models endpoint.** `GET /v1/models` returns whatever the operator listed under `[openai_compat.models]` in the bridge config. The bridge does **not** dispatch by model id — provider selection is the AI node's job. Model ids are cosmetic so OpenAI clients show something in their picker.
+- **Streaming.** Bridge-level (SIMP-019).
+- **No provider key in the bridge.** The shim does not authenticate calls (the `Authorization` header is ignored in alpha). Bind to loopback only.
+
+**Why:** Open WebUI and most "OpenAI-compatible" tools speak this exact shape. A 250-line translation layer in the bridge unlocks them without coupling Relix to any frontend and without forking Open WebUI.
+
+**Consequence:** System messages, multi-modal content, OpenAI tool/function-call payloads, and per-call sampling controls are dropped in the alpha. Power users who want those should target `POST /chat` (native) or wait for typed flow inputs (Gate 2).
+
+**Resolution gate:** Gate 2 (multimodal + structured tool calls); shim itself is permanent.
+
 ## SIMP-018 — Bridge renders SOL flow via template substitution (web bridge → SOL)
 
 **Spec target:** typed SOL flow arguments crossing the wire (RELIX-7 §7.4 yield model + CDDL stdlib).
