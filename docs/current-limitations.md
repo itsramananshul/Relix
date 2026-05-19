@@ -24,21 +24,41 @@ flow halts with a transport error and the bridge returns a 502. There
 is a stub `coordinator/` module in `relix-runtime`; it has no
 production implementation today.
 
-### The bridge's `MeshClient` does not auto-reconnect
+### The bridge's `MeshClient` auto-reconnects on transient drops
 
-The bridge dials every peer once at startup, caches the libp2p
-`PeerId`s, and reuses the same client for every chat request (M11
-pooling). If a peer disappears (process killed, port reclaimed), the
-cached `PeerId` becomes stale; subsequent fetches return transport
-errors until the bridge is restarted. A reconnect loop is planned but
-not implemented.
+(Formerly a documented limitation; **closed** in commit `<pending>`.)
+The bridge holds an alias → `Multiaddr` address book alongside the
+alias → `PeerId` map. When `MeshClient::call` sees a transport-class
+error (`DialFailure`, `ConnectionClosed`, `Timeout`, `io`), it re-dials
+the original address once, waits briefly for the swarm to settle, and
+retries the call. Live-verified by killing the memory peer mid-session:
+the next chat fails with `retry after redial failed`; restarting the
+peer and re-issuing the chat succeeds without a bridge restart.
+Controller keys are persistent on disk so `PeerId`s are stable across
+peer restarts; the cached mapping stays valid.
 
-### Discovery is one-shot
+What's still **not** handled: a peer whose Ed25519 key is regenerated
+(by deleting `dev-keys/<run>-<node>.key` and restarting). The bridge's
+cached `PeerId` would be stale and the redial would connect to a peer
+with a different `PeerId`. The fix is "delete the bridge's cache too
+(restart the bridge)"; documented behaviour, not silent failure.
 
-`discover_and_pin` runs once at bridge startup and never refreshes.
-A peer that comes online *after* the bridge will not appear in
-`/v1/models` or be reachable via `capability:<method>` until the
-bridge is restarted. SIMP-007.
+### Discovery refreshes periodically
+
+(Formerly a documented limitation; **closed** in commit `<pending>`.)
+The bridge spawns a background task that re-runs `node.manifest`
+against every peer in its address book every 60s, updating the
+`ManifestCache`. A peer that comes online *after* the bridge will be
+discovered within one refresh interval and become reachable via
+`capability:<method>`. A peer whose capabilities change at runtime
+(e.g. a node-type with a hot-swap registration; not currently used in
+any built-in node) will also be picked up.
+
+What's still **not** handled: peers whose Multiaddr changes (different
+port, different host). The address book is populated from `peers.toml`
+at bridge startup and is not refreshed. SIMP-007 keeps applying for
+fully gossip-based discovery; the alpha refresh covers the in-`peers.toml`
+case only.
 
 ### No gossip / DHT-based peer discovery
 

@@ -206,6 +206,7 @@ impl FlowRunner {
             handle: tokio::runtime::Handle::current(),
             deadline_secs: opts.deadline_secs,
             capability_cache: opts.capability_cache.clone(),
+            mesh: opts.mesh_client.clone(),
         });
 
         // 7. Spawn the VM on blocking so dispatcher.block_on(...) is safe.
@@ -264,6 +265,11 @@ struct RealDispatcher {
     handle: tokio::runtime::Handle,
     deadline_secs: i64,
     capability_cache: Option<Arc<ManifestCache>>,
+    /// When present, calls go through [`MeshClient::call`] which adds
+    /// reconnect-on-transport-failure behaviour. When absent (the
+    /// `relix-cli flow-run` path), we keep the original direct
+    /// `Client::call(peer_id, ..)` flow.
+    mesh: Option<Arc<MeshClient>>,
 }
 
 impl RemoteCallDispatcher for RealDispatcher {
@@ -330,14 +336,35 @@ impl RemoteCallDispatcher for RealDispatcher {
         }
 
         // d) Dispatch. We are on a spawn_blocking thread; block_on is safe.
+        //
+        // When a MeshClient is wired (bridge path) we go through its
+        // call-with-reconnect entry point so a peer that died and came
+        // back doesn't fail the request. When it isn't (CLI standalone)
+        // we fall through to the direct Client::call path that worked
+        // before A.4.
         let started_at = std::time::Instant::now();
-        let resp_bytes_result = self.handle.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs((self.deadline_secs + 5) as u64),
-                self.client.call(peer_id, envelope_bytes),
-            )
-            .await
-        });
+        let resp_bytes_result = if let Some(mesh) = self.mesh.clone() {
+            let alias_owned = peer_alias.to_string();
+            self.handle.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs((self.deadline_secs + 5) as u64),
+                    async move {
+                        mesh.call(&alias_owned, envelope_bytes)
+                            .await
+                            .map_err(|e| e.cause)
+                    },
+                )
+                .await
+            })
+        } else {
+            self.handle.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs((self.deadline_secs + 5) as u64),
+                    self.client.call(peer_id, envelope_bytes),
+                )
+                .await
+            })
+        };
         let latency_ms = started_at.elapsed().as_millis() as u64;
 
         // e) Surface outcomes.

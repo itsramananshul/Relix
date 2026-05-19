@@ -99,7 +99,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pooled_peer_ids = mesh_client.peer_ids().len(),
                 "bridge discovery complete (transport pooled for M11)"
             );
-            state.manifest_cache = std::sync::Arc::new(discovered);
+            let cache_arc = std::sync::Arc::new(discovered);
+            state.manifest_cache = cache_arc.clone();
+
+            // A.4: spawn a background manifest-refresh loop. Every 60s
+            // re-pulls each peer's manifest so capabilities added /
+            // removed after bridge startup become visible without a
+            // restart, and so dropped connections are re-dialled
+            // proactively (in addition to the per-call reconnect retry
+            // inside `MeshClient::call`).
+            let refresh_handle = mesh_client
+                .clone()
+                .spawn_refresh_loop(cache_arc, std::time::Duration::from_secs(60));
+            tracing::info!(
+                period_secs = 60,
+                "mesh: background manifest refresh task spawned"
+            );
+            // Detach: the loop runs for the lifetime of the bridge
+            // process; we never `.await` the handle. `drop` silences
+            // clippy::let_underscore_future.
+            drop(refresh_handle);
+
             state.mesh_client = Some(std::sync::Arc::new(mesh_client));
         }
         None => {
