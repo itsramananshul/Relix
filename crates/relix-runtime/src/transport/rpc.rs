@@ -301,7 +301,7 @@ pub async fn new(
                 kad::store::MemoryStore::new(key.public().to_peer_id()),
             ),
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
         .build();
 
     let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse()?;
