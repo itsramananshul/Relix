@@ -1,6 +1,6 @@
 # Streaming and the OpenAI-Compatible Shim
 
-This document explains exactly what the web bridge does (and does NOT do) when an OpenAI-compatible client — most notably **Open WebUI** — points at `http://127.0.0.1:9100/v1/`.
+This document explains exactly what the web bridge does (and does NOT do) when an OpenAI-compatible client — most notably **Open WebUI** — points at `http://127.0.0.1:19791/v1/` (the bridge's current default; older drafts referenced `9100`, the pre-M8 port).
 
 It is the operational counterpart to:
 
