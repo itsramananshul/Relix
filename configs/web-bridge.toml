@@ -1,0 +1,40 @@
+# Local web bridge configuration (M8).
+#
+# The bridge is a normal Relix peer that happens to expose an HTTP server.
+# It owns NO AI provider key and does no orchestration of its own; SOL is
+# still the orchestration source of truth (the bridge just renders a flow
+# template per request and asks the existing flow runner to execute it).
+
+[bridge]
+# Loopback only in the alpha. NEVER bind to a non-loopback address without
+# also adding an HTTP-layer auth front (out of scope until Gate 2+).
+listen_addr = "127.0.0.1:9100"
+
+[identity]
+# Identity bundle the bridge presents to mesh responders. Mint with
+# `relix-cli identity mint --groups chat-users` (or whatever group the
+# memory + ai policies admit). The bundle is the alpha-grade AIC produced
+# by `relix-cli identity mint` (SIMP-002).
+bundle_path     = "dev-keys/bridge.aic"
+
+# 32-byte secret used as the local libp2p PeerId AND as the signer for
+# per-flow event log records. Gitignored.
+client_key_path = "dev-keys/bridge.key"
+
+[transport]
+# Peer alias map consumed by the flow runner; same shape as
+# `configs/peers-chained.toml`. Aliases must match the names used in
+# `flows/chat_template.sol`: `memory` and `ai`.
+peers_path    = "configs/peers-chained.toml"
+
+# Per-call deadline.
+deadline_secs = 30
+
+# Optional override for the per-flow event log directory; defaults to
+# `$RELIX_DATA_DIR/flow-runner/flows/` if unset (matching the CLI flow-run
+# behavior).
+# data_dir = "dev-data"
+
+[flow]
+# SOL chat template. Two placeholders: `{{SESSION}}` and `{{MESSAGE}}`.
+template_path = "flows/chat_template.sol"

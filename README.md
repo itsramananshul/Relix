@@ -90,7 +90,15 @@ cargo run -p relix-cli -- ping \
 
 The memory demo writes two turns to a real SQLite + FTS5 backend and reads history back. The chat demo orchestrates **two real controller processes** (memory + AI) from a 4-call SOL flow in a conversational state machine: persist user turn → read recent history → AI call → persist assistant turn. Alice's flow log has 10 events in exact order; bob (`guest`) is denied at the first call. A fifth verification call confirms both turns landed in the SQLite store.
 
-The AI node selects its provider via `[ai] provider = "mock"` (default; deterministic; no secrets) or `"anthropic"` (real Claude via `reqwest`; API key from `$ANTHROPIC_API_KEY` or the gitignored `api_key_path` file). The SOL flow is identical for both — adding a new provider is an `impl ChatProvider` + a `build_provider` arm, not an architectural change.
+The AI node is **provider-agnostic**: pick one of `mock` (default; deterministic; no secrets), `openai`, `openrouter`, `xai`, `local` (Ollama / vLLM / llama.cpp), `anthropic`, or `gemini` (placeholder). All provider keys are loaded from named env vars (`api_key_env = "VAR_NAME"`) and live only on the AI node. The SOL flow is identical across providers. See [`docs/provider-configuration.md`](docs/provider-configuration.md).
+
+### M8 — local web bridge (working today)
+
+```sh
+./scripts/alpha-bringup-m8-web-bridge.sh
+```
+
+A small axum service on `127.0.0.1:9100` exposes `POST /chat` and `GET /health`. The bridge is a normal Relix peer with its own identity bundle — it holds **no** AI provider key, never bypasses identity/policy, and never orchestrates in Rust. Each request renders `flows/chat_template.sol` with the JSON-supplied `session_id`/`message` and runs it through the existing `FlowRunner`, returning `{reply, flow_id, trace_id, flow_log}` JSON. Input validation rejects `"`, `|`, and newlines (the only characters that could break out of a SOL string literal under SIMP-018).
 
 Full bringup (tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 

@@ -2779,6 +2779,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "relix-web-bridge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "hex",
+ "hyper 1.9.0",
+ "rand 0.8.6",
+ "relix-core",
+ "relix-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

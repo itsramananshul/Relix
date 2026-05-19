@@ -200,7 +200,26 @@ If a behavior in the running code does not match a spec, either:
 
 ## SIMP-013 — Single AI provider (Anthropic), single model (RESOLVED)
 
-**Status:** Resolved by the M7 `ChatProvider` abstraction. The `ai.chat` capability is now provider-agnostic at the trait level (`crates/relix-runtime/src/nodes/ai/provider.rs`); two implementations ship: `MockProvider` (deterministic default) and `AnthropicProvider` (`claude` via reqwest). Adding OpenAI / Ollama is a new `impl ChatProvider` + a `build_provider` arm, not an architectural change. Single-model assumption (`claude-3-5-sonnet-latest` default) is documented as a per-provider knob in `[ai.anthropic] model`.
+**Status:** Fully resolved by the M8a provider-agnostic refactor. The `ai.chat` capability now sits behind a `ChatProvider` trait with five real backends:
+
+- `MockProvider` — deterministic; default; no secrets.
+- `OpenAICompatibleProvider` — covers `openai`, `openrouter`, `xai`, `local` (Ollama/vLLM/llama.cpp).
+- `AnthropicProvider` — native Messages API.
+- `GeminiProvider` — placeholder; clean error path until M9+.
+
+Provider selection is one config line (`[ai] provider = "..."`); per-provider settings live in `[ai.providers.<name>]` and the key is loaded from a named env var (`api_key_env`). The web bridge and other presentation peers never hold keys. See `docs/provider-configuration.md`.
+
+## SIMP-018 — Bridge renders SOL flow via template substitution (web bridge → SOL)
+
+**Spec target:** typed SOL flow arguments crossing the wire (RELIX-7 §7.4 yield model + CDDL stdlib).
+
+**Alpha behavior:** `relix-web-bridge`'s `POST /chat` endpoint takes `{session_id, message}` JSON, substitutes the values into `flows/chat_template.sol`'s `{{SESSION}}` / `{{MESSAGE}}` placeholders, writes the rendered SOL to a per-request tempfile, and asks `relix_runtime::flow_runner::FlowRunner` to execute it. The bridge rejects inputs containing `"`, `|`, or `\n` so the substitution stays inside a single SOL string literal.
+
+**Why:** the alpha SOL VM has no flow-arguments mechanism; the FlowRunner takes a `--flow <path>` only. Template substitution is the smallest architecturally honest path from "HTTP request" to "parameterized SOL execution" without inventing a new VM surface.
+
+**Consequence:** the validator forbids three characters in user input. Production typed flow inputs (Gate 2) supersede this.
+
+**Resolution gate:** Gate 2 (with `Inst::FlowArg` opcode + typed CDDL inputs).
 
 ---
 

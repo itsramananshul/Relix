@@ -301,7 +301,7 @@ Single-command demo:
 ./scripts/alpha-bringup-m7-chat.sh
 ```
 
-Enable a controller as the AI node with:
+Enable a controller as the AI node with one of seven providers. Full reference: [`docs/provider-configuration.md`](../../docs/provider-configuration.md). Minimal example with the default mock provider:
 
 ```toml
 [controller]
@@ -309,18 +309,23 @@ name      = "ai-node"
 node_type = "ai"
 
 [ai]
-provider = "mock"          # default; deterministic; no secrets
-# provider = "anthropic"   # real model
-[ai.anthropic]
-api_key_path = "dev-keys/anthropic.key"
-model        = "claude-3-5-sonnet-latest"
-max_tokens   = 1024
-timeout_secs = 60
+provider = "mock"
 ```
 
-The AI node's `register_node_type_handlers` builds the configured provider (a `ChatProvider` trait object — see `crates/relix-runtime/src/nodes/ai/provider.rs`) and registers `ai.chat`. Arg format: `session_id|prompt|history` (history may be empty). Returns: the model's reply text.
+Switching to a real provider — only the AI-node config changes; SOL flows, bridge, web layer are untouched:
 
-**API key handling (`anthropic` provider).** The key is loaded from `$ANTHROPIC_API_KEY` first; if unset, from the `api_key_path` file. Both options exist so CI can use env vars and local dev can use a gitignored file. The file path is never committed; `dev-keys/*.key` is excluded by `.gitignore`. Switching back to `mock` requires no secret at all.
+```toml
+[ai]
+provider = "openrouter"
+model    = ""    # empty = use [ai.providers.openrouter] default_model
+
+[ai.providers.openrouter]
+base_url      = "https://openrouter.ai/api/v1"
+api_key_env   = "OPENROUTER_API_KEY"
+default_model = "openai/gpt-4o-mini"
+```
+
+`api_key_env` names the env var the provider reads at startup. Keys NEVER live inline in TOML. `api_key_env = ""` (or unset) means "no auth" — used by `local` (Ollama-style) servers. The bridge and other presentation peers never hold keys.
 
 **Flow contract.** The `chat.sol` flow performs four sequential `remote_call`s, in this order:
 
@@ -330,6 +335,71 @@ The AI node's `register_node_type_handlers` builds the configured provider (a `C
 4. `memory.write_turn` — persist assistant reply.
 
 The script appends a fifth verification call (a tiny ad-hoc SOL flow) that re-reads `memory.recent_for_session` so operators can confirm both turns landed.
+
+## M8 web bridge — local HTTP entry point
+
+`relix-web-bridge` is a small axum service that exposes `POST /chat` and `GET /health` on `127.0.0.1` and turns chat requests into the existing SOL chat flow. The bridge is a normal Relix peer (its own identity bundle, its own libp2p `PeerId`); it owns NO AI provider key and never orchestrates in Rust.
+
+Single-command demo:
+
+```sh
+./scripts/alpha-bringup-m8-web-bridge.sh
+```
+
+Request shape:
+
+```sh
+curl -sS -X POST http://127.0.0.1:9100/chat \
+    -H "Content-Type: application/json" \
+    -d '{"session_id": "demo", "message": "hello"}'
+```
+
+Response (JSON):
+
+```json
+{
+  "reply":    "<provider reply text>",
+  "flow_id":  "<hex>",
+  "trace_id": "<hex>",
+  "flow_log": "dev-data/flow-runner/flows/<hex>.log"
+}
+```
+
+`GET /health` returns `200 OK` `ok\n`.
+
+### Bridge config (`configs/web-bridge.toml`)
+
+```toml
+[bridge]
+listen_addr = "127.0.0.1:9100"
+
+[identity]
+bundle_path     = "dev-keys/bridge.aic"      # `relix-cli identity mint` output
+client_key_path = "dev-keys/bridge.key"      # auto-generated on first start
+
+[transport]
+peers_path    = "configs/peers-chained.toml" # memory + ai aliases
+deadline_secs = 30
+
+[flow]
+template_path = "flows/chat_template.sol"    # placeholders: {{SESSION}} / {{MESSAGE}}
+```
+
+### How a request becomes a SOL run
+
+1. Bridge accepts the JSON, validates `session_id` and `message` reject `"`, `|`, `\n` so the substitution stays inside a SOL string literal.
+2. Bridge renders `flows/chat_template.sol` into a per-request tempfile.
+3. Bridge calls `relix_runtime::flow_runner::FlowRunner::run(...)` with its own identity bundle.
+4. The runner dials the configured `memory` and `ai` peers and runs the SOL flow. Each `remote_call` hits the responder's full M5 admission pipeline (identity + policy + audit).
+5. Bridge returns the flow's final value as `reply`, plus `flow_id`/`trace_id`/`flow_log` for inspection.
+
+Acceptance demonstrated by the bringup script:
+
+- 10-event flow log per request (`FlowStarted` → 4× Issued/Completed → `FlowCompleted`).
+- Memory responder audit shows 3 records per request (`write_turn` user → `recent_for_session` → `write_turn` assistant).
+- AI responder audit shows 1 record per request.
+- `caller=web-bridge` on every audit entry — the bridge's identity, not a sneaky pseudo-user.
+- `grep` over the bridge crate + bridge config rejects any reference to `ANTHROPIC_API_KEY` or `sk-ant-` — secret containment proven.
 
 ## Smoke Test (Acceptance, full alpha — M7+ work)
 

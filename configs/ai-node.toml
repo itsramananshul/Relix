@@ -1,9 +1,14 @@
 # AI node — registers `ai.chat`.
 #
-# Two providers ship today: `mock` (deterministic; default; no secrets) and
-# `anthropic` (real model). Provider selection is here in config; the SOL
-# chat flow does NOT change between providers — it always calls
-# `ai.chat(session_id|prompt|history)` and gets back UTF-8 text.
+# Relix is provider-agnostic by design. Pick an `[ai] provider` and supply
+# the matching `[ai.providers.<name>]` subsection. The SOL chat flow does
+# NOT change between providers; it always calls `ai.chat(session|prompt|history)`
+# and gets back UTF-8 text.
+#
+# Provider keys live ONLY on the AI node. Never embed a key inline — the
+# `api_key_env` field names the environment variable the provider reads at
+# startup. `api_key_env = ""` (or unset) means "no auth", which is the
+# normal case for `local` (Ollama-style) servers.
 
 [controller]
 name = "ai-node"
@@ -20,20 +25,52 @@ org_root_key_path = "dev-keys/org-root.pub"
 file = "configs/policies/ai.toml"
 
 [ai]
-# `mock` (default) or `anthropic`.
+# Active provider. One of:
+#   mock | openai | openrouter | xai | local | anthropic | gemini
 provider = "mock"
 
-# Provider-specific settings. Only consulted when `provider = "anthropic"`.
-[ai.anthropic]
-# The API key is loaded from $ANTHROPIC_API_KEY first; if unset, this
-# file path is read. The path file must contain the raw key (whitespace
-# stripped on read) and MUST be excluded from version control.
-api_key_path = "dev-keys/anthropic.key"
+# Optional default model id passed into ChatInput.model. Empty = use the
+# per-provider `default_model` from the matching [ai.providers.X] section.
+model = ""
 
-# Model + request budget.
-model        = "claude-3-5-sonnet-latest"
-max_tokens   = 1024
-timeout_secs = 60
+# Per-provider configuration. The active provider's section is required;
+# others are ignored. None of these holds a key directly.
+
+[ai.providers.openai]
+base_url      = "https://api.openai.com/v1"
+api_key_env   = "OPENAI_API_KEY"
+default_model = "gpt-4o-mini"
+timeout_secs  = 60
+
+[ai.providers.openrouter]
+base_url      = "https://openrouter.ai/api/v1"
+api_key_env   = "OPENROUTER_API_KEY"
+default_model = "openai/gpt-4o-mini"
+timeout_secs  = 60
+
+[ai.providers.xai]
+base_url      = "https://api.x.ai/v1"
+api_key_env   = "XAI_API_KEY"
+default_model = "grok-2-latest"
+timeout_secs  = 60
+
+[ai.providers.local]
+# Any OpenAI-compatible local server (Ollama with the openai-compat shim,
+# vLLM, llama.cpp's server, etc.). No auth by default.
+base_url      = "http://localhost:11434/v1"
+default_model = "llama3:8b"
+timeout_secs  = 120
+
+[ai.providers.anthropic]
+api_key_env   = "ANTHROPIC_API_KEY"
+default_model = "claude-3-5-sonnet-latest"
+timeout_secs  = 60
+
+[ai.providers.gemini]
+# Placeholder until M9+. Provider boots cleanly with a configured api_key_env
+# (or none) and returns a clear `not_yet_implemented` error on first call.
+api_key_env   = "GEMINI_API_KEY"
+default_model = "gemini-1.5-flash"
 
 [peers]
 # AI node typically has no outgoing peer needs.

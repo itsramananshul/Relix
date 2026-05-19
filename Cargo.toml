@@ -6,6 +6,7 @@ members = [
     "crates/relix-controller",
     "crates/relix-cli",
     "crates/relix-flow-inspect",
+    "crates/relix-web-bridge",
 ]
 
 # Shared metadata applied to every crate via `package.workspace = true`.
@@ -23,8 +24,9 @@ authors = ["Anshul Raman <ramanal@mail.uc.edu>"]
 [workspace.dependencies]
 
 # Internal crates — version pinned so cargo-deny does not treat them as wildcards.
-relix-core    = { path = "crates/relix-core",    version = "0.1.0" }
-relix-runtime = { path = "crates/relix-runtime", version = "0.1.0" }
+relix-core        = { path = "crates/relix-core",        version = "0.1.0" }
+relix-runtime     = { path = "crates/relix-runtime",     version = "0.1.0" }
+relix-web-bridge  = { path = "crates/relix-web-bridge",  version = "0.1.0" }
 # Cryptography
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core", "zeroize"] }
 blake3        = { version = "1.5", default-features = false, features = ["std"] }

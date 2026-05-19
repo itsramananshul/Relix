@@ -243,9 +243,11 @@ fn register_node_type_handlers(
         };
         let provider = crate::nodes::ai::build_provider(&ai_cfg)?;
         let provider_name = provider.provider_name();
-        crate::nodes::ai::register(bridge, provider.clone());
+        let default_model = ai_cfg.model.clone();
+        crate::nodes::ai::register(bridge, provider.clone(), default_model.clone());
         tracing::info!(
             provider = %provider_name,
+            default_model = %default_model,
             "ai node: registered ai.chat"
         );
     }
