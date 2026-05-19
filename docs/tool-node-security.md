@@ -27,6 +27,53 @@ The HTTP client (`reqwest`) and the response cap live **on the tool node**.
 The bridge cannot dial the outside world; it can only ask a peer that has
 the capability registered.
 
+## DNS pinning between guard and connect (M9 hardening)
+
+The previous alpha cut accepted that `resolve_safe_url` was advisory:
+reqwest re-resolved the hostname when it actually dialled, so a hostile
+authoritative server could in principle return a safe address during the
+guard's lookup and a forbidden one (e.g. `127.0.0.1`) for the connect.
+
+That window is now closed. `ToolBackend::fetch` is now structured as:
+
+1. `security::resolve_safe_url(url)` performs the safety check and
+   returns **every** IP the OS resolver gave us — already validated.
+2. The handler then builds a **per-request reqwest client** with
+   `ClientBuilder::resolve_to_addrs(hostname, &[SocketAddr; n])` pinned
+   to those validated addresses.
+3. `client.get(url).send()` is called. The URL still contains the
+   hostname, so the `Host` header and the TLS SNI keep pointing at the
+   original origin. The TCP connect, however, can only target an IP
+   we already inspected — reqwest bypasses its built-in resolver when
+   a host has a `resolve_to_addrs` entry.
+
+Cost: one reqwest `Client` per request. The pre-pin alpha shared a
+single client across all requests; we lose that connection pool. In
+exchange we get a property the alpha needs much more than a few ms of
+shaved latency — the guard's verdict is the connect's verdict.
+
+For URLs whose host is already an **IP literal** (e.g. `https://1.1.1.1/`)
+no pin is set: reqwest doesn't run a resolver in that case, and the
+literal IP was already accepted/rejected in step 1.
+
+Live evidence in `pin_forces_connect_to_validated_ip_not_dns` and
+`pin_to_one_ip_ignores_other_addresses_in_dns` (run with
+`cargo test -p relix-runtime --lib nodes::tool`): a synthetic hostname
+in the RFC 2606 `.invalid` TLD is reached over the pin even though it
+has no real DNS, and the control test
+`unpinned_hostname_fails_dns_proving_pin_is_load_bearing` confirms the
+same hostname fails when no pin is set.
+
+Remaining honest gap: **per-hop redirect re-validation**. If the
+configured `max_redirects > 0` and the first hop returns `302 Location:
+http://attacker-rebind/`, reqwest's own redirect policy follows it
+without re-running `security::resolve_safe_url`. The follow inherits
+*this* request's pinning, so it still can't reach an address we have
+already validated as forbidden via the same hostname — but a redirect
+to a *different* hostname is currently re-resolved by reqwest with no
+pin. Tracked for a future milestone; the safest interim posture is
+`max_redirects = 0` for high-blast-radius deployments.
+
 ## SSRF Defence (`security::resolve_safe_url`)
 
 Every call goes through these checks **before** any HTTP I/O:
@@ -63,18 +110,23 @@ embeddings of any of the IPv4 forbidden ranges.
 
 ### Honest limitations
 
-- **DNS rebinding** is mitigated, not eliminated. Today the tool node
-  resolves the hostname, validates every returned address, then hands
-  the original URL to `reqwest`, which re-resolves and connects. A
-  rebind between the safety check and the connect would not be caught.
-  At Gate 2 we plan to pin the connection to the inspected SocketAddr
-  via a custom hyper resolver.
-- **Redirect targets** are bounded by `reqwest`'s redirect policy
-  (`[tool] max_redirects = 3` default) but each follow is **not**
-  re-screened by `security::resolve_safe_url`. A malicious origin
-  could redirect to e.g. `https://example-thatresolvesto-10.0.0.1/`.
-  A future milestone replaces the default redirect policy with a
-  `Policy::custom` that re-runs the SSRF guard on every hop.
+- **DNS rebinding between guard and connect: closed (M9 hardening).**
+  See the "DNS pinning between guard and connect" section above. The
+  TCP connect now targets a `SocketAddr` validated by the same
+  resolution that fed the safety check, via
+  `reqwest::ClientBuilder::resolve_to_addrs`. Original hostname is
+  preserved in the URL → `Host` header and TLS SNI keep working.
+  Verified by the live tests
+  `pin_forces_connect_to_validated_ip_not_dns` /
+  `pin_to_one_ip_ignores_other_addresses_in_dns` and the control
+  `unpinned_hostname_fails_dns_proving_pin_is_load_bearing`.
+- **Per-hop redirect re-validation: still open.** Redirects within the
+  same hostname inherit this request's pin and therefore can only land
+  on validated IPs. *Cross-hostname* redirects (e.g. `Location:
+  http://attacker.example/`) are re-resolved by reqwest without a pin
+  and not re-checked by `resolve_safe_url`. Operators worried about
+  this should set `[tool] max_redirects = 0` until a `Policy::custom`
+  is wired in a future milestone.
 - **OS-level egress filtering** is not configured by the tool node.
   On a shared host, operators should add an iptables / Windows-Firewall
   outbound deny for RFC 1918 networks to the tool node's user account.

@@ -48,6 +48,7 @@
 
 pub mod security;
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,37 +106,65 @@ fn default_user_agent() -> String {
     format!("Relix-tool/{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// HTTP client shared across requests (connection pool reuse). Constructed once.
+/// Tool backend. Holds the per-node config and rebuilds a small reqwest
+/// client *per request* so each fetch can pin its hostname to the IPs the
+/// SSRF guard validated. The per-request build is the price for closing the
+/// DNS-rebind window between `security::resolve_safe_url` and the connect.
 pub struct ToolBackend {
     cfg: ToolConfig,
-    client: reqwest::Client,
 }
 
 impl ToolBackend {
-    /// Build the backend, baking the deadlines/redirect cap into the client.
+    /// Build the backend. Probes a client up-front so any TLS / config
+    /// problem (e.g. an unusable root store) surfaces at startup, not on the
+    /// first request.
     pub fn new(cfg: ToolConfig) -> Result<Self, ToolError> {
-        let client = reqwest::Client::builder()
+        let _probe = Self::build_client(&cfg, None)
+            .map_err(|e| ToolError::Build(format!("client probe: {e}")))?;
+        Ok(Self { cfg })
+    }
+
+    /// Construct a reqwest client with the configured deadlines / redirect
+    /// cap, optionally pinning a hostname to a specific set of socket
+    /// addresses (the M9 DNS-pinning lever). When `pin` is `None` the
+    /// resulting client behaves like the default OS resolver — used only
+    /// when the URL host is already a literal IP (so there's nothing to
+    /// resolve in the first place) or for the startup probe.
+    fn build_client(
+        cfg: &ToolConfig,
+        pin: Option<(&str, &[SocketAddr])>,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        let mut b = reqwest::Client::builder()
             .user_agent(cfg.user_agent.clone())
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .connect_timeout(Duration::from_secs(cfg.timeout_secs.min(10)))
-            .redirect(reqwest::redirect::Policy::limited(cfg.max_redirects))
-            .build()
-            .map_err(|e| ToolError::Build(e.to_string()))?;
-        Ok(Self { cfg, client })
+            .redirect(reqwest::redirect::Policy::limited(cfg.max_redirects));
+        if let Some((host, addrs)) = pin {
+            b = b.resolve_to_addrs(host, addrs);
+        }
+        b.build()
     }
 
     /// Run the configured capability against a single URL.
     ///
     /// Order of operations matters for safety:
     ///
-    /// 1. Validate scheme & host with `security::resolve_safe_url`. This
-    ///    performs DNS *and* returns the chosen [`std::net::SocketAddr`] so we
-    ///    can pin the connection to the validated IP. DNS rebind can't beat
-    ///    a check that the connection is bound to the inspected address.
-    /// 2. Issue the GET via `reqwest`. `reqwest`'s redirect policy applies;
-    ///    each follow is independently re-validated (see [`Self::fetch`]).
-    /// 3. Stream the body into a bounded buffer; abort if the response
-    ///    exceeds the cap.
+    /// 1. **Validate** scheme & host with `security::resolve_safe_url`. The
+    ///    resolver returns every IP DNS gave us and rejects if *any* of
+    ///    them is in a forbidden range (no DNS-rebind "pick the safe one"
+    ///    smuggling).
+    /// 2. **Pin** the request's hostname to those validated IPs via
+    ///    `reqwest::ClientBuilder::resolve_to_addrs`. The reqwest client
+    ///    bypasses its built-in resolver, so the TCP connect targets the
+    ///    inspected address even if the upstream resolver subsequently
+    ///    returns something else. The URL still contains the hostname →
+    ///    `Host` header and TLS SNI keep pointing at the original origin.
+    /// 3. **Stream** the body into a bounded buffer; abort if the response
+    ///    exceeds the cap. `content-type` is filtered to text-like.
+    ///
+    /// Per-hop redirect re-validation is a separate concern (tracked
+    /// in `docs/tool-node-security.md`); the redirect policy here caps
+    /// the *number* of follows, not their targets.
     pub async fn fetch(&self, raw_url: &str, max_bytes_request: usize) -> WebFetchOutcome {
         let cap = max_bytes_request.min(self.cfg.max_bytes).max(1);
 
@@ -144,14 +173,42 @@ impl ToolBackend {
             Err(e) => return WebFetchOutcome::Rejected(e),
         };
 
-        // We re-validate redirect targets ourselves rather than trusting
-        // reqwest's redirect cap alone — reqwest has no concept of SSRF.
-        // (Alpha SIMP: we still rely on reqwest's connect to a hostname.
-        // The trade-off: dialing the validated SocketAddr would require
-        // a hyper-level custom resolver. Documented in security.rs.)
-        let url = target.normalized_url.clone();
+        // M9 DNS pinning: pre-compute the SocketAddrs we will allow the
+        // hostname to resolve to. For an IP-literal URL there is nothing to
+        // pin (reqwest does not run the resolver in that case).
+        let host_str = target
+            .normalized_url
+            .host_str()
+            .expect("resolve_safe_url guarantees a host")
+            .to_string();
+        let port = target.normalized_url.port_or_known_default().unwrap_or(
+            if target.normalized_url.scheme() == "https" {
+                443
+            } else {
+                80
+            },
+        );
+        let pinned_addrs: Vec<SocketAddr> = target
+            .resolved
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect();
+        let is_ip_literal = host_str.parse::<IpAddr>().is_ok();
 
-        let resp = match self.client.get(url).send().await {
+        let pin: Option<(&str, &[SocketAddr])> = if is_ip_literal {
+            None
+        } else {
+            Some((host_str.as_str(), pinned_addrs.as_slice()))
+        };
+        let client = match Self::build_client(&self.cfg, pin) {
+            Ok(c) => c,
+            Err(e) => {
+                return WebFetchOutcome::Transport(format!("client build with pin: {e}"));
+            }
+        };
+
+        let url = target.normalized_url.clone();
+        let resp = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => return WebFetchOutcome::Transport(e.to_string()),
         };
@@ -471,6 +528,106 @@ mod tests {
         let backend = ToolBackend::new(ToolConfig::default()).unwrap();
         let r = backend.fetch("not a url", 1024).await;
         assert!(matches!(r, WebFetchOutcome::Rejected(_)), "got {:?}", r);
+    }
+
+    // ──────────────────── DNS pinning live tests ──────────────────────────
+    //
+    // Strategy: bring up a tiny axum HTTP server on a random loopback port,
+    // then exercise `build_client` with a synthetic hostname that has no
+    // real DNS. If pinning works, reqwest connects to the loopback server
+    // (we get our test body back); if it didn't, reqwest's resolver would
+    // fail with NXDOMAIN. The test proves the post-validation connect goes
+    // to the pinned address, not whatever the resolver returns at request
+    // time — i.e. defeats DNS rebinding between guard and connect.
+
+    /// Spawn a one-shot axum server returning a fixed body. Returns the
+    /// bound `SocketAddr`. Drops with the test scope.
+    async fn spawn_loopback_server(body: &'static str) -> SocketAddr {
+        use axum::{Router, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", get(move || async move { body }));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn pin_forces_connect_to_validated_ip_not_dns() {
+        // Bring up loopback server.
+        let addr = spawn_loopback_server("pin-works\n").await;
+
+        // Build a client pinned to a hostname that almost certainly does
+        // NOT resolve via the system resolver (`.invalid` is RFC 2606
+        // reserved). If pinning didn't work, reqwest would fail with
+        // NXDOMAIN. If it does, reqwest connects to 127.0.0.1:addr.port.
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        let pin: &[SocketAddr] = &[addr];
+        let client =
+            ToolBackend::build_client(&cfg, Some(("rebind.invalid", pin))).expect("client builds");
+        let url = format!("http://rebind.invalid:{}/", addr.port());
+        let resp = client.get(&url).send().await.expect("connect via pin");
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "pin-works\n");
+    }
+
+    #[tokio::test]
+    async fn pin_to_one_ip_ignores_other_addresses_in_dns() {
+        // This test simulates a rebinding-style trick: the URL hostname
+        // *could* in principle resolve to both a loopback (forbidden) and
+        // a public IP at request time. We pin to ONLY the validated
+        // (public) IP and confirm reqwest connects there. We use a second
+        // loopback server as the "validated" target to keep the test
+        // hermetic, and supply an unrelated forbidden-looking address in
+        // the URL host (which wouldn't normally resolve at all).
+        let validated_addr = spawn_loopback_server("validated-host\n").await;
+        let _decoy_addr = spawn_loopback_server("decoy-NEVER-SHOULD-SEE\n").await;
+
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        // Pin maps "example.invalid" *only* to the validated socket. Even
+        // if a later resolver returned the decoy or a true rebind IP,
+        // reqwest will only use entries in this pin list.
+        let pin: &[SocketAddr] = &[validated_addr];
+        let client =
+            ToolBackend::build_client(&cfg, Some(("example.invalid", pin))).expect("client builds");
+        let url = format!("http://example.invalid:{}/", validated_addr.port());
+        let body = client
+            .get(&url)
+            .send()
+            .await
+            .expect("send")
+            .text()
+            .await
+            .expect("body");
+        assert_eq!(body, "validated-host\n");
+    }
+
+    #[tokio::test]
+    async fn unpinned_hostname_fails_dns_proving_pin_is_load_bearing() {
+        // Sanity test: without a pin, the same `.invalid` hostname fails.
+        // If this ever started succeeding it would mean either (a) the
+        // test environment poisoned its DNS, or (b) reqwest grew an
+        // implicit fallback — either way our pin assumption needs to be
+        // re-examined.
+        let cfg = ToolConfig {
+            allow_http: true,
+            ..ToolConfig::default()
+        };
+        let client = ToolBackend::build_client(&cfg, None).expect("client builds");
+        let url = "http://rebind-control.invalid:9/";
+        let r = client.get(url).send().await;
+        assert!(
+            r.is_err(),
+            "expected DNS failure without pin (got success — pin test is meaningless)"
+        );
     }
 
     #[test]

@@ -246,6 +246,20 @@ Per-chunk size and inter-chunk delay are configurable under `[sse]` in `configs/
 
 **Resolution gate:** Gate 2 (multimodal + structured tool calls); shim itself is permanent.
 
+## SIMP-021 — `tool.web_fetch` SSRF guard: DNS pinned, cross-host redirects not re-screened
+
+**Spec target:** a tool-node external-action capability that is safe to expose to chat users.
+
+**Alpha behavior (M9 + post-M11 hardening):** `tool.web_fetch` runs the SSRF guard in `relix_runtime::nodes::tool::security` before any I/O — scheme allowlist, literal-IP rejection, hostname denylist, full DNS resolution where *every* returned address must be safe. The actual TCP connect is then **pinned** to those validated addresses via `reqwest::ClientBuilder::resolve_to_addrs(host, &[SocketAddr; n])`, so the address the connector dials cannot diverge from the address the guard inspected (DNS-rebind window closed). The URL retains the hostname so `Host` and TLS SNI keep targeting the original origin. Verified by live tests `pin_forces_connect_to_validated_ip_not_dns`, `pin_to_one_ip_ignores_other_addresses_in_dns`, and the control test `unpinned_hostname_fails_dns_proving_pin_is_load_bearing`.
+
+**Why:** `tool.web_fetch` is the first capability that can dial arbitrary outbound endpoints. Without the pin the SSRF guard was advisory — reqwest re-resolved at connect time. With it the guard's verdict is the connect's verdict.
+
+**Consequence:** the tool node rebuilds a per-request `reqwest::Client` (one `Client` per fetch) instead of sharing a single pooled client. The TLS + connect handshake is paid per call; reqwest's connection pool is lost for this capability. Acceptable for an outbound tool call that already includes a full HTTP roundtrip, but worth noting as a deliberate trade.
+
+**Still open:** **cross-hostname redirect re-validation.** Redirects within the same hostname inherit the per-request pin and therefore can only land on validated IPs. A `Location:` header that points at a *different* hostname is re-resolved by reqwest with no pin and not re-screened by `resolve_safe_url`. Operators concerned about this should set `[tool] max_redirects = 0`. Wiring a `reqwest::redirect::Policy::custom` that re-runs the SSRF guard on every hop is tracked for a future milestone; doing it correctly is a small but spec-affecting change to how redirects are observed.
+
+**Resolution gate:** the DNS-rebind half of this SIMP is resolved today. The redirect half resolves in a later milestone with `Policy::custom` or by dropping the redirect cap entirely.
+
 ## SIMP-018 — Bridge renders SOL flow via template substitution (web bridge → SOL)
 
 **Spec target:** typed SOL flow arguments crossing the wire (RELIX-7 §7.4 yield model + CDDL stdlib).
