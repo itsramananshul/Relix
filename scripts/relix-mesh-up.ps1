@@ -221,9 +221,21 @@ user_agent    = "Relix-tool/0.1.0"
 
 # 5) Shared policy. Tool capability requires chat-users (same as ai/memory),
 #    so the bridge's existing identity bundle is sufficient.
+#    node.manifest is admitted for chat-users so the bridge can discover
+#    each peer's capability set at startup (M10).
 @"
 [admit]
 groups = ["chat-users"]
+
+[[rules]]
+name = "node_health"
+method = "node.health"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_manifest"
+method = "node.manifest"
+allow_groups = ["chat-users"]
 
 [[rules]]
 name = "mem_recent"

@@ -50,6 +50,7 @@ pub async fn run(
         peers,
         data_dir: None,
         deadline_secs,
+        capability_cache: None,
     };
     let result = FlowRunner::new(opts).run().await?;
 

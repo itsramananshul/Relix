@@ -156,6 +156,36 @@ Security details, descriptor metadata, and honest limitations (DNS rebind
 between guard and connect; per-hop redirect re-validation) live in
 [`docs/tool-node-security.md`](docs/tool-node-security.md).
 
+### M10 — runtime capability discovery (working today)
+
+Every controller now serves a built-in `node.manifest` capability that
+returns its current `NodeManifest` (node id, type, listen endpoints, and
+the live set of `CapabilityDescriptor`s). The web bridge runs a one-shot
+**discovery pass** at startup: dials each peer in `peers.toml`, pulls
+their manifests, and caches them.
+
+Two operator-visible effects:
+
+1. SOL flows can target a **capability** instead of a hard-coded peer
+   alias:
+   ```text
+   remote_call("capability:tool.web_fetch", "tool.web_fetch", url);
+   ```
+   The dispatcher resolves the prefix to whichever cached peer
+   advertises the method. Static aliases (`"memory"`, `"ai"`, etc.)
+   continue to work unchanged — `flows/chat.sol` and the other M5–M9
+   flows did not need updating.
+2. `GET /v1/models` derives extra entries from the cache. Any peer that
+   advertises `ai.chat` shows up as `relix-<provider>` (provider name
+   carried in the descriptor's `sensitivity_tags`). Operator-curated
+   entries from `[openai_compat] models = [...]` still win on id
+   collisions.
+
+Discovery is best-effort: a failed pull leaves that peer absent from the
+cache, the bridge logs a warning, and static aliases keep working. The
+manifest payload is *not* signed in the alpha (that lands at Gate 2 along
+with full gossip-based propagation).
+
 Full bringup (tool / web nodes — M7+ continuing work): see `ops/runbooks/alpha-bringup.md`.
 
 ## Reporting Security Issues

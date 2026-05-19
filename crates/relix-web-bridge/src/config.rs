@@ -12,6 +12,7 @@ use serde::Deserialize;
 use relix_core::bundle::Bundle;
 use relix_core::codec;
 use relix_runtime::flow_runner::PeersFile;
+use relix_runtime::manifest::ManifestCache;
 
 use crate::BridgeError;
 
@@ -143,6 +144,11 @@ pub struct AppState {
     /// set. `None` ⇒ `/chat_with_tool` returns 404 and the OpenAI shim
     /// never auto-routes to the tool flow.
     pub tool_template: Option<String>,
+    /// Capability discovery cache populated at bridge startup (M10). Empty
+    /// when discovery failed; the bridge stays up and static aliases continue
+    /// to work. Read by `/v1/models` and (optionally) by the flow runner's
+    /// `capability:` resolver.
+    pub manifest_cache: Arc<ManifestCache>,
 }
 
 impl AppState {
@@ -198,6 +204,7 @@ impl AppState {
             peers,
             template,
             tool_template,
+            manifest_cache: Arc::new(ManifestCache::new()),
         })
     }
 }

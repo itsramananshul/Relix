@@ -40,6 +40,7 @@ use relix_core::eventlog::{EventLog, EventType};
 use relix_core::types::{FlowId, RequestId, TraceId};
 
 use crate::dispatch::{build_request, decode_response};
+use crate::manifest::ManifestCache;
 use crate::sol::analyzer::Analyzer;
 use crate::sol::bytecode::Codegen;
 use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError, RemoteCallResult};
@@ -108,6 +109,12 @@ pub struct FlowRunOptions {
     pub data_dir: Option<PathBuf>,
     /// Per-call deadline in seconds (default 30).
     pub deadline_secs: i64,
+    /// Optional discovered capability cache. When present, SOL flows may
+    /// use a `capability:<method>` peer alias and the dispatcher will
+    /// translate it to a concrete alias before issuing the RPC. Existing
+    /// `remote_call("memory", ...)` calls are unaffected. (M10.3)
+    #[allow(missing_docs)]
+    pub capability_cache: Option<std::sync::Arc<ManifestCache>>,
 }
 
 /// What `FlowRunner::run` returns to the caller (and `relix-cli flow-run`
@@ -184,6 +191,7 @@ impl FlowRunner {
             event_log: event_log.clone(),
             handle: tokio::runtime::Handle::current(),
             deadline_secs: opts.deadline_secs,
+            capability_cache: opts.capability_cache.clone(),
         });
 
         // 7. Spawn the VM on blocking so dispatcher.block_on(...) is safe.
@@ -241,18 +249,50 @@ struct RealDispatcher {
     event_log: Arc<Mutex<EventLog>>,
     handle: tokio::runtime::Handle,
     deadline_secs: i64,
+    capability_cache: Option<Arc<ManifestCache>>,
 }
 
 impl RemoteCallDispatcher for RealDispatcher {
     fn remote_call(&self, peer_alias: &str, method: &str, arg: &[u8]) -> RemoteCallResult {
-        // a) Resolve peer alias.
-        let Some(peer_id) = self.peer_ids.get(peer_alias).copied() else {
+        // a) Resolve peer alias. Support a `capability:<method>` form (M10.3)
+        //    so flows can target a method instead of a hard-coded alias.
+        //    Existing alias usage is unchanged.
+        let resolved_alias: String = if let Some(method_target) =
+            peer_alias.strip_prefix("capability:")
+        {
+            let cache = match self.capability_cache.as_ref() {
+                Some(c) => c,
+                None => {
+                    return Err(RemoteCallError::local(
+                        peer_alias,
+                        method,
+                        "capability resolution requires a populated ManifestCache (host not wired)"
+                            .to_string(),
+                    ));
+                }
+            };
+            match cache.find_alias_for_method(method_target) {
+                Some(a) => a,
+                None => {
+                    return Err(RemoteCallError::local(
+                        peer_alias,
+                        method,
+                        format!("no peer in manifest cache advertises method '{method_target}'"),
+                    ));
+                }
+            }
+        } else {
+            peer_alias.to_string()
+        };
+
+        let Some(peer_id) = self.peer_ids.get(&resolved_alias).copied() else {
             return Err(RemoteCallError::local(
                 peer_alias,
                 method,
-                format!("unknown peer alias '{peer_alias}' (not in [peers] config)"),
+                format!("unknown peer alias '{resolved_alias}' (not in [peers] config)"),
             ));
         };
+        let peer_alias = resolved_alias.as_str();
 
         // b) Build envelope. We extract the request_id afterwards so logs and
         //    errors can correlate to the responder's audit record.

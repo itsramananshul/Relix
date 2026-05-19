@@ -9,10 +9,12 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+use relix_core::codec;
 use relix_core::policy::PolicyEngine;
 use relix_core::types::NodeId;
 
 use crate::dispatch::{DispatchBridge, FnHandler, Handler, HandlerOutcome, InvocationCtx};
+use crate::manifest::ManifestProvider;
 use crate::transport::rpc::{self, Event as TransportEvent, Multiaddr};
 
 /// Controller config (per-binary). Matches the TOML in `configs/`.
@@ -128,10 +130,20 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_dir)?;
     let audit_path = data_dir.join("audit.log");
 
+    // Manifest provider — populated as each node-type registers its
+    // capabilities and served by the built-in `node.manifest` capability.
+    let manifest = ManifestProvider::new(
+        node_id,
+        cfg.controller.name.clone(),
+        cfg.controller.node_type.clone(),
+        NodeId::from_pubkey(trust_root.as_bytes()),
+        vec![format!("/ip4/127.0.0.1/tcp/{}", cfg.controller.listen_port)],
+    );
+
     // Dispatch bridge.
     let mut bridge = DispatchBridge::new(policy, trust_root, &audit_path, node_signer.clone())?;
-    register_builtins(&mut bridge, &cfg);
-    register_node_type_handlers(&mut bridge, &cfg)?;
+    register_builtins(&mut bridge, &cfg, manifest.clone());
+    register_node_type_handlers(&mut bridge, &cfg, manifest.clone())?;
 
     let bridge = Arc::new(bridge);
 
@@ -196,7 +208,15 @@ fn node_health_body(cfg: &ControllerConfig) -> String {
 }
 
 /// Register capabilities every node serves by default.
-fn register_builtins(bridge: &mut DispatchBridge, cfg: &ControllerConfig) {
+///
+/// `node.health` returns a multi-line `key=value` string (operator-readable).
+/// `node.manifest` returns the current capability snapshot as CBOR-encoded
+/// [`crate::manifest::NodeManifest`] — that's the M10 discovery primitive.
+fn register_builtins(
+    bridge: &mut DispatchBridge,
+    cfg: &ControllerConfig,
+    manifest: ManifestProvider,
+) {
     let body = node_health_body(cfg);
     bridge.register(
         "node.health",
@@ -205,7 +225,33 @@ fn register_builtins(bridge: &mut DispatchBridge, cfg: &ControllerConfig) {
             async move { HandlerOutcome::Ok(body.into_bytes()) }
         })),
     );
-    // node.manifest, ping, etc. land in M6 once registry is wired.
+    // Built-in: every node serves its own NodeManifest.
+    let manifest_for_handler = manifest.clone();
+    bridge.register(
+        "node.manifest",
+        Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+            let provider = manifest_for_handler.clone();
+            async move {
+                let snap = provider.snapshot();
+                match codec::encode(&snap) {
+                    Ok(bytes) => HandlerOutcome::Ok(bytes),
+                    Err(e) => HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                        cause: format!("node.manifest encode: {e}"),
+                        retry_hint: 1,
+                        retry_after: None,
+                    }),
+                }
+            }
+        })),
+    );
+    // Advertise the built-ins themselves.
+    manifest.add_capability(relix_core::capability::CapabilityDescriptor::unary(
+        "node.health",
+    ));
+    manifest.add_capability(relix_core::capability::CapabilityDescriptor::unary(
+        "node.manifest",
+    ));
 }
 
 /// Register node-type-specific capabilities based on `[controller] node_type`.
@@ -218,7 +264,10 @@ fn register_builtins(bridge: &mut DispatchBridge, cfg: &ControllerConfig) {
 fn register_node_type_handlers(
     bridge: &mut DispatchBridge,
     cfg: &ControllerConfig,
+    manifest: ManifestProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use relix_core::capability::CapabilityDescriptor;
+
     if cfg.controller.node_type == "memory" {
         let raw = cfg.memory.clone().ok_or_else(|| {
             "node_type=memory requires a [memory] section with db_path".to_string()
@@ -228,6 +277,13 @@ fn register_node_type_handlers(
             .map_err(|e: toml::de::Error| format!("[memory] parse: {e}"))?;
         let store = std::sync::Arc::new(crate::nodes::memory::MemoryStore::open(&mem_cfg)?);
         crate::nodes::memory::register(bridge, store);
+        for m in [
+            "memory.write_turn",
+            "memory.recent_for_session",
+            "memory.search",
+        ] {
+            manifest.add_capability(CapabilityDescriptor::unary(m));
+        }
         tracing::info!(
             db = %mem_cfg.db_path.display(),
             "memory node: registered memory.write_turn / memory.recent_for_session / memory.search"
@@ -245,6 +301,12 @@ fn register_node_type_handlers(
         let provider_name = provider.provider_name();
         let default_model = ai_cfg.model.clone();
         crate::nodes::ai::register(bridge, provider.clone(), default_model.clone());
+        // Carry the provider name as a sensitivity tag so consumers (bridge
+        // `/v1/models`) can derive a model label without a second RPC.
+        manifest.add_capability(
+            CapabilityDescriptor::unary("ai.chat")
+                .with_sensitivity([format!("provider:{provider_name}")]),
+        );
         tracing::info!(
             provider = %provider_name,
             default_model = %default_model,
@@ -262,6 +324,7 @@ fn register_node_type_handlers(
         let backend = std::sync::Arc::new(crate::nodes::tool::ToolBackend::new(tool_cfg.clone())?);
         crate::nodes::tool::register(bridge, backend);
         let desc = crate::nodes::tool::capability_descriptor();
+        manifest.add_capability(desc.clone());
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,
             timeout_secs = tool_cfg.timeout_secs,

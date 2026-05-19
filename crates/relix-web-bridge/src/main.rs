@@ -77,7 +77,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("read config {}: {e}", args.config.display()))?;
         toml::from_str(&text).map_err(|e| format!("parse config: {e}"))?
     };
-    let state = AppState::try_new(cfg.clone())?;
+    let mut state = AppState::try_new(cfg.clone())?;
+
+    // M10: best-effort discovery pass. Dials each peer and pulls their
+    // NodeManifest so `/v1/models` and capability-prefixed remote_calls
+    // know what the mesh actually exposes. Static aliases keep working
+    // either way — a failed discovery just leaves the cache empty.
+    let discovery_opts = relix_runtime::manifest::DiscoveryOptions {
+        identity_bundle: state.identity_bundle.clone(),
+        client_key: state.client_key,
+        peers: state.peers.clone(),
+        deadline_secs: state.cfg.transport.deadline_secs.min(10),
+        overall_timeout: std::time::Duration::from_secs(6),
+        local_port: None,
+    };
+    let discovered = relix_runtime::manifest::discover_peers(discovery_opts).await;
+    let entries = discovered.entries();
+    tracing::info!(
+        peers = entries.len(),
+        methods = ?discovered.all_methods(),
+        "bridge discovery complete"
+    );
+    state.manifest_cache = std::sync::Arc::new(discovered);
     let addr: SocketAddr = state
         .cfg
         .bridge

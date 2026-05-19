@@ -130,32 +130,69 @@ pub struct ModelEntry {
 
 pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
     let now = unix_now();
-    let entries = state
+
+    // 1) Static entries from `[openai_compat] models = [...]` (operator-curated).
+    let mut data: Vec<ModelEntry> = state
         .cfg
         .openai_compat
         .as_ref()
         .map(|c| c.models.clone())
-        .unwrap_or_default();
-    let data = if entries.is_empty() {
-        vec![ModelEntry {
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| ModelEntry {
+            id: m.id,
+            object: "model",
+            created: now,
+            owned_by: "relix",
+            description: m.description,
+        })
+        .collect();
+
+    // 2) Dynamic entries derived from the M10 manifest cache. Any peer that
+    //    advertises `ai.chat` becomes a model id of the form
+    //    `relix-<provider>` (provider tag taken from the capability
+    //    descriptor's sensitivity tags, with `unknown` as a fallback).
+    //    Operator-curated entries are NOT overwritten — they appear first
+    //    so an explicit alias wins over an auto-derived one.
+    let mut have: std::collections::BTreeSet<String> = data.iter().map(|e| e.id.clone()).collect();
+    for cached in state.manifest_cache.entries() {
+        for cap in &cached.manifest.capabilities {
+            if cap.method_name != "ai.chat" {
+                continue;
+            }
+            let provider = cap
+                .sensitivity_tags
+                .iter()
+                .find_map(|t| t.strip_prefix("provider:"))
+                .unwrap_or("unknown");
+            let id = format!("relix-{provider}");
+            if have.insert(id.clone()) {
+                data.push(ModelEntry {
+                    id,
+                    object: "model",
+                    created: now,
+                    owned_by: "relix",
+                    description: format!(
+                        "Discovered ai.chat on peer '{}' (node_type={})",
+                        cached.alias.as_deref().unwrap_or("<unaliased>"),
+                        cached.manifest.node_type,
+                    ),
+                });
+            }
+        }
+    }
+
+    // 3) Last-resort fallback: nothing static, nothing discovered.
+    if data.is_empty() {
+        data.push(ModelEntry {
             id: "relix".to_string(),
             object: "model",
             created: now,
             owned_by: "relix",
             description: "Default Relix mesh route (provider configured on AI node)".to_string(),
-        }]
-    } else {
-        entries
-            .into_iter()
-            .map(|m| ModelEntry {
-                id: m.id,
-                object: "model",
-                created: now,
-                owned_by: "relix",
-                description: m.description,
-            })
-            .collect()
-    };
+        });
+    }
+
     Json(ModelsList {
         object: "list",
         data,

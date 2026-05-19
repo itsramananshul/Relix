@@ -37,10 +37,12 @@ function start() -> str {
     // 2. Read recent history (now includes the just-written user turn).
     let history: str = remote_call("memory", "memory.recent_for_session", "{{SESSION}}");
 
-    // 3. Fetch external URL. The "|16384" suffix asks the tool node to cap
-    //    the body at 16 KiB — well within the configured maximum and small
-    //    enough to keep the AI prompt under typical provider context limits.
-    let fetched: str = remote_call("tool", "tool.web_fetch", "{{TOOL_URL}}|16384");
+    // 3. Fetch external URL. Targets the capability instead of a hard-coded
+    //    peer alias (M10): the dispatcher consults the bridge's manifest
+    //    cache to find a peer that advertises `tool.web_fetch`. Static
+    //    aliases for memory/ai elsewhere in this flow keep working.
+    //    The "|16384" suffix asks the tool node to cap the body at 16 KiB.
+    let fetched: str = remote_call("capability:tool.web_fetch", "tool.web_fetch", "{{TOOL_URL}}|16384");
 
     // 4. Build a single prompt string carrying the user message, the URL,
     //    and the fetched body verbatim. SOL string literals have no escapes
