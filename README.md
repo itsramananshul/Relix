@@ -103,7 +103,15 @@ A small axum service on `127.0.0.1:9100` exposes `POST /chat` and `GET /health`.
 ### M8/S2 — streaming + Open WebUI (working today)
 
 ```sh
-./scripts/alpha-bringup-m8-openwebui.sh --keep
+# Self-running smoke demo: boots the mesh, runs canned curls, tears down.
+./scripts/alpha-bringup-m8-openwebui.sh
+
+# Operator boot driver: boots the mesh and PARKS until Ctrl-C. Use this when
+# you want to talk to the mesh from your own curl, Open WebUI, or any
+# OpenAI-compatible client.
+./scripts/relix-mesh-up.sh                       # mock provider, no keys
+./scripts/relix-mesh-up.sh --provider openrouter # needs $OPENROUTER_API_KEY
+./scripts/relix-mesh-up.sh --provider local --base-url http://localhost:11434/v1
 ```
 
 Two new endpoint shapes ship on the same bridge so any OpenAI-compatible client can talk to Relix unchanged:
