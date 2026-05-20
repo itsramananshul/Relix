@@ -2,14 +2,14 @@
 
 Continuation autonomous session focused on operator platform
 maturation. Picks up where 2026-05-19's session left off
-(`0f6eae4`). 8 new commits, +33 tests, every architecture
-invariant preserved.
+(`0f6eae4`). **11 substantive commits + 1 session-summary commit = 12 total**,
++33 tests, every architecture invariant preserved.
 
 ## Test posture
 
 - **Before session start:** 292 workspace tests passing.
-- **After session end:** 311 workspace tests passing.
-- **Net new:** +19 unit/integration tests + 2 perf smoke tests.
+- **After session end:** 318 workspace tests passing.
+- **Net new:** +26 tests including 2 perf smoke tests.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --all`: clean.
 - No regressions; no real bugs found mid-session.
@@ -50,6 +50,17 @@ invariant preserved.
   for dashboard initial render. Best-effort degradation on
   attempts fetch failure (lineage returns `attempts: []` rather
   than failing the whole call).
+- `af9f53b` **`relix-cli task watch`**
+  Operator `tail -f` for a task chronicle. Polls `task.events`
+  with cursor advancement; prints each new line until Ctrl-C.
+  Simple loop — no goroutines, no background tasks. 3 new tests
+  for the cursor-extraction helper.
+- `197f55e` **`task get --pretty --tail N`**
+  For tasks with thousands of chronicle events, keep only the
+  most recent N in the timeline block (header + summary +
+  attempts unchanged). `truncate_events_to_tail` rewrites the
+  `events=[...]` JSON array so the existing pretty renderer
+  consumes it unchanged. 4 new tests.
 
 ### Priority C — Event contract hardening
 
@@ -147,7 +158,6 @@ README.md                                            # event-vocabulary + audit-
 
 - Session 1 (2026-05-19): 26 commits, 87 new tests, 1 real bug
   fix (web_extract CDATA leak).
-- Session 2 (2026-05-20): 8 commits, 19+2 new tests, no real
-  bugs.
+- Session 2 (2026-05-20): 12 commits, 26 new tests, no real bugs.
 
-**Total: 34 commits, 108+ new tests since the C2 phase began.**
+**Total: 38 commits, 113+ new tests since the C2 phase began.**
