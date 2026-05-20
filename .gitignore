@@ -43,3 +43,8 @@ dev-data/
 dev-keys/*.key
 dev-keys/*.pub
 dev-keys/*.aic
+
+# Per-operator policy file. The shipped policy lives in
+# configs/policies/dev.toml; `local.toml` is an operator's
+# private tweak that should not enter the repo.
+configs/policies/local.toml
