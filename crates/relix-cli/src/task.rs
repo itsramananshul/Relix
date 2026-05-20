@@ -232,6 +232,24 @@ pub enum Cmd {
         #[arg(long, default_value = "")]
         status: String,
     },
+    /// Chronicle-retention dry-run candidate counter. Calls
+    /// `task.compact_events` with `mode=dry-run` and prints
+    /// what *would* be deleted under the supplied max-age
+    /// policy. No deletion happens — this is the operator
+    /// planning surface for the eventual destructive Step 3
+    /// pass (see docs/chronicle-retention.md).
+    Compact {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
+        /// Events older than `now - max_age_secs` are
+        /// candidates. Must be a positive integer.
+        #[arg(long)]
+        max_age_secs: i64,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -528,6 +546,30 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
             print!("{}", std::str::from_utf8(&body).unwrap_or("<binary>"));
+        }
+        Cmd::Compact {
+            peer,
+            identity,
+            client_key,
+            max_age_secs,
+        } => {
+            if max_age_secs <= 0 {
+                return Err("--max-age-secs must be a positive integer".into());
+            }
+            let arg = format!("{max_age_secs}|dry-run");
+            let body = call(
+                &peer,
+                &identity,
+                &client_key,
+                "task.compact_events",
+                arg.as_bytes(),
+            )
+            .await?;
+            // Print the Coordinator's JSON body verbatim — both
+            // human-skimmable (single-line) and script-friendly
+            // (parseable by `jq` from the CLI).
+            print!("{}", std::str::from_utf8(&body).unwrap_or("<binary>"));
+            println!();
         }
     }
     Ok(())

@@ -166,6 +166,16 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.export utf8: {e}"))
     }
 
+    /// `task.compact_events` passthrough. Bridge supplies only
+    /// the `dry-run` mode today — the destructive `delete` mode
+    /// is gated by the chronicle-retention Step 3 design and
+    /// would land here as a separate method once shipped.
+    pub async fn compact_events_dry_run(&self, max_age_secs: i64) -> Result<String, String> {
+        let arg = format!("{max_age_secs}|dry-run");
+        let bytes = self.call("task.compact_events", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.compact_events utf8: {e}"))
+    }
+
     /// `task.list_cursor` passthrough. Wire format:
     /// `limit|status|cursor`. Empty status / cursor mean "no
     /// filter" / "first page."

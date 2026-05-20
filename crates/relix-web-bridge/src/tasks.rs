@@ -594,6 +594,51 @@ pub async fn export(
         .expect("export response builds"))
 }
 
+/// `GET /v1/tasks/compact_events?max_age_secs=N` —
+/// chronicle-retention dry-run candidate counter.
+///
+/// Returns the Coordinator's `task.compact_events` JSON
+/// verbatim. No deletion happens; this is the operator's
+/// planning surface for the eventual Step 3 destructive
+/// pass. `max_age_secs` is required and must be a positive
+/// integer. The `mode` is hard-coded to `dry-run` at the
+/// bridge — when Step 3 lands and adds a `delete` mode, that
+/// will land here as a separate `POST` endpoint with stricter
+/// guards (operator confirmation, separate capability, etc.),
+/// not as a query parameter on this read-only path.
+pub async fn compact_events_dry_run(
+    State(state): State<AppState>,
+    Query(q): Query<CompactQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let max_age_secs = q.max_age_secs.unwrap_or(0);
+    if max_age_secs <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "max_age_secs query param required (positive integer)".into(),
+            }),
+        ));
+    }
+    let body = rec
+        .compact_events_dry_run(max_age_secs)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .expect("compact response builds"))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CompactQuery {
+    #[serde(default)]
+    pub max_age_secs: Option<i64>,
+}
+
 pub async fn attempts(
     State(state): State<AppState>,
     Path(id): Path<String>,

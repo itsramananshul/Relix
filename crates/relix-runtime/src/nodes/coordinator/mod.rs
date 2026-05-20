@@ -93,6 +93,7 @@
 //! | `task.attempts` | `task_id` | one `attempt_num\tstatus\tstarted_at\tfinished_at\|-\tfailure_class\|-\tflow_id\|-\n` per attempt |
 //! | `task.retry`    | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted retry_count=N budget=M\n` / INVALID_ARGS with cause |
 //! | `task.export`   | `task_id` | single JSON archival snapshot (`{schema_version, exported_at, task_id, task, attempts}`) |
+//! | `task.compact_events` | `max_age_secs\|mode` (mode defaults to `dry-run`; only `dry-run` is shipped) | single JSON object `{mode, destructive:false, cutoff_ts, candidate_events, candidate_tasks, oldest_candidate_ts?, newest_candidate_ts?, by_task_status:{...}}` |
 //!
 //! Optional trailers (older callers that omit them keep working
 //! unchanged): `retry_policy|max_retries|max_runtime_secs` on
@@ -1280,6 +1281,79 @@ impl TaskStore {
         })
     }
 
+    /// Count `task_events` rows that *would* be deleted by a
+    /// max-age retention pass — without deleting anything.
+    ///
+    /// `cutoff_ts` is the wall-clock unix-seconds threshold:
+    /// events with `ts < cutoff_ts` are candidates. The query
+    /// honours the chronicle-retention design's R5 invariant
+    /// (only events belonging to terminal-state tasks are
+    /// candidates), so callers may safely take the returned
+    /// counts as ground truth for the deletion that Step 3
+    /// would do.
+    ///
+    /// Returns counts grouped by parent task status so operators
+    /// can see at a glance which terminal cohort dominates.
+    pub fn count_compact_candidates(
+        &self,
+        cutoff_ts: i64,
+    ) -> Result<CompactDryRun, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // Aggregate counts in one round-trip: total, distinct task
+        // count, oldest + newest ts within the candidate set.
+        let (candidate_events, candidate_tasks, oldest_ts, newest_ts): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(DISTINCT te.task_id),
+                        MIN(te.ts),
+                        MAX(te.ts)
+                 FROM task_events te
+                 JOIN tasks t ON t.task_id = te.task_id
+                 WHERE te.ts < ?1
+                   AND t.status IN ('completed', 'failed', 'cancelled', 'interrupted')",
+                params![cutoff_ts],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(CoordinatorError::Db)?;
+        // Per-status breakdown so operators see which terminal
+        // cohort dominates the candidate set.
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.status, COUNT(*)
+                 FROM task_events te
+                 JOIN tasks t ON t.task_id = te.task_id
+                 WHERE te.ts < ?1
+                   AND t.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                 GROUP BY t.status",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![cutoff_ts], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut by_task_status: Vec<(String, i64)> = Vec::new();
+        for r in rows {
+            by_task_status.push(r.map_err(CoordinatorError::Db)?);
+        }
+        // Sort for stable JSON output ordering — alphabetical so
+        // tests and dashboards see a predictable shape.
+        by_task_status.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(CompactDryRun {
+            cutoff_ts,
+            candidate_events,
+            candidate_tasks,
+            oldest_candidate_ts: oldest_ts,
+            newest_candidate_ts: newest_ts,
+            by_task_status,
+        })
+    }
+
     /// Total task count, optionally filtered by status. Drives
     /// pagination "total" hints for operator tooling that wants to
     /// render "N of M" without walking every page.
@@ -1442,6 +1516,36 @@ pub struct TaskExport {
     pub attempts: Vec<AttemptView>,
 }
 
+/// Result of a `task.compact_events` dry-run pass: the set of
+/// `task_events` rows that *would* be deleted under the supplied
+/// `cutoff_ts` policy (and the chronicle-retention design's R5
+/// terminal-state invariant), aggregated by parent task status.
+///
+/// This is non-destructive — no rows are removed; the type
+/// exists to give operators a clear picture before any Step 3
+/// bounded-delete capability lands.
+#[derive(Debug, Clone)]
+pub struct CompactDryRun {
+    /// Wall-clock unix seconds. Events with `ts < cutoff_ts`
+    /// were counted as candidates.
+    pub cutoff_ts: i64,
+    /// Total `task_events` rows that match the policy.
+    pub candidate_events: i64,
+    /// Distinct tasks that contribute at least one candidate
+    /// event. Always ≤ `candidate_events`.
+    pub candidate_tasks: i64,
+    /// `min(ts)` over the candidate set. `None` when
+    /// `candidate_events == 0`.
+    pub oldest_candidate_ts: Option<i64>,
+    /// `max(ts)` over the candidate set. `None` when
+    /// `candidate_events == 0`.
+    pub newest_candidate_ts: Option<i64>,
+    /// Per-terminal-status breakdown, sorted alphabetically by
+    /// status for stable rendering. Statuses with zero
+    /// candidates do not appear.
+    pub by_task_status: Vec<(String, i64)>,
+}
+
 /// One execution attempt of a Task, returned by `task.attempts` and
 /// folded into `task.get`'s rendered output. `attempt_num` is 1-based
 /// per task; `attempt_id` is globally monotonic.
@@ -1586,6 +1690,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_export(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.compact_events",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_compact_events(&s, &ctx) }
             })),
         );
     }
@@ -2002,6 +2116,93 @@ fn render_task_export(e: &TaskExport) -> String {
         s.push('}');
     }
     s.push_str("]}");
+    s
+}
+
+/// `task.compact_events` — dry-run candidate counter for the
+/// chronicle-retention max-age policy.
+///
+/// Args (pipe-delimited): `max_age_secs|mode`.
+///
+/// - `max_age_secs` (required, integer > 0): events older than
+///   `now - max_age_secs` are candidates.
+/// - `mode` (optional, default `dry-run`): only `dry-run` is
+///   accepted today. Any other value returns INVALID_ARGS with
+///   a clear "not implemented" cause — the destructive Step 3
+///   path has not shipped, and this guard makes the boundary
+///   explicit.
+///
+/// Returns one JSON object describing what *would* be deleted
+/// under the policy. R5 honoured: only events whose parent task
+/// is in a terminal state are counted, mirroring what any
+/// future Step 3 deletion is constrained to touch.
+fn handle_compact_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.compact_events utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    let max_age_str = parts.first().copied().unwrap_or("").trim();
+    let mode = parts.get(1).copied().unwrap_or("").trim();
+    if max_age_str.is_empty() {
+        return invalid("task.compact_events: max_age_secs required".to_string());
+    }
+    let max_age_secs: i64 = match max_age_str.parse() {
+        Ok(v) if v > 0 => v,
+        _ => {
+            return invalid(format!(
+                "task.compact_events: bad max_age_secs (must be positive integer): {max_age_str}"
+            ));
+        }
+    };
+    // Mode guard: `dry-run` is the only currently-shipped mode.
+    // Step 3 will add `delete` once operator-export + the
+    // bounded-delete loop are both reviewed. Until then any
+    // other value is INVALID_ARGS, not 500 — operators get a
+    // clear "not yet" rather than a silent no-op.
+    let mode = if mode.is_empty() { "dry-run" } else { mode };
+    if mode != "dry-run" {
+        return invalid(format!(
+            "task.compact_events: mode {mode:?} not implemented; only \"dry-run\" is shipped \
+             (see docs/chronicle-retention.md Step 3)"
+        ));
+    }
+    let now = unix_secs();
+    let cutoff_ts = now - max_age_secs;
+    match store.count_compact_candidates(cutoff_ts) {
+        Ok(result) => HandlerOutcome::Ok(render_compact_dry_run(&result, mode).into_bytes()),
+        Err(e) => internal(format!("task.compact_events: {e}")),
+    }
+}
+
+/// Hand-built JSON for a `CompactDryRun` result. Same approach
+/// as the other Coordinator renderers — no serde_json on the
+/// runtime crate.
+fn render_compact_dry_run(r: &CompactDryRun, mode: &str) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(256);
+    let _ = write!(
+        s,
+        r#"{{"mode":"{}","destructive":false,"cutoff_ts":{},"candidate_events":{},"candidate_tasks":{}"#,
+        json_escape(mode),
+        r.cutoff_ts,
+        r.candidate_events,
+        r.candidate_tasks,
+    );
+    if let Some(t) = r.oldest_candidate_ts {
+        let _ = write!(s, r#","oldest_candidate_ts":{t}"#);
+    }
+    if let Some(t) = r.newest_candidate_ts {
+        let _ = write!(s, r#","newest_candidate_ts":{t}"#);
+    }
+    s.push_str(r#","by_task_status":{"#);
+    for (i, (status, n)) in r.by_task_status.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, r#""{}":{}"#, json_escape(status), n);
+    }
+    s.push_str("}}");
     s
 }
 
@@ -4486,5 +4687,138 @@ mod tests {
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(seen.insert(id), "collision");
         }
+    }
+
+    // ── Chronicle retention Step 2: dry-run compact counter ───────────
+
+    /// Build a small fixture: 3 terminal-state tasks each with
+    /// some events, plus one in-flight (running) task with
+    /// events. Returns the cutoff_ts that admits all-but-the-
+    /// last event of each task.
+    fn compact_fixture() -> (TaskStore, i64) {
+        let s = store();
+        // Two completed, one failed, one cancelled, plus one
+        // running (R5 guard target).
+        let completed_a = mk(&s, "ca", "f", "{}", "o");
+        let completed_b = mk(&s, "cb", "f", "{}", "o");
+        let failed_x = mk(&s, "fx", "f", "{}", "o");
+        let cancelled_y = mk(&s, "cy", "f", "{}", "o");
+        let running_r = mk(&s, "rr", "f", "{}", "o");
+        for tid in [
+            &completed_a,
+            &completed_b,
+            &failed_x,
+            &cancelled_y,
+            &running_r,
+        ] {
+            for i in 0..3 {
+                s.append_event(tid, "ops.test", &format!("e{i}")).unwrap();
+            }
+        }
+        for (tid, st) in [
+            (&completed_a, "completed"),
+            (&completed_b, "completed"),
+            (&failed_x, "failed"),
+            (&cancelled_y, "cancelled"),
+            (&running_r, "running"),
+        ] {
+            s.update(tid, Some(st), None, None, None, None, None, None)
+                .unwrap();
+        }
+        // Cutoff = "future" so every existing event is older.
+        let cutoff = unix_secs() + 60;
+        (s, cutoff)
+    }
+
+    #[test]
+    fn compact_dry_run_counts_only_terminal_state_tasks() {
+        // R5 invariant: events belonging to a `running` task
+        // must not appear in the candidate count. The fixture
+        // has 5 tasks * 3 events each, but only the 4 terminal
+        // tasks contribute (= 12 events). The running task
+        // (3 events) is excluded.
+        let (s, cutoff) = compact_fixture();
+        let r = s.count_compact_candidates(cutoff).unwrap();
+        assert_eq!(
+            r.candidate_events, 12,
+            "candidate_events should be 4 terminal tasks × 3 events"
+        );
+        assert_eq!(
+            r.candidate_tasks, 4,
+            "running task must not contribute to candidate_tasks"
+        );
+        assert_eq!(r.cutoff_ts, cutoff);
+        assert!(r.oldest_candidate_ts.is_some());
+        assert!(r.newest_candidate_ts.is_some());
+    }
+
+    #[test]
+    fn compact_dry_run_breakdown_groups_by_terminal_status() {
+        let (s, cutoff) = compact_fixture();
+        let r = s.count_compact_candidates(cutoff).unwrap();
+        // Alphabetical sort: cancelled, completed, failed.
+        // The `running` cohort must be absent (R5).
+        let m: std::collections::HashMap<String, i64> = r.by_task_status.into_iter().collect();
+        assert_eq!(m.get("completed").copied(), Some(6)); // 2 tasks × 3 events
+        assert_eq!(m.get("failed").copied(), Some(3));
+        assert_eq!(m.get("cancelled").copied(), Some(3));
+        assert!(
+            !m.contains_key("running"),
+            "running cohort must not appear in compact candidates (R5)"
+        );
+    }
+
+    #[test]
+    fn compact_dry_run_empty_when_cutoff_before_any_event() {
+        // Cutoff well in the past — no events should match.
+        let (s, _) = compact_fixture();
+        let r = s.count_compact_candidates(0).unwrap();
+        assert_eq!(r.candidate_events, 0);
+        assert_eq!(r.candidate_tasks, 0);
+        assert!(r.oldest_candidate_ts.is_none());
+        assert!(r.newest_candidate_ts.is_none());
+        assert!(r.by_task_status.is_empty());
+    }
+
+    #[test]
+    fn render_compact_dry_run_is_valid_json_with_expected_fields() {
+        let (s, cutoff) = compact_fixture();
+        let r = s.count_compact_candidates(cutoff).unwrap();
+        let body = render_compact_dry_run(&r, "dry-run");
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("dry-run body did not parse:\n{body}\nerror: {e}"));
+        assert_eq!(parsed.get("mode").and_then(|v| v.as_str()), Some("dry-run"));
+        assert_eq!(
+            parsed.get("destructive").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            parsed.get("candidate_events").and_then(|v| v.as_i64()),
+            Some(12)
+        );
+        assert_eq!(
+            parsed.get("candidate_tasks").and_then(|v| v.as_i64()),
+            Some(4)
+        );
+        assert!(parsed.get("by_task_status").is_some());
+    }
+
+    #[test]
+    fn render_compact_dry_run_handles_empty_breakdown_without_trailing_comma() {
+        // Empty candidate set means by_task_status is `{}`. The
+        // hand-built JSON would emit a trailing comma if the
+        // separator logic were broken — assert it parses.
+        let s = store();
+        let r = s.count_compact_candidates(0).unwrap();
+        let body = render_compact_dry_run(&r, "dry-run");
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("empty body did not parse:\n{body}\nerror: {e}"));
+        let by = parsed.get("by_task_status").unwrap();
+        assert!(by.is_object());
+        assert_eq!(by.as_object().unwrap().len(), 0);
+        // oldest/newest should be absent when there are no
+        // candidates — skip_serializing_if equivalent.
+        assert!(parsed.get("oldest_candidate_ts").is_none());
+        assert!(parsed.get("newest_candidate_ts").is_none());
     }
 }

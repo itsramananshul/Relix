@@ -426,6 +426,14 @@ fn register_node_type_handlers(
                 &["task", "read", "export", "operator"],
             ),
             (
+                "task.compact_events",
+                "Dry-run candidate counter for the chronicle-retention \
+                 max-age policy. Counts what *would* be deleted; does not \
+                 delete. Only `mode=dry-run` is shipped today (destructive \
+                 path gated, see chronicle-retention.md Step 3).",
+                &["task", "read", "retention", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \

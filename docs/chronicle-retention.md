@@ -191,10 +191,29 @@ dangerous to ship.
   described in this doc's "Operator export contract"
   section. See
   [`task-runtime.md`](task-runtime.md) for the wire shape.
-- **Step 2 (configurable max age, dry-run)** — pending.
-- **Step 3 (bounded delete)** — pending.
+- **Step 2 (dry-run candidate counter)** — ✅ shipped.
+  `task.compact_events` Coordinator capability accepts
+  `max_age_secs|mode` (mode required to be `dry-run` today;
+  any other value returns INVALID_ARGS with a clear
+  "not implemented" cause). Counts events that *would* be
+  deleted under the policy — broken down by parent task
+  status — without deleting anything. Honours R5 (only
+  events whose parent task is in a terminal state are
+  counted). Surfaced as
+  `GET /v1/tasks/compact_events?max_age_secs=N` on the
+  bridge and `relix-cli task compact --max-age-secs N` on
+  the CLI. **Configurable max age** in `[coordinator]` TOML
+  was deferred — the dry-run pass takes the policy from the
+  caller per-invocation, which is what operators need today;
+  pinning a default into config is only useful once an
+  automatic compaction loop exists (it doesn't).
+- **Step 3 (bounded delete)** — pending. Will land as a
+  separate capability (`task.delete_compacted_events` or
+  similar) with a `--confirm` token and per-pass `LIMIT`.
 - **Step 4 (snapshot synthesis)** — pending.
-- **Step 5 (operator triage tooling)** — pending.
+- **Step 5 (operator triage tooling)** — partial.
+  `relix-cli task compact` ships the dry-run side; the
+  delete-side tool lands with Step 3.
 
 ## Suggested implementation order
 
@@ -203,17 +222,23 @@ each remaining step.
 
 1. **Export-only first.** ✅ Shipped. `task.export` capability
    + `/v1/tasks/:id/export` bridge endpoint.
-2. **Configurable max age, dry-run.** Add `event_max_age_days`
-   config + `task.compact_events --dry-run` capability that
-   *counts* what would be deleted without deleting. Operators
-   can validate the policy before flipping the kill switch.
+2. **Dry-run candidate counter.** ✅ Shipped.
+   `task.compact_events` capability with `mode=dry-run`
+   (only mode accepted today; the destructive `delete` mode
+   returns INVALID_ARGS until Step 3 lands). Counts
+   candidates broken down by parent task status. Operators
+   validate the policy here before any kill switch exists.
 3. **Bounded delete.** Implement the actual deletion with a
    bounded `LIMIT` per pass + transaction-per-pass. Default
-   `disabled`; opt-in.
+   `disabled`; opt-in. Adds a `delete` mode (or a separate
+   capability) plus operator confirmation gate.
 4. **Snapshot synthesis.** Add Approach C's `task.snapshot`
    emit. Layer on top of step 3.
-5. **Operator triage tooling.** `relix-cli task export` +
-   `relix-cli task compact --dry-run`.
+5. **Operator triage tooling.** `relix-cli task export` (via
+   the dashboard's "Export" button today; CLI parity TBD)
+   + `relix-cli task compact --max-age-secs N` ✅ shipped
+   for the dry-run side. The destructive-side tool lands
+   with Step 3.
 
 Each step is independently shippable. Stop at step 3 if Approach
 A meets operator needs.

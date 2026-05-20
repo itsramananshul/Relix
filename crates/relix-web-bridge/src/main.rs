@@ -192,6 +192,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/:id/events/stream", get(tasks::events_stream))
         .route("/v1/tasks/:id/lineage", get(tasks::lineage))
         .route("/v1/tasks/:id/export", get(tasks::export))
+        // Chronicle-retention Step 2: dry-run candidate counter.
+        // Read-only (GET) because no deletion happens. The
+        // destructive Step 3 mode will land as a separate POST
+        // path with stricter guards (operator capability + body
+        // confirmation), not as a query parameter here.
+        .route(
+            "/v1/tasks/compact_events",
+            get(tasks::compact_events_dry_run),
+        )
         .route("/v1/tasks/recover", post(tasks::recover))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered

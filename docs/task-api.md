@@ -256,6 +256,51 @@ chronicle compaction. See
 [`chronicle-retention.md`](chronicle-retention.md) for the
 retention design contract.
 
+### `GET /v1/tasks/compact_events?max_age_secs=N`
+
+Chronicle-retention **dry-run** candidate counter. Counts
+`task_events` rows that *would* be deleted under a max-age
+policy, broken down by parent task status. Honours the
+retention design's R5 invariant — only events whose parent
+task is in a terminal state (`completed` / `failed` /
+`cancelled` / `interrupted`) are counted.
+
+`max_age_secs` is required and must be a positive integer.
+Events with `ts < now - max_age_secs` are candidates.
+
+Response shape:
+
+```json
+{
+  "mode": "dry-run",
+  "destructive": false,
+  "cutoff_ts": 1700000000,
+  "candidate_events": 12345,
+  "candidate_tasks": 567,
+  "oldest_candidate_ts": 1699000000,
+  "newest_candidate_ts": 1699999999,
+  "by_task_status": {
+    "completed": 12000,
+    "failed": 300,
+    "cancelled": 45
+  }
+}
+```
+
+`oldest_candidate_ts` / `newest_candidate_ts` are omitted
+when the candidate set is empty. The `by_task_status`
+object only contains terminal statuses with non-zero
+candidate counts.
+
+This is the operator's planning surface for the eventual
+destructive Step 3 pass — see the implementation status
+in [`chronicle-retention.md`](chronicle-retention.md). No
+deletion happens here; the bridge hard-codes
+`mode=dry-run` and the Coordinator rejects any other
+mode with INVALID_ARGS.
+
+CLI parity: `relix-cli task compact --max-age-secs N`.
+
 ## Operator actions
 
 ### `POST /v1/tasks/recover`
