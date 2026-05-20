@@ -442,6 +442,14 @@ fn register_node_type_handlers(
                 &["task", "read", "graph", "lineage"],
             ),
             (
+                "task.recent_edges",
+                "Cross-task aggregate of the most recent execution edges. \
+                 Newest-first; supports `since_edge_id` cursor for \
+                 incremental polling. Operators use this to spot \
+                 retry-storm patterns without per-task drill-in.",
+                &["task", "read", "graph", "lineage", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \

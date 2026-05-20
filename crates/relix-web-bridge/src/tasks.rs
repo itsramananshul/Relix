@@ -758,6 +758,90 @@ fn parse_edges(body: &str) -> Vec<TaskExecutionEdge> {
     out
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecentEdge {
+    pub edge_id: i64,
+    pub edge_type: String,
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_attempt_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_by_event_id: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RecentEdgesQuery {
+    #[serde(default)]
+    pub since_edge_id: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Parse the `task.recent_edges` body. Same column layout as
+/// parse_edges but with `task_id` as the third column (after
+/// edge_id + edge_type) so cross-task consumers don't need a
+/// second lookup.
+fn parse_recent_edges(body: &str) -> Vec<RecentEdge> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 8 {
+            continue;
+        }
+        let edge_id = match cols[0].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let parse_opt_i64 =
+            |s: &str| -> Option<i64> { if s == "-" { None } else { s.parse().ok() } };
+        let parse_opt_str =
+            |s: &str| -> Option<String> { if s == "-" { None } else { Some(s.to_string()) } };
+        let created_at: i64 = match cols[7].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        out.push(RecentEdge {
+            edge_id,
+            edge_type: cols[1].to_string(),
+            task_id: cols[2].to_string(),
+            attempt_id: parse_opt_i64(cols[3]),
+            related_task_id: parse_opt_str(cols[4]),
+            related_attempt_id: parse_opt_i64(cols[5]),
+            spawned_by_event_id: parse_opt_i64(cols[6]),
+            created_at,
+        });
+    }
+    out
+}
+
+/// `GET /v1/tasks/edges/recent?since_edge_id=N&limit=M` —
+/// cross-task execution edges, newest-first. Phase-1E M39
+/// surface. Operators use this to spot patterns ("retry
+/// storm on task X") across the runtime.
+pub async fn recent_edges(
+    State(state): State<AppState>,
+    Query(q): Query<RecentEdgesQuery>,
+) -> Result<Json<Vec<RecentEdge>>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let since = q.since_edge_id.unwrap_or(0);
+    let limit = q.limit.unwrap_or(50).min(500);
+    let body = rec
+        .recent_edges(since, limit)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_recent_edges(&body)))
+}
+
 /// `GET /v1/tasks/:id/edges` — list execution edges that
 /// touch the given task. Phase-1E M38 surface; today only
 /// `retried_from` is populated.

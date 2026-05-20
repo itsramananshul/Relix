@@ -95,6 +95,7 @@
 //! | `task.export`   | `task_id` | single JSON archival snapshot (`{schema_version, exported_at, task_id, task, attempts}`) |
 //! | `task.compact_events` | `max_age_secs\|mode` (mode defaults to `dry-run`; only `dry-run` is shipped) | single JSON object `{mode, destructive:false, cutoff_ts, candidate_events, candidate_tasks, oldest_candidate_ts?, newest_candidate_ts?, by_task_status:{...}}` |
 //! | `task.edges`    | `task_id` | one `edge_id\tedge_type\tattempt_id\|-\trelated_task_id\|-\trelated_attempt_id\|-\tspawned_by_event_id\|-\tcreated_at\n` per execution edge touching the task (as child or parent). Phase-1E: only `retried_from` emitted today. |
+//! | `task.recent_edges` | `since_edge_id\|limit` (both optional; defaults 0/50) | newest-first cross-task edges: `edge_id\tedge_type\ttask_id\tattempt_id\|-\trelated_task_id\|-\trelated_attempt_id\|-\tspawned_by_event_id\|-\tcreated_at\n` per row. |
 //!
 //! Optional trailers (older callers that omit them keep working
 //! unchanged): `retry_policy|max_retries|max_runtime_secs` on
@@ -893,6 +894,55 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         let rows = stmt
             .query_map(params![task_id], |r| {
+                Ok(TaskEdge {
+                    edge_id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    attempt_id: r.get(2)?,
+                    edge_type: r.get(3)?,
+                    related_task_id: r.get(4)?,
+                    related_attempt_id: r.get(5)?,
+                    spawned_by_event_id: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// List the most recent execution edges across ALL tasks.
+    /// Operators use this to spot patterns ("retry storm on
+    /// task X") without per-task drill-in. Newest-first by
+    /// `edge_id`. `since_edge_id` is a strict-greater-than
+    /// cursor for incremental polling; pass 0 to read the
+    /// most recent `limit` edges.
+    ///
+    /// Phase-1E M39: only retried_from is populated today —
+    /// the function returns whatever edge_types the table
+    /// holds.
+    pub fn list_recent_edges(
+        &self,
+        since_edge_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TaskEdge>, CoordinatorError> {
+        let cap = limit.clamp(1, self.max_list);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT edge_id, task_id, attempt_id, edge_type,
+                        related_task_id, related_attempt_id,
+                        spawned_by_event_id, created_at
+                 FROM task_edges
+                 WHERE edge_id > ?1
+                 ORDER BY edge_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![since_edge_id, cap as i64], |r| {
                 Ok(TaskEdge {
                     edge_id: r.get(0)?,
                     task_id: r.get(1)?,
@@ -1789,6 +1839,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.recent_edges",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_recent_edges(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
@@ -2493,6 +2553,58 @@ fn handle_edges(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
             HandlerOutcome::Ok(buf.into_bytes())
         }
         Err(e) => internal(format!("task.edges: {e}")),
+    }
+}
+
+/// `task.recent_edges` — cross-task aggregate of the most
+/// recent execution edges. Args: `since_edge_id|limit`
+/// (both optional; defaults 0 / 50). Returns one
+/// tab-delimited row per edge, newest-first, same column
+/// layout as `task.edges`. Operators use this to spot
+/// retry-storm patterns without per-task drill-in.
+fn handle_recent_edges(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.recent_edges utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    let since: i64 = parts
+        .first()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap_or(0))
+        .unwrap_or(0);
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap_or(50))
+        .unwrap_or(50);
+    match store.list_recent_edges(since, limit) {
+        Ok(rows) => {
+            let mut buf = String::new();
+            for e in rows {
+                let aid = e
+                    .attempt_id
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let rt = e.related_task_id.as_deref().unwrap_or("-");
+                let rat = e
+                    .related_attempt_id
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let sev = e
+                    .spawned_by_event_id
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into());
+                buf.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    e.edge_id, e.edge_type, e.task_id, aid, rt, rat, sev, e.created_at,
+                ));
+            }
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("task.recent_edges: {e}")),
     }
 }
 
@@ -5287,6 +5399,77 @@ mod tests {
             .find(|ev| ev.event_type == "task.retry_requested")
             .expect("task.retry_requested must be in chronicle");
         assert_eq!(e.spawned_by_event_id, Some(req_event.event_id));
+    }
+
+    #[test]
+    fn list_recent_edges_returns_newest_first_across_tasks() {
+        // Set up two tasks each with a retry chain so we have
+        // edges across multiple tasks. The cross-task aggregate
+        // should return all of them, newest-first by edge_id.
+        let s = store();
+        for label in ["a", "b"] {
+            let tid = s
+                .create(label, "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+                .unwrap();
+            s.update(&tid, Some("running"), None, None, None, None, None, None)
+                .unwrap();
+            s.update(
+                &tid,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                Some("blip"),
+                Some("transient"),
+            )
+            .unwrap();
+            let _ = s.request_retry(&tid);
+            s.update(&tid, Some("running"), None, None, None, None, None, None)
+                .unwrap();
+        }
+        let recent = s.list_recent_edges(0, 50).unwrap();
+        assert_eq!(recent.len(), 2);
+        // Newest first: the second task's edge has the higher
+        // edge_id.
+        assert!(recent[0].edge_id > recent[1].edge_id);
+        // Both edges should be retried_from (no other types
+        // are emitted today).
+        assert!(recent.iter().all(|e| e.edge_type == "retried_from"));
+    }
+
+    #[test]
+    fn list_recent_edges_honours_since_cursor() {
+        let s = store();
+        for _ in 0..3 {
+            let tid = s
+                .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+                .unwrap();
+            s.update(&tid, Some("running"), None, None, None, None, None, None)
+                .unwrap();
+            s.update(
+                &tid,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                Some("blip"),
+                Some("transient"),
+            )
+            .unwrap();
+            let _ = s.request_retry(&tid);
+            s.update(&tid, Some("running"), None, None, None, None, None, None)
+                .unwrap();
+        }
+        let all = s.list_recent_edges(0, 50).unwrap();
+        assert_eq!(all.len(), 3);
+        // Cursor at the middle edge → only newer edges should
+        // return.
+        let middle_id = all[1].edge_id;
+        let after = s.list_recent_edges(middle_id, 50).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].edge_id, all[0].edge_id);
     }
 
     #[test]

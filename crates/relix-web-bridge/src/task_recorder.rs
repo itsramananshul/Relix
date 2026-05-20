@@ -240,6 +240,15 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.edges utf8: {e}"))
     }
 
+    /// Read-only `task.recent_edges` passthrough. Cross-task
+    /// aggregate of the most recent execution edges. Wire
+    /// format: `since_edge_id|limit`.
+    pub async fn recent_edges(&self, since_edge_id: i64, limit: usize) -> Result<String, String> {
+        let arg = format!("{since_edge_id}|{limit}");
+        let bytes = self.call("task.recent_edges", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.recent_edges utf8: {e}"))
+    }
+
     /// Operator-triggered `task.recover` passthrough. Not fail-soft;
     /// callers want the result of the scan.
     pub async fn recover(&self) -> Result<String, String> {
