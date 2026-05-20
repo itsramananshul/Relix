@@ -469,7 +469,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / recover / attempts / retry"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events"
         );
     }
     if cfg.controller.node_type == "tool" {
