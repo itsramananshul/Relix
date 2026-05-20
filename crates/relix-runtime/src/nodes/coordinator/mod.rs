@@ -3413,6 +3413,151 @@ mod tests {
         }
     }
 
+    // ── Phase I: hardening for typed envelopes + cursors ──────────────
+
+    #[test]
+    fn every_runtime_emitted_payload_json_is_valid_json() {
+        // Regression guard: a future emitter that mishandles
+        // escapes would silently produce broken JSON. Exercise
+        // every v1 emit path and assert each payload_json parses.
+        use serde_json::Value;
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, Some(5))
+            .unwrap();
+        // attempt_started + attempt_finished
+        s.update_with_trace(
+            &tid,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("00112233445566778899aabbccddeeff"),
+        )
+        .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("error \"with quotes\" and \\backslash"),
+            Some("transient"),
+        )
+        .unwrap();
+        // retry_requested
+        s.request_retry(&tid).unwrap();
+        // Drive into interrupted via recovery scan.
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.list_attempts(&tid).unwrap().last().unwrap().started_at;
+        s.recover_interrupted(started + 60).unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let mut json_count = 0;
+        for ev in &v.events {
+            if let Some(pj) = ev.payload_json.as_deref() {
+                let _v: Value = serde_json::from_str(pj).unwrap_or_else(|e| {
+                    panic!(
+                        "event '{}' has invalid payload_json: {pj}\nerror: {e}",
+                        ev.event_type
+                    )
+                });
+                json_count += 1;
+            }
+        }
+        assert!(
+            json_count >= 4,
+            "expected several v1 events with payload_json, got {json_count}"
+        );
+    }
+
+    #[test]
+    fn render_event_json_emits_parseable_lines_under_hostile_payloads() {
+        // The line-delimited body that task.events emits must
+        // round-trip through serde_json one line at a time. A
+        // malformed escape in any single event would break
+        // every downstream parser. Exercise an operator-defined
+        // v0 event with chars that would break naive escaping.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.append_event(&tid, "ops.test", "key=\"q\" backslash=\\ ctrl=\x01 tab=\t")
+            .unwrap();
+        let events = s.list_events_after(&tid, 0, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        let line = render_event_json(&events[0]);
+        let parsed: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("rendered event line did not parse:\n{line}\nerror: {e}"));
+        assert_eq!(
+            parsed.get("type").and_then(|v| v.as_str()),
+            Some("ops.test")
+        );
+    }
+
+    #[test]
+    fn list_cursor_with_updated_target_pushed_above_does_not_repeat() {
+        // If a task has been touched (updated_at bumped) between
+        // page 1 and page 2, the row may now sit above its own
+        // cursor. The cursor's strict-less-than WHERE clause
+        // filters it; it does not reappear on page 2 — the
+        // load-bearing snapshot contract.
+        let s = store();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(mk(&s, &format!("t{i}"), "f", "{}", "o"));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let page1 = s.list_cursor(None, 2, None).unwrap();
+        assert_eq!(page1.items.len(), 2);
+        let cursor = page1.next_cursor.clone();
+        // Bump the cursor's own target above itself.
+        let target_id = page1.items.last().unwrap().task_id.clone();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.update(
+            &target_id,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let page2 = s.list_cursor(cursor, 100, None).unwrap();
+        let page2_ids: std::collections::HashSet<String> =
+            page2.items.iter().map(|r| r.task_id.clone()).collect();
+        assert!(
+            !page2_ids.contains(&target_id),
+            "bumped target reappeared on page 2 — cursor snapshot broken"
+        );
+    }
+
+    #[test]
+    fn task_cursor_parse_resists_pathological_inputs() {
+        // Operator / proxy could mangle the opaque cursor token.
+        // Parser must never panic. Return None on malformed
+        // shapes; the capability handler treats None as "start
+        // from beginning" so polling tools recover.
+        let inputs = [
+            "",
+            ":",
+            "abc:def",
+            "123:",
+            "-1:taskid", // negative updated_at; parses fine
+            "0:",        // empty task_id
+            ":0",        // empty updated_at
+            "very long input that doesn't look like a cursor",
+            "0:taskid:extra", // extra colon — split_once stops at first
+        ];
+        for s in inputs {
+            let _ = TaskCursor::parse(s); // must not panic
+        }
+    }
+
     // ── Phase S2: typed event envelopes ───────────────────────────────
 
     #[test]
