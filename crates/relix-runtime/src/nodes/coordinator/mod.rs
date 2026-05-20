@@ -3006,6 +3006,76 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    // ── Priority H: lightweight scalability smoke checks ─────────────
+
+    #[test]
+    fn list_paginated_handles_thousand_tasks_quickly() {
+        // Regression guard for accidental O(N²) behaviour in any
+        // future filter / join. Creates 1000 tasks; expects list +
+        // count + paginated walk to complete well under a second.
+        let s = TaskStore::in_memory().expect("open");
+        let start = std::time::Instant::now();
+        for i in 0..1000 {
+            s.create(&format!("t{i}"), "f", "{}", "o", RetryPolicy::None, 0, None)
+                .unwrap();
+        }
+        let create_elapsed = start.elapsed();
+        // Counts.
+        let now = std::time::Instant::now();
+        assert_eq!(s.count(None).unwrap(), 1000);
+        assert_eq!(s.count(Some("pending")).unwrap(), 1000);
+        let count_elapsed = now.elapsed();
+        // Walk pages of 100 with offset.
+        let now = std::time::Instant::now();
+        let mut total = 0;
+        for off in (0..1000).step_by(100) {
+            let page = s.list_paginated(100, off, None).unwrap();
+            total += page.len();
+        }
+        let walk_elapsed = now.elapsed();
+        assert_eq!(total, 1000);
+        // Generous bounds: anything > 5s here is a real regression.
+        assert!(
+            create_elapsed.as_secs() < 5,
+            "create 1000 took {create_elapsed:?}"
+        );
+        assert!(
+            count_elapsed.as_millis() < 500,
+            "count 2x took {count_elapsed:?}"
+        );
+        assert!(
+            walk_elapsed.as_millis() < 500,
+            "paginated walk took {walk_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn list_events_after_handles_large_chronicle_quickly() {
+        // 5000 events on one task. Read in pages of 500.
+        let s = TaskStore::in_memory().expect("open");
+        let tid = mk(&s, "t", "f", "{}", "o");
+        for i in 0..5000 {
+            s.append_event(&tid, "step", &format!("e{i}")).unwrap();
+        }
+        let mut after = 0i64;
+        let mut total = 0usize;
+        let now = std::time::Instant::now();
+        loop {
+            let chunk = s.list_events_after(&tid, after, 500).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            after = chunk.last().unwrap().event_id;
+            total += chunk.len();
+        }
+        let elapsed = now.elapsed();
+        assert_eq!(total, 5000);
+        assert!(
+            elapsed.as_secs() < 5,
+            "incremental 5000-event walk took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn append_event_with_special_chars_does_not_break_chronicle() {
         // Operator-defined events may contain payload chars that
