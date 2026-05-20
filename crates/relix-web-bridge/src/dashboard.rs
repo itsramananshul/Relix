@@ -134,6 +134,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_providers_landmarks_present() {
+        // The providers page (M6) wires the dashboard to
+        // /v1/config/providers. Assert the page mentions every
+        // shipped provider in the allowlist + the API endpoint
+        // so a future rename catches at test time.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("/v1/config/providers"),
+            "providers page should fetch /v1/config/providers"
+        );
+        // Allowlist labels appear in PROVIDER_LABELS — at least
+        // the canonical names must be present in the rendered
+        // page source.
+        for name in ["mock", "openai", "anthropic", "openrouter", "xai", "google"] {
+            assert!(
+                body.contains(name),
+                "provider {name} missing from dashboard"
+            );
+        }
+        // type="password" input ensures the key field is masked
+        // by default.
+        assert!(
+            body.contains(r#"type="password""#),
+            "api_key input should be type=password by default"
+        );
+    }
+
+    #[tokio::test]
     async fn page_sets_security_headers() {
         let resp = page().await.into_response();
         assert_eq!(

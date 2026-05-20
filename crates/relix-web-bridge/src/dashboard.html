@@ -482,6 +482,83 @@
       margin: 8px 0 0;
       border: 1px solid var(--border);
     }
+
+    /* ── Provider/settings cards ───────────────────────────────── */
+    .provider-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+      gap: 14px;
+    }
+    .provider-card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 14px;
+    }
+    .provider-card .provider-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .provider-card .provider-header h3 {
+      margin: 0;
+      font-size: var(--text-md);
+      font-weight: 600;
+      color: var(--text-strong);
+    }
+    .provider-card .provider-header .provider-label {
+      color: var(--text-muted);
+      font-size: var(--text-xs);
+      margin-left: 4px;
+      font-weight: 400;
+    }
+    .provider-card .provider-meta {
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+      margin-bottom: 10px;
+    }
+    .provider-card .provider-meta .key-preview {
+      font-family: var(--font-mono);
+      color: var(--text);
+      margin-left: 4px;
+    }
+    .provider-card .key-input-row {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .provider-card .key-input-row input { flex: 1; }
+    .provider-card .actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .provider-card .actions .action-status {
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+      margin-left: 4px;
+    }
+    .provider-card .actions .action-status.error { color: var(--danger); }
+    .provider-card .actions .action-status.ok    { color: var(--ok); }
+    .btn-primary {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--text-strong);
+    }
+    .btn-primary:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .btn-danger {
+      background: rgba(239,68,68,0.10);
+      border-color: rgba(239,68,68,0.4);
+      color: var(--danger);
+    }
+    .btn-danger:hover { background: rgba(239,68,68,0.20); }
   </style>
 </head>
 <body>
@@ -613,14 +690,22 @@
       </p>
     </section>
 
-    <!-- ── #/providers (stub for milestone 6) ─────────────────── -->
+    <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
-      <p class="page-subtitle">Configure AI provider keys + default models. Restart of the AI controller required for changes to take effect.</p>
-      <div class="banner info">
-        Provider settings UI lands in a follow-up commit. The backend
-        config endpoints (<code>/v1/config/providers</code>) are tracked
-        in <code>docs/dashboard-redesign.md</code> Milestone 5.
+      <p class="page-subtitle">
+        Configure AI provider keys + default models. Keys are stored
+        locally at <code>bridge-secrets.toml</code> (mode 0600, gitignored)
+        and never sent back over HTTP. AI controller restart required for
+        changes to take effect.
+      </p>
+      <div class="banner warn" id="providers-local-only-banner">
+        <strong>Local/dev only.</strong> These endpoints have no
+        authentication. Put a reverse proxy with auth in front before
+        exposing the bridge beyond loopback.
+      </div>
+      <div id="providers-host">
+        <div class="loading">loading…</div>
       </div>
     </section>
 
@@ -680,9 +765,18 @@ const PAGES = {
   overview:  { label: 'Overview',     init: initOverview,  enter: enterOverview },
   tasks:     { label: 'Tasks',        init: initTasks,     enter: enterTasks },
   topology:  { label: 'Topology',     init: initTopology,  enter: enterTopology },
-  providers: { label: 'AI Providers', init: null,          enter: null },
+  providers: { label: 'AI Providers', init: null,          enter: enterProviders },
   telegram:  { label: 'Telegram',     init: null,          enter: null },
   config:    { label: 'Bridge Config', init: null,         enter: null },
+};
+
+const PROVIDER_LABELS = {
+  mock:       { label: 'Mock provider',  hint: 'Built-in test provider. No API key required.' },
+  openai:     { label: 'OpenAI',         hint: 'sk-... key from platform.openai.com. Model e.g. gpt-4o, gpt-4o-mini.' },
+  anthropic:  { label: 'Anthropic',      hint: 'sk-ant-... key. Model e.g. claude-sonnet-4-6, claude-opus-4-7.' },
+  openrouter: { label: 'OpenRouter',     hint: 'sk-or-... key from openrouter.ai. Model e.g. anthropic/claude-sonnet-4-6.' },
+  xai:        { label: 'xAI / Grok',     hint: 'xai-... key from console.x.ai. Model e.g. grok-2, grok-4.' },
+  google:     { label: 'Google / Gemini', hint: 'AIza... key from ai.google.dev. Model e.g. gemini-2.5-pro.' },
 };
 let currentRoute = null;
 const initialised = new Set();
@@ -1153,6 +1247,149 @@ async function loadTopology() {
     $status.textContent = 'failed: ' + String(e);
     $host.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
+}
+
+/* ── Providers page ───────────────────────────────────────── */
+async function enterProviders() {
+  const $host = document.getElementById('providers-host');
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/config/providers');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    renderProviders(j.providers || []);
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+function renderProviders(providers) {
+  const $host = document.getElementById('providers-host');
+  if (!providers.length) {
+    $host.innerHTML = '<div class="empty">no providers in allowlist</div>';
+    return;
+  }
+  $host.innerHTML = '<div class="provider-grid">'
+    + providers.map(p => renderProviderCard(p)).join('')
+    + '</div>';
+  providers.forEach(p => wireProviderCard(p.name));
+}
+
+function renderProviderCard(p) {
+  const meta = PROVIDER_LABELS[p.name] || { label: p.name, hint: '' };
+  const badge = p.configured
+    ? '<span class="badge ok">configured</span>'
+    : '<span class="badge muted">not set</span>';
+  const previewBlock = p.configured
+    ? '<div class="provider-meta">key <span class="key-preview">'
+      + escapeHtml(p.key_preview || '') + '</span>'
+      + ' &middot; set_at <span>' + (p.key_set_at || 0) + '</span>'
+      + (p.default_model
+        ? ' &middot; default <span>' + escapeHtml(p.default_model) + '</span>'
+        : '')
+      + '</div>'
+    : '';
+  const deleteBtn = p.configured
+    ? '<button class="btn-danger" data-action="delete" data-name="' + escapeHtml(p.name) + '">Delete</button>'
+    : '';
+  // The api_key input starts as type=password so it's masked
+  // even if the operator's machine has shoulder-surfers. A
+  // reveal toggle flips it to text.
+  return ''
+    + '<div class="provider-card" data-provider="' + escapeHtml(p.name) + '">'
+    + '<div class="provider-header">'
+    + '<h3>' + escapeHtml(meta.label) + '<span class="provider-label">' + escapeHtml(p.name) + '</span></h3>'
+    + badge
+    + '</div>'
+    + '<p class="meta">' + escapeHtml(meta.hint) + '</p>'
+    + previewBlock
+    + '<div class="form-row" style="grid-template-columns: 100px 1fr;">'
+    +   '<label>API key</label>'
+    +   '<div class="field">'
+    +     '<div class="key-input-row">'
+    +       '<input type="password" data-field="api_key" placeholder="' + (p.configured ? '(set; enter new value to replace)' : 'paste key…') + '">'
+    +       '<button data-action="reveal" type="button" title="Show/hide">👁</button>'
+    +     '</div>'
+    +     '<p class="field-help">stored at mode 0600 in bridge-secrets.toml; never echoed back</p>'
+    +   '</div>'
+    + '</div>'
+    + '<div class="form-row" style="grid-template-columns: 100px 1fr;">'
+    +   '<label>default model</label>'
+    +   '<div class="field">'
+    +     '<input type="text" data-field="default_model" value="' + escapeHtml(p.default_model || '') + '" placeholder="optional">'
+    +   '</div>'
+    + '</div>'
+    + '<div class="actions">'
+    +   '<button class="btn-primary" data-action="save" data-name="' + escapeHtml(p.name) + '">Save</button>'
+    +   deleteBtn
+    +   '<span class="action-status" data-role="status"></span>'
+    + '</div>'
+    + '</div>';
+}
+
+function wireProviderCard(name) {
+  const card = document.querySelector(`.provider-card[data-provider="${name}"]`);
+  if (!card) return;
+  const $keyInput = card.querySelector('input[data-field="api_key"]');
+  const $modelInput = card.querySelector('input[data-field="default_model"]');
+  const $status = card.querySelector('[data-role="status"]');
+  card.querySelector('[data-action="reveal"]').addEventListener('click', () => {
+    $keyInput.type = $keyInput.type === 'password' ? 'text' : 'password';
+  });
+  card.querySelector('[data-action="save"]').addEventListener('click', async () => {
+    const key = $keyInput.value;
+    const model = $modelInput.value.trim();
+    if (!key.trim()) { setProviderStatus($status, 'enter an API key first', 'error'); return; }
+    setProviderStatus($status, 'saving…');
+    try {
+      const r = await fetch('/v1/config/providers/' + encodeURIComponent(name), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: key, default_model: model || null }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+      setProviderStatus($status, 'saved · restart AI controller to apply', 'ok');
+      $keyInput.value = '';   // clear so the page doesn't keep the raw value in DOM
+      $keyInput.type = 'password';
+      // Refresh just this card with the redacted status from the
+      // response (so the operator sees the new preview).
+      replaceProviderCard(body.status);
+    } catch (e) {
+      setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+    }
+  });
+  const $delete = card.querySelector('[data-action="delete"]');
+  if ($delete) {
+    $delete.addEventListener('click', async () => {
+      if (!confirm('Delete the saved key for ' + name + '?')) return;
+      setProviderStatus($status, 'deleting…');
+      try {
+        const r = await fetch('/v1/config/providers/' + encodeURIComponent(name), { method: 'DELETE' });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+        setProviderStatus($status, 'deleted · restart AI controller to apply', 'ok');
+        replaceProviderCard(body);
+      } catch (e) {
+        setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+      }
+    });
+  }
+}
+
+function setProviderStatus($el, msg, kind) {
+  $el.textContent = msg;
+  $el.className = 'action-status' + (kind ? ' ' + kind : '');
+}
+
+function replaceProviderCard(status) {
+  if (!status || !status.name) return;
+  const card = document.querySelector(`.provider-card[data-provider="${status.name}"]`);
+  if (!card) return;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = renderProviderCard(status);
+  card.replaceWith(wrapper.firstChild);
+  wireProviderCard(status.name);
 }
 
 /* ── Boot ─────────────────────────────────────────────────── */
