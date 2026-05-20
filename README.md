@@ -153,6 +153,7 @@ Start here, in this order:
 - [`docs/architecture.md`](docs/architecture.md) — peer model, request flows, the admission pipeline, why the bridge is not an orchestrator.
 - [`docs/operator-guide.md`](docs/operator-guide.md) — running the mesh, logs, troubleshooting, common failure modes.
 - [`docs/failure-modes.md`](docs/failure-modes.md) — single-page reference for "what happens when X is down": detection signals, bridge behavior, recovery steps for every component.
+- [`docs/restart-safety.md`](docs/restart-safety.md) — per-component "what persists / what's recomputed / what's lost" across a restart. Read before designing recovery procedures or backup policy.
 - [`docs/deployment.md`](docs/deployment.md) — local / multi-node / production-readiness modes, mandatory hardening before public exposure, topology diagram, Open WebUI + Telegram integration.
 - [`docs/multi-node-bringup.md`](docs/multi-node-bringup.md) — five concrete topologies (single-host → multi-host → channel-augmented), per-node config deltas, identity distribution recipe, boot order, multi-node health checks.
 - [`docs/flows-and-sol.md`](docs/flows-and-sol.md) — what SOL is and isn't, how `remote_call` works, how to write a new flow.
