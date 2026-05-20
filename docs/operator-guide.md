@@ -314,13 +314,32 @@ dashboard never echoes the key back over HTTP — only
 Each card has a **Test connection** button after the
 first save. It hits the upstream provider's models
 endpoint with the saved key and reports success/failure
-+ elapsed_ms inline. Operators verify the key works
-without needing to drive a real chat.
++ elapsed_ms inline. The page also ships a **Test all
+configured** batch button that fires the per-provider
+test endpoint in parallel for every configured provider
+and renders a matrix (provider, status, elapsed, detail)
+so operators can preflight a fresh environment in one
+click. Disabled providers are tested too — their key is
+still stored and routing may be re-enabled at any moment.
+
+The **default model** input on each card carries a
+curated `<datalist>` of common model ids per provider so
+the typical setup is one click instead of a doc lookup.
+The input stays free-text — operators using newer or
+unlisted models can type any value.
 
 When a key changes, the dashboard shows
 `saved · restart AI controller to apply` — provider keys
 are read at controller startup, not at every chat. Stop
 + start the AI controller for the change to take effect.
+
+Each configured card carries an **Enable / Disable**
+button. A disabled provider stays in the secrets file
+(key preserved across the toggle, and across overwrites)
+but the AI controller treats it as routing-ineligible.
+Useful for cycling between providers without losing a
+key, or for quarantining a key that's misbehaving while
+you investigate.
 
 ### Configuring Telegram
 
@@ -332,9 +351,13 @@ so operators verify they wired the right bot. Same
 secret handling as providers — token never echoed back,
 URL token-fragments scrubbed from any error string.
 
-`webhook` mode appears in the dropdown for forward-
-compatibility but currently returns 422; the live
-HTTPS client wiring lands later.
+`webhook` mode reveals an additional **Webhook URL**
+input. The bridge persists both the mode and the URL,
+and the response toasts an honest pending-implementation
+note: the URL is stored so operators can pre-configure,
+but the live HTTPS receiver wiring is still pending.
+Until that lands, the channel controller continues using
+polling regardless of the saved mode.
 
 ### Live runtime feel
 
@@ -356,6 +379,59 @@ Activity items are clickable: a task entry takes you to
 that task's detail panel; a peer entry opens the peer
 drawer. The topbar status dot polls every 10s
 independently as a cross-page "is the mesh up?" indicator.
+
+The overview also surfaces a **Top retried tasks (15 min)**
+card that groups recent `retried_from` edges by task_id
+and links each row directly into the task detail view —
+so when the retry-storm anomaly fires, you can name the
+actual offending tasks without searching.
+
+The task list ships an **age** column derived from
+`updated_at`. Running/retrying rows older than 120s
+gain a `stuck?` accent. A matching **stuck?** quick-
+filter chip narrows the list to only those rows
+(client-side post-filter on top of `status=running`).
+The flag persists into the URL as `?stuck=1` so the
+filter survives reloads + sharing.
+
+### Per-task causality surfaces
+
+Open any task on `#/tasks` to see four causality
+surfaces stacked above the chronicle:
+
+- **Retry chain** — horizontal pills, one per attempt,
+  with the inter-attempt wait between them and a
+  click-to-jump anchor to the triggering chronicle
+  event. A "queued for Xs before attempt 1 started"
+  line appears when the task waited noticeably between
+  creation and the first attempt — flagged as
+  `(backpressure?)` when the wait crosses 30s.
+- **Execution graph** — SVG of attempts + recorded
+  edges (today: `retried_from`; others reserved with
+  honest "edge not recorded" / "no producer yet"
+  labels). Nodes are clickable: clicking a node toggles
+  the timeline filter to that attempt, mirroring the
+  chain-pill affordance. The card header includes
+  total wall clock, the terminal attempt's duration,
+  and a **retry tax** measurement (wall time spent in
+  retries that didn't produce the final result).
+- **Failure panel** — for `failed`/`interrupted`/
+  `cancelled` tasks, the latest failure class +
+  reason + the canonical operator playbook for that
+  class (no invented recovery steps).
+- **Cross-references** — peer correlations, execution
+  path, and edge feeds populated asynchronously after
+  the detail loads.
+
+### Recovery scan results
+
+The global **Recover** button fires
+`POST /v1/tasks/recover`, which promotes overdue
+`running` tasks to `interrupted` (`failure_class=timeout`).
+The dashboard now pins a **Last recovery** panel above
+the tasks list showing the scan's outcome: timestamp,
+count, and clickable task-id links for each row that was
+promoted. The panel overwrites on each scan, dismissable.
 
 ### Production note
 
