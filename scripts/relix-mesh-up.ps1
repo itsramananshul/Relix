@@ -218,9 +218,18 @@ timeout_secs  = 15
 max_redirects = 3
 allow_http    = $allowHttp
 user_agent    = "Relix-tool/0.1.0"
+extract_max_input_bytes = 1048576
+
+[tool.fs]
+root = "$DataBase/fs-jail"
+max_read_bytes = 10485760
+max_write_bytes = 10485760
+max_search_results = 200
 
 [peers]
 "@ | Set-Content -Encoding utf8 $ToolConfig
+    # Ensure the jail root exists before the controller starts.
+    New-Item -ItemType Directory -Force -Path "$DataBase/fs-jail" | Out-Null
 }
 
 # 4.5) Coordinator controller config. Owns the durable Task ledger
@@ -297,6 +306,26 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "tool_web_extract"
 method = "tool.web_extract"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "tool_read_file"
+method = "tool.read_file"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "tool_write_file"
+method = "tool.write_file"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "tool_search_files"
+method = "tool.search_files"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "tool_patch"
+method = "tool.patch"
 allow_groups = ["chat-users"]
 
 [[rules]]

@@ -80,6 +80,10 @@ clap = { version = "4.5", features = ["derive"] }
 # SSE / streaming helpers (bridge)
 async-stream = "0.3"
 
+# Unified-diff parse + apply for tool.patch. Tiny crate, no transitive
+# deps beyond std and nu-ansi-term (optional, default-off).
+diffy = { version = "0.4", default-features = false }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

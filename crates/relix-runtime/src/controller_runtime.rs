@@ -357,6 +357,15 @@ fn register_node_type_handlers(
         // tool node so it shares identity / admission / audit / pool
         // setup. Distinct from tool.web_fetch (no network surface).
         manifest.add_capability(crate::nodes::tool::web_extract::capability_descriptor());
+        // B2: jailed filesystem subsystem. Only advertised when
+        // `[tool.fs]` is configured -- node-type tool with no
+        // `[tool.fs]` keeps fs out of the manifest.
+        if tool_cfg.fs.is_some() {
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_read());
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_write());
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_search());
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_patch());
+        }
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,
             timeout_secs = tool_cfg.timeout_secs,

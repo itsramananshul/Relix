@@ -46,6 +46,7 @@
 //!
 //! These ship in later milestones if and when a flow needs them.
 
+pub mod fs;
 pub mod security;
 pub mod web_extract;
 
@@ -87,6 +88,13 @@ pub struct ToolConfig {
     /// this cap.
     #[serde(default = "default_extract_max_input_bytes")]
     pub extract_max_input_bytes: usize,
+    /// Optional path-jailed filesystem subsystem (B2). When `None`
+    /// the four `tool.read_file` / `tool.write_file` /
+    /// `tool.search_files` / `tool.patch` capabilities are NOT
+    /// registered — the tool node serves only network + parse
+    /// capabilities. The bringup script enables this by default.
+    #[serde(default)]
+    pub fs: Option<fs::FsJailConfig>,
 }
 
 impl Default for ToolConfig {
@@ -98,6 +106,7 @@ impl Default for ToolConfig {
             allow_http: false,
             user_agent: default_user_agent(),
             extract_max_input_bytes: default_extract_max_input_bytes(),
+            fs: None,
         }
     }
 }
@@ -365,6 +374,12 @@ impl ToolBackend {
         self.cfg.extract_max_input_bytes
     }
 
+    /// Accessor for the optional `[tool.fs]` subsystem config. When
+    /// `None`, [`register`] does not register the fs capabilities.
+    pub fn fs_config(&self) -> Option<fs::FsJailConfig> {
+        self.cfg.fs.clone()
+    }
+
     /// Run the configured capability against a single URL.
     ///
     /// Order of operations matters for safety:
@@ -583,6 +598,31 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
         max_input_bytes: backend.extract_max_input_bytes(),
     });
     web_extract::register(bridge, extract_cfg);
+
+    // B2: tool.read_file / write_file / search_files / patch.
+    // Only registered when the operator opted in by setting
+    // `[tool.fs]` in the controller TOML. Bringup script enables this
+    // by default under `dev-data/<run>/fs-jail`. When None, the four
+    // capabilities are not registered and the tool node serves only
+    // network + parse.
+    if let Some(fs_cfg) = backend.fs_config() {
+        match fs::FsJail::new(fs_cfg) {
+            Ok(jail) => {
+                tracing::info!("tool node: registering fs subsystem (read/write/search/patch)");
+                fs::register(bridge, Arc::new(jail));
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "tool node: [tool.fs] config invalid; fs subsystem disabled"
+                );
+            }
+        }
+    } else {
+        tracing::info!(
+            "tool node: [tool.fs] not configured; fs subsystem disabled (read/write/search/patch unavailable)"
+        );
+    }
 }
 
 async fn handle_web_fetch(backend: Arc<ToolBackend>, ctx: InvocationCtx) -> HandlerOutcome {
