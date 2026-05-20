@@ -37,6 +37,7 @@ use clap::Parser;
 mod capabilities;
 mod chat;
 mod config;
+mod dashboard;
 mod flow;
 mod openai;
 mod sse;
@@ -196,6 +197,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // manifest cache (no extra mesh I/O).
         .route("/v1/capabilities", get(capabilities::list))
         .route("/v1/capabilities/:method", get(capabilities::get_one))
+        // Operator dashboard. Single-page static HTML; consumes
+        // the existing /v1/tasks* endpoints. No server-side
+        // state introduced. See docs/bridge-invariants.md.
+        .route("/dashboard", get(dashboard::page))
         .with_state(state);
 
     tracing::info!(

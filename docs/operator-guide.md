@@ -363,6 +363,23 @@ curl -X POST http://127.0.0.1:19791/v1/tasks/recover
 # -> {"recovered":["abc...","def..."],"count":2}
 ```
 
+### Browser dashboard (`/dashboard`)
+
+For visual triage of the task ledger, the bridge serves a
+single-page dashboard at `http://127.0.0.1:19791/dashboard`.
+Open in a browser; click any task to see its lineage + chronology.
+Tick the `auto (5s)` checkbox for live refresh.
+
+The page is a vanilla HTML/JS dashboard with no build step. It
+consumes the same `/v1/tasks*` JSON endpoints you'd hit from
+curl, so anything visible in the dashboard is reproducible from
+a script. The bridge introduces no per-session state to support
+it — see [`docs/bridge-invariants.md`](bridge-invariants.md).
+
+Same auth model as the rest of the bridge: none at the HTTP
+layer. Put a reverse proxy in front before exposing beyond
+loopback.
+
 ### Capability discovery (`/v1/capabilities`)
 
 The bridge projects its already-discovered `ManifestCache` as

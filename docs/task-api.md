@@ -233,6 +233,31 @@ Run the recovery scan now. Promotes overdue `running` tasks to
 
 No body required.
 
+## Operator dashboard (browser)
+
+### `GET /dashboard`
+
+Single-page HTML dashboard. Static (one HTML file, inline CSS +
+vanilla JS). Consumes the JSON endpoints above and renders:
+
+- A status-filtered task list with click-to-inspect rows.
+- Per-task summary + per-attempt table.
+- Chronicle events grouped + colour-coded by `event_type`
+  family (`task.*` / `attempt` / `retry` / `interrupted` /
+  `failed`).
+- Optional 5-second auto-refresh.
+
+Security headers: `X-Frame-Options: DENY`,
+`Content-Security-Policy: default-src 'none'; ... connect-src 'self'`.
+No external resources are loaded; CSP enforces it.
+
+The bridge introduces no per-session state to support this — it
+is a presentation surface only, per
+[`bridge-invariants.md`](bridge-invariants.md). When the page
+needs new features the right move is usually to add a new
+`/v1/tasks*` endpoint and consume it from JS, not to introduce
+server-side dashboard state.
+
 ## Capability discovery
 
 ### `GET /v1/capabilities?category=...&tag=...`

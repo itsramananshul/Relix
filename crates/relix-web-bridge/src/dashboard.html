@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Relix Operator Dashboard</title>
+  <style>
+    :root {
+      --fg: #1a1a1a;
+      --fg-dim: #6a6a6a;
+      --bg: #fafafa;
+      --bg-row: #fff;
+      --bg-row-alt: #f3f3f3;
+      --bg-card: #fff;
+      --border: #d8d8d8;
+      --accent: #3050a0;
+      --running: #2a7a30;
+      --pending: #6a6a6a;
+      --failed: #a02a2a;
+      --interrupted: #a08020;
+      --completed: #2a7a30;
+      --cancelled: #6a6a6a;
+      --retrying: #806020;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px; line-height: 1.4;
+      background: var(--bg); color: var(--fg);
+    }
+    header {
+      padding: 12px 20px;
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    header .controls { display: flex; gap: 8px; align-items: center; }
+    select, input, button {
+      font: inherit; padding: 4px 8px;
+      border: 1px solid var(--border); background: #fff; border-radius: 3px;
+    }
+    button { cursor: pointer; }
+    button:hover { background: var(--bg-row-alt); }
+    main {
+      display: grid; grid-template-columns: 1fr 2fr; gap: 16px;
+      padding: 16px 20px;
+      align-items: start;
+    }
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border); border-radius: 4px;
+      overflow: hidden;
+    }
+    .panel h2 {
+      margin: 0; padding: 8px 12px;
+      font-size: 13px; font-weight: 600;
+      background: var(--bg-row-alt);
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-body { max-height: calc(100vh - 180px); overflow-y: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 6px 12px; text-align: left; vertical-align: top; }
+    tbody tr { cursor: pointer; }
+    tbody tr:nth-child(even) { background: var(--bg-row-alt); }
+    tbody tr:hover { background: #e8eef8; }
+    tbody tr.selected { background: #d6e0f5; }
+    .status-badge {
+      display: inline-block; padding: 1px 6px;
+      border-radius: 3px; font-size: 11px;
+      color: #fff; font-weight: 500;
+    }
+    .status-running    { background: var(--running); }
+    .status-pending    { background: var(--pending); }
+    .status-failed     { background: var(--failed); }
+    .status-interrupted { background: var(--interrupted); }
+    .status-completed  { background: var(--completed); }
+    .status-cancelled  { background: var(--cancelled); }
+    .status-retrying   { background: var(--retrying); }
+    .id { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: var(--fg-dim); }
+    .summary {
+      padding: 8px 12px; background: var(--bg-row-alt);
+      border-bottom: 1px solid var(--border);
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .summary span { margin-right: 12px; }
+    .summary .label { color: var(--fg-dim); }
+    .attempts { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+    .attempts h3, .events h3 { margin: 0 0 6px 0; font-size: 12px; font-weight: 600; color: var(--fg-dim); }
+    .attempts table { font-size: 12px; }
+    .events {
+      padding: 8px 12px;
+      max-height: 320px; overflow-y: auto;
+    }
+    .event {
+      padding: 4px 8px; margin: 2px 0;
+      background: var(--bg-row-alt); border-left: 3px solid var(--border);
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+    .event.task    { border-left-color: var(--accent); }
+    .event.attempt { border-left-color: var(--running); }
+    .event.retry   { border-left-color: var(--retrying); }
+    .event.interrupted { border-left-color: var(--interrupted); }
+    .event.failed  { border-left-color: var(--failed); }
+    .event .type   { font-weight: 600; }
+    .event .payload { color: var(--fg-dim); margin-left: 8px; }
+    .empty { padding: 24px 12px; color: var(--fg-dim); text-align: center; font-style: italic; }
+    .error { padding: 8px 12px; color: var(--failed); background: #fde8e8; border-radius: 3px; }
+    .meta { padding: 0 12px 8px; color: var(--fg-dim); font-size: 11px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Relix Operator Dashboard</h1>
+  <div class="controls">
+    <label>status
+      <select id="filter-status">
+        <option value="">all</option>
+        <option value="pending">pending</option>
+        <option value="running">running</option>
+        <option value="retrying">retrying</option>
+        <option value="interrupted">interrupted</option>
+        <option value="awaiting_input">awaiting_input</option>
+        <option value="completed">completed</option>
+        <option value="failed">failed</option>
+        <option value="cancelled">cancelled</option>
+      </select>
+    </label>
+    <button id="refresh">Refresh</button>
+    <label><input type="checkbox" id="autorefresh"> auto (5s)</label>
+  </div>
+</header>
+<main>
+  <section class="panel">
+    <h2>Tasks (<span id="task-count">-</span>)</h2>
+    <div class="panel-body" id="task-list"><div class="empty">loading…</div></div>
+  </section>
+  <section class="panel">
+    <h2 id="detail-title">Task detail</h2>
+    <div class="panel-body" id="task-detail"><div class="empty">select a task on the left</div></div>
+  </section>
+</main>
+<script>
+'use strict';
+
+const $list   = document.getElementById('task-list');
+const $detail = document.getElementById('task-detail');
+const $count  = document.getElementById('task-count');
+const $title  = document.getElementById('detail-title');
+const $filter = document.getElementById('filter-status');
+const $refresh = document.getElementById('refresh');
+const $auto    = document.getElementById('autorefresh');
+
+let selectedTaskId = null;
+let autoTimer = null;
+
+async function loadTasks() {
+  try {
+    const status = $filter.value;
+    const url = '/v1/tasks?limit=100' + (status ? '&status=' + encodeURIComponent(status) : '');
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const items = await r.json();
+    renderTaskList(items);
+    $count.textContent = items.length + (items.length === 100 ? '+' : '');
+  } catch (e) {
+    $list.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+function renderTaskList(items) {
+  if (!items.length) {
+    $list.innerHTML = '<div class="empty">no tasks</div>';
+    return;
+  }
+  const rows = items.map(t => {
+    const sel = t.task_id === selectedTaskId ? ' class="selected"' : '';
+    return `<tr data-id="${t.task_id}"${sel}>
+      <td><span class="status-badge status-${t.status}">${escapeHtml(t.status)}</span></td>
+      <td>${escapeHtml(t.title)}</td>
+      <td class="id">${t.task_id.slice(0, 8)}</td>
+    </tr>`;
+  }).join('');
+  $list.innerHTML = `<table>
+    <thead><tr><th>status</th><th>title</th><th>id</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+  $list.querySelectorAll('tbody tr').forEach(tr => {
+    tr.addEventListener('click', () => loadDetail(tr.dataset.id));
+  });
+}
+
+async function loadDetail(id) {
+  selectedTaskId = id;
+  $list.querySelectorAll('tbody tr').forEach(tr => {
+    tr.classList.toggle('selected', tr.dataset.id === id);
+  });
+  $title.textContent = 'Task ' + id.slice(0, 12) + '…';
+  $detail.innerHTML = '<div class="empty">loading…</div>';
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(id) + '/lineage');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const lineage = await r.json();
+    renderDetail(lineage);
+  } catch (e) {
+    $detail.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+function renderDetail(l) {
+  const s = l.summary;
+  const summaryRow =
+    `<span><span class="label">status</span> <span class="status-badge status-${s.status}">${escapeHtml(s.status)}</span></span>` +
+    (s.attempt_count != null ? `<span><span class="label">attempts</span> ${s.attempt_count}</span>` : '') +
+    (s.duration_secs != null ? `<span><span class="label">duration</span> ${s.duration_secs}s</span>` : '') +
+    (s.started_at    != null ? `<span><span class="label">started</span> ${s.started_at}</span>` : '') +
+    (s.last_failure_class ? `<span><span class="label">failure</span> ${escapeHtml(s.last_failure_class)}</span>` : '') +
+    (s.retries ? `<span><span class="label">retries</span> ${escapeHtml(s.retries)}</span>` : '');
+
+  const attemptRows = l.attempts && l.attempts.length
+    ? `<table>
+        <thead><tr><th>#</th><th>status</th><th>started</th><th>duration</th><th>failure</th><th>flow_id</th></tr></thead>
+        <tbody>${l.attempts.map(a => {
+          const dur = a.finished_at != null ? (a.finished_at - a.started_at) + 's' : '(open)';
+          return `<tr>
+            <td>${a.attempt_num}</td>
+            <td><span class="status-badge status-${a.status}">${escapeHtml(a.status)}</span></td>
+            <td>${a.started_at}</td>
+            <td>${dur}</td>
+            <td>${escapeHtml(a.failure_class || '')}</td>
+            <td class="id">${a.flow_id ? a.flow_id.slice(0, 12) : ''}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>`
+    : '<div class="meta">(no attempts — task never transitioned to running)</div>';
+
+  const events = (l.task.events || []).map(e => {
+    const cls = eventClass(e.event_type);
+    return `<div class="event ${cls}"><span class="type">${escapeHtml(e.event_type)}</span><span class="payload">${escapeHtml(e.payload || '')}</span></div>`;
+  }).join('');
+  const eventsBlock = events
+    ? `<div class="events"><h3>chronology (${l.task.events.length})</h3>${events}</div>`
+    : '<div class="meta">(no chronicle events)</div>';
+
+  $detail.innerHTML =
+    `<div class="summary">${summaryRow}</div>` +
+    `<div class="attempts"><h3>attempts</h3>${attemptRows}</div>` +
+    eventsBlock +
+    `<div class="meta">task_id: <span class="id">${l.task.task_id}</span></div>`;
+}
+
+function eventClass(t) {
+  if (t.startsWith('task.attempt')) return 'attempt';
+  if (t.startsWith('task.retry'))   return 'retry';
+  if (t === 'task.interrupted')     return 'interrupted';
+  if (t === 'task.failed')          return 'failed';
+  if (t.startsWith('task.'))        return 'task';
+  return '';
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+$refresh.addEventListener('click', () => {
+  loadTasks();
+  if (selectedTaskId) loadDetail(selectedTaskId);
+});
+$filter.addEventListener('change', loadTasks);
+$auto.addEventListener('change', () => {
+  if ($auto.checked) {
+    autoTimer = setInterval(() => {
+      loadTasks();
+      if (selectedTaskId) loadDetail(selectedTaskId);
+    }, 5000);
+  } else if (autoTimer) {
+    clearInterval(autoTimer);
+    autoTimer = null;
+  }
+});
+
+loadTasks();
+</script>
+</body>
+</html>
