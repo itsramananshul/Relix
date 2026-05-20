@@ -212,8 +212,11 @@ dangerous to ship.
   similar) with a `--confirm` token and per-pass `LIMIT`.
 - **Step 4 (snapshot synthesis)** — pending.
 - **Step 5 (operator triage tooling)** — partial.
-  `relix-cli task compact` ships the dry-run side; the
-  delete-side tool lands with Step 3.
+  `relix-cli task export` ✅ shipped (CLI parity with the
+  dashboard's Export button; `--out -` streams to stdout,
+  `--out FILE` writes to disk). `relix-cli task compact`
+  ✅ shipped for the dry-run side. The delete-side tool
+  lands with Step 3.
 
 ## Suggested implementation order
 
@@ -234,11 +237,12 @@ each remaining step.
    capability) plus operator confirmation gate.
 4. **Snapshot synthesis.** Add Approach C's `task.snapshot`
    emit. Layer on top of step 3.
-5. **Operator triage tooling.** `relix-cli task export` (via
-   the dashboard's "Export" button today; CLI parity TBD)
-   + `relix-cli task compact --max-age-secs N` ✅ shipped
-   for the dry-run side. The destructive-side tool lands
-   with Step 3.
+5. **Operator triage tooling.** `relix-cli task export
+   --task-id ID [--out FILE|-]` ✅ shipped (writes the
+   archival artifact to stdout for piping into jq / gzip,
+   or to a file). `relix-cli task compact --max-age-secs N`
+   ✅ shipped for the dry-run side. The destructive-side
+   tool lands with Step 3.
 
 Each step is independently shippable. Stop at step 3 if Approach
 A meets operator needs.

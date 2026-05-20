@@ -250,6 +250,25 @@ pub enum Cmd {
         #[arg(long)]
         max_age_secs: i64,
     },
+    /// Archival snapshot of one task: header + every attempt +
+    /// every chronicle event in a single JSON document. The
+    /// operator's "save-before-delete" artifact per
+    /// docs/chronicle-retention.md.
+    Export {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
+        #[arg(long)]
+        task_id: String,
+        /// Write the export to this file instead of stdout.
+        /// Use `-` (or omit) to stream to stdout for piping
+        /// into `jq` or `gzip`.
+        #[arg(long, default_value = "-")]
+        out: String,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -570,6 +589,29 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             // (parseable by `jq` from the CLI).
             print!("{}", std::str::from_utf8(&body).unwrap_or("<binary>"));
             println!();
+        }
+        Cmd::Export {
+            peer,
+            identity,
+            client_key,
+            task_id,
+            out,
+        } => {
+            let body = call(
+                &peer,
+                &identity,
+                &client_key,
+                "task.export",
+                task_id.as_bytes(),
+            )
+            .await?;
+            if out == "-" {
+                std::io::Write::write_all(&mut std::io::stdout().lock(), &body)?;
+                println!();
+            } else {
+                std::fs::write(&out, &body)?;
+                eprintln!("wrote {} bytes to {out}", body.len());
+            }
         }
     }
     Ok(())

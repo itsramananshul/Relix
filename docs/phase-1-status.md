@@ -115,7 +115,8 @@ Workspace tests: **395 passing**, `cargo clippy --workspace
   (`--pretty --tail N`) / `list` (`--offset --status`) /
   `count` / `attempts` / `recover` / `retry` (`--force`) /
   `watch` (live tail) / `compact` (`--max-age-secs N`,
-  dry-run candidate counter).
+  dry-run candidate counter) / `export`
+  (`--task-id ID --out -|FILE`, archival JSON).
 - `relix-cli capability ls` (with `--category --tag` filters)
   + `get` + `validate` (manifest linter, 6 rules).
 
