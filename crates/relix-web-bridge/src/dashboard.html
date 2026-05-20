@@ -714,6 +714,69 @@
       padding: 2px 8px;
       border-radius: 3px;
     }
+
+    /* ── Activity feed ─────────────────────────────────────────── */
+    .activity-list {
+      max-height: 360px;
+      overflow-y: auto;
+    }
+    .activity-item {
+      display: flex;
+      gap: 10px;
+      padding: 8px 14px;
+      border-bottom: 1px solid var(--border-soft);
+      align-items: baseline;
+      font-size: var(--text-sm);
+    }
+    .activity-item:last-child { border-bottom: 0; }
+    .activity-item.new {
+      animation: activity-flash 1.6s ease-out;
+    }
+    @keyframes activity-flash {
+      from { background: rgba(90,123,214,0.15); }
+      to   { background: transparent; }
+    }
+    .activity-item .activity-tag {
+      flex: 0 0 auto;
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+      min-width: 56px;
+    }
+    .activity-item .activity-icon {
+      flex: 0 0 auto;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      margin-top: 6px;
+      background: var(--text-dim);
+    }
+    .activity-item.task   .activity-icon { background: var(--info); }
+    .activity-item.peer   .activity-icon { background: var(--accent); }
+    .activity-item.warn   .activity-icon { background: var(--warn); }
+    .activity-item.danger .activity-icon { background: var(--danger); }
+    .activity-item.ok     .activity-icon { background: var(--ok); }
+    .activity-item .activity-body {
+      flex: 1;
+      min-width: 0;
+      color: var(--text);
+    }
+    .activity-item .activity-body .id {
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+    }
+    .activity-pulse {
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--ok);
+      margin-right: 5px;
+      animation: pulse-dot 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.3; transform: scale(0.85); }
+    }
   </style>
 </head>
 <body>
@@ -762,15 +825,28 @@
         <div class="kpi"><p class="label">coordinator</p><div class="value" id="kpi-coord">—</div><div class="delta" id="kpi-coord-delta"></div></div>
         <div class="kpi"><p class="label">reconnects</p><div class="value" id="kpi-reconnect">—</div><div class="delta" id="kpi-reconnect-delta">attempts / successes</div></div>
       </div>
-      <div class="card">
-        <div class="card-header">
-          <h3>Recent peers</h3>
-          <div class="card-actions">
-            <a href="#/topology">View all →</a>
+      <div class="split" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);">
+        <div class="card">
+          <div class="card-header">
+            <h3>Recent peers</h3>
+            <div class="card-actions">
+              <a href="#/topology">View all →</a>
+            </div>
+          </div>
+          <div class="card-body dense" id="overview-peers">
+            <div class="loading">loading…</div>
           </div>
         </div>
-        <div class="card-body dense" id="overview-peers">
-          <div class="loading">loading…</div>
+        <div class="card">
+          <div class="card-header">
+            <h3>Activity</h3>
+            <div class="card-actions">
+              <span class="meta" id="activity-status"></span>
+            </div>
+          </div>
+          <div class="card-body dense" id="activity-feed">
+            <div class="empty">waiting for activity…</div>
+          </div>
         </div>
       </div>
     </section>
@@ -1119,69 +1195,286 @@ function fmtDuration(secs) {
 }
 
 /* ── Overview page ────────────────────────────────────────── */
-function initOverview() { /* nothing one-shot */ }
-async function enterOverview() {
+let overviewAutoTimer = null;
+// Snapshot of last poll for diff-based activity rail.
+let overviewPrev = {
+  tasks: null,        // Map<task_id, { status, updated_at }>
+  peers: null,        // Map<node_id, { freshness, alias }>
+  reconnect: null,    // { attempts, successes }
+  coord: null,        // bool
+};
+// Recent activity items, newest first. Capped at 50.
+let activityItems = [];
+const ACTIVITY_CAP = 50;
+let lastOverviewSyncAt = 0;
+
+function initOverview() {
+  // Start polling when the page becomes active; cleared on
+  // route change via enterOverview re-entry + the route switch
+  // implicitly halts via currentRoute check.
+}
+
+function enterOverview() {
+  // Refresh immediately, then on a 5s tick while still on overview.
+  refreshOverview(true);
+  if (overviewAutoTimer) clearInterval(overviewAutoTimer);
+  overviewAutoTimer = setInterval(() => {
+    if (currentRoute === 'overview') refreshOverview(false);
+  }, 5000);
+}
+
+async function refreshOverview(isFirst) {
   try {
-    const [hRes, tRes, cRes] = await Promise.all([
+    const [hRes, tRes, recentTasks] = await Promise.all([
       fetch('/v1/health').then(r => r.json()),
       fetch('/v1/topology').then(r => r.json()),
-      fetch('/v1/tasks/count').then(r => r.text()).then(t => {
-        const m = t.match(/count=(\d+)/);
-        return m ? parseInt(m[1], 10) : 0;
-      }).catch(() => null),
+      fetch('/v1/tasks/cursor?limit=20').then(r => r.json()).catch(() => ({ items: [] })),
     ]);
-    const okPeers = hRes.peer_count - hRes.peers_expired - hRes.peers_stale;
-    document.getElementById('kpi-status').textContent =
-      hRes.peers_expired > 0 ? 'degraded'
-      : hRes.peers_stale   > 0 ? 'stale'
-      : 'healthy';
-    document.getElementById('kpi-status-delta').textContent =
-      `${okPeers}/${hRes.peer_count} fresh`;
-    document.getElementById('kpi-uptime').textContent = fmtDuration(hRes.uptime_secs);
-    document.getElementById('kpi-peers').textContent = hRes.peer_count;
-    document.getElementById('kpi-peers-delta').textContent =
-      `fresh=${hRes.peers_fresh} stale=${hRes.peers_stale} expired=${hRes.peers_expired}`;
-    document.getElementById('kpi-tasks').textContent = cRes != null ? cRes : '—';
-    document.getElementById('kpi-tasks-delta').textContent =
-      cRes != null ? 'in coordinator ledger' : 'coordinator unavailable';
-    document.getElementById('kpi-coord').textContent =
-      hRes.coordinator_configured ? 'configured' : 'absent';
-    document.getElementById('kpi-coord-delta').textContent =
-      hRes.coordinator_configured ? '' : 'task.* endpoints return 503';
-    if (hRes.reconnect) {
-      document.getElementById('kpi-reconnect').textContent =
-        hRes.reconnect.successes + '/' + hRes.reconnect.attempts;
-    } else {
-      document.getElementById('kpi-reconnect').textContent = 'n/a';
-    }
+    const taskCount = await fetch('/v1/tasks/count')
+      .then(r => r.text())
+      .then(t => { const m = t.match(/count=(\d+)/); return m ? parseInt(m[1], 10) : null; })
+      .catch(() => null);
 
-    // Recent peers (first 5)
-    const host = document.getElementById('overview-peers');
-    if (!tRes.peers || !tRes.peers.length) {
-      host.innerHTML = '<div class="empty">no peers discovered</div>';
-      return;
-    }
-    const top5 = tRes.peers.slice(0, 5);
-    host.innerHTML =
-      '<table class="data">'
-      + '<thead><tr><th>alias</th><th>type</th><th>caps</th><th>last refr</th><th>state</th></tr></thead>'
-      + '<tbody>'
-      + top5.map(p => (
-        '<tr>'
-        + '<td>' + escapeHtml(p.alias || '(none)') + '</td>'
-        + '<td>' + escapeHtml(p.node_type) + '</td>'
-        + '<td>' + p.capability_count + '</td>'
-        + '<td>' + p.last_refreshed_secs_ago + 's ago</td>'
-        + '<td><span class="badge ' + escapeHtml(p.freshness) + '">'
-            + escapeHtml(p.freshness) + '</span></td>'
-        + '</tr>'
-      )).join('')
-      + '</tbody></table>';
+    renderOverviewKpis(hRes, taskCount);
+    renderOverviewPeers(tRes.peers || []);
+    diffAndRecordActivity(hRes, tRes.peers || [], recentTasks.items || [], isFirst);
+    lastOverviewSyncAt = Math.floor(Date.now() / 1000);
+    document.getElementById('activity-status').innerHTML =
+      '<span class="activity-pulse"></span>live · last sync ' + new Date().toLocaleTimeString();
   } catch (e) {
     document.querySelectorAll('.kpi .value').forEach(v => v.textContent = '—');
     document.getElementById('overview-peers').innerHTML =
       '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+    document.getElementById('activity-status').textContent = 'sync failed: ' + String(e);
   }
+}
+
+function renderOverviewKpis(hRes, taskCount) {
+  const okPeers = hRes.peer_count - hRes.peers_expired - hRes.peers_stale;
+  document.getElementById('kpi-status').textContent =
+    hRes.peers_expired > 0 ? 'degraded'
+    : hRes.peers_stale   > 0 ? 'stale'
+    : 'healthy';
+  document.getElementById('kpi-status-delta').textContent =
+    `${okPeers}/${hRes.peer_count} fresh`;
+  document.getElementById('kpi-uptime').textContent = fmtDuration(hRes.uptime_secs);
+  document.getElementById('kpi-peers').textContent = hRes.peer_count;
+  document.getElementById('kpi-peers-delta').textContent =
+    `fresh=${hRes.peers_fresh} stale=${hRes.peers_stale} expired=${hRes.peers_expired}`;
+  document.getElementById('kpi-tasks').textContent = taskCount != null ? taskCount : '—';
+  document.getElementById('kpi-tasks-delta').textContent =
+    taskCount != null ? 'in coordinator ledger' : 'coordinator unavailable';
+  document.getElementById('kpi-coord').textContent =
+    hRes.coordinator_configured ? 'configured' : 'absent';
+  document.getElementById('kpi-coord-delta').textContent =
+    hRes.coordinator_configured ? '' : 'task.* endpoints return 503';
+  if (hRes.reconnect) {
+    document.getElementById('kpi-reconnect').textContent =
+      hRes.reconnect.successes + '/' + hRes.reconnect.attempts;
+  } else {
+    document.getElementById('kpi-reconnect').textContent = 'n/a';
+  }
+}
+
+function renderOverviewPeers(peers) {
+  const host = document.getElementById('overview-peers');
+  if (!peers.length) {
+    host.innerHTML = '<div class="empty">no peers discovered</div>';
+    return;
+  }
+  const top5 = peers.slice(0, 5);
+  host.innerHTML =
+    '<table class="data">'
+    + '<thead><tr><th>alias</th><th>type</th><th>caps</th><th>last refr</th><th>state</th></tr></thead>'
+    + '<tbody>'
+    + top5.map(p => (
+      '<tr data-node-id="' + escapeHtml(p.node_id || '') + '">'
+      + '<td>' + escapeHtml(p.alias || '(none)') + '</td>'
+      + '<td>' + escapeHtml(p.node_type) + '</td>'
+      + '<td>' + p.capability_count + '</td>'
+      + '<td>' + p.last_refreshed_secs_ago + 's ago</td>'
+      + '<td><span class="badge ' + escapeHtml(p.freshness) + '">'
+          + escapeHtml(p.freshness) + '</span></td>'
+      + '</tr>'
+    )).join('')
+    + '</tbody></table>';
+  host.querySelectorAll('tbody tr').forEach(tr => {
+    tr.addEventListener('click', () => {
+      // Reuse the topology peers list as the source for the drawer
+      // even if the topology page hasn't been visited.
+      topologyPeers = peers;
+      openPeerDrawer(tr.dataset.nodeId);
+    });
+  });
+}
+
+/* Diff current snapshots against the previous tick and append
+   activity items for anything that changed. Activity rail is
+   the dashboard's "feels alive" surface — every visible
+   transition should appear here. */
+function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
+  // Index the current state by id.
+  const peerMap = new Map(peers.map(p => [p.node_id, {
+    freshness: p.freshness,
+    alias: p.alias || '(none)',
+  }]));
+  const taskMap = new Map(tasks.map(t => [t.task_id, {
+    status: t.status,
+    title: t.title,
+  }]));
+  const recon = hRes.reconnect || null;
+
+  // First sync: just snapshot, don't flood the rail.
+  if (isFirst || !overviewPrev.peers) {
+    overviewPrev = {
+      tasks: taskMap,
+      peers: peerMap,
+      reconnect: recon,
+      coord: hRes.coordinator_configured,
+    };
+    if (!activityItems.length) renderActivityFeed();
+    return;
+  }
+
+  const newItems = [];
+
+  // Coordinator presence flips.
+  if (overviewPrev.coord !== hRes.coordinator_configured) {
+    newItems.push({
+      ts: Date.now(),
+      kind: hRes.coordinator_configured ? 'ok' : 'danger',
+      label: hRes.coordinator_configured ? 'COORD' : 'COORD',
+      body: 'coordinator ' + (hRes.coordinator_configured
+        ? 'reachable'
+        : 'unavailable — task.* endpoints return 503'),
+    });
+  }
+
+  // Reconnect attempts increased: an underlying peer flapped.
+  if (recon && overviewPrev.reconnect) {
+    const da = recon.attempts - overviewPrev.reconnect.attempts;
+    const ds = recon.successes - overviewPrev.reconnect.successes;
+    if (da > 0) {
+      newItems.push({
+        ts: Date.now(),
+        kind: ds >= da ? 'warn' : 'danger',
+        label: 'PEER',
+        body: 'reconnect ' + (ds >= da ? 'recovered' : 'in progress')
+          + ' (+' + da + ' attempt' + (da === 1 ? '' : 's')
+          + ', +' + ds + ' success' + (ds === 1 ? '' : 'es') + ')',
+      });
+    }
+  }
+
+  // Peer freshness transitions: only emit when bucket changes,
+  // not for every second tick.
+  for (const [id, cur] of peerMap.entries()) {
+    const prev = overviewPrev.peers.get(id);
+    if (!prev) {
+      newItems.push({
+        ts: Date.now(),
+        kind: 'peer',
+        label: 'PEER',
+        body: cur.alias + ' joined (' + cur.freshness + ')',
+      });
+      continue;
+    }
+    if (prev.freshness !== cur.freshness) {
+      const k = cur.freshness === 'fresh' ? 'ok'
+              : cur.freshness === 'stale' ? 'warn'
+              : 'danger';
+      newItems.push({
+        ts: Date.now(),
+        kind: k,
+        label: 'PEER',
+        body: cur.alias + ' ' + prev.freshness + ' → ' + cur.freshness,
+      });
+    }
+  }
+  // Peers gone.
+  for (const [id, prev] of overviewPrev.peers.entries()) {
+    if (!peerMap.has(id)) {
+      newItems.push({
+        ts: Date.now(),
+        kind: 'danger',
+        label: 'PEER',
+        body: prev.alias + ' dropped from the manifest cache',
+      });
+    }
+  }
+
+  // Task status changes.
+  for (const [id, cur] of taskMap.entries()) {
+    const prev = overviewPrev.tasks.get(id);
+    if (!prev) {
+      newItems.push({
+        ts: Date.now(),
+        kind: 'task',
+        label: 'TASK',
+        body: cur.status + ' · ' + truncateMiddle(cur.title || '(untitled)', 60)
+          + '   <span class="id">' + escapeHtml(id.slice(0, 8)) + '</span>',
+        raw: true,
+      });
+      continue;
+    }
+    if (prev.status !== cur.status) {
+      const k = (cur.status === 'completed') ? 'ok'
+              : (cur.status === 'failed' || cur.status === 'interrupted') ? 'danger'
+              : (cur.status === 'retrying' || cur.status === 'cancelled') ? 'warn'
+              : 'task';
+      newItems.push({
+        ts: Date.now(),
+        kind: k,
+        label: 'TASK',
+        body: prev.status + ' → ' + cur.status
+          + ' · ' + truncateMiddle(cur.title || '', 50)
+          + '   <span class="id">' + escapeHtml(id.slice(0, 8)) + '</span>',
+        raw: true,
+      });
+    }
+  }
+
+  // Bump activity rail.
+  if (newItems.length) {
+    activityItems = newItems.reverse().concat(activityItems).slice(0, ACTIVITY_CAP);
+    renderActivityFeed(newItems.length);
+  }
+
+  overviewPrev = {
+    tasks: taskMap,
+    peers: peerMap,
+    reconnect: recon,
+    coord: hRes.coordinator_configured,
+  };
+}
+
+function renderActivityFeed(newCount) {
+  const $host = document.getElementById('activity-feed');
+  if (!activityItems.length) {
+    $host.innerHTML = '<div class="empty">waiting for activity…</div>';
+    return;
+  }
+  const rows = activityItems.map((it, i) => {
+    const dt = new Date(it.ts);
+    const tag = dt.toLocaleTimeString();
+    const isNew = newCount && i < newCount;
+    return '<div class="activity-item ' + escapeHtml(it.kind) + (isNew ? ' new' : '') + '">'
+      + '<span class="activity-icon"></span>'
+      + '<span class="activity-tag">' + escapeHtml(tag) + '</span>'
+      + '<span class="activity-body">'
+        + (it.raw ? it.body : escapeHtml(it.body))
+      + '</span>'
+      + '</div>';
+  }).join('');
+  $host.innerHTML = '<div class="activity-list">' + rows + '</div>';
+}
+
+function truncateMiddle(s, n) {
+  if (!s) return '';
+  if (s.length <= n) return s;
+  const head = Math.ceil((n - 1) / 2);
+  const tail = Math.floor((n - 1) / 2);
+  return s.slice(0, head) + '…' + s.slice(s.length - tail);
 }
 
 /* ── Tasks page ───────────────────────────────────────────── */

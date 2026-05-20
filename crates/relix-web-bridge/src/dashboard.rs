@@ -193,6 +193,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_overview_activity_feed_present() {
+        // M10: overview page hosts a live activity rail that
+        // diffs poll-cycle snapshots and surfaces transitions.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="activity-feed""#),
+            "overview should host an activity-feed element"
+        );
+        assert!(
+            body.contains("waiting for activity"),
+            "overview should ship a default empty state for activity"
+        );
+    }
+
+    #[tokio::test]
     async fn page_topology_graph_landmarks_present() {
         // M9: the topology page renders an SVG graph + a
         // peer detail drawer. Assert both elements ship.
