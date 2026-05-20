@@ -225,6 +225,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_timeline_renderer_present() {
+        // M20: task detail panel renders chronicle events as a
+        // visual timeline (default) with a toggle to raw view.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // The rendering functions are inline in the page JS;
+        // their names + CSS class hooks are the landmarks.
+        assert!(
+            body.contains("renderTimeline"),
+            "page should ship renderTimeline()"
+        );
+        assert!(
+            body.contains("timeline-marker"),
+            "page should ship timeline-marker CSS class"
+        );
+        assert!(
+            body.contains("timelineMarkerClass"),
+            "page should ship the per-event-class marker mapper"
+        );
+    }
+
+    #[tokio::test]
     async fn page_overview_activity_feed_present() {
         // M10: overview page hosts a live activity rail that
         // diffs poll-cycle snapshots and surfaces transitions.

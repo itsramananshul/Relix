@@ -795,6 +795,134 @@
       color: var(--text-strong);
     }
 
+    /* ── Execution timeline ────────────────────────────────────── */
+    .timeline {
+      padding: 4px 14px 14px;
+    }
+    .timeline-controls {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .timeline-controls .seg {
+      padding: 3px 10px;
+      font-size: var(--text-xs);
+      border-radius: 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .timeline-controls .seg.active {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--text-strong);
+    }
+    .timeline-row {
+      display: grid;
+      grid-template-columns: 70px 22px minmax(0, 1fr);
+      gap: 10px;
+      align-items: flex-start;
+      padding: 4px 0;
+      position: relative;
+      font-size: var(--text-xs);
+    }
+    .timeline-time {
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      padding-top: 4px;
+      text-align: right;
+    }
+    .timeline-time .rel {
+      display: block;
+      color: var(--text-dim);
+      font-size: 10px;
+    }
+    .timeline-track {
+      position: relative;
+      width: 22px;
+      align-self: stretch;
+    }
+    .timeline-marker {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      border: 2px solid var(--bg-elevated);
+      position: absolute;
+      top: 7px;
+      left: 50%;
+      transform: translateX(-50%);
+      box-shadow: 0 0 0 1px var(--border);
+      z-index: 2;
+    }
+    .timeline-marker.task   { background: var(--accent); }
+    .timeline-marker.attempt-start { background: var(--info); }
+    .timeline-marker.attempt-end-ok { background: var(--ok); }
+    .timeline-marker.attempt-end-bad { background: var(--danger); }
+    .timeline-marker.retry  { background: var(--warn); }
+    .timeline-marker.interrupted { background: var(--warn); box-shadow: 0 0 0 1px var(--warn); }
+    .timeline-marker.completed   { background: var(--ok); }
+    .timeline-marker.failed { background: var(--danger); }
+    .timeline-marker.cancelled { background: var(--text-dim); }
+    .timeline-marker.capability { background: var(--text-muted); }
+    /* Vertical connector line through the track. */
+    .timeline-row:not(.timeline-last) .timeline-track::after {
+      content: '';
+      position: absolute;
+      top: 16px;
+      left: 50%;
+      width: 1px;
+      height: calc(100% + 4px);
+      background: var(--border);
+      transform: translateX(-50%);
+      z-index: 1;
+    }
+    .timeline-body {
+      min-width: 0;
+    }
+    .timeline-type {
+      font-weight: 600;
+      color: var(--text);
+      font-size: var(--text-sm);
+    }
+    .timeline-type .attempt-num {
+      color: var(--text-muted);
+      font-weight: 400;
+      font-size: var(--text-xs);
+      margin-left: 6px;
+    }
+    .timeline-payload {
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      word-break: break-word;
+      margin-top: 2px;
+    }
+    .timeline-row.attempt-band {
+      background: linear-gradient(to right,
+        rgba(90,123,214,0.04), transparent 30%);
+      border-radius: 3px;
+    }
+    .timeline-row.attempt-band.attempt-failed {
+      background: linear-gradient(to right,
+        rgba(239,68,68,0.05), transparent 30%);
+    }
+    .timeline-json {
+      display: block;
+      background: var(--bg);
+      padding: 6px 8px;
+      border-radius: 3px;
+      border: 1px solid var(--border-soft);
+      margin-top: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      max-height: 120px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: var(--text);
+    }
+
     /* ── Toast notifications ───────────────────────────────────── */
     .toast-host {
       position: fixed;
@@ -1992,12 +2120,28 @@ function renderDetail(l) {
       </table>`
     : '<div class="meta" style="padding: 0 14px 12px;">(no attempts — task never transitioned to running)</div>';
 
-  const events = (l.task.events || []).map(e => {
-    const cls = eventClass(e.event_type);
-    return `<div class="event ${cls}"><span class="type">${escapeHtml(e.event_type)}</span><span class="payload">${escapeHtml(e.payload || '')}</span></div>`;
-  }).join('');
-  const eventsBlock = events
-    ? `<div class="events"><h3>chronology (${l.task.events.length})</h3>${events}</div>`
+  // ── Execution timeline (default view) + raw chronology (toggle) ──
+  const events = l.task.events || [];
+  const timelineHtml = renderTimeline(events);
+  const rawHtml = events.length
+    ? events.map(e => {
+        const cls = eventClass(e.event_type);
+        return `<div class="event ${cls}"><span class="type">${escapeHtml(e.event_type)}</span><span class="payload">${escapeHtml(e.payload || '')}</span></div>`;
+      }).join('')
+    : '<div class="meta">(no chronicle events)</div>';
+
+  const eventsBlock = events.length
+    ? `<div class="events">
+        <h3 style="display: flex; align-items: center; justify-content: space-between;">
+          <span>chronology (${events.length})</span>
+          <span class="timeline-controls">
+            <span class="seg active" data-view="timeline">Timeline</span>
+            <span class="seg" data-view="raw">Raw</span>
+          </span>
+        </h3>
+        <div id="detail-view-timeline">${timelineHtml}</div>
+        <div id="detail-view-raw" hidden>${rawHtml}</div>
+      </div>`
     : '<div class="meta" style="padding: 12px 14px;">(no chronicle events)</div>';
 
   document.getElementById('task-detail').innerHTML =
@@ -2005,6 +2149,83 @@ function renderDetail(l) {
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     + eventsBlock
     + `<div class="meta" style="padding: 8px 14px;">task_id: <span class="id">${escapeHtml(l.task.task_id)}</span></div>`;
+
+  // Wire timeline/raw toggle.
+  document.querySelectorAll('.timeline-controls .seg').forEach(seg => {
+    seg.addEventListener('click', () => {
+      const v = seg.dataset.view;
+      document.querySelectorAll('.timeline-controls .seg').forEach(x => {
+        x.classList.toggle('active', x.dataset.view === v);
+      });
+      document.getElementById('detail-view-timeline').hidden = (v !== 'timeline');
+      document.getElementById('detail-view-raw').hidden = (v !== 'raw');
+    });
+  });
+}
+
+/* Execution timeline. Renders the chronicle as a vertical
+   track with per-event markers, colored by event class.
+   Time column shows absolute HH:MM:SS + relative offset
+   from the first event so operators can scan "what
+   happened, when, and how long it took" without parsing
+   the raw `payload` strings. */
+function renderTimeline(events) {
+  if (!events.length) {
+    return '<div class="empty" style="padding: 20px;">(no chronicle events)</div>';
+  }
+  const t0 = events[0].ts || 0;
+  const rows = events.map((e, i) => {
+    const dt = new Date((e.ts || 0) * 1000);
+    const timeAbs = dt.toLocaleTimeString();
+    const rel = (e.ts || 0) - t0;
+    const relLabel = rel === 0 ? '' : '+' + fmtDuration(rel);
+    const markerCls = timelineMarkerClass(e);
+    const attemptTag = (e.attempt_id != null)
+      ? `<span class="attempt-num">· attempt ${e.attempt_id}</span>`
+      : '';
+    const payloadHtml = e.payload
+      ? `<div class="timeline-payload">${escapeHtml(e.payload)}</div>`
+      : '';
+    const jsonHtml = e.payload_json
+      ? `<details class="timeline-json-wrap"><summary class="meta" style="cursor:pointer; margin-top: 2px;">payload_json</summary><pre class="timeline-json">${escapeHtml(JSON.stringify(e.payload_json, null, 2))}</pre></details>`
+      : '';
+    const rowCls = isAttemptBand(e) ? ' attempt-band' : '';
+    const failed = e.event_type === 'task.attempt_finished'
+      && e.payload_json
+      && e.payload_json.failure_class;
+    return `<div class="timeline-row${rowCls}${failed ? ' attempt-failed' : ''}${i === events.length - 1 ? ' timeline-last' : ''}">
+      <div class="timeline-time">${escapeHtml(timeAbs)}<span class="rel">${escapeHtml(relLabel)}</span></div>
+      <div class="timeline-track"><span class="timeline-marker ${markerCls}"></span></div>
+      <div class="timeline-body">
+        <div class="timeline-type">${escapeHtml(e.event_type || '')}${attemptTag}</div>
+        ${payloadHtml}${jsonHtml}
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="timeline">${rows}</div>`;
+}
+
+function timelineMarkerClass(e) {
+  const t = e.event_type || '';
+  if (t === 'task.created' || t === 'flow.started') return 'task';
+  if (t === 'task.attempt_started') return 'attempt-start';
+  if (t === 'task.attempt_finished') {
+    if (e.payload_json && e.payload_json.failure_class) return 'attempt-end-bad';
+    return 'attempt-end-ok';
+  }
+  if (t === 'task.retry_requested' || t === 'task.retry_exhausted') return 'retry';
+  if (t === 'task.interrupted') return 'interrupted';
+  if (t === 'task.completed')   return 'completed';
+  if (t === 'task.failed')      return 'failed';
+  if (t === 'task.cancelled')   return 'cancelled';
+  if (t === 'capability.invoked') return 'capability';
+  return '';
+}
+
+function isAttemptBand(e) {
+  // Subtle band on attempt boundary rows so the eye groups them.
+  return e.event_type === 'task.attempt_started'
+    || e.event_type === 'task.attempt_finished';
 }
 
 function eventClass(t) {
@@ -2046,19 +2267,66 @@ function setLiveStatus(s) { document.getElementById('live-status').textContent =
 function appendChronologyEvent(ev) {
   const eventsBlock = document.querySelector('#task-detail .events');
   if (!eventsBlock) { if (selectedTaskId) loadDetail(selectedTaskId); return; }
-  const div = document.createElement('div');
-  div.className = 'event ' + eventClass(ev.event_type) + ' live';
-  const ts = document.createElement('span'); ts.className = 'type'; ts.textContent = ev.event_type;
-  const pl = document.createElement('span'); pl.className = 'payload'; pl.textContent = ev.payload || '';
-  div.appendChild(ts); div.appendChild(pl);
-  eventsBlock.appendChild(div);
-  eventsBlock.scrollTop = eventsBlock.scrollHeight;
-  const h3 = eventsBlock.querySelector('h3');
+
+  // Append to raw view (unchanged from previous behavior).
+  const rawView = document.getElementById('detail-view-raw');
+  if (rawView) {
+    const div = document.createElement('div');
+    div.className = 'event ' + eventClass(ev.event_type) + ' live';
+    const ts = document.createElement('span'); ts.className = 'type'; ts.textContent = ev.event_type;
+    const pl = document.createElement('span'); pl.className = 'payload'; pl.textContent = ev.payload || '';
+    div.appendChild(ts); div.appendChild(pl);
+    rawView.appendChild(div);
+    if (!rawView.hidden) rawView.scrollTop = rawView.scrollHeight;
+  }
+
+  // Append to timeline view.
+  const tlView = document.getElementById('detail-view-timeline');
+  if (tlView) {
+    const tlInner = tlView.querySelector('.timeline');
+    if (tlInner) {
+      // Remove timeline-last from the prior last row so the
+      // connector line extends to the new row.
+      const lastRow = tlInner.querySelector('.timeline-row:last-child');
+      if (lastRow) lastRow.classList.remove('timeline-last');
+      const wrap = document.createElement('div');
+      wrap.innerHTML = renderSingleTimelineRow(ev, /*isLast=*/true, /*addLive=*/true);
+      const row = wrap.firstElementChild;
+      if (row) {
+        tlInner.appendChild(row);
+        if (!tlView.hidden) tlView.scrollTop = tlView.scrollHeight;
+      }
+    }
+  }
+
+  // Bump the count badge.
+  const h3 = eventsBlock.querySelector('h3 span');
   if (h3) {
     const m = h3.textContent.match(/\((\d+)\)/);
-    const next = m ? (parseInt(m[1], 10) + 1) : eventsBlock.querySelectorAll('.event').length;
+    const next = m ? (parseInt(m[1], 10) + 1) : 1;
     h3.textContent = h3.textContent.replace(/\(\d+\)/, '(' + next + ')');
   }
+}
+
+function renderSingleTimelineRow(e, isLast, isLive) {
+  const dt = new Date((e.ts || 0) * 1000);
+  const timeAbs = dt.toLocaleTimeString();
+  const markerCls = timelineMarkerClass(e);
+  const attemptTag = (e.attempt_id != null)
+    ? `<span class="attempt-num">· attempt ${e.attempt_id}</span>`
+    : '';
+  const payloadHtml = e.payload
+    ? `<div class="timeline-payload">${escapeHtml(e.payload)}</div>`
+    : '';
+  const rowCls = isAttemptBand(e) ? ' attempt-band' : '';
+  return `<div class="timeline-row${rowCls}${isLast ? ' timeline-last' : ''}${isLive ? ' new' : ''}">
+    <div class="timeline-time">${escapeHtml(timeAbs)}<span class="rel">live</span></div>
+    <div class="timeline-track"><span class="timeline-marker ${markerCls}"></span></div>
+    <div class="timeline-body">
+      <div class="timeline-type">${escapeHtml(e.event_type || '')}${attemptTag}</div>
+      ${payloadHtml}
+    </div>
+  </div>`;
 }
 
 /* ── Retention dry-run modal ──────────────────────────────── */
