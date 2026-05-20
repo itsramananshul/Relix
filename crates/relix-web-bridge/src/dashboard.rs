@@ -225,6 +225,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_topology_correlation_present() {
+        // M28: failed / interrupted tasks surface a
+        // "Topology events near this task" correlation
+        // panel. Explicitly labeled as correlation, not
+        // causation.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("maybeFetchTopologyCorrelation"),
+            "page should ship maybeFetchTopologyCorrelation()"
+        );
+        assert!(
+            body.contains("Correlation, not causation"),
+            "correlation panel must label itself honestly"
+        );
+        assert!(
+            body.contains(r#"id="correlation-slot""#),
+            "page should ship the correlation slot element"
+        );
+    }
+
+    #[tokio::test]
     async fn page_xref_panel_renderer_present() {
         // M27: task detail surfaces a Cross-references panel
         // with the IDs operators need to drill into per-flow

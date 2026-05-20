@@ -816,6 +816,48 @@
       color: var(--text-strong);
     }
 
+    /* ── Topology correlation panel ────────────────────────────── */
+    .correlation-panel {
+      margin: 0 14px 12px;
+      padding: 10px 12px;
+      background: rgba(245,158,11,0.06);
+      border: 1px solid rgba(245,158,11,0.25);
+      border-radius: 4px;
+      font-size: var(--text-xs);
+    }
+    .correlation-panel.empty { display: none; }
+    .correlation-panel h4 {
+      margin: 0 0 6px;
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+      color: var(--warn);
+    }
+    .correlation-panel .disclaimer {
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      font-style: italic;
+    }
+    .correlation-panel .correlation-list {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .correlation-panel .correlation-row {
+      display: grid;
+      grid-template-columns: 90px auto 1fr;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .correlation-panel .ts-offset {
+      font-family: var(--font-mono);
+      color: var(--text-muted);
+    }
+    .correlation-panel .ts-offset.before { color: var(--text-muted); }
+    .correlation-panel .ts-offset.after  { color: var(--text-dim); }
+    .correlation-panel .badge { font-size: 9px; padding: 0 5px; }
+
     /* ── Cross-reference panel (causality bridge to logs) ──────── */
     .xref-panel {
       padding: 10px 14px 14px;
@@ -2373,12 +2415,22 @@ function renderDetail(l) {
 
   const chainBlock = renderRetryChain(l.attempts || []);
   const xrefBlock = renderXrefPanel(l);
+  // Empty correlation slot — filled async by
+  // fetchTopologyCorrelation when the task is failed /
+  // interrupted (the visual cue is the slot is hidden
+  // when there's nothing to show).
+  const corrSlot = '<div id="correlation-slot" class="correlation-panel empty"></div>';
   document.getElementById('task-detail').innerHTML =
     `<div class="summary">${summaryRow}</div>`
     + chainBlock
+    + corrSlot
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     + eventsBlock
     + xrefBlock;
+  // Fire-and-forget correlation lookup. Status guards
+  // mean we only fetch when the operator would actually
+  // benefit from the data (interrupted / failed tasks).
+  maybeFetchTopologyCorrelation(l);
 
   // Wire timeline/raw toggle.
   document.querySelectorAll('.timeline-controls .seg').forEach(seg => {
@@ -2453,6 +2505,81 @@ function renderRetryChain(attempts) {
     +   ' total wall-clock · ' + escapeHtml(outcome)
     + '</div>'
     + '</div>';
+}
+
+/* Topology correlation: when a task is interrupted or
+   failed, fetch the lifecycle event log and surface any
+   peer-level transitions that happened near the task's
+   failure window. Pure correlation — explicitly labeled
+   as such (correlation != causation). Operators get the
+   "did the AI peer flap right before this task died?"
+   answer in one glance instead of cross-referencing
+   timestamps manually. */
+async function maybeFetchTopologyCorrelation(l) {
+  const t = (l && l.task) || {};
+  const eligible = t.status === 'interrupted' || t.status === 'failed';
+  if (!eligible) return;
+  // Window: from the task's started_at (or updated_at as
+  // fallback) to its updated_at + 30s grace. If the task
+  // never started (no started_at), use updated_at ± 60s.
+  const anchor = (t.started_at && t.started_at > 0)
+    ? t.started_at
+    : (t.updated_at || 0);
+  const upper = (t.updated_at || anchor) + 30;
+  const lower = anchor - 30;
+  if (!anchor) return;
+  try {
+    const r = await fetch('/v1/topology/events?limit=200');
+    if (!r.ok) return;
+    const j = await r.json();
+    const all = (j.events || []);
+    const relevant = all.filter(ev =>
+      typeof ev.ts === 'number' && ev.ts >= lower && ev.ts <= upper
+    );
+    renderTopologyCorrelation(relevant, anchor, t);
+  } catch (_) {
+    // Silent: correlation is best-effort. Failure here
+    // shouldn't break the task detail rendering.
+  }
+}
+
+function renderTopologyCorrelation(events, anchor, task) {
+  const $slot = document.getElementById('correlation-slot');
+  if (!$slot) return;
+  if (!events.length) {
+    $slot.className = 'correlation-panel empty';
+    $slot.innerHTML = '';
+    return;
+  }
+  const rows = events
+    // Sort by ts ascending so the timeline reads naturally
+    // (earliest event first).
+    .slice()
+    .sort((a, b) => a.ts - b.ts)
+    .map(ev => {
+      const offset = ev.ts - anchor;
+      const offsetLabel = (offset >= 0 ? '+' : '−') + fmtDuration(Math.abs(offset));
+      const offsetCls = offset >= 0 ? 'after' : 'before';
+      const kindCls = ev.kind === 'joined' ? 'ok'
+        : ev.kind === 'dropped' ? 'danger'
+        : (ev.to_freshness === 'fresh' ? 'ok'
+            : ev.to_freshness === 'stale' ? 'warn'
+            : 'danger');
+      return '<div class="correlation-row">'
+        + '<span class="ts-offset ' + offsetCls + '">' + escapeHtml(offsetLabel) + '</span>'
+        + '<span class="badge ' + kindCls + '">' + escapeHtml(ev.kind) + '</span>'
+        + '<span>' + escapeHtml(ev.detail || '') + '</span>'
+        + '</div>';
+    }).join('');
+  $slot.className = 'correlation-panel';
+  $slot.innerHTML =
+    '<h4>Topology events near this ' + escapeHtml(task.status) + ' task</h4>'
+    + '<p class="disclaimer">'
+    +   'Correlation, not causation — these mesh-level transitions '
+    +   'happened within a ±30s window of this task. Time offsets '
+    +   'are relative to the task\'s ' + (task.started_at ? 'started_at' : 'updated_at') + '.'
+    + '</p>'
+    + '<div class="correlation-list">' + rows + '</div>';
 }
 
 /* Cross-reference panel: surfaces the IDs operators need
