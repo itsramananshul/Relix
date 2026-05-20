@@ -434,6 +434,14 @@ fn register_node_type_handlers(
                 &["task", "read", "retention", "operator"],
             ),
             (
+                "task.edges",
+                "List execution edges that touch the given task (as child \
+                 or parent). Phase-1E execution graph primitive — only \
+                 `retried_from` is emitted today; other edge types in \
+                 the schema are reserved for future runtime primitives.",
+                &["task", "read", "graph", "lineage"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -469,7 +477,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges"
         );
     }
     if cfg.controller.node_type == "tool" {

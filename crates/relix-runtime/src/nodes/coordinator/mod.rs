@@ -94,6 +94,7 @@
 //! | `task.retry`    | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted retry_count=N budget=M\n` / INVALID_ARGS with cause |
 //! | `task.export`   | `task_id` | single JSON archival snapshot (`{schema_version, exported_at, task_id, task, attempts}`) |
 //! | `task.compact_events` | `max_age_secs\|mode` (mode defaults to `dry-run`; only `dry-run` is shipped) | single JSON object `{mode, destructive:false, cutoff_ts, candidate_events, candidate_tasks, oldest_candidate_ts?, newest_candidate_ts?, by_task_status:{...}}` |
+//! | `task.edges`    | `task_id` | one `edge_id\tedge_type\tattempt_id\|-\trelated_task_id\|-\trelated_attempt_id\|-\tspawned_by_event_id\|-\tcreated_at\n` per execution edge touching the task (as child or parent). Phase-1E: only `retried_from` emitted today. |
 //!
 //! Optional trailers (older callers that omit them keep working
 //! unchanged): `retry_policy|max_retries|max_runtime_secs` on
@@ -867,6 +868,50 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// List every execution edge that touches `task_id` —
+    /// either as the child (edges where `task_id = ?`) or as
+    /// the parent (edges where `related_task_id = ?`).
+    /// Returned oldest-first by `edge_id` so the chain
+    /// reads chronologically.
+    ///
+    /// Phase-1E M38: today only the `retried_from` edge type
+    /// is actively emitted (by `open_attempt_if_needed` when
+    /// a retry opens a new attempt). Other edge types in the
+    /// schema are reserved for runtime primitives that don't
+    /// ship yet.
+    pub fn list_edges_for_task(&self, task_id: &str) -> Result<Vec<TaskEdge>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT edge_id, task_id, attempt_id, edge_type,
+                        related_task_id, related_attempt_id,
+                        spawned_by_event_id, created_at
+                 FROM task_edges
+                 WHERE task_id = ?1 OR related_task_id = ?1
+                 ORDER BY edge_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![task_id], |r| {
+                Ok(TaskEdge {
+                    edge_id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    attempt_id: r.get(2)?,
+                    edge_type: r.get(3)?,
+                    related_task_id: r.get(4)?,
+                    related_attempt_id: r.get(5)?,
+                    spawned_by_event_id: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// Fetch a slice of one Task's chronicle. Events with
     /// `event_id > after_id` are returned, oldest-first, capped at
     /// `limit` (clamped to `[1, max_list]` to share the same upper
@@ -1569,6 +1614,37 @@ pub struct AttemptView {
     pub failure_class: Option<String>,
 }
 
+/// One row from `task_edges`. An execution edge that originated
+/// from a recorded runtime action — never synthesised. See the
+/// `edge_type` taxonomy in the `task_edges` schema docblock.
+#[derive(Debug, Clone)]
+pub struct TaskEdge {
+    pub edge_id: i64,
+    pub task_id: String,
+    /// Attempt on the *child / current* side of the edge. None
+    /// when the edge is task-scoped rather than attempt-scoped
+    /// (no edge type uses this today; reserved for future
+    /// task-spawned-by-task primitives).
+    pub attempt_id: Option<i64>,
+    /// One of the documented edge_type vocabulary. Only
+    /// `retried_from` has a shipped emitter today.
+    pub edge_type: String,
+    /// Task on the *parent / dependency* side. For
+    /// `retried_from` this equals `task_id` (same task, just
+    /// a prior attempt). None for edge types that don't
+    /// reference another task.
+    pub related_task_id: Option<String>,
+    /// Attempt on the *parent / dependency* side. For
+    /// `retried_from` this is the prior attempt's id.
+    pub related_attempt_id: Option<i64>,
+    /// Chronicle event_id that triggered the edge. For
+    /// `retried_from` this is the `task.retry_requested`
+    /// event. None when the trigger isn't in the chronicle
+    /// (legacy edges, runtime emit gaps).
+    pub spawned_by_event_id: Option<i64>,
+    pub created_at: i64,
+}
+
 // ──────────────────────────── Capability registration ──────────────────────
 
 /// Register the task capabilities on the dispatch bridge.
@@ -1700,6 +1776,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_compact_events(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.edges",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_edges(&s, &ctx) }
             })),
         );
     }
@@ -2360,6 +2446,56 @@ fn handle_attempts(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// `task.edges` — list every execution edge that touches
+/// the given task (as child or parent). One tab-delimited
+/// row per edge:
+///
+///   edge_id \t edge_type \t attempt_id|- \t
+///     related_task_id|- \t related_attempt_id|- \t
+///     spawned_by_event_id|- \t created_at
+///
+/// Phase-1E M38: only `retried_from` is emitted today.
+/// Other edge types in the schema (spawned, blocked_on,
+/// resumed_from, delegated_to, parallel_branch, awaited)
+/// have no shipped emitters yet — they're reserved
+/// vocabulary so future runtime primitives don't need a
+/// schema bump.
+fn handle_edges(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.edges utf8: {e}")),
+    };
+    if task_id.is_empty() {
+        return invalid("task.edges: task_id required".to_string());
+    }
+    match store.list_edges_for_task(task_id) {
+        Ok(rows) => {
+            let mut buf = String::new();
+            for e in rows {
+                let aid = e
+                    .attempt_id
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let rt = e.related_task_id.as_deref().unwrap_or("-");
+                let rat = e
+                    .related_attempt_id
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let sev = e
+                    .spawned_by_event_id
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into());
+                buf.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    e.edge_id, e.edge_type, aid, rt, rat, sev, e.created_at,
+                ));
+            }
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("task.edges: {e}")),
+    }
+}
+
 /// Operator-triggered recovery scan. Equivalent to the one the
 /// coordinator runs at startup, but on-demand — useful when an
 /// operator just set `max_runtime_secs` on a long-running task and
@@ -2573,6 +2709,49 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         );
         CREATE INDEX IF NOT EXISTS task_attempts_by_task
             ON task_attempts(task_id, attempt_num);
+
+        -- Phase-1E M38: explicit execution edges between attempts
+        -- and (eventually) between tasks. Every edge must
+        -- originate from a recorded runtime action — no
+        -- synthesized causality. The first emitter is the
+        -- retry path (request_retry), which links a new
+        -- attempt back to the failed one as `retried_from`.
+        --
+        -- edge_type vocabulary (reserved; only the first
+        -- ships with an emitter today):
+        --   retried_from      — new attempt N follows prior
+        --                       attempt M after task.retry.
+        --                       SHIPPED.
+        --   spawned           — child task spawned by a
+        --                       parent. Reserved; no
+        --                       task-spawning primitive yet.
+        --   blocked_on        — task blocked awaiting a
+        --                       dependency. Reserved.
+        --   resumed_from      — durable yield resume. Reserved
+        --                       (Gate 2 resumable VM).
+        --   delegated_to      — sub-flow delegation. Reserved.
+        --   parallel_branch   — concurrent SOL branch.
+        --                       Reserved.
+        --   awaited           — async wait primitive. Reserved.
+        --
+        -- The shape supports cross-task edges (related_task_id)
+        -- and per-attempt edges (related_attempt_id) so future
+        -- emitters don't need a second schema bump.
+        CREATE TABLE IF NOT EXISTS task_edges (
+            edge_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id             TEXT    NOT NULL,
+            attempt_id          INTEGER,
+            edge_type           TEXT    NOT NULL,
+            related_task_id     TEXT,
+            related_attempt_id  INTEGER,
+            spawned_by_event_id INTEGER,
+            created_at          INTEGER NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        );
+        CREATE INDEX IF NOT EXISTS task_edges_by_task
+            ON task_edges(task_id, edge_id);
+        CREATE INDEX IF NOT EXISTS task_edges_by_related
+            ON task_edges(related_task_id);
         "#,
     )
     .map_err(CoordinatorError::Db)?;
@@ -2691,6 +2870,9 @@ fn open_attempt_if_needed(
     let Some((current_id, count)) = current else {
         return Err(CoordinatorError::NotFound(task_id.to_string()));
     };
+    // Capture the prior attempt's id BEFORE opening the new one
+    // — we'll need it for the retried_from edge when count > 0.
+    let prior_attempt_id = current_id;
     if let Some(aid) = current_id {
         // If the current attempt is still open, leave it alone.
         let still_open: bool = tx
@@ -2742,6 +2924,45 @@ fn open_attempt_if_needed(
         trace_id,
         Some(&payload_json),
     )?;
+
+    // Phase-1E M38: record the retried_from execution edge
+    // when the new attempt follows a prior closed attempt.
+    // The edge points the new attempt back at the prior one
+    // and (when discoverable) at the chronicle event that
+    // triggered the retry (`task.retry_requested`).
+    //
+    // Only retried_from is emitted today — other edge types
+    // in the task_edges schema (`spawned`, `blocked_on`,
+    // `delegated_to`, `parallel_branch`, `awaited`,
+    // `resumed_from`) need runtime primitives Relix doesn't
+    // ship yet.
+    if next_num > 1
+        && let Some(prior_id) = prior_attempt_id
+    {
+        // Find the most recent task.retry_requested event for
+        // this task — it's the chronicle anchor for the retry.
+        // Falls back to None when missing (e.g. tasks that
+        // retried before this instrumentation landed).
+        let trigger_event: Option<i64> = tx
+            .query_row(
+                "SELECT event_id FROM task_events
+                 WHERE task_id = ?1 AND event_type = 'task.retry_requested'
+                 ORDER BY event_id DESC LIMIT 1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        tx.execute(
+            "INSERT INTO task_edges
+                (task_id, attempt_id, edge_type, related_task_id,
+                 related_attempt_id, spawned_by_event_id, created_at)
+             VALUES (?1, ?2, 'retried_from', ?1, ?3, ?4, ?5)",
+            params![task_id, new_id, prior_id, trigger_event, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+    }
+
     Ok(())
 }
 
@@ -4974,5 +5195,149 @@ mod tests {
             assert_eq!(v.get("mode").and_then(|x| x.as_str()), Some("dry-run"));
             assert_eq!(v.get("destructive").and_then(|x| x.as_bool()), Some(false));
         }
+    }
+
+    // ── Phase-1E M38: execution edges ────────────────────────────────
+
+    #[test]
+    fn no_edges_recorded_for_a_single_attempt_task() {
+        // A task that runs once and completes has no retry chain
+        // → no retried_from edge should exist.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("completed"),
+            Some("ok"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let edges = s.list_edges_for_task(&tid).unwrap();
+        assert!(edges.is_empty(), "expected no edges, got: {edges:?}");
+    }
+
+    #[test]
+    fn retry_creates_retried_from_edge_pointing_at_prior_attempt() {
+        // Real causality: attempt 2 was created BECAUSE attempt
+        // 1 failed and the operator called retry. The edge
+        // points attempt 2 → attempt 1 with edge_type
+        // retried_from + the chronicle event_id of the
+        // task.retry_requested as the trigger.
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        // Fail attempt 1.
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("blip"),
+            Some("transient"),
+        )
+        .unwrap();
+        // Request retry → emits task.retry_requested.
+        let decision = s.request_retry(&tid).unwrap();
+        match decision {
+            RetryDecision::Accepted { .. } => {}
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        // Open attempt 2 — this is where the edge gets inserted.
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 2);
+        let attempt1_id = attempts[0].attempt_id;
+        let attempt2_id = attempts[1].attempt_id;
+
+        let edges = s.list_edges_for_task(&tid).unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected one retried_from edge, got: {edges:?}"
+        );
+        let e = &edges[0];
+        assert_eq!(e.edge_type, "retried_from");
+        assert_eq!(e.task_id, tid);
+        assert_eq!(e.attempt_id, Some(attempt2_id));
+        assert_eq!(e.related_task_id.as_deref(), Some(tid.as_str()));
+        assert_eq!(e.related_attempt_id, Some(attempt1_id));
+        // The trigger event must be the task.retry_requested
+        // we emitted in request_retry.
+        assert!(
+            e.spawned_by_event_id.is_some(),
+            "expected spawned_by_event_id to reference task.retry_requested"
+        );
+        let v = s.get(&tid).unwrap().unwrap();
+        let req_event = v
+            .events
+            .iter()
+            .find(|ev| ev.event_type == "task.retry_requested")
+            .expect("task.retry_requested must be in chronicle");
+        assert_eq!(e.spawned_by_event_id, Some(req_event.event_id));
+    }
+
+    #[test]
+    fn retry_chain_creates_one_edge_per_retry_in_order() {
+        // Three attempts → two retried_from edges. Each edge's
+        // related_attempt_id points back at the immediately
+        // prior attempt; chain reads linearly.
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 5, None)
+            .unwrap();
+        for _ in 0..3 {
+            s.update(&tid, Some("running"), None, None, None, None, None, None)
+                .unwrap();
+            s.update(
+                &tid,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                Some("blip"),
+                Some("transient"),
+            )
+            .unwrap();
+            let _ = s.request_retry(&tid);
+        }
+        // Final open attempt (attempt 4 wouldn't open without a
+        // running transition; we want exactly 3 attempts in the
+        // chain so DON'T open a 4th).
+        // ↑ Actually the loop above pushed retry 3 times after
+        // the failure of attempt 3, plus opened attempts 1/2/3.
+        // The 3rd retry transitioned status to retrying but no
+        // new attempt opened. So we have 3 attempts + 2 edges
+        // (between 2↔1, 3↔2).
+
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 3, "expected 3 attempts");
+        let edges = s.list_edges_for_task(&tid).unwrap();
+        assert_eq!(
+            edges.len(),
+            2,
+            "expected 2 retried_from edges for 3 attempts"
+        );
+        // Edge 0: attempt 2 → attempt 1
+        assert_eq!(edges[0].edge_type, "retried_from");
+        assert_eq!(edges[0].attempt_id, Some(attempts[1].attempt_id));
+        assert_eq!(edges[0].related_attempt_id, Some(attempts[0].attempt_id));
+        // Edge 1: attempt 3 → attempt 2
+        assert_eq!(edges[1].edge_type, "retried_from");
+        assert_eq!(edges[1].attempt_id, Some(attempts[2].attempt_id));
+        assert_eq!(edges[1].related_attempt_id, Some(attempts[1].attempt_id));
     }
 }
