@@ -1160,6 +1160,33 @@
     }
     .chain-summary .total { color: var(--text); font-weight: 600; }
 
+    /* Latency stacked bar — visual time budget over the
+       full execution chain. Each segment width is
+       proportional to its duration. */
+    .chain-budget {
+      display: flex;
+      height: 12px;
+      margin: 8px 0 4px;
+      border-radius: 3px;
+      overflow: hidden;
+      background: var(--bg);
+      border: 1px solid var(--border-soft);
+    }
+    .chain-budget .seg {
+      height: 100%;
+      min-width: 2px;
+      transition: filter 0.15s;
+    }
+    .chain-budget .seg:hover { filter: brightness(1.4); }
+    .chain-budget .seg.attempt-completed   { background: var(--ok); }
+    .chain-budget .seg.attempt-failed,
+    .chain-budget .seg.attempt-interrupted { background: var(--danger); }
+    .chain-budget .seg.attempt-cancelled   { background: var(--text-dim); }
+    .chain-budget .seg.attempt-running     { background: var(--info); }
+    .chain-budget .seg.attempt-retrying    { background: var(--warn); }
+    .chain-budget .seg.gap                 { background: var(--bg-row-alt); }
+    .chain-budget .seg.gap:hover           { background: var(--bg-hover); filter: none; }
+
     /* ── Execution timeline ────────────────────────────────────── */
     .timeline {
       padding: 4px 14px 14px;
@@ -2693,10 +2720,19 @@ function renderRetryChain(attempts) {
   const sorted = attempts.slice().sort((a, b) => a.attempt_num - b.attempt_num);
   let totalDur = 0;
   const parts = [];
+  // Track segments for the latency stacked bar.
+  const segments = []; // [{ kind, dur, label }]
   sorted.forEach((a, i) => {
     const dur = (a.finished_at != null) ? (a.finished_at - a.started_at) : null;
     if (dur != null) totalDur += dur;
     parts.push(renderChainPill(a, dur != null ? fmtDuration(dur) : '(open)'));
+    if (dur != null && dur > 0) {
+      segments.push({
+        kind: 'attempt-' + a.status,
+        dur,
+        label: 'attempt ' + a.attempt_num + ' · ' + a.status + ' · ' + fmtDuration(dur),
+      });
+    }
     if (i < sorted.length - 1) {
       const next = sorted[i + 1];
       const gap = (a.finished_at != null && next.started_at != null)
@@ -2709,7 +2745,14 @@ function renderRetryChain(attempts) {
         + '<span class="label">' + escapeHtml(gapLabel) + '</span>'
         + '</div>'
       );
-      if (gap != null && gap >= 0) totalDur += gap;
+      if (gap != null && gap > 0) {
+        totalDur += gap;
+        segments.push({
+          kind: 'gap',
+          dur: gap,
+          label: 'wait between attempts · ' + fmtDuration(gap),
+        });
+      }
     }
   });
   const lastSucceeded = sorted[sorted.length - 1].status === 'completed';
@@ -2717,9 +2760,24 @@ function renderRetryChain(attempts) {
   const outcome = lastSucceeded
     ? 'recovered after ' + failedCount + ' failed attempt(s)'
     : (sorted[sorted.length - 1].status === 'running' ? 'in flight' : 'unresolved');
+
+  // Render the latency budget bar. Skipped when total
+  // is 0 (all attempts open / no time elapsed).
+  let budgetHtml = '';
+  if (totalDur > 0 && segments.length > 0) {
+    const segHtml = segments.map(s => {
+      const pct = (s.dur / totalDur) * 100;
+      return '<div class="seg ' + escapeHtml(s.kind) + '" '
+        + 'style="width: ' + pct.toFixed(2) + '%;" '
+        + 'title="' + escapeHtml(s.label) + '"></div>';
+    }).join('');
+    budgetHtml = '<div class="chain-budget">' + segHtml + '</div>';
+  }
+
   return '<div class="retry-chain">'
     + '<h3>retry chain (' + sorted.length + ' attempts)</h3>'
     + '<div class="chain-strip">' + parts.join('') + '</div>'
+    + budgetHtml
     + '<div class="chain-summary">'
     +   '<span class="total">' + fmtDuration(totalDur) + '</span>'
     +   ' total wall-clock · ' + escapeHtml(outcome)
