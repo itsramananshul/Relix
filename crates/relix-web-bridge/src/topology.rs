@@ -123,12 +123,22 @@ pub struct HealthResponse {
     /// signal — a peer keeps disconnecting + reconnecting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconnect: Option<ReconnectCounters>,
+    /// Bridge-process-local SSE stream metrics. Active count
+    /// plus total opened since bridge start. Counters reset
+    /// on restart.
+    pub streams: StreamCounters,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ReconnectCounters {
     pub attempts: u64,
     pub successes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamCounters {
+    pub active: u64,
+    pub opened_total: u64,
 }
 
 /// `GET /v1/health` — bridge + mesh status summary. Distinct
@@ -154,6 +164,10 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
             successes,
         }
     });
+    let streams = StreamCounters {
+        active: state.stream_metrics.active(),
+        opened_total: state.stream_metrics.opened_total(),
+    };
     Json(HealthResponse {
         status: "ok",
         started_at: state.started_at,
@@ -165,6 +179,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         peers_stale: stale,
         peers_expired: expired,
         reconnect,
+        streams,
     })
 }
 

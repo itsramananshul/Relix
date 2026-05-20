@@ -40,6 +40,7 @@ mod config;
 mod config_api;
 mod dashboard;
 mod flow;
+mod metrics;
 mod openai;
 mod secrets;
 mod sse;

@@ -1005,6 +1005,7 @@
         <div class="kpi"><p class="label">tasks</p><div class="value" id="kpi-tasks">—</div><div class="delta" id="kpi-tasks-delta"></div></div>
         <div class="kpi"><p class="label">coordinator</p><div class="value" id="kpi-coord">—</div><div class="delta" id="kpi-coord-delta"></div></div>
         <div class="kpi"><p class="label">reconnects</p><div class="value" id="kpi-reconnect">—</div><div class="delta" id="kpi-reconnect-delta">attempts / successes</div></div>
+        <div class="kpi"><p class="label">live streams</p><div class="value" id="kpi-streams">—</div><div class="delta" id="kpi-streams-delta">active / opened</div></div>
       </div>
       <div class="split" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);">
         <div class="card">
@@ -1568,6 +1569,13 @@ function renderOverviewKpis(hRes, taskCount) {
       hRes.reconnect.successes + '/' + hRes.reconnect.attempts;
   } else {
     document.getElementById('kpi-reconnect').textContent = 'n/a';
+  }
+  if (hRes.streams) {
+    document.getElementById('kpi-streams').textContent = hRes.streams.active;
+    document.getElementById('kpi-streams-delta').textContent =
+      'active · ' + hRes.streams.opened_total + ' opened';
+  } else {
+    document.getElementById('kpi-streams').textContent = '—';
   }
 }
 

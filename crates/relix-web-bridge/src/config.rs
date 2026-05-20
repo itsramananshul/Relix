@@ -191,6 +191,11 @@ pub struct AppState {
     /// See `crates/relix-web-bridge/src/secrets.rs` for the persistence
     /// contract.
     pub secrets: crate::secrets::SecretsHandle,
+    /// Bridge-process-local runtime metrics (active SSE streams,
+    /// total streams opened). Exposed via `/v1/health`. Counters
+    /// reset on bridge restart — see
+    /// `crates/relix-web-bridge/src/metrics.rs`.
+    pub stream_metrics: std::sync::Arc<crate::metrics::StreamMetrics>,
 }
 
 impl AppState {
@@ -268,6 +273,7 @@ impl AppState {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             secrets,
+            stream_metrics: crate::metrics::StreamMetrics::new(),
         })
     }
 }

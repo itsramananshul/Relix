@@ -738,7 +738,15 @@ pub async fn events_stream(
     let event_type = q.r#type.clone().unwrap_or_default();
     let order = q.order.clone().unwrap_or_default();
     let id_for_stream = id;
+    // RAII guard: increments the active-stream counter on
+    // open, decrements on drop. Drop fires when the stream's
+    // future is cancelled (client disconnect) OR when the
+    // stream exits normally (terminal `gone` event).
+    let stream_guard = state.stream_metrics.open();
     let s = stream! {
+        // Hold the guard inside the stream body so it lives
+        // exactly as long as the stream itself.
+        let _live_guard = stream_guard;
         let mut after = initial_after;
         loop {
             match rec.events_filtered(&id_for_stream, after, 200, &event_type, &order).await {
