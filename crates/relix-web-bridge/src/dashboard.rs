@@ -261,6 +261,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_exec_graph_timing_summary_present() {
+        // M49 (Track A): exec graph header now ships a
+        // wall-clock summary (total · terminal · retry tax)
+        // computed from recorded started_at/finished_at on
+        // attempts. Missing timestamps render "(not recorded
+        // yet)" rather than inventing a number.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderExecGraphTimingSummary"),
+            "renderExecGraphTimingSummary helper missing"
+        );
+        assert!(
+            body.contains("retry tax"),
+            "retry tax label missing from exec graph summary"
+        );
+        // Honesty contract: a missing timestamp must surface
+        // "(not recorded yet)" instead of being silently filled.
+        assert!(
+            body.contains("(not recorded yet)"),
+            "exec graph summary lost its 'not recorded yet' honesty label"
+        );
+    }
+
+    #[tokio::test]
     async fn page_test_all_providers_present() {
         // M48 (Track C): batch "Test all configured" runs the
         // existing /v1/config/providers/:name/test endpoint

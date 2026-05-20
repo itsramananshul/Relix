@@ -3859,10 +3859,68 @@ function renderExecGraph(attempts, edges) {
     + '</div>';
   return '<div class="exec-graph-card">'
     + '<h4>Execution graph · ' + N + ' attempt' + (N === 1 ? '' : 's') + ' · ' + edges.length + ' edge' + (edges.length === 1 ? '' : 's') + '</h4>'
+    + renderExecGraphTimingSummary(sorted)
     + '<div class="exec-graph"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">'
     + arrowMarker + edgeLines + nodes
     + '</svg></div>'
     + note
+    + '</div>';
+}
+
+/* Wall-clock summary across the retry chain. We compute:
+   - total: latest finished_at - earliest started_at across
+     all attempts. If any attempt is still running, "total"
+     stops at now.
+   - terminal: duration of the final attempt (the one that
+     produced the task's current status).
+   - retry tax: total - terminal, i.e. wall time the task
+     spent in retries that didn't end up being the result.
+
+   Honest: if any required timestamp is missing we render
+   "(not recorded yet)" instead of inventing a number. */
+function renderExecGraphTimingSummary(sorted) {
+  if (!sorted.length) return '';
+  const started = sorted
+    .map(a => a.started_at)
+    .filter(t => typeof t === 'number');
+  const finished = sorted
+    .map(a => a.finished_at)
+    .filter(t => typeof t === 'number');
+  if (!started.length) {
+    return '<div class="exec-graph-note">'
+      + 'Wall clock: (not recorded yet)'
+      + '</div>';
+  }
+  const earliest = Math.min(...started);
+  const now = Math.floor(Date.now() / 1000);
+  const latest = finished.length === sorted.length
+    ? Math.max(...finished)
+    : now;
+  const total = Math.max(0, latest - earliest);
+  // Terminal attempt = highest attempt_num.
+  const terminal = sorted[sorted.length - 1];
+  let terminalDur = null;
+  if (typeof terminal.started_at === 'number') {
+    const end = typeof terminal.finished_at === 'number'
+      ? terminal.finished_at
+      : now;
+    terminalDur = Math.max(0, end - terminal.started_at);
+  }
+  const tax = (terminalDur != null) ? Math.max(0, total - terminalDur) : null;
+  const taxPct = (tax != null && total > 0)
+    ? Math.round((tax / total) * 100)
+    : null;
+  const taxLabel = (tax == null)
+    ? '(not recorded yet)'
+    : fmtDuration(tax) + (taxPct != null ? ' · ' + taxPct + '% of total' : '');
+  const terminalLabel = (terminalDur != null)
+    ? fmtDuration(terminalDur) + (typeof terminal.finished_at !== 'number' ? ' (still running)' : '')
+    : '(not recorded yet)';
+  return '<div class="exec-graph-note">'
+    + 'Wall clock <strong>' + fmtDuration(total) + '</strong>'
+    + (finished.length < sorted.length ? ' (open)' : '')
+    + ' · terminal attempt ' + terminalLabel
+    + ' · retry tax ' + taxLabel
     + '</div>';
 }
 
