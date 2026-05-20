@@ -50,6 +50,15 @@ pub struct CoordinatorSection {
 pub struct BridgeSection {
     /// `127.0.0.1:9100` by default. Always loopback in alpha.
     pub listen_addr: String,
+    /// Path to the bridge-owned secrets file. Defaults to
+    /// `<data_dir>/bridge-secrets.toml` when unset. Holds the
+    /// operator-supplied AI provider keys + Telegram bot token
+    /// configured via the dashboard's settings pages. Local to
+    /// one bridge process; written at mode 0600 on POSIX;
+    /// gitignored. See docs/dashboard-redesign.md for the
+    /// security model.
+    #[serde(default)]
+    pub secrets_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -176,6 +185,12 @@ pub struct AppState {
     /// start). Surfaced by `/v1/health` so dashboards + load balancers
     /// can derive uptime without a separate /metrics endpoint.
     pub started_at: i64,
+    /// Bridge-owned secrets (provider keys, Telegram token). Persisted
+    /// to `bridge-secrets.toml` at the path resolved in `try_new`. The
+    /// dashboard's settings pages read + write through this handle.
+    /// See `crates/relix-web-bridge/src/secrets.rs` for the persistence
+    /// contract.
+    pub secrets: crate::secrets::SecretsHandle,
 }
 
 impl AppState {
@@ -224,6 +239,20 @@ impl AppState {
             None
         };
 
+        // Resolve the secrets file path. Default location is
+        // `<data_dir>/bridge-secrets.toml` when `data_dir` is
+        // set, falling back to `bridge-secrets.toml` in the
+        // current working directory otherwise. Operators
+        // override via `[bridge] secrets_path`.
+        let secrets_path = cfg.bridge.secrets_path.clone().unwrap_or_else(|| {
+            match cfg.transport.data_dir.as_ref() {
+                Some(d) => d.join("bridge-secrets.toml"),
+                None => PathBuf::from("bridge-secrets.toml"),
+            }
+        });
+        let initial_secrets = crate::secrets::BridgeSecrets::load_or_empty(&secrets_path);
+        let secrets = crate::secrets::SecretsHandle::new(initial_secrets, secrets_path);
+
         Ok(Self {
             cfg: Arc::new(cfg),
             identity_bundle,
@@ -238,6 +267,7 @@ impl AppState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
+            secrets,
         })
     }
 }

@@ -37,9 +37,11 @@ use clap::Parser;
 mod capabilities;
 mod chat;
 mod config;
+mod config_api;
 mod dashboard;
 mod flow;
 mod openai;
+mod secrets;
 mod sse;
 mod task_recorder;
 mod tasks;
@@ -217,6 +219,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
         .route("/v1/health", get(topology::health))
+        // Dashboard-facing config endpoints. Local/dev only —
+        // no auth at the HTTP layer; production deployments
+        // must put a reverse proxy with auth in front before
+        // exposing the bridge beyond loopback. Secrets are
+        // never echoed back; the bridge persists them to a
+        // gitignored TOML file at mode 0600. See
+        // docs/dashboard-redesign.md for the contract.
+        .route("/v1/config", get(config_api::get_effective_config))
+        .route("/v1/config/providers", get(config_api::list_providers))
+        .route(
+            "/v1/config/providers/:name",
+            get(config_api::get_provider)
+                .put(config_api::put_provider)
+                .delete(config_api::delete_provider),
+        )
+        .route(
+            "/v1/config/telegram",
+            get(config_api::get_telegram).put(config_api::put_telegram),
+        )
         // Operator dashboard. Single-page static HTML; consumes
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.

@@ -48,3 +48,10 @@ dev-keys/*.aic
 # configs/policies/dev.toml; `local.toml` is an operator's
 # private tweak that should not enter the repo.
 configs/policies/local.toml
+
+# Bridge-owned secrets file (AI provider keys + Telegram bot
+# token configured via the dashboard's settings pages). Written
+# by the bridge at mode 0600 on POSIX. See
+# docs/dashboard-redesign.md for the security model.
+bridge-secrets.toml
+**/bridge-secrets.toml
