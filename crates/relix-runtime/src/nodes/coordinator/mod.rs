@@ -4620,6 +4620,53 @@ mod tests {
     }
 
     #[test]
+    fn count_compact_candidates_stays_fast_on_ten_thousand_events() {
+        // Scale check for the chronicle-retention dry-run
+        // count. The query JOINs task_events to tasks and
+        // filters by status — both load-bearing for operators
+        // running this on a live ledger. Establish the budget
+        // here so future regressions surface in CI rather than
+        // production.
+        let s = TaskStore::in_memory().expect("open");
+        // Mixed cohort: 200 tasks each with 50 events. Mark
+        // half completed (terminal — counted), the other half
+        // running (R5-excluded). Should yield 100 * 50 = 5000
+        // candidates out of 10_000 total events.
+        let mut ids = Vec::with_capacity(200);
+        for i in 0..200 {
+            ids.push(mk(&s, &format!("t{i}"), "f", "{}", "o"));
+        }
+        for tid in &ids {
+            for j in 0..50 {
+                s.append_event(tid, "step", &format!("e{j}")).unwrap();
+            }
+        }
+        for (i, tid) in ids.iter().enumerate() {
+            let st = if i % 2 == 0 { "completed" } else { "running" };
+            s.update(tid, Some(st), None, None, None, None, None, None)
+                .unwrap();
+        }
+        // Cutoff = "future" so every existing event qualifies.
+        let cutoff = unix_secs() + 60;
+        let now = std::time::Instant::now();
+        let r = s.count_compact_candidates(cutoff).unwrap();
+        let elapsed = now.elapsed();
+        assert_eq!(
+            r.candidate_events, 5000,
+            "expected 5000 candidates (100 completed * 50 events)"
+        );
+        assert_eq!(r.candidate_tasks, 100);
+        // 500ms budget on a dev machine. The SQL is two
+        // aggregate queries against indexed columns; anything
+        // close to this ceiling is the sign of a regression
+        // (missing index, table scan, etc.).
+        assert!(
+            elapsed.as_millis() < 500,
+            "compact dry-run on 10k events took {elapsed:?}; budget is 500ms"
+        );
+    }
+
+    #[test]
     fn list_events_after_handles_large_chronicle_quickly() {
         // 5000 events on one task. Read in pages of 500.
         let s = TaskStore::in_memory().expect("open");
