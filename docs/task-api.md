@@ -166,6 +166,42 @@ Query parameters (all optional):
 Response: JSON array of events using the same typed envelope as
 `/v1/tasks/:id`'s `events` slot.
 
+### `GET /v1/tasks/:id/events/stream` (experimental)
+
+SSE wrapper around the polling form above. Opens a long-lived
+HTTP response; the bridge polls `task.events` server-side and
+emits one SSE message per new event. Operator dashboards that
+want push-style updates use this; everyone else uses the polling
+form.
+
+Message format:
+
+```
+event: event
+data: {"event_id":N,"ts":N,"event_type":"...","payload":"...",...}
+
+event: gone
+data: task.events: not found: <task_id>
+
+event: error
+data: <cause string>
+```
+
+`event: gone` terminates the stream (the task no longer exists).
+`event: error` is a transient signal; the stream stays alive
+and retries after the poll interval.
+
+Status:
+
+- **Experimental** — kept only if it stays clean. The bridge
+  owns no per-stream task state beyond the cursor on the
+  client's open socket. If SSE turns invasive at scale it will
+  be retired in favour of the cursor + typed events polling
+  surface, which covers every alpha use case.
+- No reconnect-with-Last-Event-ID today (clients tracking
+  cursor state externally just pass `?since=N` on a new
+  request).
+
 ### `GET /v1/tasks/:id/lineage`
 
 Single-round-trip combo for dashboard initial render. Packs

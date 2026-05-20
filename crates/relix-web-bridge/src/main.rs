@@ -186,6 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
         .route("/v1/tasks/:id/events", get(tasks::events))
+        // Experimental SSE wrapper around task.events polling.
+        // Bridge-side polling; owns no per-stream task state.
+        .route("/v1/tasks/:id/events/stream", get(tasks::events_stream))
         .route("/v1/tasks/:id/lineage", get(tasks::lineage))
         .route("/v1/tasks/recover", post(tasks::recover))
         // T4 P2: capability discovery as JSON. Translation-only —

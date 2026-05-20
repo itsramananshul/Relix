@@ -29,12 +29,19 @@
 
 use std::collections::BTreeMap;
 
+use std::time::Duration;
+
+use async_stream::stream;
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        IntoResponse, Sse,
+        sse::{Event, KeepAlive},
+    },
 };
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppState;
@@ -453,6 +460,89 @@ pub async fn lineage(
         summary,
         attempts,
     }))
+}
+
+/// **Experimental** SSE wrapper around `task.events` polling.
+///
+/// `GET /v1/tasks/:id/events/stream?since=N` opens an SSE stream
+/// that emits one `Event` per chronicle event newer than `since`.
+/// The bridge polls the Coordinator's `task.events` capability
+/// internally — it owns no per-stream state beyond the cursor on
+/// the client's open socket, which dies with the socket.
+///
+/// Each SSE message carries the same JSON envelope shape
+/// `/v1/tasks/:id/events` returns. Consumers `JSON.parse` each
+/// message body without further structure.
+///
+/// On Coordinator NotFound, the stream emits a terminal `event:
+/// gone` message and closes. On other errors, the stream sleeps
+/// the poll interval and retries — transient Coordinator outages
+/// don't kill long-lived dashboards.
+///
+/// **Bridge invariant:** zero task-state ownership. The stream
+/// is a presentation wrapper over the same polling loop the CLI
+/// `task watch` uses. If SSE turns out to be invasive or
+/// resource-heavy at scale we delete this endpoint; cursor +
+/// typed events remain the supported surface.
+pub async fn events_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<EventsQuery>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let rec = rec.clone();
+    let initial_after = q.since.unwrap_or(0);
+    let event_type = q.r#type.clone().unwrap_or_default();
+    let order = q.order.clone().unwrap_or_default();
+    let id_for_stream = id;
+    let s = stream! {
+        let mut after = initial_after;
+        loop {
+            match rec.events_filtered(&id_for_stream, after, 200, &event_type, &order).await {
+                Ok(body) => {
+                    for line in body.lines() {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        // Advance cursor from this line.
+                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line)
+                            && let Some(id_field) = ev.get("id").and_then(|v| v.as_i64())
+                        {
+                            after = id_field;
+                        }
+                        // Emit the raw JSON line as the SSE data body.
+                        yield Ok(Event::default().event("event").data(line));
+                    }
+                }
+                Err(e) if e.contains("not found") => {
+                    yield Ok(Event::default().event("gone").data(e));
+                    break;
+                }
+                Err(e) => {
+                    // Transient error — surface it but keep the
+                    // stream alive. Operator dashboards may want
+                    // to surface this; gateway tooling can throttle
+                    // on repeated errors.
+                    yield Ok(Event::default().event("error").data(e));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default()))
 }
 
 pub async fn attempts(
@@ -914,10 +1004,7 @@ mod tests {
         assert_eq!(out[0].attempt_id, Some(42));
         assert_eq!(out[0].trace_id.as_deref(), Some("abc"));
         let pj = out[0].payload_json.as_ref().expect("payload_json present");
-        assert_eq!(
-            pj.get("attempt_num").and_then(|v| v.as_i64()),
-            Some(1)
-        );
+        assert_eq!(pj.get("attempt_num").and_then(|v| v.as_i64()), Some(1));
     }
 
     #[test]
