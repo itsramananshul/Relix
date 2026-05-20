@@ -40,6 +40,7 @@ mod flow;
 mod openai;
 mod sse;
 mod task_recorder;
+mod tasks;
 mod validate;
 
 use crate::config::{AppState, BridgeConfig};
@@ -175,6 +176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/chat_with_tool", post(chat::chat_with_tool))
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        // Task-native read API (Track 2). Bridge stays translation-only:
+        // each route is a thin forwarder to a Coordinator capability.
+        .route("/v1/tasks", get(tasks::list))
+        .route("/v1/tasks/:id", get(tasks::get_one))
+        .route("/v1/tasks/:id/attempts", get(tasks::attempts))
         .with_state(state);
 
     tracing::info!(

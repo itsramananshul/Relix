@@ -129,6 +129,28 @@ impl TaskRecorder {
         }
     }
 
+    /// Read-only `task.list` passthrough. Unlike the write methods
+    /// this is NOT fail-soft — callers (e.g. the bridge's
+    /// `/v1/tasks` endpoint) want to surface errors to the operator.
+    pub async fn list(&self, limit: usize) -> Result<String, String> {
+        let arg = limit.to_string();
+        let bytes = self.call("task.list", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.list utf8: {e}"))
+    }
+
+    /// Read-only `task.get` passthrough. Returns the Coordinator's
+    /// `key=value` body verbatim; the caller parses.
+    pub async fn get(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.get", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.get utf8: {e}"))
+    }
+
+    /// Read-only `task.attempts` passthrough.
+    pub async fn attempts(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.attempts", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.attempts utf8: {e}"))
+    }
+
     /// Low-level wrapper. Builds an envelope, sends via MeshClient,
     /// decodes the response, returns the body bytes or a string error.
     async fn call(&self, method: &str, arg: &[u8]) -> Result<Vec<u8>, String> {
