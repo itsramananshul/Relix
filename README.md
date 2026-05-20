@@ -32,9 +32,13 @@ and [`docs/current-limitations.md`](docs/current-limitations.md).
 | NodeManifest discovery + `capability:<method>` routing | works |
 | Connection pool reuse on bridge ↔ peers and tool ↔ origins | works |
 | MeshClient peer reconnect + 60s manifest refresh | works |
-| Coordinator node (`task.create` / `update` / `event` / `get` / `list` / `recover` / `attempts` / `retry`) with SQLite ledger | works (per-attempt lineage; operator-driven retry; recovery scan for stale tasks. Checkpointed re-run, not resumable replay — see [`docs/replay-model.md`](docs/replay-model.md)) |
-| Bridge `/v1/tasks` read API (list / get / attempts as JSON) | works |
-| `relix-cli task` CLI (list/get/attempts/retry/recover/event/update/create) with `--pretty` chronology | works |
+| Coordinator node (`task.create` / `update` / `event` / `get` / `list` / `count` / `list_cursor` / `recover` / `attempts` / `retry` / `events` / `export` / `compact_events`) with SQLite ledger | works (per-attempt lineage; operator-driven retry; recovery scan for stale tasks; cursor pagination stable under concurrent writes; typed event envelopes. Checkpointed re-run, not resumable replay — see [`docs/replay-model.md`](docs/replay-model.md)) |
+| Bridge `/v1/tasks` HTTP surface (list / cursor / count / get / summary / attempts / events / events/stream SSE / lineage / export / compact_events / recover) | works |
+| Operator dashboard `/dashboard` — single-page HTML, live SSE chronology, per-task export, retention dry-run widget | works |
+| `relix-cli task` CLI (create / update / event / get / list / count / attempts / recover / retry / watch / compact / export) with `--pretty` chronology | works |
+| `relix-cli capability` CLI (ls / get / validate, 7 manifest-lint rules) | works |
+| Chronicle retention (operator export + dry-run candidate counter; destructive deletion gated by design) | works (Steps 1, 2, 5 of [`docs/chronicle-retention.md`](docs/chronicle-retention.md)) |
+| Telegram channel scaffold (config + identity + session-store + `BotApi` trait + mock + `SqliteSessionStore`) | works (live HTTPS client awaits a Bot API token) |
 | SOL VM with `remote_call`, hand-written `.sol` flows | works |
 | Windows-safe PowerShell mesh bringup | works |
 
@@ -129,7 +133,8 @@ like any other peer.
 | `crates/relix-runtime` | libp2p transport, SOL VM with `remote_call`, dispatch bridge, manifest exchange, node implementations. |
 | `crates/relix-controller` | The `relix-controller` daemon binary. |
 | `crates/relix-web-bridge` | The local HTTP bridge binary (OpenAI shim + native endpoints). |
-| `crates/relix-cli` | Operator CLI: `identity init-org`, `identity mint`, `ping`, `flow-run`, `task {create,update,event,get,list,attempts,recover,retry}`. |
+| `crates/relix-cli` | Operator CLI: `identity init-org`, `identity mint`, `ping`, `flow-run`, `task {create,update,event,get,list,count,attempts,recover,retry,watch,compact,export}`, `capability {ls,get,validate}`. |
+| `crates/relix-telegram` | Task-native Telegram channel scaffold (config, identity, session store, BotApi trait, mock). |
 | `crates/relix-flow-inspect` | Reads audit + flow event logs. |
 | `flows/` | Hand-written `.sol` flows. |
 | `configs/` | Example node config TOMLs. |
@@ -165,7 +170,7 @@ Task lifecycle reference (C1 + C2):
 - [`docs/task-api.md`](docs/task-api.md) — bridge HTTP surface for tasks + events + capabilities. Single reference for dashboard authors.
 - [`docs/runtime-observability.md`](docs/runtime-observability.md) — operator mental model + on-call workflow + observability primitives at a glance.
 - [`docs/audit-trails.md`](docs/audit-trails.md) — operator reconstruction across the three audit surfaces (per-node audit log, per-flow event log, Coordinator chronicle), with `relix-flow-inspect` recipes.
-- [`docs/chronicle-retention.md`](docs/chronicle-retention.md) — design contract for future chronicle retention + compaction + operator export. Docs-only; no destructive deletion implemented.
+- [`docs/chronicle-retention.md`](docs/chronicle-retention.md) — design contract for chronicle retention + compaction + operator export. Steps 1 (export), 2 (dry-run candidate counter), 5 (CLI tooling) shipped; no destructive deletion implemented yet.
 - [`docs/bridge-invariants.md`](docs/bridge-invariants.md) — what the bridge MAY/MUST NOT do. Mechanical canary tests enforce the most-likely regressions; the rest is review-enforced.
 - [`docs/interruption-semantics.md`](docs/interruption-semantics.md) — what the Coordinator's recovery scan does and deliberately doesn't.
 - [`docs/retry-model.md`](docs/retry-model.md) — what `retry_policy` / `max_retries` / `task.retry` actually do today.
