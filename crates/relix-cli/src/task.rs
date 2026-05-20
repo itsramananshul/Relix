@@ -316,15 +316,35 @@ fn render_pretty_task(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 256);
     let mut events_line: Option<&str> = None;
     let mut header_lines: Vec<&str> = Vec::new();
+    let mut status: Option<&str> = None;
+    let mut failure_class: Option<&str> = None;
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("events=") {
             events_line = Some(rest);
         } else {
+            if let Some(v) = line.strip_prefix("status=") {
+                status = Some(v);
+            } else if let Some(v) = line.strip_prefix("last_failure_class=") {
+                failure_class = Some(v);
+            }
             header_lines.push(line);
         }
     }
     for line in &header_lines {
         let _ = writeln!(out, "{line}");
+    }
+    let status_callout =
+        status.and_then(|s| status_hint(s).map(|h| format!("[{s}] {h}\n")));
+    let class_callout = failure_class
+        .and_then(|fc| failure_class_hint(fc).map(|h| format!("[failure: {fc}] {h}\n")));
+    if status_callout.is_some() || class_callout.is_some() {
+        out.push('\n');
+        if let Some(s) = status_callout {
+            out.push_str(&s);
+        }
+        if let Some(s) = class_callout {
+            out.push_str(&s);
+        }
     }
     let Some(events) = events_line else {
         return out;
@@ -342,9 +362,60 @@ fn render_pretty_task(raw: &str) -> String {
         } else {
             format!("+{delta:>4}s")
         };
-        let _ = writeln!(out, "  {delta_str}  {ts}  {ev_type:<18}  {payload}");
+        let _ = writeln!(out, "  {delta_str}  {ts}  {ev_type:<22}  {payload}");
     }
     out
+}
+
+/// Short operator hint for a status value. Only emitted in
+/// `--pretty` mode for the few states where the meaning isn't
+/// already obvious from the word itself. Returning `None` leaves
+/// the status as-is without a callout line.
+fn status_hint(status: &str) -> Option<&'static str> {
+    match status {
+        "interrupted" => Some(
+            "executor died or max_runtime_secs was exceeded; recovery scan re-labelled the row. \
+             Inspect last_failure_reason and decide whether to re-run.",
+        ),
+        "awaiting_input" => Some(
+            "flow paused on an external dependency (human approval, async webhook). \
+             The runtime records this state; the resume primitive is Gate 2.",
+        ),
+        "retrying" => Some(
+            "a previous attempt failed; another attempt has been scheduled. \
+             Auto-retry is not wired today, so this status is operator-initiated.",
+        ),
+        "cancelled" => Some("operator explicitly cancelled this task."),
+        _ => None,
+    }
+}
+
+/// Short operator hint for a failure-class value. Same UX as
+/// `status_hint` — only callouts for the classes where the
+/// retry-advice isn't obvious from the name.
+fn failure_class_hint(class: &str) -> Option<&'static str> {
+    match class {
+        "transient" => {
+            Some("retryable if the flow is idempotent (e.g. same params produce same result).")
+        }
+        "timeout" => Some(
+            "deadline exceeded. Re-run with a higher --max-runtime-secs, or investigate \
+             why the flow stalled.",
+        ),
+        "unavailable" => Some(
+            "capability deprecated/removed or manifest stale. Re-check the responder, \
+             refresh manifests, then re-run.",
+        ),
+        "policy_denied" => Some(
+            "admission pipeline refused the call. DO NOT re-run blindly; fix the policy \
+             or identity first.",
+        ),
+        "invalid_args" => Some("caller-side input was malformed. Fix the caller, then re-run."),
+        "permanent" => {
+            Some("logic / contract error inside the flow. Investigate; do not auto-retry.")
+        }
+        _ => None,
+    }
 }
 
 /// Minimal parser for the Coordinator's hand-built JSON event array:
@@ -593,13 +664,13 @@ mod tests {
 
     #[test]
     fn render_pretty_task_includes_chronology_block() {
-        let raw = "task_id=abcd1234\nstatus=completed\nevents=[{\"id\":1,\"ts\":1700000000,\"type\":\"flow_selected\",\"payload\":\"chat\"},{\"id\":2,\"ts\":1700000007,\"type\":\"flow_completed\",\"payload\":\"hi\"}]\n";
+        let raw = "task_id=abcd1234\nstatus=completed\nevents=[{\"id\":1,\"ts\":1700000000,\"type\":\"flow.started\",\"payload\":\"chat\"},{\"id\":2,\"ts\":1700000007,\"type\":\"task.completed\",\"payload\":\"hi\"}]\n";
         let pretty = render_pretty_task(raw);
         assert!(pretty.contains("task_id=abcd1234"));
         assert!(pretty.contains("status=completed"));
         assert!(pretty.contains("chronology:"));
-        assert!(pretty.contains("flow_selected"));
-        assert!(pretty.contains("flow_completed"));
+        assert!(pretty.contains("flow.started"));
+        assert!(pretty.contains("task.completed"));
         assert!(pretty.contains("+   7s"));
     }
 
@@ -610,5 +681,45 @@ mod tests {
         // Header preserved; no chronology synthesized.
         assert!(pretty.contains("task_id=x"));
         assert!(!pretty.contains("chronology"));
+    }
+
+    #[test]
+    fn render_pretty_task_surfaces_interrupted_status_with_hint() {
+        let raw = "task_id=x\nstatus=interrupted\nlast_failure_class=timeout\nevents=[]\n";
+        let pretty = render_pretty_task(raw);
+        // Status hint AND failure-class hint both appear, since both
+        // are operator-relevant for this row.
+        assert!(pretty.contains("[interrupted]"));
+        assert!(pretty.contains("recovery scan"));
+        assert!(pretty.contains("[failure: timeout]"));
+        assert!(pretty.contains("deadline exceeded"));
+    }
+
+    #[test]
+    fn render_pretty_task_surfaces_awaiting_input_with_gate_2_note() {
+        let raw = "task_id=x\nstatus=awaiting_input\nevents=[]\n";
+        let pretty = render_pretty_task(raw);
+        assert!(pretty.contains("[awaiting_input]"));
+        // The note about Gate 2 is load-bearing — operators must not
+        // mistake "we recorded the state" for "the runtime resumes
+        // automatically".
+        assert!(pretty.contains("Gate 2"));
+    }
+
+    #[test]
+    fn render_pretty_task_no_callout_for_terminal_completed() {
+        let raw = "task_id=x\nstatus=completed\nevents=[]\n";
+        let pretty = render_pretty_task(raw);
+        // `completed` is self-explanatory; no callout, no clutter.
+        assert!(!pretty.contains("[completed]"));
+        assert!(!pretty.contains("[failure"));
+    }
+
+    #[test]
+    fn render_pretty_task_warns_on_policy_denied_class() {
+        let raw = "task_id=x\nstatus=failed\nlast_failure_class=policy_denied\nevents=[]\n";
+        let pretty = render_pretty_task(raw);
+        assert!(pretty.contains("[failure: policy_denied]"));
+        assert!(pretty.contains("DO NOT re-run"));
     }
 }
