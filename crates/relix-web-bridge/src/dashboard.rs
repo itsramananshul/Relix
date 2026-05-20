@@ -225,6 +225,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_xref_panel_renderer_present() {
+        // M27: task detail surfaces a Cross-references panel
+        // with the IDs operators need to drill into per-flow
+        // event logs and the audit chain.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderXrefPanel"),
+            "page should ship renderXrefPanel()"
+        );
+        assert!(
+            body.contains("Cross-references"),
+            "page should expose a Cross-references panel"
+        );
+        // The CLI command template names should appear so a
+        // future rename of relix-flow-inspect catches at test
+        // time.
+        assert!(
+            body.contains("relix-flow-inspect"),
+            "xref panel should suggest the relix-flow-inspect CLI"
+        );
+    }
+
+    #[tokio::test]
     async fn page_retry_chain_renderer_present() {
         // M26 (Phase-1C causality): task detail renders a
         // retry-chain visualization derived from real

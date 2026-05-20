@@ -816,6 +816,75 @@
       color: var(--text-strong);
     }
 
+    /* ── Cross-reference panel (causality bridge to logs) ──────── */
+    .xref-panel {
+      padding: 10px 14px 14px;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .xref-panel summary {
+      cursor: pointer;
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      font-weight: 600;
+      padding: 4px 0;
+      list-style: none;
+    }
+    .xref-panel summary::before {
+      content: '▸ ';
+      color: var(--text-dim);
+      margin-right: 4px;
+    }
+    .xref-panel[open] summary::before { content: '▾ '; }
+    .xref-grid {
+      display: grid;
+      grid-template-columns: 100px minmax(0, 1fr) auto;
+      gap: 6px 12px;
+      margin-top: 8px;
+      font-size: var(--text-xs);
+      align-items: center;
+    }
+    .xref-grid .k { color: var(--text-muted); }
+    .xref-grid .v {
+      font-family: var(--font-mono);
+      color: var(--text);
+      word-break: break-all;
+      min-width: 0;
+    }
+    .xref-grid .copy-btn {
+      padding: 1px 6px;
+      font-size: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+    .xref-grid .copy-btn:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .xref-commands {
+      margin-top: 10px;
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+    .xref-commands pre {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 6px 8px;
+      margin: 4px 0 0;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      overflow-x: auto;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
     /* ── Retry chain (causality view) ──────────────────────────── */
     .retry-chain {
       padding: 12px 14px;
@@ -2303,12 +2372,13 @@ function renderDetail(l) {
     : '<div class="meta" style="padding: 12px 14px;">(no chronicle events)</div>';
 
   const chainBlock = renderRetryChain(l.attempts || []);
+  const xrefBlock = renderXrefPanel(l);
   document.getElementById('task-detail').innerHTML =
     `<div class="summary">${summaryRow}</div>`
     + chainBlock
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     + eventsBlock
-    + `<div class="meta" style="padding: 8px 14px;">task_id: <span class="id">${escapeHtml(l.task.task_id)}</span></div>`;
+    + xrefBlock;
 
   // Wire timeline/raw toggle.
   document.querySelectorAll('.timeline-controls .seg').forEach(seg => {
@@ -2384,6 +2454,103 @@ function renderRetryChain(attempts) {
     + '</div>'
     + '</div>';
 }
+
+/* Cross-reference panel: surfaces the IDs operators need
+   to drill into the on-disk logs. Closed by default — only
+   the operator who needs to grep ever opens it.
+
+   The IDs come directly from the lineage payload:
+     task_id       (always)
+     trace_id      (from the most recent attempt with one)
+     flow_id       (from the most recent attempt with one)
+     flow_log_path (from the most recent attempt with one)
+
+   The "next steps" commands are templated against those
+   IDs so operators copy-paste rather than reconstruct. */
+function renderXrefPanel(l) {
+  const task = l.task || {};
+  const attempts = (l.attempts || []).slice().sort((a, b) => b.attempt_num - a.attempt_num);
+  // Latest attempt with each value, since older attempts
+  // may have written different trace/flow ids per retry.
+  const latestWith = (key) => attempts.find(a => a[key]);
+  const trace = latestWith('trace_id');
+  const flow = latestWith('flow_id');
+  const flowPath = latestWith('flow_log_path');
+
+  const row = (k, v, valueText) =>
+    '<div class="k">' + escapeHtml(k) + '</div>'
+    + '<div class="v">' + escapeHtml(v) + '</div>'
+    + '<button class="copy-btn" data-copy="' + escapeHtml(valueText || v) + '">copy</button>';
+
+  let grid = row('task_id', task.task_id || '—', task.task_id || '');
+  if (trace) grid += row('trace_id', trace.trace_id, trace.trace_id);
+  if (flow) grid += row('flow_id (latest)', flow.flow_id, flow.flow_id);
+  if (flowPath) grid += row('flow_log_path', flowPath.flow_log_path, flowPath.flow_log_path);
+
+  // CLI cheat-sheet derived from the actual IDs. Only render
+  // commands whose required ID is present.
+  const cmds = [];
+  if (flowPath && flowPath.flow_log_path) {
+    cmds.push('# Per-flow execution log (signed event chain)\nrelix-flow-inspect --flow ' + flowPath.flow_log_path);
+  }
+  if (trace && trace.trace_id) {
+    cmds.push('# Per-node audit entries for this trace\nrelix-flow-inspect --audit dev-data/*/audit.log --trace ' + trace.trace_id);
+  }
+  if (task.task_id) {
+    cmds.push('# Full archival export (chronicle + attempts)\ncurl -s http://127.0.0.1:19791/v1/tasks/' + task.task_id + '/export | jq');
+  }
+  const cmdHtml = cmds.length
+    ? '<div class="xref-commands">'
+      + 'CLI references:'
+      + cmds.map(c => '<pre>' + escapeHtml(c) + '</pre>').join('')
+      + '</div>'
+    : '';
+
+  return '<details class="xref-panel">'
+    + '<summary>Cross-references &amp; on-disk linkage</summary>'
+    + '<div class="xref-grid">' + grid + '</div>'
+    + cmdHtml
+    + '</details>';
+}
+
+/* Single point of clipboard handling. Falls back to a
+   prompt-based copy when navigator.clipboard is unavailable
+   (older browsers, non-HTTPS contexts). */
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text)
+      .then(() => toast('copied', 'ok'))
+      .catch(() => fallbackCopy(text));
+  } else {
+    fallbackCopy(text);
+  }
+}
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.top = '-100px';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand('copy');
+    toast('copied', 'ok');
+  } catch (_) {
+    toast('copy failed — select manually', 'warn');
+  } finally {
+    document.body.removeChild(ta);
+  }
+}
+
+/* Delegate copy-btn clicks: works for any data-copy
+   attribute added anywhere in the page (xref panel today,
+   future surfaces tomorrow). */
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-copy]');
+  if (btn) {
+    copyToClipboard(btn.dataset.copy);
+  }
+});
 
 function renderChainPill(a, durLabel) {
   const failureLine = a.failure_class
