@@ -121,25 +121,42 @@
     }
     .load-more button { width: 100%; padding: 6px; }
     /* Retention dry-run widget — collapsed by default. */
-    details.retention {
+    details.tool-panel {
       margin: 0 20px 12px; padding: 0;
       border: 1px solid var(--border); border-radius: 4px;
       background: var(--bg-card);
     }
-    details.retention summary {
+    details.tool-panel summary {
       padding: 8px 12px; cursor: pointer; font-weight: 600; font-size: 13px;
       background: var(--bg-row-alt); border-radius: 4px;
     }
-    details.retention[open] summary { border-bottom: 1px solid var(--border); border-radius: 0; }
-    details.retention .body { padding: 12px; font-size: 12px; }
-    details.retention .form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    details.retention .form label { color: var(--fg-dim); }
-    details.retention pre {
+    details.tool-panel[open] summary { border-bottom: 1px solid var(--border); border-radius: 0; }
+    details.tool-panel .body { padding: 12px; font-size: 12px; }
+    details.tool-panel .form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    details.tool-panel .form label { color: var(--fg-dim); }
+    details.tool-panel pre {
       background: var(--bg-row-alt); padding: 8px; border-radius: 3px;
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       font-size: 11px; overflow-x: auto; margin: 8px 0 0; white-space: pre-wrap;
     }
-    details.retention .hint { color: var(--fg-dim); font-size: 11px; margin-top: 6px; }
+    details.tool-panel .hint { color: var(--fg-dim); font-size: 11px; margin-top: 6px; }
+    /* Topology widget — per-peer freshness table. */
+    .topology-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .topology-table th, .topology-table td {
+      padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--border);
+    }
+    .topology-table th { background: var(--bg-row-alt); font-weight: 600; }
+    .topology-table .id {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      color: var(--fg-dim);
+    }
+    .freshness-badge {
+      display: inline-block; padding: 1px 6px; border-radius: 3px;
+      font-size: 11px; font-weight: 500; color: #fff;
+    }
+    .freshness-fresh   { background: var(--running); }
+    .freshness-stale   { background: var(--retrying); }
+    .freshness-expired { background: var(--failed); }
   </style>
 </head>
 <body>
@@ -165,7 +182,24 @@
     <span id="live-status" class="meta" style="padding:0"></span>
   </div>
 </header>
-<details class="retention" id="retention-widget">
+<details class="tool-panel" id="topology-widget">
+  <summary>Mesh topology — peer freshness</summary>
+  <div class="body">
+    <div class="form">
+      <button id="topology-refresh">Refresh</button>
+      <span id="topology-status" class="meta" style="padding:0"></span>
+    </div>
+    <div id="topology-table-host"></div>
+    <div class="hint">
+      Read-only view of the bridge's manifest cache. <code>last_refr</code>
+      is "seconds since the most recent successful <code>node.manifest</code>
+      refresh" — a stale value means the peer's refresh loop has stalled,
+      not that the peer is necessarily down. See
+      <code>docs/failure-modes.md</code> per-peer recovery steps.
+    </div>
+  </div>
+</details>
+<details class="tool-panel" id="retention-widget">
   <summary>Chronicle retention — dry-run candidate counter</summary>
   <div class="body">
     <div class="form">
@@ -509,6 +543,77 @@ $rRun.addEventListener('click', async () => {
   } catch (e) {
     $rStatus.textContent = 'failed: ' + String(e);
   }
+});
+
+// Topology widget — peer freshness table. Reads
+// /v1/topology, renders a small table with one row per
+// cached peer + a fresh/stale/expired badge. Auto-loads
+// the first time the operator expands the widget.
+const $topoWidget  = document.getElementById('topology-widget');
+const $topoRefresh = document.getElementById('topology-refresh');
+const $topoStatus  = document.getElementById('topology-status');
+const $topoHost    = document.getElementById('topology-table-host');
+let topologyLoaded = false;
+
+async function loadTopology() {
+  $topoStatus.textContent = 'querying…';
+  try {
+    const r = await fetch('/v1/topology');
+    if (!r.ok) {
+      const body = await r.text();
+      throw new Error('HTTP ' + r.status + ': ' + body);
+    }
+    const j = await r.json();
+    renderTopology(j);
+    topologyLoaded = true;
+  } catch (e) {
+    $topoStatus.textContent = 'failed: ' + String(e);
+    $topoHost.innerHTML = '';
+  }
+}
+
+function renderTopology(t) {
+  const peers = t.peers || [];
+  if (!peers.length) {
+    $topoStatus.textContent = '';
+    $topoHost.innerHTML = '<div class="empty">(no peers discovered)</div>';
+    return;
+  }
+  const rows = peers.map(p => {
+    const alias    = p.alias || '(none)';
+    const fresh    = p.freshness || 'unknown';
+    const secs     = (typeof p.last_refreshed_secs_ago === 'number')
+      ? (p.last_refreshed_secs_ago + 's ago') : '?';
+    const shortId  = (p.node_id || '').length > 16
+      ? (p.node_id.slice(0, 8) + '…' + p.node_id.slice(-4))
+      : (p.node_id || '');
+    return '<tr>'
+      + '<td>' + escapeHtml(alias) + '</td>'
+      + '<td>' + escapeHtml(p.node_type || '') + '</td>'
+      + '<td>' + escapeHtml(p.node_name || '') + '</td>'
+      + '<td>' + (p.capability_count || 0) + '</td>'
+      + '<td>' + escapeHtml(secs) + '</td>'
+      + '<td><span class="freshness-badge freshness-' + escapeHtml(fresh) + '">'
+      + escapeHtml(fresh) + '</span></td>'
+      + '<td class="id">' + escapeHtml(shortId) + '</td>'
+      + '</tr>';
+  }).join('');
+  $topoHost.innerHTML =
+    '<table class="topology-table">'
+    + '<thead><tr><th>alias</th><th>type</th><th>node_name</th>'
+    + '<th>caps</th><th>last refr</th><th>freshness</th><th>node_id</th>'
+    + '</tr></thead>'
+    + '<tbody>' + rows + '</tbody>'
+    + '</table>';
+  $topoStatus.textContent = 'generated_at=' + (t.generated_at || '?')
+    + '  peers=' + peers.length;
+}
+
+$topoRefresh.addEventListener('click', loadTopology);
+// Lazy first-load: when the operator first opens the
+// <details>, fetch — but don't fetch on every toggle.
+$topoWidget.addEventListener('toggle', () => {
+  if ($topoWidget.open && !topologyLoaded) loadTopology();
 });
 
 loadTasks();
