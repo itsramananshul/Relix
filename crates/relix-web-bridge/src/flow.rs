@@ -81,6 +81,13 @@ pub async fn execute_chat_flow(
         // C2a.2: status -> running opens a new attempt row on the
         // Coordinator. Fail-soft; recorded as WARN on failure.
         rec.start_running(tid, &trace_hex).await;
+        // Phase-1D M35: record the ai.chat capability invocation
+        // with the resolved peer alias. The chat SOL template
+        // hardcodes `remote_call("ai", "ai.chat", …)` so the
+        // alias is unambiguously "ai" — same honesty as the
+        // chat_with_tool flow's M34 record.
+        rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
+            .await;
     }
 
     let rendered = state
@@ -258,6 +265,11 @@ pub async fn execute_chat_with_tool_flow(
             &format!("method=tool.web_fetch target={url} peer=tool"),
         )
         .await;
+        // M35: the chat_with_tool template also calls ai.chat
+        // after the web_fetch. Same honest recording — the SOL
+        // template hardcodes `remote_call("ai", "ai.chat", …)`.
+        rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
+            .await;
     }
 
     let rendered = tool_template

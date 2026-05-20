@@ -3004,13 +3004,23 @@ function renderExecutionPath(invocations, routing) {
     } else {
       targetHtml = '<span class="unknown">no peer in cache advertises this method</span>';
     }
+    // Per-method extras: surface known-unknowns honestly.
+    // ai.chat → the bridge knows the provider peer, but
+    // not which model the peer was configured with. Surface
+    // a "model: not recorded yet" marker so operators see
+    // the gap explicitly instead of guessing.
+    let methodExtras = '';
+    if (method === 'ai.chat') {
+      methodExtras = '<div class="unknown">model: not recorded yet · '
+        + 'see the AI controller\'s [ai] provider config</div>';
+    }
     const targetExtra = parsed.target
       ? '<div class="unknown">arg: ' + escapeHtml(parsed.target) + '</div>'
       : '';
     const dt = new Date((ev.ts || 0) * 1000);
     return '<div class="exec-row">'
       + '<div class="exec-method">' + escapeHtml(method) + '</div>'
-      + '<div class="exec-target">' + targetHtml + targetExtra + '</div>'
+      + '<div class="exec-target">' + targetHtml + targetExtra + methodExtras + '</div>'
       + '<div class="meta" style="padding:0;">' + escapeHtml(dt.toLocaleTimeString()) + '</div>'
       + '</div>';
   }).join('');

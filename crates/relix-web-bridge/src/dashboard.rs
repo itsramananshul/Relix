@@ -258,6 +258,12 @@ mod tests {
             body.contains("parseCapabilityInvokedPayload"),
             "page should ship the capability.invoked payload parser"
         );
+        // M35: model "not recorded yet" label for ai.chat
+        // rows — load-bearing for the honesty contract.
+        assert!(
+            body.contains("model: not recorded yet"),
+            "execution path must label the model-not-recorded gap explicitly"
+        );
     }
 
     #[tokio::test]
