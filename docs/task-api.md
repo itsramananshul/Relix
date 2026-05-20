@@ -303,6 +303,48 @@ CLI parity: `relix-cli task compact --max-age-secs N`.
 
 ## Operator actions
 
+### `POST /v1/tasks/:id/retry?force=<bool>`
+
+Operator-initiated retry (M18). Bridge guards
+non-retryable failure classes (`policy_denied` /
+`invalid_args` / `permanent`); pass `force=true` to
+override. Returns a typed envelope distinguishing
+accepted / exhausted / refused outcomes; see
+`docs/retry-model.md` for the semantics. Idempotent —
+re-submitting after acceptance returns the next attempt
+number or `exhausted` once the budget is reached.
+
+### `POST /v1/tasks/:id/cancel`
+
+Mark a task cancelled (M19). Body:
+
+```json
+{ "reason": "operator-supplied text" }
+```
+
+Response:
+
+```json
+{
+  "task_id":            "...",
+  "prior_status":       "running",
+  "new_status":         "cancelled",
+  "flow_still_running": true
+}
+```
+
+`flow_still_running: true` when prior status was `running`
+or `retrying`. **Honest:** the runtime has no flow-side
+cancellation today — a currently-executing flow continues
+and may overwrite the cancelled status when it finishes.
+The bridge appends a `task.cancelled` chronicle event
+with the reason so the operator action is audit-visible
+even when the runtime ignores it.
+
+Rejects (409) terminal states: `completed` / `failed` /
+`cancelled`. See `docs/failure-modes.md` for the
+operator playbook around the flow-still-running case.
+
 ### `POST /v1/tasks/recover`
 
 Run the recovery scan now. Promotes overdue `running` tasks to
@@ -508,6 +550,60 @@ CLI parity: `relix-cli topology show [--bridge URL] [--json]
 
 Dashboard surface: the "Mesh topology" widget at the top of
 `/dashboard`.
+
+### `GET /v1/topology/events?since=<ts>&limit=N`
+
+Server-side ring of recent topology transitions (M23).
+The bridge runs a background diff every 5s; transitions
+are pushed newest-first to a 500-entry ring. Resets on
+bridge restart.
+
+Response:
+
+```json
+{
+  "events": [
+    {
+      "ts":             1700003600,
+      "kind":           "freshness_changed",
+      "alias":          "ai",
+      "node_id":        "...",
+      "node_type":      "ai",
+      "from_freshness": "fresh",
+      "to_freshness":   "stale",
+      "detail":         "ai fresh → stale"
+    }
+  ],
+  "seq":          42,
+  "generated_at": 1700003700
+}
+```
+
+`kind` values: `joined` / `freshness_changed` / `dropped`.
+
+Dashboard surface: "Recent transitions" card on the
+`#/topology` page.
+
+### `GET /v1/streams`
+
+List currently-open SSE consumers of
+`/v1/tasks/:id/events/stream` (M25).
+
+```json
+{
+  "active": [
+    { "id": 7, "task_id": "abc...",
+      "opened_at": 1700003600, "age_secs": 142 }
+  ],
+  "opened_total": 47,
+  "generated_at": 1700003742
+}
+```
+
+Bridge-process-local; resets on restart. Useful for
+"which task is being watched right now" operator
+visibility — surfaced in the live-streams KPI delta on
+the dashboard's overview page.
 
 ## Versioning + stability
 

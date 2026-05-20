@@ -364,6 +364,15 @@ These are honest non-goals that affect Phase 1 deployments:
   without a Coordinator (during a Coordinator outage) cannot
   have its chronicle reconstructed. The per-flow event log on
   disk is the authoritative record for that case.
+- **Task cancellation is metadata-only.** `POST /v1/tasks/:id/cancel`
+  appends a `task.cancelled` chronicle event and updates the
+  ledger status. The runtime has no flow-side cancellation
+  protocol today — a currently-executing flow continues, and
+  its eventual write-back may overwrite the `cancelled` status.
+  The bridge returns `flow_still_running: true` on the response
+  when prior status was `running` / `retrying` so dashboards
+  warn operators explicitly. Real flow-side cancellation is
+  Phase 2 work.
 
 ## See also
 

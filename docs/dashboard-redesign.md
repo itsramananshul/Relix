@@ -329,6 +329,15 @@ page.
 | M14 | ✅ | Filter + selected task persisted in URL hash for shareable / bookmarkable views. |
 | M15 | ✅ | Telegram connection test + URL-token scrubber (load-bearing leak guard). |
 | M16 | ✅ | Activity items clickable: navigate to task or open peer drawer. |
+| M17 | ✅ | Default provider marker — `PUT /v1/config/providers/default` + Make-default UI badge. |
+| M18 | ✅ | Operator-initiated retry endpoint + UI with refused-class confirm flow. |
+| M19 | ✅ | Task cancel: ledger-only with honest `flow_still_running` warning (no runtime-side cancellation yet). |
+| M20 | ✅ | Execution timeline view in task detail — vertical track, per-event marker colors, attempt grouping, Timeline/Raw toggle. |
+| M21 | ✅ | SSE stream metrics — RAII `StreamGuard`, active + opened_total in `/v1/health`. |
+| M22 | ✅ | Density pass — tighter paddings, smaller topbar, KPIs grouped Mesh / Runtime / Process. |
+| M23 | ✅ | Server-side lifecycle event log — `/v1/topology/events` with joins / freshness / drops ring (cap 500). |
+| M24 | ✅ | Topology page surfaces the lifecycle log as a Recent transitions card. |
+| M25 | ✅ | Per-stream tracking — `ActiveStream { id, task_id, opened_at }`, `/v1/streams` endpoint, live-streams KPI shows watching ids. |
 
 Each milestone is its own commit + push, per the directive.
 
@@ -352,6 +361,28 @@ The dashboard is a single-page app under
 Operators can bookmark any of these. Selecting a task or
 changing a filter updates the hash via `history.replaceState`
 so the URL stays in sync without inflating browser history.
+
+## New endpoints (Phase-1B)
+
+The Runtime Operations layer (M19-M25) added these
+HTTP surfaces. All are read-only or operator-action POSTs
+(no orchestration, no autonomous loops, same admission
+posture as the rest of `/v1/*`).
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/tasks/:id/retry?force=<bool>` | Operator-initiated retry (M18). Bridge guards non-retryable failure classes; `force=true` overrides. |
+| `POST` | `/v1/tasks/:id/cancel` | Mark task cancelled in the Coordinator ledger (M19). Returns `flow_still_running: true` when prior status was running/retrying — honest signal that runtime-side cancellation is not implemented. |
+| `GET` | `/v1/streams` | List currently-open SSE consumers — `{ id, task_id, opened_at, age_secs }` per stream (M25). |
+| `GET` | `/v1/topology/events?since=<ts>&limit=N` | Server-side lifecycle ring (M23) — joins / freshness changes / drops. Resets on bridge restart. |
+
+Plus health-endpoint additions (M21):
+
+```json
+{
+  "streams": { "active": 3, "opened_total": 47 }
+}
+```
 
 ## Verification
 
