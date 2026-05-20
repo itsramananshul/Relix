@@ -87,6 +87,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_body_contains_redesign_landmarks() {
+        // M3 redesign landmarks: sidebar shell, all six routes,
+        // topbar status indicator. If a future change drops one
+        // of these sections, this test fails fast.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            body.contains(r#"<aside class="sidebar">"#),
+            "missing sidebar"
+        );
+        assert!(
+            body.contains(r#"<header class="topbar">"#),
+            "missing topbar"
+        );
+        assert!(body.contains("Operator Console"), "missing brand subtitle");
+
+        // All six routes register a nav item AND a corresponding page section.
+        for route in [
+            "overview",
+            "tasks",
+            "topology",
+            "providers",
+            "telegram",
+            "config",
+        ] {
+            assert!(
+                body.contains(&format!(r#"data-route="{route}""#)),
+                "missing nav item for {route}"
+            );
+            assert!(
+                body.contains(&format!(r#"data-page="{route}""#)),
+                "missing page section for {route}"
+            );
+        }
+
+        assert!(
+            body.contains(r#"id="status-dot""#),
+            "missing topbar status dot"
+        );
+        for ep in ["/v1/health", "/v1/topology", "/v1/tasks/cursor"] {
+            assert!(body.contains(ep), "page should consume {ep}");
+        }
+    }
+
+    #[tokio::test]
     async fn page_sets_security_headers() {
         let resp = page().await.into_response();
         assert_eq!(

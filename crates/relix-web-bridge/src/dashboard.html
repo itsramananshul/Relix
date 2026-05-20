@@ -3,261 +3,899 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Relix Operator Dashboard</title>
+  <title>Relix Operator Console</title>
   <style>
+    /* ── Design tokens ─────────────────────────────────────────── */
     :root {
-      --fg: #1a1a1a;
-      --fg-dim: #6a6a6a;
-      --bg: #fafafa;
-      --bg-row: #fff;
-      --bg-row-alt: #f3f3f3;
-      --bg-card: #fff;
-      --border: #d8d8d8;
-      --accent: #3050a0;
-      --running: #2a7a30;
-      --pending: #6a6a6a;
-      --failed: #a02a2a;
-      --interrupted: #a08020;
-      --completed: #2a7a30;
-      --cancelled: #6a6a6a;
-      --retrying: #806020;
+      /* Surfaces */
+      --bg:           #0e1015;
+      --bg-elevated:  #161920;
+      --bg-row-alt:   #1a1d24;
+      --bg-hover:     #21252e;
+      --border:       #1e2028;
+      --border-soft:  #14161c;
+
+      /* Text */
+      --text:        #d4d4d8;
+      --text-strong: #f4f4f5;
+      --text-muted:  #838387;
+      --text-dim:    #5b5c61;
+
+      /* Accent + semantic */
+      --accent:      #5a7bd6;   /* Relix blue */
+      --accent-soft: #2b3a5a;
+      --ok:          #22c55e;
+      --warn:        #f59e0b;
+      --danger:      #ef4444;
+      --info:        #3b82f6;
+
+      /* Layout */
+      --shell-nav-width:     220px;
+      --shell-topbar-height: 48px;
+      --shell-pad:           20px;
+      --card-radius:         6px;
+
+      /* Typography */
+      --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                   Inter, system-ui, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      --text-xs: 11px;
+      --text-sm: 12px;
+      --text-md: 13px;
+      --text-lg: 15px;
+      --text-xl: 18px;
     }
-    * { box-sizing: border-box; }
+
+    /* ── Reset + base ──────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; }
     html, body {
       margin: 0; padding: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 14px; line-height: 1.4;
-      background: var(--bg); color: var(--fg);
+      font-family: var(--font-body);
+      font-size: var(--text-md);
+      line-height: 1.45;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
     }
-    header {
-      padding: 12px 20px;
-      background: var(--bg-card);
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button, input, select, textarea { font: inherit; color: inherit; }
+    button {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover { background: var(--bg-hover); border-color: var(--accent-soft); }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    input[type="text"], input[type="number"], input[type="password"], select, textarea {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 8px;
+      border-radius: 4px;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: 1px solid var(--accent);
+      outline-offset: -1px;
+      border-color: var(--accent);
+    }
+    code, kbd { font-family: var(--font-mono); font-size: 0.92em; }
+
+    /* ── Layout shell ──────────────────────────────────────────── */
+    .shell {
+      display: grid;
+      grid-template-columns: var(--shell-nav-width) minmax(0, 1fr);
+      grid-template-rows: var(--shell-topbar-height) 1fr;
+      grid-template-areas: "nav topbar" "nav content";
+      min-height: 100vh;
+    }
+
+    /* ── Sidebar ───────────────────────────────────────────────── */
+    .sidebar {
+      grid-area: nav;
+      background: var(--bg-elevated);
+      border-right: 1px solid var(--border);
+      padding: 16px 0;
+      overflow-y: auto;
+    }
+    .sidebar .brand {
+      padding: 0 16px 16px;
+      font-size: var(--text-lg);
+      font-weight: 600;
+      color: var(--text-strong);
+      letter-spacing: 0.02em;
       border-bottom: 1px solid var(--border);
-      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 12px;
     }
-    header h1 { margin: 0; font-size: 16px; font-weight: 600; }
-    header .controls { display: flex; gap: 8px; align-items: center; }
-    select, input, button {
-      font: inherit; padding: 4px 8px;
-      border: 1px solid var(--border); background: #fff; border-radius: 3px;
+    .sidebar .brand .subtitle {
+      display: block;
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+      font-weight: 400;
+      margin-top: 2px;
     }
-    button { cursor: pointer; }
-    button:hover { background: var(--bg-row-alt); }
-    main {
-      display: grid; grid-template-columns: 1fr 2fr; gap: 16px;
-      padding: 16px 20px;
+    .sidebar .nav-group {
+      padding: 8px 16px 4px;
+      font-size: var(--text-xs);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+    }
+    .sidebar a.nav-item {
+      display: block;
+      padding: 6px 16px;
+      color: var(--text-muted);
+      font-size: var(--text-md);
+      text-decoration: none;
+      border-left: 2px solid transparent;
+    }
+    .sidebar a.nav-item:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+      text-decoration: none;
+    }
+    .sidebar a.nav-item.active {
+      background: var(--bg-hover);
+      color: var(--text-strong);
+      border-left-color: var(--accent);
+    }
+
+    /* ── Topbar ────────────────────────────────────────────────── */
+    .topbar {
+      grid-area: topbar;
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 var(--shell-pad);
+      gap: 12px;
+    }
+    .topbar .breadcrumb {
+      font-size: var(--text-md);
+      color: var(--text);
+    }
+    .topbar .breadcrumb .sep { color: var(--text-dim); margin: 0 6px; }
+    .topbar .breadcrumb .leaf { color: var(--text-strong); font-weight: 500; }
+    .topbar .status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+    }
+    .topbar .status .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--text-dim); display: inline-block;
+    }
+    .topbar .status .dot.ok      { background: var(--ok); }
+    .topbar .status .dot.warn    { background: var(--warn); }
+    .topbar .status .dot.danger  { background: var(--danger); }
+
+    /* ── Main content ──────────────────────────────────────────── */
+    .content {
+      grid-area: content;
+      padding: var(--shell-pad);
+      overflow-y: auto;
+      min-height: 0;
+    }
+    section.page { display: none; }
+    section.page.active { display: block; }
+    section.page > h2 {
+      margin: 0 0 4px;
+      font-size: var(--text-xl);
+      font-weight: 600;
+      color: var(--text-strong);
+    }
+    section.page > .page-subtitle {
+      margin: 0 0 18px;
+      font-size: var(--text-sm);
+      color: var(--text-muted);
+    }
+
+    /* ── Card ──────────────────────────────────────────────────── */
+    .card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      overflow: hidden;
+      margin-bottom: 16px;
+    }
+    .card-header {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: var(--text-md);
+      font-weight: 600;
+      color: var(--text);
+      background: var(--bg-row-alt);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .card-header h3 {
+      margin: 0;
+      font-size: var(--text-md);
+      font-weight: 600;
+    }
+    .card-header .card-actions { display: flex; gap: 6px; }
+    .card-body { padding: 14px; }
+    .card-body.dense { padding: 0; }
+    .card .hint {
+      color: var(--text-muted);
+      font-size: var(--text-xs);
+      margin-top: 8px;
+    }
+
+    /* ── KPI grid (overview page) ──────────────────────────────── */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .kpi {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 14px;
+    }
+    .kpi .label {
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin: 0 0 6px;
+    }
+    .kpi .value {
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--text-strong);
+      font-variant-numeric: tabular-nums;
+    }
+    .kpi .delta {
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    /* ── Tables ────────────────────────────────────────────────── */
+    table.data {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: var(--text-md);
+    }
+    table.data th, table.data td {
+      padding: 8px 12px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--border);
+    }
+    table.data th {
+      font-weight: 600;
+      color: var(--text-muted);
+      background: var(--bg-row-alt);
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    table.data tbody tr { cursor: pointer; }
+    table.data tbody tr:hover { background: var(--bg-hover); }
+    table.data tbody tr.selected { background: var(--accent-soft); }
+    table.data td.id, .id {
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+    }
+
+    /* ── Badges ────────────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 3px;
+      font-size: var(--text-xs);
+      font-weight: 500;
+      color: #fff;
+      letter-spacing: 0.02em;
+    }
+    .badge.muted { background: var(--text-dim); }
+    .badge.ok, .badge.completed, .badge.fresh   { background: var(--ok); }
+    .badge.warn, .badge.retrying, .badge.stale, .badge.interrupted
+                                                { background: var(--warn); }
+    .badge.danger, .badge.failed, .badge.expired { background: var(--danger); }
+    .badge.info, .badge.running                 { background: var(--info); }
+    .badge.pending, .badge.cancelled            { background: var(--text-dim); }
+    .badge.awaiting_input                       { background: #6d4d96; }
+
+    /* ── Two-pane (list + detail) ──────────────────────────────── */
+    .split {
+      display: grid;
+      grid-template-columns: minmax(320px, 1fr) minmax(0, 2fr);
+      gap: 16px;
       align-items: start;
     }
-    .panel {
-      background: var(--bg-card);
-      border: 1px solid var(--border); border-radius: 4px;
-      overflow: hidden;
+    @media (max-width: 1000px) {
+      .split { grid-template-columns: 1fr; }
     }
-    .panel h2 {
-      margin: 0; padding: 8px 12px;
-      font-size: 13px; font-weight: 600;
-      background: var(--bg-row-alt);
-      border-bottom: 1px solid var(--border);
+
+    /* ── Forms ─────────────────────────────────────────────────── */
+    .form-row {
+      display: grid;
+      grid-template-columns: 180px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border-soft);
     }
-    .panel-body { max-height: calc(100vh - 180px); overflow-y: auto; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 6px 12px; text-align: left; vertical-align: top; }
-    tbody tr { cursor: pointer; }
-    tbody tr:nth-child(even) { background: var(--bg-row-alt); }
-    tbody tr:hover { background: #e8eef8; }
-    tbody tr.selected { background: #d6e0f5; }
-    .status-badge {
-      display: inline-block; padding: 1px 6px;
-      border-radius: 3px; font-size: 11px;
-      color: #fff; font-weight: 500;
+    .form-row:last-child { border-bottom: 0; }
+    .form-row label {
+      font-size: var(--text-sm);
+      color: var(--text-muted);
+      padding-top: 6px;
     }
-    .status-running    { background: var(--running); }
-    .status-pending    { background: var(--pending); }
-    .status-failed     { background: var(--failed); }
-    .status-interrupted { background: var(--interrupted); }
-    .status-completed  { background: var(--completed); }
-    .status-cancelled  { background: var(--cancelled); }
-    .status-retrying   { background: var(--retrying); }
-    .id { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: var(--fg-dim); }
-    .summary {
-      padding: 8px 12px; background: var(--bg-row-alt);
-      border-bottom: 1px solid var(--border);
-      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-      font-size: 12px;
+    .form-row .field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
     }
-    .summary span { margin-right: 12px; }
-    .summary .label { color: var(--fg-dim); }
-    .attempts { padding: 8px 12px; border-bottom: 1px solid var(--border); }
-    .attempts h3, .events h3 { margin: 0 0 6px 0; font-size: 12px; font-weight: 600; color: var(--fg-dim); }
-    .attempts table { font-size: 12px; }
-    .events {
-      padding: 8px 12px;
-      max-height: 320px; overflow-y: auto;
+    .form-row .field .field-row { display: flex; gap: 6px; align-items: center; }
+    .form-row .field input,
+    .form-row .field select,
+    .form-row .field textarea { width: 100%; }
+    .form-row .field .field-help {
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+    }
+    .form-row .field .field-error {
+      font-size: var(--text-xs);
+      color: var(--danger);
+    }
+
+    /* ── Chronicle entries (tasks page) ────────────────────────── */
+    .events { padding: 4px; }
+    .events h3 {
+      margin: 8px 12px;
+      font-size: var(--text-sm);
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
     .event {
-      padding: 4px 8px; margin: 2px 0;
-      background: var(--bg-row-alt); border-left: 3px solid var(--border);
-      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-      font-size: 11px;
+      padding: 6px 12px;
+      border-left: 2px solid var(--border);
+      margin: 2px 4px;
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      background: var(--bg);
     }
-    .event.task    { border-left-color: var(--accent); }
-    .event.attempt { border-left-color: var(--running); }
-    .event.retry   { border-left-color: var(--retrying); }
-    .event.interrupted { border-left-color: var(--interrupted); }
-    .event.failed  { border-left-color: var(--failed); }
-    .event .type   { font-weight: 600; }
-    .event .payload { color: var(--fg-dim); margin-left: 8px; }
-    .event.live    { animation: flash-in 1.2s ease-out; }
+    .event.task        { border-left-color: var(--accent); }
+    .event.attempt     { border-left-color: var(--ok); }
+    .event.retry       { border-left-color: var(--warn); }
+    .event.interrupted { border-left-color: var(--warn); }
+    .event.failed      { border-left-color: var(--danger); }
+    .event .type    { font-weight: 600; color: var(--text); }
+    .event .payload { color: var(--text-muted); margin-left: 8px; }
+    .event.live     { animation: flash-in 1.2s ease-out; }
     @keyframes flash-in {
-      from { background: #e8f5e8; }
-      to   { background: var(--bg-row-alt); }
+      from { background: rgba(34,197,94,0.10); }
+      to   { background: var(--bg); }
     }
-    .empty { padding: 24px 12px; color: var(--fg-dim); text-align: center; font-style: italic; }
-    .error { padding: 8px 12px; color: var(--failed); background: #fde8e8; border-radius: 3px; }
-    .meta { padding: 0 12px 8px; color: var(--fg-dim); font-size: 11px; }
-    .load-more {
-      padding: 8px 12px; text-align: center;
-      border-top: 1px solid var(--border);
+
+    /* ── Detail panel parts ────────────────────────────────────── */
+    .summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-row-alt);
+      font-size: var(--text-sm);
     }
-    .load-more button { width: 100%; padding: 6px; }
-    /* Retention dry-run widget — collapsed by default. */
-    details.tool-panel {
-      margin: 0 20px 12px; padding: 0;
-      border: 1px solid var(--border); border-radius: 4px;
-      background: var(--bg-card);
+    .summary .label { color: var(--text-muted); font-size: var(--text-xs); margin-right: 4px; }
+    .attempts-block { padding: 12px 14px; }
+    .attempts-block h3 {
+      margin: 0 0 8px;
+      font-size: var(--text-sm);
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
-    details.tool-panel summary {
-      padding: 8px 12px; cursor: pointer; font-weight: 600; font-size: 13px;
-      background: var(--bg-row-alt); border-radius: 4px;
+
+    /* ── Status / hint blocks ──────────────────────────────────── */
+    .empty {
+      padding: 32px 12px;
+      color: var(--text-muted);
+      text-align: center;
+      font-style: italic;
     }
-    details.tool-panel[open] summary { border-bottom: 1px solid var(--border); border-radius: 0; }
-    details.tool-panel .body { padding: 12px; font-size: 12px; }
-    details.tool-panel .form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    details.tool-panel .form label { color: var(--fg-dim); }
-    details.tool-panel pre {
-      background: var(--bg-row-alt); padding: 8px; border-radius: 3px;
-      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-      font-size: 11px; overflow-x: auto; margin: 8px 0 0; white-space: pre-wrap;
+    .error {
+      padding: 10px 14px;
+      color: var(--danger);
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.25);
+      border-radius: 4px;
+      font-size: var(--text-sm);
     }
-    details.tool-panel .hint { color: var(--fg-dim); font-size: 11px; margin-top: 6px; }
-    /* Topology widget — per-peer freshness table. */
-    .topology-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .topology-table th, .topology-table td {
-      padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--border);
+    .loading {
+      padding: 32px 12px;
+      color: var(--text-muted);
+      text-align: center;
+      font-size: var(--text-sm);
     }
-    .topology-table th { background: var(--bg-row-alt); font-weight: 600; }
-    .topology-table .id {
-      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-      color: var(--fg-dim);
+    .banner {
+      padding: 10px 14px;
+      border-radius: 4px;
+      font-size: var(--text-sm);
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      background: var(--bg-row-alt);
     }
-    .freshness-badge {
-      display: inline-block; padding: 1px 6px; border-radius: 3px;
-      font-size: 11px; font-weight: 500; color: #fff;
+    .banner.warn   { border-color: rgba(245,158,11,0.4);   background: rgba(245,158,11,0.06); color: var(--warn); }
+    .banner.danger { border-color: rgba(239,68,68,0.4);    background: rgba(239,68,68,0.07);  color: var(--danger); }
+    .banner.info   { border-color: rgba(90,123,214,0.4);   background: rgba(90,123,214,0.08); color: var(--accent); }
+
+    /* ── Modal ─────────────────────────────────────────────────── */
+    .modal-backdrop {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
     }
-    .freshness-fresh   { background: var(--running); }
-    .freshness-stale   { background: var(--retrying); }
-    .freshness-expired { background: var(--failed); }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      width: min(560px, 90vw);
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .modal .modal-header {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .modal .modal-body { padding: 14px; }
+
+    .meta { color: var(--text-muted); font-size: var(--text-xs); }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .row.between { justify-content: space-between; }
+
+    pre.code-block {
+      background: var(--bg);
+      padding: 10px 12px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      overflow-x: auto;
+      white-space: pre-wrap;
+      margin: 8px 0 0;
+      border: 1px solid var(--border);
+    }
   </style>
 </head>
 <body>
-<header>
-  <h1>Relix Operator Dashboard</h1>
-  <div class="controls">
-    <label>status
-      <select id="filter-status">
-        <option value="">all</option>
-        <option value="pending">pending</option>
-        <option value="running">running</option>
-        <option value="retrying">retrying</option>
-        <option value="interrupted">interrupted</option>
-        <option value="awaiting_input">awaiting_input</option>
-        <option value="completed">completed</option>
-        <option value="failed">failed</option>
-        <option value="cancelled">cancelled</option>
-      </select>
-    </label>
-    <button id="refresh">Refresh</button>
-    <label><input type="checkbox" id="autorefresh"> auto (5s)</label>
-    <label><input type="checkbox" id="livefeed" checked> live feed</label>
-    <span id="live-status" class="meta" style="padding:0"></span>
+<div class="shell">
+  <!-- ── Sidebar ─────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="brand">
+      Relix
+      <span class="subtitle">Operator Console</span>
+    </div>
+    <div class="nav-group">Operate</div>
+    <a href="#/overview" class="nav-item" data-route="overview">Overview</a>
+    <a href="#/tasks"    class="nav-item" data-route="tasks">Tasks</a>
+    <a href="#/topology" class="nav-item" data-route="topology">Topology</a>
+    <div class="nav-group">Configure</div>
+    <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
+    <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
+    <a href="#/config"    class="nav-item" data-route="config">Bridge Config</a>
+  </aside>
+
+  <!-- ── Topbar ──────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="breadcrumb">
+      <span>Relix</span>
+      <span class="sep">/</span>
+      <span class="leaf" id="topbar-leaf">Overview</span>
+    </div>
+    <div class="status">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">checking…</span>
+    </div>
+  </header>
+
+  <!-- ── Content ─────────────────────────────────────────────────── -->
+  <main class="content">
+
+    <!-- ── #/overview ─────────────────────────────────────────── -->
+    <section class="page" data-page="overview">
+      <h2>Overview</h2>
+      <p class="page-subtitle">At-a-glance mesh health and recent activity.</p>
+      <div class="kpi-grid" id="overview-kpis">
+        <div class="kpi"><p class="label">status</p><div class="value" id="kpi-status">—</div><div class="delta" id="kpi-status-delta"></div></div>
+        <div class="kpi"><p class="label">uptime</p><div class="value" id="kpi-uptime">—</div><div class="delta">since bridge start</div></div>
+        <div class="kpi"><p class="label">peers</p><div class="value" id="kpi-peers">—</div><div class="delta" id="kpi-peers-delta"></div></div>
+        <div class="kpi"><p class="label">tasks</p><div class="value" id="kpi-tasks">—</div><div class="delta" id="kpi-tasks-delta"></div></div>
+        <div class="kpi"><p class="label">coordinator</p><div class="value" id="kpi-coord">—</div><div class="delta" id="kpi-coord-delta"></div></div>
+        <div class="kpi"><p class="label">reconnects</p><div class="value" id="kpi-reconnect">—</div><div class="delta" id="kpi-reconnect-delta">attempts / successes</div></div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Recent peers</h3>
+          <div class="card-actions">
+            <a href="#/topology">View all →</a>
+          </div>
+        </div>
+        <div class="card-body dense" id="overview-peers">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── #/tasks ────────────────────────────────────────────── -->
+    <section class="page" data-page="tasks">
+      <h2>Tasks</h2>
+      <p class="page-subtitle">Durable Task ledger from the Coordinator. Cursor-paginated and stable under concurrent writes.</p>
+      <div class="row between" style="margin-bottom: 12px;">
+        <div class="row">
+          <label class="meta">status
+            <select id="filter-status" style="margin-left: 4px;">
+              <option value="">all</option>
+              <option value="pending">pending</option>
+              <option value="running">running</option>
+              <option value="retrying">retrying</option>
+              <option value="interrupted">interrupted</option>
+              <option value="awaiting_input">awaiting_input</option>
+              <option value="completed">completed</option>
+              <option value="failed">failed</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+          </label>
+          <button id="refresh">Refresh</button>
+          <label class="meta"><input type="checkbox" id="autorefresh"> auto (5s)</label>
+          <label class="meta"><input type="checkbox" id="livefeed" checked> live feed</label>
+          <span class="meta" id="live-status"></span>
+        </div>
+        <div class="row">
+          <button id="open-retention">Chronicle retention…</button>
+        </div>
+      </div>
+
+      <div class="split">
+        <div class="card">
+          <div class="card-header">
+            <h3>Tasks (<span id="task-count">—</span>)</h3>
+          </div>
+          <div class="card-body dense" id="task-list"><div class="loading">loading…</div></div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h3 id="detail-title">Task detail</h3>
+            <div class="card-actions" id="detail-actions" style="display:none;">
+              <button id="action-export">Export</button>
+              <button id="action-recover">Recover</button>
+            </div>
+          </div>
+          <div id="task-detail"><div class="empty">select a task on the left</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── #/topology ─────────────────────────────────────────── -->
+    <section class="page" data-page="topology">
+      <h2>Topology</h2>
+      <p class="page-subtitle">Mesh peers known to the bridge. Read-only projection of the manifest cache.</p>
+      <div class="row" style="margin-bottom: 12px;">
+        <button id="topology-refresh">Refresh</button>
+        <span class="meta" id="topology-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-body dense" id="topology-table-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        <code>last_refr</code> is "seconds since the most recent successful
+        <code>node.manifest</code> refresh." A stale value means the peer's
+        refresh loop has stalled, not necessarily that the peer is down.
+        See <code>docs/failure-modes.md</code> for per-peer recovery steps.
+      </p>
+    </section>
+
+    <!-- ── #/providers (stub for milestone 6) ─────────────────── -->
+    <section class="page" data-page="providers">
+      <h2>AI Providers</h2>
+      <p class="page-subtitle">Configure AI provider keys + default models. Restart of the AI controller required for changes to take effect.</p>
+      <div class="banner info">
+        Provider settings UI lands in a follow-up commit. The backend
+        config endpoints (<code>/v1/config/providers</code>) are tracked
+        in <code>docs/dashboard-redesign.md</code> Milestone 5.
+      </div>
+    </section>
+
+    <!-- ── #/telegram (stub for milestone 7) ──────────────────── -->
+    <section class="page" data-page="telegram">
+      <h2>Telegram</h2>
+      <p class="page-subtitle">Bot API token + delivery mode for the Telegram channel.</p>
+      <div class="banner info">
+        Telegram setup UI lands in a follow-up commit. See
+        <code>docs/dashboard-redesign.md</code> Milestone 7 for the
+        contract.
+      </div>
+    </section>
+
+    <!-- ── #/config (stub for milestone 8) ────────────────────── -->
+    <section class="page" data-page="config">
+      <h2>Bridge Config</h2>
+      <p class="page-subtitle">Read-only view of the bridge's effective config (secrets redacted).</p>
+      <div class="banner info">
+        Config inspection page lands in a follow-up commit.
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ── Modal (retention dry-run) ─────────────────────────────── -->
+<div class="modal-backdrop" id="retention-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Chronicle retention — dry-run candidate counter</h3>
+      <button id="retention-close">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="row" style="margin-bottom: 10px;">
+        <label class="meta">max age (days)
+          <input type="number" id="retention-days" value="30" min="1" max="3650" style="width:80px; margin-left: 4px;">
+        </label>
+        <button id="retention-run">Count candidates</button>
+        <span class="meta" id="retention-status"></span>
+      </div>
+      <pre class="code-block" id="retention-result" hidden></pre>
+      <p class="meta">
+        Non-destructive: counts events that <em>would</em> be deleted,
+        broken down by parent task status (terminal-state tasks only).
+        No deletion happens — see
+        <code>docs/chronicle-retention.md</code>.
+      </p>
+    </div>
   </div>
-</header>
-<details class="tool-panel" id="topology-widget">
-  <summary>Mesh topology — peer freshness</summary>
-  <div class="body">
-    <div class="form">
-      <button id="topology-refresh">Refresh</button>
-      <span id="topology-status" class="meta" style="padding:0"></span>
-    </div>
-    <div id="topology-table-host"></div>
-    <div class="hint">
-      Read-only view of the bridge's manifest cache. <code>last_refr</code>
-      is "seconds since the most recent successful <code>node.manifest</code>
-      refresh" — a stale value means the peer's refresh loop has stalled,
-      not that the peer is necessarily down. See
-      <code>docs/failure-modes.md</code> per-peer recovery steps.
-    </div>
-  </div>
-</details>
-<details class="tool-panel" id="retention-widget">
-  <summary>Chronicle retention — dry-run candidate counter</summary>
-  <div class="body">
-    <div class="form">
-      <label>max age (days)
-        <input type="number" id="retention-days" value="30" min="1" max="3650" style="width:80px">
-      </label>
-      <button id="retention-run">Count candidates</button>
-      <span id="retention-status" class="meta" style="padding:0"></span>
-    </div>
-    <pre id="retention-result" hidden></pre>
-    <div class="hint">
-      Non-destructive: counts events that <em>would</em> be deleted under the
-      max-age policy, broken down by parent task status (terminal-state tasks
-      only). No deletion happens — see
-      <code>docs/chronicle-retention.md</code> for the design.
-    </div>
-  </div>
-</details>
-<main>
-  <section class="panel">
-    <h2>Tasks (<span id="task-count">-</span>)</h2>
-    <div class="panel-body" id="task-list"><div class="empty">loading…</div></div>
-  </section>
-  <section class="panel">
-    <h2 id="detail-title">Task detail</h2>
-    <div class="panel-body" id="task-detail"><div class="empty">select a task on the left</div></div>
-  </section>
-</main>
+</div>
+
 <script>
 'use strict';
 
-const $list   = document.getElementById('task-list');
-const $detail = document.getElementById('task-detail');
-const $count  = document.getElementById('task-count');
-const $title  = document.getElementById('detail-title');
-const $filter = document.getElementById('filter-status');
-const $refresh = document.getElementById('refresh');
-const $auto    = document.getElementById('autorefresh');
-const $live    = document.getElementById('livefeed');
-const $liveStatus = document.getElementById('live-status');
+/* ── Router ────────────────────────────────────────────────── */
+const PAGES = {
+  overview:  { label: 'Overview',     init: initOverview,  enter: enterOverview },
+  tasks:     { label: 'Tasks',        init: initTasks,     enter: enterTasks },
+  topology:  { label: 'Topology',     init: initTopology,  enter: enterTopology },
+  providers: { label: 'AI Providers', init: null,          enter: null },
+  telegram:  { label: 'Telegram',     init: null,          enter: null },
+  config:    { label: 'Bridge Config', init: null,         enter: null },
+};
+let currentRoute = null;
+const initialised = new Set();
 
+function parseRoute() {
+  const hash = window.location.hash || '#/overview';
+  const m = hash.match(/^#\/(\w+)/);
+  const name = m && PAGES[m[1]] ? m[1] : 'overview';
+  return name;
+}
+
+function showRoute(name) {
+  currentRoute = name;
+  // Toggle sections
+  document.querySelectorAll('section.page').forEach(s => {
+    s.classList.toggle('active', s.dataset.page === name);
+  });
+  // Sidebar active state
+  document.querySelectorAll('.sidebar a.nav-item').forEach(a => {
+    a.classList.toggle('active', a.dataset.route === name);
+  });
+  // Topbar breadcrumb
+  document.getElementById('topbar-leaf').textContent = PAGES[name].label;
+  // Lazy init
+  const page = PAGES[name];
+  if (page.init && !initialised.has(name)) {
+    page.init();
+    initialised.add(name);
+  }
+  if (page.enter) page.enter();
+}
+
+window.addEventListener('hashchange', () => showRoute(parseRoute()));
+
+/* ── Status bar (polled every 10s) ────────────────────────── */
+async function refreshStatus() {
+  try {
+    const r = await fetch('/v1/health');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const h = await r.json();
+    const dot = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    let cls = 'ok';
+    let msg = `mesh ok · peers=${h.peer_count}`;
+    if (h.peers_expired > 0) { cls = 'danger'; msg = `${h.peers_expired} peer(s) expired`; }
+    else if (h.peers_stale > 0) { cls = 'warn'; msg = `${h.peers_stale} peer(s) stale`; }
+    if (!h.coordinator_configured) { cls = 'warn'; msg += ' · no coordinator'; }
+    dot.className = 'dot ' + cls;
+    text.textContent = msg;
+  } catch (e) {
+    const dot = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    dot.className = 'dot danger';
+    text.textContent = 'bridge unreachable';
+  }
+}
+setInterval(refreshStatus, 10000);
+refreshStatus();
+
+/* ── Shared helpers ───────────────────────────────────────── */
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+function shortenId(id) {
+  if (!id) return '';
+  return id.length > 16 ? (id.slice(0, 8) + '…' + id.slice(-4)) : id;
+}
+function fmtDuration(secs) {
+  if (secs == null || secs < 0) return '—';
+  if (secs < 60) return secs + 's';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return h + 'h ' + m + 'm';
+}
+
+/* ── Overview page ────────────────────────────────────────── */
+function initOverview() { /* nothing one-shot */ }
+async function enterOverview() {
+  try {
+    const [hRes, tRes, cRes] = await Promise.all([
+      fetch('/v1/health').then(r => r.json()),
+      fetch('/v1/topology').then(r => r.json()),
+      fetch('/v1/tasks/count').then(r => r.text()).then(t => {
+        const m = t.match(/count=(\d+)/);
+        return m ? parseInt(m[1], 10) : 0;
+      }).catch(() => null),
+    ]);
+    const okPeers = hRes.peer_count - hRes.peers_expired - hRes.peers_stale;
+    document.getElementById('kpi-status').textContent =
+      hRes.peers_expired > 0 ? 'degraded'
+      : hRes.peers_stale   > 0 ? 'stale'
+      : 'healthy';
+    document.getElementById('kpi-status-delta').textContent =
+      `${okPeers}/${hRes.peer_count} fresh`;
+    document.getElementById('kpi-uptime').textContent = fmtDuration(hRes.uptime_secs);
+    document.getElementById('kpi-peers').textContent = hRes.peer_count;
+    document.getElementById('kpi-peers-delta').textContent =
+      `fresh=${hRes.peers_fresh} stale=${hRes.peers_stale} expired=${hRes.peers_expired}`;
+    document.getElementById('kpi-tasks').textContent = cRes != null ? cRes : '—';
+    document.getElementById('kpi-tasks-delta').textContent =
+      cRes != null ? 'in coordinator ledger' : 'coordinator unavailable';
+    document.getElementById('kpi-coord').textContent =
+      hRes.coordinator_configured ? 'configured' : 'absent';
+    document.getElementById('kpi-coord-delta').textContent =
+      hRes.coordinator_configured ? '' : 'task.* endpoints return 503';
+    if (hRes.reconnect) {
+      document.getElementById('kpi-reconnect').textContent =
+        hRes.reconnect.successes + '/' + hRes.reconnect.attempts;
+    } else {
+      document.getElementById('kpi-reconnect').textContent = 'n/a';
+    }
+
+    // Recent peers (first 5)
+    const host = document.getElementById('overview-peers');
+    if (!tRes.peers || !tRes.peers.length) {
+      host.innerHTML = '<div class="empty">no peers discovered</div>';
+      return;
+    }
+    const top5 = tRes.peers.slice(0, 5);
+    host.innerHTML =
+      '<table class="data">'
+      + '<thead><tr><th>alias</th><th>type</th><th>caps</th><th>last refr</th><th>state</th></tr></thead>'
+      + '<tbody>'
+      + top5.map(p => (
+        '<tr>'
+        + '<td>' + escapeHtml(p.alias || '(none)') + '</td>'
+        + '<td>' + escapeHtml(p.node_type) + '</td>'
+        + '<td>' + p.capability_count + '</td>'
+        + '<td>' + p.last_refreshed_secs_ago + 's ago</td>'
+        + '<td><span class="badge ' + escapeHtml(p.freshness) + '">'
+            + escapeHtml(p.freshness) + '</span></td>'
+        + '</tr>'
+      )).join('')
+      + '</tbody></table>';
+  } catch (e) {
+    document.querySelectorAll('.kpi .value').forEach(v => v.textContent = '—');
+    document.getElementById('overview-peers').innerHTML =
+      '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+/* ── Tasks page ───────────────────────────────────────────── */
 let selectedTaskId = null;
 let autoTimer = null;
 let eventSource = null;
 let lastEventId = 0;
-// Cursor pagination state. `loadedTasks` accumulates rows
-// across "Load more" clicks; `nextCursor` holds the opaque
-// continuation token returned by /v1/tasks/cursor (null after
-// the last page). Filter / refresh / auto-refresh all reset
-// this state via loadTasks(); only the explicit "Load more"
-// button appends.
 let loadedTasks = [];
 let nextCursor = null;
-const PAGE_SIZE = 100;
+const TASKS_PAGE_SIZE = 100;
+let tasksInited = false;
+
+function initTasks() {
+  // Wire control handlers
+  document.getElementById('refresh').addEventListener('click', () => {
+    loadTasks();
+    if (selectedTaskId) loadDetail(selectedTaskId);
+  });
+  document.getElementById('autorefresh').addEventListener('change', e => {
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+    if (e.target.checked) {
+      autoTimer = setInterval(() => {
+        loadTasks();
+        if (selectedTaskId) loadDetail(selectedTaskId);
+      }, 5000);
+    }
+  });
+  document.getElementById('livefeed').addEventListener('change', () => {
+    if (!selectedTaskId) return;
+    if (document.getElementById('livefeed').checked) openLiveFeed(selectedTaskId);
+    else closeLiveFeed();
+  });
+  document.getElementById('filter-status').addEventListener('change', loadTasks);
+
+  // Retention modal
+  document.getElementById('open-retention').addEventListener('click', () => {
+    document.getElementById('retention-modal').classList.add('open');
+  });
+  document.getElementById('retention-close').addEventListener('click', () => {
+    document.getElementById('retention-modal').classList.remove('open');
+  });
+  document.getElementById('retention-run').addEventListener('click', runRetention);
+
+  // Detail actions
+  document.getElementById('action-export').addEventListener('click', () => {
+    if (selectedTaskId) {
+      window.open('/v1/tasks/' + encodeURIComponent(selectedTaskId) + '/export', '_blank');
+    }
+  });
+  document.getElementById('action-recover').addEventListener('click', async () => {
+    if (!confirm('Run the recovery scan now? Promotes overdue running tasks to interrupted. Idempotent.')) return;
+    try {
+      const r = await fetch('/v1/tasks/recover', { method: 'POST' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      alert('Recovered ' + (j.count || 0) + ' task(s).');
+      loadTasks();
+    } catch (e) {
+      alert('Recovery failed: ' + String(e));
+    }
+  });
+
+  tasksInited = true;
+}
+function enterTasks() {
+  if (!loadedTasks.length) loadTasks();
+}
 
 async function loadTasks() {
-  // Reset to first page. Operators reaching for "Refresh"
-  // want the freshest state, not more historical rows.
   loadedTasks = [];
   nextCursor = null;
   await fetchNextPage();
@@ -265,9 +903,9 @@ async function loadTasks() {
 
 async function fetchNextPage() {
   try {
-    const status = $filter.value;
+    const status = document.getElementById('filter-status').value;
     const params = new URLSearchParams();
-    params.set('limit', String(PAGE_SIZE));
+    params.set('limit', String(TASKS_PAGE_SIZE));
     if (status) params.set('status', status);
     if (nextCursor) params.set('cursor', nextCursor);
     const r = await fetch('/v1/tasks/cursor?' + params.toString());
@@ -277,35 +915,36 @@ async function fetchNextPage() {
     loadedTasks = loadedTasks.concat(items);
     nextCursor = page.next_cursor || null;
     renderTaskList(loadedTasks);
-    // Count reflects total loaded; `+` suffix when more pages
-    // are available so operators know there's more behind
-    // the "Load more" affordance.
-    $count.textContent = loadedTasks.length + (nextCursor ? '+' : '');
+    document.getElementById('task-count').textContent =
+      loadedTasks.length + (nextCursor ? '+' : '');
   } catch (e) {
-    $list.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+    document.getElementById('task-list').innerHTML =
+      '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
 }
 
 function renderTaskList(items) {
+  const $list = document.getElementById('task-list');
   if (!items.length) {
     $list.innerHTML = '<div class="empty">no tasks</div>';
     return;
   }
   const rows = items.map(t => {
     const sel = t.task_id === selectedTaskId ? ' class="selected"' : '';
-    return `<tr data-id="${t.task_id}"${sel}>
-      <td><span class="status-badge status-${t.status}">${escapeHtml(t.status)}</span></td>
-      <td>${escapeHtml(t.title)}</td>
-      <td class="id">${t.task_id.slice(0, 8)}</td>
-    </tr>`;
+    return '<tr data-id="' + escapeHtml(t.task_id) + '"' + sel + '>'
+      + '<td><span class="badge ' + escapeHtml(t.status) + '">'
+        + escapeHtml(t.status) + '</span></td>'
+      + '<td>' + escapeHtml(t.title) + '</td>'
+      + '<td class="id">' + escapeHtml(t.task_id.slice(0, 8)) + '</td>'
+      + '</tr>';
   }).join('');
-  const moreButton = nextCursor
-    ? `<div class="load-more"><button id="load-more">Load more (${items.length} shown)</button></div>`
+  const more = nextCursor
+    ? '<div style="padding: 8px 12px; text-align:center; border-top: 1px solid var(--border);">'
+    + '<button id="load-more">Load more</button></div>'
     : '';
-  $list.innerHTML = `<table>
-    <thead><tr><th>status</th><th>title</th><th>id</th></tr></thead>
-    <tbody>${rows}</tbody>
-  </table>${moreButton}`;
+  $list.innerHTML =
+    '<table class="data"><thead><tr><th>status</th><th>title</th><th>id</th></tr></thead>'
+    + '<tbody>' + rows + '</tbody></table>' + more;
   $list.querySelectorAll('tbody tr').forEach(tr => {
     tr.addEventListener('click', () => loadDetail(tr.dataset.id));
   });
@@ -314,144 +953,57 @@ function renderTaskList(items) {
 }
 
 async function loadDetail(id) {
-  // Closing previous SSE stream before opening a new one — the
-  // bridge's per-stream tokio task dies when its socket
-  // closes, so this also bounds resource usage on the server.
   closeLiveFeed();
   selectedTaskId = id;
   lastEventId = 0;
-  $list.querySelectorAll('tbody tr').forEach(tr => {
+  document.querySelectorAll('#task-list tbody tr').forEach(tr => {
     tr.classList.toggle('selected', tr.dataset.id === id);
   });
-  $title.textContent = 'Task ' + id.slice(0, 12) + '…';
-  $detail.innerHTML = '<div class="empty">loading…</div>';
+  document.getElementById('detail-title').textContent =
+    'Task ' + id.slice(0, 12) + '…';
+  document.getElementById('detail-actions').style.display = 'flex';
+  const $detail = document.getElementById('task-detail');
+  $detail.innerHTML = '<div class="loading">loading…</div>';
   try {
     const r = await fetch('/v1/tasks/' + encodeURIComponent(id) + '/lineage');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const lineage = await r.json();
     renderDetail(lineage);
-    // Track the highest event id so the SSE stream picks up
-    // strictly after the snapshot.
     for (const e of (lineage.task.events || [])) {
       if (e.event_id > lastEventId) lastEventId = e.event_id;
     }
-    if ($live.checked) openLiveFeed(id);
+    if (document.getElementById('livefeed').checked) openLiveFeed(id);
   } catch (e) {
     $detail.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
 }
 
-function openLiveFeed(id) {
-  if (!('EventSource' in window)) {
-    setLiveStatus('SSE unsupported');
-    return;
-  }
-  closeLiveFeed();
-  const url = '/v1/tasks/' + encodeURIComponent(id) + '/events/stream?since=' + lastEventId;
-  const es = new EventSource(url);
-  eventSource = es;
-  setLiveStatus('live ●');
-  es.addEventListener('event', (m) => {
-    let ev;
-    try { ev = JSON.parse(m.data); } catch (_) { return; }
-    // SSE messages carry the Coordinator's raw line shape
-    // (`id`, `ts`, `type`, `payload`) — distinct from the
-    // bridge's translated `event_id` shape. Read `id` AND
-    // surface as a bridge-shaped object for the renderer so
-    // the rest of the dashboard sees one consistent shape.
-    const eventId = (typeof ev.id === 'number') ? ev.id : ev.event_id;
-    if (typeof eventId === 'number' && eventId > lastEventId) {
-      lastEventId = eventId;
-    }
-    appendChronologyEvent({
-      event_id:   eventId,
-      ts:         ev.ts,
-      event_type: ev.type || ev.event_type,
-      payload:    ev.payload || '',
-      schema_version: ev.schema_version,
-      attempt_id: ev.attempt_id,
-      trace_id:   ev.trace_id,
-      payload_json: ev.payload_json,
-    });
-  });
-  es.addEventListener('gone', () => {
-    setLiveStatus('task gone');
-    closeLiveFeed();
-  });
-  es.addEventListener('error', () => {
-    // EventSource auto-reconnects on transport errors. The
-    // server emits `event: error` SSE messages for Coordinator-
-    // side errors and keeps the stream alive; those go through
-    // the message handler above. The `error` HANDLER here fires
-    // on transport-level disconnects.
-    setLiveStatus('reconnecting…');
-  });
-}
-
-function closeLiveFeed() {
-  if (eventSource) {
-    eventSource.close();
-    eventSource = null;
-  }
-  setLiveStatus('');
-}
-
-function setLiveStatus(s) {
-  $liveStatus.textContent = s ? ' [' + s + ']' : '';
-}
-
-function appendChronologyEvent(ev) {
-  const eventsBlock = $detail.querySelector('.events');
-  if (!eventsBlock) {
-    // Detail panel was rendered with an empty chronology meta
-    // note. Reload to materialise the block — the next
-    // event will render inline.
-    if (selectedTaskId) loadDetail(selectedTaskId);
-    return;
-  }
-  const div = document.createElement('div');
-  div.className = 'event ' + eventClass(ev.event_type) + ' live';
-  const ts = document.createElement('span'); ts.className = 'type'; ts.textContent = ev.event_type;
-  const pl = document.createElement('span'); pl.className = 'payload'; pl.textContent = ev.payload || '';
-  div.appendChild(ts); div.appendChild(pl);
-  eventsBlock.appendChild(div);
-  // Auto-scroll to the bottom so live events are visible.
-  eventsBlock.scrollTop = eventsBlock.scrollHeight;
-  // Bump the count badge.
-  const h3 = eventsBlock.querySelector('h3');
-  if (h3) {
-    const m = h3.textContent.match(/\((\d+)\)/);
-    const next = m ? (parseInt(m[1], 10) + 1) : eventsBlock.querySelectorAll('.event').length;
-    h3.textContent = h3.textContent.replace(/\(\d+\)/, '(' + next + ')');
-  }
-}
-
 function renderDetail(l) {
-  const s = l.summary;
+  const s = l.summary || {};
   const summaryRow =
-    `<span><span class="label">status</span> <span class="status-badge status-${s.status}">${escapeHtml(s.status)}</span></span>` +
-    (s.attempt_count != null ? `<span><span class="label">attempts</span> ${s.attempt_count}</span>` : '') +
-    (s.duration_secs != null ? `<span><span class="label">duration</span> ${s.duration_secs}s</span>` : '') +
-    (s.started_at    != null ? `<span><span class="label">started</span> ${s.started_at}</span>` : '') +
-    (s.last_failure_class ? `<span><span class="label">failure</span> ${escapeHtml(s.last_failure_class)}</span>` : '') +
-    (s.retries ? `<span><span class="label">retries</span> ${escapeHtml(s.retries)}</span>` : '');
+    `<span><span class="label">status</span> <span class="badge ${escapeHtml(s.status || '')}">${escapeHtml(s.status || '')}</span></span>`
+    + (s.attempt_count != null ? `<span><span class="label">attempts</span> ${s.attempt_count}</span>` : '')
+    + (s.duration_secs != null ? `<span><span class="label">duration</span> ${s.duration_secs}s</span>` : '')
+    + (s.started_at    != null ? `<span><span class="label">started</span> ${s.started_at}</span>` : '')
+    + (s.last_failure_class ? `<span><span class="label">failure</span> ${escapeHtml(s.last_failure_class)}</span>` : '')
+    + (s.retries ? `<span><span class="label">retries</span> ${escapeHtml(s.retries)}</span>` : '');
 
   const attemptRows = l.attempts && l.attempts.length
-    ? `<table>
+    ? `<table class="data">
         <thead><tr><th>#</th><th>status</th><th>started</th><th>duration</th><th>failure</th><th>flow_id</th></tr></thead>
         <tbody>${l.attempts.map(a => {
           const dur = a.finished_at != null ? (a.finished_at - a.started_at) + 's' : '(open)';
           return `<tr>
             <td>${a.attempt_num}</td>
-            <td><span class="status-badge status-${a.status}">${escapeHtml(a.status)}</span></td>
+            <td><span class="badge ${escapeHtml(a.status)}">${escapeHtml(a.status)}</span></td>
             <td>${a.started_at}</td>
             <td>${dur}</td>
             <td>${escapeHtml(a.failure_class || '')}</td>
-            <td class="id">${a.flow_id ? a.flow_id.slice(0, 12) : ''}</td>
+            <td class="id">${a.flow_id ? shortenId(a.flow_id) : ''}</td>
           </tr>`;
         }).join('')}</tbody>
       </table>`
-    : '<div class="meta">(no attempts — task never transitioned to running)</div>';
+    : '<div class="meta" style="padding: 0 14px 12px;">(no attempts — task never transitioned to running)</div>';
 
   const events = (l.task.events || []).map(e => {
     const cls = eventClass(e.event_type);
@@ -459,13 +1011,13 @@ function renderDetail(l) {
   }).join('');
   const eventsBlock = events
     ? `<div class="events"><h3>chronology (${l.task.events.length})</h3>${events}</div>`
-    : '<div class="meta">(no chronicle events)</div>';
+    : '<div class="meta" style="padding: 12px 14px;">(no chronicle events)</div>';
 
-  $detail.innerHTML =
-    `<div class="summary">${summaryRow}</div>` +
-    `<div class="attempts"><h3>attempts</h3>${attemptRows}</div>` +
-    eventsBlock +
-    `<div class="meta">task_id: <span class="id">${l.task.task_id}</span></div>`;
+  document.getElementById('task-detail').innerHTML =
+    `<div class="summary">${summaryRow}</div>`
+    + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
+    + eventsBlock
+    + `<div class="meta" style="padding: 8px 14px;">task_id: <span class="id">${escapeHtml(l.task.task_id)}</span></div>`;
 }
 
 function eventClass(t) {
@@ -477,53 +1029,63 @@ function eventClass(t) {
   return '';
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+function openLiveFeed(id) {
+  if (!('EventSource' in window)) { setLiveStatus('SSE unsupported'); return; }
+  closeLiveFeed();
+  const url = '/v1/tasks/' + encodeURIComponent(id) + '/events/stream?since=' + lastEventId;
+  const es = new EventSource(url);
+  eventSource = es;
+  setLiveStatus('live ●');
+  es.addEventListener('event', m => {
+    let ev;
+    try { ev = JSON.parse(m.data); } catch (_) { return; }
+    const eventId = (typeof ev.id === 'number') ? ev.id : ev.event_id;
+    if (typeof eventId === 'number' && eventId > lastEventId) lastEventId = eventId;
+    appendChronologyEvent({
+      event_id:   eventId,
+      ts:         ev.ts,
+      event_type: ev.type || ev.event_type,
+      payload:    ev.payload || '',
+    });
+  });
+  es.addEventListener('error', () => setLiveStatus('reconnecting…'));
+  es.addEventListener('open',  () => setLiveStatus('live ●'));
+}
+function closeLiveFeed() {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  setLiveStatus('');
+}
+function setLiveStatus(s) { document.getElementById('live-status').textContent = s; }
+function appendChronologyEvent(ev) {
+  const eventsBlock = document.querySelector('#task-detail .events');
+  if (!eventsBlock) { if (selectedTaskId) loadDetail(selectedTaskId); return; }
+  const div = document.createElement('div');
+  div.className = 'event ' + eventClass(ev.event_type) + ' live';
+  const ts = document.createElement('span'); ts.className = 'type'; ts.textContent = ev.event_type;
+  const pl = document.createElement('span'); pl.className = 'payload'; pl.textContent = ev.payload || '';
+  div.appendChild(ts); div.appendChild(pl);
+  eventsBlock.appendChild(div);
+  eventsBlock.scrollTop = eventsBlock.scrollHeight;
+  const h3 = eventsBlock.querySelector('h3');
+  if (h3) {
+    const m = h3.textContent.match(/\((\d+)\)/);
+    const next = m ? (parseInt(m[1], 10) + 1) : eventsBlock.querySelectorAll('.event').length;
+    h3.textContent = h3.textContent.replace(/\(\d+\)/, '(' + next + ')');
+  }
 }
 
-$refresh.addEventListener('click', () => {
-  loadTasks();
-  if (selectedTaskId) loadDetail(selectedTaskId);
-});
-$live.addEventListener('change', () => {
-  if (!selectedTaskId) return;
-  if ($live.checked) openLiveFeed(selectedTaskId);
-  else closeLiveFeed();
-});
-$filter.addEventListener('change', loadTasks);
-$auto.addEventListener('change', () => {
-  if ($auto.checked) {
-    autoTimer = setInterval(() => {
-      loadTasks();
-      if (selectedTaskId) loadDetail(selectedTaskId);
-    }, 5000);
-  } else if (autoTimer) {
-    clearInterval(autoTimer);
-    autoTimer = null;
-  }
-});
-
-// Retention dry-run — operator planning surface for the
-// chronicle-retention max-age policy. Wired to the
-// /v1/tasks/compact_events endpoint; the bridge hard-codes
-// mode=dry-run there, so this widget cannot delete anything
-// regardless of what an operator types.
-const $rDays   = document.getElementById('retention-days');
-const $rRun    = document.getElementById('retention-run');
-const $rStatus = document.getElementById('retention-status');
-const $rResult = document.getElementById('retention-result');
-$rRun.addEventListener('click', async () => {
-  const days = parseInt($rDays.value, 10);
+/* ── Retention dry-run modal ──────────────────────────────── */
+async function runRetention() {
+  const $days = document.getElementById('retention-days');
+  const $status = document.getElementById('retention-status');
+  const $result = document.getElementById('retention-result');
+  const days = parseInt($days.value, 10);
   if (!Number.isInteger(days) || days < 1) {
-    $rStatus.textContent = 'enter a positive integer';
+    $status.textContent = 'enter a positive integer';
     return;
   }
-  $rStatus.textContent = 'querying…';
-  $rResult.hidden = true;
+  $status.textContent = 'querying…';
+  $result.hidden = true;
   try {
     const secs = days * 86400;
     const r = await fetch('/v1/tasks/compact_events?max_age_secs=' + secs);
@@ -532,31 +1094,26 @@ $rRun.addEventListener('click', async () => {
       throw new Error('HTTP ' + r.status + ': ' + body);
     }
     const j = await r.json();
-    // Summary line plus pretty-printed JSON. Operators
-    // skim the headline; the full JSON is the audit trail.
-    const summary =
-      j.candidate_events + ' candidate event(s) across ' +
-      j.candidate_tasks + ' task(s) older than ' + days + ' day(s)';
-    $rStatus.textContent = summary;
-    $rResult.textContent = JSON.stringify(j, null, 2);
-    $rResult.hidden = false;
+    $status.textContent = j.candidate_events + ' candidate event(s) across ' + j.candidate_tasks + ' task(s)';
+    $result.textContent = JSON.stringify(j, null, 2);
+    $result.hidden = false;
   } catch (e) {
-    $rStatus.textContent = 'failed: ' + String(e);
+    $status.textContent = 'failed: ' + String(e);
   }
-});
+}
 
-// Topology widget — peer freshness table. Reads
-// /v1/topology, renders a small table with one row per
-// cached peer + a fresh/stale/expired badge. Auto-loads
-// the first time the operator expands the widget.
-const $topoWidget  = document.getElementById('topology-widget');
-const $topoRefresh = document.getElementById('topology-refresh');
-const $topoStatus  = document.getElementById('topology-status');
-const $topoHost    = document.getElementById('topology-table-host');
-let topologyLoaded = false;
-
+/* ── Topology page ────────────────────────────────────────── */
+function initTopology() {
+  document.getElementById('topology-refresh').addEventListener('click', loadTopology);
+}
+let topologyEverLoaded = false;
+function enterTopology() {
+  if (!topologyEverLoaded) loadTopology();
+}
 async function loadTopology() {
-  $topoStatus.textContent = 'querying…';
+  const $status = document.getElementById('topology-status');
+  const $host = document.getElementById('topology-table-host');
+  $status.textContent = 'querying…';
   try {
     const r = await fetch('/v1/topology');
     if (!r.ok) {
@@ -564,59 +1121,42 @@ async function loadTopology() {
       throw new Error('HTTP ' + r.status + ': ' + body);
     }
     const j = await r.json();
-    renderTopology(j);
-    topologyLoaded = true;
+    topologyEverLoaded = true;
+    const peers = j.peers || [];
+    if (!peers.length) {
+      $status.textContent = '';
+      $host.innerHTML = '<div class="empty">(no peers discovered)</div>';
+      return;
+    }
+    const rows = peers.map(p => {
+      const alias = p.alias || '(none)';
+      const fresh = p.freshness || 'unknown';
+      const secs = (typeof p.last_refreshed_secs_ago === 'number')
+        ? (p.last_refreshed_secs_ago + 's ago') : '?';
+      return '<tr>'
+        + '<td>' + escapeHtml(alias) + '</td>'
+        + '<td>' + escapeHtml(p.node_type || '') + '</td>'
+        + '<td>' + escapeHtml(p.node_name || '') + '</td>'
+        + '<td>' + (p.capability_count || 0) + '</td>'
+        + '<td>' + escapeHtml(secs) + '</td>'
+        + '<td><span class="badge ' + escapeHtml(fresh) + '">' + escapeHtml(fresh) + '</span></td>'
+        + '<td class="id">' + escapeHtml(shortenId(p.node_id || '')) + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML =
+      '<table class="data">'
+      + '<thead><tr><th>alias</th><th>type</th><th>node_name</th>'
+      + '<th>caps</th><th>last refr</th><th>freshness</th><th>node_id</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table>';
+    $status.textContent = 'generated_at=' + (j.generated_at || '?') + '  peers=' + peers.length;
   } catch (e) {
-    $topoStatus.textContent = 'failed: ' + String(e);
-    $topoHost.innerHTML = '';
+    $status.textContent = 'failed: ' + String(e);
+    $host.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
 }
 
-function renderTopology(t) {
-  const peers = t.peers || [];
-  if (!peers.length) {
-    $topoStatus.textContent = '';
-    $topoHost.innerHTML = '<div class="empty">(no peers discovered)</div>';
-    return;
-  }
-  const rows = peers.map(p => {
-    const alias    = p.alias || '(none)';
-    const fresh    = p.freshness || 'unknown';
-    const secs     = (typeof p.last_refreshed_secs_ago === 'number')
-      ? (p.last_refreshed_secs_ago + 's ago') : '?';
-    const shortId  = (p.node_id || '').length > 16
-      ? (p.node_id.slice(0, 8) + '…' + p.node_id.slice(-4))
-      : (p.node_id || '');
-    return '<tr>'
-      + '<td>' + escapeHtml(alias) + '</td>'
-      + '<td>' + escapeHtml(p.node_type || '') + '</td>'
-      + '<td>' + escapeHtml(p.node_name || '') + '</td>'
-      + '<td>' + (p.capability_count || 0) + '</td>'
-      + '<td>' + escapeHtml(secs) + '</td>'
-      + '<td><span class="freshness-badge freshness-' + escapeHtml(fresh) + '">'
-      + escapeHtml(fresh) + '</span></td>'
-      + '<td class="id">' + escapeHtml(shortId) + '</td>'
-      + '</tr>';
-  }).join('');
-  $topoHost.innerHTML =
-    '<table class="topology-table">'
-    + '<thead><tr><th>alias</th><th>type</th><th>node_name</th>'
-    + '<th>caps</th><th>last refr</th><th>freshness</th><th>node_id</th>'
-    + '</tr></thead>'
-    + '<tbody>' + rows + '</tbody>'
-    + '</table>';
-  $topoStatus.textContent = 'generated_at=' + (t.generated_at || '?')
-    + '  peers=' + peers.length;
-}
-
-$topoRefresh.addEventListener('click', loadTopology);
-// Lazy first-load: when the operator first opens the
-// <details>, fetch — but don't fetch on every toggle.
-$topoWidget.addEventListener('toggle', () => {
-  if ($topoWidget.open && !topologyLoaded) loadTopology();
-});
-
-loadTasks();
+/* ── Boot ─────────────────────────────────────────────────── */
+showRoute(parseRoute());
 </script>
 </body>
 </html>
