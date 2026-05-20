@@ -549,11 +549,17 @@ pub struct PutTelegramReq {
     /// on disk; never echoed back via any HTTP response or
     /// log line.
     pub bot_token: String,
-    /// `polling` or `webhook`. `webhook` is in the schema but
-    /// the live HTTPS client doesn't ship yet — submitting
-    /// `webhook` returns 422 until it lands.
+    /// `polling` or `webhook`. Webhook mode is persisted +
+    /// the URL is stored — but the live HTTPS client wiring
+    /// is pending, so the channel controller will still
+    /// fall back to polling until that ships. The response
+    /// `note` says so honestly.
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// Webhook URL; required when mode=webhook. URL is not
+    /// a secret (not redacted in responses).
+    #[serde(default)]
+    pub webhook_url: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -564,6 +570,12 @@ fn default_mode() -> String {
 pub struct PutTelegramResp {
     pub status: TelegramStatus,
     pub restart_required: bool,
+    /// Honest pending-implementation note when relevant
+    /// (e.g. webhook mode persisted but live client not
+    /// wired). None when everything's immediately
+    /// actionable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Result of a `POST /v1/config/telegram/test`. Same shape
@@ -715,8 +727,10 @@ fn scrub_telegram_url(s: &str) -> String {
 }
 
 /// `PUT /v1/config/telegram` — set the bot token + delivery
-/// mode. Idempotent. Returns 422 when `mode` is unknown or
-/// when it's `webhook` (not yet implemented).
+/// mode. Idempotent. Persists webhook mode + URL when
+/// supplied, but the live HTTPS client wiring is pending —
+/// the response `note` field surfaces this honestly so
+/// operators don't expect immediate webhook activation.
 pub async fn put_telegram(
     State(state): State<AppState>,
     Json(req): Json<PutTelegramReq>,
@@ -731,13 +745,31 @@ pub async fn put_telegram(
             ALLOWED_TELEGRAM_MODES.join(", ")
         )));
     }
+    // Webhook URL validation when in webhook mode.
     if req.mode == "webhook" {
-        return Err(unprocessable(
-            "webhook mode not yet implemented; use polling",
-        ));
+        let url = req.webhook_url.as_deref().unwrap_or("");
+        if url.trim().is_empty() {
+            return Err(bad_request(
+                "webhook_url required when mode='webhook' (https:// URL)",
+            ));
+        }
+        if !url.starts_with("https://") {
+            return Err(unprocessable(
+                "webhook_url must be https:// (Telegram Bot API requires HTTPS)",
+            ));
+        }
     }
+    let mode_for_log = req.mode.clone();
+    let url_for_persist = if req.mode == "webhook" {
+        req.webhook_url.clone()
+    } else {
+        // Drop any stale URL when switching to polling so
+        // operators don't see a misleading URL on the
+        // polling card.
+        None
+    };
     let result = state.secrets.mutate(|s| {
-        s.set_telegram(req.bot_token.clone(), req.mode.clone());
+        s.set_telegram(req.bot_token.clone(), req.mode.clone(), url_for_persist);
         s.telegram_status()
     });
     match result {
@@ -745,11 +777,23 @@ pub async fn put_telegram(
             tracing::info!(
                 mode = %status.mode,
                 token_preview = %status.token_preview.as_deref().unwrap_or(""),
+                webhook_url_set = status.webhook_url.is_some(),
                 "config: telegram updated"
             );
+            let note = if mode_for_log == "webhook" {
+                Some(
+                    "webhook mode persisted; live HTTPS client wiring is pending. \
+                     The channel controller will continue using polling until \
+                     the live webhook receiver ships."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
             Ok(Json(PutTelegramResp {
                 status,
                 restart_required: true,
+                note,
             }))
         }
         Err(e) => Err(internal(format!("persist failed: {e}"))),
@@ -877,7 +921,7 @@ mod tests {
     #[test]
     fn telegram_response_serialisation_never_includes_raw_token() {
         let mut s = BridgeSecrets::default();
-        s.set_telegram("1234:ABCDEF-NEVERLEAK-7890".into(), "polling".into());
+        s.set_telegram("1234:ABCDEF-NEVERLEAK-7890".into(), "polling".into(), None);
         let resp = s.telegram_status();
         let json = serde_json::to_string(&resp).unwrap();
         assert!(

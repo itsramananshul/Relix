@@ -78,12 +78,25 @@ mod tests {
         assert!(body.contains("<title>Relix"));
         // Calls the JSON endpoints described in task-api.md.
         assert!(body.contains("/v1/tasks"));
-        // No external script src — page is self-contained, and
-        // the CSP we set would block one anyway.
-        assert!(
-            !body.contains("https://"),
-            "dashboard pulled in external resource"
-        );
+        // No external script/style src — page is self-contained,
+        // and the CSP we set would block one anyway. We check the
+        // load-attribute forms specifically so that legitimate
+        // `https://` literals in user-facing copy (e.g. webhook
+        // URL placeholders, help text explaining a required
+        // scheme) don't trip the guard.
+        for needle in [
+            r#"src="https://"#,
+            r#"src='https://"#,
+            r#"href="https://"#,
+            r#"href='https://"#,
+            r#"@import"#,
+            "url(https://",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "dashboard pulled in external resource via `{needle}`"
+            );
+        }
     }
 
     #[tokio::test]
@@ -189,6 +202,29 @@ mod tests {
         assert!(
             body.contains(r#"id="tg-token""#),
             "telegram bot token input missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_telegram_webhook_landmarks_present() {
+        // M45 (Track C): webhook URL row + input ship so
+        // operators can pre-configure the URL even while the
+        // live HTTPS receiver wiring is pending. UI must reveal
+        // the row only when mode=webhook.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="tg-webhook-url""#),
+            "telegram webhook URL input missing"
+        );
+        assert!(
+            body.contains(r#"id="tg-webhook-row""#),
+            "telegram webhook URL row landmark missing"
+        );
+        assert!(
+            body.contains("updateTelegramModeUi"),
+            "mode-change handler that toggles webhook row missing"
         );
     }
 

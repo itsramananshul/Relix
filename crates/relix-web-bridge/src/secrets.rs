@@ -83,9 +83,18 @@ fn default_true() -> bool {
 pub struct TelegramEntry {
     pub bot_token: String,
     /// `polling` or `webhook`. Only `polling` is functional
-    /// today.
+    /// today; `webhook` persists the URL for future
+    /// implementation but the live HTTPS client isn't
+    /// wired yet (the channel controller falls back to
+    /// polling).
     #[serde(default = "default_telegram_mode")]
     pub mode: String,
+    /// Operator-supplied webhook URL. Required when
+    /// `mode = "webhook"`; ignored when `mode = "polling"`.
+    /// Not a secret — operators can see + edit it via the
+    /// dashboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
     pub set_at: i64,
 }
 
@@ -130,6 +139,10 @@ pub struct TelegramStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_preview: Option<String>,
     pub mode: String,
+    /// Persisted webhook URL when mode=webhook. Not a
+    /// secret; operators see the URL directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_set_at: Option<i64>,
 }
@@ -273,12 +286,14 @@ impl BridgeSecrets {
                 configured: !t.bot_token.is_empty(),
                 token_preview: redact(&t.bot_token),
                 mode: t.mode.clone(),
+                webhook_url: t.webhook_url.clone(),
                 token_set_at: Some(t.set_at),
             },
             None => TelegramStatus {
                 configured: false,
                 token_preview: None,
                 mode: "polling".to_string(),
+                webhook_url: None,
                 token_set_at: None,
             },
         }
@@ -311,12 +326,15 @@ impl BridgeSecrets {
     /// Insert or replace the Telegram entry. Caller is
     /// responsible for validating `mode` against
     /// [`ALLOWED_TELEGRAM_MODES`] + rejecting empty
-    /// `bot_token` + rejecting `webhook` until the live
-    /// client lands.
-    pub fn set_telegram(&mut self, bot_token: String, mode: String) {
+    /// `bot_token`. Webhook mode is now persisted (URL
+    /// included) — the channel controller will still fall
+    /// back to polling until the live HTTPS client wiring
+    /// lands; the dashboard surfaces this honestly.
+    pub fn set_telegram(&mut self, bot_token: String, mode: String, webhook_url: Option<String>) {
         self.telegram = Some(TelegramEntry {
             bot_token,
             mode,
+            webhook_url,
             set_at: unix_secs(),
         });
     }
@@ -485,7 +503,7 @@ mod tests {
     #[test]
     fn telegram_status_configured_reports_redacted_token() {
         let mut s = BridgeSecrets::default();
-        s.set_telegram("1234567:ABCDEFghijklmnop".into(), "polling".into());
+        s.set_telegram("1234567:ABCDEFghijklmnop".into(), "polling".into(), None);
         let t = s.telegram_status();
         assert!(t.configured);
         assert_eq!(t.token_preview.as_deref(), Some("…mnop"));
@@ -493,6 +511,33 @@ mod tests {
         assert!(
             !json.contains("1234567:ABCDEFghijklmnop"),
             "raw token leaked into TelegramStatus JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn telegram_status_round_trips_webhook_url() {
+        let mut s = BridgeSecrets::default();
+        s.set_telegram(
+            "1234:abcdef".into(),
+            "webhook".into(),
+            Some("https://relix.example.com/tg-hook".into()),
+        );
+        let t = s.telegram_status();
+        assert_eq!(t.mode, "webhook");
+        assert_eq!(
+            t.webhook_url.as_deref(),
+            Some("https://relix.example.com/tg-hook")
+        );
+        // Round-trip through disk + reload.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bridge-secrets.toml");
+        s.save(&path).unwrap();
+        let r = BridgeSecrets::load_or_empty(&path);
+        let t2 = r.telegram_status();
+        assert_eq!(t2.mode, "webhook");
+        assert_eq!(
+            t2.webhook_url.as_deref(),
+            Some("https://relix.example.com/tg-hook")
         );
     }
 
@@ -560,7 +605,7 @@ mod tests {
         let path = tmp.path().join("bridge-secrets.toml");
         let mut s = BridgeSecrets::default();
         s.set_provider("openai", "sk-xyz".into(), Some("gpt-4o".into()));
-        s.set_telegram("1234:abcdef".into(), "polling".into());
+        s.set_telegram("1234:abcdef".into(), "polling".into(), None);
         s.save(&path).unwrap();
         let r = BridgeSecrets::load_or_empty(&path);
         assert_eq!(r.providers.get("openai").unwrap().api_key, "sk-xyz");

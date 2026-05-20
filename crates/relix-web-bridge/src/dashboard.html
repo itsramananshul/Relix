@@ -1873,13 +1873,24 @@
             <div class="field">
               <select id="tg-mode">
                 <option value="polling">polling</option>
-                <option value="webhook">webhook (not yet implemented)</option>
+                <option value="webhook">webhook</option>
               </select>
               <p class="field-help">
                 Polling: the channel long-polls Telegram's
-                <code>getUpdates</code> endpoint. Webhook mode is in
-                the schema but the live HTTPS client is pending —
-                submitting it returns 422 until it lands.
+                <code>getUpdates</code> endpoint (shipped).<br>
+                Webhook: persists URL + mode, but the live
+                HTTPS receiver isn't wired yet — the channel
+                will fall back to polling until that ships.
+              </p>
+            </div>
+          </div>
+          <div class="form-row" id="tg-webhook-row" style="grid-template-columns: 140px 1fr; display: none;">
+            <label>Webhook URL</label>
+            <div class="field">
+              <input type="text" id="tg-webhook-url" placeholder="https://example.com/relix/tg-hook">
+              <p class="field-help">
+                Required when mode=webhook. Must be https://.
+                Telegram POSTs updates to this URL.
               </p>
             </div>
           </div>
@@ -4695,6 +4706,14 @@ function initTelegram() {
   });
   document.getElementById('tg-save').addEventListener('click', saveTelegram);
   document.getElementById('tg-test').addEventListener('click', testTelegram);
+  // Show/hide webhook URL row based on mode selection.
+  document.getElementById('tg-mode').addEventListener('change', updateTelegramModeUi);
+}
+
+function updateTelegramModeUi() {
+  const mode = document.getElementById('tg-mode').value;
+  const $row = document.getElementById('tg-webhook-row');
+  $row.style.display = mode === 'webhook' ? 'grid' : 'none';
 }
 
 async function testTelegram() {
@@ -4740,16 +4759,29 @@ function renderTelegramStatus(t) {
   const $meta = document.getElementById('telegram-meta');
   const $mode = document.getElementById('tg-mode');
   if (t.configured) {
-    $badge.innerHTML = '<span class="badge ok">configured</span>';
-    $meta.innerHTML = 'token <span class="key-preview">'
+    let badgeHtml = '<span class="badge ok">configured</span>';
+    if (t.mode === 'webhook') {
+      badgeHtml += ' <span class="badge warn">webhook pending</span>';
+    }
+    $badge.innerHTML = badgeHtml;
+    let metaHtml = 'token <span class="key-preview">'
       + escapeHtml(t.token_preview || '') + '</span>'
       + ' &middot; set_at <span>' + (t.token_set_at || 0) + '</span>'
       + ' &middot; mode <span>' + escapeHtml(t.mode || '') + '</span>';
+    if (t.mode === 'webhook' && t.webhook_url) {
+      metaHtml += ' &middot; url <span class="id">'
+        + escapeHtml(t.webhook_url) + '</span>';
+    }
+    $meta.innerHTML = metaHtml;
   } else {
     $badge.innerHTML = '<span class="badge muted">not set</span>';
     $meta.innerHTML = '';
   }
   if (t.mode) $mode.value = t.mode;
+  if (t.webhook_url) {
+    document.getElementById('tg-webhook-url').value = t.webhook_url;
+  }
+  updateTelegramModeUi();
   // Update token input placeholder so operators understand it
   // overwrites in place.
   const $input = document.getElementById('tg-token');
@@ -4801,18 +4833,34 @@ async function saveTelegram() {
   const $input = document.getElementById('tg-token');
   const $status = document.getElementById('tg-status');
   const $mode = document.getElementById('tg-mode');
+  const $url = document.getElementById('tg-webhook-url');
   const token = $input.value;
   const mode = $mode.value;
   if (!token.trim()) { setProviderStatus($status, 'enter a token first', 'error'); return; }
+  const webhookUrl = mode === 'webhook' ? $url.value.trim() : '';
+  if (mode === 'webhook' && !webhookUrl) {
+    setProviderStatus($status, 'webhook URL required for webhook mode', 'error');
+    return;
+  }
   setProviderStatus($status, 'saving…');
   try {
     const r = await fetch('/v1/config/telegram', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bot_token: token, mode }),
+      body: JSON.stringify({
+        bot_token: token,
+        mode,
+        webhook_url: webhookUrl || null,
+      }),
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    // Honest note from the bridge (e.g. webhook persisted
+    // but live wiring pending) → toast as warn so operators
+    // see it.
+    if (body.note) {
+      toast(body.note, 'warn');
+    }
     setProviderStatus($status, 'saved · restart channel controller to apply', 'ok');
     $input.value = '';
     $input.type = 'password';
