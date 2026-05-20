@@ -2284,9 +2284,8 @@ function renderProviders(providers) {
 
 function renderProviderCard(p) {
   const meta = PROVIDER_LABELS[p.name] || { label: p.name, hint: '' };
-  const badge = p.configured
-    ? '<span class="badge ok">configured</span>'
-    : '<span class="badge muted">not set</span>';
+  const badge = (p.configured ? '<span class="badge ok">configured</span> ' : '<span class="badge muted">not set</span> ')
+    + (p.is_default ? '<span class="badge info">default</span>' : '');
   const previewBlock = p.configured
     ? '<div class="provider-meta">key <span class="key-preview">'
       + escapeHtml(p.key_preview || '') + '</span>'
@@ -2330,6 +2329,9 @@ function renderProviderCard(p) {
     +   '<button class="btn-primary" data-action="save" data-name="' + escapeHtml(p.name) + '">Save</button>'
     +   (p.configured
         ? '<button data-action="test" data-name="' + escapeHtml(p.name) + '">Test connection</button>'
+        : '')
+    +   (p.configured && !p.is_default
+        ? '<button data-action="make-default" data-name="' + escapeHtml(p.name) + '">Make default</button>'
         : '')
     +   deleteBtn
     +   '<span class="action-status" data-role="status"></span>'
@@ -2405,6 +2407,30 @@ function wireProviderCard(name) {
         setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
       } finally {
         $test.disabled = false;
+      }
+    });
+  }
+  const $makeDefault = card.querySelector('[data-action="make-default"]');
+  if ($makeDefault) {
+    $makeDefault.addEventListener('click', async () => {
+      $makeDefault.disabled = true;
+      setProviderStatus($status, 'updating…');
+      try {
+        const r = await fetch('/v1/config/providers/default', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+        toast('Marked ' + name + ' as default · update AI controller config to actually use it', 'ok');
+        // Re-fetch all providers so the badges across all cards
+        // update to reflect the new default.
+        enterProviders();
+      } catch (e) {
+        setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+      } finally {
+        $makeDefault.disabled = false;
       }
     });
   }

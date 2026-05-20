@@ -239,6 +239,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(config_api::test_provider),
         )
         .route(
+            "/v1/config/providers/default",
+            axum::routing::put(config_api::put_default_provider),
+        )
+        .route(
             "/v1/config/telegram",
             get(config_api::get_telegram).put(config_api::put_telegram),
         )

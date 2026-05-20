@@ -432,6 +432,64 @@ pub async fn delete_provider(
     }
 }
 
+// ── Default provider marker ─────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PutDefaultProviderReq {
+    /// One of [`crate::secrets::ALLOWED_PROVIDERS`], or `null`
+    /// to clear the marker.
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DefaultProviderResp {
+    /// `Some(name)` when a default is set, `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Always `true` — the AI controller reads its provider
+    /// config from a separate TOML at startup, so changing the
+    /// dashboard default is a hint, not a runtime switch.
+    /// Operators must update their AI controller config + restart
+    /// for the change to take effect.
+    pub restart_required: bool,
+}
+
+/// `PUT /v1/config/providers/default` — set or clear the
+/// operator-marked default provider. Hint-only metadata; the
+/// AI controller still reads its provider config from its own
+/// TOML. Body: `{ "name": "openai" }` or `{ "name": null }`
+/// to clear.
+pub async fn put_default_provider(
+    State(state): State<AppState>,
+    Json(req): Json<PutDefaultProviderReq>,
+) -> Result<Json<DefaultProviderResp>, (StatusCode, Json<ApiError>)> {
+    if let Some(name) = req.name.as_ref()
+        && !ALLOWED_PROVIDERS.contains(&name.as_str())
+    {
+        return Err(unprocessable(format!(
+            "unknown provider '{name}'. allowed: {}",
+            ALLOWED_PROVIDERS.join(", ")
+        )));
+    }
+    let result = state.secrets.mutate(|s| {
+        s.set_default_provider(req.name.clone());
+        s.default_provider.clone()
+    });
+    match result {
+        Ok(current) => {
+            tracing::info!(
+                default_provider = ?current,
+                "config: default provider updated"
+            );
+            Ok(Json(DefaultProviderResp {
+                default_provider: current,
+                restart_required: true,
+            }))
+        }
+        Err(e) => Err(internal(format!("persist failed: {e}"))),
+    }
+}
+
 // ── Telegram ────────────────────────────────────────────────
 
 /// `GET /v1/config/telegram` — redacted Telegram bot status.

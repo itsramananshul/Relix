@@ -41,6 +41,17 @@ pub struct BridgeSecrets {
     pub providers: BTreeMap<String, ProviderEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram: Option<TelegramEntry>,
+    /// Operator-marked default provider name. Hint only — the
+    /// AI controller still reads its provider config from its
+    /// own TOML, so changing the default here doesn't switch
+    /// the live runtime. The dashboard surfaces it as the
+    /// "default" badge so operators can record their intended
+    /// default without losing it across restarts.
+    ///
+    /// MUST be in [`ALLOWED_PROVIDERS`] when present; the
+    /// config endpoints enforce this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +89,10 @@ fn default_telegram_mode() -> String {
 pub struct ProviderStatus {
     pub name: String,
     pub configured: bool,
+    /// `true` when this provider is the operator-marked
+    /// default. Hint only — see [`BridgeSecrets::default_provider`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// Last 4 chars of the key, prefixed with an ellipsis.
@@ -88,6 +103,10 @@ pub struct ProviderStatus {
     /// when the provider is unconfigured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_set_at: Option<i64>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,10 +194,12 @@ impl BridgeSecrets {
     /// `name` must be in [`ALLOWED_PROVIDERS`]; the caller
     /// validates that before calling.
     pub fn provider_status(&self, name: &str) -> ProviderStatus {
+        let is_default = self.default_provider.as_deref() == Some(name);
         match self.providers.get(name) {
             Some(e) => ProviderStatus {
                 name: name.to_string(),
                 configured: !e.api_key.is_empty(),
+                is_default,
                 default_model: e.default_model.clone(),
                 key_preview: redact(&e.api_key),
                 key_set_at: Some(e.set_at),
@@ -186,11 +207,20 @@ impl BridgeSecrets {
             None => ProviderStatus {
                 name: name.to_string(),
                 configured: false,
+                is_default,
                 default_model: None,
                 key_preview: None,
                 key_set_at: None,
             },
         }
+    }
+
+    /// Set / clear the operator-marked default provider. The
+    /// caller is responsible for validating `name` (when
+    /// `Some(_)`) against [`ALLOWED_PROVIDERS`]; pass `None`
+    /// to clear.
+    pub fn set_default_provider(&mut self, name: Option<String>) {
+        self.default_provider = name;
     }
 
     /// Redacted status for every allowed provider, sorted by
@@ -429,6 +459,22 @@ mod tests {
             !json.contains("1234567:ABCDEFghijklmnop"),
             "raw token leaked into TelegramStatus JSON: {json}"
         );
+    }
+
+    #[test]
+    fn default_provider_marker_round_trips() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        // Initially no default.
+        assert!(s.default_provider.is_none());
+        assert!(!s.provider_status("openai").is_default);
+        // Mark openai as default.
+        s.set_default_provider(Some("openai".into()));
+        assert!(s.provider_status("openai").is_default);
+        assert!(!s.provider_status("anthropic").is_default);
+        // Clearing.
+        s.set_default_provider(None);
+        assert!(!s.provider_status("openai").is_default);
     }
 
     #[test]
