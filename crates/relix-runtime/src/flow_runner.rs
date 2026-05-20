@@ -121,6 +121,12 @@ pub struct FlowRunOptions {
     /// the main M11 speedup; CLI standalone callers leave it `None`.
     #[allow(missing_docs)]
     pub mesh_client: Option<std::sync::Arc<MeshClient>>,
+    /// Optional caller-supplied trace id. When the bridge mints a
+    /// trace_id upfront (so it can stamp the same id on both the
+    /// Coordinator's attempt row and the per-flow event log),
+    /// providing it here keeps the two in sync. `None` means the
+    /// runner generates its own.
+    pub trace_id: Option<TraceId>,
 }
 
 /// What `FlowRunner::run` returns to the caller (and `relix-cli flow-run`
@@ -191,7 +197,10 @@ impl FlowRunner {
         //    client_key; the log records are signed by whoever ran the flow
         //    (alpha-equivalent of "the owning controller" per RELIX-3 §3.2).
         let flow_id = FlowId::new();
-        let trace_id = TraceId::new();
+        // Use the caller's trace_id if one was supplied (C2b.1) so
+        // the per-flow event log and the Coordinator's attempt row
+        // share the same correlation id. Otherwise mint one.
+        let trace_id = opts.trace_id.unwrap_or_else(TraceId::new);
         let signer = SigningKey::from_bytes(&opts.client_key);
         let flow_log_path = resolve_flow_log_path(&opts.data_dir, flow_id);
         let event_log = EventLog::open(&flow_log_path, flow_id, signer.clone())

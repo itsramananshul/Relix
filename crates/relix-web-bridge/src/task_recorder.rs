@@ -87,10 +87,22 @@ impl TaskRecorder {
         }
     }
 
+    /// Mark a Task as `running` and (Coordinator-side) open a new
+    /// attempt row. `trace_id` propagates to the attempt row so the
+    /// per-flow event log and the attempt share a correlation id.
+    /// Empty `trace_id` is accepted (Coordinator just stores NULL).
+    pub async fn start_running(&self, task_id: &str, trace_id: &str) {
+        // task_id|running||||||trace_id (9 slots).
+        let arg = format!("{task_id}|running|||||||{trace_id}");
+        if let Err(e) = self.call("task.update", arg.as_bytes()).await {
+            tracing::warn!(task_id, error = %e, "coordinator task.update (start_running) failed");
+        }
+    }
+
     /// Terminal success update: status=completed + result + flow pointer.
     pub async fn complete(&self, task_id: &str, result: &str, flow_id: &str, flow_log_path: &str) {
-        // task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class
-        let arg = format!("{task_id}|completed|{result}|{flow_id}|{flow_log_path}|||");
+        // task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class|trace_id
+        let arg = format!("{task_id}|completed|{result}|{flow_id}|{flow_log_path}||||");
         if let Err(e) = self.call("task.update", arg.as_bytes()).await {
             tracing::warn!(task_id, error = %e, "coordinator task.update (complete) failed");
         }
@@ -108,9 +120,10 @@ impl TaskRecorder {
         error_cause: &str,
         class: FailureClass,
     ) {
-        // status + error_kind + error_cause + failure_class; no result/flow pointer.
+        // status + error_kind + error_cause + failure_class; trace_id
+        // slot left empty (no new attempt is opened on the fail path).
         let class_str = class.as_str();
-        let arg = format!("{task_id}|failed|||||{error_kind}|{error_cause}|{class_str}");
+        let arg = format!("{task_id}|failed|||||{error_kind}|{error_cause}|{class_str}|");
         if let Err(e) = self.call("task.update", arg.as_bytes()).await {
             tracing::warn!(task_id, error = %e, "coordinator task.update (fail) failed");
         }

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use crate::AppState;
 use crate::task_recorder::{TaskRecorder, make_title};
 use crate::validate::{validate_input, validate_url};
+use relix_core::types::TraceId;
 use relix_runtime::flow_runner::{FlowRunOptions, FlowRunner, FlowRunnerError};
 use relix_runtime::nodes::coordinator::FailureClass;
 
@@ -70,9 +71,16 @@ pub async fn execute_chat_flow(
         &chat_params_json(session_id, message),
     )
     .await;
+    // C2b.1: mint the trace_id upfront so the Coordinator's attempt
+    // row and the per-flow event log share the same correlation id.
+    let trace_id = TraceId::new();
+    let trace_hex = trace_id.to_string();
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
         rec.event(tid, "flow.started", "flows/chat_template.sol")
             .await;
+        // C2a.2: status -> running opens a new attempt row on the
+        // Coordinator. Fail-soft; recorded as WARN on failure.
+        rec.start_running(tid, &trace_hex).await;
     }
 
     let rendered = state
@@ -98,6 +106,7 @@ pub async fn execute_chat_flow(
         deadline_secs: state.cfg.transport.deadline_secs,
         capability_cache: Some(state.manifest_cache.clone()),
         mesh_client: state.mesh_client.clone(),
+        trace_id: Some(trace_id),
     };
 
     finalize_flow_run(
@@ -221,9 +230,12 @@ pub async fn execute_chat_with_tool_flow(
         &chat_with_tool_params_json(session_id, message, url),
     )
     .await;
+    let trace_id = TraceId::new();
+    let trace_hex = trace_id.to_string();
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
         rec.event(tid, "flow.started", "flows/chat_with_tool.sol")
             .await;
+        rec.start_running(tid, &trace_hex).await;
         // Pre-execution capability intent. Useful for operators
         // triaging failures: even if the tool peer rejects the URL,
         // the task chronicle says what was attempted. The payload
@@ -260,6 +272,7 @@ pub async fn execute_chat_with_tool_flow(
         deadline_secs: state.cfg.transport.deadline_secs,
         capability_cache: Some(state.manifest_cache.clone()),
         mesh_client: state.mesh_client.clone(),
+        trace_id: Some(trace_id),
     };
 
     finalize_flow_run(

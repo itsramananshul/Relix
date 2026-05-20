@@ -52,6 +52,7 @@ pub async fn run(
         deadline_secs,
         capability_cache: None,
         mesh_client: None,
+        trace_id: None,
     };
     let result = FlowRunner::new(opts).run().await?;
 

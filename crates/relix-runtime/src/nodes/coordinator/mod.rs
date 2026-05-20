@@ -81,15 +81,17 @@
 //!
 //! | Method | Arg | Returns |
 //! |---|---|---|
-//! | `task.create` | `title\|flow_template\|params_json\|owner_subject_id\|retry_policy\|max_retries\|max_runtime_secs` | `task_id` (32-hex) |
-//! | `task.update` | `task_id\|status\|result\|flow_id\|flow_log_path\|error_kind\|error_cause\|failure_class` | `ok\n` |
-//! | `task.event`  | `task_id\|event_type\|payload` | `event_id` (integer as string) |
-//! | `task.get`    | `task_id` | multi-line `key=value` summary + `events:` JSON array |
-//! | `task.list`   | `` (empty) or `limit` (default 50) | one `task_id\tstatus\ttitle\n` per line |
+//! | `task.create`   | `title\|flow_template\|params_json\|owner_subject_id\|retry_policy\|max_retries\|max_runtime_secs` | `task_id` (32-hex) |
+//! | `task.update`   | `task_id\|status\|result\|flow_id\|flow_log_path\|error_kind\|error_cause\|failure_class\|trace_id` | `ok\n` |
+//! | `task.event`    | `task_id\|event_type\|payload` | `event_id` (integer as string) |
+//! | `task.get`      | `task_id` | multi-line `key=value` summary + `events:` JSON array |
+//! | `task.list`     | `` (empty) or `limit` (default 50) | one `task_id\tstatus\ttitle\n` per line |
+//! | `task.recover`  | (empty) | one `task_id\n` per recovered task, then `recovered=N\n` |
+//! | `task.attempts` | `task_id` | one `attempt_num\tstatus\tstarted_at\tfinished_at\|-\tfailure_class\|-\tflow_id\|-\n` per attempt |
 //!
-//! The C1 trailers (`retry_policy|max_retries|max_runtime_secs` on
-//! `task.create`; `failure_class` on `task.update`) are optional —
-//! older callers that omit them keep working unchanged.
+//! Optional trailers (older callers that omit them keep working
+//! unchanged): `retry_policy|max_retries|max_runtime_secs` on
+//! `task.create`; `failure_class|trace_id` on `task.update`.
 //!
 //! All times are unix seconds. `status` is opaque — common values:
 //! `pending`, `running`, `completed`, `failed`, `abandoned`. The
@@ -1031,10 +1033,12 @@ fn handle_update(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(s) => s,
         Err(e) => return invalid(format!("task.update utf8: {e}")),
     };
-    // `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class`.
-    // failure_class is an optional 8th field; older callers that omit it
-    // keep working unchanged.
-    let parts: Vec<&str> = s.splitn(8, '|').collect();
+    // `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class|trace_id`.
+    // The two trailers (failure_class, trace_id) are optional; older
+    // callers that omit one or both keep working unchanged. trace_id
+    // is only honored when the call opens a new attempt (status =
+    // running, no open attempt); ignored otherwise.
+    let parts: Vec<&str> = s.splitn(9, '|').collect();
     let get = |i: usize| -> Option<&str> { parts.get(i).copied().filter(|v| !v.is_empty()) };
     let Some(task_id) = get(0) else {
         return invalid("task.update: task_id required".to_string());
@@ -1046,12 +1050,20 @@ fn handle_update(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let error_kind = get(5).and_then(|v| v.parse::<i64>().ok());
     let error_cause = get(6);
     let failure_class_str = get(7);
+    let trace_id_str = get(8);
     if let Some(fc) = failure_class_str
         && FailureClass::parse(fc).is_none()
     {
         return invalid(format!("task.update: bad failure_class: {fc}"));
     }
-    match store.update(
+    if let Some(t) = trace_id_str
+        && (t.len() != 32 || !t.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        return invalid(format!(
+            "task.update: bad trace_id (want 32 hex chars): {t}"
+        ));
+    }
+    match store.update_with_trace(
         task_id,
         status,
         result,
@@ -1060,6 +1072,7 @@ fn handle_update(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         error_kind,
         error_cause,
         failure_class_str,
+        trace_id_str,
     ) {
         Ok(()) => HandlerOutcome::Ok(b"ok\n".to_vec()),
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.update: not found: {id}")),
@@ -2142,5 +2155,44 @@ mod tests {
             "scan must use current attempt's deadline, not task.started_at"
         );
         assert_eq!(s.get(&tid).unwrap().unwrap().status, "running");
+    }
+
+    #[test]
+    fn update_with_trace_persists_trace_id_on_open_attempt() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let trace_hex = "00112233445566778899aabbccddeeff";
+        s.update_with_trace(
+            &tid,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(trace_hex),
+        )
+        .unwrap();
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].trace_id.as_deref(), Some(trace_hex));
+        // Re-asserted running with a different trace_id leaves the
+        // first attempt's trace_id untouched (no new attempt opened).
+        s.update_with_trace(
+            &tid,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("ffffffffffffffffffffffffffffffff"),
+        )
+        .unwrap();
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].trace_id.as_deref(), Some(trace_hex));
     }
 }

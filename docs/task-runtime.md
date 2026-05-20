@@ -121,25 +121,46 @@ relix-cli task create \
 
 ### `task.update`
 
-Request: `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class`
+Request: `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class|trace_id`
 
 Any field may be empty — the Coordinator preserves the existing column
 value for empty fields. Non-empty `error_kind` must parse as an
 integer. Non-empty `failure_class` must be one of `transient` /
 `permanent` / `policy_denied` / `invalid_args` / `timeout` /
-`unavailable`; the Coordinator rejects unknown values with
-`INVALID_ARGS`.
+`unavailable`. Non-empty `trace_id` must be 32 hex chars; otherwise
+rejected with `INVALID_ARGS`.
 
 Side effects:
 
-- Transitioning to `running` stamps `started_at` (one-shot via
-  `COALESCE` — subsequent `running` writes don't clobber the original).
-- Setting `error_cause` also mirrors it to `last_failure_reason` so the
-  cause survives a later `retrying` transition that clears
+- `status -> running` with no open attempt opens a new attempt row,
+  stamps its `started_at`, persists `trace_id` (if supplied), and
+  emits `task.attempt_started`. Also stamps the task-level
+  `started_at` on the first-ever `running` transition (one-shot via
+  COALESCE; preserves the "first started" timestamp).
+- `status -> running` while an attempt is already open is a no-op at
+  the attempt level — `trace_id` is NOT clobbered.
+- `status -> completed | failed | cancelled` closes the open attempt
+  with the supplied outcome columns (flow_id, flow_log_path,
+  error_*, failure_class) and emits `task.attempt_finished`. No-ops
+  cleanly when no attempt is open (preserves the pre-C2a pending →
+  completed shortcut).
+- Setting `error_cause` also mirrors it to `last_failure_reason` so
+  the cause survives a later `retrying` transition that clears
   `error_cause` itself.
 
 Response: `ok\n` on success; `INVALID_ARGS` with cause
 `task.update: not found: <id>` when the task id is unknown.
+
+### `task.attempts`
+
+Request: `task_id`
+
+Response: one tab-delimited line per attempt, in chronological order:
+`<attempt_num>\t<status>\t<started_at>\t<finished_at|->\t<failure_class|->\t<flow_id|->\n`
+
+Empty body when the task has no attempts yet (created but never
+transitioned to `running`). The Coordinator's `task.update` opens /
+closes attempts implicitly; `task.attempts` is the read-only view.
 
 ### `task.recover`
 
