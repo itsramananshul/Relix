@@ -104,6 +104,20 @@ pub enum Cmd {
         #[arg(long)]
         client_key: PathBuf,
     },
+    /// List every attempt of a task, oldest first. One line per
+    /// attempt with status, duration, failure class (if any), and
+    /// flow_id pointer for cross-referencing into per-flow event
+    /// logs on disk.
+    Attempts {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
+        #[arg(long)]
+        task_id: String,
+    },
     /// Append a free-form event to a Task's history.
     Event {
         #[arg(long)]
@@ -253,10 +267,65 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             let s = std::str::from_utf8(&body).unwrap_or("<binary>");
             if pretty {
-                print!("{}", render_pretty_task(s));
+                // Pretty mode also fetches the attempts table so the
+                // chronology can show per-attempt boundaries. Fail
+                // gracefully if `task.attempts` is unreachable
+                // (older Coordinator, policy denial) — render just
+                // the task body in that case.
+                let attempts_body = match call(
+                    &peer,
+                    &identity,
+                    &client_key,
+                    "task.attempts",
+                    task_id.as_bytes(),
+                )
+                .await
+                {
+                    Ok(b) => Some(String::from_utf8_lossy(&b).into_owned()),
+                    Err(_) => None,
+                };
+                print!(
+                    "{}",
+                    render_pretty_task_with_attempts(s, attempts_body.as_deref())
+                );
             } else {
                 // Default: raw key=value, grep-friendly.
                 print!("{s}");
+            }
+        }
+        Cmd::Attempts {
+            peer,
+            identity,
+            client_key,
+            task_id,
+        } => {
+            let body = call(
+                &peer,
+                &identity,
+                &client_key,
+                "task.attempts",
+                task_id.as_bytes(),
+            )
+            .await?;
+            let s = std::str::from_utf8(&body).unwrap_or("<binary>");
+            let attempts = parse_attempts(s);
+            if attempts.is_empty() {
+                println!("(no attempts — task has not transitioned to running)");
+            } else {
+                println!(
+                    "{:>3}  {:<11}  {:<10}  {:<11}  {:<12}  flow_id",
+                    "#", "status", "started", "duration", "failure"
+                );
+                for a in attempts {
+                    let dur = match a.finished_at {
+                        Some(f) => format!("{}s", f.saturating_sub(a.started_at)),
+                        None => "(open)".to_string(),
+                    };
+                    println!(
+                        "{:>3}  {:<11}  {:<10}  {:<11}  {:<12}  {}",
+                        a.attempt_num, a.status, a.started_at, dur, a.failure_class, a.flow_id,
+                    );
+                }
             }
         }
         Cmd::List {
@@ -304,6 +373,95 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// One row of the `task.attempts` table on the Coordinator. CLI
+/// uses owned strings (lifetime erased) so we can move freely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttemptRow {
+    attempt_num: i64,
+    status: String,
+    started_at: i64,
+    finished_at: Option<i64>,
+    failure_class: String,
+    flow_id: String,
+}
+
+/// Parse the `task.attempts` body — one tab-delimited line per
+/// attempt. Skips malformed lines silently (forward-compatible with
+/// schema growth).
+fn parse_attempts(body: &str) -> Vec<AttemptRow> {
+    body.lines()
+        .filter_map(|line| {
+            if line.is_empty() {
+                return None;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 6 {
+                return None;
+            }
+            Some(AttemptRow {
+                attempt_num: parts[0].parse().ok()?,
+                status: parts[1].to_string(),
+                started_at: parts[2].parse().ok()?,
+                finished_at: if parts[3] == "-" {
+                    None
+                } else {
+                    parts[3].parse().ok()
+                },
+                failure_class: parts[4].to_string(),
+                flow_id: parts[5].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Render the Coordinator's `task.get` body together with an
+/// optional `task.attempts` response. Adds an "attempts:" block
+/// between the header callouts and the chronology when at least one
+/// attempt exists.
+fn render_pretty_task_with_attempts(raw: &str, attempts_body: Option<&str>) -> String {
+    let attempts = attempts_body.map(parse_attempts).unwrap_or_default();
+    let base = render_pretty_task(raw);
+    if attempts.is_empty() {
+        return base;
+    }
+    // Insert the attempts block immediately before the chronology
+    // section so the timeline can reference attempt numbers the
+    // operator already saw above.
+    let marker = "\nchronology:";
+    let block = {
+        let mut s = String::from("\nattempts:\n");
+        for a in &attempts {
+            let dur = match a.finished_at {
+                Some(f) => format!("{}s", f.saturating_sub(a.started_at)),
+                None => "(open)".to_string(),
+            };
+            let suffix = if a.failure_class != "-" {
+                format!(" failure={}", a.failure_class)
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "  #{:<2}  {:<11}  started={}  duration={}{}\n",
+                a.attempt_num, a.status, a.started_at, dur, suffix
+            ));
+        }
+        s
+    };
+    if let Some(pos) = base.find(marker) {
+        let mut out = String::with_capacity(base.len() + block.len());
+        out.push_str(&base[..pos]);
+        out.push_str(&block);
+        out.push_str(&base[pos..]);
+        out
+    } else {
+        // No chronology block (events were empty). Append attempts
+        // at the end.
+        let mut out = base;
+        out.push_str(&block);
+        out
+    }
 }
 
 /// Render the Coordinator's `task.get` body as a human-readable
@@ -720,5 +878,66 @@ mod tests {
         let pretty = render_pretty_task(raw);
         assert!(pretty.contains("[failure: policy_denied]"));
         assert!(pretty.contains("DO NOT re-run"));
+    }
+
+    #[test]
+    fn parse_attempts_empty_or_malformed_yields_nothing() {
+        assert!(parse_attempts("").is_empty());
+        assert!(parse_attempts("not\tenough\tcolumns").is_empty());
+        // Comment-like lines aren't expected but should skip cleanly.
+        assert!(parse_attempts("# header\nshort").is_empty());
+    }
+
+    #[test]
+    fn parse_attempts_one_row_with_open_finish() {
+        let body = "1\trunning\t1700000000\t-\t-\t-\n";
+        let out = parse_attempts(body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].attempt_num, 1);
+        assert_eq!(out[0].status, "running");
+        assert_eq!(out[0].started_at, 1_700_000_000);
+        assert!(out[0].finished_at.is_none());
+    }
+
+    #[test]
+    fn parse_attempts_multiple_rows() {
+        let body = "1\tfailed\t1700000000\t1700000005\ttransient\tflowA\n2\tcompleted\t1700000010\t1700000020\t-\tflowB\n";
+        let out = parse_attempts(body);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].status, "failed");
+        assert_eq!(out[0].finished_at, Some(1_700_000_005));
+        assert_eq!(out[0].failure_class, "transient");
+        assert_eq!(out[1].status, "completed");
+        assert_eq!(out[1].flow_id, "flowB");
+    }
+
+    #[test]
+    fn pretty_with_attempts_inserts_block_before_chronology() {
+        let raw = "task_id=x\nstatus=completed\nevents=[{\"id\":1,\"ts\":1700000000,\"type\":\"flow.started\",\"payload\":\"chat\"}]\n";
+        let attempts = "1\tcompleted\t1700000000\t1700000007\t-\tflowabc\n";
+        let pretty = render_pretty_task_with_attempts(raw, Some(attempts));
+        assert!(pretty.contains("attempts:"));
+        assert!(pretty.contains("#1"));
+        assert!(pretty.contains("duration=7s"));
+        // Attempt block precedes chronology section.
+        let attempts_pos = pretty.find("attempts:").unwrap();
+        let chronology_pos = pretty.find("chronology:").unwrap();
+        assert!(attempts_pos < chronology_pos);
+    }
+
+    #[test]
+    fn pretty_with_no_attempts_is_identity() {
+        let raw = "task_id=x\nstatus=pending\nevents=[]\n";
+        let pretty = render_pretty_task_with_attempts(raw, Some(""));
+        assert!(!pretty.contains("attempts:"));
+    }
+
+    #[test]
+    fn pretty_with_attempts_appends_when_no_chronology() {
+        let raw = "task_id=x\nstatus=running\nevents=[]\n";
+        let attempts = "1\trunning\t1700000000\t-\t-\t-\n";
+        let pretty = render_pretty_task_with_attempts(raw, Some(attempts));
+        assert!(pretty.contains("attempts:"));
+        assert!(pretty.contains("(open)"));
     }
 }
