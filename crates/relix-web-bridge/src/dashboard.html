@@ -816,6 +816,67 @@
       color: var(--text-strong);
     }
 
+    /* ── Failure breakdown panel ───────────────────────────────── */
+    .failure-panel {
+      margin: 0 14px 12px;
+      padding: 10px 12px;
+      border-radius: 4px;
+      border: 1px solid rgba(239,68,68,0.30);
+      background: rgba(239,68,68,0.05);
+      font-size: var(--text-sm);
+    }
+    .failure-panel.transient {
+      border-color: rgba(245,158,11,0.40);
+      background: rgba(245,158,11,0.06);
+    }
+    .failure-panel h4 {
+      margin: 0 0 8px;
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+      color: var(--danger);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .failure-panel.transient h4 { color: var(--warn); }
+    .failure-panel .cause {
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      color: var(--text);
+      background: var(--bg);
+      padding: 6px 8px;
+      border-radius: 3px;
+      border: 1px solid var(--border-soft);
+      margin-bottom: 8px;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .failure-panel .meta-grid {
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      gap: 2px 12px;
+      font-size: var(--text-xs);
+      margin-bottom: 8px;
+    }
+    .failure-panel .meta-grid .k { color: var(--text-muted); }
+    .failure-panel .meta-grid .v {
+      color: var(--text);
+      font-family: var(--font-mono);
+      word-break: break-word;
+    }
+    .failure-panel .suggestion {
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+      border-top: 1px dashed var(--border-soft);
+      padding-top: 6px;
+    }
+    .failure-panel .suggestion strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
     /* ── Topology correlation panel ────────────────────────────── */
     .correlation-panel {
       margin: 0 14px 12px;
@@ -2415,6 +2476,7 @@ function renderDetail(l) {
 
   const chainBlock = renderRetryChain(l.attempts || []);
   const xrefBlock = renderXrefPanel(l);
+  const failureBlock = renderFailurePanel(l);
   // Empty correlation slot — filled async by
   // fetchTopologyCorrelation when the task is failed /
   // interrupted (the visual cue is the slot is hidden
@@ -2423,6 +2485,7 @@ function renderDetail(l) {
   document.getElementById('task-detail').innerHTML =
     `<div class="summary">${summaryRow}</div>`
     + chainBlock
+    + failureBlock
     + corrSlot
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     + eventsBlock
@@ -2504,6 +2567,69 @@ function renderRetryChain(attempts) {
     +   '<span class="total">' + fmtDuration(totalDur) + '</span>'
     +   ' total wall-clock · ' + escapeHtml(outcome)
     + '</div>'
+    + '</div>';
+}
+
+/* Failure breakdown: when a task ends in failed /
+   interrupted / cancelled, surface the latest error
+   class + cause + a class-specific suggestion. The
+   suggestion text mirrors docs/retry-model.md's
+   operator playbook — no invented recovery steps,
+   just the canonical class-specific advice. */
+function renderFailurePanel(l) {
+  const s = l.summary || {};
+  const status = s.status || (l.task && l.task.header && l.task.header.status) || '';
+  if (status !== 'failed' && status !== 'interrupted' && status !== 'cancelled') {
+    return '';
+  }
+  // summary (TaskSummary) carries the operator-friendly
+  // fields; task.header has the raw key=value back-up for
+  // when the summary lacks them.
+  const header = (l.task && l.task.header) || {};
+  const cls = s.last_failure_class || header.last_failure_class || '(unknown)';
+  const reason = s.last_failure_reason || header.last_failure_reason || '';
+  const errorKind = header.error_kind ? Number(header.error_kind) : null;
+  const errorCause = header.error_cause || '';
+
+  // Class-specific operator suggestion. Pulled from
+  // docs/retry-model.md's failure-class playbook.
+  const SUGGESTIONS = {
+    transient:     'Safe to re-run if the flow is idempotent. Use Retry · the runtime did not auto-retry today.',
+    timeout:       'Re-run with a higher max_runtime_secs, or investigate the slow peer via Topology.',
+    unavailable:   'Wait or restart the responding peer. Capability disappeared from the manifest cache.',
+    policy_denied: 'Do NOT re-run as-is. The admission pipeline refused the call. Fix the policy or identity first.',
+    invalid_args:  'Do NOT re-run as-is. Caller-side input was malformed. Fix the caller.',
+    permanent:     'Do NOT re-run. A logic / contract error inside the flow. Investigate via the per-flow event log.',
+  };
+  const isWarn = cls === 'transient' || cls === 'timeout' || cls === 'unavailable';
+  const panelCls = isWarn ? 'failure-panel transient' : 'failure-panel';
+  const heading = status === 'interrupted'
+    ? 'Interrupted'
+    : status === 'cancelled'
+      ? 'Cancelled'
+      : 'Failed';
+
+  const suggestion = SUGGESTIONS[cls];
+  const suggestionHtml = suggestion
+    ? '<div class="suggestion"><strong>Recommended:</strong> ' + escapeHtml(suggestion) + '</div>'
+    : '<div class="suggestion"><strong>Note:</strong> No class-specific guidance for <code>' + escapeHtml(cls) + '</code>; inspect the chronicle + per-flow log.</div>';
+
+  const causeBlock = reason || errorCause
+    ? '<div class="cause">' + escapeHtml(reason || errorCause) + '</div>'
+    : '';
+
+  const metaRows = [];
+  metaRows.push(['failure_class', cls]);
+  if (errorKind != null) metaRows.push(['error_kind', String(errorKind)]);
+  const metaGrid = metaRows
+    .map(([k, v]) => '<div class="k">' + escapeHtml(k) + '</div><div class="v">' + escapeHtml(v) + '</div>')
+    .join('');
+
+  return '<div class="' + panelCls + '">'
+    + '<h4>' + escapeHtml(heading) + ' · <span class="badge ' + escapeHtml(cls) + '">' + escapeHtml(cls) + '</span></h4>'
+    + causeBlock
+    + (metaGrid ? '<div class="meta-grid">' + metaGrid + '</div>' : '')
+    + suggestionHtml
     + '</div>';
 }
 

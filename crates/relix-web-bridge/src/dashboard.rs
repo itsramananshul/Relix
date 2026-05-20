@@ -225,6 +225,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_failure_panel_present() {
+        // M29: failed/interrupted/cancelled tasks show a
+        // failure breakdown panel with class + cause +
+        // class-specific operator suggestion.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderFailurePanel"),
+            "page should ship renderFailurePanel()"
+        );
+        // Every canonical failure class must have a suggestion
+        // string in the mapping. Catches a future class added
+        // without its operator guidance.
+        for class in [
+            "transient",
+            "timeout",
+            "unavailable",
+            "policy_denied",
+            "invalid_args",
+            "permanent",
+        ] {
+            assert!(
+                body.contains(&format!(r#"{class}:"#)),
+                "failure suggestion missing for class {class}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn page_topology_correlation_present() {
         // M28: failed / interrupted tasks surface a
         // "Topology events near this task" correlation
