@@ -13,12 +13,12 @@
 //! - A `MockBotApi` test double + tests for the mapping logic.
 //!
 //! The live HTTPS implementation (`reqwest`-backed `BotApi`) and
-//! the controller binary live behind the credentials blocker
-//! archived at
-//! [`docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`](../../../docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md).
-//! When credentials are available, the implementer adds the
-//! `live` module + a `main.rs` that wires this scaffold to the
-//! existing controller startup path.
+//! the controller binary are not yet wired. To enable Telegram,
+//! the operator supplies a Bot API token via the dashboard's
+//! Telegram settings page (see `docs/dashboard-redesign.md`).
+//! The implementer adds a `live` module + a `main.rs` that
+//! reads that config and wires this scaffold to the existing
+//! controller startup path.
 
 pub mod config;
 pub mod identity;

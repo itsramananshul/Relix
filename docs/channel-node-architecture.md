@@ -38,8 +38,10 @@ This phase ships the **architecture and scaffold**, not a working
 bot. Specifically NOT in scope tonight:
 
 - Sending a token-authenticated message over the actual Telegram
-  Bot API (requires credentials — see
-  `docs/internal/nightly-blockers/`).
+  Bot API. Tokens are configured via the dashboard's Telegram
+  settings page; the live HTTPS client wiring lands once the
+  scaffold's BotApi trait has a `reqwest`-backed impl alongside
+  the existing `MockBotApi`.
 - Long-poll vs webhook delivery model decision (both are valid;
   the architecture supports either).
 - Multi-channel session bridging (one user on Telegram + the same

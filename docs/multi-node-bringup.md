@@ -129,8 +129,10 @@ outside instead of HTTP. Same dial-and-call pattern to the rest
 of the mesh.
 
 Today the channel scaffold is shipped without the live HTTPS
-client; gated on operator-supplied Bot API token (see
-[`docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`](internal/nightly-blockers/20260519-0030-telegram-credentials.md)).
+client. Operators supply the Bot API token via the operator
+dashboard's Telegram settings page; the live client implementation
+lands once a `reqwest`-backed `BotApi` impl is added alongside
+the existing `MockBotApi`.
 
 ## Per-node configuration deltas
 

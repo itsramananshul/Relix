@@ -80,10 +80,9 @@ Verified against every change:
 - `142c45a` **T3** — `docs/channel-node-architecture.md` end-to-end
   design (process boundary, identity model, async outbound,
   configuration shape, trust boundary, code organisation).
-  Blocker archived at
-  `docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`
-  explaining why scaffold-only was rejected as dishonest and what
-  options were considered.
+  Live HTTPS client deferred — historical session notes about the
+  decision were retired with the rest of the
+  `docs/internal/nightly-blockers/` archive.
 
 ### Track 4 — Capability discovery / planner foundations
 
@@ -148,12 +147,14 @@ Verified against every change:
   (C1 + C2)" subsection in docs index pointing at the 5 reference
   docs in reading order.
 
-## Blockers archived
+## Historical note: blocker archival
 
-1. `docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`
-   — Telegram Bot API token required before `relix-telegram`
-   crate can be implemented. Design contract shipped instead.
-   Follow-up prompt suggested.
+This session predates the current convention. The
+`docs/internal/nightly-blockers/` directory has since been
+retired. When something blocks future work, the convention is
+to ask the user directly in-terminal — not to write an archived
+note. This summary file is preserved for historical context but
+the per-blocker writeups it once referenced have been deleted.
 
 ## What I deliberately did NOT do
 
@@ -178,8 +179,6 @@ docs/attempt-lineage.md                                 # C2 reference
 docs/capability-discovery.md                            # T4 planner foundations
 docs/channel-node-architecture.md                       # T3 channel design
 docs/plugin-foundations.md                              # T5 packaging foundations
-docs/internal/nightly-blockers/                         # blocker archive dir
-docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md
 docs/internal/nightly-summary.md                        # this file
 crates/relix-web-bridge/src/tasks.rs                    # /v1/tasks endpoints
 ```
@@ -232,7 +231,8 @@ README.md                                               # task lifecycle docs
 
 End of nightly session. No regressions. All pushes through
 `origin/main`. Session-internal artefacts under `docs/internal/`
-(this file + blockers archive).
+(this file only — the per-blocker archive directory has since
+been retired).
 
 ## Final commit ledger (post-summary)
 

@@ -127,9 +127,11 @@ Workspace tests: **395 passing**, `cargo clippy --workspace
   `MockBotApi`. `SessionStorage` trait with both in-memory and
   `SqliteSessionStore` (restart-safe; idempotent schema
   migration; UNIQUE(chat_id, message_id) + ON CONFLICT
-  REPLACE). Live HTTPS client awaits a Bot API token
-  (archived blocker:
-  [`docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`](internal/nightly-blockers/20260519-0030-telegram-credentials.md)).
+  REPLACE). Live HTTPS client wiring lands once a `reqwest`-
+  backed `BotApi` impl is added alongside the existing
+  `MockBotApi`. Operators configure the Bot API token via the
+  dashboard's Telegram settings page — see
+  [`dashboard-redesign.md`](dashboard-redesign.md).
 
 ### Capability metadata (T4)
 
@@ -193,12 +195,10 @@ later-gate decision, not a current omission.
 
 ## Active blockers
 
-Total: **1** archived blocker, none currently impeding work.
-
-- `docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`
-  — Telegram Bot API token required to ship the live
-  channel. Scaffold (config + identity + types + session +
-  mock client) is complete and tested.
+None. If something blocks future work, the convention is
+to ask the user directly rather than archive a writeup —
+the `docs/internal/nightly-blockers/` directory has been
+retired.
 
 ## Architecture invariants (verified preserved)
 

@@ -209,23 +209,25 @@ post-auth requests on loopback.
 
 Architecture: [`channel-node-architecture.md`](channel-node-architecture.md).
 Scaffold: [`crates/relix-telegram`](../crates/relix-telegram).
-Implementation status: scaffolded; awaiting an operator-provided
-Bot API token to finish the live HTTPS client (blocker:
-[`docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`](internal/nightly-blockers/20260519-0030-telegram-credentials.md)).
+Implementation status: scaffold + `SqliteSessionStore` shipped;
+the live HTTPS client wiring lands once a `reqwest`-backed
+`BotApi` impl is added alongside the existing `MockBotApi`. The
+operator dashboard's Telegram settings page accepts the Bot API
+token without it ever touching git or operator logs.
 
-To enable in production once implemented:
+To enable Telegram:
 
-1. Mint a bot via `@BotFather`, capture the token, store in
-   your secret manager.
-2. Export to the channel's env (e.g.
-   `RELIX_TELEGRAM_BOT_TOKEN=...`).
-3. Add `[telegram]` to the channel controller's TOML per
-   [`crates/relix-telegram/src/config.rs`](../crates/relix-telegram/src/config.rs).
-4. Add `channel-telegram` group to your policy file with the
+1. Mint a bot via `@BotFather` and copy the token.
+2. Open the operator dashboard's **Telegram** page and paste
+   the token. The bridge persists it to a local config file
+   (not committed) and validates presence without echoing the
+   token value. See [`dashboard-redesign.md`](dashboard-redesign.md)
+   for the secret-handling contract.
+3. Add `channel-telegram` group to your policy file with the
    capabilities the channel's flow uses (typically
    `memory.*`, `ai.chat`, the `task.*` subset
    `create/update/event`).
-5. Start the channel controller alongside the others.
+4. Start the channel controller alongside the others.
 
 ## Chronicle retention on long-running deployments
 

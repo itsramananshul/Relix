@@ -150,9 +150,12 @@ README.md                                            # event-vocabulary + audit-
 3. **Read `docs/event-vocabulary.md` before adding any new event
    emitter.** The reserved names are documented; any drift from
    the format contract will be visible at code review.
-4. **Telegram credentials still the blocker** for any further
-   channel work (per
-   `docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`).
+4. **Telegram live HTTPS client wiring is still pending.** The
+   scaffold + `SqliteSessionStore` ship; the `reqwest`-backed
+   `BotApi` impl + controller binary need to be added alongside
+   the existing `MockBotApi`. Operator-supplied Bot API tokens
+   flow through the dashboard's Telegram settings page (see
+   `docs/dashboard-redesign.md`).
 
 ## Cumulative session count
 
