@@ -1219,4 +1219,22 @@ mod tests {
             StatusCode::BAD_GATEWAY,
         );
     }
+
+    #[test]
+    fn compact_query_default_round_trips_absent_param() {
+        // CompactQuery uses #[serde(default)] for max_age_secs
+        // so an absent ?max_age_secs= parses to None — the
+        // handler then returns a clear 400 instead of a 500.
+        // Round-trip via JSON proves the default behaviour
+        // (axum uses serde under the hood for query parsing).
+        let q: CompactQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(q.max_age_secs, None);
+        let q: CompactQuery = serde_json::from_str(r#"{"max_age_secs":2592000}"#).unwrap();
+        assert_eq!(q.max_age_secs, Some(2_592_000));
+        // Negative integers deserialise fine here; the
+        // handler is responsible for rejecting them (and
+        // does — see relix-runtime coordinator tests).
+        let q: CompactQuery = serde_json::from_str(r#"{"max_age_secs":-1}"#).unwrap();
+        assert_eq!(q.max_age_secs, Some(-1));
+    }
 }
