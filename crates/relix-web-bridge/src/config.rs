@@ -196,6 +196,12 @@ pub struct AppState {
     /// reset on bridge restart — see
     /// `crates/relix-web-bridge/src/metrics.rs`.
     pub stream_metrics: std::sync::Arc<crate::metrics::StreamMetrics>,
+    /// Bridge-process-local lifecycle event log (peer joins,
+    /// freshness transitions, drops). A background polling
+    /// task populates it. Exposed via `/v1/topology/events`.
+    /// Ring resets on bridge restart — see
+    /// `crates/relix-web-bridge/src/lifecycle.rs`.
+    pub lifecycle_log: std::sync::Arc<crate::lifecycle::LifecycleLog>,
 }
 
 impl AppState {
@@ -274,6 +280,7 @@ impl AppState {
                 .unwrap_or(0),
             secrets,
             stream_metrics: crate::metrics::StreamMetrics::new(),
+            lifecycle_log: crate::lifecycle::LifecycleLog::new(),
         })
     }
 }

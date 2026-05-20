@@ -40,6 +40,7 @@ mod config;
 mod config_api;
 mod dashboard;
 mod flow;
+mod lifecycle;
 mod metrics;
 mod openai;
 mod secrets;
@@ -68,6 +69,13 @@ struct Args {
 pub enum BridgeError {
     #[error("config: {0}")]
     Config(String),
+}
+
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -168,6 +176,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    // Background lifecycle diff task: every 5s, snapshot the
+    // manifest cache + diff against the previous snapshot to
+    // record join / freshness / drop transitions. Provides the
+    // server-side history operators see at /v1/topology/events.
+    {
+        let cache = state.manifest_cache.clone();
+        let log = state.lifecycle_log.clone();
+        tokio::spawn(async move {
+            // Seed snapshot immediately (no events emitted) so
+            // the next tick can detect real transitions.
+            log.diff_and_record(&cache, unix_secs());
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                log.diff_and_record(&cache, unix_secs());
+            }
+        });
+        tracing::info!(period_secs = 5, "bridge: lifecycle diff task spawned");
+    }
+
     let addr: SocketAddr = state
         .cfg
         .bridge
@@ -218,6 +245,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ManifestCache — no active probing, no orchestration
         // (bridge stays translation/presentation only).
         .route("/v1/topology", get(topology::get))
+        // Server-side history of topology transitions (peer joins,
+        // freshness flips, drops). Populated by the lifecycle diff
+        // task that runs every 5s; in-memory ring; resets on
+        // bridge restart.
+        .route("/v1/topology/events", get(topology::lifecycle_events))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).

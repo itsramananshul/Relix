@@ -21,10 +21,16 @@
 //! `node.manifest`. The bridge stays translation/presentation
 //! only — no new orchestration, no scheduler.
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use serde::Serialize;
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::config::AppState;
+use crate::lifecycle::LifecycleEvent;
 
 /// One row of `/v1/topology` — one cached peer with the
 /// aggregates an operator cares about.
@@ -139,6 +145,45 @@ pub struct ReconnectCounters {
 pub struct StreamCounters {
     pub active: u64,
     pub opened_total: u64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct LifecycleEventsQuery {
+    /// Return only events with `ts > since`. Default 0 reads
+    /// the entire in-memory ring.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Cap on returned events. Defaults to ring capacity.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LifecycleEventsResponse {
+    pub events: Vec<LifecycleEvent>,
+    /// Monotonic sequence cursor — opaque, server-assigned.
+    /// Operators that want incremental polling pass back the
+    /// max `ts` of the returned events on the next request.
+    pub seq: i64,
+    pub generated_at: i64,
+}
+
+/// `GET /v1/topology/events?since=<ts>&limit=<n>` — recent
+/// node lifecycle transitions (joins, freshness changes,
+/// drops). Newest first. In-memory ring; resets on bridge
+/// restart.
+pub async fn lifecycle_events(
+    State(state): State<AppState>,
+    Query(q): Query<LifecycleEventsQuery>,
+) -> Json<LifecycleEventsResponse> {
+    let since = q.since.unwrap_or(0);
+    let limit = q.limit.unwrap_or(500).min(2000);
+    let (events, seq) = state.lifecycle_log.since(since, limit);
+    Json(LifecycleEventsResponse {
+        events,
+        seq,
+        generated_at: unix_secs(),
+    })
 }
 
 /// `GET /v1/health` — bridge + mesh status summary. Distinct
