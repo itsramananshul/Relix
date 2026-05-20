@@ -3,15 +3,21 @@
 //! `execute_chat_flow` is the bridge's single seam to `FlowRunner`. It:
 //!
 //!   1. Validates the input characters (SIMP-018).
-//!   2. Renders the SOL template with the supplied session + message.
-//!   3. Materialises the rendered SOL to a per-request tempfile.
-//!   4. Calls `FlowRunner::run` on the existing libp2p path.
-//!   5. Surfaces a structured outcome so JSON / SSE / OpenAI handlers all
-//!      project the same underlying flow result.
+//!   2. **(B1)** Creates a Task on the Coordinator when one is wired,
+//!      fail-soft. Adds the `flow_selected` event.
+//!   3. Renders the SOL template with the supplied session + message.
+//!   4. Materialises the rendered SOL to a per-request tempfile.
+//!   5. Calls `FlowRunner::run` on the existing libp2p path.
+//!   6. **(B1)** Writes the terminal `task.update` (completed/failed) +
+//!      a `flow_completed` / `flow_failed` event. All best-effort.
+//!   7. Surfaces a structured outcome (now including `task_id`) so
+//!      JSON / SSE / OpenAI handlers all project the same underlying
+//!      flow result.
 
 use std::path::PathBuf;
 
 use crate::AppState;
+use crate::task_recorder::{TaskRecorder, make_title};
 use crate::validate::{validate_input, validate_url};
 use relix_runtime::flow_runner::{FlowRunOptions, FlowRunner, FlowRunnerError};
 
@@ -26,6 +32,10 @@ pub struct FlowOutcome {
     pub trace_id: String,
     /// On-disk path of the per-flow event log.
     pub flow_log_path: String,
+    /// Coordinator-side Task id when persistence was wired AND the
+    /// `task.create` call succeeded. `None` when the coordinator is
+    /// absent or the call failed (fail-soft).
+    pub task_id: Option<String>,
 }
 
 /// Categorised failure so handlers can pick the right HTTP status.
@@ -49,6 +59,20 @@ pub async fn execute_chat_flow(
     message: &str,
 ) -> Result<FlowOutcome, FlowExecError> {
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
+
+    // B1.2: best-effort task creation. None when coordinator is absent
+    // or the call failed (TaskRecorder logs the warning).
+    let task_id = create_task_fail_soft(
+        state.task_recorder.as_ref(),
+        "chat",
+        "flows/chat_template.sol",
+        &chat_params_json(session_id, message),
+    )
+    .await;
+    if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
+        rec.event(tid, "flow_selected", "flows/chat_template.sol")
+            .await;
+    }
 
     let rendered = state
         .template
@@ -75,47 +99,90 @@ pub async fn execute_chat_flow(
         mesh_client: state.mesh_client.clone(),
     };
 
-    finalize_flow_run(FlowRunner::new(opts).run().await)
+    finalize_flow_run(
+        FlowRunner::new(opts).run().await,
+        state.task_recorder.as_ref(),
+        task_id,
+    )
+    .await
 }
 
-/// Translate a `FlowRunner::run` outcome into a `FlowOutcome` while making
-/// VM-level halts (e.g. tool node returned `policy_denied`) visible as a
-/// real error response instead of a 200 OK with an empty body. The bridge
-/// stays a pure dispatcher; this only converts existing signals.
-fn finalize_flow_run(
+/// Translate a `FlowRunner::run` outcome into a `FlowOutcome` while
+/// making VM-level halts (e.g. tool node returned `policy_denied`)
+/// visible as a real error response instead of a 200 OK with an empty
+/// body, AND while writing the terminal task event/update when a
+/// Coordinator is wired.
+async fn finalize_flow_run(
     res: Result<relix_runtime::flow_runner::FlowRunResult, FlowRunnerError>,
+    recorder: Option<&TaskRecorder>,
+    task_id: Option<String>,
 ) -> Result<FlowOutcome, FlowExecError> {
     match res {
         Ok(result) => {
-            // VM halted because a remote_call failed — surface the responder's
-            // error envelope so curl / Open WebUI see a proper non-2xx rather
-            // than an empty `reply: ""`. The flow log on disk still records
-            // every step (RemoteCallIssued / RemoteCallFailed / FlowFailed).
+            // VM halted because a remote_call failed — surface the
+            // responder's error envelope so curl / Open WebUI see a
+            // proper non-2xx rather than an empty `reply: ""`. The
+            // flow log on disk still records every step
+            // (RemoteCallIssued / RemoteCallFailed / FlowFailed).
             if let Some(err) = result.last_error {
+                let flow_id = result.flow_id.to_string();
+                let flow_log_path = result.flow_log_path.to_string_lossy().to_string();
+                let cause_for_event = err.clone();
+                if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
+                    rec.event(tid, "flow_failed", &cause_for_event).await;
+                    rec.fail(tid, 0, &cause_for_event).await;
+                }
                 return Err(FlowExecError::Transport(format!(
-                    "flow halted: {err} (flow_id={} flow_log={})",
-                    result.flow_id,
-                    result.flow_log_path.display()
+                    "flow halted: {err} (flow_id={flow_id} flow_log={flow_log_path})"
                 )));
             }
+            let reply = result.final_string.unwrap_or_default();
+            let flow_id = result.flow_id.to_string();
+            let trace_id = result.trace_id.to_string();
+            let flow_log_path = result.flow_log_path.to_string_lossy().to_string();
+
+            if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
+                // Keep the reply that goes into task_events short so the
+                // ledger doesn't carry the full bodies (those live in the
+                // per-flow event log on disk, which task.latest_flow_log_path
+                // points at).
+                let excerpt = truncate(&reply, 200);
+                rec.event(tid, "flow_completed", &excerpt).await;
+                rec.complete(tid, &excerpt, &flow_id, &flow_log_path).await;
+            }
             Ok(FlowOutcome {
-                reply: result.final_string.unwrap_or_default(),
-                flow_id: result.flow_id.to_string(),
-                trace_id: result.trace_id.to_string(),
-                flow_log_path: result.flow_log_path.to_string_lossy().to_string(),
+                reply,
+                flow_id,
+                trace_id,
+                flow_log_path,
+                task_id,
             })
         }
-        Err(FlowRunnerError::Transport(m)) => Err(FlowExecError::Transport(m)),
-        Err(e) => Err(FlowExecError::Internal(e.to_string())),
+        Err(FlowRunnerError::Transport(m)) => {
+            if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
+                rec.event(tid, "flow_failed", &m).await;
+                rec.fail(tid, 0, &m).await;
+            }
+            Err(FlowExecError::Transport(m))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
+                rec.event(tid, "flow_failed", &msg).await;
+                rec.fail(tid, 0, &msg).await;
+            }
+            Err(FlowExecError::Internal(msg))
+        }
     }
 }
 
 /// Execute one chat turn through the configured *tool-augmented* SOL flow
 /// template (M9). Returns the same [`FlowOutcome`] shape so callers don't
 /// have to switch on the variant — the only difference at this layer is the
-/// `{{TOOL_URL}}` substitution and the fact that the flow performs an extra
-/// `tool.web_fetch` remote call before the AI step. SOL still owns the
-/// orchestration; this function only selects the template.
+/// `{{TOOL_URL}}` substitution, the fact that the flow performs an extra
+/// `tool.web_fetch` remote call before the AI step, and the additional
+/// `tool_target` / `tool_invoked` events on the Task chronicle. SOL still
+/// owns the orchestration; this function only selects the template.
 pub async fn execute_chat_with_tool_flow(
     state: &AppState,
     session_id: &str,
@@ -129,6 +196,23 @@ pub async fn execute_chat_with_tool_flow(
     };
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
     validate_url(url).map_err(FlowExecError::InvalidInput)?;
+
+    let task_id = create_task_fail_soft(
+        state.task_recorder.as_ref(),
+        "chat_with_tool",
+        "flows/chat_with_tool.sol",
+        &chat_with_tool_params_json(session_id, message, url),
+    )
+    .await;
+    if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
+        rec.event(tid, "flow_selected", "flows/chat_with_tool.sol")
+            .await;
+        // Pre-execution tool intent. Useful for operators triaging
+        // failures: even if the tool peer rejects the URL, the task
+        // chronicle says what was attempted.
+        rec.event(tid, "tool_target", url).await;
+        rec.event(tid, "tool_invoked", "tool.web_fetch").await;
+    }
 
     let rendered = tool_template
         .replace("{{SESSION}}", session_id)
@@ -155,5 +239,93 @@ pub async fn execute_chat_with_tool_flow(
         mesh_client: state.mesh_client.clone(),
     };
 
-    finalize_flow_run(FlowRunner::new(opts).run().await)
+    finalize_flow_run(
+        FlowRunner::new(opts).run().await,
+        state.task_recorder.as_ref(),
+        task_id,
+    )
+    .await
+}
+
+/// Best-effort task creation. Returns `None` when persistence isn't
+/// configured or the Coordinator call failed; the chat path continues
+/// in either case (fail-soft per B1.9).
+async fn create_task_fail_soft(
+    recorder: Option<&TaskRecorder>,
+    flow_label: &str,
+    flow_template: &str,
+    params_json: &str,
+) -> Option<String> {
+    let rec = recorder?;
+    let title = make_title(flow_label, params_json, 64);
+    rec.create(&title, flow_template, params_json).await
+}
+
+/// Compact JSON for `task.create`'s `params_json`. Inline so we don't
+/// pull serde_json's full machinery for two field types. The Coordinator
+/// stores this verbatim and never parses it.
+fn chat_params_json(session_id: &str, message: &str) -> String {
+    let m = json_escape(message);
+    let s = json_escape(session_id);
+    format!(r#"{{"session_id":"{s}","message":"{m}"}}"#)
+}
+
+fn chat_with_tool_params_json(session_id: &str, message: &str, url: &str) -> String {
+    let m = json_escape(message);
+    let s = json_escape(session_id);
+    let u = json_escape(url);
+    format!(r#"{{"session_id":"{s}","message":"{m}","url":"{u}"}}"#)
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Truncate a string at `n` characters (not bytes), appending an
+/// ellipsis when trimmed. Used to keep task_events payloads compact.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(n.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_escape_quotes_and_newlines() {
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn truncate_at_char_boundary() {
+        assert_eq!(truncate("abcdef", 10), "abcdef");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        // multi-byte safety
+        assert_eq!(truncate("αβγδε", 3), "αβ…");
+    }
+
+    #[test]
+    fn chat_params_json_shape() {
+        let s = chat_params_json("demo", "hello world");
+        assert_eq!(s, r#"{"session_id":"demo","message":"hello world"}"#);
+    }
 }

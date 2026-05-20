@@ -152,36 +152,51 @@ Sorted by `updated_at DESC` so the most recently touched task is first.
 The Coordinator clamps `limit` to `[coordinator] max_list` (default
 200).
 
-## Recommended bridge integration (not yet wired)
+## Bridge integration (B1, wired)
 
-The bridge today runs flows in-process and **does not** create Tasks.
-That's deliberate for this commit — the Coordinator + capabilities +
-CLI ship and prove durable persistence end-to-end without changing
-hot-path semantics. The bridge integration is a follow-up.
+The bridge persists every chat request as a Task. The wiring is
+configured by an optional `[coordinator] alias = "..."` section in
+the bridge TOML; when absent, the bridge runs without persistence and
+nothing breaks.
 
-When it lands, the canonical write path will be:
+The canonical write path per request:
 
-1. Bridge receives `POST /chat`.
-2. Bridge calls `task.create(title=truncate(message), flow_template,
-   params_json, owner=bridge_subject_id)` on the Coordinator. Stores
-   the returned `task_id` in request state.
-3. Bridge calls `task.update(task_id, status="running", flow_id=...)`
-   when the FlowRunner emits the new `flow_id`.
-4. Bridge optionally calls `task.event(task_id, event_type="step",
-   payload="<peer.method>")` on each `remote_call` for observability.
-   (Cost / value to be measured before turning on by default.)
-5. Bridge calls `task.update(task_id, status="completed",
-   result=reply, flow_log_path=...)` on success, or
-   `task.update(task_id, status="failed", error_kind=..., error_cause=...)`
-   on failure.
-6. Bridge returns the existing HTTP response with `task_id` added to
-   the `relix` provenance block.
+1. Bridge receives `POST /chat`, `/chat_with_tool`, or
+   `POST /v1/chat/completions` (the OpenAI shim).
+2. Bridge calls `task.create(title=truncate("chat: ..."),
+   flow_template=<template path>, params_json=<JSON of req fields>,
+   owner=<empty -> caller subject_id>)`. The Coordinator returns a
+   task_id; the bridge stores it in request state.
+3. Bridge appends `flow_selected` (with the template path). For the
+   tool flow it also appends `tool_target` (URL) and `tool_invoked`
+   (`tool.web_fetch`).
+4. Bridge runs the SOL flow through the existing FlowRunner. No
+   per-`remote_call` events are written today — the bridge can't see
+   inside the VM's RemoteCall opcodes from where it's standing. Per-
+   call detail is fully available in `dev-data/flow-runner/flows/<flow_id>.log`
+   which `task.latest_flow_log_path` points at.
+5. On success: bridge appends `flow_completed` (with a truncated
+   reply excerpt, ≤200 chars) and calls `task.update(status=completed,
+   result=excerpt, flow_id=..., flow_log_path=...)`.
+6. On failure: bridge appends `flow_failed` (with the cause) and calls
+   `task.update(status=failed, error_kind=..., error_cause=...)`.
+7. Bridge returns the HTTP response with `task_id` added to the JSON
+   (`ChatResponse.task_id`) or the `relix.task_id` provenance field
+   (OpenAI shim). The field is omitted entirely when persistence was
+   not wired or failed.
 
-Every one of those calls goes through the standard libp2p RPC + the
-Coordinator's admission pipeline + the Coordinator's audit log.
-Bridge-side latency: ~5 extra RPCs at low single-digit ms each on
-loopback, plus the existing flow execution time. Worth measuring; not
-yet committed to.
+**All `task.*` calls are fail-soft.** Every method on the bridge's
+`TaskRecorder` returns silently on Coordinator failure — a `WARN` is
+logged and the chat continues. The user's request never blocks on
+Coordinator availability. Live-verified: kill the Coordinator
+process mid-session, send another `/chat` — the response comes back
+normally with `task_id` absent and the bridge log shows the structured
+WARN.
+
+Cost: 3-5 additional `/relix/rpc/1` round-trips per chat request,
+each loopback + admission-pipeline + SQLite-insert latency (single
+digit ms on a local mesh). Worth it for the durable lineage on
+operator request triage.
 
 ## `relix-cli flow-run` and Tasks
 

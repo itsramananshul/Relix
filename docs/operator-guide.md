@@ -287,6 +287,31 @@ re-run it). This is a documented limitation
   doesn't, the issue is in the Open WebUI container's network — check
   its container logs.
 
+## Inspecting tasks (durable orchestration ledger)
+
+When the Coordinator peer is up, every chat request becomes a Task on
+its SQLite ledger. The response includes a `task_id` (top-level on
+native endpoints, under `relix.task_id` on the OpenAI shim). Operator
+inspection:
+
+```bash
+relix-cli task list   --peer /ip4/127.0.0.1/tcp/19714 \
+    --identity dev-keys/local-bridge.aic \
+    --client-key dev-keys/local-bridge.key
+
+relix-cli task get    --peer /ip4/127.0.0.1/tcp/19714 \
+    --identity dev-keys/local-bridge.aic \
+    --client-key dev-keys/local-bridge.key \
+    --task-id <id-from-response>
+```
+
+`task get` returns multi-line `key=value` plus a JSON `events=[...]`
+chronicle. The Coordinator is **fail-soft** from the bridge's
+perspective: if it dies mid-session, chat still works — the
+`task_id` is omitted from the response and a structured WARN line
+hits the bridge log. See [`docs/coordinator.md`](coordinator.md) and
+[`docs/replay-model.md`](replay-model.md).
+
 ## Inspecting flows after the fact
 
 Every chat response includes `flow_id` and `flow_log`. To replay what

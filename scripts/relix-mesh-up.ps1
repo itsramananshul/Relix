@@ -377,6 +377,18 @@ id          = "relix-$Provider"
 description = "Relix mesh route - AI node currently set to $Provider"
 "@ | Set-Content -Encoding utf8 $BridgeConfig
 
+# B1: optional coordinator integration. When the coordinator peer is
+# enabled, append the [coordinator] section so the bridge persists chat
+# flows as Tasks. When -NoCoordinator was passed, the bridge runs
+# without persistence (fail-soft).
+if (-not $NoCoordinator) {
+    Add-Content -Encoding utf8 $BridgeConfig @"
+
+[coordinator]
+alias = "coordinator"
+"@
+}
+
 $MemLog         = "$DataBase/memory.log"
 $AiLog          = "$DataBase/ai.log"
 $ToolLog        = "$DataBase/tool.log"

@@ -70,6 +70,35 @@ launches them in order (memory + AI + tool first, then the bridge once
 the controllers are listening) and records every PID it spawned so
 Ctrl-C cleanup is exact.
 
+## Coordinator (durable Task ledger)
+
+Optional fifth peer. The bridge's chat endpoints persist every request
+as a Task on the Coordinator when one is configured:
+
+```
+                    bridge
+                      │
+            task.create / event / update
+                      │
+                      ▼
+              ┌────────────────┐
+              │  coordinator   │   SQLite Task ledger
+              │  tcp/19714     │   (dev-data/<run>/tasks.db)
+              └────────────────┘
+```
+
+The bridge does not own Task state — it just **writes through** to
+the Coordinator. The Coordinator does not own flow execution — it
+just records what other peers attempt. Operators inspect via
+`relix-cli task list/get`; details in
+[`coordinator.md`](coordinator.md), [`task-runtime.md`](task-runtime.md),
+[`replay-model.md`](replay-model.md).
+
+Fail-soft: a missing or unreachable Coordinator does not block,
+crash, or fail any chat request. The bridge logs `WARN coordinator
+task.create failed; request persistence skipped` and the response is
+returned with `task_id` omitted.
+
 ## A request, end to end
 
 What happens when you `POST /v1/chat/completions` against the bridge.

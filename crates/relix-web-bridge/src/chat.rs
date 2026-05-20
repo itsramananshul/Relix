@@ -26,6 +26,12 @@ pub struct ChatResponse {
     pub flow_id: String,
     pub trace_id: String,
     pub flow_log: String,
+    /// Coordinator-side Task id when persistence was wired and the
+    /// `task.create` call succeeded. `None` when the coordinator is
+    /// absent (`[coordinator]` missing in bridge config) or any
+    /// coordinator call failed (B1.9 fail-soft).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +55,7 @@ pub async fn chat(
             flow_id: o.flow_id,
             trace_id: o.trace_id,
             flow_log: o.flow_log_path,
+            task_id: o.task_id,
         })),
         Err(e) => Err(exec_error_to_http(e)),
     }
@@ -90,6 +97,7 @@ pub async fn chat_with_tool(
             flow_id: o.flow_id,
             trace_id: o.trace_id,
             flow_log: o.flow_log_path,
+            task_id: o.task_id,
         })),
         Err(e) => Err(exec_error_to_http(e)),
     }
@@ -118,6 +126,7 @@ pub async fn chat_stream(
         "flow_id": outcome.flow_id,
         "trace_id": outcome.trace_id,
         "flow_log": outcome.flow_log_path,
+        "task_id": outcome.task_id,
     })
     .to_string();
 

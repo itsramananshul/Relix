@@ -39,6 +39,7 @@ mod config;
 mod flow;
 mod openai;
 mod sse;
+mod task_recorder;
 mod validate;
 
 use crate::config::{AppState, BridgeConfig};
@@ -120,7 +121,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // clippy::let_underscore_future.
             drop(refresh_handle);
 
-            state.mesh_client = Some(std::sync::Arc::new(mesh_client));
+            let mesh_arc = std::sync::Arc::new(mesh_client);
+
+            // B1.1 / B1.9: optional coordinator integration. We only
+            // build the TaskRecorder when both (a) the config names a
+            // coordinator alias AND (b) the alias resolves in the
+            // address book — otherwise everything stays None and the
+            // bridge runs without persistence (fail-soft).
+            if let Some(coord_cfg) = state.cfg.coordinator.as_ref() {
+                if mesh_arc.peer_id_for(&coord_cfg.alias).is_some() {
+                    let recorder = task_recorder::TaskRecorder::new(
+                        mesh_arc.clone(),
+                        coord_cfg.alias.clone(),
+                        state.identity_bundle.clone(),
+                        state.cfg.transport.deadline_secs,
+                    );
+                    state.task_recorder = Some(recorder);
+                    tracing::info!(
+                        coordinator_alias = %coord_cfg.alias,
+                        "bridge: task persistence enabled (coordinator reachable at startup)"
+                    );
+                } else {
+                    tracing::warn!(
+                        coordinator_alias = %coord_cfg.alias,
+                        "bridge: [coordinator] alias configured but peer not in discovered set; task persistence disabled (chat still works)"
+                    );
+                }
+            } else {
+                tracing::info!(
+                    "bridge: no [coordinator] section in config; task persistence disabled (chat still works)"
+                );
+            }
+
+            state.mesh_client = Some(mesh_arc);
         }
         None => {
             tracing::warn!(

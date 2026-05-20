@@ -109,6 +109,13 @@ pub struct RelixExtension {
     pub trace_id: String,
     pub flow_log: String,
     pub session_id: String,
+    /// Coordinator-side Task id when persistence was wired and the call
+    /// succeeded. `None` when the coordinator is absent / unreachable
+    /// (B1.9 fail-soft). Skipped from serialisation when None so
+    /// strict OpenAI clients that don't expect non-standard fields
+    /// stay clean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -237,6 +244,7 @@ pub async fn chat_completions(
             outcome.flow_id.clone(),
             outcome.trace_id.clone(),
             outcome.flow_log_path.clone(),
+            outcome.task_id.clone(),
             state.cfg.sse.chunk_bytes,
             Duration::from_millis(state.cfg.sse.chunk_delay_ms),
         );
@@ -267,6 +275,7 @@ pub async fn chat_completions(
                 trace_id: outcome.trace_id,
                 flow_log: outcome.flow_log_path,
                 session_id: translated.session_id,
+                task_id: outcome.task_id,
             },
         };
         Ok(Json(resp).into_response())
@@ -374,6 +383,7 @@ fn build_openai_sse(
     flow_id: String,
     trace_id: String,
     flow_log: String,
+    task_id: Option<String>,
     chunk_bytes: usize,
     chunk_delay: Duration,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
@@ -430,6 +440,7 @@ fn build_openai_sse(
                 "trace_id": trace_id,
                 "flow_log": flow_log,
                 "session_id": session_id,
+                "task_id": task_id,
             },
         });
         yield Ok(Event::default().data(relix_chunk.to_string()));

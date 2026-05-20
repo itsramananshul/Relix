@@ -30,6 +30,20 @@ pub struct BridgeConfig {
     /// variant of `/v1/chat/completions`.
     #[serde(default)]
     pub sse: SseSection,
+    /// Optional Coordinator integration. When present, every chat request
+    /// is persisted as a Task on the named peer. When absent or when the
+    /// peer is unreachable, the bridge degrades gracefully (warn + skip
+    /// persistence; the user's request still executes).
+    #[serde(default)]
+    pub coordinator: Option<CoordinatorSection>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CoordinatorSection {
+    /// Peer alias in `peers.toml` (e.g. `"coordinator"`). Bridge uses
+    /// `MeshClient::call(alias, ...)` to send `task.*` calls, so the
+    /// reconnect-on-drop behaviour applies for free.
+    pub alias: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -153,6 +167,11 @@ pub struct AppState {
     /// successful discovery pass; `None` if discovery failed (in which case
     /// FlowRunner falls back to the per-request ephemeral peer path).
     pub mesh_client: Option<Arc<MeshClient>>,
+    /// Coordinator integration. `Some` when `[coordinator] alias` is set
+    /// in bridge config AND the mesh client is up. Used fail-soft from
+    /// flow.rs — every method on `TaskRecorder` warns-and-skips on
+    /// failure so chat requests never block on coordinator availability.
+    pub task_recorder: Option<crate::task_recorder::TaskRecorder>,
 }
 
 impl AppState {
@@ -210,6 +229,7 @@ impl AppState {
             tool_template,
             manifest_cache: Arc::new(ManifestCache::new()),
             mesh_client: None,
+            task_recorder: None,
         })
     }
 }
