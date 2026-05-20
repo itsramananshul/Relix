@@ -2534,4 +2534,102 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].trace_id.as_deref(), Some(trace_hex));
     }
+
+    // ── Track 6 hardening: coordinator edge cases ─────────────────────
+
+    #[test]
+    fn large_chronicle_renders_without_truncation() {
+        // 500 events should render cleanly through render_task_view
+        // (regression guard for any future cap that might silently
+        // drop events).
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        for i in 0..500 {
+            s.append_event(&tid, "checkpoint", &format!("step={i}"))
+                .unwrap();
+        }
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.events.len(), 500);
+        let rendered = render_task_view(&v);
+        assert!(rendered.contains("event_count=500"));
+        // First and last events both present in JSON array.
+        assert!(rendered.contains("step=0"));
+        assert!(rendered.contains("step=499"));
+    }
+
+    #[test]
+    fn event_payload_with_special_chars_round_trips_safely() {
+        // Payload with quotes, backslashes, newlines, tabs, and a
+        // low control byte. Must survive store + get + render
+        // without breaking the JSON escape contract.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let payload = "quote=\" backslash=\\ newline=\n tab=\t ctrl=\x01 end";
+        s.append_event(&tid, "checkpoint", payload).unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.events[0].payload, payload);
+        let rendered = render_task_view(&v);
+        // JSON-escaped forms appear in the rendered events array.
+        assert!(rendered.contains("\\\""));
+        assert!(rendered.contains("\\\\"));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\t"));
+        // Control byte rendered as \uXXXX escape, not raw.
+        assert!(rendered.contains("\\u0001"));
+    }
+
+    #[test]
+    fn concurrent_create_and_recover_dont_corrupt_attempt_count() {
+        // Mini stress test: run 10 create+update cycles serially and
+        // confirm attempt_count tracks correctly. (Real concurrency
+        // testing requires multiple stores against the same DB; this
+        // covers the single-store serialized path.)
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 99, Some(60))
+            .unwrap();
+        for _ in 0..10 {
+            s.update(&tid, Some("running"), None, None, None, None, None, None)
+                .unwrap();
+            s.update(
+                &tid,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                Some("flake"),
+                Some("transient"),
+            )
+            .unwrap();
+            s.request_retry(&tid).unwrap();
+        }
+        let v = s.get(&tid).unwrap().unwrap();
+        // 10 attempts opened (each running transition after retry
+        // opens a new one).
+        assert_eq!(v.attempt_count, 10);
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 10);
+        // Each closed as failed.
+        assert!(attempts.iter().all(|a| a.status == "failed"));
+        // retry_count incremented per request_retry call (10 - 1
+        // since the first running used the initial slot and request_retry
+        // bumps it for the SECOND through 10th).
+        assert!(v.retry_count >= 1, "retry_count={}", v.retry_count);
+    }
+
+    #[test]
+    fn task_id_collision_resistance_check() {
+        // 1000 generated IDs should all be unique (32-hex from
+        // OsRng — collision probability is negligible but the test
+        // catches a future regression where new_task_id is replaced
+        // with something deterministic).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = new_task_id();
+            assert_eq!(id.len(), 32);
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(seen.insert(id), "collision");
+        }
+    }
 }

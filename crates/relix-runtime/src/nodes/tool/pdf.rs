@@ -529,4 +529,58 @@ mod tests {
         assert!(matches!(d.idempotency, Idempotency::Idempotent));
         assert!(d.sensitivity_tags.iter().any(|t| t == "parse:pdf"));
     }
+
+    // ── Track 6 hardening: malformed inputs do not panic ──
+
+    #[test]
+    fn empty_pdf_bytes_rejected_cleanly() {
+        let cfg = PdfConfig::default();
+        let arg = format!("text|{}", encode_pdf(b""));
+        match handle(&cfg, &ctx(arg.as_bytes())) {
+            HandlerOutcome::Err(e) => {
+                // Either "parse failed" or "empty" is acceptable;
+                // what matters is it surfaces as INVALID_ARGS without
+                // panicking.
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            HandlerOutcome::Ok(_) => panic!("expected rejection on empty input"),
+        }
+    }
+
+    #[test]
+    fn truncated_pdf_header_rejected_cleanly() {
+        // `%PDF` without a proper version + xref + trailer.
+        let cfg = PdfConfig::default();
+        let arg = format!("text|{}", encode_pdf(b"%PDF-1.4\n"));
+        match handle(&cfg, &ctx(arg.as_bytes())) {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected rejection on truncated header"),
+        }
+    }
+
+    #[test]
+    fn pdf_with_high_bit_garbage_after_header_rejected() {
+        // Header looks like a PDF but the rest is random bytes
+        // including non-UTF-8 sequences. lopdf must surface an error,
+        // not panic on UTF-8 conversion later.
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0xfd, 0xfc, 0x00, 0x01]);
+        let cfg = PdfConfig::default();
+        let arg = format!("text|{}", encode_pdf(&bytes));
+        match handle(&cfg, &ctx(arg.as_bytes())) {
+            HandlerOutcome::Err(_) => {} // either parse or extract failure is fine
+            HandlerOutcome::Ok(_) => panic!("expected rejection on garbage PDF"),
+        }
+    }
+
+    #[test]
+    fn mode_without_separator_rejected() {
+        let cfg = PdfConfig::default();
+        // Missing the `|` between mode and base64 body — should be
+        // INVALID_ARGS, not a panic on str slicing.
+        match handle(&cfg, &ctx(b"text")) {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected rejection on malformed arg"),
+        }
+    }
 }
