@@ -584,6 +584,39 @@ Response:
 Dashboard surface: "Recent transitions" card on the
 `#/topology` page.
 
+### `GET /v1/routing`
+
+Capability-to-peer routing snapshot (M33). For each
+method in the bridge's manifest cache, returns the
+peer the bridge would route to right now under the
+first-match-in-cache policy.
+
+```json
+{
+  "entries": [
+    {
+      "method":              "ai.chat",
+      "alias":               "ai",
+      "node_id":             "...",
+      "node_type":           "ai",
+      "freshness":           "fresh",
+      "last_refreshed_at":   1700000000,
+      "multiple_candidates": false
+    }
+  ],
+  "generated_at": 1700003700,
+  "policy":       "first peer in manifest cache that advertises the method (no scoring, no priority)"
+}
+```
+
+The `policy` string is the honest description of the
+runtime's choice rule — bridges to the operator the
+"why this peer" answer without inventing rationale.
+`multiple_candidates: true` marks methods where
+first-match-in-cache made a non-trivial choice.
+
+Dashboard surface: Execution path panel in task detail.
+
 ### `GET /v1/streams`
 
 List currently-open SSE consumers of

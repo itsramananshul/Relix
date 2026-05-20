@@ -345,6 +345,11 @@ page.
 | M30 | ✅ | Runtime anomaly banner on overview — peer flips + task failures + expired peers in last 5 min, elevated / high level escalation. |
 | M31 | ✅ | Topology graph activity overlay — ripple + dashed ring per peer with a transition in the last 30s. Distinct from the continuous expired pulse. |
 | M32 | ✅ | Latency time-budget bar — stacked horizontal bar under the retry chain, segment width proportional to duration share. |
+| M33 | ✅ | `/v1/routing` endpoint + Execution path panel — pairs each invoked method with its current routing target. Honest "Routing as of now" framing because per-call history isn't recorded yet. |
+| M34 | ✅ | Minimal instrumentation: `chat_with_tool` flow's `capability.invoked` payload now carries `peer=tool` — the resolved alias. Dashboard renders these rows with a green "recorded" badge instead of the routing-snapshot fallback. |
+| M35 | ✅ | `chat` flow gets its own `capability.invoked` emit (`method=ai.chat peer=ai`) — every chat task now has an Execution path. `ai.chat` rows render an explicit "model: not recorded yet" label. |
+| M36 | ✅ | Per-attempt timeline filter — click a chain pill → timeline collapses to just that attempt's events. `× clear` chip restores. |
+| M37 | ✅ | Clickable peer references in timeline + Execution path — `peer=X` becomes a link into the topology peer drawer. Closes the dashboard's causality navigation loop. |
 
 Each milestone is its own commit + push, per the directive.
 
@@ -374,6 +379,83 @@ from class taxonomies (M29 mapping to retry-model.md), from
 correlation with lifecycle events (M28), from the actual
 attempt + gap timing (M26 + M32) — never from synthesized
 narratives.
+
+## Phase-1D: Execution path visibility (M33-M37)
+
+Phase-1D extends the causality stack with explicit
+routing visibility — answering "which peer handled
+each capability call." Critical honesty rule: where
+the runtime doesn't record a fact today, the surface
+shows "not recorded yet" rather than inventing
+plausible values.
+
+New endpoint: `GET /v1/routing` (M33) — for each
+capability method in the bridge's manifest cache,
+returns the peer the bridge would route to right now
+under first-match-in-cache semantics. The response
+includes a self-describing `policy` string so dashboards
+never have to invent a rationale, and a
+`multiple_candidates` flag per method so operators see
+when the choice is non-trivial.
+
+New dashboard surface: Execution path panel in task
+detail. Pairs each `capability.invoked` event in the
+chronicle with its current routing target. Two states
+per row:
+
+- **Recorded** (green badge) — when the
+  `capability.invoked` payload includes `peer=ALIAS`
+  (shipped via M34 for `chat_with_tool`, M35 for `chat`).
+  Ground truth, not inference.
+- **Routing snapshot** (freshness-colored badge) — when
+  only the method is recorded. The panel explicitly
+  labels the snapshot-vs-history gap: "Per-call routing
+  not recorded yet — peers shown are the bridge's
+  current resolution, which may differ from what handled
+  the task at execution time."
+
+Per-method extras: `ai.chat` rows always show "model: not
+recorded yet · see the AI controller's [ai] provider
+config" — the bridge knows the responding peer but not
+its configured model.
+
+Causality navigation (M37): every peer alias on the
+dashboard — in the timeline's `capability.invoked`
+payloads + in the Execution path panel — is a clickable
+link that opens the topology peer drawer. Operators
+traverse "this happened" → "here's the entity that
+handled it" in one click.
+
+Per-attempt timeline filter (M36): chain pills are now
+click-targets. Selecting one filters the timeline to
+just that attempt's events (uses `attempt_id` to match
+the typed v1 envelope field). `× clear` chip restores
+the full view. Operators isolate "what happened during
+retry 2" without scrolling past unrelated events.
+
+### What stays "not recorded yet"
+
+These are the honest gaps where the runtime doesn't
+capture the data and Phase-1D doesn't fake it:
+
+- **Model name** — the AI peer knows its configured
+  model from its TOML; the chronicle doesn't. Surfaced
+  as "not recorded yet" with a pointer to the config
+  block.
+- **Per-step latency** — chronicle has attempt-level
+  durations (already shown via M26/M32). Within an
+  attempt, individual capability call timing isn't
+  in the chronicle. The per-flow event log on disk
+  has it; the dashboard's Cross-references panel
+  (M27) shows the CLI command to drill in.
+- **Provider failover reason** — Relix doesn't
+  implement failover today (each AI peer has one
+  configured provider). The "selection reason" is
+  always "first peer in cache that advertises ai.chat";
+  the routing snapshot surfaces this verbatim.
+- **Stream-level latency** — `/v1/streams` (M25)
+  tracks active stream count + age, not per-event
+  latency.
 
 ## URL conventions
 
