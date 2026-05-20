@@ -1685,6 +1685,15 @@
           </div>
         </div>
       </div>
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-header">
+          <h3>Top retried tasks (15 min)</h3>
+          <span class="meta" id="top-retried-status"></span>
+        </div>
+        <div class="card-body dense" id="top-retried-host">
+          <div class="empty">no retried_from edges in the last 15 minutes</div>
+        </div>
+      </div>
     </section>
 
     <!-- ── #/tasks ────────────────────────────────────────────── -->
@@ -2373,6 +2382,7 @@ async function backgroundSync() {
       renderOverviewKpis(hRes, taskCount);
       renderOverviewPeers(tRes.peers || []);
       renderAnomalyBanner();
+      renderTopRetried(lastEdgesSnapshot);
       const $status = document.getElementById('activity-status');
       if ($status) {
         $status.innerHTML =
@@ -2692,6 +2702,57 @@ function computeAnomalies() {
     retry_count_15min,
     retry_distinct_tasks: retryTaskIds.size,
   };
+}
+
+/* Top retried tasks card. Groups recent retried_from edges
+   by task_id within RETRY_STORM_WINDOW_SECS and renders the
+   top N rows so an operator can drill into the actual tasks
+   contributing to the retry-storm anomaly. Each row is a
+   click-through link to the per-task detail. */
+const TOP_RETRIED_LIMIT = 5;
+function renderTopRetried(edges) {
+  const $host = document.getElementById('top-retried-host');
+  const $status = document.getElementById('top-retried-status');
+  if (!$host) return;
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const cutoff = nowSecs - RETRY_STORM_WINDOW_SECS;
+  const counts = new Map();
+  const latest = new Map();
+  for (const e of (edges || [])) {
+    if (!e || e.edge_type !== 'retried_from') continue;
+    if (e.created_at == null || e.created_at < cutoff) continue;
+    if (!e.task_id) continue;
+    counts.set(e.task_id, (counts.get(e.task_id) || 0) + 1);
+    const prev = latest.get(e.task_id);
+    if (prev == null || e.created_at > prev) latest.set(e.task_id, e.created_at);
+  }
+  if (counts.size === 0) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'no retried_from edges in the last 15 minutes'
+      + '</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  const sorted = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, TOP_RETRIED_LIMIT);
+  const rows = sorted.map(([taskId, n]) => {
+    const ago = latest.has(taskId) ? fmtDuration(nowSecs - latest.get(taskId)) + ' ago' : '—';
+    return '<tr>'
+      + '<td><a href="#/tasks/' + encodeURIComponent(taskId)
+        + '" class="id">' + escapeHtml(taskId) + '</a></td>'
+      + '<td><span class="badge warn">' + n + ' retr'
+        + (n === 1 ? 'y' : 'ies') + '</span></td>'
+      + '<td class="meta">last ' + escapeHtml(ago) + '</td>'
+      + '</tr>';
+  }).join('');
+  $host.innerHTML = '<table class="data"><thead><tr>'
+    + '<th>task id</th><th>retries</th><th>last retry</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  if ($status) {
+    $status.textContent = counts.size + ' task'
+      + (counts.size === 1 ? '' : 's') + ' retrying';
+  }
 }
 
 function renderAnomalyBanner() {

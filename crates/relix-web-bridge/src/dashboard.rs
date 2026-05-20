@@ -477,6 +477,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_top_retried_card_present() {
+        // M55 (Track A): overview ships a "Top retried tasks
+        // (15 min)" card that groups recent retried_from edges
+        // by task_id so the operator can drill into the actual
+        // tasks behind a retry-storm anomaly.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="top-retried-host""#),
+            "top-retried card host missing"
+        );
+        assert!(
+            body.contains("function renderTopRetried"),
+            "renderTopRetried renderer missing"
+        );
+        assert!(
+            body.contains("TOP_RETRIED_LIMIT"),
+            "TOP_RETRIED_LIMIT constant missing"
+        );
+        // Renderer must consume edge.task_id for navigation.
+        assert!(
+            body.contains("encodeURIComponent(taskId)"),
+            "top-retried row should link to #/tasks/<id>"
+        );
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_nodes_clickable_present() {
         // M46 (Track A): graph nodes carry data-attempt-filter
         // so clicking a node toggles the timeline filter to
