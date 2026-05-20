@@ -7,6 +7,7 @@ members = [
     "crates/relix-cli",
     "crates/relix-flow-inspect",
     "crates/relix-web-bridge",
+    "crates/relix-telegram",
 ]
 
 # Shared metadata applied to every crate via `package.workspace = true`.
