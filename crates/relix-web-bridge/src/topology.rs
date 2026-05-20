@@ -89,6 +89,85 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Compact health-summary returned by `GET /v1/health`. Less
+/// detail than `/v1/topology` (no per-peer rows), but adds bridge
+/// uptime + cross-mesh reconnect counters that operators want at
+/// the top of every dashboard. Plain `/health` (text "ok\n") is
+/// preserved for liveness probes.
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    /// Always `"ok"` when this endpoint responds at all (the
+    /// bridge is process-up by definition). Distinguishes
+    /// `/v1/health` body from `/health` text for tooling.
+    pub status: &'static str,
+    /// Wall-clock unix seconds the bridge process started.
+    pub started_at: i64,
+    /// Wall-clock unix seconds at which the response was built.
+    pub now: i64,
+    /// `now - started_at`. Convenience for dashboards.
+    pub uptime_secs: i64,
+    /// `true` when the bridge's `[coordinator]` alias is set
+    /// AND the mesh client is up. `false` ⇒ `task.*` endpoints
+    /// return 503; chat continues fail-soft.
+    pub coordinator_configured: bool,
+    /// Total peers in the manifest cache.
+    pub peer_count: usize,
+    /// Peers broken down by freshness bucket (same bucketing
+    /// as `/v1/topology`).
+    pub peers_fresh: usize,
+    pub peers_stale: usize,
+    pub peers_expired: usize,
+    /// Cross-mesh reconnect telemetry from `MeshClient`. `None`
+    /// when the bridge has no MeshClient (discovery never
+    /// succeeded). `attempts - successes > 0` is the flapping
+    /// signal — a peer keeps disconnecting + reconnecting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect: Option<ReconnectCounters>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconnectCounters {
+    pub attempts: u64,
+    pub successes: u64,
+}
+
+/// `GET /v1/health` — bridge + mesh status summary. Distinct
+/// from `/health` which is a plaintext liveness probe.
+pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let now = unix_secs();
+    let mut fresh = 0usize;
+    let mut stale = 0usize;
+    let mut expired = 0usize;
+    let entries = state.manifest_cache.entries();
+    for c in &entries {
+        let secs_ago = (now - c.last_refreshed_at).max(0);
+        match freshness_label(secs_ago) {
+            "fresh" => fresh += 1,
+            "stale" => stale += 1,
+            _ => expired += 1,
+        }
+    }
+    let reconnect = state.mesh_client.as_ref().map(|c| {
+        let (attempts, successes) = c.reconnect_counters();
+        ReconnectCounters {
+            attempts,
+            successes,
+        }
+    });
+    Json(HealthResponse {
+        status: "ok",
+        started_at: state.started_at,
+        now,
+        uptime_secs: (now - state.started_at).max(0),
+        coordinator_configured: state.task_recorder.is_some(),
+        peer_count: entries.len(),
+        peers_fresh: fresh,
+        peers_stale: stale,
+        peers_expired: expired,
+        reconnect,
+    })
+}
+
 /// `GET /v1/topology` — list every peer in the bridge's
 /// manifest cache with freshness aggregates.
 pub async fn get(

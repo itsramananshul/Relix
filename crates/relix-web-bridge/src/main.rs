@@ -213,6 +213,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ManifestCache — no active probing, no orchestration
         // (bridge stays translation/presentation only).
         .route("/v1/topology", get(topology::get))
+        // JSON-shaped health summary: uptime + coordinator status
+        // + per-bucket peer counts + reconnect telemetry.
+        // Distinct from /health (plaintext liveness probe).
+        .route("/v1/health", get(topology::health))
         // Operator dashboard. Single-page static HTML; consumes
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.

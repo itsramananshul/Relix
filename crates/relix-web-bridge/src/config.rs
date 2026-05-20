@@ -172,6 +172,10 @@ pub struct AppState {
     /// flow.rs — every method on `TaskRecorder` warns-and-skips on
     /// failure so chat requests never block on coordinator availability.
     pub task_recorder: Option<crate::task_recorder::TaskRecorder>,
+    /// Wall-clock unix seconds at which AppState was built (≈ process
+    /// start). Surfaced by `/v1/health` so dashboards + load balancers
+    /// can derive uptime without a separate /metrics endpoint.
+    pub started_at: i64,
 }
 
 impl AppState {
@@ -230,6 +234,10 @@ impl AppState {
             manifest_cache: Arc::new(ManifestCache::new()),
             mesh_client: None,
             task_recorder: None,
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
         })
     }
 }

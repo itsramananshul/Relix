@@ -34,6 +34,18 @@ pub enum Cmd {
         #[arg(long, default_value_t = 120i64)]
         warn_after_secs: i64,
     },
+    /// Print the bridge's `/v1/health` summary: uptime,
+    /// coordinator status, peer freshness counts, reconnect
+    /// telemetry. One-shot snapshot suitable for on-call
+    /// triage or status-line scripts.
+    Health {
+        /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Raw JSON instead of the pretty one-line summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -43,7 +55,67 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             json,
             warn_after_secs,
         } => show(&bridge, json, warn_after_secs).await,
+        Cmd::Health { bridge, json } => health(&bridge, json).await,
     }
+}
+
+async fn health(bridge: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/health", bridge.trim_end_matches('/'));
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let h: HealthResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("bridge returned non-JSON body: {e}\nraw:\n{body}"))?;
+    // One-line summary so this fits in a status bar / tmux
+    // pane / shell prompt. Reconnect block only when present.
+    let coord = if h.coordinator_configured {
+        "yes"
+    } else {
+        "no"
+    };
+    let uptime = h.uptime_secs;
+    let peers = h.peer_count;
+    let fresh = h.peers_fresh;
+    let stale = h.peers_stale;
+    let expired = h.peers_expired;
+    let recon = h
+        .reconnect
+        .as_ref()
+        .map(|r| {
+            let a = r.attempts;
+            let s = r.successes;
+            format!("  reconnect={s}/{a}")
+        })
+        .unwrap_or_default();
+    println!(
+        "status={status}  uptime={uptime}s  coord={coord}  peers={peers} (fresh={fresh} stale={stale} expired={expired}){recon}",
+        status = h.status,
+    );
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    status: String,
+    uptime_secs: i64,
+    coordinator_configured: bool,
+    peer_count: usize,
+    peers_fresh: usize,
+    peers_stale: usize,
+    peers_expired: usize,
+    #[serde(default)]
+    reconnect: Option<ReconnectCounters>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReconnectCounters {
+    attempts: u64,
+    successes: u64,
 }
 
 async fn show(
@@ -198,5 +270,54 @@ mod tests {
         }"#;
         let t: TopologyResponse = serde_json::from_str(body).unwrap();
         assert!(t.peers[0].alias.is_none());
+    }
+
+    #[test]
+    fn health_response_deserializes_full_bridge_body() {
+        // Mirrors the bridge's serializer in
+        // crates/relix-web-bridge/src/topology.rs::HealthResponse.
+        // Guards against silent renames or shape changes.
+        let body = r#"{
+            "status": "ok",
+            "started_at": 1700000000,
+            "now": 1700003600,
+            "uptime_secs": 3600,
+            "coordinator_configured": true,
+            "peer_count": 4,
+            "peers_fresh": 3,
+            "peers_stale": 1,
+            "peers_expired": 0,
+            "reconnect": {"attempts": 7, "successes": 5}
+        }"#;
+        let h: HealthResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(h.status, "ok");
+        assert_eq!(h.uptime_secs, 3600);
+        assert!(h.coordinator_configured);
+        assert_eq!(h.peer_count, 4);
+        assert_eq!(h.peers_fresh, 3);
+        let r = h.reconnect.unwrap();
+        assert_eq!(r.attempts, 7);
+        assert_eq!(r.successes, 5);
+    }
+
+    #[test]
+    fn health_response_handles_missing_reconnect_block() {
+        // The bridge omits `reconnect` (skip_serializing_if =
+        // "Option::is_none") when the MeshClient is absent.
+        // The CLI must accept that shape and render gracefully.
+        let body = r#"{
+            "status": "ok",
+            "started_at": 1700000000,
+            "now": 1700000010,
+            "uptime_secs": 10,
+            "coordinator_configured": false,
+            "peer_count": 0,
+            "peers_fresh": 0,
+            "peers_stale": 0,
+            "peers_expired": 0
+        }"#;
+        let h: HealthResponse = serde_json::from_str(body).unwrap();
+        assert!(!h.coordinator_configured);
+        assert!(h.reconnect.is_none());
     }
 }
