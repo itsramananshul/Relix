@@ -222,6 +222,13 @@ pub fn descriptor_read() -> CapabilityDescriptor {
     d.cost_class = CostClass::Cheap;
     d.sensitivity_tags = vec!["fs:read".into()];
     d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Read a UTF-8 file under the jail root. Optional max_bytes cap rejects \
+         oversize files (does NOT truncate)."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
     d
 }
 
@@ -234,6 +241,13 @@ pub fn descriptor_write() -> CapabilityDescriptor {
     d.cost_class = CostClass::Cheap;
     d.sensitivity_tags = vec!["fs:write".into()];
     d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Atomic write to a path under the jail root. Modes: 'overwrite' or \
+         'create_new'."
+            .into(),
+    );
+    d.categories = vec!["mutate".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
     d
 }
 
@@ -244,6 +258,13 @@ pub fn descriptor_search() -> CapabilityDescriptor {
     d.cost_class = CostClass::Expensive; // walks the tree
     d.sensitivity_tags = vec!["fs:read".into()];
     d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Name or substring-content search under the jail root. Linear walker \
+         (no index)."
+            .into(),
+    );
+    d.categories = vec!["search".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
     d
 }
 
@@ -254,6 +275,13 @@ pub fn descriptor_patch() -> CapabilityDescriptor {
     d.cost_class = CostClass::Cheap;
     d.sensitivity_tags = vec!["fs:write".into()];
     d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Apply a unified diff to an existing file under the jail root. Refuses \
+         non-existent files and mismatched-context diffs."
+            .into(),
+    );
+    d.categories = vec!["mutate".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
     d
 }
 

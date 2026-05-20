@@ -250,12 +250,16 @@ fn register_builtins(
         })),
     );
     // Advertise the built-ins themselves.
-    manifest.add_capability(relix_core::capability::CapabilityDescriptor::unary(
-        "node.health",
-    ));
-    manifest.add_capability(relix_core::capability::CapabilityDescriptor::unary(
-        "node.manifest",
-    ));
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.health")
+            .with_description("Liveness probe. Returns 'ok' if the node is up.")
+            .with_categories(["health".into()]),
+    );
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.manifest")
+            .with_description("Return this node's manifest (capability list + node identity).")
+            .with_categories(["discover".into()]),
+    );
 }
 
 /// Register node-type-specific capabilities based on `[controller] node_type`.
@@ -281,12 +285,33 @@ fn register_node_type_handlers(
             .map_err(|e: toml::de::Error| format!("[memory] parse: {e}"))?;
         let store = std::sync::Arc::new(crate::nodes::memory::MemoryStore::open(&mem_cfg)?);
         crate::nodes::memory::register(bridge, store);
-        for m in [
-            "memory.write_turn",
-            "memory.recent_for_session",
-            "memory.search",
-        ] {
-            manifest.add_capability(CapabilityDescriptor::unary(m));
+        let memory_caps: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "memory.write_turn",
+                "Append one chat turn (role + text) to a session's memory.",
+                &["persist", "memory"],
+                &["mutate:memory"],
+            ),
+            (
+                "memory.recent_for_session",
+                "Read the N most recent turns for a session, oldest-first.",
+                &["read", "memory"],
+                &["reads:internal"],
+            ),
+            (
+                "memory.search",
+                "FTS5 substring search across all stored turns.",
+                &["search", "memory"],
+                &["reads:internal"],
+            ),
+        ];
+        for (m, desc, cats, tags) in memory_caps {
+            manifest.add_capability(
+                CapabilityDescriptor::unary(*m)
+                    .with_description(*desc)
+                    .with_categories(cats.iter().map(|s| (*s).into()))
+                    .with_sensitivity(tags.iter().map(|s| (*s).into())),
+            );
         }
         tracing::info!(
             db = %mem_cfg.db_path.display(),
@@ -309,7 +334,14 @@ fn register_node_type_handlers(
         // `/v1/models`) can derive a model label without a second RPC.
         manifest.add_capability(
             CapabilityDescriptor::unary("ai.chat")
-                .with_sensitivity([format!("provider:{provider_name}")]),
+                .with_sensitivity([format!("provider:{provider_name}")])
+                .with_description(
+                    "Single-shot chat completion. Provider is selected via the AI \
+                     node's [ai] config; this descriptor carries the provider name \
+                     as a sensitivity tag.",
+                )
+                .with_categories(["generate".into(), "ai".into()])
+                .with_environment_requirements([format!("provider:{provider_name}")]),
         );
         tracing::info!(
             provider = %provider_name,
@@ -344,17 +376,58 @@ fn register_node_type_handlers(
             }
         }
         crate::nodes::coordinator::register(bridge, store);
-        for m in [
-            "task.create",
-            "task.update",
-            "task.event",
-            "task.get",
-            "task.list",
-            "task.recover",
-            "task.attempts",
-            "task.retry",
-        ] {
-            manifest.add_capability(CapabilityDescriptor::unary(m));
+        let coord_caps: &[(&str, &str, &[&str])] = &[
+            (
+                "task.create",
+                "Mint a new Task row in the durable ledger (status=pending).",
+                &["task", "persist"],
+            ),
+            (
+                "task.update",
+                "Mutate status / result / flow pointer / failure class / trace_id. \
+                 Drives the per-attempt timeline as a side effect of status \
+                 transitions.",
+                &["task", "mutate"],
+            ),
+            (
+                "task.event",
+                "Append a free-form event to a Task's chronicle.",
+                &["task", "append"],
+            ),
+            (
+                "task.get",
+                "Read one Task plus its event chronicle.",
+                &["task", "read"],
+            ),
+            (
+                "task.list",
+                "Page through recent Task summaries (most-recently-updated first).",
+                &["task", "read"],
+            ),
+            (
+                "task.recover",
+                "Run the recovery scan now: promotes overdue running tasks to \
+                 interrupted. Operator-only; idempotent.",
+                &["task", "recover", "operator"],
+            ),
+            (
+                "task.attempts",
+                "Return the per-attempt timeline for one Task.",
+                &["task", "read"],
+            ),
+            (
+                "task.retry",
+                "Operator-initiated retry: validates state + retry budget, flips \
+                 status to retrying, emits task.retry_requested.",
+                &["task", "retry", "operator"],
+            ),
+        ];
+        for (m, desc, cats) in coord_caps {
+            manifest.add_capability(
+                CapabilityDescriptor::unary(*m)
+                    .with_description(*desc)
+                    .with_categories(cats.iter().map(|s| (*s).into())),
+            );
         }
         tracing::info!(
             db = %coord_cfg.db_path.display(),
