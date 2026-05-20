@@ -1830,6 +1830,11 @@
         authentication. Put a reverse proxy with auth in front before
         exposing the bridge beyond loopback.
       </div>
+      <div class="row" style="margin-bottom: 12px; gap: 8px;">
+        <button id="test-all-providers">Test all configured</button>
+        <span class="meta" id="test-all-status"></span>
+      </div>
+      <div id="test-all-results" style="display:none; margin-bottom: 12px;"></div>
       <div id="providers-host">
         <div class="loading">loading…</div>
       </div>
@@ -4534,9 +4539,14 @@ function closeDrawer() {
 }
 
 /* ── Providers page ───────────────────────────────────────── */
+let providersTestAllInited = false;
 async function enterProviders() {
   const $host = document.getElementById('providers-host');
   $host.innerHTML = '<div class="loading">loading…</div>';
+  if (!providersTestAllInited) {
+    document.getElementById('test-all-providers').addEventListener('click', testAllProviders);
+    providersTestAllInited = true;
+  }
   try {
     const r = await fetch('/v1/config/providers');
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -4545,6 +4555,83 @@ async function enterProviders() {
   } catch (e) {
     $host.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
+}
+
+/* Run /v1/config/providers/:name/test for every configured
+   provider in parallel. Renders a matrix of name → ok/elapsed
+   so operators can preflight keys before relying on routing.
+   Disabled providers are tested too — their key is still
+   stored and routing may be re-enabled at any moment. */
+async function testAllProviders() {
+  const $btn = document.getElementById('test-all-providers');
+  const $status = document.getElementById('test-all-status');
+  const $results = document.getElementById('test-all-results');
+  $btn.disabled = true;
+  $status.textContent = 'loading provider list…';
+  try {
+    const r = await fetch('/v1/config/providers');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const configured = (j.providers || []).filter(p => p.configured);
+    if (!configured.length) {
+      $results.style.display = '';
+      $results.innerHTML = '<div class="empty" style="padding: 12px;">'
+        + 'No configured providers to test.'
+        + '</div>';
+      $status.textContent = '';
+      return;
+    }
+    $status.textContent = 'testing ' + configured.length + ' provider(s)…';
+    const settled = await Promise.all(configured.map(async (p) => {
+      const t0 = Date.now();
+      try {
+        const tr = await fetch('/v1/config/providers/' + encodeURIComponent(p.name) + '/test', { method: 'POST' });
+        const body = await tr.json().catch(() => ({}));
+        return { name: p.name, body, http_ok: tr.ok, dt: Date.now() - t0 };
+      } catch (e) {
+        return { name: p.name, body: { ok: false, detail: String(e) }, http_ok: false, dt: Date.now() - t0 };
+      }
+    }));
+    renderTestAllMatrix(settled);
+    const okCount = settled.filter(s => s.body && s.body.ok).length;
+    $status.textContent = okCount + ' / ' + settled.length + ' ok';
+  } catch (e) {
+    $results.style.display = '';
+    $results.innerHTML = '<div class="error">test all failed: ' + escapeHtml(String(e)) + '</div>';
+    $status.textContent = '';
+  } finally {
+    $btn.disabled = false;
+  }
+}
+
+function renderTestAllMatrix(rows) {
+  const $results = document.getElementById('test-all-results');
+  const cells = rows.map(r => {
+    const ok = !!(r.body && r.body.ok);
+    const badge = ok
+      ? '<span class="badge ok">ok</span>'
+      : '<span class="badge danger">fail</span>';
+    const code = (r.body && r.body.status_code != null)
+      ? ' · HTTP ' + r.body.status_code
+      : '';
+    const detail = (r.body && r.body.detail) ? escapeHtml(r.body.detail) : '(no detail)';
+    const elapsed = (r.body && r.body.elapsed_ms != null)
+      ? r.body.elapsed_ms
+      : r.dt;
+    return '<tr>'
+      + '<td><code>' + escapeHtml(r.name) + '</code></td>'
+      + '<td>' + badge + '</td>'
+      + '<td class="meta">' + elapsed + 'ms' + code + '</td>'
+      + '<td class="meta">' + detail + '</td>'
+      + '</tr>';
+  }).join('');
+  $results.style.display = '';
+  $results.innerHTML = '<div class="card"><div class="card-body">'
+    + '<table class="data">'
+    + '<thead><tr><th>provider</th><th>status</th><th>elapsed</th><th>detail</th></tr></thead>'
+    + '<tbody>' + cells + '</tbody>'
+    + '</table>'
+    + '</div></div>';
 }
 
 function renderProviders(providers) {

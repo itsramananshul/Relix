@@ -261,6 +261,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_test_all_providers_present() {
+        // M48 (Track C): batch "Test all configured" runs the
+        // existing /v1/config/providers/:name/test endpoint
+        // in parallel for every configured provider and
+        // renders the results as a matrix.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="test-all-providers""#),
+            "test-all-providers button missing"
+        );
+        assert!(
+            body.contains(r#"id="test-all-results""#),
+            "test-all-results container missing"
+        );
+        assert!(
+            body.contains("function testAllProviders"),
+            "testAllProviders handler missing"
+        );
+        assert!(
+            body.contains("renderTestAllMatrix"),
+            "renderTestAllMatrix renderer missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_last_recovery_panel_present() {
         // M47 (Track B): recovery scan result lands in a
         // pinned panel above the tasks list with clickable
