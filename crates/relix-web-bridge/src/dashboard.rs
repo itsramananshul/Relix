@@ -261,6 +261,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_config_shows_bridge_version_and_enabled_providers() {
+        // M51 (Track C): config page renders the bridge build
+        // version + the routable (enabled) provider subset, so
+        // operators can verify which build they're talking to
+        // and which providers will actually receive traffic.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("Bridge version"),
+            "config page should label the bridge version row"
+        );
+        assert!(
+            body.contains("Providers enabled (routable)"),
+            "config page should label the enabled-providers row"
+        );
+        assert!(
+            body.contains("c.bridge_version"),
+            "renderEffectiveConfig should consume bridge_version from /v1/config"
+        );
+        assert!(
+            body.contains("c.providers_enabled"),
+            "renderEffectiveConfig should consume providers_enabled from /v1/config"
+        );
+    }
+
+    #[tokio::test]
     async fn page_task_row_age_column_present() {
         // M50 (Track B): task list ships an age column derived
         // from updated_at. Running/retrying rows older than

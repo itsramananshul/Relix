@@ -808,6 +808,10 @@ pub async fn put_telegram(
 /// secrets file itself.
 #[derive(Debug, Serialize)]
 pub struct EffectiveConfig {
+    /// Bridge crate version from CARGO_PKG_VERSION. Lets
+    /// operators verify they're talking to the build they
+    /// just deployed (matters when restarting in place).
+    pub bridge_version: &'static str,
     pub listen_addr: String,
     pub identity_bundle_path: String,
     pub peers_path: String,
@@ -817,20 +821,33 @@ pub struct EffectiveConfig {
     pub openai_compat: bool,
     pub secrets_path: String,
     pub providers_configured: Vec<String>,
+    /// Subset of `providers_configured` whose `enabled` flag is
+    /// true. Disabled providers stay in `providers_configured`
+    /// so operators can see them but the AI controller treats
+    /// them as routing-ineligible.
+    pub providers_enabled: Vec<String>,
     pub telegram_configured: bool,
 }
 
 /// `GET /v1/config` — effective bridge config (redacted).
 pub async fn get_effective_config(State(state): State<AppState>) -> Json<EffectiveConfig> {
-    let providers_configured = state.secrets.read(|s| {
-        s.all_provider_statuses()
-            .into_iter()
+    let (providers_configured, providers_enabled) = state.secrets.read(|s| {
+        let statuses = s.all_provider_statuses();
+        let configured: Vec<String> = statuses
+            .iter()
             .filter(|p| p.configured)
-            .map(|p| p.name)
-            .collect::<Vec<_>>()
+            .map(|p| p.name.clone())
+            .collect();
+        let enabled: Vec<String> = statuses
+            .iter()
+            .filter(|p| p.configured && p.enabled)
+            .map(|p| p.name.clone())
+            .collect();
+        (configured, enabled)
     });
     let telegram_configured = state.secrets.read(|s| s.telegram_status().configured);
     Json(EffectiveConfig {
+        bridge_version: env!("CARGO_PKG_VERSION"),
         listen_addr: state.cfg.bridge.listen_addr.clone(),
         identity_bundle_path: state.cfg.identity.bundle_path.display().to_string(),
         peers_path: state.cfg.transport.peers_path.display().to_string(),
@@ -845,6 +862,7 @@ pub async fn get_effective_config(State(state): State<AppState>) -> Json<Effecti
         openai_compat: state.cfg.openai_compat.is_some(),
         secrets_path: state.secrets.path().display().to_string(),
         providers_configured,
+        providers_enabled,
         telegram_configured,
     })
 }

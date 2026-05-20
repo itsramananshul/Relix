@@ -5043,7 +5043,17 @@ async function enterConfig() {
   }
 }
 function renderEffectiveConfig(c) {
+  const configured = c.providers_configured || [];
+  const enabled = c.providers_enabled || [];
+  const disabled = configured.filter(n => enabled.indexOf(n) < 0);
+  const providersLine = configured.length
+    ? configured.join(', ')
+      + (disabled.length
+        ? ' (disabled: ' + disabled.join(', ') + ')'
+        : '')
+    : '(none)';
   const rowsHtml = [
+    ['Bridge version',     c.bridge_version || '(unknown)'],
     ['Listen address',     c.listen_addr],
     ['Identity bundle',    c.identity_bundle_path],
     ['Peers file',         c.peers_path],
@@ -5052,10 +5062,9 @@ function renderEffectiveConfig(c) {
     ['Coordinator alias',  c.coordinator_alias || '(none)'],
     ['OpenAI shim',        c.openai_compat ? 'enabled' : 'disabled'],
     ['Secrets file',       c.secrets_path],
-    ['Providers configured',
-        (c.providers_configured || []).length
-          ? c.providers_configured.join(', ')
-          : '(none)'],
+    ['Providers configured', providersLine],
+    ['Providers enabled (routable)',
+        enabled.length ? enabled.join(', ') : '(none)'],
     ['Telegram configured', c.telegram_configured ? 'yes' : 'no'],
   ].map(([k, v]) => (
     '<tr><th style="width: 220px;">' + escapeHtml(k) + '</th>'
