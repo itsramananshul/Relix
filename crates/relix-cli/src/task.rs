@@ -176,7 +176,8 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
-    /// List recent Tasks (most-recently-updated first).
+    /// List recent Tasks (most-recently-updated first). Server-side
+    /// pagination and status filtering since Priority A.
     List {
         #[arg(long)]
         peer: String,
@@ -186,10 +187,22 @@ pub enum Cmd {
         client_key: PathBuf,
         #[arg(long, default_value_t = 50usize)]
         limit: usize,
-        /// Client-side filter on `status`. The Coordinator does not
-        /// filter today (kept compatible with the existing
-        /// `task.list` wire format); we fetch up to `limit` rows then
-        /// hide ones that don't match. Empty = no filter.
+        /// Skip the first N rows (server-side). Pair with --limit
+        /// for cursor-style pagination.
+        #[arg(long, default_value_t = 0usize)]
+        offset: usize,
+        /// Server-side status filter. Empty = no filter.
+        #[arg(long, default_value = "")]
+        status: String,
+    },
+    /// Print the total number of tasks, optionally filtered by status.
+    Count {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
         #[arg(long, default_value = "")]
         status: String,
     },
@@ -407,16 +420,11 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             identity,
             client_key,
             limit,
+            offset,
             status,
         } => {
-            let body = call(
-                &peer,
-                &identity,
-                &client_key,
-                "task.list",
-                limit.to_string().as_bytes(),
-            )
-            .await?;
+            let arg = format!("{limit}|{offset}|{status}");
+            let body = call(&peer, &identity, &client_key, "task.list", arg.as_bytes()).await?;
             let s = std::str::from_utf8(&body).unwrap_or("<binary>");
             let mut count = 0;
             for line in s.lines() {
@@ -425,12 +433,6 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let parts: Vec<&str> = line.splitn(3, '\t').collect();
                 if parts.len() == 3 {
-                    // Client-side filter — the Coordinator's `task.list`
-                    // is unsorted-by-status by design, and the data is
-                    // already in memory.
-                    if !status.is_empty() && parts[1] != status {
-                        continue;
-                    }
                     println!("{}  {:<14}  {}", parts[0].split_at(8).0, parts[1], parts[2]);
                 } else {
                     println!("{line}");
@@ -444,6 +446,22 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                     println!("(no tasks with status={status})");
                 }
             }
+        }
+        Cmd::Count {
+            peer,
+            identity,
+            client_key,
+            status,
+        } => {
+            let body = call(
+                &peer,
+                &identity,
+                &client_key,
+                "task.count",
+                status.as_bytes(),
+            )
+            .await?;
+            print!("{}", std::str::from_utf8(&body).unwrap_or("<binary>"));
         }
     }
     Ok(())
