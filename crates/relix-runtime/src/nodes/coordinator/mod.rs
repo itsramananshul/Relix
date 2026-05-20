@@ -4821,4 +4821,111 @@ mod tests {
         assert!(parsed.get("oldest_candidate_ts").is_none());
         assert!(parsed.get("newest_candidate_ts").is_none());
     }
+
+    // ── Handler-level hardening for task.compact_events ───────────────
+
+    fn compact_ctx(args: &[u8]) -> InvocationCtx {
+        use relix_core::identity::VerifiedIdentity;
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"op"),
+                name: "op".into(),
+                org_id: NodeId::from_pubkey(b"org"),
+                groups: vec!["operators".into()],
+                role: "operator".into(),
+                clearance: "internal".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args: args.to_vec(),
+        }
+    }
+
+    fn compact_err_cause(outcome: HandlerOutcome) -> String {
+        match outcome {
+            HandlerOutcome::Err(d) => d.cause,
+            _ => panic!("expected HandlerOutcome::Err"),
+        }
+    }
+
+    #[test]
+    fn compact_handler_rejects_empty_args() {
+        let s = store();
+        let cause = compact_err_cause(handle_compact_events(&s, &compact_ctx(b"")));
+        assert!(
+            cause.contains("max_age_secs required"),
+            "unexpected cause: {cause}"
+        );
+    }
+
+    #[test]
+    fn compact_handler_rejects_negative_max_age() {
+        let s = store();
+        let cause = compact_err_cause(handle_compact_events(&s, &compact_ctx(b"-1|dry-run")));
+        assert!(
+            cause.contains("bad max_age_secs"),
+            "unexpected cause: {cause}"
+        );
+    }
+
+    #[test]
+    fn compact_handler_rejects_zero_max_age() {
+        // Zero is meaningless — no events would ever match.
+        // Reject explicitly instead of returning an empty
+        // result that's indistinguishable from a real
+        // "nothing matches" outcome.
+        let s = store();
+        let cause = compact_err_cause(handle_compact_events(&s, &compact_ctx(b"0|dry-run")));
+        assert!(
+            cause.contains("bad max_age_secs"),
+            "unexpected cause: {cause}"
+        );
+    }
+
+    #[test]
+    fn compact_handler_rejects_nonnumeric_max_age() {
+        let s = store();
+        let cause = compact_err_cause(handle_compact_events(&s, &compact_ctx(b"never|dry-run")));
+        assert!(
+            cause.contains("bad max_age_secs"),
+            "unexpected cause: {cause}"
+        );
+    }
+
+    #[test]
+    fn compact_handler_rejects_destructive_mode() {
+        // The whole point of the mode guard: a future caller
+        // who passes mode=delete must get a clear "not
+        // implemented" error, not silent acceptance as a
+        // dry-run.
+        let s = store();
+        let cause = compact_err_cause(handle_compact_events(&s, &compact_ctx(b"60|delete")));
+        assert!(
+            cause.contains("not implemented") && cause.contains("dry-run"),
+            "unexpected cause: {cause}"
+        );
+    }
+
+    #[test]
+    fn compact_handler_accepts_dry_run_or_default_mode() {
+        // Default mode (omitted) and explicit dry-run both
+        // succeed and return the same wire shape.
+        let s = store();
+        let r1 = match handle_compact_events(&s, &compact_ctx(b"3600")) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            _ => panic!("expected HandlerOutcome::Ok"),
+        };
+        let r2 = match handle_compact_events(&s, &compact_ctx(b"3600|dry-run")) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            _ => panic!("expected HandlerOutcome::Ok"),
+        };
+        for body in [&r1, &r2] {
+            let v: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("body did not parse:\n{body}\nerror: {e}"));
+            assert_eq!(v.get("mode").and_then(|x| x.as_str()), Some("dry-run"));
+            assert_eq!(v.get("destructive").and_then(|x| x.as_bool()), Some(false));
+        }
+    }
 }
