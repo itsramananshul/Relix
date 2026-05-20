@@ -261,6 +261,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_last_recovery_panel_present() {
+        // M47 (Track B): recovery scan result lands in a
+        // pinned panel above the tasks list with clickable
+        // recovered IDs. Operators must be able to see what
+        // was actually promoted, not just a toasted count.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="last-recovery""#),
+            "last-recovery panel landmark missing"
+        );
+        assert!(
+            body.contains(r#"id="last-recovery-body""#),
+            "last-recovery body container missing"
+        );
+        assert!(
+            body.contains("showLastRecovery"),
+            "showLastRecovery renderer missing"
+        );
+        assert!(
+            body.contains(r#"id="last-recovery-dismiss""#),
+            "last-recovery dismiss control missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_nodes_clickable_present() {
         // M46 (Track A): graph nodes carry data-attempt-filter
         // so clicking a node toggles the timeline filter to

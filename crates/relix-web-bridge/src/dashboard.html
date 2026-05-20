@@ -1724,6 +1724,14 @@
         </div>
       </div>
 
+      <div id="last-recovery" class="card" style="display:none; margin-bottom: 12px; border-color: var(--warn);">
+        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+          <h3 style="margin: 0;">Last recovery</h3>
+          <button id="last-recovery-dismiss" class="chip" style="padding: 2px 8px;">dismiss</button>
+        </div>
+        <div class="card-body" id="last-recovery-body"></div>
+      </div>
+
       <div class="split">
         <div class="card">
           <div class="card-header">
@@ -2140,6 +2148,37 @@ function toast(msg, kind) {
     clearTimeout(timeout);
     $el.remove();
   });
+}
+
+/* Render the most recent recovery scan's result as a
+   pinned panel above the tasks list. Operators can click
+   any recovered ID to drill into the task detail view.
+   Idempotent panel — repeat recoveries overwrite it. */
+function showLastRecovery(ids, count) {
+  const $panel = document.getElementById('last-recovery');
+  const $body = document.getElementById('last-recovery-body');
+  if (!$panel || !$body) return;
+  const ts = new Date().toLocaleTimeString();
+  if (!ids.length) {
+    $body.innerHTML = '<p class="meta" style="margin: 0;">'
+      + 'Scan at ' + escapeHtml(ts)
+      + ' · no overdue running tasks. Nothing to promote.'
+      + '</p>';
+  } else {
+    const linkRow = ids.map(id =>
+      '<a href="#/tasks/' + encodeURIComponent(id) + '" class="id">'
+      + escapeHtml(id) + '</a>'
+    ).join(' ');
+    $body.innerHTML = '<p class="meta" style="margin: 0 0 8px 0;">'
+      + 'Scan at ' + escapeHtml(ts) + ' promoted '
+      + ids.length + ' task' + (ids.length === 1 ? '' : 's')
+      + ' from <code>running</code> to <code>interrupted</code> '
+      + '(failure_class=timeout). Click an ID to inspect.'
+      + '</p>'
+      + '<div class="row" style="flex-wrap: wrap; gap: 6px;">'
+      + linkRow + '</div>';
+  }
+  $panel.style.display = '';
 }
 
 /* ── Overview page ────────────────────────────────────────── */
@@ -2814,11 +2853,19 @@ function initTasks() {
       const r = await fetch('/v1/tasks/recover', { method: 'POST' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const j = await r.json();
-      toast('Recovered ' + (j.count || 0) + ' task(s)', 'ok');
+      const recovered = Array.isArray(j.recovered) ? j.recovered : [];
+      showLastRecovery(recovered, j.count || 0);
+      const summary = recovered.length === 0
+        ? 'Recovery scan complete · no overdue tasks'
+        : 'Recovered ' + recovered.length + ' task(s) · see panel above';
+      toast(summary, recovered.length === 0 ? 'info' : 'ok');
       loadTasks();
     } catch (e) {
       toast('Recovery failed: ' + String(e), 'error');
     }
+  });
+  document.getElementById('last-recovery-dismiss').addEventListener('click', () => {
+    document.getElementById('last-recovery').style.display = 'none';
   });
   document.getElementById('action-retry').addEventListener('click', async () => {
     if (!selectedTaskId) return;
