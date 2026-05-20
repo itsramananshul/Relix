@@ -1253,6 +1253,22 @@
     }
     .chain-gap .arrow { font-size: 14px; color: var(--text-muted); }
     .chain-gap .label { white-space: nowrap; }
+    .chain-gap .edge-anchor {
+      color: var(--accent);
+      cursor: pointer;
+      text-decoration: underline;
+      text-decoration-style: dotted;
+      text-underline-offset: 2px;
+      font-size: 9px;
+    }
+    .chain-gap .edge-anchor:hover {
+      text-decoration-style: solid;
+    }
+    .chain-gap .edge-anchor.no-anchor {
+      color: var(--text-dim);
+      cursor: default;
+      text-decoration: none;
+    }
     .chain-summary {
       margin-top: 8px;
       font-size: var(--text-xs);
@@ -2788,7 +2804,7 @@ function renderDetail(l) {
       </div>`
     : '<div class="meta" style="padding: 12px 14px;">(no chronicle events)</div>';
 
-  const chainBlock = renderRetryChain(l.attempts || []);
+  const chainBlock = renderRetryChain(l.attempts || [], l.edges || []);
   const xrefBlock = renderXrefPanel(l);
   const failureBlock = renderFailurePanel(l);
   // Empty correlation slot — filled async by
@@ -2838,8 +2854,9 @@ function renderDetail(l) {
      attempt # · status · duration · failure_class (if any)
    The gap between pills shows wait time so operators can
    spot "long backoff" vs "instant retry" patterns. */
-function renderRetryChain(attempts) {
+function renderRetryChain(attempts, edges) {
   if (!attempts || attempts.length === 0) return '';
+  edges = edges || [];
 
   // Single attempt: render a compact summary, no chain.
   if (attempts.length === 1) {
@@ -2857,6 +2874,16 @@ function renderRetryChain(attempts) {
 
   // Multi-attempt: full chain with gap markers.
   const sorted = attempts.slice().sort((a, b) => a.attempt_num - b.attempt_num);
+  // Index retried_from edges by (attempt_id → edge) so each
+  // gap can show its real spawned_by_event_id anchor. Edges
+  // that don't reference an event_id still appear; their
+  // anchor is the dim "edge recorded" label.
+  const retryEdgeByAttempt = new Map();
+  for (const e of edges) {
+    if (e.edge_type === 'retried_from' && e.attempt_id != null) {
+      retryEdgeByAttempt.set(e.attempt_id, e);
+    }
+  }
   let totalDur = 0;
   const parts = [];
   // Track segments for the latency stacked bar.
@@ -2878,10 +2905,29 @@ function renderRetryChain(attempts) {
         ? (next.started_at - a.finished_at)
         : null;
       const gapLabel = gap != null && gap >= 0 ? '+' + fmtDuration(gap) : '?';
+      // M38c: render the retried_from edge anchor on this gap
+      // — operators see WHICH event in the chronicle triggered
+      // the retry. Click → filter timeline to that event_id.
+      // When no edge is recorded (older tasks predating the
+      // instrumentation), show the dim "no anchor" placeholder.
+      const edge = retryEdgeByAttempt.get(next.attempt_id);
+      let edgeAnchorHtml = '';
+      if (edge && edge.spawned_by_event_id != null) {
+        edgeAnchorHtml =
+          '<span class="edge-anchor" data-jump-to-event="'
+          + escapeHtml(String(edge.spawned_by_event_id))
+          + '" title="jump to triggering event">← evt '
+          + edge.spawned_by_event_id + '</span>';
+      } else if (edge) {
+        edgeAnchorHtml = '<span class="edge-anchor no-anchor" title="edge recorded but trigger event not linked">edge recorded</span>';
+      } else {
+        edgeAnchorHtml = '<span class="edge-anchor no-anchor" title="edge not recorded (pre-M38a task)">edge not recorded</span>';
+      }
       parts.push(
         '<div class="chain-gap">'
         + '<span class="arrow">→</span>'
         + '<span class="label">' + escapeHtml(gapLabel) + '</span>'
+        + edgeAnchorHtml
         + '</div>'
       );
       if (gap != null && gap > 0) {
@@ -3318,6 +3364,28 @@ document.addEventListener('click', (ev) => {
     if (lastDetailLineage) renderDetail(lastDetailLineage);
     return;
   }
+  const jumpEvent = ev.target.closest('[data-jump-to-event]');
+  if (jumpEvent) {
+    const eventId = parseInt(jumpEvent.dataset.jumpToEvent, 10);
+    // Clear attempt filter so the target event isn't hidden.
+    attemptFilter = null;
+    if (lastDetailLineage) {
+      renderDetail(lastDetailLineage);
+      requestAnimationFrame(() => {
+        const row = document.querySelector(
+          '#detail-view-timeline [data-event-id="' + eventId + '"]');
+        if (row) {
+          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          // Brief flash so the operator's eye lands on it.
+          row.classList.add('attempt-band');
+          setTimeout(() => row.classList.remove('attempt-band'), 1800);
+        } else {
+          toast('event #' + eventId + ' not in current timeline', 'warn');
+        }
+      });
+    }
+    return;
+  }
   const peerLink = ev.target.closest('[data-peer-alias]');
   if (peerLink) {
     const alias = peerLink.dataset.peerAlias;
@@ -3388,7 +3456,9 @@ function renderTimeline(events) {
     const failed = e.event_type === 'task.attempt_finished'
       && e.payload_json
       && e.payload_json.failure_class;
-    return `<div class="timeline-row${rowCls}${failed ? ' attempt-failed' : ''}${i === events.length - 1 ? ' timeline-last' : ''}">
+    const eventIdAttr = e.event_id != null
+      ? ' data-event-id="' + e.event_id + '"' : '';
+    return `<div class="timeline-row${rowCls}${failed ? ' attempt-failed' : ''}${i === events.length - 1 ? ' timeline-last' : ''}"${eventIdAttr}>
       <div class="timeline-time">${escapeHtml(timeAbs)}<span class="rel">${escapeHtml(relLabel)}</span></div>
       <div class="timeline-track"><span class="timeline-marker ${markerCls}"></span></div>
       <div class="timeline-body">

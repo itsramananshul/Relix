@@ -225,6 +225,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_edge_anchor_navigation_present() {
+        // M38c: chain gaps render the retried_from edge anchor
+        // (← evt N) when one is recorded; click jumps to the
+        // triggering event in the timeline. data-jump-to-event
+        // is the routing attribute.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("data-jump-to-event"),
+            "page should ship data-jump-to-event for edge anchors"
+        );
+        assert!(
+            body.contains("retryEdgeByAttempt"),
+            "page should ship the edge-by-attempt index"
+        );
+        // Edges-not-recorded fallback must label itself honestly.
+        assert!(
+            body.contains("edge not recorded"),
+            "older tasks without instrumentation should be labeled honestly"
+        );
+        // Timeline rows should carry data-event-id for precise scroll-to.
+        assert!(
+            body.contains("data-event-id"),
+            "timeline rows should carry data-event-id"
+        );
+    }
+
+    #[tokio::test]
     async fn page_peer_link_navigation_present() {
         // M37: timeline + execution path panel render peer
         // aliases as clickable links into the topology peer
