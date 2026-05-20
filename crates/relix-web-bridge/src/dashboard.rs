@@ -225,6 +225,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_attempt_filter_present() {
+        // M36: chain pills carry data-attempt-filter so clicking
+        // one filters the timeline to that attempt's events.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("data-attempt-filter"),
+            "page should ship data-attempt-filter on chain pills"
+        );
+        assert!(
+            body.contains("clear-attempt-filter"),
+            "page should ship the clear-filter affordance"
+        );
+        assert!(
+            body.contains("attemptFilter"),
+            "page should hold attemptFilter state"
+        );
+    }
+
+    #[tokio::test]
     async fn page_execution_path_panel_present() {
         // M33: task detail surfaces an Execution path panel
         // when the chronicle has capability.invoked events.

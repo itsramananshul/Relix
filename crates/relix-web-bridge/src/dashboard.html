@@ -1191,6 +1191,25 @@
     .chain-pill.cancelled { border-left: 3px solid var(--text-dim); }
     .chain-pill.running { border-left: 3px solid var(--info); }
     .chain-pill.retrying { border-left: 3px solid var(--warn); }
+    .chain-pill.selected {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+    }
+    /* Filter clear-affordance shown in the timeline header
+       when a chain pill is selected. */
+    .timeline-filter-clear {
+      display: inline-flex;
+      gap: 4px;
+      align-items: center;
+      padding: 2px 8px;
+      background: var(--accent-soft);
+      border: 1px solid var(--accent);
+      border-radius: 3px;
+      font-size: 10px;
+      color: var(--text-strong);
+      cursor: pointer;
+    }
+    .timeline-filter-clear:hover { background: var(--accent); }
     .chain-pill .num {
       font-size: 10px;
       text-transform: uppercase;
@@ -2390,6 +2409,14 @@ let selectedTaskId = null;
 let autoTimer = null;
 let eventSource = null;
 let lastEventId = 0;
+// Per-attempt timeline filter. When set, the timeline
+// view shows only events whose attempt_id matches.
+// Set by clicking a chain pill; cleared via the
+// "× clear filter" affordance.
+let attemptFilter = null;
+// Cached lineage so we can re-render the timeline when
+// the attempt filter changes without re-fetching.
+let lastDetailLineage = null;
 let loadedTasks = [];
 let nextCursor = null;
 const TASKS_PAGE_SIZE = 100;
@@ -2653,6 +2680,10 @@ function renderTaskList(items) {
 
 async function loadDetail(id) {
   closeLiveFeed();
+  // Selecting a different task clears any per-attempt
+  // timeline filter so the operator doesn't see stale
+  // selection state on the new task.
+  if (selectedTaskId !== id) attemptFilter = null;
   selectedTaskId = id;
   lastEventId = 0;
   document.querySelectorAll('#task-list tbody tr').forEach(tr => {
@@ -2670,6 +2701,7 @@ async function loadDetail(id) {
     const r = await fetch('/v1/tasks/' + encodeURIComponent(id) + '/lineage');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const lineage = await r.json();
+    lastDetailLineage = lineage;
     renderDetail(lineage);
     for (const e of (lineage.task.events || [])) {
       if (e.event_id > lastEventId) lastEventId = e.event_id;
@@ -2708,19 +2740,36 @@ function renderDetail(l) {
     : '<div class="meta" style="padding: 0 14px 12px;">(no attempts — task never transitioned to running)</div>';
 
   // ── Execution timeline (default view) + raw chronology (toggle) ──
-  const events = l.task.events || [];
+  const allEvents = l.task.events || [];
+  // Apply per-attempt filter when one is set. Filter is
+  // numeric (attempt_id), so we compare to ev.attempt_id.
+  // Events without an attempt_id (e.g. v0 chronicle entries,
+  // task-level transitions like task.created) are excluded
+  // when a filter is active — operators wanting them switch
+  // off the filter via × clear.
+  const events = (attemptFilter != null)
+    ? allEvents.filter(e => e.attempt_id === attemptFilter)
+    : allEvents;
   const timelineHtml = renderTimeline(events);
   const rawHtml = events.length
     ? events.map(e => {
         const cls = eventClass(e.event_type);
         return `<div class="event ${cls}"><span class="type">${escapeHtml(e.event_type)}</span><span class="payload">${escapeHtml(e.payload || '')}</span></div>`;
       }).join('')
-    : '<div class="meta">(no chronicle events)</div>';
+    : '<div class="meta">(no chronicle events match filter)</div>';
 
-  const eventsBlock = events.length
+  const filterChip = (attemptFilter != null)
+    ? '<span class="timeline-filter-clear" data-action="clear-attempt-filter">'
+      + 'attempt ' + attemptFilter + ' only ×'
+      + '</span>'
+    : '';
+  const countLabel = attemptFilter != null
+    ? events.length + ' of ' + allEvents.length
+    : String(allEvents.length);
+  const eventsBlock = allEvents.length
     ? `<div class="events">
         <h3 style="display: flex; align-items: center; justify-content: space-between;">
-          <span>chronology (${events.length})</span>
+          <span>chronology (${countLabel})${filterChip ? ' ' + filterChip : ''}</span>
           <span class="timeline-controls">
             <span class="seg active" data-view="timeline">Timeline</span>
             <span class="seg" data-view="raw">Raw</span>
@@ -3230,13 +3279,30 @@ function fallbackCopy(text) {
   }
 }
 
-/* Delegate copy-btn clicks: works for any data-copy
-   attribute added anywhere in the page (xref panel today,
-   future surfaces tomorrow). */
+/* Global click delegator for data-attribute-driven UI:
+   - data-copy="…"               → clipboard helper
+   - data-attempt-filter="<id>"  → set per-attempt timeline filter
+   - data-action="clear-attempt-filter" → clear filter
+*/
 document.addEventListener('click', (ev) => {
-  const btn = ev.target.closest('button[data-copy]');
-  if (btn) {
-    copyToClipboard(btn.dataset.copy);
+  const copyBtn = ev.target.closest('button[data-copy]');
+  if (copyBtn) {
+    copyToClipboard(copyBtn.dataset.copy);
+    return;
+  }
+  const filterPill = ev.target.closest('[data-attempt-filter]');
+  if (filterPill) {
+    const next = parseInt(filterPill.dataset.attemptFilter, 10);
+    // Toggle: clicking the selected pill clears the filter.
+    attemptFilter = (attemptFilter === next) ? null : next;
+    if (lastDetailLineage) renderDetail(lastDetailLineage);
+    return;
+  }
+  const clearChip = ev.target.closest('[data-action="clear-attempt-filter"]');
+  if (clearChip) {
+    attemptFilter = null;
+    if (lastDetailLineage) renderDetail(lastDetailLineage);
+    return;
   }
 });
 
@@ -3244,10 +3310,17 @@ function renderChainPill(a, durLabel) {
   const failureLine = a.failure_class
     ? '<div class="pill-failure">' + escapeHtml(a.failure_class) + '</div>'
     : '';
-  return '<div class="chain-pill ' + escapeHtml(a.status) + '" title="started ' + a.started_at
+  const selected = (attemptFilter != null && attemptFilter === a.attempt_id) ? ' selected' : '';
+  // data-attempt-filter carries the global attempt_id (not
+  // attempt_num) — that's what task events reference.
+  const filterAttr = (a.attempt_id != null)
+    ? ' data-attempt-filter="' + a.attempt_id + '"'
+    : '';
+  return '<div class="chain-pill ' + escapeHtml(a.status) + selected + '"' + filterAttr
+    + ' title="started ' + a.started_at
     + (a.finished_at != null ? ', finished ' + a.finished_at : '')
     + (a.flow_id ? ', flow ' + a.flow_id : '')
-    + '">'
+    + ' · click to filter timeline to this attempt only">'
     + '<span class="num">attempt ' + a.attempt_num + '</span>'
     + '<span class="pill-status">' + escapeHtml(a.status) + '</span>'
     + '<span class="pill-meta">' + escapeHtml(durLabel) + '</span>'
