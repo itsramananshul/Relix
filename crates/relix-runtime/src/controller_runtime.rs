@@ -351,6 +351,7 @@ fn register_node_type_handlers(
             "task.get",
             "task.list",
             "task.recover",
+            "task.attempts",
         ] {
             manifest.add_capability(CapabilityDescriptor::unary(m));
         }
@@ -358,7 +359,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / recover"
+            "coordinator node: registered task.create / update / event / get / list / recover / attempts"
         );
     }
     if cfg.controller.node_type == "tool" {

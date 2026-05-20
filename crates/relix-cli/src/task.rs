@@ -333,8 +333,7 @@ fn render_pretty_task(raw: &str) -> String {
     for line in &header_lines {
         let _ = writeln!(out, "{line}");
     }
-    let status_callout =
-        status.and_then(|s| status_hint(s).map(|h| format!("[{s}] {h}\n")));
+    let status_callout = status.and_then(|s| status_hint(s).map(|h| format!("[{s}] {h}\n")));
     let class_callout = failure_class
         .and_then(|fc| failure_class_hint(fc).map(|h| format!("[failure: {fc}] {h}\n")));
     if status_callout.is_some() || class_callout.is_some() {

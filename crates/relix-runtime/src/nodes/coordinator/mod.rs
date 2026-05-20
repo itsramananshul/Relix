@@ -354,13 +354,26 @@ impl TaskStore {
     /// Mutate a Task. Any of `status` / `result` / `flow_id` /
     /// `flow_log_path` / `error_kind` / `error_cause` /
     /// `failure_class` may be `None`, in which case the existing
-    /// value is preserved.
+    /// value is preserved. `trace_id` is only consumed on the
+    /// `running` transition that opens a new attempt; it's a no-op
+    /// otherwise.
     ///
-    /// Side effect: when `status` transitions from anything else to
-    /// `running`, `started_at` is stamped (used by the recovery scan
-    /// to detect tasks that have outrun `max_runtime_secs`). The
-    /// stamp is one-shot per row; a subsequent `running` write does
-    /// not clobber the original.
+    /// Side effects (all transactional with the row update):
+    ///
+    /// - `status -> running` with no open attempt opens a new
+    ///   attempt row, stamps its `started_at`, and emits a
+    ///   `task.attempt_started` event.
+    /// - `status -> running` while an attempt is already open is a
+    ///   no-op at the attempt level (idempotent on the bridge side).
+    /// - `status -> completed | failed | cancelled` closes the open
+    ///   attempt with the supplied outcome columns and emits
+    ///   `task.attempt_finished`.
+    /// - First-ever `status -> running` also stamps the task-level
+    ///   `started_at` (one-shot via COALESCE; preserves the
+    ///   first-attempt timestamp as the immutable "task first
+    ///   started" record).
+    /// - Setting `error_cause` mirrors it to `last_failure_reason`
+    ///   so the cause survives a later `retrying` transition.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &self,
@@ -373,16 +386,49 @@ impl TaskStore {
         error_cause: Option<&str>,
         failure_class: Option<&str>,
     ) -> Result<(), CoordinatorError> {
+        self.update_with_trace(
+            task_id,
+            status,
+            result,
+            flow_id,
+            flow_log_path,
+            error_kind,
+            error_cause,
+            failure_class,
+            None,
+        )
+    }
+
+    /// Same as [`update`], but propagates a `trace_id` into the new
+    /// attempt row when the call opens one. Separate entry point so
+    /// callers that don't have a trace_id keep working unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_trace(
+        &self,
+        task_id: &str,
+        status: Option<&str>,
+        result: Option<&str>,
+        flow_id: Option<&str>,
+        flow_log_path: Option<&str>,
+        error_kind: Option<i64>,
+        error_cause: Option<&str>,
+        failure_class: Option<&str>,
+        trace_id: Option<&str>,
+    ) -> Result<(), CoordinatorError> {
         let now = unix_secs();
-        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
         let mut sets: Vec<&str> = vec!["updated_at = ?"];
         let mut args: Vec<rusqlite::types::Value> = vec![now.into()];
         if let Some(v) = status {
             sets.push("status = ?");
             args.push(v.to_string().into());
-            // Stamp started_at on first transition into `running` so
-            // C1.7 timeout detection has a baseline.
             if v == "running" {
+                // Stamp the task-level started_at on the FIRST ever
+                // 'running' transition. Per-attempt timing lives on
+                // task_attempts.started_at; tasks.started_at is the
+                // immutable "first run" record (and what
+                // recover_interrupted falls back to for tasks pre-C2a).
                 sets.push("started_at = COALESCE(started_at, ?)");
                 args.push(now.into());
             }
@@ -415,12 +461,39 @@ impl TaskStore {
         }
         args.push(task_id.to_string().into());
         let sql = format!("UPDATE tasks SET {} WHERE task_id = ?", sets.join(", "));
-        let n = conn
+        let n = tx
             .execute(&sql, rusqlite::params_from_iter(args.iter()))
             .map_err(CoordinatorError::Db)?;
         if n == 0 {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
+
+        // C2a: drive the per-attempt timeline as a side effect of
+        // status transitions. Same transaction as the task row update
+        // so observers can never see the cached `tasks.current_attempt_id`
+        // diverge from the attempts table.
+        if let Some(v) = status {
+            match v {
+                "running" => {
+                    open_attempt_if_needed(&tx, task_id, trace_id, now)?;
+                }
+                "completed" | "failed" | "cancelled" => {
+                    close_open_attempt_if_any(
+                        &tx,
+                        task_id,
+                        v,
+                        flow_id,
+                        flow_log_path,
+                        error_kind,
+                        error_cause,
+                        failure_class,
+                        now,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        tx.commit().map_err(CoordinatorError::Db)?;
         Ok(())
     }
 
@@ -451,39 +524,45 @@ impl TaskStore {
     }
 
     /// Find tasks the Coordinator believes are still `running` but
-    /// whose `started_at + max_runtime_secs` is older than `now_secs`,
-    /// flip them to `interrupted`, and append a `task.interrupted`
-    /// event explaining why. Returns the list of task ids that were
-    /// recovered.
+    /// whose deadline has passed, flip them to `interrupted`, close
+    /// the open attempt as interrupted, and append `task.interrupted`
+    /// + `task.attempt_finished` events. Returns the recovered ids.
     ///
-    /// Only considers tasks that have BOTH `started_at` and
-    /// `max_runtime_secs` set — a `running` row without those is
-    /// indistinguishable from a flow that's making slow progress and
-    /// is left alone (operators can still cancel it via
-    /// `task.update`).
+    /// Deadline source preference: the current attempt's `started_at`
+    /// (the C2a attempt timeline). For tasks created before C2a (no
+    /// `current_attempt_id`) the scan falls back to the task-level
+    /// `started_at`. Both code paths require `max_runtime_secs` set;
+    /// rows without it are left alone.
     ///
-    /// Idempotent: re-running with the same `now_secs` after the first
-    /// pass finds nothing because the rows are no longer `running`.
+    /// Race-guarded: the UPDATE re-asserts `status = 'running'` so an
+    /// in-flight `task.update` from a long-lived executor cannot be
+    /// silently overwritten.
+    ///
+    /// Idempotent: re-running finds nothing because the rows are no
+    /// longer `running`.
     pub fn recover_interrupted(&self, now_secs: i64) -> Result<Vec<String>, CoordinatorError> {
-        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
-        // Collect first so we can append per-task events without
-        // holding the iterator open during writes.
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let mut stmt = conn
             .prepare(
-                "SELECT task_id, started_at, max_runtime_secs
-                 FROM tasks
-                 WHERE status = 'running'
-                   AND started_at IS NOT NULL
-                   AND max_runtime_secs IS NOT NULL
-                   AND (started_at + max_runtime_secs) < ?1",
+                "SELECT t.task_id,
+                        COALESCE(a.started_at, t.started_at) AS scan_started,
+                        t.max_runtime_secs,
+                        t.current_attempt_id
+                 FROM tasks t
+                 LEFT JOIN task_attempts a ON a.attempt_id = t.current_attempt_id
+                 WHERE t.status = 'running'
+                   AND t.max_runtime_secs IS NOT NULL
+                   AND COALESCE(a.started_at, t.started_at) IS NOT NULL
+                   AND (COALESCE(a.started_at, t.started_at) + t.max_runtime_secs) < ?1",
             )
             .map_err(CoordinatorError::Db)?;
-        let candidates: Vec<(String, i64, i64)> = stmt
+        let candidates: Vec<(String, i64, i64, Option<i64>)> = stmt
             .query_map(params![now_secs], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
                 ))
             })
             .map_err(CoordinatorError::Db)?
@@ -491,13 +570,9 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         drop(stmt);
 
-        let tx = conn.unchecked_transaction().map_err(CoordinatorError::Db)?;
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
         let mut recovered = Vec::with_capacity(candidates.len());
-        for (tid, started, max) in candidates {
-            // Race guard: only flip if the row is STILL `running` at
-            // the moment of the update. Without this an in-flight
-            // `task.update` from a long-lived executor could re-write
-            // status between our SELECT and UPDATE.
+        for (tid, started, max, current_attempt) in candidates {
             let n = tx
                 .execute(
                     "UPDATE tasks
@@ -527,10 +602,79 @@ impl TaskStore {
                 params![tid, now_secs, payload],
             )
             .map_err(CoordinatorError::Db)?;
+            // Close the per-attempt row, if any, so the attempt
+            // timeline stays consistent with the task's status field.
+            if let Some(attempt_id) = current_attempt {
+                tx.execute(
+                    "UPDATE task_attempts
+                     SET finished_at = ?1,
+                         status = 'interrupted',
+                         failure_class = 'timeout',
+                         error_cause = ?2
+                     WHERE attempt_id = ?3 AND finished_at IS NULL",
+                    params![
+                        now_secs,
+                        format!(
+                            "deadline_exceeded: started_at={started} max_runtime_secs={max} now={now_secs}"
+                        ),
+                        attempt_id,
+                    ],
+                )
+                .map_err(CoordinatorError::Db)?;
+                tx.execute(
+                    "INSERT INTO task_events (task_id, ts, event_type, payload)
+                     VALUES (?1, ?2, 'task.attempt_finished', ?3)",
+                    params![
+                        tid,
+                        now_secs,
+                        format!("attempt_id={attempt_id} status=interrupted failure_class=timeout"),
+                    ],
+                )
+                .map_err(CoordinatorError::Db)?;
+            }
             recovered.push(tid);
         }
         tx.commit().map_err(CoordinatorError::Db)?;
         Ok(recovered)
+    }
+
+    /// List all attempts of a task in chronological order. Returns
+    /// an empty Vec when the task has no attempts yet (e.g. it was
+    /// created but never transitioned to `running`).
+    pub fn list_attempts(&self, task_id: &str) -> Result<Vec<AttemptView>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT attempt_id, attempt_num, started_at, finished_at, status,
+                        flow_id, flow_log_path, trace_id,
+                        error_kind, error_cause, failure_class
+                 FROM task_attempts
+                 WHERE task_id = ?1
+                 ORDER BY attempt_num ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![task_id], |r| {
+                Ok(AttemptView {
+                    attempt_id: r.get(0)?,
+                    attempt_num: r.get(1)?,
+                    started_at: r.get(2)?,
+                    finished_at: r.get(3)?,
+                    status: r.get(4)?,
+                    flow_id: r.get(5)?,
+                    flow_log_path: r.get(6)?,
+                    trace_id: r.get(7)?,
+                    error_kind: r.get(8)?,
+                    error_cause: r.get(9)?,
+                    failure_class: r.get(10)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
     }
 
     /// Append a free-form event to a Task's history. Returns the
@@ -575,7 +719,8 @@ impl TaskStore {
                         created_at, updated_at,
                         retry_count, retry_policy, max_retries,
                         max_runtime_secs, last_failure_reason,
-                        last_failure_class, started_at
+                        last_failure_class, started_at,
+                        attempt_count, current_attempt_id
                  FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 |r| {
@@ -600,6 +745,8 @@ impl TaskStore {
                         last_failure_reason: r.get(16)?,
                         last_failure_class: r.get(17)?,
                         started_at: r.get(18)?,
+                        attempt_count: r.get(19)?,
+                        current_attempt_id: r.get(20)?,
                         events: Vec::new(),
                     })
                 },
@@ -685,6 +832,11 @@ pub struct TaskView {
     pub last_failure_reason: Option<String>,
     pub last_failure_class: Option<String>,
     pub started_at: Option<i64>,
+    /// C2a attempt lineage. Cached pointers; the authoritative
+    /// per-attempt timeline lives in `task_attempts` and is fetched
+    /// via [`TaskStore::list_attempts`].
+    pub attempt_count: i64,
+    pub current_attempt_id: Option<i64>,
     pub events: Vec<TaskEvent>,
 }
 
@@ -704,6 +856,29 @@ pub struct TaskSummary {
     pub title: String,
     pub status: String,
     pub updated_at: i64,
+}
+
+/// One execution attempt of a Task, returned by `task.attempts` and
+/// folded into `task.get`'s rendered output. `attempt_num` is 1-based
+/// per task; `attempt_id` is globally monotonic.
+#[derive(Debug, Clone)]
+pub struct AttemptView {
+    pub attempt_id: i64,
+    pub attempt_num: i64,
+    pub started_at: i64,
+    /// `None` while the attempt is still in flight (`status =
+    /// 'running'`).
+    pub finished_at: Option<i64>,
+    /// One of `running` / `completed` / `failed` / `cancelled` /
+    /// `interrupted`. Drift-resistant: the same vocabulary the
+    /// `task.update` handler accepts.
+    pub status: String,
+    pub flow_id: Option<String>,
+    pub flow_log_path: Option<String>,
+    pub trace_id: Option<String>,
+    pub error_kind: Option<i64>,
+    pub error_cause: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 // ──────────────────────────── Capability registration ──────────────────────
@@ -767,6 +942,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_recover(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.attempts",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_attempts(&s, &ctx) }
             })),
         );
     }
@@ -946,6 +1131,40 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// `task.attempts` — list every attempt of a task in chronological
+/// order. Args: `task_id`. Returns one tab-delimited line per
+/// attempt: `attempt_num\tstatus\tstarted_at\tfinished_at|-\tfailure_class|-\tflow_id|-`.
+/// Empty body when the task has no attempts yet (created but never
+/// transitioned to running).
+fn handle_attempts(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.attempts utf8: {e}")),
+    };
+    if task_id.is_empty() {
+        return invalid("task.attempts: task_id required".to_string());
+    }
+    match store.list_attempts(task_id) {
+        Ok(rows) => {
+            let mut buf = String::new();
+            for a in rows {
+                let finished = a
+                    .finished_at
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let class = a.failure_class.as_deref().unwrap_or("-");
+                let flow = a.flow_id.as_deref().unwrap_or("-");
+                buf.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    a.attempt_num, a.status, a.started_at, finished, class, flow,
+                ));
+            }
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("task.attempts: {e}")),
+    }
+}
+
 /// Operator-triggered recovery scan. Equivalent to the one the
 /// coordinator runs at startup, but on-demand — useful when an
 /// operator just set `max_runtime_secs` on a long-running task and
@@ -1012,6 +1231,10 @@ fn render_task_view(v: &TaskView) -> String {
     }
     if let Some(x) = v.last_failure_reason.as_ref() {
         let _ = writeln!(s, "last_failure_reason={}", x);
+    }
+    let _ = writeln!(s, "attempt_count={}", v.attempt_count);
+    if let Some(x) = v.current_attempt_id {
+        let _ = writeln!(s, "current_attempt_id={}", x);
     }
     let _ = writeln!(s, "event_count={}", v.events.len());
     // Events as a simple JSON array. We hand-build the JSON to avoid
@@ -1102,6 +1325,28 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
             FOREIGN KEY (task_id) REFERENCES tasks(task_id)
         );
         CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id, event_id);
+
+        -- C2a: per-attempt execution records. The `tasks` row carries
+        -- the cached "latest attempt" pointer for fast lookup; the
+        -- authoritative per-attempt timeline lives here.
+        CREATE TABLE IF NOT EXISTS task_attempts (
+            attempt_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id       TEXT    NOT NULL,
+            attempt_num   INTEGER NOT NULL,
+            started_at    INTEGER NOT NULL,
+            finished_at   INTEGER,
+            status        TEXT    NOT NULL,
+            flow_id       TEXT,
+            flow_log_path TEXT,
+            trace_id      TEXT,
+            error_kind    INTEGER,
+            error_cause   TEXT,
+            failure_class TEXT,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id),
+            UNIQUE (task_id, attempt_num)
+        );
+        CREATE INDEX IF NOT EXISTS task_attempts_by_task
+            ON task_attempts(task_id, attempt_num);
         "#,
     )
     .map_err(CoordinatorError::Db)?;
@@ -1119,6 +1364,10 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE tasks ADD COLUMN last_failure_reason TEXT",
         "ALTER TABLE tasks ADD COLUMN last_failure_class TEXT",
         "ALTER TABLE tasks ADD COLUMN started_at INTEGER",
+        // C2a: cached pointer into task_attempts. NULL until the first
+        // 'running' transition opens an attempt.
+        "ALTER TABLE tasks ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN current_attempt_id INTEGER",
     ];
     for sql in alters {
         // Best-effort. The only error we expect is "duplicate column
@@ -1140,6 +1389,150 @@ fn unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ──────────────────────────── Attempt helpers (C2a) ─────────────────────────
+
+/// Open a new attempt row if and only if the task has no open
+/// attempt right now. Idempotent on the bridge side: a re-asserted
+/// `running` status is a no-op at the attempt level.
+///
+/// Always called inside a transaction with the parent `update` (or
+/// the `recover` retry-restart path) so observers cannot see the
+/// cached `tasks.current_attempt_id` diverge from the attempts table.
+fn open_attempt_if_needed(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    trace_id: Option<&str>,
+    now: i64,
+) -> Result<(), CoordinatorError> {
+    let current: Option<(Option<i64>, i64)> = tx
+        .query_row(
+            "SELECT current_attempt_id, attempt_count FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)?;
+    let Some((current_id, count)) = current else {
+        return Err(CoordinatorError::NotFound(task_id.to_string()));
+    };
+    if let Some(aid) = current_id {
+        // If the current attempt is still open, leave it alone.
+        let still_open: bool = tx
+            .query_row(
+                "SELECT finished_at IS NULL FROM task_attempts WHERE attempt_id = ?1",
+                params![aid],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        if still_open {
+            return Ok(());
+        }
+    }
+    let next_num = count + 1;
+    tx.execute(
+        "INSERT INTO task_attempts
+            (task_id, attempt_num, started_at, status, trace_id)
+         VALUES (?1, ?2, ?3, 'running', ?4)",
+        params![task_id, next_num, now, trace_id],
+    )
+    .map_err(CoordinatorError::Db)?;
+    let new_id = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE tasks
+         SET attempt_count = ?1,
+             current_attempt_id = ?2
+         WHERE task_id = ?3",
+        params![next_num, new_id, task_id],
+    )
+    .map_err(CoordinatorError::Db)?;
+    let payload = match trace_id {
+        Some(t) => format!("attempt_id={new_id} attempt_num={next_num} trace_id={t}"),
+        None => format!("attempt_id={new_id} attempt_num={next_num}"),
+    };
+    tx.execute(
+        "INSERT INTO task_events (task_id, ts, event_type, payload)
+         VALUES (?1, ?2, 'task.attempt_started', ?3)",
+        params![task_id, now, payload],
+    )
+    .map_err(CoordinatorError::Db)?;
+    Ok(())
+}
+
+/// Close the currently-open attempt row, if any, with the supplied
+/// terminal outcome columns. Emits `task.attempt_finished`. Silently
+/// no-ops when there is no open attempt — this preserves the pre-
+/// C2a flow where a caller may go straight from `pending` to a
+/// terminal status without an intervening `running` transition.
+#[allow(clippy::too_many_arguments)]
+fn close_open_attempt_if_any(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    new_status: &str,
+    flow_id: Option<&str>,
+    flow_log_path: Option<&str>,
+    error_kind: Option<i64>,
+    error_cause: Option<&str>,
+    failure_class: Option<&str>,
+    now: i64,
+) -> Result<(), CoordinatorError> {
+    let current_id: Option<i64> = tx
+        .query_row(
+            "SELECT current_attempt_id FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)?
+        .flatten();
+    let Some(aid) = current_id else {
+        return Ok(());
+    };
+    let still_open: Option<bool> = tx
+        .query_row(
+            "SELECT finished_at IS NULL FROM task_attempts WHERE attempt_id = ?1",
+            params![aid],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)?;
+    if !matches!(still_open, Some(true)) {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE task_attempts
+         SET finished_at = ?1,
+             status = ?2,
+             flow_id = COALESCE(?3, flow_id),
+             flow_log_path = COALESCE(?4, flow_log_path),
+             error_kind = COALESCE(?5, error_kind),
+             error_cause = COALESCE(?6, error_cause),
+             failure_class = COALESCE(?7, failure_class)
+         WHERE attempt_id = ?8",
+        params![
+            now,
+            new_status,
+            flow_id,
+            flow_log_path,
+            error_kind,
+            error_cause,
+            failure_class,
+            aid,
+        ],
+    )
+    .map_err(CoordinatorError::Db)?;
+    let mut payload = format!("attempt_id={aid} status={new_status}");
+    if let Some(fc) = failure_class {
+        payload.push_str(&format!(" failure_class={fc}"));
+    }
+    tx.execute(
+        "INSERT INTO task_events (task_id, ts, event_type, payload)
+         VALUES (?1, ?2, 'task.attempt_finished', ?3)",
+        params![task_id, now, payload],
+    )
+    .map_err(CoordinatorError::Db)?;
+    Ok(())
 }
 
 // rusqlite::OptionalExtension brings `.optional()` into scope; importing
@@ -1529,5 +1922,225 @@ mod tests {
         assert!(RetryPolicy::parse("forever").is_none());
         assert_eq!(RetryPolicy::None.as_str(), "none");
         assert_eq!(RetryPolicy::Bounded.as_str(), "bounded");
+    }
+
+    // ── C2a: per-attempt lineage ──────────────────────────────────────
+
+    #[test]
+    fn running_transition_opens_attempt_row() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // No attempts yet.
+        assert_eq!(s.list_attempts(&tid).unwrap().len(), 0);
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.attempt_count, 0);
+        assert!(v.current_attempt_id.is_none());
+
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.attempt_count, 1);
+        let cur = v.current_attempt_id.expect("attempt opened");
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_id, cur);
+        assert_eq!(attempts[0].attempt_num, 1);
+        assert_eq!(attempts[0].status, "running");
+        assert!(attempts[0].finished_at.is_none());
+        // task.attempt_started event landed.
+        assert!(
+            v.events
+                .iter()
+                .any(|e| e.event_type == "task.attempt_started")
+        );
+    }
+
+    #[test]
+    fn running_transition_is_idempotent_at_attempt_level() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        // Still one attempt, not two.
+        assert_eq!(s.list_attempts(&tid).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_transition_closes_open_attempt() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("completed"),
+            Some("ok"),
+            Some("flowdeadbeef"),
+            Some("/tmp/f.log"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "completed");
+        assert!(attempts[0].finished_at.is_some());
+        assert_eq!(attempts[0].flow_id.as_deref(), Some("flowdeadbeef"));
+        assert_eq!(attempts[0].flow_log_path.as_deref(), Some("/tmp/f.log"));
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v.events
+                .iter()
+                .any(|e| e.event_type == "task.attempt_finished")
+        );
+    }
+
+    #[test]
+    fn terminal_without_running_is_a_clean_noop_on_attempts() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Pre-C2a flow: pending -> completed straight, no running
+        // transition. Attempts table stays empty, no error.
+        s.update(
+            &tid,
+            Some("completed"),
+            Some("ok"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.list_attempts(&tid).unwrap().len(), 0);
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.attempt_count, 0);
+        assert_eq!(v.status, "completed");
+    }
+
+    #[test]
+    fn retry_cycle_creates_second_attempt() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .unwrap();
+        // Attempt 1: running -> failed.
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            Some(error_kinds::TRANSPORT as i64),
+            Some("net flake"),
+            Some("transient"),
+        )
+        .unwrap();
+        // Operator requests retry: status -> retrying. No attempt opens.
+        s.update(&tid, Some("retrying"), None, None, None, None, None, None)
+            .unwrap();
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 1, "retrying does not open a new attempt");
+        // Bridge picks it up: running -> completed.
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("completed"),
+            Some("ok this time"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, "failed");
+        assert_eq!(attempts[0].failure_class.as_deref(), Some("transient"));
+        assert_eq!(attempts[1].status, "completed");
+        assert!(attempts[1].started_at >= attempts[0].finished_at.unwrap());
+    }
+
+    #[test]
+    fn recovery_scan_closes_open_attempt_as_interrupted() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.list_attempts(&tid).unwrap()[0].started_at;
+        let recovered = s.recover_interrupted(started + 60).unwrap();
+        assert_eq!(recovered.len(), 1);
+        let attempts = s.list_attempts(&tid).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "interrupted");
+        assert_eq!(attempts[0].failure_class.as_deref(), Some("timeout"));
+        assert!(attempts[0].finished_at.is_some());
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v.events
+                .iter()
+                .any(|e| e.event_type == "task.attempt_finished"
+                    && e.payload.contains("failure_class=timeout"))
+        );
+    }
+
+    #[test]
+    fn recovery_scan_uses_current_attempt_deadline_not_first_attempt() {
+        // Regression guard for the C2a semantics shift: the scan
+        // should key off the CURRENT attempt's started_at, not the
+        // immutable task.started_at from the first attempt.
+        //
+        // Setup uses small (2s) deadline + 2.5s sleep so the test
+        // doesn't depend on sub-second precision. We then check
+        // `recover_interrupted(now)` for `now = second_started + 1`,
+        // which is past attempt-1's 2-second deadline but inside
+        // attempt-2's.
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, Some(2))
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let first_started = s.list_attempts(&tid).unwrap()[0].started_at;
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("blip"),
+            Some("transient"),
+        )
+        .unwrap();
+        // Wait long enough that attempt 2's started_at is past
+        // attempt 1's deadline (2s) by at least one whole second.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        s.update(&tid, Some("retrying"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let second_started = s.list_attempts(&tid).unwrap()[1].started_at;
+        // Sanity: attempt 2 started after attempt 1's deadline.
+        assert!(second_started >= first_started + 2);
+        // Choose `now` inside attempt-2's window but past attempt-1's.
+        let now = second_started + 1;
+        assert!(now > first_started + 2, "now past attempt-1 deadline");
+        assert!(now < second_started + 2, "now inside attempt-2 deadline");
+        let recovered = s.recover_interrupted(now).unwrap();
+        assert!(
+            recovered.is_empty(),
+            "scan must use current attempt's deadline, not task.started_at"
+        );
+        assert_eq!(s.get(&tid).unwrap().unwrap().status, "running");
     }
 }
