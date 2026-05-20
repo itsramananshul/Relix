@@ -2947,6 +2947,81 @@ mod tests {
         }
     }
 
+    // ── Priority F hardening: pagination edge cases ───────────────────
+
+    #[test]
+    fn list_paginated_offset_past_end_returns_empty() {
+        let s = store();
+        for i in 0..3 {
+            mk(&s, &format!("t{i}"), "f", "{}", "o");
+        }
+        let v = s.list_paginated(50, 99, None).unwrap();
+        assert!(v.is_empty(), "offset past end must return empty, got {v:?}");
+    }
+
+    #[test]
+    fn list_paginated_huge_limit_is_clamped() {
+        let s = store();
+        for i in 0..5 {
+            mk(&s, &format!("t{i}"), "f", "{}", "o");
+        }
+        // Request u32::MAX rows; expect at most max_list rows but in
+        // practice limited by what exists. Verify it doesn't OOM or
+        // panic.
+        let v = s.list_paginated(usize::MAX / 2, 0, None).unwrap();
+        assert_eq!(v.len(), 5);
+    }
+
+    #[test]
+    fn list_events_after_huge_limit_is_clamped() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        for i in 0..3 {
+            s.append_event(&tid, "step", &format!("e{i}")).unwrap();
+        }
+        let v = s.list_events_after(&tid, 0, usize::MAX / 2).unwrap();
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn list_events_after_negative_after_id_treats_as_zero() {
+        // The SELECT condition is `event_id > ?`. SQLite treats a
+        // negative integer literally — every positive event_id is
+        // greater than -100, so the call returns everything. Verify.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.append_event(&tid, "step", "a").unwrap();
+        let v = s.list_events_after(&tid, -100, 50).unwrap();
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn count_with_unknown_status_returns_zero_not_error() {
+        let s = store();
+        mk(&s, "t", "f", "{}", "o");
+        // The Coordinator does not validate status against an enum —
+        // operators can write any string. Asking for the count of a
+        // status that doesn't appear must return 0, not error.
+        let n = s.count(Some("definitely_not_a_real_status")).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn append_event_with_special_chars_does_not_break_chronicle() {
+        // Operator-defined events may contain payload chars that
+        // would break naive rendering. Verify they survive
+        // store -> list_events_after.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let payload = "key=\"value\" key2=val with spaces\tand\ttabs\nand newlines";
+        s.append_event(&tid, "ops.custom", payload).unwrap();
+        let v = s.list_events_after(&tid, 0, 50).unwrap();
+        assert_eq!(v.len(), 1);
+        // The Coordinator stores the payload verbatim (escaping is
+        // the renderer's concern, not the store's).
+        assert_eq!(v[0].payload, payload);
+    }
+
     #[test]
     fn list_backward_compat_old_signature_still_works() {
         // The old `list(limit)` method must keep behaving like the
