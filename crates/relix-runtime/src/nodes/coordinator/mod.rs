@@ -85,7 +85,8 @@
 //! | `task.update`   | `task_id\|status\|result\|flow_id\|flow_log_path\|error_kind\|error_cause\|failure_class\|trace_id` | `ok\n` |
 //! | `task.event`    | `task_id\|event_type\|payload` | `event_id` (integer as string) |
 //! | `task.get`      | `task_id` | multi-line `key=value` summary + `events:` JSON array |
-//! | `task.list`     | `` (empty) or `limit` (default 50) | one `task_id\tstatus\ttitle\n` per line |
+//! | `task.list`     | `` (empty) or `limit\|offset\|status` (limit default 50, all optional) | one `task_id\tstatus\ttitle\n` per line |
+//! | `task.count`    | `` (empty) or `<status>` | `count=N\n` |
 //! | `task.recover`  | (empty) | one `task_id\n` per recovered task, then `recovered=N\n` |
 //! | `task.attempts` | `task_id` | one `attempt_num\tstatus\tstarted_at\tfinished_at\|-\tfailure_class\|-\tflow_id\|-\n` per attempt |
 //! | `task.retry`    | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted retry_count=N budget=M\n` / INVALID_ARGS with cause |
@@ -911,30 +912,93 @@ impl TaskStore {
     }
 
     /// Most-recently-updated tasks first, capped at `min(limit, max_list)`.
+    /// Equivalent to `list_paginated(limit, 0, None)`.
     pub fn list(&self, limit: usize) -> Result<Vec<TaskSummary>, CoordinatorError> {
+        self.list_paginated(limit, 0, None)
+    }
+
+    /// Most-recently-updated tasks first with offset-based pagination
+    /// and optional server-side status filter. Returns at most
+    /// `min(limit, max_list)` rows.
+    ///
+    /// `offset` skips the first N rows of the (filtered) ordering.
+    /// Using offset is the operator-simple choice; cursor-based
+    /// pagination is a follow-up if `tasks_updated` index growth
+    /// becomes a measurable concern.
+    ///
+    /// `status_filter`, when set, narrows to rows whose `status`
+    /// column matches exactly. Backed by the `tasks_status` index
+    /// (added in C1a).
+    pub fn list_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<TaskSummary>, CoordinatorError> {
         let cap = limit.clamp(1, self.max_list);
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
-        let mut stmt = conn
-            .prepare(
+        let (sql, has_filter) = match status_filter {
+            Some(_) => (
                 "SELECT task_id, title, status, updated_at
-                 FROM tasks ORDER BY updated_at DESC LIMIT ?1",
-            )
-            .map_err(CoordinatorError::Db)?;
-        let rows = stmt
-            .query_map(params![cap as i64], |r| {
-                Ok(TaskSummary {
-                    task_id: r.get(0)?,
-                    title: r.get(1)?,
-                    status: r.get(2)?,
-                    updated_at: r.get(3)?,
-                })
+                 FROM tasks WHERE status = ?3
+                 ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2",
+                true,
+            ),
+            None => (
+                "SELECT task_id, title, status, updated_at
+                 FROM tasks ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2",
+                false,
+            ),
+        };
+        let mut stmt = conn.prepare(sql).map_err(CoordinatorError::Db)?;
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(TaskSummary {
+                task_id: r.get(0)?,
+                title: r.get(1)?,
+                status: r.get(2)?,
+                updated_at: r.get(3)?,
             })
-            .map_err(CoordinatorError::Db)?;
+        };
         let mut out = Vec::with_capacity(cap);
-        for r in rows {
-            out.push(r.map_err(CoordinatorError::Db)?);
+        if has_filter {
+            let rows = stmt
+                .query_map(
+                    params![cap as i64, offset as i64, status_filter.unwrap()],
+                    map_row,
+                )
+                .map_err(CoordinatorError::Db)?;
+            for r in rows {
+                out.push(r.map_err(CoordinatorError::Db)?);
+            }
+        } else {
+            let rows = stmt
+                .query_map(params![cap as i64, offset as i64], map_row)
+                .map_err(CoordinatorError::Db)?;
+            for r in rows {
+                out.push(r.map_err(CoordinatorError::Db)?);
+            }
         }
         Ok(out)
+    }
+
+    /// Total task count, optionally filtered by status. Drives
+    /// pagination "total" hints for operator tooling that wants to
+    /// render "N of M" without walking every page.
+    pub fn count(&self, status_filter: Option<&str>) -> Result<i64, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let n: i64 = match status_filter {
+            Some(s) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE status = ?1",
+                    params![s],
+                    |r| r.get(0),
+                )
+                .map_err(CoordinatorError::Db)?,
+            None => conn
+                .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
+                .map_err(CoordinatorError::Db)?,
+        };
+        Ok(n)
     }
 }
 
@@ -1094,6 +1158,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_retry(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.count",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_count(&s, &ctx) }
             })),
         );
     }
@@ -1260,12 +1334,25 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(s) => s.trim(),
         Err(e) => return invalid(format!("task.list utf8: {e}")),
     };
-    let limit: usize = if s.is_empty() {
-        50
-    } else {
-        s.parse().unwrap_or(50)
-    };
-    match store.list(limit) {
+    // Wire format: `<limit>|<offset>|<status>`. All three optional.
+    // Empty body == limit=50, offset=0, no status filter. Callers
+    // that pass just `<N>` keep working (offset defaults to 0, status
+    // to none). New callers can paginate via `100|200|failed`.
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let limit: usize = parts
+        .first()
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let offset: usize = parts
+        .get(1)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let status_filter = parts.get(2).copied().filter(|v| !v.is_empty());
+    match store.list_paginated(limit, offset, status_filter) {
         Ok(rows) => {
             let mut buf = String::new();
             for r in rows {
@@ -1281,6 +1368,23 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
             HandlerOutcome::Ok(buf.into_bytes())
         }
         Err(e) => internal(format!("task.list: {e}")),
+    }
+}
+
+/// `task.count` — total task count, optionally filtered by status.
+/// Arg: empty or `<status>`. Returns a single line `count=N\n`.
+///
+/// Drives "N of M" pagination hints in operator UIs without forcing
+/// them to walk every page.
+fn handle_count(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.count utf8: {e}")),
+    };
+    let status_filter = if s.is_empty() { None } else { Some(s) };
+    match store.count(status_filter) {
+        Ok(n) => HandlerOutcome::Ok(format!("count={n}\n").into_bytes()),
+        Err(e) => internal(format!("task.count: {e}")),
     }
 }
 
@@ -2616,6 +2720,82 @@ mod tests {
         // since the first running used the initial slot and request_retry
         // bumps it for the SECOND through 10th).
         assert!(v.retry_count >= 1, "retry_count={}", v.retry_count);
+    }
+
+    // ── Priority A: pagination + count ────────────────────────────────
+
+    #[test]
+    fn list_paginated_offset_skips_rows() {
+        let s = store();
+        // Create 5 tasks with deterministic-ish ordering: each new
+        // task is the most-recently-updated, so list returns them
+        // in reverse-creation order.
+        for i in 0..5 {
+            mk(&s, &format!("t{i}"), "f", "{}", "o");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let page1 = s.list_paginated(2, 0, None).unwrap();
+        let page2 = s.list_paginated(2, 2, None).unwrap();
+        let page3 = s.list_paginated(2, 4, None).unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page3.len(), 1);
+        // No duplicates across pages.
+        let ids: std::collections::HashSet<String> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|r| r.task_id.clone())
+            .collect();
+        assert_eq!(ids.len(), 5);
+    }
+
+    #[test]
+    fn list_paginated_status_filter_only_matches() {
+        let s = store();
+        let t1 = mk(&s, "a", "f", "{}", "o");
+        let _t2 = mk(&s, "b", "f", "{}", "o");
+        let t3 = mk(&s, "c", "f", "{}", "o");
+        s.update(&t1, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&t3, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let running = s.list_paginated(50, 0, Some("running")).unwrap();
+        assert_eq!(running.len(), 2);
+        assert!(running.iter().all(|r| r.status == "running"));
+        let pending = s.list_paginated(50, 0, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, "pending");
+        let none_match = s.list_paginated(50, 0, Some("nope")).unwrap();
+        assert!(none_match.is_empty());
+    }
+
+    #[test]
+    fn count_total_and_filtered() {
+        let s = store();
+        for i in 0..7 {
+            let tid = mk(&s, &format!("t{i}"), "f", "{}", "o");
+            if i % 2 == 0 {
+                s.update(&tid, Some("running"), None, None, None, None, None, None)
+                    .unwrap();
+            }
+        }
+        assert_eq!(s.count(None).unwrap(), 7);
+        assert_eq!(s.count(Some("pending")).unwrap(), 3);
+        assert_eq!(s.count(Some("running")).unwrap(), 4);
+        assert_eq!(s.count(Some("nope")).unwrap(), 0);
+    }
+
+    #[test]
+    fn list_backward_compat_old_signature_still_works() {
+        // The old `list(limit)` method must keep behaving like the
+        // paginated version with offset=0 and no filter — the bridge
+        // and CLI both call it.
+        let s = store();
+        mk(&s, "a", "f", "{}", "o");
+        mk(&s, "b", "f", "{}", "o");
+        let v = s.list(10).unwrap();
+        assert_eq!(v.len(), 2);
     }
 
     #[test]

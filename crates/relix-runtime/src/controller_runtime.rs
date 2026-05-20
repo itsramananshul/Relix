@@ -401,7 +401,14 @@ fn register_node_type_handlers(
             ),
             (
                 "task.list",
-                "Page through recent Task summaries (most-recently-updated first).",
+                "Page through Task summaries (limit|offset|status). Most- \
+                 recently-updated first.",
+                &["task", "read"],
+            ),
+            (
+                "task.count",
+                "Total task count, optionally filtered by status. Drives \
+                 pagination 'N of M' hints.",
                 &["task", "read"],
             ),
             (
@@ -433,7 +440,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / recover / attempts / retry"
+            "coordinator node: registered task.create / update / event / get / list / count / recover / attempts / retry"
         );
     }
     if cfg.controller.node_type == "tool" {

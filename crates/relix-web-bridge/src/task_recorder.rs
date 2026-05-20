@@ -132,10 +132,31 @@ impl TaskRecorder {
     /// Read-only `task.list` passthrough. Unlike the write methods
     /// this is NOT fail-soft — callers (e.g. the bridge's
     /// `/v1/tasks` endpoint) want to surface errors to the operator.
+    ///
+    /// Equivalent to `list_paginated(limit, 0, "")`. Kept for older
+    /// call sites; new code should call `list_paginated` directly.
+    #[allow(dead_code)]
     pub async fn list(&self, limit: usize) -> Result<String, String> {
-        let arg = limit.to_string();
+        self.list_paginated(limit, 0, "").await
+    }
+
+    /// Server-side paginated + filtered passthrough. `status` empty
+    /// means no filter.
+    pub async fn list_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+        status: &str,
+    ) -> Result<String, String> {
+        let arg = format!("{limit}|{offset}|{status}");
         let bytes = self.call("task.list", arg.as_bytes()).await?;
         String::from_utf8(bytes).map_err(|e| format!("task.list utf8: {e}"))
+    }
+
+    /// `task.count` passthrough.
+    pub async fn count(&self, status: &str) -> Result<String, String> {
+        let bytes = self.call("task.count", status.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.count utf8: {e}"))
     }
 
     /// Read-only `task.get` passthrough. Returns the Coordinator's

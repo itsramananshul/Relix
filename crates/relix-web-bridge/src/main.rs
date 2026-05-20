@@ -180,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Task-native read API (Track 2). Bridge stays translation-only:
         // each route is a thin forwarder to a Coordinator capability.
         .route("/v1/tasks", get(tasks::list))
+        .route("/v1/tasks/count", get(tasks::count))
         .route("/v1/tasks/:id", get(tasks::get_one))
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
         .route("/v1/tasks/:id/summary", get(tasks::summary))

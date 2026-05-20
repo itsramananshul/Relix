@@ -322,9 +322,15 @@ For browser / curl / scripting flows that don't want a libp2p hop,
 the bridge exposes the same data as JSON:
 
 ```bash
-# List recent tasks. Optional status filter and limit.
+# List recent tasks. Server-side pagination + filter (Priority A).
 curl http://127.0.0.1:19791/v1/tasks
 curl 'http://127.0.0.1:19791/v1/tasks?status=interrupted&limit=20'
+curl 'http://127.0.0.1:19791/v1/tasks?status=failed&limit=50&offset=100'
+
+# Total count for the "N of M" pagination footer.
+curl http://127.0.0.1:19791/v1/tasks/count
+curl 'http://127.0.0.1:19791/v1/tasks/count?status=failed'
+# -> {"count":17}
 
 # One task with full chronicle.
 curl http://127.0.0.1:19791/v1/tasks/<task_id>

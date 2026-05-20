@@ -123,8 +123,18 @@ pub struct ListQuery {
     pub status: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Skip the first N rows of the (filtered) ordering. Server-side
+    /// since Priority A; the Coordinator hits its `tasks_status`
+    /// index when `status` is set.
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
+/// `GET /v1/tasks` — list tasks. Server-side paginated and filtered
+/// via the Coordinator's `task.list` (since Priority A). The
+/// previous client-side status-filter behaviour is unchanged for
+/// callers: filtering still works, it just no longer requires
+/// over-fetching.
 pub async fn list(
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
@@ -133,8 +143,10 @@ pub async fn list(
         return Err(no_coordinator());
     };
     let limit = q.limit.unwrap_or(50);
+    let offset = q.offset.unwrap_or(0);
+    let status = q.status.as_deref().unwrap_or("");
     let body = rec
-        .list(limit)
+        .list_paginated(limit, offset, status)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, Json(ApiError { error: e })))?;
     let mut out = Vec::new();
@@ -146,12 +158,6 @@ pub async fn list(
         if parts.len() != 3 {
             continue;
         }
-        if let Some(s) = &q.status
-            && !s.is_empty()
-            && parts[1] != s
-        {
-            continue;
-        }
         out.push(TaskListEntry {
             task_id: parts[0].to_string(),
             status: parts[1].to_string(),
@@ -159,6 +165,35 @@ pub async fn list(
         });
     }
     Ok(Json(out))
+}
+
+/// `GET /v1/tasks/count` — total count, optionally filtered by
+/// status. Returns `{ "count": N }`. Drives pagination UIs that
+/// want "N of M" without walking every page.
+pub async fn count(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<CountResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let status = q.status.as_deref().unwrap_or("");
+    let body = rec
+        .count(status)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(ApiError { error: e })))?;
+    let n = parse_count_body(&body).ok_or((
+        StatusCode::BAD_GATEWAY,
+        Json(ApiError {
+            error: format!("coordinator task.count returned unexpected body: {body}"),
+        }),
+    ))?;
+    Ok(Json(CountResponse { count: n }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct CountResponse {
+    pub count: i64,
 }
 
 pub async fn get_one(
@@ -526,6 +561,14 @@ fn derive_summary(id: &str, raw: &str) -> Option<TaskSummary> {
     })
 }
 
+/// Parse the `task.count` body — a single line `count=N`.
+/// Tolerant of trailing whitespace / newlines.
+fn parse_count_body(body: &str) -> Option<i64> {
+    body.lines()
+        .find_map(|l| l.strip_prefix("count="))
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// Parse the `task.recover` body: one task_id per line, then a
 /// trailing `recovered=N\n`. Returns the recovered ids plus the
 /// reported count (which should equal `ids.len()` but the caller
@@ -684,6 +727,16 @@ mod tests {
         let (ids, count) = parse_recover_body(body);
         assert_eq!(ids, vec!["abc111".to_string(), "def222".to_string()]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_count_body_extracts_integer() {
+        assert_eq!(parse_count_body("count=42\n"), Some(42));
+        assert_eq!(parse_count_body("count=0"), Some(0));
+        assert_eq!(parse_count_body(""), None);
+        assert_eq!(parse_count_body("not a count"), None);
+        // Extra lines don't break parsing.
+        assert_eq!(parse_count_body("preamble\ncount=17\n"), Some(17));
     }
 
     #[test]
