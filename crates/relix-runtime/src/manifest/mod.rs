@@ -144,6 +144,12 @@ pub struct CachedManifest {
     pub alias: Option<String>,
     /// Manifest as returned by the peer.
     pub manifest: NodeManifest,
+    /// Unix seconds when this entry was last successfully (re)fetched
+    /// via `node.manifest`. Operators use this to spot peers whose
+    /// refresh loop has stalled — a stale `last_refreshed_at` means
+    /// the peer hasn't responded since that time, even though the
+    /// cached capabilities are still being used for routing.
+    pub last_refreshed_at: i64,
 }
 
 impl ManifestCache {
@@ -152,11 +158,22 @@ impl ManifestCache {
         Self::default()
     }
 
-    /// Insert / replace by node id.
+    /// Insert / replace by node id. Stamps `last_refreshed_at` with
+    /// the current wall-clock time — this is the only path that
+    /// updates the freshness timestamp, so it reflects only
+    /// *successful* refresh round-trips. Failed refreshes leave the
+    /// prior timestamp intact (the caller skips the insert).
     pub fn insert(&self, alias: Option<String>, manifest: NodeManifest) {
         let key = manifest.node_id.to_string();
         let mut guard = self.inner.write().expect("manifest cache lock poisoned");
-        guard.insert(key, CachedManifest { alias, manifest });
+        guard.insert(
+            key,
+            CachedManifest {
+                alias,
+                manifest,
+                last_refreshed_at: unix_secs(),
+            },
+        );
     }
 
     /// Snapshot every cached entry.
@@ -206,6 +223,13 @@ impl ManifestCache {
             .values()
             .any(|c| c.manifest.advertises(method))
     }
+}
+
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 // ────────────────────────── Long-lived MeshClient ──────────────────────────

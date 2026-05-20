@@ -43,6 +43,7 @@ mod openai;
 mod sse;
 mod task_recorder;
 mod tasks;
+mod topology;
 mod validate;
 
 use crate::config::{AppState, BridgeConfig};
@@ -207,6 +208,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // manifest cache (no extra mesh I/O).
         .route("/v1/capabilities", get(capabilities::list))
         .route("/v1/capabilities/:method", get(capabilities::get_one))
+        // Multi-node operational realism: peer-level topology view
+        // with freshness aggregates. Read-only projection of the
+        // ManifestCache — no active probing, no orchestration
+        // (bridge stays translation/presentation only).
+        .route("/v1/topology", get(topology::get))
         // Operator dashboard. Single-page static HTML; consumes
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.

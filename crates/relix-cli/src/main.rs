@@ -5,6 +5,7 @@ mod flow_run;
 mod identity;
 mod ping;
 mod task;
+mod topology;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -59,6 +60,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: capability::Cmd,
     },
+    /// Inspect the mesh topology via the bridge.
+    ///
+    /// Hits the bridge's `GET /v1/topology` endpoint and prints
+    /// one line per cached peer with freshness, capability count,
+    /// and an at-a-glance `fresh` / `stale` / `expired` verdict.
+    /// Use this to spot peers whose manifest-refresh loop has
+    /// silently stalled.
+    Topology {
+        #[command(subcommand)]
+        cmd: topology::Cmd,
+    },
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -98,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Identity { cmd } => identity::run(cmd),
         Cmd::Task { cmd } => task::run(cmd).await,
         Cmd::Capability { cmd } => capability::run(cmd).await,
+        Cmd::Topology { cmd } => topology::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,
