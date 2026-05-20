@@ -316,6 +316,36 @@ relix-cli task get    --peer ... --identity ... --client-key ... \
     --task-id <id> --pretty
 ```
 
+### HTTP-side inspection (`/v1/tasks`)
+
+For browser / curl / scripting flows that don't want a libp2p hop,
+the bridge exposes the same data as JSON:
+
+```bash
+# List recent tasks. Optional status filter and limit.
+curl http://127.0.0.1:19791/v1/tasks
+curl 'http://127.0.0.1:19791/v1/tasks?status=interrupted&limit=20'
+
+# One task with full chronicle.
+curl http://127.0.0.1:19791/v1/tasks/<task_id>
+
+# Per-attempt rows.
+curl http://127.0.0.1:19791/v1/tasks/<task_id>/attempts
+```
+
+Response shape is documented inline in
+[`crates/relix-web-bridge/src/tasks.rs`](../crates/relix-web-bridge/src/tasks.rs).
+The endpoints return `503` when the bridge has no Coordinator
+configured, `404` when the task id is unknown, `400` on malformed
+ids, and `502` for other Coordinator errors (the cause string is in
+the JSON body for triage).
+
+The bridge stays translation-only: each route is a thin forwarder
+to the same `task.*` capability the CLI calls, with the same
+admission pipeline running on the Coordinator. **There is no
+authentication at the HTTP layer** — put a reverse proxy in front
+if you expose this surface beyond loopback.
+
 `--pretty` reformats the response as a header block plus a timeline
 of events with absolute timestamps and `+Δs` deltas. The header
 includes `retry_count`, `retry_policy`, `max_retries`,
