@@ -380,6 +380,98 @@ pub struct RetryResponse {
 /// list the CLI's `retry_blocked_by_class` enforces.
 const NON_RETRYABLE_CLASSES: &[&str] = &["policy_denied", "invalid_args", "permanent"];
 
+/// Task statuses that allow cancel. Terminal states reject so
+/// operators don't mark completed tasks as cancelled and lose
+/// the original outcome.
+const CANCELLABLE_STATUSES: &[&str] = &[
+    "pending",
+    "running",
+    "retrying",
+    "interrupted",
+    "awaiting_input",
+];
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CancelReq {
+    /// Operator-supplied reason. Surfaced in the
+    /// `task.cancelled` chronicle event payload. Empty body
+    /// → defaults to "operator-cancelled".
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CancelResp {
+    pub task_id: String,
+    pub prior_status: String,
+    pub new_status: String,
+    /// Honest note: the runtime has no flow-cancellation today.
+    /// A running flow's write-back may overwrite the cancelled
+    /// status. Surfaced so dashboards can warn operators.
+    pub flow_still_running: bool,
+}
+
+/// `POST /v1/tasks/:id/cancel` — mark a task as cancelled in
+/// the Coordinator ledger. Refuses terminal states (completed
+/// / failed / cancelled).
+///
+/// HONEST: cancellation is metadata-only today. The runtime
+/// has no flow-side cancellation protocol; an in-flight flow
+/// continues and may overwrite the status when it finishes.
+/// `flow_still_running: true` is returned when prior_status
+/// was `running` or `retrying` so the dashboard can warn
+/// the operator explicitly.
+pub async fn cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CancelReq>,
+) -> Result<Json<CancelResp>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    // Pre-flight: read current status so we can reject terminal
+    // tasks + report the prior status in the response.
+    let body = rec
+        .get(&id)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    let prior_status = body
+        .lines()
+        .find_map(|line| line.strip_prefix("status="))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    if !CANCELLABLE_STATUSES.contains(&prior_status.as_str()) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: format!(
+                    "task is in terminal status '{prior_status}'; cancel rejected (allowed: {})",
+                    CANCELLABLE_STATUSES.join(", ")
+                ),
+            }),
+        ));
+    }
+    let reason = req.reason.unwrap_or_default();
+    rec.cancel(&id, &reason)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    let flow_still_running = matches!(prior_status.as_str(), "running" | "retrying");
+    Ok(Json(CancelResp {
+        task_id: id,
+        prior_status,
+        new_status: "cancelled".to_string(),
+        flow_still_running,
+    }))
+}
+
 /// `POST /v1/tasks/:id/retry?force=<bool>` — operator-triggered
 /// retry. Returns a typed envelope distinguishing the three
 /// outcomes (accepted / exhausted / refused) so dashboards can

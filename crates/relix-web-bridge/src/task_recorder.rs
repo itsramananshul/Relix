@@ -249,6 +249,41 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.retry utf8: {e}"))
     }
 
+    /// Operator-triggered cancellation. Two steps:
+    ///
+    /// 1. Append a `task.cancelled` event with the operator-
+    ///    supplied reason (chronicle visibility).
+    /// 2. Update the task's status to `cancelled`.
+    ///
+    /// HONEST CAVEAT: the runtime has no flow-cancellation
+    /// protocol today. A currently-executing flow continues
+    /// to run; its eventual write-back may overwrite the
+    /// `cancelled` status. The dashboard surfaces this
+    /// caveat in the confirm dialog. Phase 2 work introduces
+    /// real flow-side cancellation.
+    pub async fn cancel(&self, task_id: &str, reason: &str) -> Result<(), String> {
+        // Best-effort chronicle event first.
+        let event_arg = format!(
+            "{task_id}|task.cancelled|{}",
+            if reason.is_empty() {
+                "operator-cancelled".to_string()
+            } else {
+                reason.to_string()
+            }
+        );
+        if let Err(e) = self.call("task.event", event_arg.as_bytes()).await {
+            // Non-fatal: continue to the status update so the
+            // operator sees the task move state even if the
+            // chronicle event didn't land.
+            tracing::warn!(task_id, error = %e, "coordinator task.event (cancel) failed");
+        }
+        // task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class|trace_id
+        let update_arg = format!("{task_id}|cancelled||||||||");
+        self.call("task.update", update_arg.as_bytes())
+            .await
+            .map(|_| ())
+    }
+
     /// Low-level wrapper. Builds an envelope, sends via MeshClient,
     /// decodes the response, returns the body bytes or a string error.
     async fn call(&self, method: &str, arg: &[u8]) -> Result<Vec<u8>, String> {
