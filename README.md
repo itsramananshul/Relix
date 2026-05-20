@@ -169,6 +169,8 @@ Reference docs (deeper / narrower):
 - [`docs/tool-node-security.md`](docs/tool-node-security.md) — the full SSRF model + DNS pin + redirect re-check + pool security invariants.
 - [`docs/sol-runtime-analysis.md`](docs/sol-runtime-analysis.md) — SOL VM internals.
 - [`docs/channel-node-architecture.md`](docs/channel-node-architecture.md) — design for task-native messaging channels (Telegram first; implementation pending credentials).
+- [`docs/capability-discovery.md`](docs/capability-discovery.md) — how the mesh advertises capabilities and the planner-foundations contract any future planner must satisfy.
+- [`docs/plugin-foundations.md`](docs/plugin-foundations.md) — packaging + loading model options and the architectural constraints any plugin system must respect.
 - [`specs/`](specs/) — wire-format and architecture specifications.
 
 ---
