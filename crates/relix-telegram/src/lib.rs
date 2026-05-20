@@ -29,7 +29,7 @@ pub mod session_store;
 pub use config::{TelegramConfig, TelegramError};
 pub use identity::{ChannelSubject, derive_channel_subject};
 pub use messages::{IncomingMessage, OutgoingMessage};
-pub use session_store::SessionStore;
+pub use session_store::{InMemorySessionStore, SessionStorage, SessionStore, SqliteSessionStore};
 
 use async_trait::async_trait;
 

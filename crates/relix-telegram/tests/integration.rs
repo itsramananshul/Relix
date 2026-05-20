@@ -6,7 +6,7 @@
 //! binary's tests live separately when it lands.
 
 use relix_telegram::{
-    BotApi, IncomingMessage, OutgoingMessage, SessionStore, derive_channel_subject,
+    BotApi, IncomingMessage, OutgoingMessage, SessionStorage, SessionStore, derive_channel_subject,
     mock::MockBotApi,
 };
 
