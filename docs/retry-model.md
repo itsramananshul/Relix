@@ -31,9 +31,9 @@ relix-cli flow-run --flow flows/... --identity ... --client-key ... --peers ...
 relix-cli task update --peer ... --task-id $tid --status completed --result '...'
 ```
 
-The bridge today does no retries on `/chat` — if the SOL flow returns
-`flow_failed`, the bridge writes `status = failed` and surfaces the
-error envelope to the HTTP caller. The caller decides whether to
+The bridge today does no retries on `/chat` — if the SOL flow fails,
+the bridge appends a `task.failed` event, writes `status = failed`,
+and surfaces the error envelope to the HTTP caller. The caller decides whether to
 retry the request.
 
 ## What each value means

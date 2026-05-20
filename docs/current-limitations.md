@@ -39,9 +39,10 @@ is Gate 2.
 (Formerly a documented gap; **closed** in commit `<pending>`.)
 All three chat-bearing endpoints (`/chat`, `/chat_with_tool`,
 `/v1/chat/completions`) auto-create a Task on the Coordinator before
-the flow runs, append `flow_selected` (and `tool_target` / `tool_invoked`
-for the tool path), and write a terminal `task.update(status=completed|failed)`
-+ `flow_completed`/`flow_failed` event when the flow finishes.
+the flow runs, append `task.created` + `flow.started` (and
+`capability.invoked` for the tool path), and write a terminal
+`task.update(status=completed|failed)` + `task.completed` /
+`task.failed` event when the flow finishes.
 
 The integration is **fail-soft**: every `task.*` call from the bridge
 warns-and-skips on Coordinator failure. Chat requests never block on
@@ -51,9 +52,10 @@ OpenAI clients never see a field they don't expect.
 
 What's still **not** done:
 - Per-`remote_call` events. The bridge writes flow-level events
-  (`flow_selected`, `flow_completed`/`flow_failed`) plus a fixed set
-  of tool-path events. Per-call detail lives in the existing per-flow
-  event log on disk, which `task.latest_flow_log_path` points at.
+  (`task.created`, `flow.started`, `task.completed`/`task.failed`)
+  plus a single `capability.invoked` on the tool path. Per-call
+  detail lives in the existing per-flow event log on disk, which
+  `task.latest_flow_log_path` points at.
 - Status transitions through `running`. The current path writes
   `pending` → `completed` (or `failed`); the intermediate `running`
   state is not used by the bridge. Operators driving tasks manually

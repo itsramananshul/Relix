@@ -45,11 +45,11 @@ alias = "coordinator"
 ```
 
 - `POST /chat` → `task.create(title="chat: ...", flow_template="flows/chat_template.sol",
-  params_json={session_id, message})` → event `flow_selected` → flow runs →
-  event `flow_completed`/`flow_failed` + `task.update(status=completed|failed)`.
-- `POST /chat_with_tool` → same shape plus three pre-execution events:
-  `flow_selected` (`flows/chat_with_tool.sol`), `tool_target` (the URL),
-  `tool_invoked` (`tool.web_fetch`).
+  params_json={session_id, message})` → events `task.created` +
+  `flow.started` → flow runs → event `task.completed`/`task.failed`
+  + `task.update(status=completed|failed)`.
+- `POST /chat_with_tool` → same shape plus a pre-execution
+  `capability.invoked` event (`method=tool.web_fetch target=<url>`).
 - `POST /v1/chat/completions` (OpenAI shim) → routed through one of the
   two flows above; the Task chronicle is identical to what the native
   endpoint produces. Open WebUI users get durable orchestration without

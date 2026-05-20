@@ -164,10 +164,33 @@ don't accumulate as orphans.
 
 Response: the new `event_id` as a decimal integer.
 
-Use for: checkpoint markers (`event_type=checkpoint, payload=step=3`),
-attempt boundaries (`event_type=attempt_start`), or any other
+Use for: checkpoint markers, attempt boundaries, or any other
 chronological observation the caller wants to remember alongside the
 Task.
+
+#### Standard event vocabulary
+
+`event_type` is a free string, but Relix-shipped callers (the bridge,
+the recovery scan) use this vocabulary. Stick to it — drift becomes
+expensive once dashboards start pattern-matching on these names.
+
+| `event_type` | Emitted by | Payload convention |
+|---|---|---|
+| `task.created` | bridge, immediately after `task.create` succeeds | flow_template path |
+| `flow.started` | bridge, before invoking `FlowRunner::run` | flow_template path |
+| `capability.invoked` | bridge, before a capability call it knows about | `method=... target=...` (target optional) |
+| `capability.completed` | (reserved; not emitted yet) | capability method |
+| `capability.failed` | (reserved; not emitted yet) | capability method + cause |
+| `task.interrupted` | Coordinator recovery scan | `started_at=N max_runtime_secs=N now=N reason=deadline_exceeded` |
+| `task.retry_started` | (reserved; not emitted yet — see [`retry-model.md`](retry-model.md)) | attempt number |
+| `task.completed` | bridge, on successful flow | truncated reply (≤200 chars) |
+| `task.failed` | bridge, on failed flow | error cause string |
+
+Reserved names land when the corresponding logic does. The bridge
+does NOT emit per-`remote_call` `capability.invoked` /
+`capability.completed` today — those would need RemoteCall callbacks
+the bridge can't observe from outside the VM. Per-call detail still
+lives in the per-flow event log on disk.
 
 ### `task.get`
 
@@ -219,19 +242,21 @@ The canonical write path per request:
    flow_template=<template path>, params_json=<JSON of req fields>,
    owner=<empty -> caller subject_id>)`. The Coordinator returns a
    task_id; the bridge stores it in request state.
-3. Bridge appends `flow_selected` (with the template path). For the
-   tool flow it also appends `tool_target` (URL) and `tool_invoked`
-   (`tool.web_fetch`).
+3. Bridge appends `task.created` and then `flow.started` (both with
+   the template path). For the tool flow it also appends
+   `capability.invoked` with payload `method=tool.web_fetch
+   target=<url>`.
 4. Bridge runs the SOL flow through the existing FlowRunner. No
    per-`remote_call` events are written today — the bridge can't see
    inside the VM's RemoteCall opcodes from where it's standing. Per-
    call detail is fully available in `dev-data/flow-runner/flows/<flow_id>.log`
    which `task.latest_flow_log_path` points at.
-5. On success: bridge appends `flow_completed` (with a truncated
+5. On success: bridge appends `task.completed` (with a truncated
    reply excerpt, ≤200 chars) and calls `task.update(status=completed,
    result=excerpt, flow_id=..., flow_log_path=...)`.
-6. On failure: bridge appends `flow_failed` (with the cause) and calls
-   `task.update(status=failed, error_kind=..., error_cause=...)`.
+6. On failure: bridge appends `task.failed` (with the cause) and
+   calls `task.update(status=failed, error_kind=...,
+   error_cause=..., failure_class=...)`.
 7. Bridge returns the HTTP response with `task_id` added to the JSON
    (`ChatResponse.task_id`) or the `relix.task_id` provenance field
    (OpenAI shim). The field is omitted entirely when persistence was

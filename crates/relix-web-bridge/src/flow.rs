@@ -71,7 +71,7 @@ pub async fn execute_chat_flow(
     )
     .await;
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
-        rec.event(tid, "flow_selected", "flows/chat_template.sol")
+        rec.event(tid, "flow.started", "flows/chat_template.sol")
             .await;
     }
 
@@ -132,7 +132,7 @@ async fn finalize_flow_run(
                 let kind = result.last_error_kind.unwrap_or(0);
                 let class = FailureClass::from_kind(kind);
                 if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
-                    rec.event(tid, "flow_failed", &cause_for_event).await;
+                    rec.event(tid, "task.failed", &cause_for_event).await;
                     rec.fail(tid, kind, &cause_for_event, class).await;
                 }
                 return Err(FlowExecError::Transport(format!(
@@ -150,7 +150,7 @@ async fn finalize_flow_run(
                 // per-flow event log on disk, which task.latest_flow_log_path
                 // points at).
                 let excerpt = truncate(&reply, 200);
-                rec.event(tid, "flow_completed", &excerpt).await;
+                rec.event(tid, "task.completed", &excerpt).await;
                 rec.complete(tid, &excerpt, &flow_id, &flow_log_path).await;
             }
             Ok(FlowOutcome {
@@ -163,7 +163,7 @@ async fn finalize_flow_run(
         }
         Err(FlowRunnerError::Transport(m)) => {
             if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
-                rec.event(tid, "flow_failed", &m).await;
+                rec.event(tid, "task.failed", &m).await;
                 // FlowRunner-layer transport failure (libp2p dial /
                 // RPC), not a responder error envelope; classify as
                 // transient and tag the kind as TRANSPORT so operator
@@ -181,7 +181,7 @@ async fn finalize_flow_run(
         Err(e) => {
             let msg = e.to_string();
             if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
-                rec.event(tid, "flow_failed", &msg).await;
+                rec.event(tid, "task.failed", &msg).await;
                 // Config / EventLog / Vm: not safe to retry without
                 // operator action — surface as permanent so the CLI
                 // colours it accordingly and bounded auto-retry (when
@@ -198,8 +198,8 @@ async fn finalize_flow_run(
 /// have to switch on the variant — the only difference at this layer is the
 /// `{{TOOL_URL}}` substitution, the fact that the flow performs an extra
 /// `tool.web_fetch` remote call before the AI step, and the additional
-/// `tool_target` / `tool_invoked` events on the Task chronicle. SOL still
-/// owns the orchestration; this function only selects the template.
+/// `capability.invoked` event on the Task chronicle. SOL still owns
+/// the orchestration; this function only selects the template.
 pub async fn execute_chat_with_tool_flow(
     state: &AppState,
     session_id: &str,
@@ -222,13 +222,19 @@ pub async fn execute_chat_with_tool_flow(
     )
     .await;
     if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
-        rec.event(tid, "flow_selected", "flows/chat_with_tool.sol")
+        rec.event(tid, "flow.started", "flows/chat_with_tool.sol")
             .await;
-        // Pre-execution tool intent. Useful for operators triaging
-        // failures: even if the tool peer rejects the URL, the task
-        // chronicle says what was attempted.
-        rec.event(tid, "tool_target", url).await;
-        rec.event(tid, "tool_invoked", "tool.web_fetch").await;
+        // Pre-execution capability intent. Useful for operators
+        // triaging failures: even if the tool peer rejects the URL,
+        // the task chronicle says what was attempted. The payload
+        // format `method=... target=...` is the convention for
+        // capability.invoked when there's a meaningful target arg.
+        rec.event(
+            tid,
+            "capability.invoked",
+            &format!("method=tool.web_fetch target={url}"),
+        )
+        .await;
     }
 
     let rendered = tool_template
@@ -267,6 +273,10 @@ pub async fn execute_chat_with_tool_flow(
 /// Best-effort task creation. Returns `None` when persistence isn't
 /// configured or the Coordinator call failed; the chat path continues
 /// in either case (fail-soft per B1.9).
+///
+/// On success, emits a `task.created` chronology event so the
+/// timeline is self-describing from line 1 (no need to cross-
+/// reference `tasks.created_at`).
 async fn create_task_fail_soft(
     recorder: Option<&TaskRecorder>,
     flow_label: &str,
@@ -275,7 +285,9 @@ async fn create_task_fail_soft(
 ) -> Option<String> {
     let rec = recorder?;
     let title = make_title(flow_label, params_json, 64);
-    rec.create(&title, flow_template, params_json).await
+    let tid = rec.create(&title, flow_template, params_json).await?;
+    rec.event(&tid, "task.created", flow_template).await;
+    Some(tid)
 }
 
 /// Compact JSON for `task.create`'s `params_json`. Inline so we don't

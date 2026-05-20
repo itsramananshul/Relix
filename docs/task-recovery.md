@@ -58,8 +58,8 @@ last_failure_reason=deadline_exceeded: started_at=1779235935 max_runtime_secs=12
 event_count=3
 
 chronology:
-        1779235935  flow_selected       chat_template.sol
-  +   2s 1779235937  flow_started        ...
+        1779235935  task.created        chat_template.sol
+  +   0s 1779235935  flow.started        chat_template.sol
   + 125s 1779236060  task.interrupted    started_at=1779235935 max_runtime_secs=120 ...
 ```
 
