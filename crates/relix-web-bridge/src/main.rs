@@ -34,6 +34,7 @@ use axum::{
 };
 use clap::Parser;
 
+mod capabilities;
 mod chat;
 mod config;
 mod flow;
@@ -183,6 +184,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
         .route("/v1/tasks/recover", post(tasks::recover))
+        // T4 P2: capability discovery as JSON. Translation-only —
+        // pure projection of the bridge's already-discovered
+        // manifest cache (no extra mesh I/O).
+        .route("/v1/capabilities", get(capabilities::list))
+        .route("/v1/capabilities/:method", get(capabilities::get_one))
         .with_state(state);
 
     tracing::info!(

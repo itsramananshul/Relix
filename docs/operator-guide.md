@@ -346,6 +346,38 @@ curl -X POST http://127.0.0.1:19791/v1/tasks/recover
 # -> {"recovered":["abc...","def..."],"count":2}
 ```
 
+### Capability discovery (`/v1/capabilities`)
+
+The bridge projects its already-discovered `ManifestCache` as
+JSON so dashboards and operator scripts can answer "what's the
+mesh capable of right now?" without a libp2p call:
+
+```bash
+# Every capability across every peer the bridge knows about.
+curl http://127.0.0.1:19791/v1/capabilities
+
+# Filter by planner category (added in T4 P1).
+curl 'http://127.0.0.1:19791/v1/capabilities?category=fetch'
+
+# Filter by sensitivity tag.
+curl 'http://127.0.0.1:19791/v1/capabilities?tag=external:network'
+
+# Scope to one method (returns all peers that advertise it).
+curl http://127.0.0.1:19791/v1/capabilities/tool.web_fetch
+```
+
+Each entry includes the peer alias, node id, node type, the
+descriptor fields (kind / idempotency / cost_class / sensitivity
+tags / requires_groups / policy attachment point), and the T4 P1
+advisory fields (description / categories / environment_requirements)
+when set.
+
+This endpoint is **read-only** and exposes information already
+visible to any peer via `node.manifest`. No invariant is changed
+by serving it. See
+[`docs/capability-discovery.md`](capability-discovery.md) for the
+planner-foundations design.
+
 Response shape is documented inline in
 [`crates/relix-web-bridge/src/tasks.rs`](../crates/relix-web-bridge/src/tasks.rs).
 The endpoints return `503` when the bridge has no Coordinator
