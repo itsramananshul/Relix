@@ -1,5 +1,6 @@
 //! relix-cli — developer and operator CLI.
 
+mod capability;
 mod flow_run;
 mod identity;
 mod ping;
@@ -49,6 +50,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: task::Cmd,
     },
+    /// Inspect peer capability manifests (T4 P3).
+    ///
+    /// Dials one peer, calls `node.manifest`, and prints the
+    /// descriptors. Same dial-and-call pattern as `ping`. Read-only;
+    /// goes through the admission pipeline.
+    Capability {
+        #[command(subcommand)]
+        cmd: capability::Cmd,
+    },
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -87,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.cmd {
         Cmd::Identity { cmd } => identity::run(cmd),
         Cmd::Task { cmd } => task::run(cmd).await,
+        Cmd::Capability { cmd } => capability::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,
