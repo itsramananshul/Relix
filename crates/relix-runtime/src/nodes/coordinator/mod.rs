@@ -47,6 +47,8 @@
 //! - `task.event`   — append a free-form event to a Task's history.
 //! - `task.get`     — read one Task and its event chronicle.
 //! - `task.list`    — page through Task summaries.
+//! - `task.recover` — operator-triggered version of the startup scan;
+//!   promotes overdue `running` tasks to `interrupted`.
 //!
 //! ## What "checkpointed re-run" actually means (read this first)
 //!
@@ -112,11 +114,14 @@
 //!
 //! ## Not in scope (deliberate)
 //!
-//! - No automatic re-launch on Coordinator restart. Tasks left in
-//!   `running` after a crash stay in `running`; an operator must
-//!   `update` them to `abandoned` or `retry` them manually. Automatic
-//!   recovery needs both (a) a real resume model and (b) a leadership
-//!   election among potential executors — both Gate 2.
+//! - No automatic **re-launch** on Coordinator restart. The C1b
+//!   startup scan promotes tasks past their `max_runtime_secs` from
+//!   `running` to `interrupted` (so dashboards stop showing a
+//!   never-finishing flow), but does NOT execute them again — the
+//!   operator decides whether to re-run from the start, and only the
+//!   bridge (or `relix-cli flow-run`) can actually execute a flow.
+//!   Real re-launch needs both (a) a durable VM resume model and (b)
+//!   a leadership election among potential executors — both Gate 2.
 //! - No fan-out / scheduling. The Coordinator is a record-keeper.
 
 use std::path::PathBuf;
@@ -236,7 +241,7 @@ impl RetryPolicy {
 }
 
 /// Per-node coordinator configuration parsed from `[coordinator]`.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct CoordinatorConfig {
     /// SQLite database path. Parent directory created on first start.
     pub db_path: PathBuf,
@@ -244,10 +249,31 @@ pub struct CoordinatorConfig {
     /// the caller's request. Defaults to 200.
     #[serde(default = "default_max_list")]
     pub max_list: usize,
+    /// Run the interruption-recovery scan once at coordinator startup.
+    /// Defaults to `true`. Operators can disable it for forensic
+    /// investigation (keep stale `running` rows in place) by setting
+    /// `recovery_scan = false`. The on-demand `task.recover` capability
+    /// is unaffected.
+    #[serde(default = "default_recovery_scan")]
+    pub recovery_scan: bool,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            db_path: PathBuf::new(),
+            max_list: default_max_list(),
+            recovery_scan: default_recovery_scan(),
+        }
+    }
 }
 
 fn default_max_list() -> usize {
     200
+}
+
+fn default_recovery_scan() -> bool {
+    true
 }
 
 /// SQLite-backed Task ledger. `rusqlite::Connection` is not `Sync`, so
@@ -422,6 +448,89 @@ impl TaskStore {
             )
             .map_err(CoordinatorError::Db)?;
         Ok(count)
+    }
+
+    /// Find tasks the Coordinator believes are still `running` but
+    /// whose `started_at + max_runtime_secs` is older than `now_secs`,
+    /// flip them to `interrupted`, and append a `task.interrupted`
+    /// event explaining why. Returns the list of task ids that were
+    /// recovered.
+    ///
+    /// Only considers tasks that have BOTH `started_at` and
+    /// `max_runtime_secs` set — a `running` row without those is
+    /// indistinguishable from a flow that's making slow progress and
+    /// is left alone (operators can still cancel it via
+    /// `task.update`).
+    ///
+    /// Idempotent: re-running with the same `now_secs` after the first
+    /// pass finds nothing because the rows are no longer `running`.
+    pub fn recover_interrupted(&self, now_secs: i64) -> Result<Vec<String>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // Collect first so we can append per-task events without
+        // holding the iterator open during writes.
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, started_at, max_runtime_secs
+                 FROM tasks
+                 WHERE status = 'running'
+                   AND started_at IS NOT NULL
+                   AND max_runtime_secs IS NOT NULL
+                   AND (started_at + max_runtime_secs) < ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let candidates: Vec<(String, i64, i64)> = stmt
+            .query_map(params![now_secs], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CoordinatorError::Db)?;
+        drop(stmt);
+
+        let tx = conn.unchecked_transaction().map_err(CoordinatorError::Db)?;
+        let mut recovered = Vec::with_capacity(candidates.len());
+        for (tid, started, max) in candidates {
+            // Race guard: only flip if the row is STILL `running` at
+            // the moment of the update. Without this an in-flight
+            // `task.update` from a long-lived executor could re-write
+            // status between our SELECT and UPDATE.
+            let n = tx
+                .execute(
+                    "UPDATE tasks
+                     SET status = 'interrupted',
+                         updated_at = ?1,
+                         last_failure_reason = ?2,
+                         last_failure_class = 'timeout'
+                     WHERE task_id = ?3 AND status = 'running'",
+                    params![
+                        now_secs,
+                        format!(
+                            "deadline_exceeded: started_at={started} max_runtime_secs={max} now={now_secs}"
+                        ),
+                        tid,
+                    ],
+                )
+                .map_err(CoordinatorError::Db)?;
+            if n == 0 {
+                continue;
+            }
+            let payload = format!(
+                "started_at={started} max_runtime_secs={max} now={now_secs} reason=deadline_exceeded"
+            );
+            tx.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'task.interrupted', ?3)",
+                params![tid, now_secs, payload],
+            )
+            .map_err(CoordinatorError::Db)?;
+            recovered.push(tid);
+        }
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(recovered)
     }
 
     /// Append a free-form event to a Task's history. Returns the
@@ -599,7 +708,7 @@ pub struct TaskSummary {
 
 // ──────────────────────────── Capability registration ──────────────────────
 
-/// Register the five task capabilities on the dispatch bridge.
+/// Register the task capabilities on the dispatch bridge.
 pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
     {
         let s = store.clone();
@@ -648,6 +757,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_list(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.recover",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_recover(&s, &ctx) }
             })),
         );
     }
@@ -824,6 +943,30 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
             HandlerOutcome::Ok(buf.into_bytes())
         }
         Err(e) => internal(format!("task.list: {e}")),
+    }
+}
+
+/// Operator-triggered recovery scan. Equivalent to the one the
+/// coordinator runs at startup, but on-demand — useful when an
+/// operator just set `max_runtime_secs` on a long-running task and
+/// wants the scan to act now without restarting the node.
+///
+/// Args: empty (the scan reads `now` itself). Returns one line per
+/// recovered task id, plus a trailing `recovered=N` line so callers
+/// don't have to count.
+fn handle_recover(store: &TaskStore, _ctx: &InvocationCtx) -> HandlerOutcome {
+    let now = unix_secs();
+    match store.recover_interrupted(now) {
+        Ok(ids) => {
+            let mut buf = String::with_capacity(ids.len() * 33 + 32);
+            for id in &ids {
+                buf.push_str(id);
+                buf.push('\n');
+            }
+            buf.push_str(&format!("recovered={}\n", ids.len()));
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("task.recover: {e}")),
     }
 }
 
@@ -1274,6 +1417,108 @@ mod tests {
         // Unknown kind defaults to Permanent so callers fail loudly
         // rather than silently retrying on something they don't model.
         assert_eq!(FailureClass::from_kind(9_999), FailureClass::Permanent);
+    }
+
+    // ── C1b: recovery scan ────────────────────────────────────────────
+
+    #[test]
+    fn recovery_scan_flips_overdue_running_tasks_to_interrupted() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(10))
+            .unwrap();
+        // started_at gets stamped to "now" when we transition to running.
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.get(&tid).unwrap().unwrap().started_at.unwrap();
+        // Pretend a lot of wall clock has passed.
+        let recovered = s.recover_interrupted(started + 60).unwrap();
+        assert_eq!(recovered, vec![tid.clone()]);
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "interrupted");
+        assert_eq!(v.last_failure_class.as_deref(), Some("timeout"));
+        assert!(
+            v.last_failure_reason
+                .as_deref()
+                .unwrap()
+                .contains("deadline_exceeded")
+        );
+        assert!(v.events.iter().any(|e| e.event_type == "task.interrupted"));
+    }
+
+    #[test]
+    fn recovery_scan_leaves_tasks_without_deadline_alone() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let recovered = s.recover_interrupted(unix_secs() + 999_999).unwrap();
+        assert!(recovered.is_empty());
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "running");
+    }
+
+    #[test]
+    fn recovery_scan_leaves_running_tasks_inside_deadline_alone() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(3600))
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.get(&tid).unwrap().unwrap().started_at.unwrap();
+        let recovered = s.recover_interrupted(started + 30).unwrap();
+        assert!(recovered.is_empty());
+        assert_eq!(s.get(&tid).unwrap().unwrap().status, "running");
+    }
+
+    #[test]
+    fn recovery_scan_is_idempotent() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.get(&tid).unwrap().unwrap().started_at.unwrap();
+        let first = s.recover_interrupted(started + 60).unwrap();
+        assert_eq!(first.len(), 1);
+        // Second pass finds nothing — row is no longer `running`.
+        let second = s.recover_interrupted(started + 60).unwrap();
+        assert!(second.is_empty());
+        // And only one `task.interrupted` event was appended.
+        let v = s.get(&tid).unwrap().unwrap();
+        let n = v
+            .events
+            .iter()
+            .filter(|e| e.event_type == "task.interrupted")
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn recovery_scan_skips_completed_and_failed_rows() {
+        let s = store();
+        let t_done = s
+            .create("done", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .unwrap();
+        s.update(&t_done, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &t_done,
+            Some("completed"),
+            Some("ok"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let started = s.get(&t_done).unwrap().unwrap().started_at.unwrap();
+        let recovered = s.recover_interrupted(started + 60).unwrap();
+        assert!(recovered.is_empty());
+        assert_eq!(s.get(&t_done).unwrap().unwrap().status, "completed");
     }
 
     #[test]

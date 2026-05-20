@@ -325,6 +325,24 @@ fn register_node_type_handlers(
             .try_into()
             .map_err(|e: toml::de::Error| format!("[coordinator] parse: {e}"))?;
         let store = std::sync::Arc::new(crate::nodes::coordinator::TaskStore::open(&coord_cfg)?);
+        // C1b: startup recovery scan. Promotes any task left in
+        // `running` past its `max_runtime_secs` to `interrupted` and
+        // appends a `task.interrupted` event explaining why. Tasks
+        // without a deadline are left untouched.
+        if coord_cfg.recovery_scan {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            match store.recover_interrupted(now) {
+                Ok(ids) if !ids.is_empty() => tracing::warn!(
+                    recovered = ids.len(),
+                    "coordinator startup: marked stale `running` tasks as `interrupted`"
+                ),
+                Ok(_) => tracing::info!("coordinator startup: recovery scan found no stale tasks"),
+                Err(e) => tracing::error!(error = %e, "coordinator startup: recovery scan failed"),
+            }
+        }
         crate::nodes::coordinator::register(bridge, store);
         for m in [
             "task.create",
@@ -332,13 +350,15 @@ fn register_node_type_handlers(
             "task.event",
             "task.get",
             "task.list",
+            "task.recover",
         ] {
             manifest.add_capability(CapabilityDescriptor::unary(m));
         }
         tracing::info!(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
-            "coordinator node: registered task.create / update / event / get / list"
+            recovery_scan = coord_cfg.recovery_scan,
+            "coordinator node: registered task.create / update / event / get / list / recover"
         );
     }
     if cfg.controller.node_type == "tool" {
