@@ -6,81 +6,82 @@ before relying on any retry behaviour in production.
 
 ## TL;DR
 
-The runtime does NOT auto-retry today. The C1 retry columns are
-metadata:
+The runtime does NOT auto-retry today. The C1/C2 retry columns are
+metadata + an explicit operator primitive:
 
-- `retry_policy` (`none` / `once` / `bounded`) — operator hint.
-- `max_retries` — operator hint, only meaningful under `bounded`.
-- `retry_count` — bumped explicitly via `bump_retry_count`. Nothing in
-  the alpha calls it, but the seam exists for future bounded-retry
-  logic and for operator scripts.
-- `last_failure_class` — the wire-level signal a future policy will
-  key off (see [`interruption-semantics.md`](interruption-semantics.md)).
+- `retry_policy` (`none` / `once` / `bounded`) — operator declaration
+  at `task.create` time. The Coordinator only retries when this
+  permits.
+- `max_retries` — budget under `bounded`. Ignored under `once` (which
+  has implicit budget = 1) and `none` (which refuses retry).
+- `retry_count` — incremented by `task.retry` on accepted retries.
+  Never decremented automatically.
+- `last_failure_class` — pattern-match input for operator triage and
+  for the client-side `--force` guard (see
+  [`interruption-semantics.md`](interruption-semantics.md)).
 
-If you want a Task retried today, an operator (or a script) does it
-manually:
+To retry a failed task today, an operator uses the C2c retry
+primitive:
 
 ```bash
-# Mark a failed task as a candidate for re-run.
-relix-cli task update --peer ... --task-id $tid --status retrying
+# Validate state + budget on the Coordinator, emit
+# task.retry_requested, flip status to retrying.
+relix-cli task retry --peer ... --task-id $tid
 
-# Re-run the flow yourself; pass the same flow_template + params_json.
+# Re-run the flow. The bridge does NOT do this automatically — the
+# operator runs flow-run with the same template + params.
 relix-cli flow-run --flow flows/... --identity ... --client-key ... --peers ...
-
-# Roll the row to its final state.
-relix-cli task update --peer ... --task-id $tid --status completed --result '...'
 ```
+
+`task retry` refuses by default when `last_failure_class` is one of
+`policy_denied` / `invalid_args` / `permanent` — re-running a
+mutation flow whose last failure indicates the request was correctly
+refused (policy_denied) or malformed (invalid_args) almost always
+just masks the underlying issue. Pass `--force` to override after
+inspecting the flow and chronicle.
 
 The bridge today does no retries on `/chat` — if the SOL flow fails,
 the bridge appends a `task.failed` event, writes `status = failed`,
-and surfaces the error envelope to the HTTP caller. The caller decides whether to
-retry the request.
+and surfaces the error envelope to the HTTP caller. The caller
+decides whether to retry the request.
 
 ## What each value means
 
 ### `retry_policy = 'none'`
 
-The default. No retry intent recorded. Operator scripts that look for
-retry candidates should skip these.
+The default. `task.retry` refuses with "retry_policy=none on this
+task". Operator scripts that look for retry candidates should skip
+these.
 
 ### `retry_policy = 'once'`
 
-Operator marker: "if this fails with a `transient` or `timeout`
-class, one re-run is permitted." Nothing in the alpha acts on this —
-it is a hint for the operator playbook (or for the bounded-retry
-logic when it lands).
+Implicit budget = 1. The first `task.retry` is accepted; subsequent
+ones return `RetryDecision::Exhausted` (which the CLI prints and
+the chronicle records as `task.retry_exhausted`).
 
 ### `retry_policy = 'bounded'`
 
-Operator marker: "up to `max_retries` re-runs permitted for
-`transient` or `timeout` class failures." Same caveat: nothing in the
-alpha acts on this yet.
+Up to `max_retries` retries permitted. The Coordinator's
+`task.retry` capability enforces this budget; the bridge does NOT
+auto-retry — the operator must request each retry explicitly.
 
 ### `max_retries`
 
-Only meaningful under `bounded`. Stored as `INTEGER NOT NULL DEFAULT
-0`; the Coordinator does not validate it (a value of `1` is
-effectively `once`). Operators use it to express intent; future
-policy will enforce it.
+Budget under `bounded`. Stored as `INTEGER NOT NULL DEFAULT 0`.
+Under `none` or `once` it is ignored.
 
 ### `retry_count`
 
-Bumped via `TaskStore::bump_retry_count(task_id) -> i64` returning
-the new count. The bridge does not bump it today. The expected wiring
-when bounded auto-retry lands:
+Incremented by `task.retry` on accepted retries. Never decremented.
+The Coordinator's `request_retry` clears `error_kind` and
+`error_cause` on transition to `retrying` but preserves
+`last_failure_class` and `last_failure_reason` for triage.
 
-1. Bridge sees a `transient` / `timeout` failure on attempt N.
-2. Bridge reads `retry_policy` and `max_retries` from the task.
-3. If policy permits, bridge appends a `retry.started` event, calls
-   `bump_retry_count`, and re-runs the flow with the same template
-   + params.
-4. On success: terminal `completed`. On final failure: `status =
-   failed`, `last_failure_class` set to the most recent class.
-
-`retry_count` is never decremented and is never automatically reset
-— an operator who re-uses a Task for a fresh attempt should write
-`task.update --retry-count 0` (note: no such flag today; would need
-to be added at the same time as the bounded-retry logic).
+For programmatic incrementing (e.g. an operator script that
+implements its own retry loop), the lower-level
+`TaskStore::bump_retry_count` is available and does not validate
+state or budget. Prefer `task.retry` unless you need to bypass the
+policy check.
 
 ### `last_failure_class`
 

@@ -88,6 +88,7 @@
 //! | `task.list`     | `` (empty) or `limit` (default 50) | one `task_id\tstatus\ttitle\n` per line |
 //! | `task.recover`  | (empty) | one `task_id\n` per recovered task, then `recovered=N\n` |
 //! | `task.attempts` | `task_id` | one `attempt_num\tstatus\tstarted_at\tfinished_at\|-\tfailure_class\|-\tflow_id\|-\n` per attempt |
+//! | `task.retry`    | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted retry_count=N budget=M\n` / INVALID_ARGS with cause |
 //!
 //! Optional trailers (older callers that omit them keep working
 //! unchanged): `retry_policy|max_retries|max_runtime_secs` on
@@ -240,6 +241,23 @@ impl RetryPolicy {
             _ => None,
         }
     }
+}
+
+/// Outcome of a [`TaskStore::request_retry`] call. The Coordinator
+/// is honest about all three outcomes so the CLI can render them
+/// without guessing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetryDecision {
+    /// Retry allowed and applied: status flipped to `retrying`,
+    /// `retry_count` bumped, `task.retry_requested` event emitted.
+    Accepted { new_retry_count: i64, budget: i64 },
+    /// Retry budget already exhausted. A `task.retry_exhausted`
+    /// event is appended so the chronicle records the decision.
+    Exhausted { retry_count: i64, budget: i64 },
+    /// Retry refused for a reason other than budget exhaustion
+    /// (status not failed/interrupted, retry_policy=none, etc.). No
+    /// state change.
+    Rejected { reason: String },
 }
 
 /// Per-node coordinator configuration parsed from `[coordinator]`.
@@ -499,9 +517,9 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Bump `retry_count` by one. Used by the bridge when it starts a
-    /// new attempt (an explicit `retry.started` event lands first to
-    /// keep the chronicle self-describing). Returns the new count.
+    /// Bump `retry_count` by one. Low-level primitive — does NOT
+    /// validate retry policy or emit events. Prefer [`request_retry`]
+    /// for the operator-facing flow. Returns the new count.
     pub fn bump_retry_count(&self, task_id: &str) -> Result<i64, CoordinatorError> {
         let now = unix_secs();
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
@@ -523,6 +541,118 @@ impl TaskStore {
             )
             .map_err(CoordinatorError::Db)?;
         Ok(count)
+    }
+
+    /// Operator-initiated retry request. Validates the task is in a
+    /// state where retry makes sense, validates the retry budget, and
+    /// on success transitions the task to `retrying`, increments
+    /// `retry_count`, emits a `task.retry_requested` event, and clears
+    /// the transient `error_kind` / `error_cause` columns (the
+    /// failure CLASS + REASON are preserved on the previous attempt
+    /// row, and on `last_failure_class` / `last_failure_reason` for
+    /// quick lookup).
+    ///
+    /// Does NOT open a new attempt — the next `running` transition
+    /// does that. Does NOT actually re-run the flow; re-execution is
+    /// owned by whoever runs the flow (bridge auto-retry is not
+    /// wired today; operator typically runs `relix-cli flow-run`
+    /// against the same flow_template + params).
+    ///
+    /// On exhaustion (retry_count >= max_retries) the task is left
+    /// as-is and a `task.retry_exhausted` event is appended so the
+    /// chronicle records the decision. Returns a [`RetryDecision`]
+    /// describing what happened.
+    pub fn request_retry(&self, task_id: &str) -> Result<RetryDecision, CoordinatorError> {
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        let row: Option<(String, String, i64, i64, Option<String>)> = tx
+            .query_row(
+                "SELECT status, retry_policy, retry_count, max_retries, last_failure_class
+                 FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let Some((status, retry_policy, retry_count, max_retries, last_class)) = row else {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        };
+
+        // Only retry from terminal-bad states.
+        match status.as_str() {
+            "failed" | "interrupted" => {}
+            other => {
+                return Ok(RetryDecision::Rejected {
+                    reason: format!("task is in status `{other}`, not failed/interrupted"),
+                });
+            }
+        }
+
+        if retry_policy == "none" {
+            return Ok(RetryDecision::Rejected {
+                reason: "retry_policy=none on this task".into(),
+            });
+        }
+        let budget = match retry_policy.as_str() {
+            "once" => 1,
+            "bounded" => max_retries.max(0),
+            _ => 0,
+        };
+        if retry_count >= budget {
+            // Exhausted. Append an event so the chronicle is honest.
+            tx.execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload)
+                 VALUES (?1, ?2, 'task.retry_exhausted', ?3)",
+                params![
+                    task_id,
+                    now,
+                    format!("retry_count={retry_count} budget={budget} policy={retry_policy}"),
+                ],
+            )
+            .map_err(CoordinatorError::Db)?;
+            tx.commit().map_err(CoordinatorError::Db)?;
+            return Ok(RetryDecision::Exhausted {
+                retry_count,
+                budget,
+            });
+        }
+
+        let new_count = retry_count + 1;
+        tx.execute(
+            "UPDATE tasks
+             SET status = 'retrying',
+                 retry_count = ?1,
+                 updated_at = ?2,
+                 error_kind = NULL,
+                 error_cause = NULL
+             WHERE task_id = ?3",
+            params![new_count, now, task_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let payload = format!(
+            "attempt={new_count} of_budget={budget} policy={retry_policy} prior_class={}",
+            last_class.as_deref().unwrap_or("-"),
+        );
+        tx.execute(
+            "INSERT INTO task_events (task_id, ts, event_type, payload)
+             VALUES (?1, ?2, 'task.retry_requested', ?3)",
+            params![task_id, now, payload],
+        )
+        .map_err(CoordinatorError::Db)?;
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(RetryDecision::Accepted {
+            new_retry_count: new_count,
+            budget,
+        })
     }
 
     /// Find tasks the Coordinator believes are still `running` but
@@ -957,6 +1087,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.retry",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_retry(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
@@ -1141,6 +1281,51 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
             HandlerOutcome::Ok(buf.into_bytes())
         }
         Err(e) => internal(format!("task.list: {e}")),
+    }
+}
+
+/// `task.retry` — operator-initiated retry request. Args: `task_id`.
+/// Validates the task is in failed/interrupted, the retry policy
+/// permits another attempt, and the budget isn't exhausted. On
+/// success transitions status to `retrying`, bumps retry_count, and
+/// emits `task.retry_requested`. On exhaustion appends
+/// `task.retry_exhausted`. On other rejection, returns INVALID_ARGS
+/// with the cause.
+///
+/// Does NOT re-run the flow. Re-execution is owned by whoever runs
+/// the flow (bridge auto-retry is not wired today). Returns one
+/// line: `accepted attempt=N of budget`, `exhausted retry_count=N
+/// budget=M`, or just the rejection cause.
+fn handle_retry(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.retry utf8: {e}")),
+    };
+    if task_id.is_empty() {
+        return invalid("task.retry: task_id required".to_string());
+    }
+    match store.request_retry(task_id) {
+        Ok(RetryDecision::Accepted {
+            new_retry_count,
+            budget,
+        }) => {
+            let body = format!("accepted attempt={new_retry_count} of_budget={budget}\n");
+            HandlerOutcome::Ok(body.into_bytes())
+        }
+        Ok(RetryDecision::Exhausted {
+            retry_count,
+            budget,
+        }) => {
+            // Exhaustion is a normal, expected outcome — surface as
+            // OK with structured body, not as an error envelope.
+            // Operators decide what to do next (cancel, raise budget,
+            // investigate).
+            let body = format!("exhausted retry_count={retry_count} budget={budget}\n");
+            HandlerOutcome::Ok(body.into_bytes())
+        }
+        Ok(RetryDecision::Rejected { reason }) => invalid(format!("task.retry: {reason}")),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.retry: not found: {id}")),
+        Err(e) => internal(format!("task.retry: {e}")),
     }
 }
 
@@ -2155,6 +2340,160 @@ mod tests {
             "scan must use current attempt's deadline, not task.started_at"
         );
         assert_eq!(s.get(&tid).unwrap().unwrap().status, "running");
+    }
+
+    // ── C2c: operator-initiated retry primitive ──────────────────────
+
+    #[test]
+    fn request_retry_rejects_on_pending_status() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        match s.request_retry(&tid).unwrap() {
+            RetryDecision::Rejected { reason } => assert!(reason.contains("pending")),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_retry_rejects_on_retry_policy_none() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Drive into failed state.
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("oops"),
+            Some("transient"),
+        )
+        .unwrap();
+        match s.request_retry(&tid).unwrap() {
+            RetryDecision::Rejected { reason } => assert!(reason.contains("retry_policy=none")),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_retry_accepted_then_exhausted_with_once_policy() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Once, 0, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("blip"),
+            Some("transient"),
+        )
+        .unwrap();
+        // First retry: accepted.
+        match s.request_retry(&tid).unwrap() {
+            RetryDecision::Accepted {
+                new_retry_count,
+                budget,
+            } => {
+                assert_eq!(new_retry_count, 1);
+                assert_eq!(budget, 1);
+            }
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "retrying");
+        assert_eq!(v.retry_count, 1);
+        assert!(
+            v.events
+                .iter()
+                .any(|e| e.event_type == "task.retry_requested")
+        );
+        // Second retry without re-failing: still in retrying (not
+        // failed/interrupted) so rejected.
+        match s.request_retry(&tid).unwrap() {
+            RetryDecision::Rejected { reason } => assert!(reason.contains("retrying")),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        // Fail again, then re-request: now exhausted because
+        // retry_count (1) >= budget (1).
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("blip2"),
+            Some("transient"),
+        )
+        .unwrap();
+        match s.request_retry(&tid).unwrap() {
+            RetryDecision::Exhausted {
+                retry_count,
+                budget,
+            } => {
+                assert_eq!(retry_count, 1);
+                assert_eq!(budget, 1);
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v.events
+                .iter()
+                .any(|e| e.event_type == "task.retry_exhausted")
+        );
+        // Still in failed (exhausted does not flip status).
+        assert_eq!(v.status, "failed");
+    }
+
+    #[test]
+    fn request_retry_clears_error_columns_but_preserves_last_failure_record() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            Some(error_kinds::TRANSPORT as i64),
+            Some("the actual cause"),
+            Some("transient"),
+        )
+        .unwrap();
+        s.request_retry(&tid).unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        // Transient error_* columns cleared on the task row...
+        assert_eq!(v.error_kind, None);
+        assert_eq!(v.error_cause, None);
+        // ...but the persistent failure record is preserved for
+        // operator triage.
+        assert_eq!(v.last_failure_class.as_deref(), Some("transient"));
+        assert_eq!(v.last_failure_reason.as_deref(), Some("the actual cause"));
+    }
+
+    #[test]
+    fn request_retry_unknown_task_is_invalid() {
+        let s = store();
+        match s.request_retry("nope") {
+            Err(CoordinatorError::NotFound(id)) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]

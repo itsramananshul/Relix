@@ -118,6 +118,32 @@ pub enum Cmd {
         #[arg(long)]
         task_id: String,
     },
+    /// Request an operator-initiated retry. The Coordinator validates
+    /// the task is in failed/interrupted and the retry budget is
+    /// available, then flips status to `retrying` and emits
+    /// `task.retry_requested`. Does NOT re-run the flow — the
+    /// operator runs `relix-cli flow-run` (or the bridge picks it up
+    /// next time) for that.
+    ///
+    /// Safety: the CLI refuses by default when the prior failure
+    /// class indicates a mutation might have partially succeeded
+    /// (currently: `policy_denied`, `invalid_args`, `permanent`).
+    /// Pass `--force` to override after operator inspection.
+    Retry {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
+        #[arg(long)]
+        task_id: String,
+        /// Override the client-side safety guard. Use only after
+        /// you've inspected the flow and confirmed re-execution is
+        /// safe under the prior failure class.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Append a free-form event to a Task's history.
     Event {
         #[arg(long)]
@@ -293,6 +319,54 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 print!("{s}");
             }
         }
+        Cmd::Retry {
+            peer,
+            identity,
+            client_key,
+            task_id,
+            force,
+        } => {
+            // C2c.2: client-side safety classification. We GET the
+            // task first to inspect last_failure_class. The
+            // server-side request_retry handles state/budget
+            // validation; we layer one extra check that's
+            // operator-judgement-shaped (don't blindly re-run flows
+            // whose last failure class suggests a non-retryable
+            // condition).
+            let get_body = call(
+                &peer,
+                &identity,
+                &client_key,
+                "task.get",
+                task_id.as_bytes(),
+            )
+            .await?;
+            let s = std::str::from_utf8(&get_body).unwrap_or("");
+            let fc = s
+                .lines()
+                .find_map(|l| l.strip_prefix("last_failure_class="))
+                .unwrap_or("-");
+            if !force && retry_blocked_by_class(fc) {
+                eprintln!("refused: last_failure_class={fc} is not safe to auto-retry");
+                eprintln!(
+                    "  re-running may produce duplicate side effects or repeat a request that"
+                );
+                eprintln!(
+                    "  should not be repeated. Inspect the flow + chronicle, then pass --force"
+                );
+                eprintln!("  if the retry is appropriate.");
+                std::process::exit(3);
+            }
+            let body = call(
+                &peer,
+                &identity,
+                &client_key,
+                "task.retry",
+                task_id.as_bytes(),
+            )
+            .await?;
+            print!("{}", std::str::from_utf8(&body).unwrap_or("<binary>"));
+        }
         Cmd::Attempts {
             peer,
             identity,
@@ -373,6 +447,21 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Client-side safety guard for `task retry`. The Coordinator does
+/// not block based on failure class — it only enforces state +
+/// budget. The CLI adds this opinion so an operator can't blindly
+/// re-run a flow whose last failure suggests doing so would be
+/// harmful (e.g. `policy_denied` — the request was correctly
+/// refused; re-running asks the same question and gets the same
+/// answer, masking the underlying mis-configuration).
+///
+/// Classes returned as "blocked" require explicit `--force` to
+/// proceed. Returned as `false` for unknown classes so a future
+/// FailureClass variant does not silently get blocked.
+fn retry_blocked_by_class(class: &str) -> bool {
+    matches!(class, "policy_denied" | "invalid_args" | "permanent")
 }
 
 /// One row of the `task.attempts` table on the Coordinator. CLI
@@ -930,6 +1019,35 @@ mod tests {
         let raw = "task_id=x\nstatus=pending\nevents=[]\n";
         let pretty = render_pretty_task_with_attempts(raw, Some(""));
         assert!(!pretty.contains("attempts:"));
+    }
+
+    #[test]
+    fn retry_blocked_for_non_retryable_classes() {
+        for c in ["policy_denied", "invalid_args", "permanent"] {
+            assert!(
+                retry_blocked_by_class(c),
+                "class {c} should be blocked without --force"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_allowed_for_retryable_classes() {
+        for c in ["transient", "timeout", "unavailable", "-"] {
+            assert!(
+                !retry_blocked_by_class(c),
+                "class {c} should be allowed without --force"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_unknown_class_not_blocked() {
+        // Forward compatibility: a future FailureClass variant must
+        // not be silently treated as blocking. The Coordinator will
+        // still gate on state/budget; the CLI only adds opinion to
+        // KNOWN-bad classes.
+        assert!(!retry_blocked_by_class("brand_new_class"));
     }
 
     #[test]
