@@ -338,6 +338,12 @@ curl http://127.0.0.1:19791/v1/tasks/<task_id>
 # Per-attempt rows.
 curl http://127.0.0.1:19791/v1/tasks/<task_id>/attempts
 
+# Incremental chronicle fetch (long-poll friendly):
+curl 'http://127.0.0.1:19791/v1/tasks/<task_id>/events?since=0&limit=200'
+# -> JSON array of events with event_id > since, oldest first.
+# Remember the largest event_id and poll again with since=<that>
+# to get only new events. Returns [] when nothing is newer.
+
 # One-line operator-friendly summary (same shape as the CLI's
 # --pretty first line, JSON-typed for dashboard projection).
 curl http://127.0.0.1:19791/v1/tasks/<task_id>/summary

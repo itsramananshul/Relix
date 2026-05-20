@@ -159,6 +159,18 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.count utf8: {e}"))
     }
 
+    /// `task.events` passthrough. Wire format: `task_id|after_id|limit`.
+    pub async fn events(
+        &self,
+        task_id: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<String, String> {
+        let arg = format!("{task_id}|{after_id}|{limit}");
+        let bytes = self.call("task.events", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.events utf8: {e}"))
+    }
+
     /// Read-only `task.get` passthrough. Returns the Coordinator's
     /// `key=value` body verbatim; the caller parses.
     pub async fn get(&self, task_id: &str) -> Result<String, String> {

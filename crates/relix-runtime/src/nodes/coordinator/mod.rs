@@ -87,6 +87,7 @@
 //! | `task.get`      | `task_id` | multi-line `key=value` summary + `events:` JSON array |
 //! | `task.list`     | `` (empty) or `limit\|offset\|status` (limit default 50, all optional) | one `task_id\tstatus\ttitle\n` per line |
 //! | `task.count`    | `` (empty) or `<status>` | `count=N\n` |
+//! | `task.events`   | `task_id\|after_id\|limit` (after_id default 0, limit default 200) | one JSON event per line (`{"id":N,"ts":N,"type":"...","payload":"..."}`) |
 //! | `task.recover`  | (empty) | one `task_id\n` per recovered task, then `recovered=N\n` |
 //! | `task.attempts` | `task_id` | one `attempt_num\tstatus\tstarted_at\tfinished_at\|-\tfailure_class\|-\tflow_id\|-\n` per attempt |
 //! | `task.retry`    | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted retry_count=N budget=M\n` / INVALID_ARGS with cause |
@@ -810,6 +811,60 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// Fetch a slice of one Task's chronicle. Events with
+    /// `event_id > after_id` are returned, oldest-first, capped at
+    /// `limit` (clamped to `[1, max_list]` to share the same upper
+    /// bound as `task.list`). Used by long-poll-style operator
+    /// dashboards: read once with `after_id=0`, remember the largest
+    /// id returned, poll again with that id to fetch only what's
+    /// new.
+    ///
+    /// Returns `Ok(empty Vec)` when the task exists but has no new
+    /// events; returns `Err(NotFound)` when the task doesn't exist
+    /// so dashboards stop polling lost rows.
+    pub fn list_events_after(
+        &self,
+        task_id: &str,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TaskEvent>, CoordinatorError> {
+        let cap = limit.clamp(1, self.max_list);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        if exists == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, ts, event_type, payload
+                 FROM task_events
+                 WHERE task_id = ?1 AND event_id > ?2
+                 ORDER BY event_id ASC LIMIT ?3",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![task_id, after_id, cap as i64], |r| {
+                Ok(TaskEvent {
+                    event_id: r.get(0)?,
+                    ts: r.get(1)?,
+                    event_type: r.get(2)?,
+                    payload: r.get(3)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::with_capacity(cap);
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// Append a free-form event to a Task's history. Returns the
     /// monotonically-increasing event id.
     pub fn append_event(
@@ -1171,6 +1226,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.events",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_events(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
@@ -1368,6 +1433,58 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
             HandlerOutcome::Ok(buf.into_bytes())
         }
         Err(e) => internal(format!("task.list: {e}")),
+    }
+}
+
+/// `task.events` — incremental chronicle fetch for one task. Arg
+/// shape: `task_id|after_id|limit`. `after_id` defaults to 0 (read
+/// from the beginning); `limit` defaults to 200 (clamped to
+/// `[coordinator] max_list`).
+///
+/// Returns one JSON object per event, one per line:
+/// `{"id":N,"ts":N,"type":"...","payload":"..."}`. Empty body when
+/// the task has no events newer than `after_id`. Returns
+/// INVALID_ARGS on a malformed task id; `not found` if the task
+/// doesn't exist (so polling dashboards drop the row).
+fn handle_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.events utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let task_id = parts.first().copied().unwrap_or("").trim();
+    if task_id.is_empty() {
+        return invalid("task.events: task_id required".to_string());
+    }
+    let after_id: i64 = parts
+        .get(1)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = parts
+        .get(2)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    match store.list_events_after(task_id, after_id, limit) {
+        Ok(events) => {
+            let mut buf = String::with_capacity(events.len() * 96);
+            for ev in &events {
+                buf.push_str(&format!(
+                    r#"{{"id":{},"ts":{},"type":"{}","payload":"{}"}}"#,
+                    ev.event_id,
+                    ev.ts,
+                    json_escape(&ev.event_type),
+                    json_escape(&ev.payload),
+                ));
+                buf.push('\n');
+            }
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.events: not found: {id}")),
+        Err(e) => internal(format!("task.events: {e}")),
     }
 }
 
@@ -2784,6 +2901,50 @@ mod tests {
         assert_eq!(s.count(Some("pending")).unwrap(), 3);
         assert_eq!(s.count(Some("running")).unwrap(), 4);
         assert_eq!(s.count(Some("nope")).unwrap(), 0);
+    }
+
+    #[test]
+    fn list_events_after_incremental_fetch() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let e1 = s.append_event(&tid, "step", "a").unwrap();
+        let e2 = s.append_event(&tid, "step", "b").unwrap();
+        let e3 = s.append_event(&tid, "step", "c").unwrap();
+        // From the beginning.
+        let all = s.list_events_after(&tid, 0, 100).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].event_id, e1);
+        // After e1.
+        let after1 = s.list_events_after(&tid, e1, 100).unwrap();
+        assert_eq!(after1.len(), 2);
+        assert_eq!(after1[0].event_id, e2);
+        // After the latest — empty.
+        let after3 = s.list_events_after(&tid, e3, 100).unwrap();
+        assert!(after3.is_empty());
+    }
+
+    #[test]
+    fn list_events_after_respects_limit_cap() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        for i in 0..10 {
+            s.append_event(&tid, "step", &format!("e{i}")).unwrap();
+        }
+        let chunk = s.list_events_after(&tid, 0, 3).unwrap();
+        assert_eq!(chunk.len(), 3);
+        let next = s.list_events_after(&tid, chunk[2].event_id, 3).unwrap();
+        assert_eq!(next.len(), 3);
+        // No overlap.
+        assert!(next[0].event_id > chunk[2].event_id);
+    }
+
+    #[test]
+    fn list_events_after_unknown_task_is_not_found() {
+        let s = store();
+        match s.list_events_after("deadbeef", 0, 10) {
+            Err(CoordinatorError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]

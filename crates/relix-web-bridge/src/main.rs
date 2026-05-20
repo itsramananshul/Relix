@@ -184,6 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/:id", get(tasks::get_one))
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
+        .route("/v1/tasks/:id/events", get(tasks::events))
         .route("/v1/tasks/recover", post(tasks::recover))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered

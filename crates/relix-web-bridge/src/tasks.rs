@@ -278,6 +278,46 @@ pub async fn recover(
     }))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct EventsQuery {
+    /// Return only events with `event_id > since`. Defaults to 0
+    /// (read from the beginning).
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Cap the response. Clamped by the Coordinator. Defaults to 200.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `GET /v1/tasks/:id/events?since=N&limit=M` — incremental
+/// chronicle fetch. Long-poll-friendly: read once with `since=0`,
+/// remember the largest id, poll again with that id to fetch only
+/// new events.
+pub async fn events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<EventsQuery>,
+) -> Result<Json<Vec<TaskEvent>>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let after = q.since.unwrap_or(0);
+    let limit = q.limit.unwrap_or(200);
+    let body = rec
+        .events(&id, after, limit)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_events_lines(&body)))
+}
+
 pub async fn attempts(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -561,6 +601,16 @@ fn derive_summary(id: &str, raw: &str) -> Option<TaskSummary> {
     })
 }
 
+/// Parse a `task.events` body — one JSON event per line.
+/// Tolerant of empty lines and malformed entries (which are
+/// skipped silently).
+fn parse_events_lines(body: &str) -> Vec<TaskEvent> {
+    body.lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(parse_event_object)
+        .collect()
+}
+
 /// Parse the `task.count` body — a single line `count=N`.
 /// Tolerant of trailing whitespace / newlines.
 fn parse_count_body(body: &str) -> Option<i64> {
@@ -727,6 +777,43 @@ mod tests {
         let (ids, count) = parse_recover_body(body);
         assert_eq!(ids, vec!["abc111".to_string(), "def222".to_string()]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_events_lines_handles_typical_body() {
+        let body = concat!(
+            r#"{"id":1,"ts":100,"type":"task.created","payload":"x"}"#,
+            "\n",
+            r#"{"id":2,"ts":105,"type":"flow.started","payload":"chat"}"#,
+            "\n"
+        );
+        let out = parse_events_lines(body);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event_id, 1);
+        assert_eq!(out[0].event_type, "task.created");
+        assert_eq!(out[1].ts, 105);
+    }
+
+    #[test]
+    fn parse_events_lines_skips_blank_and_malformed_lines() {
+        let body = concat!(
+            "\n",
+            r#"{"id":1,"ts":100,"type":"x","payload":"y"}"#,
+            "\n",
+            "garbage line\n",
+            r#"{"id":2,"ts":200,"type":"z","payload":""}"#,
+            "\n"
+        );
+        let out = parse_events_lines(body);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event_id, 1);
+        assert_eq!(out[1].event_id, 2);
+    }
+
+    #[test]
+    fn parse_events_lines_empty_body_returns_empty() {
+        assert!(parse_events_lines("").is_empty());
+        assert!(parse_events_lines("\n\n").is_empty());
     }
 
     #[test]

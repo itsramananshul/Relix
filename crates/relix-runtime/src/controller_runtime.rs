@@ -412,6 +412,13 @@ fn register_node_type_handlers(
                 &["task", "read"],
             ),
             (
+                "task.events",
+                "Incremental chronicle fetch (task_id|after_id|limit). \
+                 Returns one JSON event per line; empty when nothing is \
+                 newer than after_id.",
+                &["task", "read", "events"],
+            ),
+            (
                 "task.recover",
                 "Run the recovery scan now: promotes overdue running tasks to \
                  interrupted. Operator-only; idempotent.",
