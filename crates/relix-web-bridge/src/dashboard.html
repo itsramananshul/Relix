@@ -1275,7 +1275,6 @@ function toast(msg, kind) {
 }
 
 /* ── Overview page ────────────────────────────────────────── */
-let overviewAutoTimer = null;
 // Snapshot of last poll for diff-based activity rail.
 let overviewPrev = {
   tasks: null,        // Map<task_id, { status, updated_at }>
@@ -1283,27 +1282,37 @@ let overviewPrev = {
   reconnect: null,    // { attempts, successes }
   coord: null,        // bool
 };
-// Recent activity items, newest first. Capped at 50.
+// Recent activity items, newest first. Capped at 50. Lives
+// outside the overview lifecycle so background collection
+// keeps populating it while the operator is on other pages.
 let activityItems = [];
 const ACTIVITY_CAP = 50;
-let lastOverviewSyncAt = 0;
+// Latest snapshots for the overview KPIs / peer table —
+// kept so re-entering overview can paint immediately without
+// waiting for the next poll tick.
+let lastHealthSnapshot = null;
+let lastTopologySnapshot = null;
+let lastTaskCountSnapshot = null;
 
-function initOverview() {
-  // Start polling when the page becomes active; cleared on
-  // route change via enterOverview re-entry + the route switch
-  // implicitly halts via currentRoute check.
-}
+function initOverview() { /* nothing one-shot */ }
 
 function enterOverview() {
-  // Refresh immediately, then on a 5s tick while still on overview.
-  refreshOverview(true);
-  if (overviewAutoTimer) clearInterval(overviewAutoTimer);
-  overviewAutoTimer = setInterval(() => {
-    if (currentRoute === 'overview') refreshOverview(false);
-  }, 5000);
+  // Paint from cache instantly if we have data; refreshOverview
+  // is then called on the next background tick anyway.
+  if (lastHealthSnapshot) {
+    renderOverviewKpis(lastHealthSnapshot, lastTaskCountSnapshot);
+    renderOverviewPeers(lastTopologySnapshot ? lastTopologySnapshot.peers || [] : []);
+    renderActivityFeed();
+  }
+  // Trigger an immediate background refresh so the operator's
+  // navigation feels responsive.
+  backgroundSync();
 }
 
-async function refreshOverview(isFirst) {
+/* Always-on background sync. Runs every 5s for the full
+   dashboard lifetime — feeds the activity rail + topbar
+   status whether or not the operator is on overview. */
+async function backgroundSync() {
   try {
     const [hRes, tRes, recentTasks] = await Promise.all([
       fetch('/v1/health').then(r => r.json()),
@@ -1315,19 +1324,44 @@ async function refreshOverview(isFirst) {
       .then(t => { const m = t.match(/count=(\d+)/); return m ? parseInt(m[1], 10) : null; })
       .catch(() => null);
 
-    renderOverviewKpis(hRes, taskCount);
-    renderOverviewPeers(tRes.peers || []);
+    const isFirst = lastHealthSnapshot === null;
+    lastHealthSnapshot = hRes;
+    lastTopologySnapshot = tRes;
+    lastTaskCountSnapshot = taskCount;
+
     diffAndRecordActivity(hRes, tRes.peers || [], recentTasks.items || [], isFirst);
-    lastOverviewSyncAt = Math.floor(Date.now() / 1000);
-    document.getElementById('activity-status').innerHTML =
-      '<span class="activity-pulse"></span>live · last sync ' + new Date().toLocaleTimeString();
+
+    // Re-render overview if currently visible.
+    if (currentRoute === 'overview') {
+      renderOverviewKpis(hRes, taskCount);
+      renderOverviewPeers(tRes.peers || []);
+      const $status = document.getElementById('activity-status');
+      if ($status) {
+        $status.innerHTML =
+          '<span class="activity-pulse"></span>live · last sync '
+          + new Date().toLocaleTimeString();
+      }
+    }
   } catch (e) {
-    document.querySelectorAll('.kpi .value').forEach(v => v.textContent = '—');
-    document.getElementById('overview-peers').innerHTML =
-      '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
-    document.getElementById('activity-status').textContent = 'sync failed: ' + String(e);
+    if (currentRoute === 'overview') {
+      document.querySelectorAll('.kpi .value').forEach(v => v.textContent = '—');
+      const $peers = document.getElementById('overview-peers');
+      if ($peers) {
+        $peers.innerHTML =
+          '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+      }
+      const $status = document.getElementById('activity-status');
+      if ($status) $status.textContent = 'sync failed: ' + String(e);
+    }
   }
 }
+
+// Kick the always-on background poll. Runs once at boot then
+// on a 5s tick for the lifetime of the page.
+setInterval(backgroundSync, 5000);
+// Initial fetch on the next microtask so the rest of the boot
+// path (showRoute → init pages) runs first.
+setTimeout(backgroundSync, 0);
 
 function renderOverviewKpis(hRes, taskCount) {
   const okPeers = hRes.peer_count - hRes.peers_expired - hRes.peers_stale;
