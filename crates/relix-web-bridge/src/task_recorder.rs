@@ -232,6 +232,14 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.attempts utf8: {e}"))
     }
 
+    /// Read-only `task.edges` passthrough. Returns the
+    /// Coordinator's tab-delimited body verbatim — the bridge
+    /// parses it into `TaskExecutionEdge` in tasks.rs.
+    pub async fn edges(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.edges", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.edges utf8: {e}"))
+    }
+
     /// Operator-triggered `task.recover` passthrough. Not fail-soft;
     /// callers want the result of the scan.
     pub async fn recover(&self) -> Result<String, String> {

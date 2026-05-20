@@ -216,6 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/cursor", get(tasks::list_cursor))
         .route("/v1/tasks/:id", get(tasks::get_one))
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
+        .route("/v1/tasks/:id/edges", get(tasks::edges))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
         .route("/v1/tasks/:id/events", get(tasks::events))
         // Experimental SSE wrapper around task.events polling.

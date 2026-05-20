@@ -632,15 +632,35 @@ pub async fn events(
     Ok(Json(parse_events_lines(&body)))
 }
 
-/// One-call full reconstruction: task detail + attempts + summary.
-/// Returns the same shapes the per-resource endpoints do, packed
-/// into one round-trip so dashboard initial-render doesn't need
-/// three separate fetches.
+/// One execution edge from `task.edges`. Phase-1E primitive.
+/// Today only `retried_from` is emitted; other edge types are
+/// reserved in the Coordinator schema.
+#[derive(Debug, Serialize)]
+pub struct TaskExecutionEdge {
+    pub edge_id: i64,
+    pub edge_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_attempt_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_by_event_id: Option<i64>,
+    pub created_at: i64,
+}
+
+/// One-call full reconstruction: task detail + attempts + summary
+/// plus execution edges. Returns the same shapes the per-resource
+/// endpoints do, packed into one round-trip so dashboard
+/// initial-render doesn't need four separate fetches.
 #[derive(Debug, Serialize)]
 pub struct TaskLineage {
     pub task: TaskDetail,
     pub summary: TaskSummary,
     pub attempts: Vec<TaskAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<TaskExecutionEdge>,
 }
 
 /// `GET /v1/tasks/:id/lineage` — single-round-trip view of a task.
@@ -685,11 +705,82 @@ pub async fn lineage(
         Ok(s) => parse_attempts(&s),
         Err(_) => Vec::new(),
     };
+    // Edges is best-effort too: older Coordinators without
+    // task.edges should not break the lineage response.
+    let edges = match rec.edges(&id).await {
+        Ok(s) => parse_edges(&s),
+        Err(_) => Vec::new(),
+    };
     Ok(Json(TaskLineage {
         task,
         summary,
         attempts,
+        edges,
     }))
+}
+
+/// Parse the tab-delimited body returned by `task.edges`.
+/// One edge per non-empty line; columns:
+///   edge_id, edge_type, attempt_id|-, related_task_id|-,
+///   related_attempt_id|-, spawned_by_event_id|-, created_at
+fn parse_edges(body: &str) -> Vec<TaskExecutionEdge> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let edge_id = match cols[0].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let parse_opt_i64 =
+            |s: &str| -> Option<i64> { if s == "-" { None } else { s.parse().ok() } };
+        let parse_opt_str =
+            |s: &str| -> Option<String> { if s == "-" { None } else { Some(s.to_string()) } };
+        let created_at: i64 = match cols[6].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        out.push(TaskExecutionEdge {
+            edge_id,
+            edge_type: cols[1].to_string(),
+            attempt_id: parse_opt_i64(cols[2]),
+            related_task_id: parse_opt_str(cols[3]),
+            related_attempt_id: parse_opt_i64(cols[4]),
+            spawned_by_event_id: parse_opt_i64(cols[5]),
+            created_at,
+        });
+    }
+    out
+}
+
+/// `GET /v1/tasks/:id/edges` — list execution edges that
+/// touch the given task. Phase-1E M38 surface; today only
+/// `retried_from` is populated.
+pub async fn edges(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<TaskExecutionEdge>>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = rec
+        .edges(&id)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_edges(&body)))
 }
 
 /// **Experimental** SSE wrapper around `task.events` polling.
@@ -1461,6 +1552,52 @@ mod tests {
             gateway_status_for("kind=1 cause=transport timeout"),
             StatusCode::BAD_GATEWAY,
         );
+    }
+
+    #[test]
+    fn parse_edges_extracts_retried_from_with_all_fields() {
+        // Real-shape line from the Coordinator: a retried_from
+        // edge for attempt 2 (id 102) linking back to attempt 1
+        // (id 101) via task.retry_requested event 47.
+        let body = "5\tretried_from\t102\tabc\t101\t47\t1700000000\n";
+        let edges = parse_edges(body);
+        assert_eq!(edges.len(), 1);
+        let e = &edges[0];
+        assert_eq!(e.edge_id, 5);
+        assert_eq!(e.edge_type, "retried_from");
+        assert_eq!(e.attempt_id, Some(102));
+        assert_eq!(e.related_task_id.as_deref(), Some("abc"));
+        assert_eq!(e.related_attempt_id, Some(101));
+        assert_eq!(e.spawned_by_event_id, Some(47));
+        assert_eq!(e.created_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_edges_handles_dash_placeholders() {
+        // Coordinator emits `-` for any nullable column. Parser
+        // must turn those into None without errors.
+        let body = "9\tretried_from\t-\tabc\t-\t-\t1700000099\n";
+        let edges = parse_edges(body);
+        assert_eq!(edges.len(), 1);
+        let e = &edges[0];
+        assert!(e.attempt_id.is_none());
+        assert!(e.related_attempt_id.is_none());
+        assert!(e.spawned_by_event_id.is_none());
+        assert_eq!(e.related_task_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn parse_edges_skips_malformed_lines_silently() {
+        let body = "not-a-real-line\n5\tretried_from\t1\ta\t2\t3\t100\nbroken\n";
+        let edges = parse_edges(body);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].edge_id, 5);
+    }
+
+    #[test]
+    fn parse_edges_empty_body_returns_empty_vec() {
+        assert!(parse_edges("").is_empty());
+        assert!(parse_edges("\n\n").is_empty());
     }
 
     #[test]
