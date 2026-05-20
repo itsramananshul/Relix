@@ -287,6 +287,86 @@ re-run it). This is a documented limitation
   doesn't, the issue is in the Open WebUI container's network — check
   its container logs.
 
+## Operator dashboard
+
+Open `http://127.0.0.1:19791/dashboard` for the operator
+console. Six routes, all shareable as URLs:
+
+| Hash | What it shows |
+|---|---|
+| `#/overview` | Mesh KPIs + live activity rail. The first stop for triage. |
+| `#/tasks` | Task list, detail panel, chronicle, export, recover. |
+| `#/tasks?status=failed` | Bookmarkable filter. `q=` for free-text. `task=` to auto-open. |
+| `#/topology` | Mesh peer graph + table. Click any node for a detail drawer. |
+| `#/providers` | AI provider keys + Test connection per provider. |
+| `#/telegram` | Bot token + mode + Test connection. |
+| `#/config` | Effective bridge config snapshot. |
+
+### Configuring providers (dashboard-first)
+
+You **do not** need to hardcode keys, export env vars, or
+edit TOML. Open `#/providers`, pick a card, paste the
+key, click Save. Keys persist to a local
+`bridge-secrets.toml` at mode 0600 (gitignored). The
+dashboard never echoes the key back over HTTP — only
+`…last4` previews + a `configured` flag.
+
+Each card has a **Test connection** button after the
+first save. It hits the upstream provider's models
+endpoint with the saved key and reports success/failure
++ elapsed_ms inline. Operators verify the key works
+without needing to drive a real chat.
+
+When a key changes, the dashboard shows
+`saved · restart AI controller to apply` — provider keys
+are read at controller startup, not at every chat. Stop
++ start the AI controller for the change to take effect.
+
+### Configuring Telegram
+
+`#/telegram` ships a copy-paste @BotFather walkthrough
+and a single form: paste the token, pick `polling` mode,
+click Save. **Test connection** calls Telegram's
+`getMe` and reports back the bot's @username on success
+so operators verify they wired the right bot. Same
+secret handling as providers — token never echoed back,
+URL token-fragments scrubbed from any error string.
+
+`webhook` mode appears in the dropdown for forward-
+compatibility but currently returns 422; the live
+HTTPS client wiring lands later.
+
+### Live runtime feel
+
+The dashboard polls `/v1/health` + `/v1/topology` +
+`/v1/tasks/cursor` in the background every 5s. The
+overview's Activity rail diffs against the prior
+snapshot and surfaces:
+
+- Task status transitions (running → completed / failed
+  / interrupted).
+- Peer freshness transitions (fresh → stale → expired
+  and recoveries).
+- Peer joins + drops from the manifest cache.
+- Reconnect attempts (`MeshClient::reconnect_counters`
+  delta) — separated as "recovered" or "in progress".
+- Coordinator presence flips (configured ↔ unavailable).
+
+Activity items are clickable: a task entry takes you to
+that task's detail panel; a peer entry opens the peer
+drawer. The topbar status dot polls every 10s
+independently as a cross-page "is the mesh up?" indicator.
+
+### Production note
+
+The `/v1/config/*` endpoints have **no authentication**
+at the HTTP layer. Put a reverse proxy with auth in
+front before exposing the bridge beyond loopback. The
+dashboard banners on the providers / telegram pages
+restate this. See
+[`docs/deployment.md`](deployment.md) for the
+production-hardening checklist.
+
 ## Inspecting tasks (durable orchestration ledger)
 
 When the Coordinator peer is up, every chat request becomes a Task on
