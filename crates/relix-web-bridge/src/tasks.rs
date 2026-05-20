@@ -738,11 +738,16 @@ pub async fn events_stream(
     let event_type = q.r#type.clone().unwrap_or_default();
     let order = q.order.clone().unwrap_or_default();
     let id_for_stream = id;
-    // RAII guard: increments the active-stream counter on
-    // open, decrements on drop. Drop fires when the stream's
-    // future is cancelled (client disconnect) OR when the
-    // stream exits normally (terminal `gone` event).
-    let stream_guard = state.stream_metrics.open();
+    // RAII guard: registers this stream against the task_id
+    // and decrements active + removes the detail entry on
+    // drop. Drop fires when the stream's future is cancelled
+    // (client disconnect) OR when the stream exits normally
+    // (terminal `gone` event).
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state.stream_metrics.open(id_for_stream.clone(), opened_at);
     let s = stream! {
         // Hold the guard inside the stream body so it lives
         // exactly as long as the stream itself.

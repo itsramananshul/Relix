@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppState;
 use crate::lifecycle::LifecycleEvent;
+use crate::metrics::ActiveStream;
 
 /// One row of `/v1/topology` — one cached peer with the
 /// aggregates an operator cares about.
@@ -166,6 +167,48 @@ pub struct LifecycleEventsResponse {
     /// max `ts` of the returned events on the next request.
     pub seq: i64,
     pub generated_at: i64,
+}
+
+/// One row of `/v1/streams`. Same shape as
+/// `crate::metrics::ActiveStream` plus a derived `age_secs`
+/// so dashboards don't have to compute the elapsed time.
+#[derive(Debug, Serialize)]
+pub struct StreamRow {
+    pub id: u64,
+    pub task_id: String,
+    pub opened_at: i64,
+    pub age_secs: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamsResponse {
+    pub active: Vec<StreamRow>,
+    pub opened_total: u64,
+    pub generated_at: i64,
+}
+
+/// `GET /v1/streams` — list currently-open SSE streams. One
+/// row per active stream tagged with task_id + opened_at +
+/// age_secs. Useful for "which task is being watched right
+/// now" operator visibility.
+pub async fn streams_list(State(state): State<AppState>) -> Json<StreamsResponse> {
+    let now = unix_secs();
+    let rows: Vec<StreamRow> = state
+        .stream_metrics
+        .list_active()
+        .into_iter()
+        .map(|s: ActiveStream| StreamRow {
+            id: s.id,
+            task_id: s.task_id,
+            opened_at: s.opened_at,
+            age_secs: (now - s.opened_at).max(0),
+        })
+        .collect();
+    Json(StreamsResponse {
+        active: rows,
+        opened_total: state.stream_metrics.opened_total(),
+        generated_at: now,
+    })
 }
 
 /// `GET /v1/topology/events?since=<ts>&limit=<n>` — recent

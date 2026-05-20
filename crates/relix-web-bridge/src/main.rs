@@ -250,6 +250,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // task that runs every 5s; in-memory ring; resets on
         // bridge restart.
         .route("/v1/topology/events", get(topology::lifecycle_events))
+        // Per-stream tracking for /v1/tasks/:id/events/stream
+        // consumers. Lists active streams + opened_at + age so
+        // operators see "which task is being watched right now."
+        .route("/v1/streams", get(topology::streams_list))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
