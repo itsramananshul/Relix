@@ -213,6 +213,21 @@ pub fn extract(html: &str) -> Extracted {
             continue;
         }
 
+        // CDATA: `<![CDATA[ ... ]]>`. Not legal in HTML5 outside
+        // foreign content (SVG/MathML) but appears in scraped pages.
+        // Treat the whole section as ignored markup so the body
+        // (which may include `<script>` tags whose payload would
+        // otherwise leak as text — see Track 6 hardening tests)
+        // never gets parsed as inline content.
+        if b == b'<' && i + 9 <= n && &bytes[i..i + 9] == b"<![CDATA[" {
+            if let Some(end) = find_subslice(&bytes[i + 9..], b"]]>") {
+                i = i + 9 + end + 3;
+            } else {
+                i = n;
+            }
+            continue;
+        }
+
         if b == b'<' && i + 1 < n {
             // Tag start. Identify tag name (next ASCII letters), maybe
             // with leading `/`.
@@ -775,5 +790,112 @@ mod tests {
         let html = "<p>one</p><p>two</p>";
         let e = extract(html);
         assert_eq!(e.text, "one two");
+    }
+
+    // ── Track 6 hardening: parser doesn't panic on hostile inputs ──
+
+    #[test]
+    fn deeply_nested_tags_do_not_overflow_stack() {
+        // 2000 nested <div>s. A naive recursive parser would blow
+        // the stack; the alpha parser is iterative.
+        let depth = 2000;
+        let mut html = String::with_capacity(depth * 11);
+        for _ in 0..depth {
+            html.push_str("<div>");
+        }
+        html.push_str("payload");
+        for _ in 0..depth {
+            html.push_str("</div>");
+        }
+        let e = extract(&html);
+        assert!(e.text.contains("payload"));
+    }
+
+    #[test]
+    fn cdata_sections_are_skipped_entirely() {
+        // CDATA is not legal in HTML5 outside foreign content
+        // (SVG/MathML) but appears in scraped pages. The parser
+        // skips the whole `<![CDATA[ ... ]]>` block — its body
+        // never becomes text and any `<script>` inside is not
+        // re-parsed as inline content.
+        let html = "<p>before</p><![CDATA[ raw text ]]><p>after</p>";
+        let e = extract(html);
+        assert!(e.text.contains("before"));
+        assert!(e.text.contains("after"));
+        assert!(
+            !e.text.contains("raw text"),
+            "CDATA body leaked: {:?}",
+            e.text
+        );
+    }
+
+    #[test]
+    fn script_inside_cdata_does_not_leak_payload() {
+        // Hardening: even when a script tag is wrapped inside CDATA,
+        // none of its payload should escape into the extracted text.
+        // (The CDATA wrapper itself is skipped; this is belt-and-
+        // suspenders that the operator-facing contract holds under
+        // weird inputs.)
+        let html = "<![CDATA[ <script>alert('xss')</script> ]]>";
+        let e = extract(html);
+        assert!(
+            !e.text.contains("alert"),
+            "script body leaked from inside CDATA: {:?}",
+            e.text
+        );
+    }
+
+    #[test]
+    fn cdata_inside_real_content_doesnt_break_surrounding_text() {
+        let html = "<p>A</p><![CDATA[ ignored <span>also ignored</span> ]]><p>B</p>";
+        let e = extract(html);
+        assert_eq!(e.text, "A B");
+    }
+
+    #[test]
+    fn malformed_meta_tag_does_not_panic_or_corrupt_links() {
+        let html = "<meta name=\"a content=\"unterminated><a href=\"https://ok\">x</a>";
+        let e = extract(html);
+        // Should not crash. May or may not extract the meta, but the
+        // link should still be findable since it's well-formed.
+        assert!(
+            e.links.iter().any(|l| l.contains("https://ok")),
+            "links: {:?}",
+            e.links
+        );
+    }
+
+    #[test]
+    fn extremely_long_attribute_value_handled_cleanly() {
+        // 1 MB attribute value. Tests the parser doesn't read it into
+        // an unbounded buffer that defeats max_input_bytes downstream.
+        let val = "x".repeat(1_000_000);
+        let html = format!("<a href=\"https://e.com/?q={val}\">link</a>");
+        let e = extract(&html);
+        // Parser succeeds (it's the handler's job to bound input size,
+        // not the parser's). The link IS captured.
+        assert_eq!(e.links.len(), 1);
+        assert!(e.links[0].starts_with("https://e.com/?q=x"));
+    }
+
+    #[test]
+    fn self_closing_void_tags_dont_open_block_context() {
+        // <br/> and <img/> should not produce text content of their
+        // own; subsequent <p> still produces clean boundaries.
+        let html = "<p>line1</p><br/><img src=\"x\"/><p>line2</p>";
+        let e = extract(html);
+        assert_eq!(e.text, "line1 line2");
+    }
+
+    #[test]
+    fn html_entity_double_decoding_is_avoided() {
+        // `&amp;lt;` should decode ONCE to `&lt;`, not twice to `<`.
+        let html = "<p>&amp;lt;tag&amp;gt;</p>";
+        let e = extract(html);
+        assert!(
+            e.text.contains("&lt;tag&gt;"),
+            "double-decode regression: {:?}",
+            e.text
+        );
     }
 }

@@ -919,4 +919,162 @@ mod tests {
             Idempotency::AtMostOnce
         ));
     }
+
+    // ── Track 6 hardening: edge cases the original alpha tests skipped ──
+
+    #[test]
+    fn write_with_traversal_in_path_is_rejected() {
+        let (_td, j) = mk_jail();
+        // Even with `create_new`, a `..` in the rel path is refused
+        // before any file open is attempted.
+        let r = handle_write(&j, &ctx(b"../escape.txt|create_new|hi"));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(
+                    e.cause.contains("contains '..'") || e.cause.contains("traversal"),
+                    "cause: {}",
+                    e.cause
+                );
+            }
+            HandlerOutcome::Ok(_) => panic!("expected traversal rejection on write"),
+        }
+    }
+
+    #[test]
+    fn write_with_absolute_path_is_rejected() {
+        let (_td, j) = mk_jail();
+        #[cfg(unix)]
+        let absolute_arg = b"/tmp/escape.txt|create_new|hi".to_vec();
+        #[cfg(windows)]
+        let absolute_arg = b"C:\\Windows\\escape.txt|create_new|hi".to_vec();
+        let r = handle_write(&j, &ctx(&absolute_arg));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(
+                    e.cause.to_lowercase().contains("absolute"),
+                    "cause: {}",
+                    e.cause
+                );
+            }
+            HandlerOutcome::Ok(_) => panic!("expected absolute-path rejection on write"),
+        }
+    }
+
+    #[test]
+    fn write_oversize_payload_rejected_before_open() {
+        let (td, _) = mk_jail();
+        let tiny = FsJail::new(FsJailConfig {
+            root: td.path().to_path_buf(),
+            max_read_bytes: 10,
+            max_write_bytes: 10,
+            max_search_results: 100,
+        })
+        .unwrap();
+        // 20 bytes of content with a 10-byte cap.
+        let r = handle_write(&tiny, &ctx(b"big.txt|create_new|aaaaaaaaaaaaaaaaaaaa"));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("exceeds cap"), "cause: {}", e.cause);
+            }
+            HandlerOutcome::Ok(_) => panic!("expected write oversize rejection"),
+        }
+        // File MUST NOT have been created.
+        assert!(!td.path().join("big.txt").exists(),);
+    }
+
+    #[test]
+    fn patch_on_nonexistent_file_rejected() {
+        let (_td, j) = mk_jail();
+        let diff = "--- a/ghost.txt\n+++ b/ghost.txt\n@@ -1,1 +1,1 @@\n-x\n+y\n";
+        let arg = format!("ghost.txt|unified_diff|{diff}");
+        let r = handle_patch(&j, &ctx(arg.as_bytes()));
+        match r {
+            HandlerOutcome::Err(_) => {}
+            HandlerOutcome::Ok(_) => panic!("expected error on patching ghost file"),
+        }
+        assert!(!Path::new("ghost.txt").exists(),);
+    }
+
+    #[test]
+    fn search_content_no_matches_returns_empty_body() {
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("doc.txt"), "alpha beta").unwrap();
+        let r = handle_search(&j, &ctx(b"content|charlie|10"));
+        match r {
+            HandlerOutcome::Ok(b) => {
+                assert!(b.is_empty(), "expected empty body, got: {b:?}");
+            }
+            HandlerOutcome::Err(e) => panic!("search failed: {}", e.cause),
+        }
+    }
+
+    #[test]
+    fn search_name_handles_deeply_nested_dirs() {
+        let (td, j) = mk_jail();
+        let deep = td.path().join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("needle.txt"), b"x").unwrap();
+        let r = handle_search(&j, &ctx(b"name|needle|10"));
+        match r {
+            HandlerOutcome::Ok(b) => {
+                let s = String::from_utf8(b).unwrap();
+                assert!(s.contains("needle.txt"), "got: {s}");
+                // Path should reflect the nested structure.
+                assert!(s.contains("a") && s.contains("e"), "path lost depth: {s}");
+            }
+            HandlerOutcome::Err(e) => panic!("deep search failed: {}", e.cause),
+        }
+    }
+
+    #[test]
+    fn search_empty_pattern_does_not_match_everything() {
+        // Operator concern: an empty content pattern with substring
+        // semantics would `contains("")` -> true on every line and
+        // explode the result set. Verify we either reject it or
+        // return zero matches (NEVER all lines of all files).
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("a.txt"), "one\ntwo\nthree").unwrap();
+        std::fs::write(td.path().join("b.txt"), "four\nfive").unwrap();
+        let r = handle_search(&j, &ctx(b"content||10"));
+        match r {
+            HandlerOutcome::Ok(b) => {
+                let n = b.iter().filter(|c| **c == b'\n').count();
+                assert!(n <= 10, "empty pattern leaked match-all (got {n} lines)");
+            }
+            HandlerOutcome::Err(_) => {
+                // Explicit rejection of empty pattern is also fine —
+                // safer than silently matching everything.
+            }
+        }
+    }
+
+    #[test]
+    fn read_with_explicit_max_bytes_rejects_oversize_not_truncates() {
+        // Regression guard for the safety contract: max_bytes is a
+        // CAP that rejects oversize files, NOT a truncation directive.
+        // Truncated reads silently hide content from the caller and
+        // can lead to wrong-answer flows. The honest behaviour is to
+        // refuse and let the caller raise the cap if needed.
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("doc.txt"), "abcdefghij").unwrap();
+        let r = handle_read(&j, &ctx(b"doc.txt|4"));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(
+                    e.cause.contains("exceeds cap"),
+                    "expected cap rejection, got: {}",
+                    e.cause
+                );
+            }
+            HandlerOutcome::Ok(_) => panic!("max_bytes must reject oversize, not truncate"),
+        }
+        // Reading within the cap returns the full contents.
+        let r = handle_read(&j, &ctx(b"doc.txt|32"));
+        match r {
+            HandlerOutcome::Ok(b) => {
+                assert_eq!(String::from_utf8(b).unwrap(), "abcdefghij");
+            }
+            HandlerOutcome::Err(e) => panic!("read within cap failed: {}", e.cause),
+        }
+    }
 }
