@@ -352,6 +352,11 @@ curl http://127.0.0.1:19791/v1/tasks/<task_id>/summary
 #     "last_failure_class":"transient","retries":"1/3",
 #     "retry_policy":"bounded"}
 
+# Full reconstruction in one round-trip: task + summary + attempts.
+# Use when a dashboard needs the whole picture on initial render.
+curl http://127.0.0.1:19791/v1/tasks/<task_id>/lineage
+# -> {"task": {...}, "summary": {...}, "attempts": [...]}
+
 # Operator-triggered recovery scan — promotes overdue running
 # tasks to interrupted. Idempotent.
 curl -X POST http://127.0.0.1:19791/v1/tasks/recover

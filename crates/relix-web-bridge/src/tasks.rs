@@ -318,6 +318,66 @@ pub async fn events(
     Ok(Json(parse_events_lines(&body)))
 }
 
+/// One-call full reconstruction: task detail + attempts + summary.
+/// Returns the same shapes the per-resource endpoints do, packed
+/// into one round-trip so dashboard initial-render doesn't need
+/// three separate fetches.
+#[derive(Debug, Serialize)]
+pub struct TaskLineage {
+    pub task: TaskDetail,
+    pub summary: TaskSummary,
+    pub attempts: Vec<TaskAttempt>,
+}
+
+/// `GET /v1/tasks/:id/lineage` — single-round-trip view of a task.
+/// Each component is fetched serially via the existing capabilities
+/// (no batching at the Coordinator); the win is at the HTTP layer
+/// (one TLS handshake, one CORS preflight, one JSON parse).
+///
+/// If a component fails (e.g. older Coordinator without
+/// `task.attempts`), the lineage is still returned with the other
+/// components populated and the failing component's slot left
+/// empty. Operator dashboards then degrade gracefully.
+pub async fn lineage(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskLineage>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    // task.get is the mandatory component — if it fails we surface
+    // the failure (vs degrading silently to an empty task).
+    let body = rec
+        .get(&id)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    let task = parse_task_body(&id, &body);
+    let summary = derive_summary(&id, &body).ok_or((
+        StatusCode::BAD_GATEWAY,
+        Json(ApiError {
+            error: "coordinator returned a task body without status".into(),
+        }),
+    ))?;
+    // Attempts is best-effort: degrade gracefully.
+    let attempts = match rec.attempts(&id).await {
+        Ok(s) => parse_attempts(&s),
+        Err(_) => Vec::new(),
+    };
+    Ok(Json(TaskLineage {
+        task,
+        summary,
+        attempts,
+    }))
+}
+
 pub async fn attempts(
     State(state): State<AppState>,
     Path(id): Path<String>,
