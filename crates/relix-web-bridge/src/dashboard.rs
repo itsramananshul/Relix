@@ -395,6 +395,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_provider_model_presets_present() {
+        // M54 (Track C): provider card default_model input is
+        // wired to a datalist of curated presets per provider
+        // so the common case is one click instead of looking
+        // up a model id. Still a plain text input, so operators
+        // running newer/unlisted models can type freely.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("PROVIDER_MODEL_PRESETS"),
+            "PROVIDER_MODEL_PRESETS table missing"
+        );
+        assert!(
+            body.contains("renderProviderModelPresetDatalist"),
+            "datalist renderer missing"
+        );
+        // One canonical preset id per provider must appear in
+        // the page source.
+        for needle in ["claude-opus-4-7", "gpt-4o", "grok-4", "gemini-2.5-pro"] {
+            assert!(
+                body.contains(needle),
+                "preset model id `{needle}` missing from PROVIDER_MODEL_PRESETS"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn page_test_all_providers_present() {
         // M48 (Track C): batch "Test all configured" runs the
         // existing /v1/config/providers/:name/test endpoint

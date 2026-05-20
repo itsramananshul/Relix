@@ -2011,6 +2011,22 @@ const PROVIDER_LABELS = {
   xai:        { label: 'xAI / Grok',     hint: 'xai-... key from console.x.ai. Model e.g. grok-2, grok-4.' },
   google:     { label: 'Google / Gemini', hint: 'AIza... key from ai.google.dev. Model e.g. gemini-2.5-pro.' },
 };
+
+/* Per-provider model-name suggestions surfaced via a <datalist>
+   on each provider card's "default model" input. Operators can
+   still type any value (the input is plain text); these are
+   convenience hints so the common case is one-click instead of
+   "go look up the model id." Curated against current public
+   model catalogs as of this dashboard ship — operators using
+   newer models should still type them in directly. */
+const PROVIDER_MODEL_PRESETS = {
+  mock:       ['mock-fast', 'mock-slow'],
+  openai:     ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'o3-mini'],
+  anthropic:  ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
+  openrouter: ['anthropic/claude-sonnet-4-6', 'openai/gpt-4o', 'meta-llama/llama-3.1-405b-instruct'],
+  xai:        ['grok-4', 'grok-2'],
+  google:     ['gemini-2.5-pro', 'gemini-2.5-flash'],
+};
 let currentRoute = null;
 const initialised = new Set();
 
@@ -4804,6 +4820,18 @@ function renderProviders(providers) {
   providers.forEach(p => wireProviderCard(p.name));
 }
 
+/* HTML5 <datalist> with curated model-name presets for the
+   given provider. Empty string when the provider isn't in
+   PROVIDER_MODEL_PRESETS (operators still get a plain text
+   input — datalist is purely an autocomplete affordance). */
+function renderProviderModelPresetDatalist(name) {
+  const presets = PROVIDER_MODEL_PRESETS[name];
+  if (!presets || !presets.length) return '';
+  const opts = presets.map(m =>
+    '<option value="' + escapeHtml(m) + '"></option>').join('');
+  return '<datalist id="model-presets-' + escapeHtml(name) + '">' + opts + '</datalist>';
+}
+
 function renderProviderCard(p) {
   const meta = PROVIDER_LABELS[p.name] || { label: p.name, hint: '' };
   // Composite status badge: configured + default + disabled.
@@ -4851,7 +4879,8 @@ function renderProviderCard(p) {
     + '<div class="form-row" style="grid-template-columns: 100px 1fr;">'
     +   '<label>default model</label>'
     +   '<div class="field">'
-    +     '<input type="text" data-field="default_model" value="' + escapeHtml(p.default_model || '') + '" placeholder="optional">'
+    +     '<input type="text" data-field="default_model" list="' + escapeHtml('model-presets-' + p.name) + '" value="' + escapeHtml(p.default_model || '') + '" placeholder="optional">'
+    +     renderProviderModelPresetDatalist(p.name)
     +   '</div>'
     + '</div>'
     + '<div class="actions">'
