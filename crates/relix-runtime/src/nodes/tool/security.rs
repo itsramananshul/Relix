@@ -475,4 +475,111 @@ mod tests {
             other => panic!("expected v4-unwrapped, got {other:?}"),
         }
     }
+
+    // ── Track 6 SSRF hardening: edge cases ────────────────────────────
+
+    /// Either rejection path (literal-IP OR resolved-DNS) is
+    /// acceptable for bracketed IPv6 URLs — what matters is that
+    /// the URL is refused before any I/O.
+    fn assert_v6_rejected(err: &SsrfError) {
+        match err {
+            SsrfError::IpForbidden { .. } | SsrfError::DnsForbidden { .. } => {}
+            other => panic!("bracketed v6 must be rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_rejects_bracketed_ipv6_loopback() {
+        let e = resolve_safe_url("https://[::1]/", false)
+            .await
+            .expect_err("bracketed v6 loopback must be rejected");
+        assert_v6_rejected(&e);
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_rejects_bracketed_ipv6_link_local() {
+        let e = resolve_safe_url("https://[fe80::1]/", false)
+            .await
+            .expect_err("bracketed v6 link-local must be rejected");
+        assert_v6_rejected(&e);
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_rejects_mapped_v4_loopback_in_url() {
+        // `[::ffff:127.0.0.1]` should unwrap to 127.0.0.1 either at
+        // parse time or after DNS resolution — both paths must
+        // refuse before any I/O.
+        let e = resolve_safe_url("https://[::ffff:127.0.0.1]/", false)
+            .await
+            .expect_err("mapped v4 loopback must be rejected");
+        assert_v6_rejected(&e);
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_rejects_localhost_case_variants() {
+        // Hostname denylist must be case-insensitive. An attacker
+        // who knows the denylist will try `LOCALHOST`, `LocalHost`,
+        // etc.
+        for variant in ["LOCALHOST", "LocalHost", "lOcAlHoSt"] {
+            let url = format!("https://{variant}/");
+            let e = resolve_safe_url(&url, false)
+                .await
+                .expect_err(&format!("variant {variant} must be denied"));
+            assert!(
+                matches!(e, SsrfError::HostnameDenied { .. }),
+                "variant {variant} got {e:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_rejects_internal_suffix_case_variants() {
+        let e = resolve_safe_url("https://API.INTERNAL/", false)
+            .await
+            .expect_err("INTERNAL suffix variant must be denied");
+        assert!(matches!(e, SsrfError::HostnameDenied { .. }), "got {e:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_with_userinfo_does_not_smuggle() {
+        // `https://safe.example@127.0.0.1/` — naive parsing might
+        // see `safe.example` as the host. URL spec says userinfo
+        // is before the `@`, host is after. The literal-IP check
+        // must operate on the actual host (`127.0.0.1`).
+        let e = resolve_safe_url("https://user:pass@127.0.0.1/", false)
+            .await
+            .expect_err("userinfo must not mask the real host");
+        assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_with_explicit_port_still_checks_host() {
+        let e = resolve_safe_url("https://127.0.0.1:8443/path", false)
+            .await
+            .expect_err("port must not bypass IP check");
+        assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_rejects_url_without_host() {
+        // `data:` URLs and similar exotic schemes parse but have no
+        // host. Should produce a clean SchemeDenied (or NoHost) —
+        // never a panic on .host_str().unwrap().
+        let e = resolve_safe_url("data:text/plain,hello", false)
+            .await
+            .expect_err("data: URL must be refused");
+        assert!(
+            matches!(e, SsrfError::SchemeDenied { .. } | SsrfError::NoHost(_)),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn forbidden_ip_reason_covers_documentation_range() {
+        // RFC 5737 documentation ranges should be denied. A handler
+        // that reaches "192.0.2.1" means a misconfiguration; better
+        // to fail loudly than silently dial nothing.
+        assert!(forbidden_ip_reason("192.0.2.1".parse().unwrap()).is_some());
+        assert!(forbidden_ip_reason("203.0.113.1".parse().unwrap()).is_some());
+    }
 }
