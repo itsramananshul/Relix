@@ -154,6 +154,7 @@ Start here, in this order:
 - [`docs/operator-guide.md`](docs/operator-guide.md) — running the mesh, logs, troubleshooting, common failure modes.
 - [`docs/failure-modes.md`](docs/failure-modes.md) — single-page reference for "what happens when X is down": detection signals, bridge behavior, recovery steps for every component.
 - [`docs/deployment.md`](docs/deployment.md) — local / multi-node / production-readiness modes, mandatory hardening before public exposure, topology diagram, Open WebUI + Telegram integration.
+- [`docs/multi-node-bringup.md`](docs/multi-node-bringup.md) — five concrete topologies (single-host → multi-host → channel-augmented), per-node config deltas, identity distribution recipe, boot order, multi-node health checks.
 - [`docs/flows-and-sol.md`](docs/flows-and-sol.md) — what SOL is and isn't, how `remote_call` works, how to write a new flow.
 - [`docs/security.md`](docs/security.md) — identities, policy, audit, what the alpha guarantees and what it doesn't.
 - [`docs/tool-node.md`](docs/tool-node.md) — the external-action peer, the SSRF model, the DNS pin, the redirect re-check, the secure client pool.
