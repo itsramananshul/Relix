@@ -304,40 +304,54 @@ These all stay deliberately out of Phase 1 — the goal is
 "operators can set a key without editing TOML in a shell,"
 not "production-grade secret management."
 
-## Implementation plan
+## Implementation status
 
-Milestones map to the eight commits in the user directive:
+Milestones M1-M8 landed the foundational redesign. M9-M16
+ship the productization layer that makes the dashboard
+feel like a real operator console rather than a debug
+page.
 
-1. **Retire `docs/internal/nightly-blockers/`** — done in the
-   commit preceding this doc.
-2. **OpenClaw analysis + this doc** — current commit.
-3. **Dashboard layout foundation** — replace `dashboard.html`
-   with the new sidebar+topbar+content shell, hash-based
-   router, page registry. Move existing task list to
-   `#/tasks`. No content redesign yet.
-4. **Task / topology / health redesign** — restyle the
-   existing surfaces with cards, status badges, empty/loading
-   states. Move the retention widget into a modal under
-   `#/tasks`. The `#/overview` page synthesises health +
-   topology + task count.
-5. **Settings/config backend** — new `BridgeSecretsFile`
-   abstraction + `/v1/config/*` endpoints. Schema validation,
-   secret redaction, file persistence at mode 0600. Tests for
-   redaction + presence-without-leak.
-6. **Provider settings UI** — `#/providers` page wired to the
-   config backend. Per-provider card with masked key entry,
-   default model dropdown, restart-required banner. Six
-   provider types (mock / openai / anthropic / openrouter /
-   xai / google).
-7. **Telegram setup UI** — `#/telegram` page. Mode selector
-   (polling only today; webhook returns 422). Setup
-   instructions including `@BotFather` walkthrough. Status
-   badges.
-8. **Tests + docs polish** — workspace tests, dashboard
-   landmark assertions, secret-redaction unit tests, README
-   refresh, operator-guide cross-reference.
+| # | Status | What |
+|---|---|---|
+| M1 | ✅ | Retire `docs/internal/nightly-blockers/`. |
+| M2 | ✅ | OpenClaw analysis + this design doc. |
+| M3 | ✅ | Sidebar + topbar + hash-router shell. Six routes wired. |
+| M4 | ✅ | Card-based redesign for task / topology / overview (folded into M3). |
+| M5 | ✅ | `BridgeSecrets` + `/v1/config/*` endpoints. Atomic file write, mode 0600, redaction-tested. |
+| M6 | ✅ | `#/providers` page: per-provider cards, masked input + reveal toggle, save / delete / restart-required UX. |
+| M7 | ✅ | `#/telegram` page: token + mode form, BotFather walkthrough. |
+| M8 | ✅ | `#/config` page + redaction endpoint tests + docs polish. |
+| M9 | ✅ | Topology graph (SVG) + peer detail drawer. Click-to-inspect peer. |
+| M10 | ✅ | Live activity feed on overview. Polls + diffs every 5s. |
+| M11 | ✅ | Provider connection test endpoint + UI button. Probes upstream `/models`. |
+| M12 | ✅ | Task search, quick-filter chips, toast notifications. |
+| M13 | ✅ | Always-on background sync so activity rail stays alive across route switches. |
+| M14 | ✅ | Filter + selected task persisted in URL hash for shareable / bookmarkable views. |
+| M15 | ✅ | Telegram connection test + URL-token scrubber (load-bearing leak guard). |
+| M16 | ✅ | Activity items clickable: navigate to task or open peer drawer. |
 
 Each milestone is its own commit + push, per the directive.
+
+## URL conventions
+
+The dashboard is a single-page app under
+`/dashboard`. Routing is hash-based and shareable:
+
+| Hash | What it shows |
+|---|---|
+| `#/overview` | KPI grid + recent peers + live activity rail. |
+| `#/tasks` | Task list + detail panel + chronicle. |
+| `#/tasks?status=failed` | Pre-filtered to failed tasks. |
+| `#/tasks?status=running&q=demo` | Status filter + free-text search. |
+| `#/tasks?task=abc12345…` | Auto-opens that task's detail panel. |
+| `#/topology` | Mesh graph + peer table. |
+| `#/providers` | AI provider settings (cards). |
+| `#/telegram` | Telegram bot setup + test. |
+| `#/config` | Effective bridge config snapshot. |
+
+Operators can bookmark any of these. Selecting a task or
+changing a filter updates the hash via `history.replaceState`
+so the URL stays in sync without inflating browser history.
 
 ## Verification
 

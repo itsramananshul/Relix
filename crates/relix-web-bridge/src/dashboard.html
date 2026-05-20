@@ -1541,6 +1541,7 @@ function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
         kind: 'peer',
         label: 'PEER',
         body: cur.alias + ' joined (' + cur.freshness + ')',
+        link: { kind: 'peer', id },
       });
       continue;
     }
@@ -1553,6 +1554,7 @@ function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
         kind: k,
         label: 'PEER',
         body: cur.alias + ' ' + prev.freshness + ' → ' + cur.freshness,
+        link: { kind: 'peer', id },
       });
     }
   }
@@ -1579,6 +1581,7 @@ function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
         body: cur.status + ' · ' + truncateMiddle(cur.title || '(untitled)', 60)
           + '   <span class="id">' + escapeHtml(id.slice(0, 8)) + '</span>',
         raw: true,
+        link: { kind: 'task', id },
       });
       continue;
     }
@@ -1595,6 +1598,7 @@ function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
           + ' · ' + truncateMiddle(cur.title || '', 50)
           + '   <span class="id">' + escapeHtml(id.slice(0, 8)) + '</span>',
         raw: true,
+        link: { kind: 'task', id },
       });
     }
   }
@@ -1615,6 +1619,7 @@ function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
 
 function renderActivityFeed(newCount) {
   const $host = document.getElementById('activity-feed');
+  if (!$host) return;
   if (!activityItems.length) {
     $host.innerHTML = '<div class="empty">waiting for activity…</div>';
     return;
@@ -1623,7 +1628,10 @@ function renderActivityFeed(newCount) {
     const dt = new Date(it.ts);
     const tag = dt.toLocaleTimeString();
     const isNew = newCount && i < newCount;
-    return '<div class="activity-item ' + escapeHtml(it.kind) + (isNew ? ' new' : '') + '">'
+    const linkAttr = it.link
+      ? ' data-link-kind="' + escapeHtml(it.link.kind) + '" data-link-id="' + escapeHtml(it.link.id) + '" style="cursor: pointer;"'
+      : '';
+    return '<div class="activity-item ' + escapeHtml(it.kind) + (isNew ? ' new' : '') + '"' + linkAttr + '>'
       + '<span class="activity-icon"></span>'
       + '<span class="activity-tag">' + escapeHtml(tag) + '</span>'
       + '<span class="activity-body">'
@@ -1632,6 +1640,24 @@ function renderActivityFeed(newCount) {
       + '</div>';
   }).join('');
   $host.innerHTML = '<div class="activity-list">' + rows + '</div>';
+  $host.querySelectorAll('.activity-item[data-link-kind]').forEach(el => {
+    el.addEventListener('click', () => {
+      const kind = el.dataset.linkKind;
+      const id = el.dataset.linkId;
+      if (kind === 'task') {
+        window.location.hash = buildHash('tasks', { task: id });
+      } else if (kind === 'peer') {
+        // Ensure topology peers are loaded so the drawer can find
+        // the entry; if not, navigate to topology and the page
+        // will fetch.
+        if (topologyPeers.find(p => p.node_id === id)) {
+          openPeerDrawer(id);
+        } else {
+          window.location.hash = '#/topology';
+        }
+      }
+    });
+  });
 }
 
 function truncateMiddle(s, n) {

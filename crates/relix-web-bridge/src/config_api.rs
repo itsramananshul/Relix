@@ -481,8 +481,8 @@ pub struct TelegramTestResult {
 }
 
 /// `POST /v1/config/telegram/test` — validate the saved bot
-/// token by calling Telegram's `getMe`. Returns success/failure
-/// + optional bot_username + elapsed_ms + a redaction-safe
+/// token by calling Telegram's `getMe`. Returns success/failure,
+/// optional bot_username, elapsed_ms, and a redaction-safe
 /// detail string.
 ///
 /// SECURITY NOTE: the Bot API requires the token in the URL
