@@ -339,6 +339,11 @@ curl http://127.0.0.1:19791/v1/tasks/<task_id>/summary
 #     "duration_secs":12,"started_at":1700000000,
 #     "last_failure_class":"transient","retries":"1/3",
 #     "retry_policy":"bounded"}
+
+# Operator-triggered recovery scan — promotes overdue running
+# tasks to interrupted. Idempotent.
+curl -X POST http://127.0.0.1:19791/v1/tasks/recover
+# -> {"recovered":["abc...","def..."],"count":2}
 ```
 
 Response shape is documented inline in

@@ -151,6 +151,13 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.attempts utf8: {e}"))
     }
 
+    /// Operator-triggered `task.recover` passthrough. Not fail-soft;
+    /// callers want the result of the scan.
+    pub async fn recover(&self) -> Result<String, String> {
+        let bytes = self.call("task.recover", b"").await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.recover utf8: {e}"))
+    }
+
     /// Low-level wrapper. Builds an envelope, sends via MeshClient,
     /// decodes the response, returns the body bytes or a string error.
     async fn call(&self, method: &str, arg: &[u8]) -> Result<Vec<u8>, String> {

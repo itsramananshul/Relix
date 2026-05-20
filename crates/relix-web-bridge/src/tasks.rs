@@ -211,6 +211,38 @@ pub async fn summary(
     Ok(Json(summary))
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecoverResponse {
+    pub recovered: Vec<String>,
+    pub count: usize,
+}
+
+/// `POST /v1/tasks/recover` — operator-triggered recovery scan.
+/// Promotes overdue `running` tasks to `interrupted` and closes
+/// the open attempt with `failure_class=timeout`. Idempotent.
+///
+/// Same write-only-with-no-HTTP-auth caveat as the chat endpoints:
+/// put a reverse proxy in front before exposing this beyond
+/// loopback. The Coordinator's policy still applies (the bridge's
+/// identity must be admitted to `task.recover`).
+pub async fn recover(
+    State(state): State<AppState>,
+) -> Result<Json<RecoverResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let body = rec
+        .recover()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(ApiError { error: e })))?;
+    let (ids, _count) = parse_recover_body(&body);
+    let count = ids.len();
+    Ok(Json(RecoverResponse {
+        recovered: ids,
+        count,
+    }))
+}
+
 pub async fn attempts(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -494,6 +526,26 @@ fn derive_summary(id: &str, raw: &str) -> Option<TaskSummary> {
     })
 }
 
+/// Parse the `task.recover` body: one task_id per line, then a
+/// trailing `recovered=N\n`. Returns the recovered ids plus the
+/// reported count (which should equal `ids.len()` but the caller
+/// is the source of truth on the count, not us).
+fn parse_recover_body(body: &str) -> (Vec<String>, usize) {
+    let mut ids = Vec::new();
+    let mut reported_count = 0usize;
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("recovered=") {
+            reported_count = rest.parse().unwrap_or(0);
+        } else {
+            ids.push(line.to_string());
+        }
+    }
+    (ids, reported_count)
+}
+
 /// Parse `task.attempts` body (tab-delimited lines).
 fn parse_attempts(body: &str) -> Vec<TaskAttempt> {
     body.lines()
@@ -624,6 +676,22 @@ mod tests {
     fn summary_returns_none_when_status_missing() {
         let raw = "task_id=abc\nevents=[]\n";
         assert!(derive_summary("abc", raw).is_none());
+    }
+
+    #[test]
+    fn parse_recover_body_extracts_ids_and_count() {
+        let body = "abc111\ndef222\nrecovered=2\n";
+        let (ids, count) = parse_recover_body(body);
+        assert_eq!(ids, vec!["abc111".to_string(), "def222".to_string()]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_recover_body_handles_empty_scan() {
+        let body = "recovered=0\n";
+        let (ids, count) = parse_recover_body(body);
+        assert!(ids.is_empty());
+        assert_eq!(count, 0);
     }
 
     #[test]
