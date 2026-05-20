@@ -56,6 +56,7 @@ row.
 | Just retry decisions | `?type=task.retry_requested` |
 | Forensic dive (with signed proofs) | `relix-flow-inspect --flow <path>` + audit logs |
 | What's the mesh capable of? | `GET /v1/capabilities` |
+| Which peers are alive & fresh? | `GET /v1/topology` |
 | Trigger recovery scan | `POST /v1/tasks/recover` |
 
 CLI equivalents are documented in

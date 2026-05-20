@@ -354,6 +354,58 @@ Scoped to one method. Returns 404 when no peer advertises it.
 See [`capability-discovery.md`](capability-discovery.md) for the
 planner-foundations contract these endpoints satisfy.
 
+## Mesh topology
+
+### `GET /v1/topology`
+
+One row per peer in the bridge's `ManifestCache`, with freshness
+aggregates. Translation-only — pure projection of an already-
+existing cache; the bridge does NOT probe peers here. The
+`last_refreshed_at` field reflects only successful
+`node.manifest` round-trips from the 60s background refresh
+loop. See [`failure-modes.md`](failure-modes.md) for what to do
+when a peer is reported `stale` or `expired`.
+
+Response shape:
+
+```json
+{
+  "peers": [
+    {
+      "alias": "memory",
+      "node_id": "...",
+      "node_type": "memory",
+      "node_name": "local-memory",
+      "manifest_version": 1,
+      "capability_count": 3,
+      "methods": ["memory.recent_for_session", "memory.search", "memory.write_turn"],
+      "last_refreshed_at":      1700000000,
+      "last_refreshed_secs_ago": 42,
+      "freshness": "fresh"
+    }
+  ],
+  "generated_at": 1700000042
+}
+```
+
+Sort order: peers are sorted alphabetically by alias, then by
+`node_id` (deterministic). Peers without an alias sort after
+aliased peers.
+
+Freshness buckets (aligned with the 60s refresh period):
+
+| Bucket | Range | Meaning |
+|---|---|---|
+| `fresh` | <120s | Within one refresh tick + clock-skew grace. |
+| `stale` | <600s | 1–10 missed ticks; peer probably reachable. |
+| `expired` | ≥600s | Operator action recommended; routing still uses cached caps. |
+
+CLI parity: `relix-cli topology show [--bridge URL] [--json]
+[--warn-after-secs N]`.
+
+Dashboard surface: the "Mesh topology" widget at the top of
+`/dashboard`.
+
 ## Versioning + stability
 
 - All endpoints listed above are stable through Gate 1.
