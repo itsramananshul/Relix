@@ -1135,6 +1135,77 @@
     .correlation-panel .ts-offset.after  { color: var(--text-dim); }
     .correlation-panel .badge { font-size: 9px; padding: 0 5px; }
 
+    /* ── Execution graph (DAG view) ────────────────────────────── */
+    .exec-graph-card {
+      margin: 0 14px 12px;
+      padding: 10px 12px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+    }
+    .exec-graph-card h4 {
+      margin: 0 0 8px;
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    .exec-graph svg {
+      width: 100%;
+      height: 100px;
+      display: block;
+      background: var(--bg);
+      border-radius: 3px;
+      border: 1px solid var(--border-soft);
+    }
+    .exec-graph .node-box {
+      fill: var(--bg-elevated);
+      stroke: var(--border);
+      stroke-width: 1;
+    }
+    .exec-graph .node-box.status-completed { stroke: var(--ok); stroke-width: 2; }
+    .exec-graph .node-box.status-failed,
+    .exec-graph .node-box.status-interrupted { stroke: var(--danger); stroke-width: 2; }
+    .exec-graph .node-box.status-running { stroke: var(--info); stroke-width: 2; }
+    .exec-graph .node-box.status-cancelled { stroke: var(--text-dim); stroke-width: 2; }
+    .exec-graph .node-label {
+      font-family: var(--font-body);
+      font-size: 11px;
+      fill: var(--text);
+      text-anchor: middle;
+      pointer-events: none;
+    }
+    .exec-graph .node-status {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      fill: var(--text-muted);
+      text-anchor: middle;
+      pointer-events: none;
+    }
+    .exec-graph .edge-line {
+      stroke: var(--text-muted);
+      stroke-width: 1.5;
+      fill: none;
+    }
+    .exec-graph .edge-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      fill: var(--text-dim);
+      text-anchor: middle;
+      pointer-events: none;
+    }
+    .exec-graph-note {
+      margin-top: 6px;
+      font-size: 10px;
+      color: var(--text-dim);
+      font-style: italic;
+    }
+    .exec-graph-reserved {
+      font-family: var(--font-mono);
+      color: var(--text-dim);
+    }
+
     /* ── Cross-reference panel (causality bridge to logs) ──────── */
     .xref-panel {
       padding: 10px 14px 14px;
@@ -3017,6 +3088,7 @@ function renderDetail(l) {
     : '<div class="meta" style="padding: 12px 14px;">(no chronicle events)</div>';
 
   const chainBlock = renderRetryChain(l.attempts || [], l.edges || []);
+  const graphBlock = renderExecGraph(l.attempts || [], l.edges || []);
   const xrefBlock = renderXrefPanel(l);
   const failureBlock = renderFailurePanel(l);
   // Empty correlation slot — filled async by
@@ -3031,6 +3103,7 @@ function renderDetail(l) {
   document.getElementById('task-detail').innerHTML =
     `<div class="summary">${summaryRow}</div>`
     + chainBlock
+    + graphBlock
     + failureBlock
     + execSlot
     + corrSlot
@@ -3615,6 +3688,102 @@ document.addEventListener('click', (ev) => {
     return;
   }
 });
+
+/* Execution graph (DAG view): SVG visualization of
+   attempts as nodes + task_edges as labeled arrows.
+   Today only retried_from edges exist, so the graph is
+   linear. The shape is correct for future edge types
+   (spawned, delegated_to, parallel_branch, …) that will
+   produce branches — the renderer just walks
+   attempt→edge pairs regardless of edge_type.
+
+   Honestly scoped:
+   - Single-attempt tasks render nothing (no DAG value
+     for an unconnected node).
+   - No-edge tasks render nothing (the chain pills
+     already cover the single-attempt and zero-attempt
+     cases).
+   - The reserved-edge-type note at the bottom is
+     load-bearing for the Phase-1D honesty rule. */
+function renderExecGraph(attempts, edges) {
+  if (!attempts || attempts.length < 2) return '';
+  if (!edges || edges.length === 0) return '';
+  const sorted = attempts.slice().sort((a, b) => a.attempt_num - b.attempt_num);
+  // Layout: equal-width slots, left-to-right.
+  const N = sorted.length;
+  const W = Math.max(560, N * 130);
+  const H = 100;
+  const slotW = W / N;
+  const boxW = 100;
+  const boxH = 56;
+  const yMid = H / 2;
+  // Position nodes; build an index for edge anchoring.
+  const positions = new Map();
+  sorted.forEach((a, i) => {
+    const cx = slotW * (i + 0.5);
+    positions.set(a.attempt_id, { cx, cy: yMid });
+  });
+  // Build SVG.
+  const nodes = sorted.map(a => {
+    const p = positions.get(a.attempt_id);
+    if (!p) return '';
+    const x = p.cx - boxW / 2;
+    const y = p.cy - boxH / 2;
+    return ''
+      + '<rect class="node-box status-' + escapeHtml(a.status) + '"'
+      +   ' x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '"'
+      +   ' width="' + boxW + '" height="' + boxH + '" rx="4" />'
+      + '<text class="node-label" x="' + p.cx + '" y="' + (p.cy - 8) + '">'
+      +   'attempt ' + a.attempt_num + '</text>'
+      + '<text class="node-status" x="' + p.cx + '" y="' + (p.cy + 10) + '">'
+      +   escapeHtml(a.status) + '</text>'
+      + (a.failure_class
+        ? '<text class="node-status" x="' + p.cx + '" y="' + (p.cy + 22) + '" style="fill: var(--danger);">'
+            + escapeHtml(a.failure_class) + '</text>'
+        : '');
+  }).join('');
+  // Draw edges. For each edge with both endpoints in
+  // the attempt set, draw an arrow from the parent to
+  // the child node. Label = edge_type.
+  const arrowMarker = '<defs><marker id="arrow-head" viewBox="0 0 10 10" refX="9" refY="5" '
+    + 'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+    + '<path d="M 0 0 L 10 5 L 0 10 z" fill="var(--text-muted)" />'
+    + '</marker></defs>';
+  const edgeLines = edges.map(e => {
+    const child = positions.get(e.attempt_id);
+    const parent = positions.get(e.related_attempt_id);
+    if (!child || !parent) return '';
+    const x1 = parent.cx + boxW / 2;
+    const y1 = parent.cy;
+    const x2 = child.cx - boxW / 2;
+    const y2 = child.cy;
+    const midX = (x1 + x2) / 2;
+    const midY = y1 - 12;
+    return ''
+      + '<line class="edge-line" x1="' + x1.toFixed(1) + '" y1="' + y1.toFixed(1)
+      + '" x2="' + x2.toFixed(1) + '" y2="' + y2.toFixed(1)
+      + '" marker-end="url(#arrow-head)" />'
+      + '<text class="edge-label" x="' + midX.toFixed(1) + '" y="' + midY.toFixed(1) + '">'
+      + escapeHtml(e.edge_type) + '</text>';
+  }).join('');
+  // Honest note: which edge types are emitted today vs
+  // reserved in the schema.
+  const reservedTypes = ['spawned', 'blocked_on', 'resumed_from', 'delegated_to', 'parallel_branch', 'awaited'];
+  const note =
+    '<div class="exec-graph-note">'
+    + 'Emitted today: <span class="exec-graph-reserved">retried_from</span>. '
+    + 'Reserved (no producer yet): '
+    + reservedTypes.map(t => '<span class="exec-graph-reserved">' + t + '</span>').join(', ')
+    + '. The graph will branch when other edge types ship.'
+    + '</div>';
+  return '<div class="exec-graph-card">'
+    + '<h4>Execution graph · ' + N + ' attempt' + (N === 1 ? '' : 's') + ' · ' + edges.length + ' edge' + (edges.length === 1 ? '' : 's') + '</h4>'
+    + '<div class="exec-graph"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">'
+    + arrowMarker + edgeLines + nodes
+    + '</svg></div>'
+    + note
+    + '</div>';
+}
 
 function renderChainPill(a, durLabel) {
   const failureLine = a.failure_class

@@ -266,6 +266,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_exec_graph_renderer_present() {
+        // M44: task detail renders an SVG execution graph for
+        // multi-attempt tasks with edges. The renderer + the
+        // honest "Emitted today / Reserved" note must ship.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderExecGraph"),
+            "page should ship renderExecGraph()"
+        );
+        // The reserved-edge-type note is load-bearing for the
+        // no-invented-causality contract.
+        assert!(
+            body.contains("Reserved (no producer yet)"),
+            "exec graph must honestly label reserved edge types"
+        );
+        // Both retried_from (shipped) and at least one
+        // reserved name must appear so operators see the
+        // gap.
+        assert!(body.contains("retried_from"));
+        assert!(body.contains("spawned"));
+        assert!(body.contains("blocked_on"));
+    }
+
+    #[tokio::test]
     async fn page_retry_storm_landmarks_present() {
         // M40: anomaly banner adds a retry-storm signal sourced
         // from /v1/tasks/edges/recent. Topology page gets a
