@@ -193,6 +193,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_topology_graph_landmarks_present() {
+        // M9: the topology page renders an SVG graph + a
+        // peer detail drawer. Assert both elements ship.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="topology-graph""#),
+            "topology page should ship an SVG graph element"
+        );
+        assert!(
+            body.contains(r#"id="node-drawer""#),
+            "topology page should ship a node detail drawer"
+        );
+        assert!(
+            body.contains("topology-legend"),
+            "topology page should ship a freshness legend"
+        );
+    }
+
+    #[tokio::test]
     async fn page_config_landmarks_present() {
         // The bridge config page (M8) reads /v1/config and
         // renders the effective bridge state. Assert the
