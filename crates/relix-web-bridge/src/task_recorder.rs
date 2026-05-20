@@ -18,6 +18,7 @@ use std::sync::Arc;
 use relix_core::bundle::Bundle;
 use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::manifest::MeshClient;
+use relix_runtime::nodes::coordinator::FailureClass;
 use relix_runtime::transport::envelope::ResponseResult;
 
 /// Owns the bridge-side fail-soft path for `task.*` calls.
@@ -88,17 +89,28 @@ impl TaskRecorder {
 
     /// Terminal success update: status=completed + result + flow pointer.
     pub async fn complete(&self, task_id: &str, result: &str, flow_id: &str, flow_log_path: &str) {
-        // task_id|status|result|flow_id|flow_log_path|error_kind|error_cause
-        let arg = format!("{task_id}|completed|{result}|{flow_id}|{flow_log_path}||");
+        // task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class
+        let arg = format!("{task_id}|completed|{result}|{flow_id}|{flow_log_path}|||");
         if let Err(e) = self.call("task.update", arg.as_bytes()).await {
             tracing::warn!(task_id, error = %e, "coordinator task.update (complete) failed");
         }
     }
 
-    /// Terminal failure update: status=failed + error_kind + error_cause.
-    pub async fn fail(&self, task_id: &str, error_kind: u32, error_cause: &str) {
-        // status only, no result/flow pointer; error_kind / error_cause set.
-        let arg = format!("{task_id}|failed|||||{error_kind}|{error_cause}");
+    /// Terminal failure update: status=failed + error_kind + error_cause +
+    /// classified `FailureClass`. The class is what operators key off
+    /// when deciding whether a retry is worth it (see
+    /// `docs/retry-model.md`); the Coordinator stores it verbatim in
+    /// `last_failure_class`.
+    pub async fn fail(
+        &self,
+        task_id: &str,
+        error_kind: u32,
+        error_cause: &str,
+        class: FailureClass,
+    ) {
+        // status + error_kind + error_cause + failure_class; no result/flow pointer.
+        let class_str = class.as_str();
+        let arg = format!("{task_id}|failed|||||{error_kind}|{error_cause}|{class_str}");
         if let Err(e) = self.call("task.update", arg.as_bytes()).await {
             tracing::warn!(task_id, error = %e, "coordinator task.update (fail) failed");
         }

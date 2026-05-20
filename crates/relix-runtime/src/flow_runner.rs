@@ -141,6 +141,12 @@ pub struct FlowRunResult {
     /// Last RemoteCall error from the dispatcher, when the flow halted with
     /// VM_ERROR_SENTINEL.
     pub last_error: Option<String>,
+    /// `error_kinds::*` value of the last RemoteCall error, when known.
+    /// `None` when the flow halted with no remote-call error attached;
+    /// `Some(0)` indicates a dispatcher-local failure (no peer reached).
+    /// Carried so the bridge can derive a `FailureClass` for the Task
+    /// without re-parsing `last_error`.
+    pub last_error_kind: Option<u32>,
 }
 
 /// One run. Constructed and `.run()` consumes it.
@@ -243,13 +249,16 @@ impl FlowRunner {
             append_log(&event_log, EventType::FlowCompleted, payload.into_bytes())?;
         }
 
+        let last_error_kind = last_err.as_ref().map(|e| e.kind);
+        let last_error = last_err.map(|e| e.to_string());
         Ok(FlowRunResult {
             flow_id,
             flow_log_path,
             trace_id,
             vm_exit,
             final_string,
-            last_error: last_err.map(|e| e.to_string()),
+            last_error,
+            last_error_kind,
         })
     }
 }

@@ -1,5 +1,44 @@
 //! Coordinator node — durable Task records over SQLite.
 //!
+//! ## Lifecycle vocabulary (C1)
+//!
+//! Status is an opaque string at the database level — the Coordinator
+//! does not enforce a state machine. The bridge + CLI use this
+//! convention:
+//!
+//! | Status            | Meaning |
+//! |---|---|
+//! | `pending`         | Task created, no execution attempted yet. |
+//! | `running`         | An executor took ownership and is running the flow now. |
+//! | `retrying`        | A previous attempt failed; another attempt is scheduled (operator-initiated in the alpha). |
+//! | `interrupted`     | Executor died or the task's `max_runtime_secs` was exceeded. Coordinator's startup recovery scan flips stale `running` tasks here. |
+//! | `awaiting_input`  | Flow paused on an external dependency (human approval, async webhook, etc.). The alpha records the state; the runtime does not yet implement the resume primitive. |
+//! | `completed`       | Final attempt succeeded. `latest_result` holds the reply. |
+//! | `failed`          | Final attempt failed and the task will not retry. `last_failure_class` and `last_failure_reason` are filled. |
+//! | `cancelled`       | Operator explicitly cancelled an active task. |
+//!
+//! Callers can write any string — these are just the values tooling
+//! understands. State-machine enforcement lands at Gate 2 with the
+//! resumable VM.
+//!
+//! ## Failure classes (C1)
+//!
+//! When a flow fails, the bridge classifies the cause into one of:
+//!
+//! | Class           | Meaning |
+//! |---|---|
+//! | `transient`     | Network blip, peer momentarily unreachable, etc. Safe to retry. |
+//! | `permanent`     | Logic / contract error inside the flow or a responder. Retry won't help. |
+//! | `policy_denied` | Admission pipeline rejected the call. Retry won't help unless policy or identity changes. |
+//! | `invalid_args`  | Caller-side input was malformed. Retry won't help. |
+//! | `timeout`       | Deadline exceeded. May or may not help to retry. |
+//! | `unavailable`   | Capability or peer reported it can't serve right now. |
+//!
+//! Stored in `last_failure_class` on the Task. Operators use it (via
+//! `relix-cli task get` / `task list --status failed`) to decide
+//! whether retry is worth it. The runtime does not auto-retry today
+//! — bounded auto-retry is a follow-up (see `docs/retry-model.md`).
+//!
 //! Capabilities registered on a controller with `[controller] node_type =
 //! "coordinator"`:
 //!
@@ -40,11 +79,15 @@
 //!
 //! | Method | Arg | Returns |
 //! |---|---|---|
-//! | `task.create` | `title\|flow_template\|params_json\|owner_subject_id` | `task_id` (32-hex) |
-//! | `task.update` | `task_id\|status\|result\|flow_id\|flow_log_path\|error_kind\|error_cause` | `ok\n` |
+//! | `task.create` | `title\|flow_template\|params_json\|owner_subject_id\|retry_policy\|max_retries\|max_runtime_secs` | `task_id` (32-hex) |
+//! | `task.update` | `task_id\|status\|result\|flow_id\|flow_log_path\|error_kind\|error_cause\|failure_class` | `ok\n` |
 //! | `task.event`  | `task_id\|event_type\|payload` | `event_id` (integer as string) |
 //! | `task.get`    | `task_id` | multi-line `key=value` summary + `events:` JSON array |
 //! | `task.list`   | `` (empty) or `limit` (default 50) | one `task_id\tstatus\ttitle\n` per line |
+//!
+//! The C1 trailers (`retry_policy|max_retries|max_runtime_secs` on
+//! `task.create`; `failure_class` on `task.update`) are optional —
+//! older callers that omit them keep working unchanged.
 //!
 //! All times are unix seconds. `status` is opaque — common values:
 //! `pending`, `running`, `completed`, `failed`, `abandoned`. The
@@ -84,6 +127,113 @@ use rusqlite::{Connection, params};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
+
+/// Lightweight classification of why a flow failed. Written to
+/// `tasks.last_failure_class` by the bridge so operators (and any
+/// future auto-retry policy) can decide whether the failure is worth
+/// retrying. The mapping from `relix_core::types::error_kinds::*` to
+/// this enum is the bridge's job; the Coordinator just persists
+/// whatever string comes in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Network blip, peer momentarily unreachable. Safe to retry.
+    Transient,
+    /// Logic / contract error. Retry won't help.
+    Permanent,
+    /// Admission pipeline refused. Retry won't help without identity / policy change.
+    PolicyDenied,
+    /// Caller-side input was malformed.
+    InvalidArgs,
+    /// Deadline exceeded.
+    Timeout,
+    /// Capability or peer signalled it can't serve right now.
+    Unavailable,
+}
+
+impl FailureClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::Permanent => "permanent",
+            Self::PolicyDenied => "policy_denied",
+            Self::InvalidArgs => "invalid_args",
+            Self::Timeout => "timeout",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "transient" => Some(Self::Transient),
+            "permanent" => Some(Self::Permanent),
+            "policy_denied" => Some(Self::PolicyDenied),
+            "invalid_args" => Some(Self::InvalidArgs),
+            "timeout" => Some(Self::Timeout),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    /// Convenience mapping from `relix_core::types::error_kinds::*` to
+    /// a class. Used by the bridge so it can call
+    /// `TaskRecorder::fail(_, FailureClass::from_kind(kind), cause)`
+    /// without re-implementing the switch at every call site.
+    pub fn from_kind(kind: u32) -> Self {
+        use relix_core::types::error_kinds as ek;
+        match kind {
+            ek::TRANSPORT | ek::PEER_UNREACHABLE | ek::RESPONDER_OVERLOADED => Self::Transient,
+            ek::TIMEOUT | ek::APPROVAL_TIMEOUT => Self::Timeout,
+            ek::POLICY_DENIED
+            | ek::CREDENTIAL_EXPIRED
+            | ek::IDENTITY_INVALID
+            | ek::APPROVAL_DENIED => Self::PolicyDenied,
+            ek::INVALID_ARGS | ek::REPLAY_REJECTED | ek::VERSION_MISMATCH => Self::InvalidArgs,
+            ek::UNKNOWN_METHOD
+            | ek::CAPABILITY_DEPRECATED
+            | ek::CAPABILITY_REMOVED
+            | ek::MANIFEST_STALE => Self::Unavailable,
+            ek::RESPONDER_INTERNAL | ek::CANCELLED => Self::Permanent,
+            _ => Self::Permanent,
+        }
+    }
+}
+
+impl std::fmt::Display for FailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Retry policy for a Task. Stored as text in the `tasks` table; the
+/// Coordinator does NOT auto-retry today. Operators decide; this is
+/// hints + metadata for them, not an executor primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryPolicy {
+    /// Never retry. Default for backwards compatibility with pre-C1 Tasks.
+    None,
+    /// One retry permitted on transient-class failures.
+    Once,
+    /// Up to `max_retries` retries permitted, transient class only.
+    Bounded,
+}
+
+impl RetryPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Once => "once",
+            Self::Bounded => "bounded",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" | "" => Some(Self::None),
+            "once" => Some(Self::Once),
+            "bounded" => Some(Self::Bounded),
+            _ => None,
+        }
+    }
+}
 
 /// Per-node coordinator configuration parsed from `[coordinator]`.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -133,13 +283,20 @@ impl TaskStore {
         })
     }
 
-    /// Insert a new Task. Returns the freshly-minted `task_id` (32 hex chars).
+    /// Insert a new Task. Returns the freshly-minted `task_id`
+    /// (32 hex chars). Optional retry / timeout metadata defaults to
+    /// "no retry, no timeout" for backwards compatibility with pre-C1
+    /// callers that don't supply them.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         title: &str,
         flow_template: &str,
         params_json: &str,
         owner_subject_id: &str,
+        retry_policy: RetryPolicy,
+        max_retries: i64,
+        max_runtime_secs: Option<i64>,
     ) -> Result<String, CoordinatorError> {
         let task_id = new_task_id();
         let now = unix_secs();
@@ -147,15 +304,21 @@ impl TaskStore {
         conn.execute(
             "INSERT INTO tasks (task_id, title, status, owner_subject_id,
                                 flow_template, params_json,
-                                created_at, updated_at)
-             VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?6)",
+                                created_at, updated_at,
+                                retry_count, retry_policy, max_retries,
+                                max_runtime_secs)
+             VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?6,
+                     0, ?7, ?8, ?9)",
             params![
                 task_id,
                 title,
                 owner_subject_id,
                 flow_template,
                 params_json,
-                now
+                now,
+                retry_policy.as_str(),
+                max_retries,
+                max_runtime_secs,
             ],
         )
         .map_err(CoordinatorError::Db)?;
@@ -163,8 +326,15 @@ impl TaskStore {
     }
 
     /// Mutate a Task. Any of `status` / `result` / `flow_id` /
-    /// `flow_log_path` / `error_kind` / `error_cause` may be `None`, in
-    /// which case the existing value is preserved.
+    /// `flow_log_path` / `error_kind` / `error_cause` /
+    /// `failure_class` may be `None`, in which case the existing
+    /// value is preserved.
+    ///
+    /// Side effect: when `status` transitions from anything else to
+    /// `running`, `started_at` is stamped (used by the recovery scan
+    /// to detect tasks that have outrun `max_runtime_secs`). The
+    /// stamp is one-shot per row; a subsequent `running` write does
+    /// not clobber the original.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &self,
@@ -175,16 +345,21 @@ impl TaskStore {
         flow_log_path: Option<&str>,
         error_kind: Option<i64>,
         error_cause: Option<&str>,
+        failure_class: Option<&str>,
     ) -> Result<(), CoordinatorError> {
         let now = unix_secs();
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
-        // Build a dynamic UPDATE with only the supplied fields. Avoids
-        // overwriting unrelated columns with NULL on partial updates.
         let mut sets: Vec<&str> = vec!["updated_at = ?"];
         let mut args: Vec<rusqlite::types::Value> = vec![now.into()];
         if let Some(v) = status {
             sets.push("status = ?");
             args.push(v.to_string().into());
+            // Stamp started_at on first transition into `running` so
+            // C1.7 timeout detection has a baseline.
+            if v == "running" {
+                sets.push("started_at = COALESCE(started_at, ?)");
+                args.push(now.into());
+            }
         }
         if let Some(v) = result {
             sets.push("latest_result = ?");
@@ -205,6 +380,12 @@ impl TaskStore {
         if let Some(v) = error_cause {
             sets.push("error_cause = ?");
             args.push(v.to_string().into());
+            sets.push("last_failure_reason = ?");
+            args.push(v.to_string().into());
+        }
+        if let Some(v) = failure_class {
+            sets.push("last_failure_class = ?");
+            args.push(v.to_string().into());
         }
         args.push(task_id.to_string().into());
         let sql = format!("UPDATE tasks SET {} WHERE task_id = ?", sets.join(", "));
@@ -215,6 +396,32 @@ impl TaskStore {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
         Ok(())
+    }
+
+    /// Bump `retry_count` by one. Used by the bridge when it starts a
+    /// new attempt (an explicit `retry.started` event lands first to
+    /// keep the chronicle self-describing). Returns the new count.
+    pub fn bump_retry_count(&self, task_id: &str) -> Result<i64, CoordinatorError> {
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let n = conn
+            .execute(
+                "UPDATE tasks SET retry_count = retry_count + 1, updated_at = ?1
+                 WHERE task_id = ?2",
+                params![now, task_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if n == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT retry_count FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(count)
     }
 
     /// Append a free-form event to a Task's history. Returns the
@@ -256,7 +463,10 @@ impl TaskStore {
                 "SELECT title, status, owner_subject_id, flow_template,
                         params_json, latest_result, latest_flow_id,
                         latest_flow_log_path, error_kind, error_cause,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        retry_count, retry_policy, max_retries,
+                        max_runtime_secs, last_failure_reason,
+                        last_failure_class, started_at
                  FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 |r| {
@@ -274,6 +484,13 @@ impl TaskStore {
                         error_cause: r.get(9)?,
                         created_at: r.get(10)?,
                         updated_at: r.get(11)?,
+                        retry_count: r.get(12)?,
+                        retry_policy: r.get(13)?,
+                        max_retries: r.get(14)?,
+                        max_runtime_secs: r.get(15)?,
+                        last_failure_reason: r.get(16)?,
+                        last_failure_class: r.get(17)?,
+                        started_at: r.get(18)?,
                         events: Vec::new(),
                     })
                 },
@@ -351,6 +568,14 @@ pub struct TaskView {
     pub error_cause: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// C1 lifecycle additions.
+    pub retry_count: i64,
+    pub retry_policy: String,
+    pub max_retries: i64,
+    pub max_runtime_secs: Option<i64>,
+    pub last_failure_reason: Option<String>,
+    pub last_failure_class: Option<String>,
+    pub started_at: Option<i64>,
     pub events: Vec<TaskEvent>,
 }
 
@@ -435,24 +660,63 @@ fn handle_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(s) => s,
         Err(e) => return invalid(format!("task.create utf8: {e}")),
     };
-    // `title|flow_template|params_json|owner_subject_id`. We splitn(4) so
-    // params_json can contain `|`.
-    let mut parts = s.splitn(4, '|');
-    let title = parts.next().unwrap_or("");
-    let flow_template = parts.next().unwrap_or("");
-    let params_json = parts.next().unwrap_or("");
-    let owner = parts.next().unwrap_or("");
+    // `title|flow_template|params_json|owner_subject_id|retry_policy|max_retries|max_runtime_secs`.
+    // Retry/runtime trailer is optional; callers can leave the suffix
+    // off entirely or send empty slots. params_json that contains `|`
+    // should be base64-encoded by the caller (SIMP-016).
+    let parts: Vec<&str> = s.splitn(7, '|').collect();
+    let title = parts.first().copied().unwrap_or("");
+    let flow_template = parts.get(1).copied().unwrap_or("");
+    let params_json = parts.get(2).copied().unwrap_or("");
+    let owner = parts.get(3).copied().unwrap_or("");
+    let retry_policy_str = parts.get(4).copied().unwrap_or("");
+    let max_retries_str = parts.get(5).copied().unwrap_or("");
+    let max_runtime_str = parts.get(6).copied().unwrap_or("");
     if title.is_empty() || flow_template.is_empty() {
         return invalid("task.create: `title` and `flow_template` are required".to_string());
     }
     let owner = if owner.is_empty() {
-        // Default to the caller's subject_id. Operators who want to
-        // pin an owner from elsewhere can still pass one explicitly.
         ctx.caller.subject_id.to_string()
     } else {
         owner.to_string()
     };
-    match store.create(title, flow_template, params_json, &owner) {
+    let retry_policy = if retry_policy_str.is_empty() {
+        RetryPolicy::None
+    } else {
+        match RetryPolicy::parse(retry_policy_str) {
+            Some(p) => p,
+            None => return invalid(format!("task.create: bad retry_policy: {retry_policy_str}")),
+        }
+    };
+    let max_retries: i64 = if max_retries_str.is_empty() {
+        0
+    } else {
+        match max_retries_str.parse() {
+            Ok(v) if v >= 0 => v,
+            _ => return invalid(format!("task.create: bad max_retries: {max_retries_str}")),
+        }
+    };
+    let max_runtime_secs: Option<i64> = if max_runtime_str.is_empty() {
+        None
+    } else {
+        match max_runtime_str.parse::<i64>() {
+            Ok(v) if v > 0 => Some(v),
+            _ => {
+                return invalid(format!(
+                    "task.create: bad max_runtime_secs: {max_runtime_str}"
+                ));
+            }
+        }
+    };
+    match store.create(
+        title,
+        flow_template,
+        params_json,
+        &owner,
+        retry_policy,
+        max_retries,
+        max_runtime_secs,
+    ) {
         Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
         Err(e) => internal(format!("task.create: {e}")),
     }
@@ -463,8 +727,10 @@ fn handle_update(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(s) => s,
         Err(e) => return invalid(format!("task.update utf8: {e}")),
     };
-    // `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause`
-    let parts: Vec<&str> = s.splitn(7, '|').collect();
+    // `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class`.
+    // failure_class is an optional 8th field; older callers that omit it
+    // keep working unchanged.
+    let parts: Vec<&str> = s.splitn(8, '|').collect();
     let get = |i: usize| -> Option<&str> { parts.get(i).copied().filter(|v| !v.is_empty()) };
     let Some(task_id) = get(0) else {
         return invalid("task.update: task_id required".to_string());
@@ -475,6 +741,12 @@ fn handle_update(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let flow_log_path = get(4);
     let error_kind = get(5).and_then(|v| v.parse::<i64>().ok());
     let error_cause = get(6);
+    let failure_class_str = get(7);
+    if let Some(fc) = failure_class_str
+        && FailureClass::parse(fc).is_none()
+    {
+        return invalid(format!("task.update: bad failure_class: {fc}"));
+    }
     match store.update(
         task_id,
         status,
@@ -483,6 +755,7 @@ fn handle_update(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         flow_log_path,
         error_kind,
         error_cause,
+        failure_class_str,
     ) {
         Ok(()) => HandlerOutcome::Ok(b"ok\n".to_vec()),
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.update: not found: {id}")),
@@ -582,6 +855,21 @@ fn render_task_view(v: &TaskView) -> String {
     }
     let _ = writeln!(s, "created_at={}", v.created_at);
     let _ = writeln!(s, "updated_at={}", v.updated_at);
+    let _ = writeln!(s, "retry_count={}", v.retry_count);
+    let _ = writeln!(s, "retry_policy={}", v.retry_policy);
+    let _ = writeln!(s, "max_retries={}", v.max_retries);
+    if let Some(x) = v.max_runtime_secs {
+        let _ = writeln!(s, "max_runtime_secs={}", x);
+    }
+    if let Some(x) = v.started_at {
+        let _ = writeln!(s, "started_at={}", x);
+    }
+    if let Some(x) = v.last_failure_class.as_ref() {
+        let _ = writeln!(s, "last_failure_class={}", x);
+    }
+    if let Some(x) = v.last_failure_reason.as_ref() {
+        let _ = writeln!(s, "last_failure_reason={}", x);
+    }
     let _ = writeln!(s, "event_count={}", v.events.len());
     // Events as a simple JSON array. We hand-build the JSON to avoid
     // pulling serde_json into this hot path; payloads are escaped
@@ -660,6 +948,7 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
             updated_at           INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS tasks_updated ON tasks(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
 
         CREATE TABLE IF NOT EXISTS task_events (
             event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -672,7 +961,28 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id, event_id);
         "#,
     )
-    .map_err(CoordinatorError::Db)
+    .map_err(CoordinatorError::Db)?;
+
+    // C1: idempotent additive schema migration for the new lifecycle
+    // columns. SQLite rejects ADD COLUMN of a duplicate name; we
+    // intentionally ignore the resulting error so re-runs against an
+    // already-migrated DB are a no-op. A proper migration framework
+    // lands at Gate 2 along with the typed event payloads.
+    let alters = [
+        "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN retry_policy TEXT NOT NULL DEFAULT 'none'",
+        "ALTER TABLE tasks ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN max_runtime_secs INTEGER",
+        "ALTER TABLE tasks ADD COLUMN last_failure_reason TEXT",
+        "ALTER TABLE tasks ADD COLUMN last_failure_class TEXT",
+        "ALTER TABLE tasks ADD COLUMN started_at INTEGER",
+    ];
+    for sql in alters {
+        // Best-effort. The only error we expect is "duplicate column
+        // name" on a re-init; any other error here is a schema bug.
+        let _ = conn.execute(sql, []);
+    }
+    Ok(())
 }
 
 fn new_task_id() -> String {
@@ -720,12 +1030,18 @@ mod tests {
         TaskStore::in_memory().expect("open")
     }
 
+    /// Test helper: create a task with the C1 defaults so we don't have
+    /// to repeat the `RetryPolicy::None, 0, None` trailer at every call
+    /// site.
+    fn mk(s: &TaskStore, title: &str, flow: &str, params: &str, owner: &str) -> String {
+        s.create(title, flow, params, owner, RetryPolicy::None, 0, None)
+            .unwrap()
+    }
+
     #[test]
     fn create_and_get_roundtrip() {
         let s = store();
-        let tid = s
-            .create("demo task", "chat_template.sol", "{}", "owner-xyz")
-            .unwrap();
+        let tid = mk(&s, "demo task", "chat_template.sol", "{}", "owner-xyz");
         assert_eq!(tid.len(), 32);
         let v = s.get(&tid).unwrap().expect("present");
         assert_eq!(v.title, "demo task");
@@ -733,13 +1049,20 @@ mod tests {
         assert_eq!(v.flow_template, "chat_template.sol");
         assert_eq!(v.owner_subject_id, "owner-xyz");
         assert_eq!(v.events.len(), 0);
+        assert_eq!(v.retry_count, 0);
+        assert_eq!(v.retry_policy, "none");
+        assert_eq!(v.max_retries, 0);
+        assert!(v.max_runtime_secs.is_none());
+        assert!(v.started_at.is_none());
+        assert!(v.last_failure_class.is_none());
+        assert!(v.last_failure_reason.is_none());
     }
 
     #[test]
     fn update_preserves_unset_fields() {
         let s = store();
-        let tid = s.create("t", "f", "{}", "o").unwrap();
-        s.update(&tid, Some("running"), None, None, None, None, None)
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
         s.update(
             &tid,
@@ -747,6 +1070,7 @@ mod tests {
             Some("the result body"),
             Some("flowabc"),
             Some("/tmp/x.log"),
+            None,
             None,
             None,
         )
@@ -761,7 +1085,7 @@ mod tests {
     #[test]
     fn events_append_and_read_back_in_order() {
         let s = store();
-        let tid = s.create("t", "f", "{}", "o").unwrap();
+        let tid = mk(&s, "t", "f", "{}", "o");
         let e1 = s.append_event(&tid, "step", "memory.write_turn").unwrap();
         let e2 = s.append_event(&tid, "step", "ai.chat").unwrap();
         let e3 = s
@@ -778,13 +1102,21 @@ mod tests {
     #[test]
     fn list_returns_most_recently_updated_first() {
         let s = store();
-        let _ = s.create("first", "f", "{}", "o").unwrap();
-        let second = s.create("second", "f", "{}", "o").unwrap();
-        let _ = s.create("third", "f", "{}", "o").unwrap();
-        // Touch the second so it bubbles to the top.
+        let _ = mk(&s, "first", "f", "{}", "o");
+        let second = mk(&s, "second", "f", "{}", "o");
+        let _ = mk(&s, "third", "f", "{}", "o");
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        s.update(&second, Some("completed"), None, None, None, None, None)
-            .unwrap();
+        s.update(
+            &second,
+            Some("completed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let rows = s.list(10).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].title, "second");
@@ -793,7 +1125,16 @@ mod tests {
     #[test]
     fn update_unknown_task_is_invalid() {
         let s = store();
-        match s.update("deadbeef", Some("running"), None, None, None, None, None) {
+        match s.update(
+            "deadbeef",
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
             Err(CoordinatorError::NotFound(id)) => assert_eq!(id, "deadbeef"),
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -811,9 +1152,7 @@ mod tests {
     #[test]
     fn rendered_view_contains_expected_keys() {
         let s = store();
-        let tid = s
-            .create("render demo", "chat", "{\"a\":1}", "owner-1")
-            .unwrap();
+        let tid = mk(&s, "render demo", "chat", "{\"a\":1}", "owner-1");
         s.append_event(&tid, "checkpoint", "step=1").unwrap();
         let v = s.get(&tid).unwrap().unwrap();
         let rendered = render_task_view(&v);
@@ -823,5 +1162,127 @@ mod tests {
         assert!(rendered.contains("event_count=1"));
         assert!(rendered.contains("\"type\":\"checkpoint\""));
         assert!(rendered.contains("\"payload\":\"step=1\""));
+        assert!(rendered.contains("retry_count=0"));
+        assert!(rendered.contains("retry_policy=none"));
+        assert!(rendered.contains("max_retries=0"));
+    }
+
+    // ── C1: lifecycle states + failure class + retry knobs ────────────
+
+    #[test]
+    fn retry_knobs_persist_on_create() {
+        let s = store();
+        let tid = s
+            .create(
+                "with knobs",
+                "demo.sol",
+                "{}",
+                "alice",
+                RetryPolicy::Bounded,
+                3,
+                Some(120),
+            )
+            .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.retry_policy, "bounded");
+        assert_eq!(v.max_retries, 3);
+        assert_eq!(v.max_runtime_secs, Some(120));
+        assert_eq!(v.retry_count, 0);
+    }
+
+    #[test]
+    fn started_at_stamped_on_first_running_transition() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let first = s.get(&tid).unwrap().unwrap().started_at.unwrap();
+        // Subsequent transitions back through `running` must not clobber
+        // the original stamp — C1 recovery scan depends on this.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let again = s.get(&tid).unwrap().unwrap().started_at.unwrap();
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn failure_class_and_reason_roundtrip() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            Some(error_kinds::TRANSPORT as i64),
+            Some("dial failed"),
+            Some("transient"),
+        )
+        .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "failed");
+        assert_eq!(v.last_failure_class.as_deref(), Some("transient"));
+        assert_eq!(v.last_failure_reason.as_deref(), Some("dial failed"));
+        assert_eq!(v.error_cause.as_deref(), Some("dial failed"));
+    }
+
+    #[test]
+    fn bump_retry_count_increments_and_returns_new_value() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .unwrap();
+        assert_eq!(s.bump_retry_count(&tid).unwrap(), 1);
+        assert_eq!(s.bump_retry_count(&tid).unwrap(), 2);
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.retry_count, 2);
+    }
+
+    #[test]
+    fn bump_retry_count_unknown_task_is_invalid() {
+        let s = store();
+        match s.bump_retry_count("nope") {
+            Err(CoordinatorError::NotFound(id)) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failure_class_from_kind_covers_known_kinds() {
+        assert_eq!(
+            FailureClass::from_kind(error_kinds::POLICY_DENIED),
+            FailureClass::PolicyDenied
+        );
+        assert_eq!(
+            FailureClass::from_kind(error_kinds::INVALID_ARGS),
+            FailureClass::InvalidArgs
+        );
+        assert_eq!(
+            FailureClass::from_kind(error_kinds::TIMEOUT),
+            FailureClass::Timeout
+        );
+        assert_eq!(
+            FailureClass::from_kind(error_kinds::TRANSPORT),
+            FailureClass::Transient
+        );
+        assert_eq!(
+            FailureClass::from_kind(error_kinds::RESPONDER_INTERNAL),
+            FailureClass::Permanent
+        );
+        // Unknown kind defaults to Permanent so callers fail loudly
+        // rather than silently retrying on something they don't model.
+        assert_eq!(FailureClass::from_kind(9_999), FailureClass::Permanent);
+    }
+
+    #[test]
+    fn retry_policy_parse_roundtrip() {
+        assert_eq!(RetryPolicy::parse("none"), Some(RetryPolicy::None));
+        assert_eq!(RetryPolicy::parse("once"), Some(RetryPolicy::Once));
+        assert_eq!(RetryPolicy::parse("bounded"), Some(RetryPolicy::Bounded));
+        assert!(RetryPolicy::parse("forever").is_none());
+        assert_eq!(RetryPolicy::None.as_str(), "none");
+        assert_eq!(RetryPolicy::Bounded.as_str(), "bounded");
     }
 }

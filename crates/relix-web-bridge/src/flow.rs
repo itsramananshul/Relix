@@ -20,6 +20,7 @@ use crate::AppState;
 use crate::task_recorder::{TaskRecorder, make_title};
 use crate::validate::{validate_input, validate_url};
 use relix_runtime::flow_runner::{FlowRunOptions, FlowRunner, FlowRunnerError};
+use relix_runtime::nodes::coordinator::FailureClass;
 
 /// Successful end-to-end chat flow.
 #[derive(Debug, Clone)]
@@ -128,9 +129,11 @@ async fn finalize_flow_run(
                 let flow_id = result.flow_id.to_string();
                 let flow_log_path = result.flow_log_path.to_string_lossy().to_string();
                 let cause_for_event = err.clone();
+                let kind = result.last_error_kind.unwrap_or(0);
+                let class = FailureClass::from_kind(kind);
                 if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
                     rec.event(tid, "flow_failed", &cause_for_event).await;
-                    rec.fail(tid, 0, &cause_for_event).await;
+                    rec.fail(tid, kind, &cause_for_event, class).await;
                 }
                 return Err(FlowExecError::Transport(format!(
                     "flow halted: {err} (flow_id={flow_id} flow_log={flow_log_path})"
@@ -161,7 +164,17 @@ async fn finalize_flow_run(
         Err(FlowRunnerError::Transport(m)) => {
             if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
                 rec.event(tid, "flow_failed", &m).await;
-                rec.fail(tid, 0, &m).await;
+                // FlowRunner-layer transport failure (libp2p dial /
+                // RPC), not a responder error envelope; classify as
+                // transient and tag the kind as TRANSPORT so operator
+                // tooling matches.
+                rec.fail(
+                    tid,
+                    relix_core::types::error_kinds::TRANSPORT,
+                    &m,
+                    FailureClass::Transient,
+                )
+                .await;
             }
             Err(FlowExecError::Transport(m))
         }
@@ -169,7 +182,11 @@ async fn finalize_flow_run(
             let msg = e.to_string();
             if let (Some(rec), Some(tid)) = (recorder, task_id.as_ref()) {
                 rec.event(tid, "flow_failed", &msg).await;
-                rec.fail(tid, 0, &msg).await;
+                // Config / EventLog / Vm: not safe to retry without
+                // operator action — surface as permanent so the CLI
+                // colours it accordingly and bounded auto-retry (when
+                // it lands) skips these.
+                rec.fail(tid, 0, &msg, FailureClass::Permanent).await;
             }
             Err(FlowExecError::Internal(msg))
         }
