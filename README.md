@@ -164,6 +164,7 @@ Task lifecycle reference (C1 + C2):
 - [`docs/runtime-observability.md`](docs/runtime-observability.md) — operator mental model + on-call workflow + observability primitives at a glance.
 - [`docs/audit-trails.md`](docs/audit-trails.md) — operator reconstruction across the three audit surfaces (per-node audit log, per-flow event log, Coordinator chronicle), with `relix-flow-inspect` recipes.
 - [`docs/chronicle-retention.md`](docs/chronicle-retention.md) — design contract for future chronicle retention + compaction + operator export. Docs-only; no destructive deletion implemented.
+- [`docs/bridge-invariants.md`](docs/bridge-invariants.md) — what the bridge MAY/MUST NOT do. Mechanical canary tests enforce the most-likely regressions; the rest is review-enforced.
 - [`docs/interruption-semantics.md`](docs/interruption-semantics.md) — what the Coordinator's recovery scan does and deliberately doesn't.
 - [`docs/retry-model.md`](docs/retry-model.md) — what `retry_policy` / `max_retries` / `task.retry` actually do today.
 - [`docs/task-recovery.md`](docs/task-recovery.md) — operator playbook with CLI invocations for diagnosing and acting on interrupted / failed tasks.
