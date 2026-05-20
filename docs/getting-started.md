@@ -189,6 +189,55 @@ curl -X POST http://127.0.0.1:19791/chat_with_tool \
 Full security details: [`tool-node.md`](tool-node.md) and
 [`tool-node-security.md`](tool-node-security.md).
 
+## Inspect tasks (if the Coordinator is up)
+
+When the bringup script includes a Coordinator peer, every chat
+request becomes a durable Task with a lineage operators can
+inspect after the fact. The chat response includes a `task_id`
+field — top-level on `/chat`, under `relix.task_id` on the
+OpenAI shim.
+
+```bash
+# List recent tasks as JSON.
+curl http://127.0.0.1:19791/v1/tasks
+
+# Inspect one task in full (header + chronicle).
+curl http://127.0.0.1:19791/v1/tasks/<task_id>
+
+# Quick operator summary (status, duration, failure class, retries).
+curl http://127.0.0.1:19791/v1/tasks/<task_id>/summary
+```
+
+The CLI surface is richer; it prints a per-attempt chronology
+timeline:
+
+```bash
+relix-cli task get --peer /ip4/127.0.0.1/tcp/19714 \
+    --identity dev-keys/local-bridge.aic \
+    --client-key dev-keys/local-bridge.key \
+    --task-id <task_id> --pretty
+```
+
+Full operator playbook in
+[`task-recovery.md`](task-recovery.md). The task lifecycle is
+documented in [`runtime-lifecycle.md`](runtime-lifecycle.md);
+per-attempt detail in [`attempt-lineage.md`](attempt-lineage.md).
+
+## See what the mesh can do
+
+The bridge projects the discovered capability manifests as JSON,
+and the CLI offers the same view:
+
+```bash
+# Every capability the bridge knows about, with descriptions.
+curl http://127.0.0.1:19791/v1/capabilities
+
+# Same data, scoped to one peer:
+relix-cli capability ls --peer /ip4/127.0.0.1/tcp/19712 \
+    --identity dev-keys/local-bridge.aic \
+    --client-key dev-keys/local-bridge.key
+```
+
 ## Shutdown
 
 Ctrl-C in the script's terminal. The script intercepts the signal and
@@ -200,4 +249,7 @@ affected.
 - [`architecture.md`](architecture.md) — how the pieces fit together.
 - [`operator-guide.md`](operator-guide.md) — running the mesh, logs, common failures.
 - [`flows-and-sol.md`](flows-and-sol.md) — write your own SOL flow.
+- [`task-recovery.md`](task-recovery.md) — operator playbook for failed / interrupted tasks.
+- [`runtime-lifecycle.md`](runtime-lifecycle.md) — the canonical task status diagram.
+- [`capability-discovery.md`](capability-discovery.md) — discovery model + planner foundations.
 - [`current-limitations.md`](current-limitations.md) — read before relying on Relix in production.
