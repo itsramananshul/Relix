@@ -709,14 +709,74 @@
       </div>
     </section>
 
-    <!-- ── #/telegram (stub for milestone 7) ──────────────────── -->
+    <!-- ── #/telegram ──────────────────────────────────────────── -->
     <section class="page" data-page="telegram">
       <h2>Telegram</h2>
-      <p class="page-subtitle">Bot API token + delivery mode for the Telegram channel.</p>
-      <div class="banner info">
-        Telegram setup UI lands in a follow-up commit. See
-        <code>docs/dashboard-redesign.md</code> Milestone 7 for the
-        contract.
+      <p class="page-subtitle">
+        Bot API token + delivery mode for the Telegram channel. The
+        live HTTPS client wiring is pending — token is stored
+        durably so when the live client ships, no operator
+        re-entry is needed.
+      </p>
+      <div class="banner warn">
+        <strong>Local/dev only.</strong> No HTTP authentication on
+        these endpoints. Production: put a reverse proxy with auth
+        in front.
+      </div>
+      <div class="card">
+        <div class="card-header"><h3>Setup</h3></div>
+        <div class="card-body">
+          <ol style="margin: 0; padding-left: 20px; color: var(--text-muted);">
+            <li>Open Telegram and message <code>@BotFather</code>.</li>
+            <li>Run <code>/newbot</code> and follow the prompts.
+                Copy the API token (looks like
+                <code>1234567:ABCDEF…</code>).</li>
+            <li>Paste it below and click <strong>Save</strong>.
+                The token is stored at <code>bridge-secrets.toml</code>
+                (mode 0600, gitignored). It is never echoed back
+                via HTTP or written to logs.</li>
+            <li>Restart the Telegram channel controller for the
+                change to take effect.</li>
+          </ol>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Configuration</h3>
+          <span id="telegram-badge"></span>
+        </div>
+        <div class="card-body">
+          <div id="telegram-meta" class="provider-meta" style="margin-bottom: 4px;"></div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Bot token</label>
+            <div class="field">
+              <div class="key-input-row">
+                <input type="password" id="tg-token" placeholder="paste @BotFather token…">
+                <button id="tg-token-reveal" type="button" title="Show/hide">👁</button>
+              </div>
+              <p class="field-help">never echoed back; stored at mode 0600 in bridge-secrets.toml</p>
+            </div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Delivery mode</label>
+            <div class="field">
+              <select id="tg-mode">
+                <option value="polling">polling</option>
+                <option value="webhook">webhook (not yet implemented)</option>
+              </select>
+              <p class="field-help">
+                Polling: the channel long-polls Telegram's
+                <code>getUpdates</code> endpoint. Webhook mode is in
+                the schema but the live HTTPS client is pending —
+                submitting it returns 422 until it lands.
+              </p>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn-primary" id="tg-save">Save</button>
+            <span class="action-status" id="tg-status"></span>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -766,7 +826,7 @@ const PAGES = {
   tasks:     { label: 'Tasks',        init: initTasks,     enter: enterTasks },
   topology:  { label: 'Topology',     init: initTopology,  enter: enterTopology },
   providers: { label: 'AI Providers', init: null,          enter: enterProviders },
-  telegram:  { label: 'Telegram',     init: null,          enter: null },
+  telegram:  { label: 'Telegram',     init: initTelegram,  enter: enterTelegram },
   config:    { label: 'Bridge Config', init: null,         enter: null },
 };
 
@@ -1390,6 +1450,80 @@ function replaceProviderCard(status) {
   wrapper.innerHTML = renderProviderCard(status);
   card.replaceWith(wrapper.firstChild);
   wireProviderCard(status.name);
+}
+
+/* ── Telegram page ────────────────────────────────────────── */
+function initTelegram() {
+  document.getElementById('tg-token-reveal').addEventListener('click', () => {
+    const $i = document.getElementById('tg-token');
+    $i.type = $i.type === 'password' ? 'text' : 'password';
+  });
+  document.getElementById('tg-save').addEventListener('click', saveTelegram);
+}
+
+async function enterTelegram() {
+  const $badge = document.getElementById('telegram-badge');
+  const $meta = document.getElementById('telegram-meta');
+  const $status = document.getElementById('tg-status');
+  $badge.innerHTML = '';
+  $meta.innerHTML = '';
+  setProviderStatus($status, '');
+  try {
+    const r = await fetch('/v1/config/telegram');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const t = await r.json();
+    renderTelegramStatus(t);
+  } catch (e) {
+    setProviderStatus($status, 'load failed: ' + String(e), 'error');
+  }
+}
+
+function renderTelegramStatus(t) {
+  const $badge = document.getElementById('telegram-badge');
+  const $meta = document.getElementById('telegram-meta');
+  const $mode = document.getElementById('tg-mode');
+  if (t.configured) {
+    $badge.innerHTML = '<span class="badge ok">configured</span>';
+    $meta.innerHTML = 'token <span class="key-preview">'
+      + escapeHtml(t.token_preview || '') + '</span>'
+      + ' &middot; set_at <span>' + (t.token_set_at || 0) + '</span>'
+      + ' &middot; mode <span>' + escapeHtml(t.mode || '') + '</span>';
+  } else {
+    $badge.innerHTML = '<span class="badge muted">not set</span>';
+    $meta.innerHTML = '';
+  }
+  if (t.mode) $mode.value = t.mode;
+  // Update token input placeholder so operators understand it
+  // overwrites in place.
+  const $input = document.getElementById('tg-token');
+  $input.placeholder = t.configured
+    ? '(set; enter new value to replace)'
+    : 'paste @BotFather token…';
+}
+
+async function saveTelegram() {
+  const $input = document.getElementById('tg-token');
+  const $status = document.getElementById('tg-status');
+  const $mode = document.getElementById('tg-mode');
+  const token = $input.value;
+  const mode = $mode.value;
+  if (!token.trim()) { setProviderStatus($status, 'enter a token first', 'error'); return; }
+  setProviderStatus($status, 'saving…');
+  try {
+    const r = await fetch('/v1/config/telegram', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bot_token: token, mode }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    setProviderStatus($status, 'saved · restart channel controller to apply', 'ok');
+    $input.value = '';
+    $input.type = 'password';
+    renderTelegramStatus(body.status);
+  } catch (e) {
+    setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+  }
 }
 
 /* ── Boot ─────────────────────────────────────────────────── */

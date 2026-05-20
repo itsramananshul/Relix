@@ -164,6 +164,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_telegram_landmarks_present() {
+        // The telegram page (M7) wires the dashboard to
+        // /v1/config/telegram. Assert the API path + BotFather
+        // setup hint + mode selector all appear in the page.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("/v1/config/telegram"),
+            "telegram page should fetch /v1/config/telegram"
+        );
+        assert!(
+            body.contains("BotFather"),
+            "telegram page should mention BotFather setup"
+        );
+        // Mode selector exposes both shipped + future-but-blocked modes.
+        for mode in ["polling", "webhook"] {
+            assert!(body.contains(mode), "telegram mode {mode} missing");
+        }
+        // Token input is masked by default. We already assert
+        // type="password" in the providers test; here we
+        // additionally assert it's near the telegram id.
+        assert!(
+            body.contains(r#"id="tg-token""#),
+            "telegram bot token input missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_sets_security_headers() {
         let resp = page().await.into_response();
         assert_eq!(
