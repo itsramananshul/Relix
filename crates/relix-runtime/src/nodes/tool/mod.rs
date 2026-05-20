@@ -590,6 +590,9 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
     d.sensitivity_tags = vec!["external:network".into(), "egress:http".into()];
     d.policy_attachment_point = "tool.web_fetch".to_string();
     d.requires_groups = vec!["chat-users".into()];
+    d.description = Some("Fetch a URL with SSRF + DNS pin + per-hop redirect re-check.".into());
+    d.categories = vec!["fetch".into(), "io".into()];
+    d.environment_requirements = vec!["network:outbound".into()];
     d
 }
 

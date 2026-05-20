@@ -87,6 +87,12 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
     d.sensitivity_tags = vec!["parse:html".into()];
     d.policy_attachment_point = "tool.web_extract".to_string();
     d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Extract title / text / links / meta from HTML bytes. No network access; \
+         scripts and styles are stripped."
+            .into(),
+    );
+    d.categories = vec!["parse".into()];
     d
 }
 

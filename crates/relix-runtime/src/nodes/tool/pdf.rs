@@ -97,6 +97,12 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
     d.cost_class = CostClass::Expensive; // CPU bound to input size
     d.sensitivity_tags = vec!["parse:pdf".into()];
     d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Parse PDF bytes; extract page count / metadata / text. Pure-Rust (lopdf), \
+         no system deps."
+            .into(),
+    );
+    d.categories = vec!["parse".into()];
     d
 }
 
