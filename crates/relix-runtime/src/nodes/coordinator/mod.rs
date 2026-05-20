@@ -3875,6 +3875,82 @@ mod tests {
     }
 
     #[test]
+    fn list_paginated_handles_ten_thousand_tasks_quickly() {
+        // S6 scale check. 10x the existing 1000-task smoke. Catches
+        // regressions where a quadratic or per-row allocation
+        // sneaks in. Bounds are deliberately loose — real perf
+        // work waits until there's a load profile to optimise for.
+        let s = TaskStore::in_memory().expect("open");
+        let start = std::time::Instant::now();
+        // Use larger max_list so the 1000-row pages don't get clamped.
+        // Inline `create` is the bottleneck; bound the whole test at
+        // 30s on a typical dev machine.
+        for i in 0..10_000 {
+            s.create(&format!("t{i}"), "f", "{}", "o", RetryPolicy::None, 0, None)
+                .unwrap();
+        }
+        let create = start.elapsed();
+        assert!(create.as_secs() < 30, "create 10k tasks took {create:?}");
+
+        let now = std::time::Instant::now();
+        assert_eq!(s.count(None).unwrap(), 10_000);
+        let count_elapsed = now.elapsed();
+        assert!(
+            count_elapsed.as_millis() < 500,
+            "count 10k took {count_elapsed:?}"
+        );
+
+        // Walk via cursor — the production primitive at scale.
+        let now = std::time::Instant::now();
+        let mut cursor = None;
+        let mut total = 0usize;
+        loop {
+            let page = s.list_cursor(cursor.clone(), 200, None).unwrap();
+            if page.items.is_empty() {
+                break;
+            }
+            total += page.items.len();
+            cursor = page.next_cursor;
+        }
+        let walk = now.elapsed();
+        assert_eq!(total, 10_000);
+        // 50 pages of 200; should be well under 3s on a dev machine.
+        assert!(walk.as_secs() < 3, "cursor walk of 10k tasks took {walk:?}");
+    }
+
+    #[test]
+    fn list_events_after_handles_ten_thousand_events_quickly() {
+        // S6: scale check for chronicle pagination. 10K events,
+        // walked in pages of 500.
+        let s = TaskStore::in_memory().expect("open");
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let start = std::time::Instant::now();
+        for i in 0..10_000 {
+            s.append_event(&tid, "step", &format!("e{i}")).unwrap();
+        }
+        let append = start.elapsed();
+        assert!(append.as_secs() < 30, "append 10k events took {append:?}");
+
+        let now = std::time::Instant::now();
+        let mut after = 0i64;
+        let mut total = 0usize;
+        loop {
+            let chunk = s.list_events_after(&tid, after, 500).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            after = chunk.last().unwrap().event_id;
+            total += chunk.len();
+        }
+        let walk = now.elapsed();
+        assert_eq!(total, 10_000);
+        assert!(
+            walk.as_secs() < 3,
+            "incremental walk of 10k events took {walk:?}"
+        );
+    }
+
+    #[test]
     fn list_events_after_handles_large_chronicle_quickly() {
         // 5000 events on one task. Read in pages of 500.
         let s = TaskStore::in_memory().expect("open");
