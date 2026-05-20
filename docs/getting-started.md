@@ -225,17 +225,36 @@ per-attempt detail in [`attempt-lineage.md`](attempt-lineage.md).
 
 ## Operator dashboard (browser)
 
-Open `http://127.0.0.1:19791/dashboard` for a single-page
-operator view: status-filtered task list with cursor
-pagination ("Load more"), per-task lineage with attempt
-table + chronicle, live SSE chronology updates for the
-selected task, per-task **Export** button (archival
-JSON), and a **Chronicle retention** widget for dry-run
-candidate counting before any future destructive
-compaction.
+Open `http://127.0.0.1:19791/dashboard` for the operator
+console. Sidebar nav with six routes:
+
+- **Overview** — at-a-glance health KPIs (uptime, peer
+  freshness, coordinator status, reconnect counters).
+- **Tasks** — status-filtered task list with cursor
+  pagination, per-task lineage + attempts + live SSE
+  chronology, per-task **Export** button, and a
+  **Chronicle retention** modal for dry-run candidate
+  counting.
+- **Topology** — full peer table with fresh/stale/expired
+  badges and capability counts.
+- **AI Providers** — per-provider cards (OpenAI,
+  Anthropic, OpenRouter, xAI/Grok, Google/Gemini, mock)
+  for API key + default model setup. No more hand-editing
+  TOML.
+- **Telegram** — Bot API token + delivery mode setup,
+  with a copy-paste @BotFather walkthrough.
+- **Bridge Config** — read-only snapshot of the bridge's
+  effective config (secrets redacted).
+
+Secrets supplied via the settings pages persist to a
+local `bridge-secrets.toml` at mode 0600 and are
+**never echoed back over HTTP**. Production: put a
+reverse proxy with auth in front before exposing
+beyond loopback.
 
 The dashboard is static HTML — no build step, no JS
-framework. Consumes the same `/v1/tasks*` and
+framework. Consumes the same `/v1/tasks*`,
+`/v1/topology`, `/v1/health`, `/v1/config/*`, and
 `/v1/tasks/compact_events` endpoints curl reaches above.
 
 ## See what the mesh can do

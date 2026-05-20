@@ -354,6 +354,109 @@ Scoped to one method. Returns 404 when no peer advertises it.
 See [`capability-discovery.md`](capability-discovery.md) for the
 planner-foundations contract these endpoints satisfy.
 
+## Dashboard config
+
+These endpoints back the dashboard's settings pages
+(`#/providers`, `#/telegram`, `#/config`). Local/dev only —
+no auth at the HTTP layer; production deployments must put
+a reverse proxy with auth in front before exposing the
+bridge beyond loopback. See
+[`dashboard-redesign.md`](dashboard-redesign.md) for the
+full security model.
+
+### `GET /v1/config`
+
+Read-only redacted snapshot of the bridge's effective
+config. Lists configured providers (names only, no
+secrets) + Telegram configured flag + paths to the
+bridge's own config files. Useful for "what did I
+actually configure" troubleshooting.
+
+### `GET /v1/config/providers`
+
+Lists every provider in the allowlist (`mock`, `openai`,
+`anthropic`, `openrouter`, `xai`, `google`) with redacted
+status. Response: `{ "providers": [ProviderStatus, ...] }`.
+
+`ProviderStatus`:
+
+```json
+{
+  "name": "openai",
+  "configured": true,
+  "default_model": "gpt-4o",
+  "key_preview": "…cdef",         // last 4 chars only; omitted when unset
+  "key_set_at": 1700000000        // omitted when unset
+}
+```
+
+### `GET /v1/config/providers/:name`
+
+Per-provider redacted status. Returns 404 when the name
+is not in the allowlist.
+
+### `PUT /v1/config/providers/:name`
+
+Set the provider's API key + optional default model.
+Idempotent. Body:
+
+```json
+{
+  "api_key": "sk-...",
+  "default_model": "gpt-4o"
+}
+```
+
+Response:
+
+```json
+{
+  "status": { /* ProviderStatus, redacted */ },
+  "restart_required": true
+}
+```
+
+`restart_required` is always `true` today — provider keys
+are read at AI controller startup, not at every chat. The
+dashboard surfaces this as a "restart AI controller to
+apply" notice.
+
+Status codes: 200 on success; 400 (empty api_key); 422
+(unknown provider); 500 (disk persist failed).
+
+### `DELETE /v1/config/providers/:name`
+
+Remove the provider entry. Idempotent: deleting an absent
+entry returns the redacted "not configured" status.
+
+### `GET /v1/config/telegram`
+
+Redacted Telegram bot status.
+
+```json
+{
+  "configured": true,
+  "token_preview": "…mnop",
+  "mode": "polling",
+  "token_set_at": 1700000000
+}
+```
+
+### `PUT /v1/config/telegram`
+
+Set the bot token + delivery mode. Body:
+
+```json
+{
+  "bot_token": "1234567:...",
+  "mode": "polling"
+}
+```
+
+`mode` accepts `polling` or `webhook` in the schema, but
+`webhook` is rejected with 422 today (live HTTPS client
+pending).
+
 ## Mesh topology
 
 ### `GET /v1/topology`

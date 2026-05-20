@@ -193,6 +193,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_config_landmarks_present() {
+        // The bridge config page (M8) reads /v1/config and
+        // renders the effective bridge state. Assert the
+        // endpoint + refresh button id appear.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("/v1/config"),
+            "config page should fetch /v1/config"
+        );
+        assert!(
+            body.contains(r#"id="config-refresh""#),
+            "config page should expose a refresh button"
+        );
+    }
+
+    #[tokio::test]
     async fn page_sets_security_headers() {
         let resp = page().await.into_response();
         assert_eq!(

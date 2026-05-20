@@ -296,3 +296,126 @@ pub async fn get_effective_config(State(state): State<AppState>) -> Json<Effecti
         telegram_configured,
     })
 }
+
+// ── Tests for endpoint shapes (redaction contract) ─────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::{BridgeSecrets, SecretsHandle};
+
+    fn handle_with(secrets: BridgeSecrets) -> SecretsHandle {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bridge-secrets.toml");
+        // Leak the tempdir so the path stays valid for the
+        // duration of the test (these are one-shot in-memory
+        // checks; tempdir cleanup at end of test is fine).
+        std::mem::forget(tmp);
+        SecretsHandle::new(secrets, path)
+    }
+
+    #[test]
+    fn put_provider_request_accepts_minimal_body() {
+        // Required field present, default_model absent → ok.
+        let body = r#"{"api_key":"sk-test-1234"}"#;
+        let req: PutProviderReq = serde_json::from_str(body).unwrap();
+        assert_eq!(req.api_key, "sk-test-1234");
+        assert!(req.default_model.is_none());
+    }
+
+    #[test]
+    fn put_provider_request_round_trips_default_model() {
+        let body = r#"{"api_key":"sk-x","default_model":"gpt-4o"}"#;
+        let req: PutProviderReq = serde_json::from_str(body).unwrap();
+        assert_eq!(req.default_model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn put_telegram_request_defaults_mode_to_polling() {
+        let body = r#"{"bot_token":"1234:abc"}"#;
+        let req: PutTelegramReq = serde_json::from_str(body).unwrap();
+        assert_eq!(req.mode, "polling");
+    }
+
+    #[test]
+    fn providers_response_serialisation_never_includes_raw_key() {
+        // Set a key, serialise the list-providers response,
+        // assert the raw key is absent from the JSON.
+        let mut s = BridgeSecrets::default();
+        s.set_provider(
+            "openai",
+            "sk-test-NEVERLEAK-1234".into(),
+            Some("gpt-4o".into()),
+        );
+        let resp = ProvidersResponse {
+            providers: s.all_provider_statuses(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("sk-test-NEVERLEAK-1234"),
+            "raw provider key leaked into ProvidersResponse JSON: {json}"
+        );
+        assert!(
+            !json.contains("NEVERLEAK"),
+            "key body leaked into ProvidersResponse JSON: {json}"
+        );
+        // But the redacted preview IS present.
+        assert!(
+            json.contains("…1234"),
+            "expected redacted preview in response JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn telegram_response_serialisation_never_includes_raw_token() {
+        let mut s = BridgeSecrets::default();
+        s.set_telegram("1234:ABCDEF-NEVERLEAK-7890".into(), "polling".into());
+        let resp = s.telegram_status();
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("ABCDEF-NEVERLEAK-7890"),
+            "raw token leaked into TelegramStatus JSON: {json}"
+        );
+        assert!(
+            !json.contains("NEVERLEAK"),
+            "token body leaked into TelegramStatus JSON: {json}"
+        );
+        assert!(
+            json.contains("…7890"),
+            "expected redacted preview in response JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn allowed_providers_list_is_stable() {
+        // The dashboard hard-codes labels per provider; the
+        // backend allowlist is the source of truth. Any new
+        // provider entry that lands must also be reflected in
+        // the dashboard's PROVIDER_LABELS map and the docs.
+        // This test pins the current list so the cross-file
+        // contract isn't accidentally broken.
+        assert_eq!(
+            ALLOWED_PROVIDERS,
+            &["mock", "openai", "anthropic", "openrouter", "xai", "google"]
+        );
+    }
+
+    #[test]
+    fn handle_can_persist_and_reload_via_mutate() {
+        let h = handle_with(BridgeSecrets::default());
+        h.mutate(|s| s.set_provider("openai", "sk-xyz-1234".into(), None))
+            .unwrap();
+        let v = h.read(|s| s.provider_status("openai"));
+        assert!(v.configured);
+        assert_eq!(v.key_preview.as_deref(), Some("…1234"));
+        // Round-trip the file: a fresh handle pointed at the
+        // same path should pick up the same entry.
+        let h2 = SecretsHandle::new(
+            BridgeSecrets::load_or_empty(h.path()),
+            h.path().to_path_buf(),
+        );
+        let v2 = h2.read(|s| s.provider_status("openai"));
+        assert!(v2.configured);
+        assert_eq!(v2.key_preview.as_deref(), Some("…1234"));
+    }
+}

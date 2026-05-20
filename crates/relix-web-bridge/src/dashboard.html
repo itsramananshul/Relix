@@ -780,12 +780,26 @@
       </div>
     </section>
 
-    <!-- ── #/config (stub for milestone 8) ────────────────────── -->
+    <!-- ── #/config ────────────────────────────────────────────── -->
     <section class="page" data-page="config">
       <h2>Bridge Config</h2>
-      <p class="page-subtitle">Read-only view of the bridge's effective config (secrets redacted).</p>
-      <div class="banner info">
-        Config inspection page lands in a follow-up commit.
+      <p class="page-subtitle">
+        Read-only snapshot of the bridge's effective config. Secrets
+        are aggregated to "configured / not configured" only — the
+        raw values never leave the bridge process. To change
+        provider keys or the Telegram token, use the dedicated
+        settings pages.
+      </p>
+      <div class="card">
+        <div class="card-header">
+          <h3>Effective configuration</h3>
+          <div class="card-actions">
+            <button id="config-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="config-host">
+          <div class="loading">loading…</div>
+        </div>
       </div>
     </section>
   </main>
@@ -827,7 +841,7 @@ const PAGES = {
   topology:  { label: 'Topology',     init: initTopology,  enter: enterTopology },
   providers: { label: 'AI Providers', init: null,          enter: enterProviders },
   telegram:  { label: 'Telegram',     init: initTelegram,  enter: enterTelegram },
-  config:    { label: 'Bridge Config', init: null,         enter: null },
+  config:    { label: 'Bridge Config', init: initConfig,    enter: enterConfig },
 };
 
 const PROVIDER_LABELS = {
@@ -1499,6 +1513,45 @@ function renderTelegramStatus(t) {
   $input.placeholder = t.configured
     ? '(set; enter new value to replace)'
     : 'paste @BotFather token…';
+}
+
+/* ── Config page ──────────────────────────────────────────── */
+function initConfig() {
+  document.getElementById('config-refresh').addEventListener('click', enterConfig);
+}
+async function enterConfig() {
+  const $host = document.getElementById('config-host');
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/config');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const c = await r.json();
+    renderEffectiveConfig(c);
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+function renderEffectiveConfig(c) {
+  const rowsHtml = [
+    ['Listen address',     c.listen_addr],
+    ['Identity bundle',    c.identity_bundle_path],
+    ['Peers file',         c.peers_path],
+    ['Flow template',      c.flow_template_path],
+    ['Tool flow template', c.tool_template_path || '(none)'],
+    ['Coordinator alias',  c.coordinator_alias || '(none)'],
+    ['OpenAI shim',        c.openai_compat ? 'enabled' : 'disabled'],
+    ['Secrets file',       c.secrets_path],
+    ['Providers configured',
+        (c.providers_configured || []).length
+          ? c.providers_configured.join(', ')
+          : '(none)'],
+    ['Telegram configured', c.telegram_configured ? 'yes' : 'no'],
+  ].map(([k, v]) => (
+    '<tr><th style="width: 220px;">' + escapeHtml(k) + '</th>'
+    + '<td><code>' + escapeHtml(String(v)) + '</code></td></tr>'
+  )).join('');
+  document.getElementById('config-host').innerHTML =
+    '<table class="data">' + '<tbody>' + rowsHtml + '</tbody></table>';
 }
 
 async function saveTelegram() {

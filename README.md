@@ -34,7 +34,8 @@ and [`docs/current-limitations.md`](docs/current-limitations.md).
 | MeshClient peer reconnect + 60s manifest refresh | works |
 | Coordinator node (`task.create` / `update` / `event` / `get` / `list` / `count` / `list_cursor` / `recover` / `attempts` / `retry` / `events` / `export` / `compact_events`) with SQLite ledger | works (per-attempt lineage; operator-driven retry; recovery scan for stale tasks; cursor pagination stable under concurrent writes; typed event envelopes. Checkpointed re-run, not resumable replay — see [`docs/replay-model.md`](docs/replay-model.md)) |
 | Bridge `/v1/tasks` HTTP surface (list / cursor / count / get / summary / attempts / events / events/stream SSE / lineage / export / compact_events / recover) | works |
-| Operator dashboard `/dashboard` — single-page HTML, live SSE chronology, per-task export, retention dry-run widget | works |
+| Operator dashboard `/dashboard` — sidebar + topbar shell, six routes (Overview / Tasks / Topology / AI Providers / Telegram / Bridge Config), live SSE chronology, per-task export, retention dry-run modal, AI provider key setup, Telegram token setup | works |
+| Dashboard-driven config (`/v1/config/*`) — AI provider keys + Telegram bot token via the dashboard's settings pages. Local secrets file (mode 0600, gitignored); never echoed back over HTTP. | works |
 | `relix-cli task` CLI (create / update / event / get / list / count / attempts / recover / retry / watch / compact / export) with `--pretty` chronology | works |
 | `relix-cli capability` CLI (ls / get / validate, 7 manifest-lint rules) | works |
 | Chronicle retention (operator export + dry-run candidate counter; destructive deletion gated by design) | works (Steps 1, 2, 5 of [`docs/chronicle-retention.md`](docs/chronicle-retention.md)) |
@@ -154,6 +155,7 @@ Start here, in this order:
 - [`docs/operator-guide.md`](docs/operator-guide.md) — running the mesh, logs, troubleshooting, common failure modes.
 - [`docs/failure-modes.md`](docs/failure-modes.md) — single-page reference for "what happens when X is down": detection signals, bridge behavior, recovery steps for every component.
 - [`docs/restart-safety.md`](docs/restart-safety.md) — per-component "what persists / what's recomputed / what's lost" across a restart. Read before designing recovery procedures or backup policy.
+- [`docs/dashboard-redesign.md`](docs/dashboard-redesign.md) — design contract for the operator console redesign, including the secret-handling model used by the AI provider + Telegram settings pages.
 - [`docs/deployment.md`](docs/deployment.md) — local / multi-node / production-readiness modes, mandatory hardening before public exposure, topology diagram, Open WebUI + Telegram integration.
 - [`docs/multi-node-bringup.md`](docs/multi-node-bringup.md) — five concrete topologies (single-host → multi-host → channel-augmented), per-node config deltas, identity distribution recipe, boot order, multi-node health checks.
 - [`docs/flows-and-sol.md`](docs/flows-and-sol.md) — what SOL is and isn't, how `remote_call` works, how to write a new flow.
