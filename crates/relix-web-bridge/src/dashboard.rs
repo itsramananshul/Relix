@@ -288,6 +288,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_stuck_quick_filter_chip_present() {
+        // M53 (Track B): adds a "stuck?" quick-filter chip
+        // that narrows the list to running/retrying tasks
+        // whose updated_at age >= STUCK_AGE_SECS. The chip
+        // uses the __stuck sentinel since "stuck" is not a
+        // backend status. enterTasks restores the flag from
+        // the ?stuck=1 query param so shared links work.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"data-quick-filter="__stuck""#),
+            "stuck quick-filter chip missing"
+        );
+        assert!(
+            body.contains("let stuckOnly"),
+            "stuckOnly client-side filter flag missing"
+        );
+        assert!(
+            body.contains("query.stuck"),
+            "enterTasks should restore stuck flag from URL"
+        );
+    }
+
+    #[tokio::test]
     async fn page_task_row_age_column_present() {
         // M50 (Track B): task list ships an age column derived
         // from updated_at. Running/retrying rows older than

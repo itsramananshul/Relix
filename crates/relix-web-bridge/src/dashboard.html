@@ -1697,6 +1697,7 @@
         <button class="chip" data-quick-filter="failed">failed</button>
         <button class="chip" data-quick-filter="interrupted">interrupted</button>
         <button class="chip" data-quick-filter="completed">completed</button>
+        <button class="chip" data-quick-filter="__stuck" title="running for ≥ STUCK_AGE_SECS — same age that future recovery scans would flag">stuck?</button>
       </div>
       <div class="row between" style="margin-bottom: 12px; gap: 8px; flex-wrap: wrap;">
         <div class="row" style="flex-wrap: wrap; gap: 8px;">
@@ -2790,6 +2791,10 @@ let loadedTasks = [];
 let nextCursor = null;
 const TASKS_PAGE_SIZE = 100;
 let tasksInited = false;
+// Client-side post-filter: when true, renderTaskList hides
+// any row that isn't running/retrying and STUCK_AGE_SECS old.
+// Driven by the "stuck?" quick-filter chip.
+let stuckOnly = false;
 
 function initTasks() {
   // Wire control handlers
@@ -2826,12 +2831,25 @@ function initTasks() {
     renderTaskList(loadedTasks);
   });
   // Quick-filter chip row — drives the status select.
+  // The "__stuck" sentinel is special: it's a client-side
+  // post-filter (age >= STUCK_AGE_SECS for running/retrying
+  // rows). We narrow to running on the backend to keep the
+  // candidate set small, then renderTaskList applies the
+  // age filter locally.
   document.querySelectorAll('.chip[data-quick-filter]').forEach(chip => {
     chip.addEventListener('click', () => {
       const v = chip.dataset.quickFilter;
-      document.getElementById('filter-status').value = v;
-      syncChipState();
-      setQueryParams({ status: v });
+      if (v === '__stuck') {
+        stuckOnly = true;
+        document.getElementById('filter-status').value = 'running';
+        syncChipState();
+        setQueryParams({ status: 'running', stuck: '1' });
+      } else {
+        stuckOnly = false;
+        document.getElementById('filter-status').value = v;
+        syncChipState();
+        setQueryParams({ status: v, stuck: null });
+      }
       loadTasks();
     });
   });
@@ -2944,7 +2962,11 @@ async function requestRetry(taskId, force) {
 function syncChipState() {
   const v = document.getElementById('filter-status').value;
   document.querySelectorAll('.chip[data-quick-filter]').forEach(chip => {
-    chip.classList.toggle('active', chip.dataset.quickFilter === v);
+    if (chip.dataset.quickFilter === '__stuck') {
+      chip.classList.toggle('active', stuckOnly === true);
+    } else {
+      chip.classList.toggle('active', !stuckOnly && chip.dataset.quickFilter === v);
+    }
   });
 }
 function enterTasks() {
@@ -2952,8 +2974,14 @@ function enterTasks() {
   // link like #/tasks?status=failed&q=demo lands with the
   // controls already set).
   const { query } = parseHash();
+  stuckOnly = (query.stuck === '1');
   if (query.status != null) {
     document.getElementById('filter-status').value = query.status;
+    syncChipState();
+  } else if (stuckOnly) {
+    // Stuck filter implies status=running for backend filtering;
+    // the age post-filter narrows further client-side.
+    document.getElementById('filter-status').value = 'running';
     syncChipState();
   }
   if (query.q != null) {
@@ -3027,11 +3055,18 @@ function renderTaskList(items) {
   const $search = document.getElementById('filter-search');
   const $filter = document.getElementById('filter-status');
   const q = ($search.value || '').trim().toLowerCase();
-  const filtered = q
+  const nowFilter = Math.floor(Date.now() / 1000);
+  let filtered = q
     ? items.filter(t =>
         (t.title || '').toLowerCase().includes(q)
         || (t.task_id || '').toLowerCase().includes(q))
     : items;
+  if (stuckOnly) {
+    filtered = filtered.filter(t =>
+      (t.status === 'running' || t.status === 'retrying')
+      && typeof t.updated_at === 'number'
+      && (nowFilter - t.updated_at) >= STUCK_AGE_SECS);
+  }
   // Update the count badge: filtered/loaded with `+` when more pages.
   const total = items.length;
   const showing = filtered.length;
