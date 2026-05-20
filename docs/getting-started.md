@@ -223,6 +223,21 @@ Full operator playbook in
 documented in [`runtime-lifecycle.md`](runtime-lifecycle.md);
 per-attempt detail in [`attempt-lineage.md`](attempt-lineage.md).
 
+## Operator dashboard (browser)
+
+Open `http://127.0.0.1:19791/dashboard` for a single-page
+operator view: status-filtered task list with cursor
+pagination ("Load more"), per-task lineage with attempt
+table + chronicle, live SSE chronology updates for the
+selected task, per-task **Export** button (archival
+JSON), and a **Chronicle retention** widget for dry-run
+candidate counting before any future destructive
+compaction.
+
+The dashboard is static HTML — no build step, no JS
+framework. Consumes the same `/v1/tasks*` and
+`/v1/tasks/compact_events` endpoints curl reaches above.
+
 ## See what the mesh can do
 
 The bridge projects the discovered capability manifests as JSON,
