@@ -225,6 +225,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_retry_storm_landmarks_present() {
+        // M40: anomaly banner adds a retry-storm signal sourced
+        // from /v1/tasks/edges/recent. Topology page gets a
+        // Recent retry chains card. Both must show up in the
+        // rendered HTML.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // backgroundSync now fetches the edges aggregate.
+        assert!(
+            body.contains("/v1/tasks/edges/recent"),
+            "backgroundSync should fetch /v1/tasks/edges/recent"
+        );
+        // Anomaly computation gains the retry-count signal.
+        assert!(
+            body.contains("retry_count_15min"),
+            "computeAnomalies should track retry_count_15min"
+        );
+        // Topology page hosts the Recent retry chains card.
+        assert!(
+            body.contains(r#"id="cross-edges-host""#),
+            "topology page should host the cross-edges card"
+        );
+        assert!(
+            body.contains("Recent retry chains"),
+            "topology page should label the cross-edges card"
+        );
+    }
+
+    #[tokio::test]
     async fn page_edge_anchor_navigation_present() {
         // M38c: chain gaps render the retried_from edge anchor
         // (← evt N) when one is recorded; click jumps to the

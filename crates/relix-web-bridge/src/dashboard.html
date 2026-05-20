@@ -1660,6 +1660,16 @@
         </div>
       </div>
 
+      <div class="card">
+        <div class="card-header">
+          <h3>Recent retry chains</h3>
+          <span class="meta" id="cross-edges-status"></span>
+        </div>
+        <div class="card-body dense" id="cross-edges-host">
+          <div class="empty">loading…</div>
+        </div>
+      </div>
+
       <p class="meta">
         <code>last_refr</code> is "seconds since the most recent successful
         <code>node.manifest</code> refresh." A stale value means the peer's
@@ -2010,6 +2020,10 @@ const ACTIVITY_CAP = 50;
 let lastHealthSnapshot = null;
 let lastTopologySnapshot = null;
 let lastTaskCountSnapshot = null;
+// Cross-task execution edges (M39 /v1/tasks/edges/recent).
+// Used by computeAnomalies() to surface retry-storm patterns
+// derived from real recorded edges — no synthesized signals.
+let lastEdgesSnapshot = null;
 
 function initOverview() { /* nothing one-shot */ }
 
@@ -2032,10 +2046,16 @@ function enterOverview() {
    status whether or not the operator is on overview. */
 async function backgroundSync() {
   try {
-    const [hRes, tRes, recentTasks] = await Promise.all([
+    const [hRes, tRes, recentTasks, recentEdges] = await Promise.all([
       fetch('/v1/health').then(r => r.json()),
       fetch('/v1/topology').then(r => r.json()),
       fetch('/v1/tasks/cursor?limit=20').then(r => r.json()).catch(() => ({ items: [] })),
+      // M40: cross-task edges for retry-storm detection. Best-
+      // effort — older Coordinator without task.recent_edges
+      // returns a 502, dashboard degrades silently.
+      fetch('/v1/tasks/edges/recent?limit=50')
+        .then(r => r.ok ? r.json() : [])
+        .catch(() => []),
     ]);
     const taskCount = await fetch('/v1/tasks/count')
       .then(r => r.text())
@@ -2046,6 +2066,7 @@ async function backgroundSync() {
     lastHealthSnapshot = hRes;
     lastTopologySnapshot = tRes;
     lastTaskCountSnapshot = taskCount;
+    lastEdgesSnapshot = Array.isArray(recentEdges) ? recentEdges : [];
 
     diffAndRecordActivity(hRes, tRes.peers || [], recentTasks.items || [], isFirst);
 
@@ -2326,8 +2347,16 @@ function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
      high      → critical thresholds breached
 */
 const ANOMALY_WINDOW_SECS = 300;          // 5 min
-const ANOMALY_ELEVATED = { peer_flips: 1, task_failures: 1, expired_now: 1 };
-const ANOMALY_HIGH     = { peer_flips: 4, task_failures: 3, expired_now: 2 };
+// M40: retry-storm uses a slightly longer window so brief
+// flurries (e.g. one task retrying 3x in 60s) register but
+// noise from single-task chains spread over an hour doesn't.
+const RETRY_STORM_WINDOW_SECS = 900;      // 15 min
+const ANOMALY_ELEVATED = {
+  peer_flips: 1, task_failures: 1, expired_now: 1, retry_count_15min: 3,
+};
+const ANOMALY_HIGH = {
+  peer_flips: 4, task_failures: 3, expired_now: 2, retry_count_15min: 8,
+};
 
 function computeAnomalies() {
   const cutoff = Date.now() - ANOMALY_WINDOW_SECS * 1000;
@@ -2344,37 +2373,72 @@ function computeAnomalies() {
     }
   }
   const expired_now = lastHealthSnapshot ? (lastHealthSnapshot.peers_expired || 0) : 0;
-  return { peer_flips, task_failures, expired_now };
+  // M40: count retried_from edges in the recent window. The
+  // edges payload carries server-side created_at (unix
+  // seconds), so we use that — not Date.now() — to honor the
+  // bridge's clock.
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const retryCutoff = nowSecs - RETRY_STORM_WINDOW_SECS;
+  let retry_count_15min = 0;
+  const retryTaskIds = new Set();
+  for (const e of (lastEdgesSnapshot || [])) {
+    if (!e || e.created_at == null) continue;
+    if (e.created_at < retryCutoff) continue;
+    if (e.edge_type === 'retried_from') {
+      retry_count_15min += 1;
+      if (e.task_id) retryTaskIds.add(e.task_id);
+    }
+  }
+  return {
+    peer_flips, task_failures, expired_now,
+    retry_count_15min,
+    retry_distinct_tasks: retryTaskIds.size,
+  };
 }
 
 function renderAnomalyBanner() {
   const $banner = document.getElementById('anomaly-banner');
   if (!$banner) return;
   const a = computeAnomalies();
-  const total = a.peer_flips + a.task_failures + a.expired_now;
+  const total = a.peer_flips + a.task_failures + a.expired_now + a.retry_count_15min;
   if (total === 0) {
     $banner.className = 'anomaly-banner empty';
     $banner.innerHTML = '';
     return;
   }
-  // Decide level: high if any signal crosses the high
-  // threshold, elevated otherwise.
+  // Decide level: high if any signal crosses its high threshold.
   let level = 'elevated';
   if (a.peer_flips    >= ANOMALY_HIGH.peer_flips
       || a.task_failures >= ANOMALY_HIGH.task_failures
-      || a.expired_now   >= ANOMALY_HIGH.expired_now) {
+      || a.expired_now   >= ANOMALY_HIGH.expired_now
+      || a.retry_count_15min >= ANOMALY_HIGH.retry_count_15min) {
     level = 'high';
   }
   const chips = [];
   if (a.peer_flips > 0)    chips.push(a.peer_flips + ' peer transition' + (a.peer_flips === 1 ? '' : 's'));
   if (a.task_failures > 0) chips.push(a.task_failures + ' task failure' + (a.task_failures === 1 ? '' : 's'));
   if (a.expired_now > 0)   chips.push(a.expired_now + ' expired peer' + (a.expired_now === 1 ? '' : 's'));
+  if (a.retry_count_15min > 0) {
+    // Show distinct-task count when it's lower than the edge
+    // count — operators see "5 retries across 2 tasks" as
+    // a more useful signal than "5 retries" alone.
+    const detail = a.retry_distinct_tasks < a.retry_count_15min
+      ? ' across ' + a.retry_distinct_tasks + ' task' + (a.retry_distinct_tasks === 1 ? '' : 's')
+      : '';
+    chips.push(a.retry_count_15min + ' retry' + (a.retry_count_15min === 1 ? '' : 's') + detail);
+  }
+  // The retry window is 15min, the other signals 5min. Show
+  // both so operators don't misread the chips against the
+  // wrong window.
+  const windowText = (a.retry_count_15min > 0)
+    ? 'last 5/15min (retries 15min)'
+    : 'last ' + (ANOMALY_WINDOW_SECS / 60) + 'min';
   $banner.className = 'anomaly-banner ' + level;
   $banner.innerHTML =
     '<span class="level-dot"></span>'
     + '<span class="label">runtime anomalies</span>'
     + chips.map(c => '<span class="anomaly-chip">' + escapeHtml(c) + '</span>').join('')
-    + '<span class="window-meta">last ' + (ANOMALY_WINDOW_SECS / 60) + 'min</span>';
+    + '<span class="window-meta">' + escapeHtml(windowText) + '</span>';
 }
 
 function renderActivityFeed(newCount) {
@@ -3687,15 +3751,17 @@ async function loadTopology() {
   const $host = document.getElementById('topology-table-host');
   $status.textContent = 'querying…';
   try {
-    const [topoRes, evtRes] = await Promise.all([
+    const [topoRes, evtRes, edgesRes] = await Promise.all([
       fetch('/v1/topology').then(r => r.ok ? r.json() : Promise.reject('HTTP ' + r.status)),
       fetch('/v1/topology/events?limit=100').then(r => r.ok ? r.json() : { events: [] }).catch(() => ({ events: [] })),
+      fetch('/v1/tasks/edges/recent?limit=50').then(r => r.ok ? r.json() : []).catch(() => []),
     ]);
     const peers = topoRes.peers || [];
     topologyPeers = peers;
     renderTopologyGraph(peers);
     renderTopologyTable(peers);
     renderLifecycleEvents(evtRes.events || []);
+    renderCrossTaskEdges(edgesRes);
     $status.textContent = 'generated_at=' + (topoRes.generated_at || '?')
       + '  peers=' + peers.length
       + (peers.some(p => p.freshness === 'expired')
@@ -3706,6 +3772,60 @@ async function loadTopology() {
     document.getElementById('topology-table-host').innerHTML =
       '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
+}
+
+/* Renders the cross-task execution-edge aggregate (M39
+   data). Groups edges by task_id so operators see "task X
+   retried 3 times" at a glance instead of scanning a flat
+   row-per-edge list. */
+function renderCrossTaskEdges(edges) {
+  const $host = document.getElementById('cross-edges-host');
+  const $status = document.getElementById('cross-edges-status');
+  if (!$host) return;
+  if (!Array.isArray(edges) || edges.length === 0) {
+    $host.innerHTML = '<div class="empty">no recent retry chains (the task_edges table holds the most recent retried_from edges across all tasks)</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  // Group by task_id, keep newest edge as the anchor.
+  const byTask = new Map();
+  for (const e of edges) {
+    if (e.edge_type !== 'retried_from') continue;
+    if (!byTask.has(e.task_id)) {
+      byTask.set(e.task_id, { count: 0, newest_at: 0 });
+    }
+    const g = byTask.get(e.task_id);
+    g.count += 1;
+    if ((e.created_at || 0) > g.newest_at) g.newest_at = e.created_at;
+  }
+  if (byTask.size === 0) {
+    $host.innerHTML = '<div class="empty">no retried_from edges in the recent window</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  // Sort by newest_at DESC so the most-recent chains land
+  // at the top.
+  const rows = Array.from(byTask.entries())
+    .sort((a, b) => b[1].newest_at - a[1].newest_at)
+    .map(([taskId, g]) => {
+      const dt = new Date(g.newest_at * 1000);
+      const taskHash = '#/tasks?task=' + encodeURIComponent(taskId);
+      return '<div class="activity-item ' + (g.count >= 3 ? 'danger' : g.count >= 2 ? 'warn' : 'task') + '" style="cursor: pointer;" data-href="' + escapeHtml(taskHash) + '">'
+        + '<span class="activity-icon"></span>'
+        + '<span class="activity-tag">' + escapeHtml(dt.toLocaleTimeString()) + '</span>'
+        + '<span class="activity-body">'
+        +   '<strong>' + g.count + ' retr' + (g.count === 1 ? 'y' : 'ies') + '</strong>'
+        +   ' · task <span class="id">' + escapeHtml(taskId.slice(0, 12)) + '…</span>'
+        + '</span>'
+        + '</div>';
+    }).join('');
+  $host.innerHTML = '<div class="activity-list">' + rows + '</div>';
+  $host.querySelectorAll('[data-href]').forEach(el => {
+    el.addEventListener('click', () => {
+      window.location.hash = el.dataset.href;
+    });
+  });
+  if ($status) $status.textContent = byTask.size + ' task' + (byTask.size === 1 ? '' : 's');
 }
 
 function renderLifecycleEvents(events) {
