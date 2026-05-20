@@ -539,6 +539,46 @@ See also: [`docs/coordinator.md`](coordinator.md),
 [`docs/retry-model.md`](retry-model.md),
 [`docs/replay-model.md`](replay-model.md).
 
+### Chronicle retention (save + plan, no destructive deletion yet)
+
+The Coordinator's `task_events` table grows unbounded by design;
+two operator surfaces help you plan before the destructive Step 3
+capability lands. Full design in
+[`docs/chronicle-retention.md`](chronicle-retention.md).
+
+**Export one task's full chronicle for archival:**
+
+```bash
+relix-cli task export --peer ... --identity ... --client-key ... \
+    --task-id <hex> --out task-snapshot.json
+# Or stream to stdout for piping (jq, gzip, …):
+relix-cli task export --peer ... --identity ... --client-key ... \
+    --task-id <hex> --out -
+```
+
+Browser equivalent: the dashboard's per-task **Export** button
+hits `GET /v1/tasks/:id/export` with
+`Content-Disposition: attachment`.
+
+**Plan a retention policy without deleting:**
+
+```bash
+relix-cli task compact --peer ... --identity ... --client-key ... \
+    --max-age-secs 2592000   # 30 days
+# Prints a JSON object: candidate_events, candidate_tasks,
+# by_task_status breakdown, oldest/newest candidate ts.
+```
+
+Browser equivalent: the **Chronicle retention** widget at the
+top of the dashboard. Both call `task.compact_events` with
+`mode=dry-run`. The Coordinator currently rejects any other
+mode value with INVALID_ARGS — the destructive Step 3
+capability is not shipped, by design.
+
+R5 guarantee: only events whose parent task is in a terminal
+state (`completed` / `failed` / `cancelled` / `interrupted`)
+are counted. In-flight tasks are never candidates.
+
 ## Inspecting flows after the fact
 
 Every chat response includes `flow_id` and `flow_log`. To replay what
