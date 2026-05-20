@@ -1182,14 +1182,57 @@ const PROVIDER_LABELS = {
 let currentRoute = null;
 const initialised = new Set();
 
-function parseRoute() {
+/* Parse the hash into { route, query }.
+   Hash shape: #/<route>[?key=val&key2=val2]
+   Unknown routes fall back to overview. */
+function parseHash() {
   const hash = window.location.hash || '#/overview';
-  const m = hash.match(/^#\/(\w+)/);
+  const stripped = hash.startsWith('#') ? hash.slice(1) : hash;
+  const [pathRaw, queryRaw] = stripped.split('?', 2);
+  const m = pathRaw.match(/^\/(\w+)/);
   const name = m && PAGES[m[1]] ? m[1] : 'overview';
-  return name;
+  const query = {};
+  if (queryRaw) {
+    for (const part of queryRaw.split('&')) {
+      const [k, v] = part.split('=', 2);
+      if (k) query[decodeURIComponent(k)] = v != null ? decodeURIComponent(v) : '';
+    }
+  }
+  return { route: name, query };
+}
+
+/* Build a hash from (route, query). Drops empty values
+   so the URL stays tidy. */
+function buildHash(route, query) {
+  const parts = Object.entries(query || {})
+    .filter(([_, v]) => v != null && v !== '')
+    .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v));
+  return '#/' + route + (parts.length ? '?' + parts.join('&') : '');
+}
+
+/* Update the query portion of the URL without leaving the
+   current route. The `_inSuppressedUpdate` flag prevents the
+   resulting hashchange event from re-entering showRoute. */
+let _inSuppressedUpdate = false;
+function setQueryParams(updates) {
+  const { route, query } = parseHash();
+  const next = Object.assign({}, query, updates);
+  // Drop keys explicitly set to null / undefined / "".
+  for (const k of Object.keys(next)) {
+    if (next[k] == null || next[k] === '') delete next[k];
+  }
+  const nextHash = buildHash(route, next);
+  if (nextHash === window.location.hash) return;
+  _inSuppressedUpdate = true;
+  // pushState avoids the hashchange event entirely (history
+  // entry created but the listener doesn't fire because we
+  // didn't actually navigate via location.hash).
+  history.replaceState(null, '', nextHash);
+  _inSuppressedUpdate = false;
 }
 
 function showRoute(name) {
+  const isSameRoute = currentRoute === name;
   currentRoute = name;
   // Toggle sections
   document.querySelectorAll('section.page').forEach(s => {
@@ -1201,16 +1244,23 @@ function showRoute(name) {
   });
   // Topbar breadcrumb
   document.getElementById('topbar-leaf').textContent = PAGES[name].label;
-  // Lazy init
+  // Lazy init (only once per route).
   const page = PAGES[name];
   if (page.init && !initialised.has(name)) {
     page.init();
     initialised.add(name);
   }
+  // Always call enter() so the page can re-read URL query
+  // on revisit; pages are responsible for being idempotent.
   if (page.enter) page.enter();
+  // If hash changed (route or query), update topbar tag.
+  void isSameRoute;
 }
 
-window.addEventListener('hashchange', () => showRoute(parseRoute()));
+window.addEventListener('hashchange', () => {
+  if (_inSuppressedUpdate) return;
+  showRoute(parseHash().route);
+});
 
 /* ── Status bar (polled every 10s) ────────────────────────── */
 async function refreshStatus() {
@@ -1623,19 +1673,25 @@ function initTasks() {
   });
   document.getElementById('filter-status').addEventListener('change', () => {
     syncChipState();
+    setQueryParams({ status: document.getElementById('filter-status').value });
     loadTasks();
   });
   // Free-text client-side search. Re-renders the loaded
   // list without re-fetching — operators can refine
-  // their view across already-loaded pages.
+  // their view across already-loaded pages. Query persists
+  // in the URL so search state survives a refresh.
   const $search = document.getElementById('filter-search');
-  $search.addEventListener('input', () => renderTaskList(loadedTasks));
+  $search.addEventListener('input', () => {
+    setQueryParams({ q: $search.value || '' });
+    renderTaskList(loadedTasks);
+  });
   // Quick-filter chip row — drives the status select.
   document.querySelectorAll('.chip[data-quick-filter]').forEach(chip => {
     chip.addEventListener('click', () => {
       const v = chip.dataset.quickFilter;
       document.getElementById('filter-status').value = v;
       syncChipState();
+      setQueryParams({ status: v });
       loadTasks();
     });
   });
@@ -1679,7 +1735,27 @@ function syncChipState() {
   });
 }
 function enterTasks() {
-  if (!loadedTasks.length) loadTasks();
+  // Apply persisted filters from URL query (so a shared
+  // link like #/tasks?status=failed&q=demo lands with the
+  // controls already set).
+  const { query } = parseHash();
+  if (query.status != null) {
+    document.getElementById('filter-status').value = query.status;
+    syncChipState();
+  }
+  if (query.q != null) {
+    document.getElementById('filter-search').value = query.q;
+  }
+  if (!loadedTasks.length) {
+    loadTasks().then(() => {
+      // If the URL named a task, open its detail panel after
+      // the list loads.
+      if (query.task) loadDetail(query.task);
+    });
+  } else {
+    renderTaskList(loadedTasks);
+    if (query.task && query.task !== selectedTaskId) loadDetail(query.task);
+  }
 }
 
 async function loadTasks() {
@@ -1773,6 +1849,9 @@ async function loadDetail(id) {
   document.querySelectorAll('#task-list tbody tr').forEach(tr => {
     tr.classList.toggle('selected', tr.dataset.id === id);
   });
+  // Persist the selection in the URL so refresh / back /
+  // shared links land on the same task.
+  if (currentRoute === 'tasks') setQueryParams({ task: id });
   document.getElementById('detail-title').textContent =
     'Task ' + id.slice(0, 12) + '…';
   document.getElementById('detail-actions').style.display = 'flex';
@@ -2433,7 +2512,7 @@ async function saveTelegram() {
 }
 
 /* ── Boot ─────────────────────────────────────────────────── */
-showRoute(parseRoute());
+showRoute(parseHash().route);
 </script>
 </body>
 </html>
