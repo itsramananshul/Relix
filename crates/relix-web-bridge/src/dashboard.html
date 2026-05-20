@@ -115,6 +115,11 @@
     .empty { padding: 24px 12px; color: var(--fg-dim); text-align: center; font-style: italic; }
     .error { padding: 8px 12px; color: var(--failed); background: #fde8e8; border-radius: 3px; }
     .meta { padding: 0 12px 8px; color: var(--fg-dim); font-size: 11px; }
+    .load-more {
+      padding: 8px 12px; text-align: center;
+      border-top: 1px solid var(--border);
+    }
+    .load-more button { width: 100%; padding: 6px; }
     /* Retention dry-run widget — collapsed by default. */
     details.retention {
       margin: 0 20px 12px; padding: 0;
@@ -206,16 +211,42 @@ let selectedTaskId = null;
 let autoTimer = null;
 let eventSource = null;
 let lastEventId = 0;
+// Cursor pagination state. `loadedTasks` accumulates rows
+// across "Load more" clicks; `nextCursor` holds the opaque
+// continuation token returned by /v1/tasks/cursor (null after
+// the last page). Filter / refresh / auto-refresh all reset
+// this state via loadTasks(); only the explicit "Load more"
+// button appends.
+let loadedTasks = [];
+let nextCursor = null;
+const PAGE_SIZE = 100;
 
 async function loadTasks() {
+  // Reset to first page. Operators reaching for "Refresh"
+  // want the freshest state, not more historical rows.
+  loadedTasks = [];
+  nextCursor = null;
+  await fetchNextPage();
+}
+
+async function fetchNextPage() {
   try {
     const status = $filter.value;
-    const url = '/v1/tasks?limit=100' + (status ? '&status=' + encodeURIComponent(status) : '');
-    const r = await fetch(url);
+    const params = new URLSearchParams();
+    params.set('limit', String(PAGE_SIZE));
+    if (status) params.set('status', status);
+    if (nextCursor) params.set('cursor', nextCursor);
+    const r = await fetch('/v1/tasks/cursor?' + params.toString());
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const items = await r.json();
-    renderTaskList(items);
-    $count.textContent = items.length + (items.length === 100 ? '+' : '');
+    const page = await r.json();
+    const items = page.items || [];
+    loadedTasks = loadedTasks.concat(items);
+    nextCursor = page.next_cursor || null;
+    renderTaskList(loadedTasks);
+    // Count reflects total loaded; `+` suffix when more pages
+    // are available so operators know there's more behind
+    // the "Load more" affordance.
+    $count.textContent = loadedTasks.length + (nextCursor ? '+' : '');
   } catch (e) {
     $list.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
@@ -234,13 +265,18 @@ function renderTaskList(items) {
       <td class="id">${t.task_id.slice(0, 8)}</td>
     </tr>`;
   }).join('');
+  const moreButton = nextCursor
+    ? `<div class="load-more"><button id="load-more">Load more (${items.length} shown)</button></div>`
+    : '';
   $list.innerHTML = `<table>
     <thead><tr><th>status</th><th>title</th><th>id</th></tr></thead>
     <tbody>${rows}</tbody>
-  </table>`;
+  </table>${moreButton}`;
   $list.querySelectorAll('tbody tr').forEach(tr => {
     tr.addEventListener('click', () => loadDetail(tr.dataset.id));
   });
+  const $more = document.getElementById('load-more');
+  if ($more) $more.addEventListener('click', fetchNextPage);
 }
 
 async function loadDetail(id) {
