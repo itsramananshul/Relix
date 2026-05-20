@@ -8,8 +8,8 @@ own commit, no batched mega-commits.
 ## Test posture
 
 - **Before session start:** 205 workspace tests passing.
-- **After session end:** 278 workspace tests passing.
-- **Net new:** +73 tests across 9 files.
+- **After session end:** 292 workspace tests passing.
+- **Net new:** +87 tests across 11 files.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --all`: clean.
 - One real bug discovered and fixed mid-session (web_extract CDATA
@@ -92,6 +92,22 @@ Verified against every change:
   proposal (P1-P4), explicit hard non-goals (no autonomous
   recursive planner, no hidden orchestration prompts, no swarm
   routing, no self-modifying flows).
+- `ab110fb` **T4 P1** — `CapabilityDescriptor` gains 3 optional
+  fields (description, categories, environment_requirements) with
+  serde defaults + skip_serializing_if so pre-P1 manifests still
+  decode and unannotated descriptors stay wire-identical. tool.web_fetch
+  / tool.web_extract / tool.pdf annotated as living examples.
+  4 new tests.
+- `62ff287` **T4 P2** — bridge `/v1/capabilities` (and
+  `/v1/capabilities/:method`) JSON endpoints as pure projection of
+  `ManifestCache`. Optional `?category=` and `?tag=` filters; 404
+  on unknown method. 5 new tests (including enum-to-string mapping
+  regression guard).
+- `d16e0cc` **T4 P3** — `relix-cli capability ls / get`
+  subcommand. Same data as the HTTP endpoint, dial-and-call to
+  `node.manifest`. `ls` shows oneline-per-cap with category
+  brackets; `get` shows full descriptor with absent optional
+  fields elided. 5 new tests.
 
 ### Track 5 — Plugin / packaging foundations
 
@@ -195,18 +211,25 @@ README.md                                               # task lifecycle docs
 
 ## Suggested next steps (morning review)
 
-1. **Greenlight P1 of capability discovery foundations** —
-   tiny extension to `CapabilityDescriptor` with three optional
-   fields. Single commit. Preserves every invariant.
-2. **Decide on Telegram channel implementation** — confirm token
+1. **Decide on Telegram channel implementation** — confirm token
    handling pattern (env var vs secret manager) and unblock
-   `crates/relix-telegram/` work.
-3. **Operator review of `docs/plugin-foundations.md`** — the
+   `crates/relix-telegram/` work per
+   `docs/channel-node-architecture.md`.
+2. **Operator review of `docs/plugin-foundations.md`** — the
    forbidden-surface section and the 7 mandatory constraints
    need explicit operator sign-off before any plugin work starts.
-4. **Glance at recent commits in the GitHub repository view** —
-   the 18 commits are small, single-purpose, and individually
+3. **Greenlight T4 P4** — "planners live outside the runtime"
+   policy decision. Once that's confirmed in writing, a separate
+   `relix-planner` repo / tool can consume `/v1/capabilities` +
+   `/v1/tasks` without touching the runtime.
+4. **Annotate remaining capabilities with P1 advisory fields** —
+   memory.*, ai.chat, coordinator's task.*, and the FS capabilities
+   should each get a description / categories pass. Each is a
+   1-commit unit of work and individually reviewable.
+5. **Glance at recent commits in the GitHub repository view** —
+   the 22 commits are small, single-purpose, and individually
    reviewable; no mega-commit needs un-bundling.
 
 End of nightly session. No regressions. All pushes through
-`origin/main`.
+`origin/main`. Session-internal artefacts under `docs/internal/`
+(this file + blockers archive).
