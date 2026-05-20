@@ -209,10 +209,21 @@ The realistic first slice is to **document better what's already
 plugin-like** and clean up the rough edges, NOT introduce a
 loader:
 
-1. **Manifest evolution (small):** add `description`, `categories`,
-   `environment_requirements` to `CapabilityDescriptor` with
-   serde defaults (P1 from
-   [`docs/capability-discovery.md`](capability-discovery.md)).
+1. **Manifest evolution (small):** ✅ shipped. `description`,
+   `categories`, `environment_requirements` are present on
+   `CapabilityDescriptor` (P1 from
+   [`docs/capability-discovery.md`](capability-discovery.md)),
+   surfaced via `/v1/capabilities` (P2) and `relix-cli
+   capability ls/get` (P3). `relix-cli capability validate`
+   ships a 7-rule linter operators can run pre-deploy / in CI:
+    - non-empty `method_name`
+    - `method_name` follows `<namespace>.<action>` convention
+    - non-empty `policy_attachment_point`
+    - no duplicate `method_name` across descriptors
+    - sensitivity_tags follow `<namespace>:<tag>` form
+    - environment_requirements follow `<key>:<value>` form
+    - `requires_groups` non-empty (every capability
+      policy-gated to at least one group)
 2. **Capability package convention (doc-only):** specify the
    on-disk layout an Option-B "plugin as separate peer" should
    take: `plugins/<name>/` with `controller.toml`,
