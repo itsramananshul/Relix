@@ -52,6 +52,13 @@ pub struct TaskListEntry {
     pub task_id: String,
     pub status: String,
     pub title: String,
+    /// Unix seconds when the task row was last updated in the
+    /// Coordinator ledger. Surfaced so the dashboard can render
+    /// "running for X" / "stale for X" age labels on the
+    /// per-task row. Optional because old payload shapes (and
+    /// truncated rows) may not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
 }
 
 /// Detailed task body returned by `GET /v1/tasks/:id`.
@@ -187,6 +194,10 @@ pub async fn list(
             task_id: parts[0].to_string(),
             status: parts[1].to_string(),
             title: parts[2].to_string(),
+            // The older list_paginated payload omits updated_at;
+            // the dashboard renders "—" when None, so this is
+            // honest rather than fabricated.
+            updated_at: None,
         });
     }
     Ok(Json(out))
@@ -1304,10 +1315,12 @@ fn parse_cursor_body(body: &str) -> (Vec<TaskListEntry>, Option<String>) {
         if parts.len() < 3 {
             continue;
         }
+        let updated_at = parts.get(3).and_then(|v| v.trim().parse::<i64>().ok());
         items.push(TaskListEntry {
             task_id: parts[0].to_string(),
             status: parts[1].to_string(),
             title: parts[2].to_string(),
+            updated_at,
         });
     }
     (items, next)
@@ -1589,7 +1602,21 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].task_id, "abc");
         assert_eq!(items[1].status, "pending");
+        assert_eq!(items[0].updated_at, Some(100));
+        assert_eq!(items[1].updated_at, Some(99));
         assert_eq!(next.as_deref(), Some("99:def"));
+    }
+
+    #[test]
+    fn parse_cursor_body_tolerates_missing_updated_at_field() {
+        // Older coord builds (or truncated lines) may omit the
+        // fourth column. We must still parse the row, just with
+        // updated_at=None — the dashboard renders "—" instead
+        // of inventing an age.
+        let body = "abc\trunning\tt0\nnext_cursor=\n";
+        let (items, _next) = parse_cursor_body(body);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].updated_at, None);
     }
 
     #[test]

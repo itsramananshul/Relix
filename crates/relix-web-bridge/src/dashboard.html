@@ -2999,6 +2999,29 @@ async function fetchNextPage() {
   }
 }
 
+/* Age column for the task list. For not-yet-terminal
+   statuses (running, retrying, pending, awaiting_input), we
+   render "for Xs" so operators can spot stuck tasks at a
+   glance. The cell gains a `stuck` accent when the
+   running/retrying age crosses 120s — same threshold as the
+   recovery scan would eventually use. For terminal statuses,
+   we show "Xs ago" so the list still reads as a timeline.
+   Missing updated_at → "—" (no fabricated age). */
+const RUNNING_STATUSES_FOR_AGE = ['running', 'retrying', 'pending', 'awaiting_input'];
+const STUCK_AGE_SECS = 120;
+function renderTaskRowAge(t, now) {
+  if (typeof t.updated_at !== 'number') return '—';
+  const age = Math.max(0, now - t.updated_at);
+  const isLive = RUNNING_STATUSES_FOR_AGE.indexOf(t.status) >= 0;
+  if (isLive) {
+    const stuck = (t.status === 'running' || t.status === 'retrying') && age >= STUCK_AGE_SECS;
+    const cls = stuck ? ' style="color: var(--warn); font-weight: 600;"' : '';
+    const stuckTag = stuck ? ' · stuck?' : '';
+    return '<span' + cls + '>for ' + escapeHtml(fmtDuration(age)) + stuckTag + '</span>';
+  }
+  return escapeHtml(fmtDuration(age)) + ' ago';
+}
+
 function renderTaskList(items) {
   const $list = document.getElementById('task-list');
   const $search = document.getElementById('filter-search');
@@ -3032,13 +3055,16 @@ function renderTaskList(items) {
       + '</div>';
     return;
   }
+  const now = Math.floor(Date.now() / 1000);
   const rows = filtered.map(t => {
     const sel = t.task_id === selectedTaskId ? ' class="selected"' : '';
+    const ageCell = renderTaskRowAge(t, now);
     return '<tr data-id="' + escapeHtml(t.task_id) + '"' + sel + '>'
       + '<td><span class="badge ' + escapeHtml(t.status) + '">'
         + escapeHtml(t.status) + '</span></td>'
       + '<td>' + escapeHtml(t.title) + '</td>'
       + '<td class="id">' + escapeHtml(t.task_id.slice(0, 8)) + '</td>'
+      + '<td class="meta">' + ageCell + '</td>'
       + '</tr>';
   }).join('');
   const more = (nextCursor && !q)
@@ -3046,7 +3072,7 @@ function renderTaskList(items) {
     + '<button id="load-more">Load more</button></div>'
     : '';
   $list.innerHTML =
-    '<table class="data"><thead><tr><th>status</th><th>title</th><th>id</th></tr></thead>'
+    '<table class="data"><thead><tr><th>status</th><th>title</th><th>id</th><th>age</th></tr></thead>'
     + '<tbody>' + rows + '</tbody></table>' + more;
   $list.querySelectorAll('tbody tr').forEach(tr => {
     tr.addEventListener('click', () => loadDetail(tr.dataset.id));

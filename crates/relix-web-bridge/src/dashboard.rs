@@ -261,6 +261,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_task_row_age_column_present() {
+        // M50 (Track B): task list ships an age column derived
+        // from updated_at. Running/retrying rows older than
+        // STUCK_AGE_SECS get a "stuck?" tag so operators can
+        // spot stalled work at a glance. Missing updated_at
+        // → "—" (no fabricated age).
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderTaskRowAge"),
+            "renderTaskRowAge helper missing"
+        );
+        assert!(
+            body.contains("STUCK_AGE_SECS"),
+            "stuck-age threshold constant missing"
+        );
+        assert!(body.contains("stuck?"), "stuck-task accent label missing");
+        // The header gains an 'age' column.
+        assert!(
+            body.contains("<th>age</th>"),
+            "task list age column header missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_timing_summary_present() {
         // M49 (Track A): exec graph header now ships a
         // wall-clock summary (total · terminal · retry tax)
