@@ -175,6 +175,12 @@ pub enum Cmd {
         /// stream, which is grep-friendly for scripts.
         #[arg(long, default_value_t = false)]
         pretty: bool,
+        /// In pretty mode, show only the last N events in the
+        /// chronology block. 0 = show all (default). Useful for tasks
+        /// with thousands of events where the header + summary +
+        /// attempts block matter more than the full timeline.
+        #[arg(long, default_value_t = 0usize)]
+        tail: usize,
     },
     /// List recent Tasks (most-recently-updated first). Server-side
     /// pagination and status filtering since Priority A.
@@ -315,6 +321,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             client_key,
             task_id,
             pretty,
+            tail,
         } => {
             let body = call(
                 &peer,
@@ -343,9 +350,14 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(b) => Some(String::from_utf8_lossy(&b).into_owned()),
                     Err(_) => None,
                 };
+                let raw = if tail > 0 {
+                    truncate_events_to_tail(s, tail)
+                } else {
+                    s.to_string()
+                };
                 print!(
                     "{}",
-                    render_pretty_task_with_attempts(s, attempts_body.as_deref())
+                    render_pretty_task_with_attempts(&raw, attempts_body.as_deref())
                 );
             } else {
                 // Default: raw key=value, grep-friendly.
@@ -519,6 +531,69 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Trim the `events=[...]` array in a `task.get` body to keep
+/// only the last `tail` events. Operator-friendly view for tasks
+/// with thousands of chronicle entries where the header, summary,
+/// and attempt block matter more than every individual step. The
+/// non-events lines are preserved verbatim; if we can't find the
+/// `events=` line, return the input unchanged.
+fn truncate_events_to_tail(raw: &str, tail: usize) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        if let Some(events_array) = line.strip_prefix("events=") {
+            let parsed = parse_events_array(events_array);
+            if parsed.len() <= tail {
+                // Already short enough; pass through.
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let start = parsed.len() - tail;
+            // Re-emit the same JSON-array shape the Coordinator uses
+            // so the downstream pretty renderer continues to work.
+            let mut new_array = String::from("events=[");
+            for (i, (ev_type, ts, payload)) in parsed[start..].iter().enumerate() {
+                if i > 0 {
+                    new_array.push(',');
+                }
+                new_array.push_str(&format!(
+                    r#"{{"id":{},"ts":{},"type":"{}","payload":"{}"}}"#,
+                    start as i64 + i as i64 + 1,
+                    ts,
+                    json_escape_payload(ev_type),
+                    json_escape_payload(payload),
+                ));
+            }
+            new_array.push(']');
+            out.push_str(&new_array);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Minimal JSON-string escape — same shape as the Coordinator's
+/// `json_escape`. Inlined here so the CLI stays independent of
+/// runtime internals.
+fn json_escape_payload(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Extract the `id` field from one line of `task.events` output
@@ -1220,6 +1295,51 @@ mod tests {
         let raw = "task_id=x\nstatus=pending\nevents=[]\n";
         let pretty = render_pretty_task_with_attempts(raw, Some(""));
         assert!(!pretty.contains("attempts:"));
+    }
+
+    #[test]
+    fn truncate_events_to_tail_keeps_last_n() {
+        let raw = "task_id=x\nstatus=running\nevents=[{\"id\":1,\"ts\":100,\"type\":\"a\",\"payload\":\"p1\"},{\"id\":2,\"ts\":200,\"type\":\"b\",\"payload\":\"p2\"},{\"id\":3,\"ts\":300,\"type\":\"c\",\"payload\":\"p3\"}]\n";
+        let trimmed = truncate_events_to_tail(raw, 2);
+        // Header preserved.
+        assert!(trimmed.contains("task_id=x"));
+        assert!(trimmed.contains("status=running"));
+        // Only the last 2 events appear.
+        assert!(!trimmed.contains("\"type\":\"a\""));
+        assert!(trimmed.contains("\"type\":\"b\""));
+        assert!(trimmed.contains("\"type\":\"c\""));
+    }
+
+    #[test]
+    fn truncate_events_to_tail_short_chronology_unchanged() {
+        let raw = "task_id=x\nstatus=running\nevents=[{\"id\":1,\"ts\":100,\"type\":\"a\",\"payload\":\"p\"}]\n";
+        let trimmed = truncate_events_to_tail(raw, 5);
+        // tail > event_count: no change to the array.
+        assert!(trimmed.contains("\"type\":\"a\""));
+    }
+
+    #[test]
+    fn truncate_events_to_tail_missing_events_line_passthrough() {
+        let raw = "task_id=x\nstatus=pending\n";
+        let trimmed = truncate_events_to_tail(raw, 5);
+        // No events= line: input preserved (trailing newline added
+        // per line by our writer).
+        assert!(trimmed.contains("task_id=x"));
+        assert!(trimmed.contains("status=pending"));
+    }
+
+    #[test]
+    fn truncate_events_to_tail_then_pretty_render_works() {
+        // Belt-and-suspenders: feed the truncated output to the
+        // pretty renderer and confirm chronology block is built
+        // from the trimmed events.
+        let raw = "task_id=x\nstatus=running\nevents=[{\"id\":1,\"ts\":100,\"type\":\"a\",\"payload\":\"p1\"},{\"id\":2,\"ts\":200,\"type\":\"b\",\"payload\":\"p2\"},{\"id\":3,\"ts\":300,\"type\":\"c\",\"payload\":\"p3\"}]\n";
+        let trimmed = truncate_events_to_tail(raw, 2);
+        let pretty = render_pretty_task(&trimmed);
+        assert!(pretty.contains("chronology:"));
+        assert!(!pretty.contains(" a "));
+        assert!(pretty.contains("b"));
+        assert!(pretty.contains("c"));
     }
 
     #[test]
