@@ -225,6 +225,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_retry_chain_renderer_present() {
+        // M26 (Phase-1C causality): task detail renders a
+        // retry-chain visualization derived from real
+        // task_attempts rows.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderRetryChain"),
+            "page should ship renderRetryChain()"
+        );
+        assert!(
+            body.contains("chain-pill"),
+            "page should ship the chain-pill CSS class"
+        );
+        assert!(
+            body.contains("chain-gap"),
+            "page should ship the inter-attempt gap marker"
+        );
+    }
+
+    #[tokio::test]
     async fn page_timeline_renderer_present() {
         // M20: task detail panel renders chronicle events as a
         // visual timeline (default) with a toggle to raw view.

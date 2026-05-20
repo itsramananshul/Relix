@@ -816,6 +816,90 @@
       color: var(--text-strong);
     }
 
+    /* ── Retry chain (causality view) ──────────────────────────── */
+    .retry-chain {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .retry-chain h3 {
+      margin: 0 0 8px;
+      font-size: var(--text-sm);
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .chain-strip {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      flex-wrap: wrap;
+      padding: 4px 0;
+    }
+    .chain-pill {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 6px 12px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      border-radius: 4px;
+      cursor: pointer;
+      min-width: 120px;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .chain-pill:hover {
+      border-color: var(--accent);
+      background: var(--bg-hover);
+    }
+    .chain-pill.completed { border-left: 3px solid var(--ok); }
+    .chain-pill.failed,
+    .chain-pill.interrupted { border-left: 3px solid var(--danger); }
+    .chain-pill.cancelled { border-left: 3px solid var(--text-dim); }
+    .chain-pill.running { border-left: 3px solid var(--info); }
+    .chain-pill.retrying { border-left: 3px solid var(--warn); }
+    .chain-pill .num {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+    .chain-pill .pill-status {
+      font-weight: 600;
+      font-size: var(--text-sm);
+      color: var(--text);
+    }
+    .chain-pill .pill-meta {
+      font-size: 10px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+    .chain-pill .pill-failure {
+      font-size: 10px;
+      color: var(--danger);
+      font-family: var(--font-mono);
+    }
+    .chain-gap {
+      align-self: center;
+      padding: 0 8px;
+      color: var(--text-dim);
+      font-size: 10px;
+      font-family: var(--font-mono);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      min-width: 60px;
+    }
+    .chain-gap .arrow { font-size: 14px; color: var(--text-muted); }
+    .chain-gap .label { white-space: nowrap; }
+    .chain-summary {
+      margin-top: 8px;
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+    }
+    .chain-summary .total { color: var(--text); font-weight: 600; }
+
     /* ── Execution timeline ────────────────────────────────────── */
     .timeline {
       padding: 4px 14px 14px;
@@ -2218,8 +2302,10 @@ function renderDetail(l) {
       </div>`
     : '<div class="meta" style="padding: 12px 14px;">(no chronicle events)</div>';
 
+  const chainBlock = renderRetryChain(l.attempts || []);
   document.getElementById('task-detail').innerHTML =
     `<div class="summary">${summaryRow}</div>`
+    + chainBlock
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     + eventsBlock
     + `<div class="meta" style="padding: 8px 14px;">task_id: <span class="id">${escapeHtml(l.task.task_id)}</span></div>`;
@@ -2235,6 +2321,83 @@ function renderDetail(l) {
       document.getElementById('detail-view-raw').hidden = (v !== 'raw');
     });
   });
+}
+
+/* Retry chain visualization. Renders attempts as horizontal
+   pills with arrows + the inter-attempt wait between them.
+   Derived entirely from real task_attempts rows — no
+   invented causality. Each pill shows:
+     attempt # · status · duration · failure_class (if any)
+   The gap between pills shows wait time so operators can
+   spot "long backoff" vs "instant retry" patterns. */
+function renderRetryChain(attempts) {
+  if (!attempts || attempts.length === 0) return '';
+
+  // Single attempt: render a compact summary, no chain.
+  if (attempts.length === 1) {
+    const a = attempts[0];
+    const dur = (a.finished_at != null)
+      ? fmtDuration(a.finished_at - a.started_at)
+      : '(open)';
+    return '<div class="retry-chain">'
+      + '<h3>execution</h3>'
+      + '<div class="chain-strip">'
+      +   renderChainPill(a, dur)
+      + '</div>'
+      + '</div>';
+  }
+
+  // Multi-attempt: full chain with gap markers.
+  const sorted = attempts.slice().sort((a, b) => a.attempt_num - b.attempt_num);
+  let totalDur = 0;
+  const parts = [];
+  sorted.forEach((a, i) => {
+    const dur = (a.finished_at != null) ? (a.finished_at - a.started_at) : null;
+    if (dur != null) totalDur += dur;
+    parts.push(renderChainPill(a, dur != null ? fmtDuration(dur) : '(open)'));
+    if (i < sorted.length - 1) {
+      const next = sorted[i + 1];
+      const gap = (a.finished_at != null && next.started_at != null)
+        ? (next.started_at - a.finished_at)
+        : null;
+      const gapLabel = gap != null && gap >= 0 ? '+' + fmtDuration(gap) : '?';
+      parts.push(
+        '<div class="chain-gap">'
+        + '<span class="arrow">→</span>'
+        + '<span class="label">' + escapeHtml(gapLabel) + '</span>'
+        + '</div>'
+      );
+      if (gap != null && gap >= 0) totalDur += gap;
+    }
+  });
+  const lastSucceeded = sorted[sorted.length - 1].status === 'completed';
+  const failedCount = sorted.filter(a => a.status === 'failed' || a.status === 'interrupted').length;
+  const outcome = lastSucceeded
+    ? 'recovered after ' + failedCount + ' failed attempt(s)'
+    : (sorted[sorted.length - 1].status === 'running' ? 'in flight' : 'unresolved');
+  return '<div class="retry-chain">'
+    + '<h3>retry chain (' + sorted.length + ' attempts)</h3>'
+    + '<div class="chain-strip">' + parts.join('') + '</div>'
+    + '<div class="chain-summary">'
+    +   '<span class="total">' + fmtDuration(totalDur) + '</span>'
+    +   ' total wall-clock · ' + escapeHtml(outcome)
+    + '</div>'
+    + '</div>';
+}
+
+function renderChainPill(a, durLabel) {
+  const failureLine = a.failure_class
+    ? '<div class="pill-failure">' + escapeHtml(a.failure_class) + '</div>'
+    : '';
+  return '<div class="chain-pill ' + escapeHtml(a.status) + '" title="started ' + a.started_at
+    + (a.finished_at != null ? ', finished ' + a.finished_at : '')
+    + (a.flow_id ? ', flow ' + a.flow_id : '')
+    + '">'
+    + '<span class="num">attempt ' + a.attempt_num + '</span>'
+    + '<span class="pill-status">' + escapeHtml(a.status) + '</span>'
+    + '<span class="pill-meta">' + escapeHtml(durLabel) + '</span>'
+    + failureLine
+    + '</div>';
 }
 
 /* Execution timeline. Renders the chronicle as a vertical
