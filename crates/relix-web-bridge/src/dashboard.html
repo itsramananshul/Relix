@@ -636,6 +636,40 @@
       stroke: var(--danger);
       stroke-width: 2;
     }
+    /* Recent-transition overlay: a single ripple (not
+       infinite) drawn on top of any node whose state
+       changed in the last 30s. Different from .pulse
+       (continuous, expired-only) so operators can tell
+       "still degraded" from "just changed". */
+    .topology-graph .transition-ripple {
+      animation: graph-ripple 2.4s ease-out 1;
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 2;
+      opacity: 0;
+    }
+    .topology-graph .transition-ripple.danger { stroke: var(--danger); }
+    .topology-graph .transition-ripple.warn   { stroke: var(--warn); }
+    .topology-graph .transition-ripple.ok     { stroke: var(--ok); }
+    @keyframes graph-ripple {
+      0%   { r: 18; opacity: 0.9; }
+      80%  { r: 42; opacity: 0;   }
+      100% { r: 42; opacity: 0;   }
+    }
+    /* Subtle solid ring that stays for 30s after a
+       transition. Communicates "this node just had a
+       state change" without the continuous distraction
+       of an infinite animation. */
+    .topology-graph .recent-ring {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 1;
+      stroke-dasharray: 3 3;
+      opacity: 0.6;
+    }
+    .topology-graph .recent-ring.danger { stroke: var(--danger); }
+    .topology-graph .recent-ring.warn   { stroke: var(--warn); }
+    .topology-graph .recent-ring.ok     { stroke: var(--ok); }
     .topology-graph .empty-state {
       fill: var(--text-muted);
       font-size: 13px;
@@ -3141,6 +3175,12 @@ async function runRetention() {
 let topologyPeers = [];
 let topologyAutoTimer = null;
 let topologySelected = null;
+// Map<node_id, { ts, kind, to_freshness }> — populated from
+// /v1/topology/events; drives the graph's recent-transition
+// overlay (ripple + dashed ring). Entries age out after
+// RECENT_TRANSITION_SECS.
+const recentTransitions = new Map();
+const RECENT_TRANSITION_SECS = 30;
 
 function initTopology() {
   document.getElementById('topology-refresh').addEventListener('click', loadTopology);
@@ -3196,6 +3236,27 @@ async function loadTopology() {
 function renderLifecycleEvents(events) {
   const $host = document.getElementById('lifecycle-host');
   const $status = document.getElementById('lifecycle-status');
+  // Update the recentTransitions map — the most recent
+  // event per node within the recent window populates the
+  // graph overlay. Iterate events in their server order
+  // (newest first) so we take the freshest per node.
+  const cutoff = Math.floor(Date.now() / 1000) - RECENT_TRANSITION_SECS;
+  for (const ev of events) {
+    if (ev.ts < cutoff) continue;
+    if (!ev.node_id) continue;
+    if (!recentTransitions.has(ev.node_id)) {
+      recentTransitions.set(ev.node_id, {
+        ts: ev.ts,
+        kind: ev.kind,
+        to_freshness: ev.to_freshness,
+      });
+    }
+  }
+  // Age out anything older than the window.
+  for (const [id, r] of recentTransitions.entries()) {
+    if (r.ts < cutoff) recentTransitions.delete(id);
+  }
+
   if (!events.length) {
     $host.innerHTML = '<div class="empty">no transitions in the ring yet (resets on bridge restart)</div>';
     $status.textContent = '';
@@ -3333,6 +3394,29 @@ function renderTopologyGraph(peers) {
       pulse.setAttribute('cx', p.__x); pulse.setAttribute('cy', p.__y);
       pulse.setAttribute('r', 22);
       g.appendChild(pulse);
+    }
+    // Recent-transition overlay: ripple (one-shot) +
+    // dashed ring (persistent for ~30s) so operators can
+    // see "this node just changed state."
+    const recent = recentTransitions.get(p.node_id);
+    if (recent) {
+      const cls = recent.kind === 'dropped' ? 'danger'
+        : recent.to_freshness === 'fresh' ? 'ok'
+        : recent.to_freshness === 'stale' ? 'warn'
+        : recent.to_freshness === 'expired' ? 'danger'
+        : '';
+      const ripple = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      ripple.setAttribute('class', 'transition-ripple ' + cls);
+      ripple.setAttribute('cx', p.__x);
+      ripple.setAttribute('cy', p.__y);
+      ripple.setAttribute('r', 18);
+      g.appendChild(ripple);
+      const ring = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      ring.setAttribute('class', 'recent-ring ' + cls);
+      ring.setAttribute('cx', p.__x);
+      ring.setAttribute('cy', p.__y);
+      ring.setAttribute('r', 26);
+      g.appendChild(ring);
     }
 
     const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
