@@ -48,6 +48,28 @@ pub enum Cmd {
         #[arg(long)]
         method: String,
     },
+    /// Validate a peer's manifest against the plugin-foundations
+    /// rules. Reports each issue on stderr; exits non-zero when
+    /// any rule fires. Use in CI / pre-deployment checks.
+    ///
+    /// Rules checked:
+    ///  - non-empty `method_name`
+    ///  - non-empty `policy_attachment_point`
+    ///  - no duplicate `method_name` across descriptors
+    ///  - sensitivity_tags follow `<namespace>:<tag>` form when
+    ///    present (e.g. `fs:read`, `external:network`)
+    ///  - environment_requirements follow `<key>:<value>` form
+    ///    when present
+    ///  - `requires_groups` non-empty (every capability must be
+    ///    policy-gated to at least one group)
+    Validate {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -88,6 +110,34 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 println!("  (no capabilities match {filter_note})");
             }
         }
+        Cmd::Validate {
+            peer,
+            identity,
+            client_key,
+        } => {
+            let manifest = fetch_manifest(&peer, &identity, &client_key).await?;
+            let issues = validate_manifest(&manifest);
+            if issues.is_empty() {
+                println!(
+                    "{} {} — {} capabilities — OK",
+                    manifest.node_type,
+                    manifest.node_id,
+                    manifest.capabilities.len()
+                );
+            } else {
+                eprintln!(
+                    "{} {} — {} capabilities — {} issue(s):",
+                    manifest.node_type,
+                    manifest.node_id,
+                    manifest.capabilities.len(),
+                    issues.len()
+                );
+                for issue in &issues {
+                    eprintln!("  - {issue}");
+                }
+                std::process::exit(2);
+            }
+        }
         Cmd::Get {
             peer,
             identity,
@@ -115,6 +165,61 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Validate a peer's manifest against the plugin-foundations
+/// rules in `docs/plugin-foundations.md` (M-series constraints).
+/// Returns one human-readable issue per rule fired; empty Vec
+/// when the manifest is clean.
+///
+/// Rules are advisory at the wire level today — the Coordinator
+/// does not reject malformed descriptors at registration. This
+/// linter is the operator-visible enforcement seam: pre-deploy,
+/// CI, or ad-hoc inspection.
+fn validate_manifest(manifest: &NodeManifest) -> Vec<String> {
+    let mut issues = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for cap in &manifest.capabilities {
+        if cap.method_name.trim().is_empty() {
+            issues.push("descriptor with empty method_name".into());
+            continue;
+        }
+        if !seen.insert(cap.method_name.as_str()) {
+            issues.push(format!(
+                "duplicate method_name `{}` — multiple descriptors register the same wire name",
+                cap.method_name
+            ));
+        }
+        if cap.policy_attachment_point.trim().is_empty() {
+            issues.push(format!(
+                "`{}`: policy_attachment_point is empty — policy authors can't reference this method",
+                cap.method_name
+            ));
+        }
+        if cap.requires_groups.is_empty() {
+            issues.push(format!(
+                "`{}`: requires_groups is empty — capability is ungated, every identity can call it",
+                cap.method_name
+            ));
+        }
+        for tag in &cap.sensitivity_tags {
+            if !tag.contains(':') {
+                issues.push(format!(
+                    "`{}`: sensitivity tag `{tag}` is missing the `<namespace>:<value>` form",
+                    cap.method_name
+                ));
+            }
+        }
+        for req in &cap.environment_requirements {
+            if !req.contains(':') {
+                issues.push(format!(
+                    "`{}`: environment requirement `{req}` is missing the `<key>:<value>` form",
+                    cap.method_name
+                ));
+            }
+        }
+    }
+    issues
 }
 
 fn render_oneline(cap: &CapabilityDescriptor) -> String {
@@ -326,6 +431,101 @@ mod tests {
         assert!(!s.contains("description:"));
         assert!(!s.contains("categories:"));
         assert!(!s.contains("environment:"));
+    }
+
+    fn cap_ok(method: &str) -> CapabilityDescriptor {
+        let mut d = CapabilityDescriptor::unary(method);
+        d.requires_groups = vec!["chat-users".into()];
+        d.sensitivity_tags = vec!["reads:internal".into()];
+        d.environment_requirements = vec!["fs:jail".into()];
+        d
+    }
+
+    #[test]
+    fn validate_clean_manifest_returns_no_issues() {
+        let mut manifest = mk_manifest("memory");
+        manifest.capabilities.push(cap_ok("memory.search"));
+        manifest.capabilities.push(cap_ok("memory.write_turn"));
+        assert!(validate_manifest(&manifest).is_empty());
+    }
+
+    #[test]
+    fn validate_flags_duplicate_method_names() {
+        let mut manifest = mk_manifest("memory");
+        manifest.capabilities.push(cap_ok("memory.search"));
+        manifest.capabilities.push(cap_ok("memory.search"));
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues.iter().any(|s| s.contains("duplicate method_name")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_empty_method_name() {
+        let mut manifest = mk_manifest("memory");
+        manifest.capabilities.push(CapabilityDescriptor::unary(""));
+        let issues = validate_manifest(&manifest);
+        assert!(issues.iter().any(|s| s.contains("empty method_name")));
+    }
+
+    #[test]
+    fn validate_flags_missing_requires_groups() {
+        let mut manifest = mk_manifest("memory");
+        let mut c = CapabilityDescriptor::unary("memory.search");
+        c.policy_attachment_point = "memory.search".into();
+        // intentionally NO requires_groups
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("requires_groups is empty")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_malformed_sensitivity_tags() {
+        let mut manifest = mk_manifest("memory");
+        let mut c = cap_ok("memory.search");
+        c.sensitivity_tags = vec!["reads_internal".into()]; // missing colon
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("sensitivity tag") && s.contains("missing")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_malformed_environment_requirements() {
+        let mut manifest = mk_manifest("memory");
+        let mut c = cap_ok("memory.search");
+        c.environment_requirements = vec!["fs_jail".into()];
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues.iter().any(|s| s.contains("environment requirement")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_empty_policy_attachment_point_caught() {
+        let mut manifest = mk_manifest("memory");
+        let mut c = cap_ok("memory.search");
+        c.policy_attachment_point = String::new();
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("policy_attachment_point is empty")),
+            "issues = {issues:?}"
+        );
     }
 
     #[test]
