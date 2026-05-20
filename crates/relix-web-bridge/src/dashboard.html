@@ -401,6 +401,14 @@
     .event.failed      { border-left-color: var(--danger); }
     .event .type    { font-weight: 600; color: var(--text); }
     .event .payload { color: var(--text-muted); margin-left: 8px; }
+    .peer-link {
+      color: var(--accent);
+      cursor: pointer;
+      text-decoration: underline;
+      text-decoration-style: dotted;
+      text-underline-offset: 2px;
+    }
+    .peer-link:hover { text-decoration-style: solid; }
     .event.live     { animation: flash-in 1.2s ease-out; }
     @keyframes flash-in {
       from { background: rgba(34,197,94,0.10); }
@@ -3041,11 +3049,17 @@ function renderExecutionPath(invocations, routing) {
       // M34 path: peer was recorded at execution time —
       // authoritative, not a snapshot.
       targetHtml =
-        '<span class="alias">' + escapeHtml(recordedPeer) + '</span>'
+        '<span class="alias peer-link" data-peer-alias="' + escapeHtml(recordedPeer)
+          + '" title="open peer detail">' + escapeHtml(recordedPeer) + '</span>'
         + '<span class="badge ok">recorded</span>';
     } else if (route) {
+      const aliasText = route.alias || '(unaliased)';
+      const aliasHtml = route.alias
+        ? '<span class="alias peer-link" data-peer-alias="' + escapeHtml(route.alias)
+          + '" title="open peer detail">' + escapeHtml(aliasText) + '</span>'
+        : '<span class="alias">' + escapeHtml(aliasText) + '</span>';
       targetHtml =
-        '<span class="alias">' + escapeHtml(route.alias || '(unaliased)') + '</span>'
+        aliasHtml
         + '<span class="id">' + escapeHtml(route.node_id.slice(0, 12)) + '…</span>'
         + '<span class="badge ' + escapeHtml(route.freshness) + '">' + escapeHtml(route.freshness) + '</span>'
         + (route.multiple_candidates
@@ -3304,6 +3318,22 @@ document.addEventListener('click', (ev) => {
     if (lastDetailLineage) renderDetail(lastDetailLineage);
     return;
   }
+  const peerLink = ev.target.closest('[data-peer-alias]');
+  if (peerLink) {
+    const alias = peerLink.dataset.peerAlias;
+    // Find the peer with this alias in the topology snapshot.
+    // If topology hasn't been loaded yet (operator opened a
+    // task without visiting topology), navigate to topology
+    // — the page will load and surface the peer when ready.
+    const peer = topologyPeers.find(p => p.alias === alias);
+    if (peer) {
+      openPeerDrawer(peer.node_id);
+    } else {
+      toast('peer "' + alias + '" not in topology snapshot — opening topology page', 'warn');
+      window.location.hash = '#/topology';
+    }
+    return;
+  }
 });
 
 function renderChainPill(a, durLabel) {
@@ -3349,7 +3379,7 @@ function renderTimeline(events) {
       ? `<span class="attempt-num">· attempt ${e.attempt_id}</span>`
       : '';
     const payloadHtml = e.payload
-      ? `<div class="timeline-payload">${escapeHtml(e.payload)}</div>`
+      ? `<div class="timeline-payload">${renderTimelinePayload(e.event_type, e.payload)}</div>`
       : '';
     const jsonHtml = e.payload_json
       ? `<details class="timeline-json-wrap"><summary class="meta" style="cursor:pointer; margin-top: 2px;">payload_json</summary><pre class="timeline-json">${escapeHtml(JSON.stringify(e.payload_json, null, 2))}</pre></details>`
@@ -3368,6 +3398,30 @@ function renderTimeline(events) {
     </div>`;
   }).join('');
   return `<div class="timeline">${rows}</div>`;
+}
+
+/* Per-event payload renderer. For capability.invoked
+   events we render the peer= segment as a clickable
+   link into the topology peer drawer. Other event
+   types fall through to plain escaped text.
+
+   The peer-link uses data-peer-alias so the global
+   click delegator routes the click without per-element
+   wiring. */
+function renderTimelinePayload(eventType, payload) {
+  if (eventType !== 'capability.invoked') {
+    return escapeHtml(payload);
+  }
+  const parsed = parseCapabilityInvokedPayload(payload);
+  if (!parsed.peer) return escapeHtml(payload);
+  // Re-assemble the payload with the peer segment marked.
+  // Preserve order: method=, target=, peer=, anything else.
+  const parts = [];
+  if (parsed.method) parts.push('method=' + escapeHtml(parsed.method));
+  if (parsed.target) parts.push('target=' + escapeHtml(parsed.target));
+  parts.push('peer=<span class="peer-link" data-peer-alias="' + escapeHtml(parsed.peer)
+    + '" title="open peer detail">' + escapeHtml(parsed.peer) + '</span>');
+  return parts.join(' ');
 }
 
 function timelineMarkerClass(e) {

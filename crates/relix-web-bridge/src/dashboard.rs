@@ -225,6 +225,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_peer_link_navigation_present() {
+        // M37: timeline + execution path panel render peer
+        // aliases as clickable links into the topology peer
+        // drawer. data-peer-alias is the routing attribute.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderTimelinePayload"),
+            "page should ship renderTimelinePayload()"
+        );
+        assert!(
+            body.contains("data-peer-alias"),
+            "page should attach data-peer-alias for click-to-drawer"
+        );
+        assert!(
+            body.contains("class=\"peer-link\"") || body.contains("peer-link"),
+            "page should ship the peer-link CSS class"
+        );
+    }
+
+    #[tokio::test]
     async fn page_attempt_filter_present() {
         // M36: chain pills carry data-attempt-filter so clicking
         // one filters the timeline to that attempt's events.
