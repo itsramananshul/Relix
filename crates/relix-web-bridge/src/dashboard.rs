@@ -265,6 +265,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_topology_lifecycle_events_consumed() {
+        // M23 + M24: topology page fetches the server-side
+        // lifecycle event log and renders it as a Recent
+        // transitions card.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("/v1/topology/events"),
+            "topology page should fetch /v1/topology/events"
+        );
+        assert!(
+            body.contains(r#"id="lifecycle-host""#),
+            "topology page should ship a lifecycle events host"
+        );
+    }
+
+    #[tokio::test]
     async fn page_topology_graph_landmarks_present() {
         // M9: the topology page renders an SVG graph + a
         // peer detail drawer. Assert both elements ship.

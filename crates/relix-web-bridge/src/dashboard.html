@@ -1161,6 +1161,17 @@
           <div class="loading">loading…</div>
         </div>
       </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>Recent transitions</h3>
+          <span class="meta" id="lifecycle-status"></span>
+        </div>
+        <div class="card-body dense" id="lifecycle-host">
+          <div class="empty">loading…</div>
+        </div>
+      </div>
+
       <p class="meta">
         <code>last_refr</code> is "seconds since the most recent successful
         <code>node.manifest</code> refresh." A stale value means the peer's
@@ -2436,17 +2447,16 @@ async function loadTopology() {
   const $host = document.getElementById('topology-table-host');
   $status.textContent = 'querying…';
   try {
-    const r = await fetch('/v1/topology');
-    if (!r.ok) {
-      const body = await r.text();
-      throw new Error('HTTP ' + r.status + ': ' + body);
-    }
-    const j = await r.json();
-    const peers = j.peers || [];
+    const [topoRes, evtRes] = await Promise.all([
+      fetch('/v1/topology').then(r => r.ok ? r.json() : Promise.reject('HTTP ' + r.status)),
+      fetch('/v1/topology/events?limit=100').then(r => r.ok ? r.json() : { events: [] }).catch(() => ({ events: [] })),
+    ]);
+    const peers = topoRes.peers || [];
     topologyPeers = peers;
     renderTopologyGraph(peers);
     renderTopologyTable(peers);
-    $status.textContent = 'generated_at=' + (j.generated_at || '?')
+    renderLifecycleEvents(evtRes.events || []);
+    $status.textContent = 'generated_at=' + (topoRes.generated_at || '?')
       + '  peers=' + peers.length
       + (peers.some(p => p.freshness === 'expired')
           ? '  ⚠ ' + peers.filter(p => p.freshness === 'expired').length + ' expired'
@@ -2456,6 +2466,44 @@ async function loadTopology() {
     document.getElementById('topology-table-host').innerHTML =
       '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
   }
+}
+
+function renderLifecycleEvents(events) {
+  const $host = document.getElementById('lifecycle-host');
+  const $status = document.getElementById('lifecycle-status');
+  if (!events.length) {
+    $host.innerHTML = '<div class="empty">no transitions in the ring yet (resets on bridge restart)</div>';
+    $status.textContent = '';
+    return;
+  }
+  const rows = events.map(ev => {
+    const dt = new Date((ev.ts || 0) * 1000);
+    const time = dt.toLocaleTimeString();
+    const kindCls = ev.kind === 'joined' ? 'ok'
+      : ev.kind === 'dropped' ? 'danger'
+      : (ev.to_freshness === 'fresh' ? 'ok'
+          : ev.to_freshness === 'stale' ? 'warn'
+          : 'danger');
+    const link = ev.node_id
+      ? ' data-node-id="' + escapeHtml(ev.node_id) + '" style="cursor: pointer;"'
+      : '';
+    return '<div class="activity-item ' + kindCls + '"' + link + '>'
+      + '<span class="activity-icon"></span>'
+      + '<span class="activity-tag">' + escapeHtml(time) + '</span>'
+      + '<span class="activity-body">'
+        + '<strong>' + escapeHtml(ev.kind || '') + '</strong> · '
+        + escapeHtml(ev.detail || '')
+      + '</span>'
+      + '</div>';
+  }).join('');
+  $host.innerHTML = '<div class="activity-list">' + rows + '</div>';
+  $status.textContent = events.length + ' recent';
+  $host.querySelectorAll('.activity-item[data-node-id]').forEach(el => {
+    el.addEventListener('click', () => {
+      const id = el.dataset.nodeId;
+      if (topologyPeers.find(p => p.node_id === id)) openPeerDrawer(id);
+    });
+  });
 }
 
 function renderTopologyTable(peers) {
