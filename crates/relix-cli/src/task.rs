@@ -195,6 +195,26 @@ pub enum Cmd {
         #[arg(long, default_value = "")]
         status: String,
     },
+    /// Follow a task's chronicle live. Polls `task.events`
+    /// incrementally and prints each new event as it lands until
+    /// Ctrl-C. Operator equivalent of `tail -f` for a task.
+    Watch {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
+        #[arg(long)]
+        task_id: String,
+        /// Poll interval in seconds. Default 2.
+        #[arg(long, default_value_t = 2u64)]
+        interval_secs: u64,
+        /// Start from this event_id (exclusive). Default 0
+        /// (everything from the beginning).
+        #[arg(long, default_value_t = 0i64)]
+        since: i64,
+    },
     /// Print the total number of tasks, optionally filtered by status.
     Count {
         #[arg(long)]
@@ -447,6 +467,40 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Cmd::Watch {
+            peer,
+            identity,
+            client_key,
+            task_id,
+            interval_secs,
+            since,
+        } => {
+            // Long-poll loop. Each tick calls task.events with the
+            // current cursor and advances on any new events. NotFound
+            // surfaced by the Coordinator stops the loop (the task
+            // disappeared / never existed).
+            let mut cursor = since;
+            loop {
+                let arg = format!("{task_id}|{cursor}|200");
+                let body =
+                    call(&peer, &identity, &client_key, "task.events", arg.as_bytes()).await?;
+                let s = std::str::from_utf8(&body).unwrap_or("");
+                let mut last: Option<i64> = None;
+                for line in s.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    println!("{line}");
+                    if let Some(id) = extract_event_id_from_line(line) {
+                        last = Some(id);
+                    }
+                }
+                if let Some(new_cursor) = last {
+                    cursor = new_cursor;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs.max(1))).await;
+            }
+        }
         Cmd::Count {
             peer,
             identity,
@@ -465,6 +519,18 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Extract the `id` field from one line of `task.events` output
+/// (which is `{"id":N,"ts":N,"type":"...","payload":"..."}`). Used
+/// by `task watch` to advance its cursor. Returns `None` when the
+/// line doesn't start with the expected prefix or the integer
+/// doesn't parse — defensively skips malformed lines rather than
+/// stalling the watch loop.
+fn extract_event_id_from_line(line: &str) -> Option<i64> {
+    let rest = line.strip_prefix("{\"id\":")?;
+    let comma = rest.find(',')?;
+    rest[..comma].parse().ok()
 }
 
 /// Client-side safety guard for `task retry`. The Coordinator does
@@ -1154,6 +1220,33 @@ mod tests {
         let raw = "task_id=x\nstatus=pending\nevents=[]\n";
         let pretty = render_pretty_task_with_attempts(raw, Some(""));
         assert!(!pretty.contains("attempts:"));
+    }
+
+    #[test]
+    fn extract_event_id_finds_id_from_typical_line() {
+        let line = r#"{"id":42,"ts":1700000000,"type":"task.created","payload":"x"}"#;
+        assert_eq!(extract_event_id_from_line(line), Some(42));
+    }
+
+    #[test]
+    fn extract_event_id_handles_malformed_lines() {
+        assert_eq!(extract_event_id_from_line(""), None);
+        assert_eq!(extract_event_id_from_line("not json"), None);
+        assert_eq!(extract_event_id_from_line(r#"{"id":notanum,"ts":1}"#), None);
+        // Different field first — defensively unsupported.
+        assert_eq!(
+            extract_event_id_from_line(r#"{"ts":1,"id":42,"type":"x","payload":""}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_event_id_handles_large_id() {
+        let line = r#"{"id":9223372036854775000,"ts":1,"type":"x","payload":""}"#;
+        assert_eq!(
+            extract_event_id_from_line(line),
+            Some(9_223_372_036_854_775_000)
+        );
     }
 
     #[test]
