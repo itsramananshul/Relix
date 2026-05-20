@@ -407,6 +407,52 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PutEnabledReq {
+    pub enabled: bool,
+}
+
+/// `PUT /v1/config/providers/:name/enabled` — flip the
+/// operator-marked enabled flag. Hint only — the AI
+/// controller reads its provider config from its own TOML
+/// at startup, so flipping this here does NOT switch the
+/// live runtime. Returns the new ProviderStatus.
+pub async fn set_provider_enabled(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<PutEnabledReq>,
+) -> Result<Json<PutProviderResp>, (StatusCode, Json<ApiError>)> {
+    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
+        return Err(unprocessable(format!(
+            "unknown provider '{name}'. allowed: {}",
+            ALLOWED_PROVIDERS.join(", ")
+        )));
+    }
+    let result = state.secrets.mutate(|s| {
+        let applied = s.set_provider_enabled(&name, req.enabled);
+        (applied, s.provider_status(&name))
+    });
+    match result {
+        Ok((applied, status)) => {
+            if !applied {
+                return Err(unprocessable(format!(
+                    "provider '{name}' has no entry; set an api_key first via PUT /v1/config/providers/{name}"
+                )));
+            }
+            tracing::info!(
+                provider = %name,
+                enabled = req.enabled,
+                "config: providers.{name} enabled flag updated"
+            );
+            Ok(Json(PutProviderResp {
+                status,
+                restart_required: true,
+            }))
+        }
+        Err(e) => Err(internal(format!("persist failed: {e}"))),
+    }
+}
+
 /// `DELETE /v1/config/providers/:name` — remove the provider
 /// entry. Idempotent: deleting an absent entry is a no-op.
 pub async fn delete_provider(

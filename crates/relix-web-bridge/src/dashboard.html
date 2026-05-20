@@ -4263,8 +4263,15 @@ function renderProviders(providers) {
 
 function renderProviderCard(p) {
   const meta = PROVIDER_LABELS[p.name] || { label: p.name, hint: '' };
-  const badge = (p.configured ? '<span class="badge ok">configured</span> ' : '<span class="badge muted">not set</span> ')
-    + (p.is_default ? '<span class="badge info">default</span>' : '');
+  // Composite status badge: configured + default + disabled.
+  // `enabled=false` is meaningful only when configured.
+  let badge = p.configured
+    ? '<span class="badge ok">configured</span> '
+    : '<span class="badge muted">not set</span> ';
+  if (p.is_default) badge += '<span class="badge info">default</span> ';
+  if (p.configured && p.enabled === false) {
+    badge += '<span class="badge warn">disabled</span>';
+  }
   const previewBlock = p.configured
     ? '<div class="provider-meta">key <span class="key-preview">'
       + escapeHtml(p.key_preview || '') + '</span>'
@@ -4311,6 +4318,11 @@ function renderProviderCard(p) {
         : '')
     +   (p.configured && !p.is_default
         ? '<button data-action="make-default" data-name="' + escapeHtml(p.name) + '">Make default</button>'
+        : '')
+    +   (p.configured
+        ? '<button data-action="toggle-enabled" data-name="' + escapeHtml(p.name)
+          + '" data-current-enabled="' + (p.enabled !== false ? 'true' : 'false') + '">'
+          + (p.enabled !== false ? 'Disable' : 'Enable') + '</button>'
         : '')
     +   deleteBtn
     +   '<span class="action-status" data-role="status"></span>'
@@ -4386,6 +4398,29 @@ function wireProviderCard(name) {
         setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
       } finally {
         $test.disabled = false;
+      }
+    });
+  }
+  const $toggle = card.querySelector('[data-action="toggle-enabled"]');
+  if ($toggle) {
+    $toggle.addEventListener('click', async () => {
+      const want = $toggle.dataset.currentEnabled !== 'true';
+      $toggle.disabled = true;
+      setProviderStatus($status, want ? 'enabling…' : 'disabling…');
+      try {
+        const r = await fetch('/v1/config/providers/' + encodeURIComponent(name) + '/enabled', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: want }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+        toast(name + ' ' + (want ? 'enabled' : 'disabled') + ' · restart AI controller to apply', 'ok');
+        replaceProviderCard(body.status);
+      } catch (e) {
+        setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+      } finally {
+        $toggle.disabled = false;
       }
     });
   }

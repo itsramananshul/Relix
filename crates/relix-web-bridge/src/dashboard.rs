@@ -225,6 +225,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_provider_enable_disable_present() {
+        // M42 (Track C): per-provider enable/disable toggle.
+        // PUT /v1/config/providers/:name/enabled + UI button
+        // + disabled badge for disabled providers.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("toggle-enabled"),
+            "page should ship the toggle-enabled action"
+        );
+        assert!(
+            body.contains("/enabled"),
+            "page should call /v1/config/providers/:name/enabled"
+        );
+    }
+
+    #[tokio::test]
     async fn page_streams_inspection_landmarks_present() {
         // M41: clicking the live-streams KPI tile opens a
         // per-stream inspection panel. The tile must be

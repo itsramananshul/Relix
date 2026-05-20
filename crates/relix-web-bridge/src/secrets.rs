@@ -66,6 +66,17 @@ pub struct ProviderEntry {
     /// dashboard can detect "key set after last controller
     /// restart, restart required."
     pub set_at: i64,
+    /// Operator-marked enabled flag. Hint only — the AI
+    /// controller reads its provider config from its own
+    /// TOML at startup, so flipping this does NOT switch
+    /// the live runtime. Defaults to `true` for back-compat
+    /// with entries created before this field landed.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +104,10 @@ pub struct ProviderStatus {
     /// default. Hint only — see [`BridgeSecrets::default_provider`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_default: bool,
+    /// Operator-marked enabled flag. Defaults to `true` for
+    /// unconfigured providers (no entry → no opinion yet).
+    /// Hint only — see `ProviderEntry::enabled`.
+    pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// Last 4 chars of the key, prefixed with an ellipsis.
@@ -200,6 +215,7 @@ impl BridgeSecrets {
                 name: name.to_string(),
                 configured: !e.api_key.is_empty(),
                 is_default,
+                enabled: e.enabled,
                 default_model: e.default_model.clone(),
                 key_preview: redact(&e.api_key),
                 key_set_at: Some(e.set_at),
@@ -208,10 +224,25 @@ impl BridgeSecrets {
                 name: name.to_string(),
                 configured: false,
                 is_default,
+                enabled: true, // default for unconfigured: no opinion
                 default_model: None,
                 key_preview: None,
                 key_set_at: None,
             },
+        }
+    }
+
+    /// Set the operator-marked enabled flag on a provider
+    /// entry. Returns `false` when the provider has no entry
+    /// (operator must set a key first); `true` on success.
+    pub fn set_provider_enabled(&mut self, name: &str, enabled: bool) -> bool {
+        match self.providers.get_mut(name) {
+            Some(e) => {
+                e.enabled = enabled;
+                e.set_at = unix_secs();
+                true
+            }
+            None => false,
         }
     }
 
@@ -254,16 +285,20 @@ impl BridgeSecrets {
     }
 
     /// Insert or replace a provider entry. Stamps `set_at`
-    /// with the current time. Caller is responsible for
-    /// validating `name` against [`ALLOWED_PROVIDERS`] +
-    /// rejecting empty `api_key`.
+    /// with the current time. Preserves the operator-marked
+    /// `enabled` flag from any prior entry — flipping a key
+    /// shouldn't silently re-enable a disabled provider.
+    /// Caller is responsible for validating `name` against
+    /// [`ALLOWED_PROVIDERS`] + rejecting empty `api_key`.
     pub fn set_provider(&mut self, name: &str, api_key: String, default_model: Option<String>) {
+        let prior_enabled = self.providers.get(name).map(|e| e.enabled).unwrap_or(true);
         self.providers.insert(
             name.to_string(),
             ProviderEntry {
                 api_key,
                 default_model,
                 set_at: unix_secs(),
+                enabled: prior_enabled,
             },
         );
     }
@@ -475,6 +510,38 @@ mod tests {
         // Clearing.
         s.set_default_provider(None);
         assert!(!s.provider_status("openai").is_default);
+    }
+
+    #[test]
+    fn set_provider_enabled_returns_false_for_unconfigured() {
+        let mut s = BridgeSecrets::default();
+        assert!(!s.set_provider_enabled("openai", false));
+    }
+
+    #[test]
+    fn set_provider_enabled_round_trips_through_status() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        // Default is true for newly-set providers.
+        assert!(s.provider_status("openai").enabled);
+        // Disable.
+        assert!(s.set_provider_enabled("openai", false));
+        assert!(!s.provider_status("openai").enabled);
+        // Re-enable.
+        assert!(s.set_provider_enabled("openai", true));
+        assert!(s.provider_status("openai").enabled);
+    }
+
+    #[test]
+    fn set_provider_preserves_enabled_when_overwriting_key() {
+        // Operator's enabled=false intent must survive a
+        // key rotation — set_provider() shouldn't silently
+        // re-enable a disabled provider.
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-old".into(), None);
+        s.set_provider_enabled("openai", false);
+        s.set_provider("openai", "sk-new".into(), None);
+        assert!(!s.provider_status("openai").enabled);
     }
 
     #[test]
