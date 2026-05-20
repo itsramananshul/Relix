@@ -115,6 +115,26 @@
     .empty { padding: 24px 12px; color: var(--fg-dim); text-align: center; font-style: italic; }
     .error { padding: 8px 12px; color: var(--failed); background: #fde8e8; border-radius: 3px; }
     .meta { padding: 0 12px 8px; color: var(--fg-dim); font-size: 11px; }
+    /* Retention dry-run widget — collapsed by default. */
+    details.retention {
+      margin: 0 20px 12px; padding: 0;
+      border: 1px solid var(--border); border-radius: 4px;
+      background: var(--bg-card);
+    }
+    details.retention summary {
+      padding: 8px 12px; cursor: pointer; font-weight: 600; font-size: 13px;
+      background: var(--bg-row-alt); border-radius: 4px;
+    }
+    details.retention[open] summary { border-bottom: 1px solid var(--border); border-radius: 0; }
+    details.retention .body { padding: 12px; font-size: 12px; }
+    details.retention .form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    details.retention .form label { color: var(--fg-dim); }
+    details.retention pre {
+      background: var(--bg-row-alt); padding: 8px; border-radius: 3px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px; overflow-x: auto; margin: 8px 0 0; white-space: pre-wrap;
+    }
+    details.retention .hint { color: var(--fg-dim); font-size: 11px; margin-top: 6px; }
   </style>
 </head>
 <body>
@@ -140,6 +160,25 @@
     <span id="live-status" class="meta" style="padding:0"></span>
   </div>
 </header>
+<details class="retention" id="retention-widget">
+  <summary>Chronicle retention — dry-run candidate counter</summary>
+  <div class="body">
+    <div class="form">
+      <label>max age (days)
+        <input type="number" id="retention-days" value="30" min="1" max="3650" style="width:80px">
+      </label>
+      <button id="retention-run">Count candidates</button>
+      <span id="retention-status" class="meta" style="padding:0"></span>
+    </div>
+    <pre id="retention-result" hidden></pre>
+    <div class="hint">
+      Non-destructive: counts events that <em>would</em> be deleted under the
+      max-age policy, broken down by parent task status (terminal-state tasks
+      only). No deletion happens — see
+      <code>docs/chronicle-retention.md</code> for the design.
+    </div>
+  </div>
+</details>
 <main>
   <section class="panel">
     <h2>Tasks (<span id="task-count">-</span>)</h2>
@@ -395,6 +434,44 @@ $auto.addEventListener('change', () => {
   } else if (autoTimer) {
     clearInterval(autoTimer);
     autoTimer = null;
+  }
+});
+
+// Retention dry-run — operator planning surface for the
+// chronicle-retention max-age policy. Wired to the
+// /v1/tasks/compact_events endpoint; the bridge hard-codes
+// mode=dry-run there, so this widget cannot delete anything
+// regardless of what an operator types.
+const $rDays   = document.getElementById('retention-days');
+const $rRun    = document.getElementById('retention-run');
+const $rStatus = document.getElementById('retention-status');
+const $rResult = document.getElementById('retention-result');
+$rRun.addEventListener('click', async () => {
+  const days = parseInt($rDays.value, 10);
+  if (!Number.isInteger(days) || days < 1) {
+    $rStatus.textContent = 'enter a positive integer';
+    return;
+  }
+  $rStatus.textContent = 'querying…';
+  $rResult.hidden = true;
+  try {
+    const secs = days * 86400;
+    const r = await fetch('/v1/tasks/compact_events?max_age_secs=' + secs);
+    if (!r.ok) {
+      const body = await r.text();
+      throw new Error('HTTP ' + r.status + ': ' + body);
+    }
+    const j = await r.json();
+    // Summary line plus pretty-printed JSON. Operators
+    // skim the headline; the full JSON is the audit trail.
+    const summary =
+      j.candidate_events + ' candidate event(s) across ' +
+      j.candidate_tasks + ' task(s) older than ' + days + ' day(s)';
+    $rStatus.textContent = summary;
+    $rResult.textContent = JSON.stringify(j, null, 2);
+    $rResult.hidden = false;
+  } catch (e) {
+    $rStatus.textContent = 'failed: ' + String(e);
   }
 });
 
