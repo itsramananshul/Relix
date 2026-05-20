@@ -193,6 +193,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_tasks_search_and_chips_present() {
+        // M12: tasks page gains a search input + quick-filter
+        // chip row. Assert both land.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="filter-search""#),
+            "tasks page should ship a free-text search input"
+        );
+        for status in ["running", "failed", "interrupted", "completed"] {
+            assert!(
+                body.contains(&format!(r#"data-quick-filter="{status}""#)),
+                "missing quick-filter chip for {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn page_toast_host_present() {
+        // M12: toast notification host replaces alert() calls
+        // for action feedback. Operator actions don't block.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="toast-host""#),
+            "dashboard should ship a toast notification host"
+        );
+    }
+
+    #[tokio::test]
     async fn page_overview_activity_feed_present() {
         // M10: overview page hosts a live activity rail that
         // diffs poll-cycle snapshots and surfaces transitions.
