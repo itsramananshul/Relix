@@ -211,6 +211,113 @@ pub async fn streams_list(State(state): State<AppState>) -> Json<StreamsResponse
     })
 }
 
+/// One row of `/v1/routing` — for a given capability method,
+/// which peer the bridge's manifest cache would route to
+/// right now, plus that peer's freshness so operators can
+/// see "this routing decision is currently stale."
+#[derive(Debug, Serialize)]
+pub struct RoutingEntry {
+    /// `<namespace>.<action>` capability method name.
+    pub method: String,
+    /// Operator-configured alias of the chosen peer. The
+    /// bridge picks the first peer in cache that
+    /// advertises the method — same semantics as
+    /// `ManifestCache::find_alias_for_method`. `None` for
+    /// methods advertised by a peer without an alias.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// Hex `NodeId` of the chosen peer.
+    pub node_id: String,
+    /// `node_type` of the chosen peer (`memory`, `ai`,
+    /// `tool`, `coordinator`, …).
+    pub node_type: String,
+    /// Freshness bucket of the chosen peer at snapshot
+    /// time. `expired` here means routing would use a
+    /// peer that may be unreachable.
+    pub freshness: &'static str,
+    /// Wall-clock unix seconds the chosen peer was last
+    /// successfully refreshed.
+    pub last_refreshed_at: i64,
+    /// `true` when more than one peer advertises this
+    /// method — operators can see "first-match-in-cache"
+    /// is making a non-trivial choice.
+    pub multiple_candidates: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RoutingResponse {
+    pub entries: Vec<RoutingEntry>,
+    pub generated_at: i64,
+    /// Honest description of how the bridge picks: first
+    /// peer in cache that advertises the method. Surfaces
+    /// to dashboards so the "why this peer" answer is
+    /// available without operators reading source.
+    pub policy: &'static str,
+}
+
+/// `GET /v1/routing` — snapshot of the bridge's current
+/// capability-to-peer resolution. Pure projection of the
+/// manifest cache — no probing, no orchestration. The
+/// answer to "where would `tool.web_fetch` go right
+/// now?" without per-call routing logs (which the
+/// runtime doesn't record today).
+/// One peer candidate for a method — extracted to keep
+/// the by_method map's value type from being so wide
+/// that clippy flags it.
+#[derive(Debug, Clone)]
+struct RoutingCandidate {
+    alias: Option<String>,
+    node_id: String,
+    node_type: String,
+    last_refreshed_at: i64,
+}
+
+pub async fn routing_snapshot(State(state): State<AppState>) -> Json<RoutingResponse> {
+    let now = unix_secs();
+    let entries_cached = state.manifest_cache.entries();
+    // For each method, collect every peer that advertises
+    // it. The first entry in `entries_cached` wins, mirroring
+    // `ManifestCache::find_alias_for_method`'s
+    // first-iteration-in-BTreeMap semantics.
+    use std::collections::BTreeMap;
+    let mut by_method: BTreeMap<String, Vec<RoutingCandidate>> = BTreeMap::new();
+    for c in entries_cached.iter() {
+        for cap in &c.manifest.capabilities {
+            by_method
+                .entry(cap.method_name.clone())
+                .or_default()
+                .push(RoutingCandidate {
+                    alias: c.alias.clone(),
+                    node_id: c.manifest.node_id.to_string(),
+                    node_type: c.manifest.node_type.clone(),
+                    last_refreshed_at: c.last_refreshed_at,
+                });
+        }
+    }
+    let mut entries: Vec<RoutingEntry> = by_method
+        .into_iter()
+        .map(|(method, candidates)| {
+            let winner = candidates[0].clone();
+            let secs_ago = (now - winner.last_refreshed_at).max(0);
+            RoutingEntry {
+                method,
+                alias: winner.alias,
+                node_id: winner.node_id,
+                node_type: winner.node_type,
+                freshness: freshness_label(secs_ago),
+                last_refreshed_at: winner.last_refreshed_at,
+                multiple_candidates: candidates.len() > 1,
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.method.cmp(&b.method));
+    Json(RoutingResponse {
+        entries,
+        generated_at: now,
+        policy: "first peer in manifest cache that advertises the method (no scoring, no priority)",
+    })
+}
+
 /// `GET /v1/topology/events?since=<ts>&limit=<n>` — recent
 /// node lifecycle transitions (joins, freshness changes,
 /// drops). Newest first. In-memory ring; resets on bridge

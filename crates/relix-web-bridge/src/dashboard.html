@@ -850,6 +850,79 @@
       color: var(--text-strong);
     }
 
+    /* ── Execution path panel ──────────────────────────────────── */
+    .exec-panel {
+      margin: 0 14px 12px;
+      padding: 10px 12px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-row-alt);
+    }
+    .exec-panel h4 {
+      margin: 0 0 8px;
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    .exec-panel .exec-row {
+      display: grid;
+      grid-template-columns: max-content 1fr max-content;
+      gap: 8px 12px;
+      padding: 4px 0;
+      border-bottom: 1px dashed var(--border-soft);
+      align-items: center;
+      font-size: var(--text-sm);
+    }
+    .exec-panel .exec-row:last-child { border-bottom: 0; }
+    .exec-panel .exec-method {
+      font-family: var(--font-mono);
+      font-size: var(--text-xs);
+      color: var(--text);
+    }
+    .exec-panel .exec-target {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: var(--text-xs);
+      color: var(--text-muted);
+      flex-wrap: wrap;
+    }
+    .exec-panel .exec-target .alias {
+      color: var(--text);
+      font-weight: 500;
+    }
+    .exec-panel .exec-target .id {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+    .exec-panel .badge { font-size: 9px; padding: 1px 6px; }
+    .exec-panel .unknown {
+      color: var(--text-dim);
+      font-style: italic;
+      font-size: 10px;
+    }
+    .exec-panel .multi-marker {
+      font-size: 10px;
+      color: var(--warn);
+      margin-left: 4px;
+    }
+    .exec-panel .policy-line {
+      margin-top: 8px;
+      font-size: 10px;
+      color: var(--text-dim);
+      font-style: italic;
+      border-top: 1px solid var(--border-soft);
+      padding-top: 6px;
+    }
+    .exec-panel .historical-warn {
+      margin-top: 4px;
+      font-size: 10px;
+      color: var(--warn);
+    }
+
     /* ── Anomaly indicator ─────────────────────────────────────── */
     .anomaly-banner {
       margin: 0 0 12px;
@@ -2666,10 +2739,15 @@ function renderDetail(l) {
   // interrupted (the visual cue is the slot is hidden
   // when there's nothing to show).
   const corrSlot = '<div id="correlation-slot" class="correlation-panel empty"></div>';
+  // Execution-path slot — filled async by maybeFetchExecutionPath
+  // after /v1/routing returns. Visible whenever the chronicle
+  // has at least one capability.invoked event.
+  const execSlot = '<div id="exec-slot"></div>';
   document.getElementById('task-detail').innerHTML =
     `<div class="summary">${summaryRow}</div>`
     + chainBlock
     + failureBlock
+    + execSlot
     + corrSlot
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     + eventsBlock
@@ -2678,6 +2756,10 @@ function renderDetail(l) {
   // mean we only fetch when the operator would actually
   // benefit from the data (interrupted / failed tasks).
   maybeFetchTopologyCorrelation(l);
+  // Execution path: surface which peer would have handled
+  // each capability invocation. Honest about the
+  // "snapshot at view time, not at execution time" gap.
+  maybeFetchExecutionPath(l);
 
   // Wire timeline/raw toggle.
   document.querySelectorAll('.timeline-controls .seg').forEach(seg => {
@@ -2846,6 +2928,134 @@ function renderFailurePanel(l) {
     + (metaGrid ? '<div class="meta-grid">' + metaGrid + '</div>' : '')
     + suggestionHtml
     + '</div>';
+}
+
+/* Execution path: surface for the operator which peer
+   would handle each capability invocation right now.
+   Critically honest about the "snapshot at view time"
+   gap — historical routing isn't recorded per-call yet
+   (the runtime emits `capability.invoked` events with
+   the method name but, today, without the resolved
+   peer alias).
+
+   Data sources:
+     - The chronicle's capability.invoked events → list of
+       methods this task invoked.
+     - /v1/routing → which peer the bridge would choose
+       RIGHT NOW for each method (= first-match-in-cache
+       semantics).
+
+   We render a "Routing as of now" panel that pairs each
+   invoked method with its current routing target.
+   Operators learn the routing target without the actual
+   per-call history; the panel labels itself accordingly. */
+async function maybeFetchExecutionPath(l) {
+  const $slot = document.getElementById('exec-slot');
+  if (!$slot) return;
+  const events = (l.task && l.task.events) || [];
+  const invocations = events.filter(e => e.event_type === 'capability.invoked');
+  if (invocations.length === 0) {
+    $slot.innerHTML = '';
+    return;
+  }
+  try {
+    const r = await fetch('/v1/routing');
+    if (!r.ok) {
+      $slot.innerHTML = '';
+      return;
+    }
+    const routing = await r.json();
+    renderExecutionPath(invocations, routing);
+  } catch (_) {
+    $slot.innerHTML = '';
+  }
+}
+
+function renderExecutionPath(invocations, routing) {
+  const $slot = document.getElementById('exec-slot');
+  if (!$slot) return;
+  // Index routing by method for O(1) lookup.
+  const byMethod = new Map();
+  for (const e of (routing.entries || [])) byMethod.set(e.method, e);
+
+  // Parse each capability.invoked payload to extract the
+  // method name. Today's payload shape is `method=X target=Y`
+  // (set by the bridge's chat_with_tool flow); a future
+  // payload may include `peer=ALIAS` directly (M34).
+  const rows = invocations.map(ev => {
+    const parsed = parseCapabilityInvokedPayload(ev.payload || '');
+    const method = parsed.method || '(method-not-parsed)';
+    const recordedPeer = parsed.peer || null;
+    const route = byMethod.get(method);
+    let targetHtml;
+    if (recordedPeer) {
+      // M34 path: peer was recorded at execution time —
+      // authoritative, not a snapshot.
+      targetHtml =
+        '<span class="alias">' + escapeHtml(recordedPeer) + '</span>'
+        + '<span class="badge ok">recorded</span>';
+    } else if (route) {
+      targetHtml =
+        '<span class="alias">' + escapeHtml(route.alias || '(unaliased)') + '</span>'
+        + '<span class="id">' + escapeHtml(route.node_id.slice(0, 12)) + '…</span>'
+        + '<span class="badge ' + escapeHtml(route.freshness) + '">' + escapeHtml(route.freshness) + '</span>'
+        + (route.multiple_candidates
+          ? '<span class="multi-marker">multiple candidates</span>' : '');
+    } else {
+      targetHtml = '<span class="unknown">no peer in cache advertises this method</span>';
+    }
+    const targetExtra = parsed.target
+      ? '<div class="unknown">arg: ' + escapeHtml(parsed.target) + '</div>'
+      : '';
+    const dt = new Date((ev.ts || 0) * 1000);
+    return '<div class="exec-row">'
+      + '<div class="exec-method">' + escapeHtml(method) + '</div>'
+      + '<div class="exec-target">' + targetHtml + targetExtra + '</div>'
+      + '<div class="meta" style="padding:0;">' + escapeHtml(dt.toLocaleTimeString()) + '</div>'
+      + '</div>';
+  }).join('');
+
+  // Has any invocation got a recorded peer? If none do,
+  // surface the historical-routing-not-recorded warning
+  // explicitly. If some do, we don't need to — the
+  // operator sees recorded chips alongside snapshots.
+  const anyRecorded = invocations.some(ev =>
+    parseCapabilityInvokedPayload(ev.payload || '').peer);
+  const historicalWarn = anyRecorded
+    ? ''
+    : '<div class="historical-warn">' +
+      'Per-call routing not recorded yet — peers shown are the bridge\'s current resolution, ' +
+      'which may differ from what handled the task at execution time.' +
+      '</div>';
+
+  $slot.innerHTML =
+    '<div class="exec-panel">'
+    + '<h4>Execution path · ' + invocations.length + ' capability invocation' + (invocations.length === 1 ? '' : 's') + '</h4>'
+    + rows
+    + historicalWarn
+    + '<div class="policy-line">'
+    +   'Routing policy: ' + escapeHtml(routing.policy || '(unknown)')
+    + '</div>'
+    + '</div>';
+}
+
+/* Parse the `capability.invoked` event payload.
+   Today's shipped shape: "method=X target=Y" (bridge's
+   chat_with_tool flow). M34 will add an optional
+   "peer=ALIAS" segment — parser tolerates either. */
+function parseCapabilityInvokedPayload(payload) {
+  const parts = String(payload || '').split(/\s+/);
+  const out = { method: null, target: null, peer: null };
+  for (const p of parts) {
+    const eq = p.indexOf('=');
+    if (eq < 0) continue;
+    const k = p.slice(0, eq);
+    const v = p.slice(eq + 1);
+    if (k === 'method') out.method = v;
+    else if (k === 'target') out.target = v;
+    else if (k === 'peer') out.peer = v;
+  }
+  return out;
 }
 
 /* Topology correlation: when a task is interrupted or

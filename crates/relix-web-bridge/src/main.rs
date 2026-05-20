@@ -254,6 +254,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // consumers. Lists active streams + opened_at + age so
         // operators see "which task is being watched right now."
         .route("/v1/streams", get(topology::streams_list))
+        // Routing snapshot: for each capability method known
+        // to the bridge, the peer it would dispatch to right
+        // now under the first-match-in-cache policy. Pure
+        // projection of the manifest cache.
+        .route("/v1/routing", get(topology::routing_snapshot))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).

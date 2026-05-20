@@ -225,6 +225,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_execution_path_panel_present() {
+        // M33: task detail surfaces an Execution path panel
+        // when the chronicle has capability.invoked events.
+        // Pairs each method with the bridge's current
+        // routing target, honestly labeled.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("maybeFetchExecutionPath"),
+            "page should ship maybeFetchExecutionPath()"
+        );
+        assert!(
+            body.contains("renderExecutionPath"),
+            "page should ship renderExecutionPath()"
+        );
+        assert!(
+            body.contains("/v1/routing"),
+            "page should fetch /v1/routing to derive execution path"
+        );
+        // The "not recorded yet" framing is load-bearing for
+        // the Phase-1D honesty contract. If a future change
+        // drops it, this test fails.
+        assert!(
+            body.contains("not recorded yet"),
+            "execution path must honestly label the per-call-routing gap"
+        );
+        // Parser landmark — catches accidental removal of the
+        // payload parser when the runtime adds the peer field.
+        assert!(
+            body.contains("parseCapabilityInvokedPayload"),
+            "page should ship the capability.invoked payload parser"
+        );
+    }
+
+    #[tokio::test]
     async fn page_anomaly_banner_present() {
         // M30: overview surfaces runtime anomaly counts
         // (peer flips, task failures, expired peers) when
