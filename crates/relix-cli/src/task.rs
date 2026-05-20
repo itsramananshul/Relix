@@ -684,7 +684,21 @@ fn render_pretty_task(raw: &str) -> String {
     }
     out.push_str("\nchronology:\n");
     let first_ts = parsed[0].1;
+    let mut current_attempt: Option<i64> = None;
     for (i, (ev_type, ts, payload)) in parsed.iter().enumerate() {
+        // C2d.2: when we cross an attempt boundary, emit a visual
+        // separator so operators can scan the timeline by attempt
+        // group at a glance. We parse the attempt_id from the event
+        // payload (format: `attempt_id=N attempt_num=M ...`) so
+        // attempt_started rows label the group with the attempt
+        // number; attempt_finished rows close the group.
+        if ev_type == "task.attempt_started" {
+            let num = extract_kv_int(payload, "attempt_num");
+            current_attempt = num;
+            if let Some(n) = num {
+                let _ = writeln!(out, "  ---- attempt #{n} ----");
+            }
+        }
         let delta = ts - first_ts;
         let delta_str = if i == 0 {
             "      ".to_string()
@@ -692,8 +706,28 @@ fn render_pretty_task(raw: &str) -> String {
             format!("+{delta:>4}s")
         };
         let _ = writeln!(out, "  {delta_str}  {ts}  {ev_type:<22}  {payload}");
+        if ev_type == "task.attempt_finished"
+            && let Some(n) = current_attempt
+        {
+            let _ = writeln!(out, "  ---- end attempt #{n} ----");
+            current_attempt = None;
+        }
     }
     out
+}
+
+/// Pull `key=value` from a space-delimited payload string and parse
+/// `value` as `i64`. Returns `None` if the key isn't present or the
+/// value doesn't parse.
+fn extract_kv_int(payload: &str, key: &str) -> Option<i64> {
+    for tok in payload.split_ascii_whitespace() {
+        if let Some(v) = tok.strip_prefix(key)
+            && let Some(v) = v.strip_prefix('=')
+        {
+            return v.parse().ok();
+        }
+    }
+    None
 }
 
 /// Short operator hint for a status value. Only emitted in
@@ -1161,6 +1195,52 @@ mod tests {
         let first = pretty.lines().next().unwrap();
         assert!(first.contains("failure=transient"));
         assert!(first.contains("retries=1/3(bounded)"));
+    }
+
+    #[test]
+    fn extract_kv_int_finds_value() {
+        assert_eq!(
+            extract_kv_int("attempt_id=42 attempt_num=3 trace=abc", "attempt_num"),
+            Some(3)
+        );
+        assert_eq!(extract_kv_int("", "x"), None);
+        assert_eq!(extract_kv_int("attempt_num=NaN", "attempt_num"), None);
+    }
+
+    #[test]
+    fn chronology_groups_by_attempt_boundary() {
+        let raw = concat!(
+            "task_id=x\nstatus=completed\n",
+            "events=[",
+            r#"{"id":1,"ts":1700000000,"type":"task.created","payload":"chat"},"#,
+            r#"{"id":2,"ts":1700000000,"type":"task.attempt_started","payload":"attempt_id=1 attempt_num=1"},"#,
+            r#"{"id":3,"ts":1700000010,"type":"task.attempt_finished","payload":"attempt_id=1 status=failed failure_class=transient"},"#,
+            r#"{"id":4,"ts":1700000020,"type":"task.attempt_started","payload":"attempt_id=2 attempt_num=2"},"#,
+            r#"{"id":5,"ts":1700000030,"type":"task.attempt_finished","payload":"attempt_id=2 status=completed"}"#,
+            "]\n"
+        );
+        let pretty = render_pretty_task(raw);
+        assert!(pretty.contains("---- attempt #1 ----"));
+        assert!(pretty.contains("---- end attempt #1 ----"));
+        assert!(pretty.contains("---- attempt #2 ----"));
+        assert!(pretty.contains("---- end attempt #2 ----"));
+        // Ordering: attempt #1 markers precede attempt #2 markers.
+        let pos1 = pretty.find("---- attempt #1 ----").unwrap();
+        let pos2 = pretty.find("---- attempt #2 ----").unwrap();
+        assert!(pos1 < pos2);
+    }
+
+    #[test]
+    fn chronology_skips_grouping_when_attempt_events_absent() {
+        let raw = concat!(
+            "task_id=x\nstatus=completed\n",
+            "events=[",
+            r#"{"id":1,"ts":1700000000,"type":"flow.started","payload":"x"},"#,
+            r#"{"id":2,"ts":1700000005,"type":"task.completed","payload":"ok"}"#,
+            "]\n"
+        );
+        let pretty = render_pretty_task(raw);
+        assert!(!pretty.contains("attempt #"));
     }
 
     #[test]
