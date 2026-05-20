@@ -143,6 +143,7 @@ like any other peer.
 
 Start here, in this order:
 
+- [`docs/phase-1-status.md`](docs/phase-1-status.md) — single page covering "what's done, what's deferred" across Phase 1. Read this if you want to know the system's scope without reading every reference doc.
 - [`docs/getting-started.md`](docs/getting-started.md) — install, boot, first chat, Open WebUI hookup, first `tool.web_fetch`.
 - [`docs/architecture.md`](docs/architecture.md) — peer model, request flows, the admission pipeline, why the bridge is not an orchestrator.
 - [`docs/operator-guide.md`](docs/operator-guide.md) — running the mesh, logs, troubleshooting, common failure modes.
