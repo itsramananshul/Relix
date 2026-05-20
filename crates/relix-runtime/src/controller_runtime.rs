@@ -45,6 +45,10 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub bridge: Option<toml::Value>,
+    /// Coordinator node options.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub coordinator: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -311,6 +315,30 @@ fn register_node_type_handlers(
             provider = %provider_name,
             default_model = %default_model,
             "ai node: registered ai.chat"
+        );
+    }
+    if cfg.controller.node_type == "coordinator" {
+        let raw = cfg.coordinator.clone().ok_or_else(|| {
+            "node_type=coordinator requires a [coordinator] section with db_path".to_string()
+        })?;
+        let coord_cfg: crate::nodes::coordinator::CoordinatorConfig = raw
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("[coordinator] parse: {e}"))?;
+        let store = std::sync::Arc::new(crate::nodes::coordinator::TaskStore::open(&coord_cfg)?);
+        crate::nodes::coordinator::register(bridge, store);
+        for m in [
+            "task.create",
+            "task.update",
+            "task.event",
+            "task.get",
+            "task.list",
+        ] {
+            manifest.add_capability(CapabilityDescriptor::unary(m));
+        }
+        tracing::info!(
+            db = %coord_cfg.db_path.display(),
+            max_list = coord_cfg.max_list,
+            "coordinator node: registered task.create / update / event / get / list"
         );
     }
     if cfg.controller.node_type == "tool" {

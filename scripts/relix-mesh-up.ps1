@@ -34,12 +34,14 @@ param(
     [string]$Provider     = 'mock',
     [string]$BaseUrl      = '',
     [string]$Run          = 'local',
-    [int]$BridgePort      = 19791,
-    [int]$MemPort         = 19711,
-    [int]$AiPort          = 19712,
-    [int]$ToolPort        = 19713,
+    [int]$BridgePort        = 19791,
+    [int]$MemPort           = 19711,
+    [int]$AiPort            = 19712,
+    [int]$ToolPort          = 19713,
+    [int]$CoordinatorPort   = 19714,
     [switch]$ToolAllowHttp,
-    [switch]$NoTool
+    [switch]$NoTool,
+    [switch]$NoCoordinator
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,10 +62,11 @@ $DataBase   = "dev-data/$Run"
 $OrgKey     = "dev-keys/$Run-org-root.key"
 $OrgPub     = "dev-keys/$Run-org-root.pub"
 $BridgeAic  = "dev-keys/$Run-bridge.aic"
-$MemKey     = "dev-keys/$Run-memory.key"
-$AiKey      = "dev-keys/$Run-ai.key"
-$ToolKey    = "dev-keys/$Run-tool.key"
-$BridgeKey  = "dev-keys/$Run-bridge.key"
+$MemKey         = "dev-keys/$Run-memory.key"
+$AiKey          = "dev-keys/$Run-ai.key"
+$ToolKey        = "dev-keys/$Run-tool.key"
+$CoordinatorKey = "dev-keys/$Run-coordinator.key"
+$BridgeKey      = "dev-keys/$Run-bridge.key"
 $Policy     = "configs/policies/$Run.toml"
 $BridgeHttp = "127.0.0.1:$BridgePort"
 
@@ -81,11 +84,12 @@ if (-not (Test-Path $BridgeAic)) {
     if ($LASTEXITCODE -ne 0) { throw "identity mint failed (exit $LASTEXITCODE)" }
 }
 
-$MemConfig    = "$DataBase/memory.toml"
-$AiConfig     = "$DataBase/ai.toml"
-$ToolConfig   = "$DataBase/tool.toml"
-$BridgeConfig = "$DataBase/bridge.toml"
-$Peers        = "$DataBase/peers.toml"
+$MemConfig         = "$DataBase/memory.toml"
+$AiConfig          = "$DataBase/ai.toml"
+$ToolConfig        = "$DataBase/tool.toml"
+$CoordinatorConfig = "$DataBase/coordinator.toml"
+$BridgeConfig      = "$DataBase/bridge.toml"
+$Peers             = "$DataBase/peers.toml"
 
 # 2) Memory controller config.
 @"
@@ -219,10 +223,38 @@ user_agent    = "Relix-tool/0.1.0"
 "@ | Set-Content -Encoding utf8 $ToolConfig
 }
 
+# 4.5) Coordinator controller config. Owns the durable Task ledger
+#      (SQLite). Optional -- pass -NoCoordinator to skip.
+if (-not $NoCoordinator) {
+@"
+[controller]
+name = "$Run-coordinator"
+node_type = "coordinator"
+listen_port = $CoordinatorPort
+
+[identity]
+key_path = "$CoordinatorKey"
+
+[trust]
+org_root_key_path = "$OrgPub"
+
+[policy]
+file = "$Policy"
+
+[coordinator]
+db_path = "$DataBase/tasks.db"
+max_list = 200
+
+[peers]
+"@ | Set-Content -Encoding utf8 $CoordinatorConfig
+}
+
 # 5) Shared policy. Tool capability requires chat-users (same as ai/memory),
 #    so the bridge's existing identity bundle is sufficient.
 #    node.manifest is admitted for chat-users so the bridge can discover
 #    each peer's capability set at startup (M10).
+#    task.* admitted so the bridge (and operators via `relix-cli task`)
+#    can manage durable Task records on the coordinator (A.1+A.2).
 @"
 [admit]
 groups = ["chat-users"]
@@ -261,6 +293,31 @@ allow_groups = ["chat-users"]
 name = "tool_web_fetch"
 method = "tool.web_fetch"
 allow_groups = ["chat-users"]
+
+[[rules]]
+name = "task_create"
+method = "task.create"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "task_update"
+method = "task.update"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "task_event"
+method = "task.event"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "task_get"
+method = "task.get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "task_list"
+method = "task.list"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
 # 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.
@@ -277,6 +334,14 @@ if (-not $NoTool) {
 
 [peers.tool]
 addr = "/ip4/127.0.0.1/tcp/$ToolPort"
+"@
+}
+if (-not $NoCoordinator) {
+    $peersToml += @"
+
+
+[peers.coordinator]
+addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
 "@
 }
 $peersToml | Set-Content -Encoding utf8 $Peers
@@ -312,14 +377,16 @@ id          = "relix-$Provider"
 description = "Relix mesh route - AI node currently set to $Provider"
 "@ | Set-Content -Encoding utf8 $BridgeConfig
 
-$MemLog    = "$DataBase/memory.log"
-$AiLog     = "$DataBase/ai.log"
-$ToolLog   = "$DataBase/tool.log"
-$BridgeLog = "$DataBase/bridge.log"
-$MemErr    = "$DataBase/memory.err.log"
-$AiErr     = "$DataBase/ai.err.log"
-$ToolErr   = "$DataBase/tool.err.log"
-$BridgeErr = "$DataBase/bridge.err.log"
+$MemLog         = "$DataBase/memory.log"
+$AiLog          = "$DataBase/ai.log"
+$ToolLog        = "$DataBase/tool.log"
+$CoordinatorLog = "$DataBase/coordinator.log"
+$BridgeLog      = "$DataBase/bridge.log"
+$MemErr         = "$DataBase/memory.err.log"
+$AiErr          = "$DataBase/ai.err.log"
+$ToolErr        = "$DataBase/tool.err.log"
+$CoordinatorErr = "$DataBase/coordinator.err.log"
+$BridgeErr      = "$DataBase/bridge.err.log"
 
 $env:RELIX_DATA_DIR = 'dev-data'
 
@@ -373,6 +440,11 @@ if (-not $NoTool) {
 } else {
     Write-Host "  tool port:     (disabled - -NoTool)"
 }
+if (-not $NoCoordinator) {
+    Write-Host ("  coord port:    tcp/{0}  (db={1}/tasks.db)" -f $CoordinatorPort, $DataBase)
+} else {
+    Write-Host "  coord port:    (disabled - -NoCoordinator)"
+}
 Write-Host "  bridge HTTP:   http://$BridgeHttp"
 Write-Host "  data dir:      $DataBase"
 Write-Host ""
@@ -393,10 +465,18 @@ try {
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $ToolConfig -OutLog $ToolLog -ErrLog $ToolErr -RustLog 'relix_runtime=info') )
     }
 
+    if (-not $NoCoordinator) {
+        Write-Host "starting coordinator controller ..."
+        [void]$started.Add( (Start-Node -Exe $Controller -Cfg $CoordinatorConfig -OutLog $CoordinatorLog -ErrLog $CoordinatorErr -RustLog 'relix_runtime=info') )
+    }
+
     if (-not (Wait-Log -Path $MemLog -Needle 'transport listening' -Desc 'memory controller')) { throw 'memory controller never came up' }
     if (-not (Wait-Log -Path $AiLog  -Needle 'transport listening' -Desc 'ai controller'))     { throw 'ai controller never came up' }
     if (-not $NoTool) {
         if (-not (Wait-Log -Path $ToolLog -Needle 'transport listening' -Desc 'tool controller')) { throw 'tool controller never came up' }
+    }
+    if (-not $NoCoordinator) {
+        if (-not (Wait-Log -Path $CoordinatorLog -Needle 'transport listening' -Desc 'coordinator controller')) { throw 'coordinator controller never came up' }
     }
     Start-Sleep -Milliseconds 400
 
@@ -438,11 +518,20 @@ try {
         Write-Host "    -ContentType 'application/json' ``"
         Write-Host "    -Body (@{ session_id='demo'; message='summarize this page'; url='https://example.com/' } | ConvertTo-Json)"
     }
+    if (-not $NoCoordinator) {
+        Write-Host ""
+        Write-Host "  # Coordinator (durable Task ledger):"
+        Write-Host "  .\target\debug\relix-cli.exe task list ``"
+        Write-Host "    --peer /ip4/127.0.0.1/tcp/$CoordinatorPort ``"
+        Write-Host "    --identity $BridgeAic ``"
+        Write-Host "    --client-key $BridgeKey"
+    }
     Write-Host ""
     Write-Host "Logs:"
     Write-Host "  $MemLog"
     Write-Host "  $AiLog"
-    if (-not $NoTool) { Write-Host "  $ToolLog" }
+    if (-not $NoTool)        { Write-Host "  $ToolLog" }
+    if (-not $NoCoordinator) { Write-Host "  $CoordinatorLog" }
     Write-Host "  $BridgeLog"
     Write-Host ""
     Write-Host "PIDs (this script will only stop these on Ctrl-C):"

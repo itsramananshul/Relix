@@ -31,6 +31,9 @@ and [`docs/current-limitations.md`](docs/current-limitations.md).
 | OpenAI-compatible shim — `/v1/models`, `/v1/chat/completions` (incl. SSE) | works |
 | NodeManifest discovery + `capability:<method>` routing | works |
 | Connection pool reuse on bridge ↔ peers and tool ↔ origins | works |
+| MeshClient peer reconnect + 60s manifest refresh | works |
+| Coordinator node (`task.create` / `update` / `event` / `get` / `list`) with SQLite ledger | works (checkpointed re-run, not resumable replay — see [`docs/replay-model.md`](docs/replay-model.md)) |
+| `relix-cli task` CLI | works |
 | SOL VM with `remote_call`, hand-written `.sol` flows | works |
 | Windows-safe PowerShell mesh bringup | works |
 
@@ -145,6 +148,9 @@ Start here, in this order:
 - [`docs/flows-and-sol.md`](docs/flows-and-sol.md) — what SOL is and isn't, how `remote_call` works, how to write a new flow.
 - [`docs/security.md`](docs/security.md) — identities, policy, audit, what the alpha guarantees and what it doesn't.
 - [`docs/tool-node.md`](docs/tool-node.md) — the external-action peer, the SSRF model, the DNS pin, the redirect re-check, the secure client pool.
+- [`docs/coordinator.md`](docs/coordinator.md) — the durable Task ledger peer.
+- [`docs/task-runtime.md`](docs/task-runtime.md) — Task schema + the five `task.*` capabilities, wire-format exact.
+- [`docs/replay-model.md`](docs/replay-model.md) — exactly what "checkpointed re-run" means and what it does *not* mean. Read this before assuming Tasks resume on retry.
 - [`docs/current-limitations.md`](docs/current-limitations.md) — read before deploying.
 
 Reference docs (deeper / narrower):

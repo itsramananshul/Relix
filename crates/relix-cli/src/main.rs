@@ -3,6 +3,7 @@
 mod flow_run;
 mod identity;
 mod ping;
+mod task;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -37,6 +38,16 @@ enum Cmd {
         /// Path to a 32-byte signing key used as the local libp2p PeerId.
         #[arg(long)]
         client_key: PathBuf,
+    },
+    /// Operate the Coordinator's durable Task ledger.
+    ///
+    /// Each subcommand dials the Coordinator peer once, runs through
+    /// the full admission pipeline (identity → policy → handler →
+    /// audit), and prints the result. The Coordinator persists Tasks
+    /// across restarts; see `docs/coordinator.md`.
+    Task {
+        #[command(subcommand)]
+        cmd: task::Cmd,
     },
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
@@ -75,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.cmd {
         Cmd::Identity { cmd } => identity::run(cmd),
+        Cmd::Task { cmd } => task::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,

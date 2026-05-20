@@ -16,13 +16,32 @@ where a limitation here corresponds to a SIMP entry there, it's cited.
 
 ## Operations and resilience
 
-### No automated coordinator
+### Coordinator is a Task ledger, not a flow scheduler
 
-There is no orchestrator process that watches for peer health, restarts
-nodes, or re-runs flows on failure. If a node crashes mid-flow, the
-flow halts with a transport error and the bridge returns a 502. There
-is a stub `coordinator/` module in `relix-runtime`; it has no
-production implementation today.
+The Coordinator node-type owns a durable SQLite ledger of Task records
++ events (commit `<pending>`; see [`coordinator.md`](coordinator.md)).
+It does **not**:
+
+- Watch for peer health.
+- Auto-detect crashed executors or sweep `running` tasks to `abandoned`.
+- Schedule or queue work — there is no auto-scheduler picking up
+  `pending` tasks.
+- Resume a flow mid-execution (the SOL VM is synchronous — see
+  [`replay-model.md`](replay-model.md) for the honest framing).
+
+What it gives you is durable records of who tried to do what and where
+the per-flow event log lives. Retry decisions are operator-driven via
+`relix-cli task update` (set `status` + re-issue the call); auto-retry
+is Gate 2.
+
+### Bridge does not yet write Task records on `/chat`
+
+The Coordinator and CLI are wired; the bridge's HTTP path
+(`POST /chat`, `/v1/chat/completions`, `/chat_with_tool`) does not yet
+call `task.create` / `task.update`. Chat requests still execute the
+flow in-process and return; nothing is persisted in the Coordinator
+unless an operator drives `relix-cli task` separately. Bridge
+integration is the next follow-up.
 
 ### The bridge's `MeshClient` auto-reconnects on transient drops
 
