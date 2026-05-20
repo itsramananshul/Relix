@@ -107,6 +107,11 @@
     .event.failed  { border-left-color: var(--failed); }
     .event .type   { font-weight: 600; }
     .event .payload { color: var(--fg-dim); margin-left: 8px; }
+    .event.live    { animation: flash-in 1.2s ease-out; }
+    @keyframes flash-in {
+      from { background: #e8f5e8; }
+      to   { background: var(--bg-row-alt); }
+    }
     .empty { padding: 24px 12px; color: var(--fg-dim); text-align: center; font-style: italic; }
     .error { padding: 8px 12px; color: var(--failed); background: #fde8e8; border-radius: 3px; }
     .meta { padding: 0 12px 8px; color: var(--fg-dim); font-size: 11px; }
@@ -131,6 +136,8 @@
     </label>
     <button id="refresh">Refresh</button>
     <label><input type="checkbox" id="autorefresh"> auto (5s)</label>
+    <label><input type="checkbox" id="livefeed" checked> live feed</label>
+    <span id="live-status" class="meta" style="padding:0"></span>
   </div>
 </header>
 <main>
@@ -153,9 +160,13 @@ const $title  = document.getElementById('detail-title');
 const $filter = document.getElementById('filter-status');
 const $refresh = document.getElementById('refresh');
 const $auto    = document.getElementById('autorefresh');
+const $live    = document.getElementById('livefeed');
+const $liveStatus = document.getElementById('live-status');
 
 let selectedTaskId = null;
 let autoTimer = null;
+let eventSource = null;
+let lastEventId = 0;
 
 async function loadTasks() {
   try {
@@ -194,7 +205,12 @@ function renderTaskList(items) {
 }
 
 async function loadDetail(id) {
+  // Closing previous SSE stream before opening a new one — the
+  // bridge's per-stream tokio task dies when its socket
+  // closes, so this also bounds resource usage on the server.
+  closeLiveFeed();
   selectedTaskId = id;
+  lastEventId = 0;
   $list.querySelectorAll('tbody tr').forEach(tr => {
     tr.classList.toggle('selected', tr.dataset.id === id);
   });
@@ -205,8 +221,84 @@ async function loadDetail(id) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const lineage = await r.json();
     renderDetail(lineage);
+    // Track the highest event id so the SSE stream picks up
+    // strictly after the snapshot.
+    for (const e of (lineage.task.events || [])) {
+      if (e.event_id > lastEventId) lastEventId = e.event_id;
+    }
+    if ($live.checked) openLiveFeed(id);
   } catch (e) {
     $detail.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+function openLiveFeed(id) {
+  if (!('EventSource' in window)) {
+    setLiveStatus('SSE unsupported');
+    return;
+  }
+  closeLiveFeed();
+  const url = '/v1/tasks/' + encodeURIComponent(id) + '/events/stream?since=' + lastEventId;
+  const es = new EventSource(url);
+  eventSource = es;
+  setLiveStatus('live ●');
+  es.addEventListener('event', (m) => {
+    let ev;
+    try { ev = JSON.parse(m.data); } catch (_) { return; }
+    if (typeof ev.event_id === 'number' && ev.event_id > lastEventId) {
+      lastEventId = ev.event_id;
+    }
+    appendChronologyEvent(ev);
+  });
+  es.addEventListener('gone', () => {
+    setLiveStatus('task gone');
+    closeLiveFeed();
+  });
+  es.addEventListener('error', () => {
+    // EventSource auto-reconnects on transport errors. The
+    // server emits `event: error` SSE messages for Coordinator-
+    // side errors and keeps the stream alive; those go through
+    // the message handler above. The `error` HANDLER here fires
+    // on transport-level disconnects.
+    setLiveStatus('reconnecting…');
+  });
+}
+
+function closeLiveFeed() {
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  setLiveStatus('');
+}
+
+function setLiveStatus(s) {
+  $liveStatus.textContent = s ? ' [' + s + ']' : '';
+}
+
+function appendChronologyEvent(ev) {
+  const eventsBlock = $detail.querySelector('.events');
+  if (!eventsBlock) {
+    // Detail panel was rendered with an empty chronology meta
+    // note. Reload to materialise the block — the next
+    // event will render inline.
+    if (selectedTaskId) loadDetail(selectedTaskId);
+    return;
+  }
+  const div = document.createElement('div');
+  div.className = 'event ' + eventClass(ev.event_type) + ' live';
+  const ts = document.createElement('span'); ts.className = 'type'; ts.textContent = ev.event_type;
+  const pl = document.createElement('span'); pl.className = 'payload'; pl.textContent = ev.payload || '';
+  div.appendChild(ts); div.appendChild(pl);
+  eventsBlock.appendChild(div);
+  // Auto-scroll to the bottom so live events are visible.
+  eventsBlock.scrollTop = eventsBlock.scrollHeight;
+  // Bump the count badge.
+  const h3 = eventsBlock.querySelector('h3');
+  if (h3) {
+    const m = h3.textContent.match(/\((\d+)\)/);
+    const next = m ? (parseInt(m[1], 10) + 1) : eventsBlock.querySelectorAll('.event').length;
+    h3.textContent = h3.textContent.replace(/\(\d+\)/, '(' + next + ')');
   }
 }
 
@@ -272,6 +364,11 @@ function escapeHtml(s) {
 $refresh.addEventListener('click', () => {
   loadTasks();
   if (selectedTaskId) loadDetail(selectedTaskId);
+});
+$live.addEventListener('change', () => {
+  if (!selectedTaskId) return;
+  if ($live.checked) openLiveFeed(selectedTaskId);
+  else closeLiveFeed();
 });
 $filter.addEventListener('change', loadTasks);
 $auto.addEventListener('change', () => {
