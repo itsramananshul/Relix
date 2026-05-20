@@ -205,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(tasks::compact_events_dry_run),
         )
         .route("/v1/tasks/recover", post(tasks::recover))
+        .route("/v1/tasks/:id/retry", post(tasks::retry))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered
         // manifest cache (no extra mesh I/O).

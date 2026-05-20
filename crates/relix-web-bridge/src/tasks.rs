@@ -351,6 +351,144 @@ pub async fn recover(
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct RetryQuery {
+    /// Override the bridge-side guard that refuses retries on
+    /// non-retryable failure classes (policy_denied /
+    /// invalid_args / permanent). Mirrors the CLI's `--force`.
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RetryResponse {
+    /// One of `accepted` / `exhausted` / `refused`.
+    pub outcome: String,
+    /// Raw Coordinator body line (or refusal explanation).
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub of_budget: Option<i64>,
+    /// When refused, the failure class that triggered the
+    /// guard. Operators see this to decide whether to retry
+    /// with force=true after inspection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_class: Option<String>,
+}
+
+/// Non-retryable failure classes per docs/retry-model.md. Same
+/// list the CLI's `retry_blocked_by_class` enforces.
+const NON_RETRYABLE_CLASSES: &[&str] = &["policy_denied", "invalid_args", "permanent"];
+
+/// `POST /v1/tasks/:id/retry?force=<bool>` — operator-triggered
+/// retry. Returns a typed envelope distinguishing the three
+/// outcomes (accepted / exhausted / refused) so dashboards can
+/// react accordingly. The `force` query param defaults to false;
+/// when false the bridge refuses retries on non-retryable
+/// failure classes (mirrors the CLI's `--force`).
+pub async fn retry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RetryQuery>,
+) -> Result<Json<RetryResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let force = q.force.unwrap_or(false);
+
+    // Guard: refuse non-retryable failure classes unless force.
+    // Fetch the task get to read last_failure_class. Skip the
+    // guard if the get itself fails — the Coordinator will
+    // surface the appropriate error.
+    if !force && let Ok(body) = rec.get(&id).await {
+        let class = parse_failure_class_from_body(&body);
+        if let Some(c) = class.as_deref()
+            && NON_RETRYABLE_CLASSES.contains(&c)
+        {
+            return Ok(Json(RetryResponse {
+                outcome: "refused".to_string(),
+                detail: format!(
+                    "last_failure_class={c} is non-retryable. Inspect the flow + chronicle, then pass force=true to override."
+                ),
+                attempt: None,
+                of_budget: None,
+                last_failure_class: Some(c.to_string()),
+            }));
+        }
+    }
+
+    let body = rec
+        .retry(&id)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_retry_body(&body)))
+}
+
+fn parse_failure_class_from_body(body: &str) -> Option<String> {
+    body.lines()
+        .find_map(|line| line.strip_prefix("last_failure_class="))
+        .map(|v| v.trim().to_string())
+}
+
+fn parse_retry_body(body: &str) -> RetryResponse {
+    let trimmed = body.trim();
+    // accepted attempt=N of_budget=M
+    if let Some(rest) = trimmed.strip_prefix("accepted ") {
+        let mut attempt = None;
+        let mut budget = None;
+        for tok in rest.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("attempt=") {
+                attempt = v.parse().ok();
+            } else if let Some(v) = tok.strip_prefix("of_budget=") {
+                budget = v.parse().ok();
+            }
+        }
+        return RetryResponse {
+            outcome: "accepted".to_string(),
+            detail: trimmed.to_string(),
+            attempt,
+            of_budget: budget,
+            last_failure_class: None,
+        };
+    }
+    // exhausted retry_count=N budget=M
+    if let Some(rest) = trimmed.strip_prefix("exhausted ") {
+        let mut count = None;
+        let mut budget = None;
+        for tok in rest.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("retry_count=") {
+                count = v.parse().ok();
+            } else if let Some(v) = tok.strip_prefix("budget=") {
+                budget = v.parse().ok();
+            }
+        }
+        return RetryResponse {
+            outcome: "exhausted".to_string(),
+            detail: trimmed.to_string(),
+            attempt: count,
+            of_budget: budget,
+            last_failure_class: None,
+        };
+    }
+    // Anything else (unexpected) — return as a generic body.
+    RetryResponse {
+        outcome: "unknown".to_string(),
+        detail: trimmed.to_string(),
+        attempt: None,
+        of_budget: None,
+        last_failure_class: None,
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct EventsQuery {
     /// Return only events with `event_id > since`. Defaults to 0
     /// (read from the beginning).
@@ -1218,6 +1356,45 @@ mod tests {
             gateway_status_for("kind=1 cause=transport timeout"),
             StatusCode::BAD_GATEWAY,
         );
+    }
+
+    #[test]
+    fn parse_retry_body_extracts_accepted_outcome() {
+        let r = parse_retry_body("accepted attempt=2 of_budget=3\n");
+        assert_eq!(r.outcome, "accepted");
+        assert_eq!(r.attempt, Some(2));
+        assert_eq!(r.of_budget, Some(3));
+        assert!(r.last_failure_class.is_none());
+    }
+
+    #[test]
+    fn parse_retry_body_extracts_exhausted_outcome() {
+        let r = parse_retry_body("exhausted retry_count=3 budget=3\n");
+        assert_eq!(r.outcome, "exhausted");
+        assert_eq!(r.attempt, Some(3));
+        assert_eq!(r.of_budget, Some(3));
+    }
+
+    #[test]
+    fn parse_retry_body_falls_back_to_unknown() {
+        // Future-proof: if the Coordinator adds a new outcome
+        // shape, the parser surfaces it as "unknown" with the
+        // raw detail so the dashboard can still show something.
+        let r = parse_retry_body("some unexpected line");
+        assert_eq!(r.outcome, "unknown");
+        assert_eq!(r.detail, "some unexpected line");
+    }
+
+    #[test]
+    fn parse_failure_class_finds_the_marker() {
+        let body = "task_id=abc\nstatus=failed\nlast_failure_class=transient\nevents=[]\n";
+        assert_eq!(
+            parse_failure_class_from_body(body).as_deref(),
+            Some("transient")
+        );
+        // Returns None when absent.
+        let body2 = "task_id=abc\nstatus=completed\nevents=[]\n";
+        assert!(parse_failure_class_from_body(body2).is_none());
     }
 
     #[test]

@@ -239,6 +239,16 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.recover utf8: {e}"))
     }
 
+    /// Operator-triggered `task.retry` passthrough. Returns the
+    /// Coordinator's body verbatim: `accepted attempt=N
+    /// of_budget=M` or `exhausted retry_count=N budget=M`.
+    /// The force-vs-not-retryable check is the bridge handler's
+    /// responsibility (mirrors the CLI's same-pattern guard).
+    pub async fn retry(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.retry", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.retry utf8: {e}"))
+    }
+
     /// Low-level wrapper. Builds an envelope, sends via MeshClient,
     /// decodes the response, returns the body bytes or a string error.
     async fn call(&self, method: &str, arg: &[u8]) -> Result<Vec<u8>, String> {
