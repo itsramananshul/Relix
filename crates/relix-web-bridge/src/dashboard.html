@@ -1619,8 +1619,27 @@ function renderOverviewKpis(hRes, taskCount) {
   }
   if (hRes.streams) {
     document.getElementById('kpi-streams').textContent = hRes.streams.active;
-    document.getElementById('kpi-streams-delta').textContent =
-      'active · ' + hRes.streams.opened_total + ' opened';
+    // Fetch per-stream detail in the background so the delta
+    // shows what tasks are actually being watched. Cheap call
+    // — bridge holds the data in memory.
+    if (hRes.streams.active > 0) {
+      fetch('/v1/streams')
+        .then(r => r.ok ? r.json() : null)
+        .then(j => {
+          if (!j || !j.active || !j.active.length) return;
+          const summary = j.active
+            .slice(0, 3)
+            .map(s => s.task_id.slice(0, 6) + '…(' + s.age_secs + 's)')
+            .join(', ');
+          const more = j.active.length > 3 ? ' +' + (j.active.length - 3) : '';
+          document.getElementById('kpi-streams-delta').textContent =
+            'watching ' + summary + more;
+        })
+        .catch(() => {});
+    } else {
+      document.getElementById('kpi-streams-delta').textContent =
+        '0 active · ' + hRes.streams.opened_total + ' opened';
+    }
   } else {
     document.getElementById('kpi-streams').textContent = '—';
   }
