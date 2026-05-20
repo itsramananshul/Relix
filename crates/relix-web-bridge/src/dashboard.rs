@@ -225,6 +225,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_streams_inspection_landmarks_present() {
+        // M41: clicking the live-streams KPI tile opens a
+        // per-stream inspection panel. The tile must be
+        // marked clickable + the panel-render function must
+        // ship.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="kpi-streams-tile""#),
+            "live-streams KPI tile should be a click target"
+        );
+        assert!(
+            body.contains("renderStreamsDetail"),
+            "page should ship renderStreamsDetail()"
+        );
+        assert!(
+            body.contains(r#"id="streams-detail-host""#),
+            "page should ship the streams-detail host element"
+        );
+    }
+
+    #[tokio::test]
     async fn page_retry_storm_landmarks_present() {
         // M40: anomaly banner adds a retry-storm signal sourced
         // from /v1/tasks/edges/recent. Topology page gets a

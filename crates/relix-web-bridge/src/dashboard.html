@@ -985,6 +985,53 @@
       font-size: var(--text-xs);
     }
 
+    /* ── Streams inspection (click-out from KPI) ───────────────── */
+    .streams-detail {
+      margin-top: 8px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--card-radius);
+      padding: 10px 12px;
+      font-size: var(--text-xs);
+    }
+    .streams-detail.empty { display: none; }
+    .streams-detail h4 {
+      margin: 0 0 6px;
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .streams-detail h4 button {
+      padding: 1px 8px;
+      font-size: 10px;
+    }
+    .streams-detail table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .streams-detail table th,
+    .streams-detail table td {
+      padding: 4px 8px;
+      text-align: left;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .streams-detail table th {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+    .streams-detail .stream-row { cursor: pointer; }
+    .streams-detail .stream-row:hover { background: var(--bg-hover); }
+    .streams-detail .age-old { color: var(--warn); font-weight: 600; }
+    .streams-detail .age-very-old { color: var(--danger); font-weight: 600; }
+
     /* ── Failure breakdown panel ───────────────────────────────── */
     .failure-panel {
       margin: 0 14px 12px;
@@ -1521,8 +1568,13 @@
           <div class="kpi-grid">
             <div class="kpi"><p class="label">coordinator</p><div class="value" id="kpi-coord">—</div><div class="delta" id="kpi-coord-delta"></div></div>
             <div class="kpi"><p class="label">tasks</p><div class="value" id="kpi-tasks">—</div><div class="delta" id="kpi-tasks-delta"></div></div>
-            <div class="kpi"><p class="label">live streams</p><div class="value" id="kpi-streams">—</div><div class="delta" id="kpi-streams-delta">active / opened</div></div>
+            <div class="kpi" id="kpi-streams-tile" style="cursor: pointer;" title="click to inspect active streams">
+              <p class="label">live streams</p>
+              <div class="value" id="kpi-streams">—</div>
+              <div class="delta" id="kpi-streams-delta">active / opened</div>
+            </div>
           </div>
+          <div id="streams-detail-host"></div>
         </div>
         <div class="kpi-section">
           <p class="section-label">Process</p>
@@ -2024,8 +2076,104 @@ let lastTaskCountSnapshot = null;
 // Used by computeAnomalies() to surface retry-storm patterns
 // derived from real recorded edges — no synthesized signals.
 let lastEdgesSnapshot = null;
+// M41: streams-detail panel state — when expanded, a list
+// of active streams shows below the KPI grid. Toggled via
+// the live-streams KPI tile.
+let streamsDetailExpanded = false;
 
-function initOverview() { /* nothing one-shot */ }
+function initOverview() {
+  // M41: clicking the live-streams KPI tile expands/collapses
+  // an inline streams-detail panel below the KPI grid.
+  // Initialized once; the tile element is shipped in the
+  // initial HTML.
+  const $tile = document.getElementById('kpi-streams-tile');
+  if ($tile) {
+    $tile.addEventListener('click', () => {
+      streamsDetailExpanded = !streamsDetailExpanded;
+      renderStreamsDetail();
+    });
+  }
+}
+
+/* Render the per-stream inspection panel under the
+   live-streams KPI. Pulls from /v1/streams to get the
+   authoritative list (the lastHealthSnapshot.streams
+   block is just counts; the per-stream details need
+   the dedicated endpoint).
+
+   Hidden when streamsDetailExpanded is false OR when
+   the panel has no data. */
+async function renderStreamsDetail() {
+  const $host = document.getElementById('streams-detail-host');
+  if (!$host) return;
+  if (!streamsDetailExpanded) {
+    $host.innerHTML = '';
+    return;
+  }
+  $host.innerHTML = '<div class="streams-detail"><h4>Active SSE streams<button id="streams-detail-close">close</button></h4><div class="loading" style="padding: 12px;">loading…</div></div>';
+  document.getElementById('streams-detail-close').addEventListener('click', () => {
+    streamsDetailExpanded = false;
+    renderStreamsDetail();
+  });
+  try {
+    const r = await fetch('/v1/streams');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const active = j.active || [];
+    if (!active.length) {
+      $host.innerHTML =
+        '<div class="streams-detail">'
+        + '<h4>Active SSE streams<button id="streams-detail-close">close</button></h4>'
+        + '<div class="empty" style="padding: 12px;">no active streams · '
+        + (j.opened_total || 0) + ' total opened since bridge start</div>'
+        + '</div>';
+      document.getElementById('streams-detail-close').addEventListener('click', () => {
+        streamsDetailExpanded = false;
+        renderStreamsDetail();
+      });
+      return;
+    }
+    const rows = active.map(s => {
+      const ageCls = s.age_secs > 300 ? ' age-very-old'
+        : s.age_secs > 60 ? ' age-old' : '';
+      const taskHash = '#/tasks?task=' + encodeURIComponent(s.task_id);
+      return '<tr class="stream-row" data-href="' + escapeHtml(taskHash) + '">'
+        + '<td>' + s.id + '</td>'
+        + '<td class="id">' + escapeHtml(s.task_id.slice(0, 12)) + '…</td>'
+        + '<td class="' + ageCls + '">' + fmtDuration(s.age_secs) + '</td>'
+        + '<td>' + s.opened_at + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML =
+      '<div class="streams-detail">'
+      + '<h4>Active SSE streams · ' + active.length + ' open · '
+        + (j.opened_total || 0) + ' opened total'
+        + '<button id="streams-detail-close">close</button></h4>'
+      + '<table><thead><tr>'
+      + '<th>id</th><th>task</th><th>age</th><th>opened_at</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>'
+      + '</div>';
+    document.getElementById('streams-detail-close').addEventListener('click', () => {
+      streamsDetailExpanded = false;
+      renderStreamsDetail();
+    });
+    $host.querySelectorAll('.stream-row').forEach(tr => {
+      tr.addEventListener('click', () => {
+        window.location.hash = tr.dataset.href;
+      });
+    });
+  } catch (e) {
+    $host.innerHTML =
+      '<div class="streams-detail">'
+      + '<h4>Active SSE streams<button id="streams-detail-close">close</button></h4>'
+      + '<div class="error" style="margin: 8px 0;">load failed: ' + escapeHtml(String(e)) + '</div>'
+      + '</div>';
+    document.getElementById('streams-detail-close').addEventListener('click', () => {
+      streamsDetailExpanded = false;
+      renderStreamsDetail();
+    });
+  }
+}
 
 function enterOverview() {
   // Paint from cache instantly if we have data; refreshOverview
