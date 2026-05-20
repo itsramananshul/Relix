@@ -505,13 +505,96 @@ fn parse_attempts(body: &str) -> Vec<AttemptRow> {
         .collect()
 }
 
+/// Build a one-line operator synopsis from the parsed task header
+/// fields. The synopsis is the first thing rendered in pretty mode
+/// so operators triaging in bulk can see "what state is this in" at
+/// a glance without scrolling.
+///
+/// Returns `None` when the inputs are too sparse to produce a
+/// meaningful summary (e.g. malformed task body).
+fn build_summary(header: &TaskHeader<'_>) -> Option<String> {
+    let status = header.status?;
+    let mut parts: Vec<String> = vec![format!("status={status}")];
+    if let Some(n) = header.attempt_count {
+        parts.push(format!("attempts={n}"));
+    }
+    if let (Some(start), Some(end)) = (header.started_at, header.updated_at)
+        && matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+        && end >= start
+    {
+        parts.push(format!("duration={}s", end - start));
+    } else if let Some(start) = header.started_at
+        && status == "running"
+    {
+        parts.push(format!("started={start}"));
+    }
+    if let Some(fc) = header.last_failure_class {
+        parts.push(format!("failure={fc}"));
+    }
+    if let Some(rp) = header.retry_policy
+        && rp != "none"
+    {
+        if let Some(max) = header.max_retries {
+            let count = header.retry_count.unwrap_or(0);
+            parts.push(format!("retries={count}/{max}({rp})"));
+        } else {
+            parts.push(format!("retry_policy={rp}"));
+        }
+    }
+    Some(format!("summary: {}", parts.join("  ")))
+}
+
+/// Lightweight view of the header fields the pretty renderer
+/// references. Lives as a borrowed projection of the raw `task.get`
+/// body so we don't pull `serde` in for one-shot parsing.
+#[derive(Default)]
+struct TaskHeader<'a> {
+    status: Option<&'a str>,
+    attempt_count: Option<i64>,
+    started_at: Option<i64>,
+    updated_at: Option<i64>,
+    last_failure_class: Option<&'a str>,
+    retry_policy: Option<&'a str>,
+    retry_count: Option<i64>,
+    max_retries: Option<i64>,
+}
+
+fn parse_header(raw: &str) -> TaskHeader<'_> {
+    let mut h = TaskHeader::default();
+    for line in raw.lines() {
+        if let Some(v) = line.strip_prefix("status=") {
+            h.status = Some(v);
+        } else if let Some(v) = line.strip_prefix("attempt_count=") {
+            h.attempt_count = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("started_at=") {
+            h.started_at = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("updated_at=") {
+            h.updated_at = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("last_failure_class=") {
+            h.last_failure_class = Some(v);
+        } else if let Some(v) = line.strip_prefix("retry_policy=") {
+            h.retry_policy = Some(v);
+        } else if let Some(v) = line.strip_prefix("retry_count=") {
+            h.retry_count = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("max_retries=") {
+            h.max_retries = v.parse().ok();
+        }
+    }
+    h
+}
+
 /// Render the Coordinator's `task.get` body together with an
 /// optional `task.attempts` response. Adds an "attempts:" block
 /// between the header callouts and the chronology when at least one
 /// attempt exists.
 fn render_pretty_task_with_attempts(raw: &str, attempts_body: Option<&str>) -> String {
     let attempts = attempts_body.map(parse_attempts).unwrap_or_default();
-    let base = render_pretty_task(raw);
+    let mut base = render_pretty_task(raw);
+    // C2d.1: prepend a one-line operator synopsis so the first thing
+    // an operator sees is the answer to "what state is this in?".
+    if let Some(summary) = build_summary(&parse_header(raw)) {
+        base = format!("{summary}\n\n{base}");
+    }
     if attempts.is_empty() {
         return base;
     }
@@ -1048,6 +1131,43 @@ mod tests {
         // still gate on state/budget; the CLI only adds opinion to
         // KNOWN-bad classes.
         assert!(!retry_blocked_by_class("brand_new_class"));
+    }
+
+    #[test]
+    fn summary_line_for_completed_task_shows_duration() {
+        let raw = "task_id=x\nstatus=completed\nstarted_at=1700000000\nupdated_at=1700000012\nattempt_count=1\nevents=[]\n";
+        let pretty = render_pretty_task_with_attempts(raw, Some(""));
+        let first = pretty.lines().next().unwrap();
+        assert!(first.starts_with("summary:"), "got: {first}");
+        assert!(first.contains("status=completed"));
+        assert!(first.contains("attempts=1"));
+        assert!(first.contains("duration=12s"));
+    }
+
+    #[test]
+    fn summary_line_for_running_task_shows_started_not_duration() {
+        let raw = "task_id=x\nstatus=running\nstarted_at=1700000000\nupdated_at=1700000050\nattempt_count=1\nevents=[]\n";
+        let pretty = render_pretty_task_with_attempts(raw, Some(""));
+        let first = pretty.lines().next().unwrap();
+        assert!(first.contains("status=running"));
+        assert!(first.contains("started=1700000000"));
+        assert!(!first.contains("duration="));
+    }
+
+    #[test]
+    fn summary_line_includes_failure_and_retry_budget() {
+        let raw = "task_id=x\nstatus=failed\nstarted_at=1700000000\nupdated_at=1700000005\nattempt_count=2\nretry_policy=bounded\nretry_count=1\nmax_retries=3\nlast_failure_class=transient\nevents=[]\n";
+        let pretty = render_pretty_task_with_attempts(raw, Some(""));
+        let first = pretty.lines().next().unwrap();
+        assert!(first.contains("failure=transient"));
+        assert!(first.contains("retries=1/3(bounded)"));
+    }
+
+    #[test]
+    fn summary_line_omitted_when_status_missing() {
+        let raw = "task_id=x\nevents=[]\n";
+        let pretty = render_pretty_task_with_attempts(raw, Some(""));
+        assert!(!pretty.starts_with("summary:"));
     }
 
     #[test]
