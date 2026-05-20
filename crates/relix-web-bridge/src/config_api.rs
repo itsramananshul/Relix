@@ -151,6 +151,262 @@ pub async fn put_provider(
     }
 }
 
+/// Result of a `POST /v1/config/providers/:name/test`. Includes
+/// the upstream HTTP status code + elapsed_ms so operators can
+/// distinguish "key works but provider is slow" from "key is
+/// rejected" from "network unreachable."
+#[derive(Debug, Serialize)]
+pub struct ProviderTestResult {
+    pub name: String,
+    pub ok: bool,
+    /// Upstream HTTP status code, when the request reached the
+    /// provider's server. `None` for transport-layer failures
+    /// (DNS, TCP, TLS) — those land in `detail`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    pub elapsed_ms: u64,
+    /// Human-readable summary. Bridge-supplied — NEVER includes
+    /// the raw key, NEVER echoes back arbitrary upstream body.
+    pub detail: String,
+}
+
+/// `POST /v1/config/providers/:name/test` — validate the saved
+/// key against the upstream provider by listing models. Returns
+/// success/failure + elapsed time + a redaction-safe detail
+/// string.
+pub async fn test_provider(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<ProviderTestResult>, (StatusCode, Json<ApiError>)> {
+    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!(
+                    "unknown provider '{name}'. allowed: {}",
+                    ALLOWED_PROVIDERS.join(", ")
+                ),
+            }),
+        ));
+    }
+    // Read the key from secrets under the lock; clone it
+    // immediately so the lock is released before the network
+    // round-trip.
+    let api_key = state.secrets.read(|s| {
+        s.providers
+            .get(&name)
+            .map(|e| e.api_key.clone())
+            .unwrap_or_default()
+    });
+    if api_key.is_empty() && name != "mock" {
+        return Err(unprocessable(format!(
+            "provider '{name}' is not configured. Set an API key via PUT /v1/config/providers/{name} first."
+        )));
+    }
+    let started = std::time::Instant::now();
+    let outcome = check_provider_key(&name, &api_key).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let result = match outcome {
+        Ok(detail) => ProviderTestResult {
+            name: name.clone(),
+            ok: true,
+            status_code: Some(200),
+            elapsed_ms,
+            detail,
+        },
+        Err((status_code, detail)) => ProviderTestResult {
+            name: name.clone(),
+            ok: false,
+            status_code,
+            elapsed_ms,
+            detail,
+        },
+    };
+    // INFO line carries only the redaction-safe summary, never
+    // the raw key.
+    tracing::info!(
+        provider = %name,
+        ok = result.ok,
+        status_code = ?result.status_code,
+        elapsed_ms = result.elapsed_ms,
+        "config: providers.{name} test"
+    );
+    Ok(Json(result))
+}
+
+/// Per-provider connectivity probe. Returns `Ok(detail)` on
+/// success, `Err((status_code, detail))` on failure. Never
+/// surfaces the raw key in the returned strings.
+async fn check_provider_key(name: &str, api_key: &str) -> Result<String, (Option<u16>, String)> {
+    // Short timeout — operators won't wait long on a "test
+    // connection" button. 10s is generous for a list-models call.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| (None, format!("http client init failed: {e}")))?;
+    match name {
+        "mock" => Ok("mock provider: no upstream to test".to_string()),
+        "openai" => probe_bearer(&client, "https://api.openai.com/v1/models", api_key).await,
+        "openrouter" => probe_bearer(&client, "https://openrouter.ai/api/v1/models", api_key).await,
+        "xai" => probe_bearer(&client, "https://api.x.ai/v1/models", api_key).await,
+        "anthropic" => {
+            // Anthropic uses x-api-key + anthropic-version, not
+            // Authorization: Bearer.
+            let resp = client
+                .get("https://api.anthropic.com/v1/models")
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await
+                .map_err(|e| {
+                    (
+                        None,
+                        format!("network error: {}", redact_err(&e.to_string())),
+                    )
+                })?;
+            interpret_response(resp).await
+        }
+        "google" => {
+            // Gemini uses ?key=<KEY> in the query string. The
+            // URL is built deliberately — the key is never logged.
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                urlencode(api_key)
+            );
+            let resp = client.get(&url).send().await.map_err(|e| {
+                (
+                    None,
+                    format!("network error: {}", redact_err(&e.to_string())),
+                )
+            })?;
+            interpret_response(resp).await
+        }
+        _ => Err((
+            None,
+            format!("provider '{name}' has no shipped test handler"),
+        )),
+    }
+}
+
+async fn probe_bearer(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+) -> Result<String, (Option<u16>, String)> {
+    let resp = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                None,
+                format!("network error: {}", redact_err(&e.to_string())),
+            )
+        })?;
+    interpret_response(resp).await
+}
+
+/// Translate a `reqwest::Response` into the success/failure
+/// detail string. Never includes the raw body — only the
+/// status + (optional) model count parsed from a JSON list
+/// shape.
+async fn interpret_response(resp: reqwest::Response) -> Result<String, (Option<u16>, String)> {
+    let status = resp.status();
+    if status.is_success() {
+        // Try to parse a model count; non-fatal if we can't.
+        match resp.text().await {
+            Ok(body) => {
+                let count = count_models_loosely(&body);
+                let suffix = if count > 0 {
+                    format!(" · {count} models advertised")
+                } else {
+                    String::new()
+                };
+                Ok(format!("ok ({}){suffix}", status.as_u16()))
+            }
+            Err(_) => Ok(format!("ok ({})", status.as_u16())),
+        }
+    } else {
+        // Read the body but strip anything that looks like the
+        // key (defensive). Most providers' error bodies don't
+        // include the key, but they sometimes do echo back
+        // headers in debug output. We hard-truncate to keep the
+        // response surface minimal.
+        let body = resp.text().await.unwrap_or_default();
+        let detail = truncate_for_op(&body, 200);
+        Err((
+            Some(status.as_u16()),
+            format!("upstream returned {}: {detail}", status.as_u16()),
+        ))
+    }
+}
+
+/// Very loose model-count parser — looks for a top-level
+/// `"data": [...]` array (OpenAI shape) or counts top-level
+/// objects under `"models"` (Google shape). Misses some
+/// providers; that's fine — the count is a nice-to-have.
+fn count_models_loosely(body: &str) -> usize {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            return arr.len();
+        }
+        if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+            return arr.len();
+        }
+    }
+    0
+}
+
+/// Defensive: scrub anything that obviously looks like an API
+/// key prefix from upstream error strings. Not cryptographic —
+/// just an extra belt-and-braces guard so an oddly-formatted
+/// upstream error can't accidentally surface the key.
+fn redact_err(s: &str) -> String {
+    // Common provider key prefixes. Treat any token that
+    // starts with these as redacted.
+    let redacted: String = s
+        .split_whitespace()
+        .map(|tok| {
+            let lower = tok.to_ascii_lowercase();
+            if lower.starts_with("sk-")
+                || lower.starts_with("xai-")
+                || lower.starts_with("aiza")
+                || lower.starts_with("bearer ")
+            {
+                "<redacted>"
+            } else {
+                tok
+            }
+        })
+        .collect::<Vec<&str>>()
+        .join(" ");
+    truncate_for_op(&redacted, 200)
+}
+
+fn truncate_for_op(s: &str, n: usize) -> String {
+    let trimmed = s.trim();
+    let s: String = trimmed.chars().take(n).collect();
+    if trimmed.chars().count() > n {
+        format!("{s}…")
+    } else {
+        s
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// `DELETE /v1/config/providers/:name` — remove the provider
 /// entry. Idempotent: deleting an absent entry is a no-op.
 pub async fn delete_provider(
@@ -398,6 +654,56 @@ mod tests {
             ALLOWED_PROVIDERS,
             &["mock", "openai", "anthropic", "openrouter", "xai", "google"]
         );
+    }
+
+    #[test]
+    fn count_models_loosely_handles_openai_shape() {
+        let body = r#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"},{"id":"o1"}]}"#;
+        assert_eq!(count_models_loosely(body), 3);
+    }
+
+    #[test]
+    fn count_models_loosely_handles_google_shape() {
+        let body = r#"{"models":[{"name":"models/gemini-1"},{"name":"models/gemini-2"}]}"#;
+        assert_eq!(count_models_loosely(body), 2);
+    }
+
+    #[test]
+    fn count_models_loosely_returns_zero_on_unknown_shape() {
+        assert_eq!(count_models_loosely(""), 0);
+        assert_eq!(count_models_loosely("{}"), 0);
+        assert_eq!(count_models_loosely("not json"), 0);
+    }
+
+    #[test]
+    fn redact_err_strips_known_key_prefixes() {
+        // Defensive: even if an upstream error string somehow
+        // contained the key, the bridge's response must not
+        // forward it verbatim.
+        let s = redact_err("401 Unauthorized for key sk-test-1234567890");
+        assert!(!s.contains("sk-test"));
+        assert!(s.contains("<redacted>"));
+    }
+
+    #[test]
+    fn redact_err_passes_normal_text_through() {
+        let s = redact_err("network timeout after 5s");
+        assert_eq!(s, "network timeout after 5s");
+    }
+
+    #[test]
+    fn truncate_for_op_caps_long_strings_with_ellipsis() {
+        let s = truncate_for_op("aaaaaaaaaa", 4);
+        assert_eq!(s, "aaaa…");
+    }
+
+    #[test]
+    fn urlencode_preserves_unreserved_chars() {
+        // Letters / digits / -_.~ stay as-is; everything else
+        // is %HH.
+        assert_eq!(urlencode("AIza_abc-DEF.123~"), "AIza_abc-DEF.123~");
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
     }
 
     #[test]

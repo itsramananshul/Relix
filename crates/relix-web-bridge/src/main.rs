@@ -235,6 +235,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .delete(config_api::delete_provider),
         )
         .route(
+            "/v1/config/providers/:name/test",
+            post(config_api::test_provider),
+        )
+        .route(
             "/v1/config/telegram",
             get(config_api::get_telegram).put(config_api::put_telegram),
         )

@@ -39,3 +39,4 @@ blake3.workspace             = true
 futures.workspace            = true
 async-stream.workspace       = true
 time.workspace               = true
+reqwest.workspace            = true

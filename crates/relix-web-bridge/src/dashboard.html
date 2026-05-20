@@ -2056,6 +2056,9 @@ function renderProviderCard(p) {
     + '</div>'
     + '<div class="actions">'
     +   '<button class="btn-primary" data-action="save" data-name="' + escapeHtml(p.name) + '">Save</button>'
+    +   (p.configured
+        ? '<button data-action="test" data-name="' + escapeHtml(p.name) + '">Test connection</button>'
+        : '')
     +   deleteBtn
     +   '<span class="action-status" data-role="status"></span>'
     + '</div>'
@@ -2107,6 +2110,29 @@ function wireProviderCard(name) {
         replaceProviderCard(body);
       } catch (e) {
         setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+      }
+    });
+  }
+  const $test = card.querySelector('[data-action="test"]');
+  if ($test) {
+    $test.addEventListener('click', async () => {
+      $test.disabled = true;
+      setProviderStatus($status, 'testing…');
+      try {
+        const r = await fetch('/v1/config/providers/' + encodeURIComponent(name) + '/test', {
+          method: 'POST',
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+        const kind = body.ok ? 'ok' : 'error';
+        const msg = (body.ok ? '✓ ' : '✗ ')
+          + (body.detail || '')
+          + ' · ' + body.elapsed_ms + 'ms';
+        setProviderStatus($status, msg, kind);
+      } catch (e) {
+        setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+      } finally {
+        $test.disabled = false;
       }
     });
   }
