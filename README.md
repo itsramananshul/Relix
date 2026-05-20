@@ -152,6 +152,7 @@ Start here, in this order:
 - [`docs/getting-started.md`](docs/getting-started.md) — install, boot, first chat, Open WebUI hookup, first `tool.web_fetch`.
 - [`docs/architecture.md`](docs/architecture.md) — peer model, request flows, the admission pipeline, why the bridge is not an orchestrator.
 - [`docs/operator-guide.md`](docs/operator-guide.md) — running the mesh, logs, troubleshooting, common failure modes.
+- [`docs/failure-modes.md`](docs/failure-modes.md) — single-page reference for "what happens when X is down": detection signals, bridge behavior, recovery steps for every component.
 - [`docs/deployment.md`](docs/deployment.md) — local / multi-node / production-readiness modes, mandatory hardening before public exposure, topology diagram, Open WebUI + Telegram integration.
 - [`docs/flows-and-sol.md`](docs/flows-and-sol.md) — what SOL is and isn't, how `remote_call` works, how to write a new flow.
 - [`docs/security.md`](docs/security.md) — identities, policy, audit, what the alpha guarantees and what it doesn't.

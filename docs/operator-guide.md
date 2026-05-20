@@ -537,7 +537,9 @@ See also: [`docs/coordinator.md`](coordinator.md),
 [`docs/runtime-lifecycle.md`](runtime-lifecycle.md),
 [`docs/interruption-semantics.md`](interruption-semantics.md),
 [`docs/retry-model.md`](retry-model.md),
-[`docs/replay-model.md`](replay-model.md).
+[`docs/replay-model.md`](replay-model.md),
+[`docs/failure-modes.md`](failure-modes.md) —
+single-page "what happens when X is down" reference for on-call use.
 
 ### Chronicle retention (save + plan, no destructive deletion yet)
 
