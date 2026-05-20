@@ -86,6 +86,7 @@
 //! | `task.event`    | `task_id\|event_type\|payload` | `event_id` (integer as string) |
 //! | `task.get`      | `task_id` | multi-line `key=value` summary + `events:` JSON array |
 //! | `task.list`     | `` (empty) or `limit\|offset\|status` (limit default 50, all optional) | one `task_id\tstatus\ttitle\n` per line |
+//! | `task.list_cursor` | `` (empty) or `limit\|status\|cursor` (cursor = `<updated_at>:<task_id>`; empty = first page) | rows + `next_cursor=<value>\n` trailer; stable under concurrent writes |
 //! | `task.count`    | `` (empty) or `<status>` | `count=N\n` |
 //! | `task.events`   | `task_id\|after_id\|limit\|type\|order` (after_id default 0, limit default 200, type empty = no filter, order in {asc, desc}, default asc) | one JSON event per line (`{"id":N,"ts":N,"type":"...","payload":"..."}`) |
 //! | `task.recover`  | (empty) | one `task_id\n` per recovered task, then `recovered=N\n` |
@@ -1121,6 +1122,102 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// Cursor-based pagination over the same `tasks` ordering as
+    /// `list_paginated` (most-recently-updated first), but stable
+    /// under concurrent inserts and updates. The cursor is the
+    /// `(updated_at, task_id)` of the last row of the prior page;
+    /// rows with the same `updated_at` are tie-broken by
+    /// `task_id DESC` so two snapshots taken during a write burst
+    /// never see the same row twice on adjacent pages and never
+    /// silently skip one.
+    ///
+    /// `cursor = None` returns the first page; subsequent calls
+    /// pass the `next_cursor` from the previous response. Empty
+    /// `items` means the cursor has walked off the end (or the
+    /// filter has no matches).
+    ///
+    /// `limit` is clamped to `[1, max_list]`.
+    ///
+    /// `status_filter` matches exactly when set; uses the existing
+    /// `tasks_status` index.
+    pub fn list_cursor(
+        &self,
+        cursor: Option<TaskCursor>,
+        limit: usize,
+        status_filter: Option<&str>,
+    ) -> Result<TaskPage, CoordinatorError> {
+        let cap = limit.clamp(1, self.max_list);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // Materialise four SQL strings rather than runtime-
+        // substituting identifiers. Same pattern as query_events.
+        let (sql, args): (&str, Vec<rusqlite::types::Value>) =
+            match (cursor.as_ref(), status_filter) {
+                (None, None) => (
+                    "SELECT task_id, title, status, updated_at
+                     FROM tasks
+                     ORDER BY updated_at DESC, task_id DESC
+                     LIMIT ?1",
+                    vec![(cap as i64).into()],
+                ),
+                (None, Some(s)) => (
+                    "SELECT task_id, title, status, updated_at
+                     FROM tasks
+                     WHERE status = ?2
+                     ORDER BY updated_at DESC, task_id DESC
+                     LIMIT ?1",
+                    vec![(cap as i64).into(), s.to_string().into()],
+                ),
+                (Some(c), None) => (
+                    "SELECT task_id, title, status, updated_at
+                     FROM tasks
+                     WHERE (updated_at < ?2)
+                        OR (updated_at = ?2 AND task_id < ?3)
+                     ORDER BY updated_at DESC, task_id DESC
+                     LIMIT ?1",
+                    vec![
+                        (cap as i64).into(),
+                        c.updated_at.into(),
+                        c.task_id.clone().into(),
+                    ],
+                ),
+                (Some(c), Some(s)) => (
+                    "SELECT task_id, title, status, updated_at
+                     FROM tasks
+                     WHERE status = ?4
+                       AND ((updated_at < ?2)
+                            OR (updated_at = ?2 AND task_id < ?3))
+                     ORDER BY updated_at DESC, task_id DESC
+                     LIMIT ?1",
+                    vec![
+                        (cap as i64).into(),
+                        c.updated_at.into(),
+                        c.task_id.clone().into(),
+                        s.to_string().into(),
+                    ],
+                ),
+            };
+        let mut stmt = conn.prepare(sql).map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(TaskSummary {
+                    task_id: r.get(0)?,
+                    title: r.get(1)?,
+                    status: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut items = Vec::with_capacity(cap);
+        for r in rows {
+            items.push(r.map_err(CoordinatorError::Db)?);
+        }
+        let next_cursor = items.last().map(|r| TaskCursor {
+            updated_at: r.updated_at,
+            task_id: r.task_id.clone(),
+        });
+        Ok(TaskPage { items, next_cursor })
+    }
+
     /// Total task count, optionally filtered by status. Drives
     /// pagination "total" hints for operator tooling that wants to
     /// render "N of M" without walking every page.
@@ -1192,6 +1289,49 @@ pub struct TaskSummary {
     pub title: String,
     pub status: String,
     pub updated_at: i64,
+}
+
+/// Cursor for [`TaskStore::list_cursor`]. Encodes the
+/// `(updated_at, task_id)` of the last row of the prior page so
+/// subsequent pages skip exactly past it. Wire-serialised as
+/// `<updated_at>:<task_id>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskCursor {
+    pub updated_at: i64,
+    pub task_id: String,
+}
+
+impl TaskCursor {
+    /// Encode for the wire (`<updated_at>:<task_id>`).
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.updated_at, self.task_id)
+    }
+
+    /// Parse the wire form. Returns `None` on malformed input;
+    /// callers treat that as "start from the beginning" rather
+    /// than failing the request, which keeps polling dashboards
+    /// resilient to corrupted cursor state.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (ts, tid) = s.split_once(':')?;
+        let updated_at = ts.parse().ok()?;
+        if tid.is_empty() {
+            return None;
+        }
+        Some(Self {
+            updated_at,
+            task_id: tid.to_string(),
+        })
+    }
+}
+
+/// One page of cursor-paginated tasks. `next_cursor = None` only
+/// when the page itself was empty; callers know the cursor walked
+/// off the end by getting back `TaskPage { items: [], .. }` on the
+/// next call.
+#[derive(Debug, Clone)]
+pub struct TaskPage {
+    pub items: Vec<TaskSummary>,
+    pub next_cursor: Option<TaskCursor>,
 }
 
 /// One execution attempt of a Task, returned by `task.attempts` and
@@ -1318,6 +1458,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_events(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.list_cursor",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_list_cursor(&s, &ctx) }
             })),
         );
     }
@@ -1579,6 +1729,64 @@ fn handle_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         }
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.events: not found: {id}")),
         Err(e) => internal(format!("task.events: {e}")),
+    }
+}
+
+/// `task.list_cursor` — cursor-paginated task list. Stable
+/// against concurrent inserts/updates (unlike offset pagination,
+/// which can repeat or skip rows when ordering ties shift). The
+/// returned tail line `next_cursor=<value>` is opaque to the
+/// caller — pass it back verbatim on the next request.
+///
+/// Wire format: `limit|status|cursor`. All three optional. Cursor
+/// is `<updated_at>:<task_id>`; empty cursor returns the first
+/// page. Malformed cursor is treated as empty so dashboards
+/// recover from corrupted state without a 4xx.
+///
+/// Response: one tab-delimited row per task
+/// (`task_id\tstatus\ttitle\tupdated_at`), followed by
+/// `next_cursor=<value>\n` (empty value when the page was empty).
+fn handle_list_cursor(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.list_cursor utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let limit: usize = parts
+        .first()
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let status_filter = parts.get(1).copied().filter(|v| !v.is_empty());
+    let cursor = parts
+        .get(2)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(TaskCursor::parse);
+    match store.list_cursor(cursor, limit, status_filter) {
+        Ok(page) => {
+            let mut buf = String::new();
+            for r in &page.items {
+                buf.push_str(&r.task_id);
+                buf.push('\t');
+                buf.push_str(&r.status);
+                buf.push('\t');
+                let title = r.title.replace(['\t', '\n'], " ");
+                buf.push_str(&title);
+                buf.push('\t');
+                buf.push_str(&r.updated_at.to_string());
+                buf.push('\n');
+            }
+            let next = page
+                .next_cursor
+                .as_ref()
+                .map(TaskCursor::encode)
+                .unwrap_or_default();
+            buf.push_str(&format!("next_cursor={next}\n"));
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("task.list_cursor: {e}")),
     }
 }
 
@@ -3039,6 +3247,148 @@ mod tests {
             Err(CoordinatorError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    // ── Phase S1: cursor pagination ───────────────────────────────────
+
+    #[test]
+    fn list_cursor_first_page_has_no_input_cursor() {
+        let s = store();
+        for i in 0..5 {
+            mk(&s, &format!("t{i}"), "f", "{}", "o");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let page = s.list_cursor(None, 3, None).unwrap();
+        assert_eq!(page.items.len(), 3);
+        // next_cursor is the last row of THIS page.
+        let last = page.items.last().unwrap();
+        let c = page.next_cursor.expect("non-empty page must yield cursor");
+        assert_eq!(c.updated_at, last.updated_at);
+        assert_eq!(c.task_id, last.task_id);
+    }
+
+    #[test]
+    fn list_cursor_walks_pages_without_duplicates_or_skips() {
+        let s = store();
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            ids.push(mk(&s, &format!("t{i}"), "f", "{}", "o"));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        loop {
+            let page = s.list_cursor(cursor.clone(), 3, None).unwrap();
+            if page.items.is_empty() {
+                break;
+            }
+            for r in &page.items {
+                seen.push(r.task_id.clone());
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(seen.len(), 10);
+        // No duplicates.
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 10);
+        // All 10 created ids are present.
+        for tid in &ids {
+            assert!(seen.contains(tid), "task {tid} missing from cursor walk");
+        }
+    }
+
+    #[test]
+    fn list_cursor_stable_under_concurrent_inserts() {
+        // After getting page 1, insert new rows that bump the
+        // ordering. Page 2 (cursor-based) must NOT show rows that
+        // appeared at the top of the ordering AFTER page 1 was
+        // taken. (Offset-based pagination would have shown / hidden
+        // duplicates here; the cursor pins the snapshot.)
+        let s = store();
+        let mut original_ids = Vec::new();
+        for i in 0..6 {
+            original_ids.push(mk(&s, &format!("orig{i}"), "f", "{}", "o"));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let page1 = s.list_cursor(None, 3, None).unwrap();
+        assert_eq!(page1.items.len(), 3);
+        // Simulate concurrent activity: new rows + an update bumping
+        // an original row's updated_at to "now".
+        for i in 0..3 {
+            mk(&s, &format!("new{i}"), "f", "{}", "o");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Bump one of the original rows.
+        s.update(
+            &original_ids[0],
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let page2 = s.list_cursor(page1.next_cursor.clone(), 100, None).unwrap();
+        // Original tasks orig0..orig5 minus the 3 we saw on page 1
+        // should appear, plus orig0 should NOT reappear (its
+        // updated_at jumped above the cursor's, so the WHERE clause
+        // filters it out — exactly the stable-snapshot contract).
+        let page1_ids: std::collections::HashSet<String> =
+            page1.items.iter().map(|r| r.task_id.clone()).collect();
+        let page2_ids: std::collections::HashSet<String> =
+            page2.items.iter().map(|r| r.task_id.clone()).collect();
+        let overlap: Vec<&String> = page1_ids.intersection(&page2_ids).collect();
+        assert!(
+            overlap.is_empty(),
+            "cursor pagination duplicated rows: {overlap:?}"
+        );
+    }
+
+    #[test]
+    fn list_cursor_with_status_filter() {
+        let s = store();
+        let t1 = mk(&s, "a", "f", "{}", "o");
+        let _t2 = mk(&s, "b", "f", "{}", "o");
+        let t3 = mk(&s, "c", "f", "{}", "o");
+        s.update(&t1, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&t3, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let page = s.list_cursor(None, 100, Some("running")).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert!(page.items.iter().all(|r| r.status == "running"));
+    }
+
+    #[test]
+    fn list_cursor_empty_page_returns_none_cursor() {
+        let s = store();
+        let page = s.list_cursor(None, 10, None).unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn task_cursor_encode_parse_roundtrip() {
+        let c = TaskCursor {
+            updated_at: 1_700_000_000,
+            task_id: "0123456789abcdef0123456789abcdef".into(),
+        };
+        let s = c.encode();
+        let back = TaskCursor::parse(&s).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn task_cursor_parse_malformed_is_none() {
+        assert!(TaskCursor::parse("").is_none());
+        assert!(TaskCursor::parse("nocolon").is_none());
+        assert!(TaskCursor::parse(":onlyid").is_none());
+        assert!(TaskCursor::parse("123:").is_none());
+        assert!(TaskCursor::parse("notanumber:abc").is_none());
     }
 
     // ── Priority A (continuation): chronicle ergonomics ───────────────

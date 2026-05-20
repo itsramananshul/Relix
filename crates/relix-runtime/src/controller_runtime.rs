@@ -412,6 +412,13 @@ fn register_node_type_handlers(
                 &["task", "read"],
             ),
             (
+                "task.list_cursor",
+                "Cursor-paginated task list. Stable under concurrent \
+                 inserts/updates; rows are not repeated or skipped \
+                 across pages.",
+                &["task", "read", "cursor"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
