@@ -338,8 +338,42 @@ page.
 | M23 | ✅ | Server-side lifecycle event log — `/v1/topology/events` with joins / freshness / drops ring (cap 500). |
 | M24 | ✅ | Topology page surfaces the lifecycle log as a Recent transitions card. |
 | M25 | ✅ | Per-stream tracking — `ActiveStream { id, task_id, opened_at }`, `/v1/streams` endpoint, live-streams KPI shows watching ids. |
+| M26 | ✅ | Retry chain visualization — horizontal pills + inter-attempt gap markers + outcome summary. |
+| M27 | ✅ | Cross-reference panel — trace_id + flow_id + flow_log_path + copy-to-clipboard + CLI command templates. |
+| M28 | ✅ | Topology correlation for interrupted/failed tasks — ±30s lifecycle events near the task's failure window. Labeled "Correlation, not causation". |
+| M29 | ✅ | Failure breakdown panel — class badge + cause + class-specific operator suggestion (sourced from `docs/retry-model.md`). |
+| M30 | ✅ | Runtime anomaly banner on overview — peer flips + task failures + expired peers in last 5 min, elevated / high level escalation. |
+| M31 | ✅ | Topology graph activity overlay — ripple + dashed ring per peer with a transition in the last 30s. Distinct from the continuous expired pulse. |
+| M32 | ✅ | Latency time-budget bar — stacked horizontal bar under the retry chain, segment width proportional to duration share. |
 
 Each milestone is its own commit + push, per the directive.
+
+## Phase-1C causality stack (per task detail)
+
+The task detail panel reads top-down as a causality story:
+
+1. **Summary row** — current status, attempt count, duration.
+2. **Retry chain pills** (M26) — sequence of attempts with
+   inter-attempt waits.
+3. **Latency time-budget bar** (M32) — where the wall-clock
+   actually went.
+4. **Failure breakdown panel** (M29) — when failed/interrupted/
+   cancelled: class + cause + suggested next step.
+5. **Topology correlation panel** (M28) — when failed/interrupted:
+   mesh events that happened in the ±30s window around the failure.
+6. **Attempts table** — raw per-attempt rows for forensics.
+7. **Execution timeline** (M20) — full chronicle as vertical
+   marker track, grouped by attempt.
+8. **Cross-references panel** (M27) — task_id / trace_id /
+   flow_id with copy buttons + CLI command templates for
+   per-flow event log + per-node audit drill-in.
+
+Every surface derives from real runtime state. No invented
+causality, no fake AI reasoning. The "why" answers come
+from class taxonomies (M29 mapping to retry-model.md), from
+correlation with lifecycle events (M28), from the actual
+attempt + gap timing (M26 + M32) — never from synthesized
+narratives.
 
 ## URL conventions
 
