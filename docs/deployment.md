@@ -227,6 +227,53 @@ To enable in production once implemented:
    `create/update/event`).
 5. Start the channel controller alongside the others.
 
+## Chronicle retention on long-running deployments
+
+Every chat hits the Coordinator's `task_events` table at
+least five times; long-running deployments accumulate
+millions of rows. The retention design + currently-shipped
+tooling is in
+[`chronicle-retention.md`](chronicle-retention.md).
+
+What ships today (Phase 1):
+
+- **Save before deleting** — `relix-cli task export
+  --task-id ID --out FILE` or the dashboard's per-task
+  **Export** button writes a single-JSON archival
+  artifact (header + every attempt + every chronicle
+  event). Pipe to `gzip` for long-term storage.
+- **Plan before any future deletion** — `relix-cli task
+  compact --max-age-secs N` or the dashboard's
+  **Chronicle retention** widget counts what *would*
+  be deleted under a max-age policy, broken down by
+  parent task status. Honours the R5 invariant
+  (terminal-state tasks only, never in-flight).
+
+What does NOT ship today: destructive deletion of
+chronicle rows. The dry-run counter exists so operators
+can plan an archival policy now (e.g. nightly job that
+exports tasks older than 30 days before any future
+compaction lands). The destructive Step 3 capability
+lands behind operator confirmation per the design.
+
+Operator recipe for a nightly archive job (POSIX):
+
+```bash
+#!/usr/bin/env bash
+# Export every task completed/failed/cancelled more than
+# 30 days ago. Replace the curl URL + identity with
+# your bridge / CLI path.
+set -euo pipefail
+out_dir="/var/relix/archive/$(date +%Y-%m-%d)"
+mkdir -p "$out_dir"
+# 1. Dry-run to see what's eligible.
+curl -fsS "http://127.0.0.1:19791/v1/tasks/compact_events?max_age_secs=2592000" \
+    | tee "$out_dir/candidates.json"
+# 2. Iterate over candidate tasks and export each.
+#    Drive task ids from your own bookkeeping or
+#    /v1/tasks/cursor with the right status filter.
+```
+
 ## What's NOT supported
 
 Honest list of out-of-scope items:
