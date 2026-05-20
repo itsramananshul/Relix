@@ -1779,15 +1779,9 @@ fn handle_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     };
     match store.query_events(task_id, after_id, limit, type_filter, order) {
         Ok(events) => {
-            let mut buf = String::with_capacity(events.len() * 96);
+            let mut buf = String::with_capacity(events.len() * 128);
             for ev in &events {
-                buf.push_str(&format!(
-                    r#"{{"id":{},"ts":{},"type":"{}","payload":"{}"}}"#,
-                    ev.event_id,
-                    ev.ts,
-                    json_escape(&ev.event_type),
-                    json_escape(&ev.payload),
-                ));
+                buf.push_str(&render_event_json(ev));
                 buf.push('\n');
             }
             HandlerOutcome::Ok(buf.into_bytes())
@@ -2025,23 +2019,54 @@ fn render_task_view(v: &TaskView) -> String {
     let _ = writeln!(s, "event_count={}", v.events.len());
     // Events as a simple JSON array. We hand-build the JSON to avoid
     // pulling serde_json into this hot path; payloads are escaped
-    // minimally. Operators wanting structured payloads should keep them
-    // already-encoded inside the payload string.
+    // minimally. S2-structured events also surface schema_version,
+    // attempt_id, trace_id, payload_json — older renderers that
+    // only look at id/ts/type/payload keep working since those four
+    // keys come first.
     s.push_str("events=[");
     for (i, ev) in v.events.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        let _ = write!(
-            s,
-            r#"{{"id":{},"ts":{},"type":"{}","payload":"{}"}}"#,
-            ev.event_id,
-            ev.ts,
-            json_escape(&ev.event_type),
-            json_escape(&ev.payload),
-        );
+        s.push_str(&render_event_json(ev));
     }
     s.push_str("]\n");
+    s
+}
+
+/// Hand-built JSON for one event. Used by both the chronicle
+/// inline array (`render_task_view`) and the streaming
+/// `task.events` body. Field order is stable: `id`, `ts`, `type`,
+/// `payload` come first so legacy parsers see them at predictable
+/// positions; the typed envelope keys land after, omitted entirely
+/// when null/0 so v0 events stay byte-identical to the pre-S2
+/// shape.
+fn render_event_json(ev: &TaskEvent) -> String {
+    let mut s = String::with_capacity(128);
+    s.push_str(&format!(
+        r#"{{"id":{},"ts":{},"type":"{}","payload":"{}""#,
+        ev.event_id,
+        ev.ts,
+        json_escape(&ev.event_type),
+        json_escape(&ev.payload),
+    ));
+    if ev.schema_version != 0 {
+        s.push_str(&format!(r#","schema_version":{}"#, ev.schema_version));
+    }
+    if let Some(aid) = ev.attempt_id {
+        s.push_str(&format!(r#","attempt_id":{aid}"#));
+    }
+    if let Some(t) = ev.trace_id.as_deref() {
+        s.push_str(&format!(r#","trace_id":"{}""#, json_escape(t)));
+    }
+    if let Some(pj) = ev.payload_json.as_deref() {
+        // payload_json is already valid JSON (object/array/value).
+        // Embed verbatim so consumers can parse without a double-
+        // decode step.
+        s.push_str(r#","payload_json":"#);
+        s.push_str(pj);
+    }
+    s.push('}');
     s
 }
 

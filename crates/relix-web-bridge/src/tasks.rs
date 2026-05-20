@@ -64,6 +64,24 @@ pub struct TaskEvent {
     pub ts: i64,
     pub event_type: String,
     pub payload: String,
+    /// S2 typed envelope fields. All optional so v0 events render
+    /// identically to before. `schema_version` defaults to 0 when
+    /// the Coordinator omits it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub schema_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// Embedded JSON document (already-encoded). The bridge
+    /// surfaces it verbatim so dashboards can re-parse without
+    /// double-decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<serde_json::Value>,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// One attempt row returned by `GET /v1/tasks/:id/attempts`.
@@ -508,144 +526,57 @@ fn parse_task_body(id: &str, raw: &str) -> TaskDetail {
     }
 }
 
-/// Parse the Coordinator's hand-built JSON event array. Same shape
-/// as the CLI's parser (`relix_cli::task::parse_events_array`), but
-/// duplicated here so the bridge stays independent of the CLI
-/// crate.
+/// Parse the Coordinator's JSON event array using `serde_json`.
+/// Switched from a hand-rolled brace-counter (which couldn't
+/// nest) to proper JSON parsing once events started carrying
+/// `payload_json` objects (S2). Malformed input still returns an
+/// empty Vec so a corrupted chronicle doesn't fail the whole
+/// request.
 fn parse_events_array(s: &str) -> Vec<TaskEvent> {
-    let s = s.trim();
-    let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) else {
-        return Vec::new();
-    };
-    let inner = inner.trim();
-    if inner.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut depth = 0usize;
-    let mut buf = String::new();
-    let mut in_str = false;
-    let mut esc = false;
-    for c in inner.chars() {
-        if in_str {
-            buf.push(c);
-            if esc {
-                esc = false;
-            } else if c == '\\' {
-                esc = true;
-            } else if c == '"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            '{' => {
-                depth += 1;
-                buf.push(c);
-            }
-            '}' => {
-                depth -= 1;
-                buf.push(c);
-                if depth == 0 {
-                    if let Some(obj) = parse_event_object(buf.trim()) {
-                        out.push(obj);
-                    }
-                    buf.clear();
-                }
-            }
-            ',' if depth == 0 => {}
-            '"' => {
-                in_str = true;
-                buf.push(c);
-            }
-            _ => buf.push(c),
-        }
-    }
-    out
+    serde_json::from_str::<Vec<RawEvent>>(s.trim())
+        .map(|raws| raws.into_iter().map(RawEvent::into_task_event).collect())
+        .unwrap_or_default()
 }
 
 fn parse_event_object(obj: &str) -> Option<TaskEvent> {
-    let body = obj.strip_prefix('{')?.strip_suffix('}')?;
-    let mut id: Option<i64> = None;
-    let mut ts: Option<i64> = None;
-    let mut ev_type: Option<String> = None;
-    let mut payload: Option<String> = None;
-    let mut chars = body.chars().peekable();
-    while chars.peek().is_some() {
-        while matches!(chars.peek(), Some(c) if c.is_whitespace() || *c == ',') {
-            chars.next();
-        }
-        if chars.peek().is_none() {
-            break;
-        }
-        if chars.next() != Some('"') {
-            return None;
-        }
-        let mut key = String::new();
-        for c in chars.by_ref() {
-            if c == '"' {
-                break;
-            }
-            key.push(c);
-        }
-        while matches!(chars.peek(), Some(c) if c.is_whitespace() || *c == ':') {
-            chars.next();
-        }
-        match chars.peek() {
-            Some('"') => {
-                chars.next();
-                let mut v = String::new();
-                let mut esc = false;
-                for c in chars.by_ref() {
-                    if esc {
-                        match c {
-                            'n' => v.push('\n'),
-                            'r' => v.push('\r'),
-                            't' => v.push('\t'),
-                            '"' => v.push('"'),
-                            '\\' => v.push('\\'),
-                            other => v.push(other),
-                        }
-                        esc = false;
-                    } else if c == '\\' {
-                        esc = true;
-                    } else if c == '"' {
-                        break;
-                    } else {
-                        v.push(c);
-                    }
-                }
-                match key.as_str() {
-                    "type" => ev_type = Some(v),
-                    "payload" => payload = Some(v),
-                    _ => {}
-                }
-            }
-            Some(_) => {
-                let mut v = String::new();
-                while let Some(c) = chars.peek() {
-                    if c.is_ascii_digit() || *c == '-' {
-                        v.push(*c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                match key.as_str() {
-                    "id" => id = v.parse().ok(),
-                    "ts" => ts = v.parse().ok(),
-                    _ => {}
-                }
-            }
-            None => break,
+    serde_json::from_str::<RawEvent>(obj)
+        .ok()
+        .map(RawEvent::into_task_event)
+}
+
+/// Wire shape the Coordinator emits — distinct from the
+/// outbound `TaskEvent` so we can do field renames at the
+/// boundary (id → event_id, type → event_type) without leaking
+/// the wire keys into the public JSON contract.
+#[derive(Debug, Deserialize)]
+struct RawEvent {
+    id: i64,
+    ts: i64,
+    r#type: String,
+    payload: String,
+    #[serde(default)]
+    schema_version: i64,
+    #[serde(default)]
+    attempt_id: Option<i64>,
+    #[serde(default)]
+    trace_id: Option<String>,
+    #[serde(default)]
+    payload_json: Option<serde_json::Value>,
+}
+
+impl RawEvent {
+    fn into_task_event(self) -> TaskEvent {
+        TaskEvent {
+            event_id: self.id,
+            ts: self.ts,
+            event_type: self.r#type,
+            payload: self.payload,
+            schema_version: self.schema_version,
+            attempt_id: self.attempt_id,
+            trace_id: self.trace_id,
+            payload_json: self.payload_json,
         }
     }
-    Some(TaskEvent {
-        event_id: id?,
-        ts: ts?,
-        event_type: ev_type?,
-        payload: payload.unwrap_or_default(),
-    })
 }
 
 /// Derive a [`TaskSummary`] from a parsed `task.get` body. Same
@@ -965,6 +896,42 @@ mod tests {
     fn parse_events_lines_empty_body_returns_empty() {
         assert!(parse_events_lines("").is_empty());
         assert!(parse_events_lines("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parse_events_lines_surfaces_typed_envelope_fields() {
+        // S2: the Coordinator emits schema_version, attempt_id,
+        // trace_id, payload_json on structured events. The bridge
+        // surface them on TaskEvent so dashboards can consume the
+        // typed payload directly.
+        let body = concat!(
+            r#"{"id":1,"ts":100,"type":"task.attempt_started","payload":"attempt_id=42 attempt_num=1","schema_version":1,"attempt_id":42,"trace_id":"abc","payload_json":{"attempt_id":42,"attempt_num":1}}"#,
+            "\n"
+        );
+        let out = parse_events_lines(body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].schema_version, 1);
+        assert_eq!(out[0].attempt_id, Some(42));
+        assert_eq!(out[0].trace_id.as_deref(), Some("abc"));
+        let pj = out[0].payload_json.as_ref().expect("payload_json present");
+        assert_eq!(
+            pj.get("attempt_num").and_then(|v| v.as_i64()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_events_lines_legacy_v0_still_works() {
+        // Existing v0 events (no typed envelope keys) must continue
+        // to parse cleanly with default schema_version=0 and
+        // all-None typed fields.
+        let body = r#"{"id":1,"ts":100,"type":"ops.custom","payload":"anything"}"#;
+        let out = parse_events_lines(body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].schema_version, 0);
+        assert!(out[0].attempt_id.is_none());
+        assert!(out[0].trace_id.is_none());
+        assert!(out[0].payload_json.is_none());
     }
 
     #[test]
