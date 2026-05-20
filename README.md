@@ -159,6 +159,7 @@ Task lifecycle reference (C1 + C2):
 - [`docs/runtime-lifecycle.md`](docs/runtime-lifecycle.md) — canonical status transitions across the eight Task states.
 - [`docs/attempt-lineage.md`](docs/attempt-lineage.md) — per-attempt rows, when they open/close, attempt-aware event vocabulary, flow lineage mapping.
 - [`docs/event-vocabulary.md`](docs/event-vocabulary.md) — stable contract for runtime-emitted event names + payload conventions. Read before adding a new emitter.
+- [`docs/audit-trails.md`](docs/audit-trails.md) — operator reconstruction across the three audit surfaces (per-node audit log, per-flow event log, Coordinator chronicle), with `relix-flow-inspect` recipes.
 - [`docs/interruption-semantics.md`](docs/interruption-semantics.md) — what the Coordinator's recovery scan does and deliberately doesn't.
 - [`docs/retry-model.md`](docs/retry-model.md) — what `retry_policy` / `max_retries` / `task.retry` actually do today.
 - [`docs/task-recovery.md`](docs/task-recovery.md) — operator playbook with CLI invocations for diagnosing and acting on interrupted / failed tasks.
