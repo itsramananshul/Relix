@@ -181,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks", get(tasks::list))
         .route("/v1/tasks/:id", get(tasks::get_one))
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
+        .route("/v1/tasks/:id/summary", get(tasks::summary))
         .with_state(state);
 
     tracing::info!(

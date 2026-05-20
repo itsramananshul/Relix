@@ -331,6 +331,14 @@ curl http://127.0.0.1:19791/v1/tasks/<task_id>
 
 # Per-attempt rows.
 curl http://127.0.0.1:19791/v1/tasks/<task_id>/attempts
+
+# One-line operator-friendly summary (same shape as the CLI's
+# --pretty first line, JSON-typed for dashboard projection).
+curl http://127.0.0.1:19791/v1/tasks/<task_id>/summary
+# -> {"task_id":"...","status":"failed","attempt_count":2,
+#     "duration_secs":12,"started_at":1700000000,
+#     "last_failure_class":"transient","retries":"1/3",
+#     "retry_policy":"bounded"}
 ```
 
 Response shape is documented inline in

@@ -80,6 +80,38 @@ pub struct TaskAttempt {
     pub flow_id: Option<String>,
 }
 
+/// One-line operator-friendly summary returned by
+/// `GET /v1/tasks/:id/summary`. Same shape as the CLI's
+/// `task get --pretty` first line, but JSON-typed so dashboards can
+/// project columns directly. All fields are Optional so the response
+/// is honest about what's known versus inferred.
+#[derive(Debug, Serialize)]
+pub struct TaskSummary {
+    pub task_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_count: Option<i64>,
+    /// Wall-clock seconds between `started_at` and `updated_at` for
+    /// terminal states (completed / failed / cancelled / interrupted).
+    /// `None` for in-flight states.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<i64>,
+    /// `started_at` of the task, present for running and terminal
+    /// states. `None` when the task is still pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_reason: Option<String>,
+    /// `<retry_count>/<max_retries>` text under bounded; `None`
+    /// when retry_policy is `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retries: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiError {
     pub error: String,
@@ -149,6 +181,34 @@ pub async fn get_one(
         .await
         .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
     Ok(Json(parse_task_body(&id, &body)))
+}
+
+pub async fn summary(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskSummary>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = rec
+        .get(&id)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    let summary = derive_summary(&id, &body).ok_or((
+        StatusCode::BAD_GATEWAY,
+        Json(ApiError {
+            error: "coordinator returned a task body without status".into(),
+        }),
+    ))?;
+    Ok(Json(summary))
 }
 
 pub async fn attempts(
@@ -362,6 +422,78 @@ fn parse_event_object(obj: &str) -> Option<TaskEvent> {
     })
 }
 
+/// Derive a [`TaskSummary`] from a parsed `task.get` body. Same
+/// logic the CLI's `--pretty` summary line uses; the two surfaces
+/// stay in sync because both consume the Coordinator's
+/// `key=value` projection.
+///
+/// Returns `None` when the body lacks `status=` — which never
+/// happens for a real Coordinator response but the JSON contract
+/// is honest about it.
+fn derive_summary(id: &str, raw: &str) -> Option<TaskSummary> {
+    let mut status: Option<&str> = None;
+    let mut attempt_count: Option<i64> = None;
+    let mut started_at: Option<i64> = None;
+    let mut updated_at: Option<i64> = None;
+    let mut last_failure_class: Option<String> = None;
+    let mut last_failure_reason: Option<String> = None;
+    let mut retry_policy: Option<String> = None;
+    let mut retry_count: Option<i64> = None;
+    let mut max_retries: Option<i64> = None;
+    for line in raw.lines() {
+        if let Some(v) = line.strip_prefix("status=") {
+            status = Some(v);
+        } else if let Some(v) = line.strip_prefix("attempt_count=") {
+            attempt_count = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("started_at=") {
+            started_at = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("updated_at=") {
+            updated_at = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("last_failure_class=") {
+            last_failure_class = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("last_failure_reason=") {
+            last_failure_reason = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("retry_policy=") {
+            retry_policy = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("retry_count=") {
+            retry_count = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("max_retries=") {
+            max_retries = v.parse().ok();
+        }
+    }
+    let status_s = status?.to_string();
+    let duration_secs = match (status_s.as_str(), started_at, updated_at) {
+        ("completed" | "failed" | "cancelled" | "interrupted", Some(s), Some(u)) if u >= s => {
+            Some(u - s)
+        }
+        _ => None,
+    };
+    // Render the retries field the same way the CLI does, but only
+    // when the policy is non-`none`.
+    let retries = match (retry_policy.as_deref(), max_retries) {
+        (Some(p), Some(m)) if p != "none" => {
+            let c = retry_count.unwrap_or(0);
+            Some(format!("{c}/{m}"))
+        }
+        _ => None,
+    };
+    let retry_policy_out = match retry_policy.as_deref() {
+        Some("none") | None => None,
+        Some(p) => Some(p.to_string()),
+    };
+    Some(TaskSummary {
+        task_id: id.to_string(),
+        status: status_s,
+        attempt_count,
+        duration_secs,
+        started_at,
+        last_failure_class,
+        last_failure_reason,
+        retries,
+        retry_policy: retry_policy_out,
+    })
+}
+
 /// Parse `task.attempts` body (tab-delimited lines).
 fn parse_attempts(body: &str) -> Vec<TaskAttempt> {
     body.lines()
@@ -447,6 +579,51 @@ mod tests {
         assert!(rows[1].finished_at.is_none());
         assert!(rows[1].failure_class.is_none());
         assert!(rows[1].flow_id.is_none());
+    }
+
+    #[test]
+    fn summary_terminal_includes_duration_and_retries() {
+        let raw = concat!(
+            "task_id=abc\n",
+            "status=completed\n",
+            "started_at=1700000000\n",
+            "updated_at=1700000007\n",
+            "attempt_count=2\n",
+            "retry_policy=bounded\n",
+            "retry_count=1\n",
+            "max_retries=3\n",
+            "events=[]\n"
+        );
+        let s = derive_summary("abc", raw).unwrap();
+        assert_eq!(s.status, "completed");
+        assert_eq!(s.attempt_count, Some(2));
+        assert_eq!(s.duration_secs, Some(7));
+        assert_eq!(s.retries.as_deref(), Some("1/3"));
+        assert_eq!(s.retry_policy.as_deref(), Some("bounded"));
+    }
+
+    #[test]
+    fn summary_running_omits_duration() {
+        let raw = "task_id=abc\nstatus=running\nstarted_at=1700000000\nupdated_at=1700000050\nattempt_count=1\nevents=[]\n";
+        let s = derive_summary("abc", raw).unwrap();
+        assert!(s.duration_secs.is_none());
+        assert_eq!(s.started_at, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn summary_with_retry_policy_none_omits_retries_field() {
+        let raw = "task_id=abc\nstatus=failed\nstarted_at=100\nupdated_at=105\nattempt_count=1\nretry_policy=none\nretry_count=0\nmax_retries=0\nlast_failure_class=permanent\nevents=[]\n";
+        let s = derive_summary("abc", raw).unwrap();
+        assert!(s.retries.is_none());
+        assert!(s.retry_policy.is_none());
+        assert_eq!(s.last_failure_class.as_deref(), Some("permanent"));
+        assert_eq!(s.duration_secs, Some(5));
+    }
+
+    #[test]
+    fn summary_returns_none_when_status_missing() {
+        let raw = "task_id=abc\nevents=[]\n";
+        assert!(derive_summary("abc", raw).is_none());
     }
 
     #[test]
