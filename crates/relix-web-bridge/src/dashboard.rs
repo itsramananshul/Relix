@@ -225,6 +225,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_anomaly_banner_present() {
+        // M30: overview surfaces runtime anomaly counts
+        // (peer flips, task failures, expired peers) when
+        // signals exceed quiet thresholds.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("computeAnomalies"),
+            "page should ship computeAnomalies()"
+        );
+        assert!(
+            body.contains(r#"id="anomaly-banner""#),
+            "page should ship the anomaly banner element"
+        );
+        assert!(
+            body.contains("runtime anomalies"),
+            "anomaly banner should label itself"
+        );
+    }
+
+    #[tokio::test]
     async fn page_failure_panel_present() {
         // M29: failed/interrupted/cancelled tasks show a
         // failure breakdown panel with class + cause +

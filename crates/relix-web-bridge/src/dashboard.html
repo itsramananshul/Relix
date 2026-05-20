@@ -816,6 +816,60 @@
       color: var(--text-strong);
     }
 
+    /* ── Anomaly indicator ─────────────────────────────────────── */
+    .anomaly-banner {
+      margin: 0 0 12px;
+      padding: 10px 14px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg-row-alt);
+      font-size: var(--text-sm);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .anomaly-banner.empty { display: none; }
+    .anomaly-banner.elevated {
+      border-color: rgba(245,158,11,0.4);
+      background: rgba(245,158,11,0.06);
+    }
+    .anomaly-banner.high {
+      border-color: rgba(239,68,68,0.4);
+      background: rgba(239,68,68,0.06);
+    }
+    .anomaly-banner .label {
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+    .anomaly-banner .level-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      display: inline-block;
+    }
+    .anomaly-banner.elevated .level-dot { background: var(--warn); }
+    .anomaly-banner.high     .level-dot { background: var(--danger); animation: pulse-dot 1.6s ease-in-out infinite; }
+    .anomaly-banner .anomaly-chip {
+      padding: 2px 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-size: var(--text-xs);
+      color: var(--text);
+      font-family: var(--font-mono);
+    }
+    .anomaly-banner.elevated .anomaly-chip { border-color: rgba(245,158,11,0.5); }
+    .anomaly-banner.high     .anomaly-chip { border-color: rgba(239,68,68,0.5); }
+    .anomaly-banner .window-meta {
+      margin-left: auto;
+      color: var(--text-dim);
+      font-size: var(--text-xs);
+    }
+
     /* ── Failure breakdown panel ───────────────────────────────── */
     .failure-panel {
       margin: 0 14px 12px;
@@ -1275,6 +1329,7 @@
     <section class="page" data-page="overview">
       <h2>Overview</h2>
       <p class="page-subtitle">At-a-glance mesh health and recent activity.</p>
+      <div id="anomaly-banner" class="anomaly-banner empty"></div>
       <div id="overview-kpis">
         <div class="kpi-section">
           <p class="section-label">Mesh</p>
@@ -1788,6 +1843,7 @@ function enterOverview() {
     renderOverviewKpis(lastHealthSnapshot, lastTaskCountSnapshot);
     renderOverviewPeers(lastTopologySnapshot ? lastTopologySnapshot.peers || [] : []);
     renderActivityFeed();
+    renderAnomalyBanner();
   }
   // Trigger an immediate background refresh so the operator's
   // navigation feels responsive.
@@ -1820,6 +1876,7 @@ async function backgroundSync() {
     if (currentRoute === 'overview') {
       renderOverviewKpis(hRes, taskCount);
       renderOverviewPeers(tRes.peers || []);
+      renderAnomalyBanner();
       const $status = document.getElementById('activity-status');
       if ($status) {
         $status.innerHTML =
@@ -2075,6 +2132,72 @@ function diffAndRecordActivity(hRes, peers, tasks, isFirst) {
     reconnect: recon,
     coord: hRes.coordinator_configured,
   };
+}
+
+/* Anomaly surfacing: counts recent activity items by
+   class within a sliding window. Pure derivation from
+   the same data the activity rail already collects —
+   nothing invented. Three signals:
+
+     peer_flips      = freshness-changed + dropped events
+     task_failures   = task transitions to failed/interrupted/cancelled
+     expired_now     = current peer count in `expired` bucket
+
+   Level escalation:
+     empty     → none of the signals above zero
+     elevated  → at least one signal at low threshold
+     high      → critical thresholds breached
+*/
+const ANOMALY_WINDOW_SECS = 300;          // 5 min
+const ANOMALY_ELEVATED = { peer_flips: 1, task_failures: 1, expired_now: 1 };
+const ANOMALY_HIGH     = { peer_flips: 4, task_failures: 3, expired_now: 2 };
+
+function computeAnomalies() {
+  const cutoff = Date.now() - ANOMALY_WINDOW_SECS * 1000;
+  let peer_flips = 0;
+  let task_failures = 0;
+  for (const it of activityItems) {
+    if (it.ts < cutoff) break; // newest-first → can break early
+    if (it.label === 'PEER' &&
+        (it.kind === 'warn' || it.kind === 'danger')) {
+      peer_flips += 1;
+    } else if (it.label === 'TASK' &&
+        (it.kind === 'danger' || it.kind === 'warn')) {
+      task_failures += 1;
+    }
+  }
+  const expired_now = lastHealthSnapshot ? (lastHealthSnapshot.peers_expired || 0) : 0;
+  return { peer_flips, task_failures, expired_now };
+}
+
+function renderAnomalyBanner() {
+  const $banner = document.getElementById('anomaly-banner');
+  if (!$banner) return;
+  const a = computeAnomalies();
+  const total = a.peer_flips + a.task_failures + a.expired_now;
+  if (total === 0) {
+    $banner.className = 'anomaly-banner empty';
+    $banner.innerHTML = '';
+    return;
+  }
+  // Decide level: high if any signal crosses the high
+  // threshold, elevated otherwise.
+  let level = 'elevated';
+  if (a.peer_flips    >= ANOMALY_HIGH.peer_flips
+      || a.task_failures >= ANOMALY_HIGH.task_failures
+      || a.expired_now   >= ANOMALY_HIGH.expired_now) {
+    level = 'high';
+  }
+  const chips = [];
+  if (a.peer_flips > 0)    chips.push(a.peer_flips + ' peer transition' + (a.peer_flips === 1 ? '' : 's'));
+  if (a.task_failures > 0) chips.push(a.task_failures + ' task failure' + (a.task_failures === 1 ? '' : 's'));
+  if (a.expired_now > 0)   chips.push(a.expired_now + ' expired peer' + (a.expired_now === 1 ? '' : 's'));
+  $banner.className = 'anomaly-banner ' + level;
+  $banner.innerHTML =
+    '<span class="level-dot"></span>'
+    + '<span class="label">runtime anomalies</span>'
+    + chips.map(c => '<span class="anomaly-chip">' + escapeHtml(c) + '</span>').join('')
+    + '<span class="window-meta">last ' + (ANOMALY_WINDOW_SECS / 60) + 'min</span>';
 }
 
 function renderActivityFeed(newCount) {
