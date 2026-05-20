@@ -245,10 +245,25 @@ function openLiveFeed(id) {
   es.addEventListener('event', (m) => {
     let ev;
     try { ev = JSON.parse(m.data); } catch (_) { return; }
-    if (typeof ev.event_id === 'number' && ev.event_id > lastEventId) {
-      lastEventId = ev.event_id;
+    // SSE messages carry the Coordinator's raw line shape
+    // (`id`, `ts`, `type`, `payload`) — distinct from the
+    // bridge's translated `event_id` shape. Read `id` AND
+    // surface as a bridge-shaped object for the renderer so
+    // the rest of the dashboard sees one consistent shape.
+    const eventId = (typeof ev.id === 'number') ? ev.id : ev.event_id;
+    if (typeof eventId === 'number' && eventId > lastEventId) {
+      lastEventId = eventId;
     }
-    appendChronologyEvent(ev);
+    appendChronologyEvent({
+      event_id:   eventId,
+      ts:         ev.ts,
+      event_type: ev.type || ev.event_type,
+      payload:    ev.payload || '',
+      schema_version: ev.schema_version,
+      attempt_id: ev.attempt_id,
+      trace_id:   ev.trace_id,
+      payload_json: ev.payload_json,
+    });
   });
   es.addEventListener('gone', () => {
     setLiveStatus('task gone');

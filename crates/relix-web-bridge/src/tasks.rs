@@ -517,9 +517,20 @@ pub async fn events_stream(
                         if line.is_empty() {
                             continue;
                         }
-                        // Advance cursor from this line.
-                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line)
-                            && let Some(id_field) = ev.get("id").and_then(|v| v.as_i64())
+                        // Advance cursor via a prefix-scan on
+                        // the leading `{"id":N,` rather than a
+                        // full serde_json parse. A line whose
+                        // payload contains hostile chars could
+                        // fail full-JSON parse — but its `id`
+                        // prefix is fixed-shape per
+                        // render_event_json. Without this, a
+                        // single un-parseable line would stop
+                        // cursor advancement and the next poll
+                        // would re-deliver every event from the
+                        // last good cursor, duplicating
+                        // forever.
+                        if let Some(id_field) = extract_event_id_prefix(line)
+                            && id_field > after
                         {
                             after = id_field;
                         }
@@ -779,6 +790,24 @@ fn derive_summary(id: &str, raw: &str) -> Option<TaskSummary> {
     })
 }
 
+/// Extract the `id` field from one line of `task.events` output
+/// without doing a full JSON parse. The Coordinator's
+/// `render_event_json` always emits `{"id":N,...` first, so a
+/// prefix scan is robust against any subsequent payload
+/// content — including malformed `payload_json` blobs that
+/// would break a full parse.
+///
+/// Returns `None` when the line doesn't start with the expected
+/// prefix or the integer doesn't parse; callers leave the
+/// cursor untouched in that case (the line still emits to the
+/// SSE client; transport-layer reconnect with `?since=` from
+/// the client's own state recovers).
+fn extract_event_id_prefix(line: &str) -> Option<i64> {
+    let rest = line.strip_prefix("{\"id\":")?;
+    let comma = rest.find(',')?;
+    rest[..comma].parse().ok()
+}
+
 /// Parse a `task.events` body — one JSON event per line.
 /// Tolerant of empty lines and malformed entries (which are
 /// skipped silently).
@@ -987,6 +1016,37 @@ mod tests {
         let (ids, count) = parse_recover_body(body);
         assert_eq!(ids, vec!["abc111".to_string(), "def222".to_string()]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn extract_event_id_prefix_handles_typical_lines() {
+        assert_eq!(
+            extract_event_id_prefix(r#"{"id":42,"ts":1,"type":"x","payload":""}"#),
+            Some(42)
+        );
+        assert_eq!(
+            extract_event_id_prefix(
+                r#"{"id":1,"ts":0,"type":"a","payload":"b","schema_version":1,"attempt_id":7,"trace_id":"abc","payload_json":{"k":"v"}}"#
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn extract_event_id_prefix_resists_malformed_payload_json() {
+        // Hostile payload_json with embedded braces / quotes
+        // that would break a full JSON parse. The prefix scan
+        // must still find the id.
+        let line = r#"{"id":99,"ts":1,"type":"x","payload":"hostile","schema_version":1,"payload_json":{"weird":"}\"with\"nested":"braces"}}"#;
+        assert_eq!(extract_event_id_prefix(line), Some(99));
+    }
+
+    #[test]
+    fn extract_event_id_prefix_rejects_non_event_lines() {
+        assert_eq!(extract_event_id_prefix(""), None);
+        assert_eq!(extract_event_id_prefix("not an event"), None);
+        assert_eq!(extract_event_id_prefix(r#"{"ts":1,"id":42}"#), None); // id not first
+        assert_eq!(extract_event_id_prefix(r#"{"id":notnum,"ts":1}"#), None);
     }
 
     #[test]
