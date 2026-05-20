@@ -54,6 +54,8 @@ pub enum Cmd {
     ///
     /// Rules checked:
     ///  - non-empty `method_name`
+    ///  - `method_name` follows `<namespace>.<action>` convention
+    ///    (must contain `.`, non-empty parts on each side)
     ///  - non-empty `policy_attachment_point`
     ///  - no duplicate `method_name` across descriptors
     ///  - sensitivity_tags follow `<namespace>:<tag>` form when
@@ -187,6 +189,25 @@ fn validate_manifest(manifest: &NodeManifest) -> Vec<String> {
         if !seen.insert(cap.method_name.as_str()) {
             issues.push(format!(
                 "duplicate method_name `{}` — multiple descriptors register the same wire name",
+                cap.method_name
+            ));
+        }
+        // Convention: method_name MUST be `<namespace>.<action>`
+        // with non-empty parts on each side of the first dot.
+        // Every shipped capability follows this (task.*, node.*,
+        // memory.*, ai.*, tool.*); the rule catches descriptors
+        // that would land in `/v1/capabilities?category=...`
+        // filters with no namespace, breaking discovery.
+        if let Some((ns, action)) = cap.method_name.split_once('.') {
+            if ns.is_empty() || action.is_empty() {
+                issues.push(format!(
+                    "`{}`: method_name must be `<namespace>.<action>` with non-empty parts on each side of the dot",
+                    cap.method_name
+                ));
+            }
+        } else {
+            issues.push(format!(
+                "`{}`: method_name has no `.` — convention is `<namespace>.<action>` (e.g. `task.list`)",
                 cap.method_name
             ));
         }
@@ -526,6 +547,62 @@ mod tests {
                 .any(|s| s.contains("policy_attachment_point is empty")),
             "issues = {issues:?}"
         );
+    }
+
+    #[test]
+    fn validate_flags_method_name_without_dot() {
+        let mut manifest = mk_manifest("memory");
+        let mut c = cap_ok("memorysearch"); // no dot
+        c.policy_attachment_point = "memorysearch".into();
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("no `.`") || s.contains("`<namespace>.<action>`")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_method_name_with_empty_namespace() {
+        let mut manifest = mk_manifest("memory");
+        let mut c = cap_ok(".search"); // empty namespace
+        c.policy_attachment_point = ".search".into();
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues.iter().any(|s| s.contains("non-empty parts")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_method_name_with_empty_action() {
+        let mut manifest = mk_manifest("memory");
+        let mut c = cap_ok("memory."); // empty action
+        c.policy_attachment_point = "memory.".into();
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues.iter().any(|s| s.contains("non-empty parts")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_multi_dot_method_names() {
+        // `memory.recent_for_session` is one of the actually-shipped
+        // names — the rule only checks the FIRST dot has non-empty
+        // parts on each side. Underscores in the action are fine;
+        // future namespaces like `tool.web.fetch` would also be
+        // accepted (ns=tool, action=web.fetch).
+        let mut manifest = mk_manifest("memory");
+        manifest
+            .capabilities
+            .push(cap_ok("memory.recent_for_session"));
+        manifest.capabilities.push(cap_ok("tool.web.fetch"));
+        assert!(validate_manifest(&manifest).is_empty());
     }
 
     #[test]
