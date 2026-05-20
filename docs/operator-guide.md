@@ -291,25 +291,103 @@ re-run it). This is a documented limitation
 
 When the Coordinator peer is up, every chat request becomes a Task on
 its SQLite ledger. The response includes a `task_id` (top-level on
-native endpoints, under `relix.task_id` on the OpenAI shim). Operator
-inspection:
+native endpoints, under `relix.task_id` on the OpenAI shim).
+
+The Coordinator is **fail-soft** from the bridge's perspective: if
+it dies mid-session, chat still works — the `task_id` is omitted
+from the response and a structured WARN line hits the bridge log.
+
+### Basic inspection
 
 ```bash
+# Recent tasks, most-recently-updated first.
 relix-cli task list   --peer /ip4/127.0.0.1/tcp/19714 \
     --identity dev-keys/local-bridge.aic \
     --client-key dev-keys/local-bridge.key
 
+# One task — raw key=value (grep-friendly for scripts).
 relix-cli task get    --peer /ip4/127.0.0.1/tcp/19714 \
     --identity dev-keys/local-bridge.aic \
     --client-key dev-keys/local-bridge.key \
     --task-id <id-from-response>
+
+# Same, but pretty-printed with a chronology timeline.
+relix-cli task get    --peer ... --identity ... --client-key ... \
+    --task-id <id> --pretty
 ```
 
-`task get` returns multi-line `key=value` plus a JSON `events=[...]`
-chronicle. The Coordinator is **fail-soft** from the bridge's
-perspective: if it dies mid-session, chat still works — the
-`task_id` is omitted from the response and a structured WARN line
-hits the bridge log. See [`docs/coordinator.md`](coordinator.md) and
+`--pretty` reformats the response as a header block plus a timeline
+of events with absolute timestamps and `+Δs` deltas. The header
+includes `retry_count`, `retry_policy`, `max_retries`,
+`max_runtime_secs`, `started_at`, `last_failure_class`, and
+`last_failure_reason` when set — everything an operator needs to
+triage.
+
+### Status filtering
+
+C1c adds client-side `--status` filtering on `task list`:
+
+```bash
+# Anything the recovery scan flipped from running to interrupted.
+relix-cli task list --peer ... --identity ... --client-key ... \
+    --status interrupted
+
+# Outright failures.
+relix-cli task list --peer ... --identity ... --client-key ... \
+    --status failed
+
+# Tasks the bridge marked as waiting on a human / async dependency
+# (recorded today; resume primitive is Gate 2).
+relix-cli task list --peer ... --identity ... --client-key ... \
+    --status awaiting_input
+```
+
+The full status convention is in
+[`docs/runtime-lifecycle.md`](runtime-lifecycle.md). Valid filters:
+`pending`, `running`, `retrying`, `interrupted`, `awaiting_input`,
+`completed`, `failed`, `cancelled`.
+
+### Interruption recovery
+
+The Coordinator promotes overdue `running` tasks to `interrupted`
+once at startup (when `[coordinator] recovery_scan = true`, default)
+and any time an operator runs:
+
+```bash
+relix-cli task recover --peer ... --identity ... --client-key ...
+# Prints one task id per recovered task, then `recovered=N`.
+```
+
+The scan only touches rows that have BOTH `started_at` and
+`max_runtime_secs` set — a `running` row without a deadline is
+indistinguishable from a long-running flow and is left alone.
+
+It does NOT re-launch the flow. Re-launch needs a durable VM resume
+model (Gate 2). The scan just re-labels so dashboards stay honest.
+Full contract: [`docs/interruption-semantics.md`](interruption-semantics.md).
+
+### Failure classification
+
+Failed tasks carry a `last_failure_class` so operators can pattern-
+match on what kind of failure they're looking at, without parsing
+the cause string:
+
+| Class | When the bridge writes it | Retry advice |
+|---|---|---|
+| `transient` | Network blip, peer unreachable, responder overloaded | Safe to re-run (if flow is idempotent) |
+| `timeout` | Deadline exceeded or recovery scan flipped the row | Re-run with a higher `max_runtime_secs` |
+| `unavailable` | Capability deprecated / removed; manifest stale | Wait, check the responder peer, re-run |
+| `policy_denied` | Admission pipeline refused | Do NOT re-run; fix policy or identity first |
+| `invalid_args` | Caller-side input was malformed | Do NOT re-run; fix the caller |
+| `permanent` | Logic / contract error inside the flow | Do NOT re-run; investigate |
+
+Operator playbook with concrete CLI invocations for each case is in
+[`docs/task-recovery.md`](task-recovery.md). The retry model
+(what `retry_policy` / `max_retries` mean today, why nothing
+auto-retries yet) is in [`docs/retry-model.md`](retry-model.md).
+
+See also: [`docs/coordinator.md`](coordinator.md),
+[`docs/task-runtime.md`](task-runtime.md),
 [`docs/replay-model.md`](replay-model.md).
 
 ## Inspecting flows after the fact
