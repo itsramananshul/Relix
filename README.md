@@ -32,8 +32,9 @@ and [`docs/current-limitations.md`](docs/current-limitations.md).
 | NodeManifest discovery + `capability:<method>` routing | works |
 | Connection pool reuse on bridge ↔ peers and tool ↔ origins | works |
 | MeshClient peer reconnect + 60s manifest refresh | works |
-| Coordinator node (`task.create` / `update` / `event` / `get` / `list`) with SQLite ledger | works (checkpointed re-run, not resumable replay — see [`docs/replay-model.md`](docs/replay-model.md)) |
-| `relix-cli task` CLI | works |
+| Coordinator node (`task.create` / `update` / `event` / `get` / `list` / `recover` / `attempts` / `retry`) with SQLite ledger | works (per-attempt lineage; operator-driven retry; recovery scan for stale tasks. Checkpointed re-run, not resumable replay — see [`docs/replay-model.md`](docs/replay-model.md)) |
+| Bridge `/v1/tasks` read API (list / get / attempts as JSON) | works |
+| `relix-cli task` CLI (list/get/attempts/retry/recover/event/update/create) with `--pretty` chronology | works |
 | SOL VM with `remote_call`, hand-written `.sol` flows | works |
 | Windows-safe PowerShell mesh bringup | works |
 
@@ -128,7 +129,7 @@ like any other peer.
 | `crates/relix-runtime` | libp2p transport, SOL VM with `remote_call`, dispatch bridge, manifest exchange, node implementations. |
 | `crates/relix-controller` | The `relix-controller` daemon binary. |
 | `crates/relix-web-bridge` | The local HTTP bridge binary (OpenAI shim + native endpoints). |
-| `crates/relix-cli` | Operator CLI: `identity init-org`, `identity mint`, `ping`, `flow-run`. |
+| `crates/relix-cli` | Operator CLI: `identity init-org`, `identity mint`, `ping`, `flow-run`, `task {create,update,event,get,list,attempts,recover,retry}`. |
 | `crates/relix-flow-inspect` | Reads audit + flow event logs. |
 | `flows/` | Hand-written `.sol` flows. |
 | `configs/` | Example node config TOMLs. |
@@ -149,9 +150,17 @@ Start here, in this order:
 - [`docs/security.md`](docs/security.md) — identities, policy, audit, what the alpha guarantees and what it doesn't.
 - [`docs/tool-node.md`](docs/tool-node.md) — the external-action peer, the SSRF model, the DNS pin, the redirect re-check, the secure client pool.
 - [`docs/coordinator.md`](docs/coordinator.md) — the durable Task ledger peer.
-- [`docs/task-runtime.md`](docs/task-runtime.md) — Task schema + the five `task.*` capabilities, wire-format exact.
+- [`docs/task-runtime.md`](docs/task-runtime.md) — Task schema + the `task.*` capabilities, wire-format exact.
 - [`docs/replay-model.md`](docs/replay-model.md) — exactly what "checkpointed re-run" means and what it does *not* mean. Read this before assuming Tasks resume on retry.
 - [`docs/current-limitations.md`](docs/current-limitations.md) — read before deploying.
+
+Task lifecycle reference (C1 + C2):
+
+- [`docs/runtime-lifecycle.md`](docs/runtime-lifecycle.md) — canonical status transitions across the eight Task states.
+- [`docs/attempt-lineage.md`](docs/attempt-lineage.md) — per-attempt rows, when they open/close, attempt-aware event vocabulary, flow lineage mapping.
+- [`docs/interruption-semantics.md`](docs/interruption-semantics.md) — what the Coordinator's recovery scan does and deliberately doesn't.
+- [`docs/retry-model.md`](docs/retry-model.md) — what `retry_policy` / `max_retries` / `task.retry` actually do today.
+- [`docs/task-recovery.md`](docs/task-recovery.md) — operator playbook with CLI invocations for diagnosing and acting on interrupted / failed tasks.
 
 Reference docs (deeper / narrower):
 
@@ -159,6 +168,7 @@ Reference docs (deeper / narrower):
 - [`docs/streaming-and-openai-shim.md`](docs/streaming-and-openai-shim.md) — the bridge's SSE shape.
 - [`docs/tool-node-security.md`](docs/tool-node-security.md) — the full SSRF model + DNS pin + redirect re-check + pool security invariants.
 - [`docs/sol-runtime-analysis.md`](docs/sol-runtime-analysis.md) — SOL VM internals.
+- [`docs/channel-node-architecture.md`](docs/channel-node-architecture.md) — design for task-native messaging channels (Telegram first; implementation pending credentials).
 - [`specs/`](specs/) — wire-format and architecture specifications.
 
 ---
