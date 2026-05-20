@@ -638,16 +638,22 @@ impl TaskStore {
         };
         if retry_count >= budget {
             // Exhausted. Append an event so the chronicle is honest.
-            tx.execute(
-                "INSERT INTO task_events (task_id, ts, event_type, payload)
-                 VALUES (?1, ?2, 'task.retry_exhausted', ?3)",
-                params![
-                    task_id,
-                    now,
-                    format!("retry_count={retry_count} budget={budget} policy={retry_policy}"),
-                ],
-            )
-            .map_err(CoordinatorError::Db)?;
+            let exhausted_legacy =
+                format!("retry_count={retry_count} budget={budget} policy={retry_policy}");
+            let exhausted_json = format!(
+                r#"{{"retry_count":{retry_count},"budget":{budget},"policy":"{}"}}"#,
+                json_escape(&retry_policy)
+            );
+            insert_typed_event(
+                &tx,
+                task_id,
+                now,
+                "task.retry_exhausted",
+                &exhausted_legacy,
+                None,
+                None,
+                Some(&exhausted_json),
+            )?;
             tx.commit().map_err(CoordinatorError::Db)?;
             return Ok(RetryDecision::Exhausted {
                 retry_count,
@@ -667,16 +673,25 @@ impl TaskStore {
             params![new_count, now, task_id],
         )
         .map_err(CoordinatorError::Db)?;
-        let payload = format!(
-            "attempt={new_count} of_budget={budget} policy={retry_policy} prior_class={}",
-            last_class.as_deref().unwrap_or("-"),
+        let prior = last_class.as_deref().unwrap_or("-");
+        let requested_legacy = format!(
+            "attempt={new_count} of_budget={budget} policy={retry_policy} prior_class={prior}",
         );
-        tx.execute(
-            "INSERT INTO task_events (task_id, ts, event_type, payload)
-             VALUES (?1, ?2, 'task.retry_requested', ?3)",
-            params![task_id, now, payload],
-        )
-        .map_err(CoordinatorError::Db)?;
+        let requested_json = format!(
+            r#"{{"attempt":{new_count},"of_budget":{budget},"policy":"{}","prior_class":"{}"}}"#,
+            json_escape(&retry_policy),
+            json_escape(prior),
+        );
+        insert_typed_event(
+            &tx,
+            task_id,
+            now,
+            "task.retry_requested",
+            &requested_legacy,
+            None,
+            None,
+            Some(&requested_json),
+        )?;
         tx.commit().map_err(CoordinatorError::Db)?;
         Ok(RetryDecision::Accepted {
             new_retry_count: new_count,
@@ -754,15 +769,22 @@ impl TaskStore {
             if n == 0 {
                 continue;
             }
-            let payload = format!(
+            let legacy_interrupt = format!(
                 "started_at={started} max_runtime_secs={max} now={now_secs} reason=deadline_exceeded"
             );
-            tx.execute(
-                "INSERT INTO task_events (task_id, ts, event_type, payload)
-                 VALUES (?1, ?2, 'task.interrupted', ?3)",
-                params![tid, now_secs, payload],
-            )
-            .map_err(CoordinatorError::Db)?;
+            let interrupt_json = format!(
+                r#"{{"started_at":{started},"max_runtime_secs":{max},"now":{now_secs},"reason":"deadline_exceeded"}}"#
+            );
+            insert_typed_event(
+                &tx,
+                &tid,
+                now_secs,
+                "task.interrupted",
+                &legacy_interrupt,
+                current_attempt,
+                None,
+                Some(&interrupt_json),
+            )?;
             // Close the per-attempt row, if any, so the attempt
             // timeline stays consistent with the task's status field.
             if let Some(attempt_id) = current_attempt {
@@ -782,16 +804,21 @@ impl TaskStore {
                     ],
                 )
                 .map_err(CoordinatorError::Db)?;
-                tx.execute(
-                    "INSERT INTO task_events (task_id, ts, event_type, payload)
-                     VALUES (?1, ?2, 'task.attempt_finished', ?3)",
-                    params![
-                        tid,
-                        now_secs,
-                        format!("attempt_id={attempt_id} status=interrupted failure_class=timeout"),
-                    ],
-                )
-                .map_err(CoordinatorError::Db)?;
+                let finished_legacy =
+                    format!("attempt_id={attempt_id} status=interrupted failure_class=timeout");
+                let finished_json = format!(
+                    r#"{{"attempt_id":{attempt_id},"status":"interrupted","failure_class":"timeout"}}"#
+                );
+                insert_typed_event(
+                    &tx,
+                    &tid,
+                    now_secs,
+                    "task.attempt_finished",
+                    &finished_legacy,
+                    Some(attempt_id),
+                    None,
+                    Some(&finished_json),
+                )?;
             }
             recovered.push(tid);
         }
@@ -2157,6 +2184,47 @@ fn unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+// ──────────────────────────── Typed event emit (S2) ────────────────────────
+
+/// Insert a structured event envelope (schema_version=1) inside
+/// an open transaction. The legacy `payload` string is also
+/// populated for back-compat with renderers that haven't been
+/// upgraded; the typed JSON in `payload_json` is the
+/// authoritative form going forward.
+///
+/// Runtime-only helper — operator-defined events via the
+/// `task.event` capability remain v0 (string-only) by design,
+/// since per-event-type schemas are runtime concerns.
+#[allow(clippy::too_many_arguments)]
+fn insert_typed_event(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    ts: i64,
+    event_type: &str,
+    legacy_payload: &str,
+    attempt_id: Option<i64>,
+    trace_id: Option<&str>,
+    payload_json: Option<&str>,
+) -> Result<(), CoordinatorError> {
+    tx.execute(
+        "INSERT INTO task_events
+            (task_id, ts, event_type, payload,
+             schema_version, attempt_id, trace_id, payload_json)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+        params![
+            task_id,
+            ts,
+            event_type,
+            legacy_payload,
+            attempt_id,
+            trace_id,
+            payload_json,
+        ],
+    )
+    .map_err(CoordinatorError::Db)?;
+    Ok(())
+}
+
 // ──────────────────────────── Attempt helpers (C2a) ─────────────────────────
 
 /// Open a new attempt row if and only if the task has no open
@@ -2213,16 +2281,27 @@ fn open_attempt_if_needed(
         params![next_num, new_id, task_id],
     )
     .map_err(CoordinatorError::Db)?;
-    let payload = match trace_id {
+    let legacy = match trace_id {
         Some(t) => format!("attempt_id={new_id} attempt_num={next_num} trace_id={t}"),
         None => format!("attempt_id={new_id} attempt_num={next_num}"),
     };
-    tx.execute(
-        "INSERT INTO task_events (task_id, ts, event_type, payload)
-         VALUES (?1, ?2, 'task.attempt_started', ?3)",
-        params![task_id, now, payload],
-    )
-    .map_err(CoordinatorError::Db)?;
+    let payload_json = match trace_id {
+        Some(t) => format!(
+            r#"{{"attempt_id":{new_id},"attempt_num":{next_num},"trace_id":"{}"}}"#,
+            json_escape(t)
+        ),
+        None => format!(r#"{{"attempt_id":{new_id},"attempt_num":{next_num}}}"#),
+    };
+    insert_typed_event(
+        tx,
+        task_id,
+        now,
+        "task.attempt_started",
+        &legacy,
+        Some(new_id),
+        trace_id,
+        Some(&payload_json),
+    )?;
     Ok(())
 }
 
@@ -2288,16 +2367,31 @@ fn close_open_attempt_if_any(
         ],
     )
     .map_err(CoordinatorError::Db)?;
-    let mut payload = format!("attempt_id={aid} status={new_status}");
+    let mut legacy = format!("attempt_id={aid} status={new_status}");
     if let Some(fc) = failure_class {
-        payload.push_str(&format!(" failure_class={fc}"));
+        legacy.push_str(&format!(" failure_class={fc}"));
     }
-    tx.execute(
-        "INSERT INTO task_events (task_id, ts, event_type, payload)
-         VALUES (?1, ?2, 'task.attempt_finished', ?3)",
-        params![task_id, now, payload],
-    )
-    .map_err(CoordinatorError::Db)?;
+    let payload_json = match failure_class {
+        Some(fc) => format!(
+            r#"{{"attempt_id":{aid},"status":"{}","failure_class":"{}"}}"#,
+            json_escape(new_status),
+            json_escape(fc),
+        ),
+        None => format!(
+            r#"{{"attempt_id":{aid},"status":"{}"}}"#,
+            json_escape(new_status)
+        ),
+    };
+    insert_typed_event(
+        tx,
+        task_id,
+        now,
+        "task.attempt_finished",
+        &legacy,
+        Some(aid),
+        None,
+        Some(&payload_json),
+    )?;
     Ok(())
 }
 
@@ -3292,6 +3386,148 @@ mod tests {
             Err(CoordinatorError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    // ── Phase S2: typed event envelopes ───────────────────────────────
+
+    #[test]
+    fn attempt_started_event_has_typed_fields() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update_with_trace(
+            &tid,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("00112233445566778899aabbccddeeff"),
+        )
+        .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let ev = v
+            .events
+            .iter()
+            .find(|e| e.event_type == "task.attempt_started")
+            .expect("attempt_started event missing");
+        assert_eq!(ev.schema_version, 1);
+        assert!(ev.attempt_id.is_some());
+        assert_eq!(
+            ev.trace_id.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        let pj = ev.payload_json.as_deref().expect("payload_json populated");
+        assert!(pj.contains("\"attempt_id\""));
+        assert!(pj.contains("\"trace_id\":\"00112233445566778899aabbccddeeff\""));
+    }
+
+    #[test]
+    fn attempt_finished_event_has_typed_fields() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("oops"),
+            Some("transient"),
+        )
+        .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let ev = v
+            .events
+            .iter()
+            .find(|e| e.event_type == "task.attempt_finished")
+            .expect("attempt_finished event missing");
+        assert_eq!(ev.schema_version, 1);
+        assert!(ev.attempt_id.is_some());
+        let pj = ev.payload_json.as_deref().expect("payload_json populated");
+        assert!(pj.contains("\"status\":\"failed\""));
+        assert!(pj.contains("\"failure_class\":\"transient\""));
+    }
+
+    #[test]
+    fn task_interrupted_event_has_typed_fields() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.list_attempts(&tid).unwrap()[0].started_at;
+        s.recover_interrupted(started + 60).unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let ev = v
+            .events
+            .iter()
+            .find(|e| e.event_type == "task.interrupted")
+            .expect("task.interrupted event missing");
+        assert_eq!(ev.schema_version, 1);
+        let pj = ev.payload_json.as_deref().expect("payload_json populated");
+        assert!(pj.contains("\"reason\":\"deadline_exceeded\""));
+        assert!(pj.contains("\"started_at\""));
+    }
+
+    #[test]
+    fn retry_requested_event_has_typed_fields() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("blip"),
+            Some("transient"),
+        )
+        .unwrap();
+        s.request_retry(&tid).unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let ev = v
+            .events
+            .iter()
+            .find(|e| e.event_type == "task.retry_requested")
+            .expect("task.retry_requested event missing");
+        assert_eq!(ev.schema_version, 1);
+        let pj = ev.payload_json.as_deref().expect("payload_json populated");
+        assert!(pj.contains("\"attempt\":1"));
+        assert!(pj.contains("\"policy\":\"bounded\""));
+        assert!(pj.contains("\"prior_class\":\"transient\""));
+    }
+
+    #[test]
+    fn operator_event_via_append_event_stays_v0() {
+        // Operator-defined events via the `task.event` capability
+        // are NOT auto-promoted to v1 — schemas per event_type are
+        // a runtime concern, and we don't want to fake structure
+        // we don't have.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.append_event(&tid, "ops.custom", "anything goes").unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let ev = v
+            .events
+            .iter()
+            .find(|e| e.event_type == "ops.custom")
+            .expect("custom event missing");
+        assert_eq!(ev.schema_version, 0);
+        assert!(ev.attempt_id.is_none());
+        assert!(ev.trace_id.is_none());
+        assert!(ev.payload_json.is_none());
+        assert_eq!(ev.payload, "anything goes");
     }
 
     // ── Phase S1: cursor pagination ───────────────────────────────────
