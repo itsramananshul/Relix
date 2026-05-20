@@ -353,6 +353,10 @@ fn register_node_type_handlers(
         crate::nodes::tool::register(bridge, backend);
         let desc = crate::nodes::tool::capability_descriptor();
         manifest.add_capability(desc.clone());
+        // B1: tool.web_extract — pure HTML parser. Lives on the same
+        // tool node so it shares identity / admission / audit / pool
+        // setup. Distinct from tool.web_fetch (no network surface).
+        manifest.add_capability(crate::nodes::tool::web_extract::capability_descriptor());
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,
             timeout_secs = tool_cfg.timeout_secs,

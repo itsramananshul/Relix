@@ -47,6 +47,7 @@
 //! These ship in later milestones if and when a flow needs them.
 
 pub mod security;
+pub mod web_extract;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -81,6 +82,11 @@ pub struct ToolConfig {
     /// `User-Agent` header sent with each request.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+    /// Max bytes `tool.web_extract` will accept as input. Default 1 MiB.
+    /// Pure parser — no network, no provider keys, just CPU bound to
+    /// this cap.
+    #[serde(default = "default_extract_max_input_bytes")]
+    pub extract_max_input_bytes: usize,
 }
 
 impl Default for ToolConfig {
@@ -91,6 +97,7 @@ impl Default for ToolConfig {
             max_redirects: default_max_redirects(),
             allow_http: false,
             user_agent: default_user_agent(),
+            extract_max_input_bytes: default_extract_max_input_bytes(),
         }
     }
 }
@@ -106,6 +113,9 @@ fn default_max_redirects() -> usize {
 }
 fn default_user_agent() -> String {
     format!("Relix-tool/{}", env!("CARGO_PKG_VERSION"))
+}
+fn default_extract_max_input_bytes() -> usize {
+    1024 * 1024
 }
 
 // ─────────────────────────── Client construction ───────────────────────────
@@ -348,6 +358,13 @@ impl ToolBackend {
         })
     }
 
+    /// Accessor used by [`register`] to forward the operator's
+    /// `[tool] extract_max_input_bytes` to the `tool.web_extract`
+    /// capability without making the whole `cfg` field public.
+    pub fn extract_max_input_bytes(&self) -> usize {
+        self.cfg.extract_max_input_bytes
+    }
+
     /// Run the configured capability against a single URL.
     ///
     /// Order of operations matters for safety:
@@ -547,7 +564,9 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
     d
 }
 
-/// Register tool capabilities on the dispatch bridge.
+/// Register tool capabilities on the dispatch bridge. Wires every
+/// `tool.*` capability the node exposes; today: `tool.web_fetch` (M9)
+/// and `tool.web_extract` (B1).
 pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
     let backend_for_handler = backend.clone();
     bridge.register(
@@ -557,6 +576,13 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
             async move { handle_web_fetch(b, ctx).await }
         })),
     );
+
+    // tool.web_extract — pure HTML parser, no network surface. Shares
+    // the tool node's existing identity / admission / audit setup.
+    let extract_cfg = Arc::new(web_extract::WebExtractConfig {
+        max_input_bytes: backend.extract_max_input_bytes(),
+    });
+    web_extract::register(bridge, extract_cfg);
 }
 
 async fn handle_web_fetch(backend: Arc<ToolBackend>, ctx: InvocationCtx) -> HandlerOutcome {

@@ -295,6 +295,11 @@ method = "tool.web_fetch"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "tool_web_extract"
+method = "tool.web_extract"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "task_create"
 method = "task.create"
 allow_groups = ["chat-users"]
