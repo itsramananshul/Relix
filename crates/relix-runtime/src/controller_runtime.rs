@@ -419,6 +419,13 @@ fn register_node_type_handlers(
                 &["task", "read", "cursor"],
             ),
             (
+                "task.export",
+                "Archival snapshot of one task: header + attempts + every \
+                 chronicle event in a single JSON object. The operator's \
+                 save-before-delete artifact.",
+                &["task", "read", "export", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \

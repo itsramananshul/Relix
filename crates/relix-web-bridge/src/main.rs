@@ -191,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bridge-side polling; owns no per-stream task state.
         .route("/v1/tasks/:id/events/stream", get(tasks::events_stream))
         .route("/v1/tasks/:id/lineage", get(tasks::lineage))
+        .route("/v1/tasks/:id/export", get(tasks::export))
         .route("/v1/tasks/recover", post(tasks::recover))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered

@@ -92,6 +92,7 @@
 //! | `task.recover`  | (empty) | one `task_id\n` per recovered task, then `recovered=N\n` |
 //! | `task.attempts` | `task_id` | one `attempt_num\tstatus\tstarted_at\tfinished_at\|-\tfailure_class\|-\tflow_id\|-\n` per attempt |
 //! | `task.retry`    | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted retry_count=N budget=M\n` / INVALID_ARGS with cause |
+//! | `task.export`   | `task_id` | single JSON archival snapshot (`{schema_version, exported_at, task_id, task, attempts}`) |
 //!
 //! Optional trailers (older callers that omit them keep working
 //! unchanged): `retry_policy|max_retries|max_runtime_secs` on
@@ -1258,6 +1259,27 @@ impl TaskStore {
         Ok(TaskPage { items, next_cursor })
     }
 
+    /// Export one Task's full archival artifact: header columns,
+    /// every attempt row, every chronicle event in a single
+    /// snapshot. Per `docs/chronicle-retention.md` this is the
+    /// "save-before-delete" path the operator runs before any
+    /// destructive deletion.
+    ///
+    /// Returns `Err(NotFound)` when the task doesn't exist.
+    pub fn export_task(&self, task_id: &str) -> Result<TaskExport, CoordinatorError> {
+        let view = self
+            .get(task_id)?
+            .ok_or_else(|| CoordinatorError::NotFound(task_id.to_string()))?;
+        let attempts = self.list_attempts(task_id)?;
+        Ok(TaskExport {
+            schema_version: 1,
+            exported_at: unix_secs(),
+            task_id: view.task_id.clone(),
+            view,
+            attempts,
+        })
+    }
+
     /// Total task count, optionally filtered by status. Drives
     /// pagination "total" hints for operator tooling that wants to
     /// render "N of M" without walking every page.
@@ -1399,6 +1421,27 @@ pub struct TaskPage {
     pub next_cursor: Option<TaskCursor>,
 }
 
+/// Operator's "save-before-delete" archival snapshot of one
+/// Task. Returned by [`TaskStore::export_task`] and rendered by
+/// the `task.export` capability handler as a single JSON object.
+///
+/// The shape is intentionally additive — older consumers
+/// reading the inner `view` + `attempts` arrays keep working
+/// even if future fields are added at the export envelope
+/// level. `schema_version` is the kill-switch when the inner
+/// shapes ever bump in a breaking way.
+#[derive(Debug, Clone)]
+pub struct TaskExport {
+    /// Export-envelope schema version. Currently 1.
+    pub schema_version: u32,
+    /// Unix seconds at which the snapshot was taken.
+    pub exported_at: i64,
+    /// Convenience — same as `view.task_id`.
+    pub task_id: String,
+    pub view: TaskView,
+    pub attempts: Vec<AttemptView>,
+}
+
 /// One execution attempt of a Task, returned by `task.attempts` and
 /// folded into `task.get`'s rendered output. `attempt_num` is 1-based
 /// per task; `attempt_id` is globally monotonic.
@@ -1533,6 +1576,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_list_cursor(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.export",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_export(&s, &ctx) }
             })),
         );
     }
@@ -1789,6 +1842,167 @@ fn handle_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.events: not found: {id}")),
         Err(e) => internal(format!("task.events: {e}")),
     }
+}
+
+/// `task.export` — archival snapshot of one task.
+///
+/// Args: `task_id` (32 hex). Returns one JSON object:
+///
+/// ```text
+/// {
+///   "schema_version": 1,
+///   "exported_at":    1700000000,
+///   "task_id":        "...",
+///   "task":           { header: {...}, events: [...] },
+///   "attempts":       [...]
+/// }
+/// ```
+///
+/// This is the operator's "save-before-delete" snapshot that
+/// the chronicle-retention design requires before any
+/// destructive deletion lands. Compact form (single JSON
+/// object, not line-delimited) so it's directly archivable
+/// to a file.
+fn handle_export(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.export utf8: {e}")),
+    };
+    if task_id.is_empty() {
+        return invalid("task.export: task_id required".to_string());
+    }
+    match store.export_task(task_id) {
+        Ok(export) => HandlerOutcome::Ok(render_task_export(&export).into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.export: not found: {id}")),
+        Err(e) => internal(format!("task.export: {e}")),
+    }
+}
+
+/// Hand-built JSON for one `TaskExport`. Same approach as the
+/// other Coordinator renderers — no serde_json dependency on
+/// the runtime crate.
+#[allow(unused_assignments)] // `first` is mutated by macros below; final write is by design
+fn render_task_export(e: &TaskExport) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(2048);
+    let _ = write!(
+        s,
+        r#"{{"schema_version":{},"exported_at":{},"task_id":"{}","task":{{"#,
+        e.schema_version,
+        e.exported_at,
+        json_escape(&e.task_id),
+    );
+    // Header fields. Build from the same struct fields the
+    // existing renderer uses so any new column added there
+    // surfaces here too.
+    let v = &e.view;
+    let mut first = true;
+    macro_rules! push_str_field {
+        ($key:expr, $val:expr) => {{
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            let _ = write!(s, r#""{}":"{}""#, $key, json_escape(&$val));
+        }};
+    }
+    macro_rules! push_int_field {
+        ($key:expr, $val:expr) => {{
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            let _ = write!(s, r#""{}":{}"#, $key, $val);
+        }};
+    }
+    macro_rules! push_opt_str_field {
+        ($key:expr, $val:expr) => {
+            if let Some(x) = $val.as_ref() {
+                if !first {
+                    s.push(',');
+                }
+                first = false;
+                let _ = write!(s, r#""{}":"{}""#, $key, json_escape(x));
+            }
+        };
+    }
+    macro_rules! push_opt_int_field {
+        ($key:expr, $val:expr) => {
+            if let Some(x) = $val {
+                if !first {
+                    s.push(',');
+                }
+                first = false;
+                let _ = write!(s, r#""{}":{}"#, $key, x);
+            }
+        };
+    }
+    push_str_field!("title", v.title);
+    push_str_field!("status", v.status);
+    push_str_field!("owner_subject_id", v.owner_subject_id);
+    push_str_field!("flow_template", v.flow_template);
+    push_str_field!("params_json", v.params_json);
+    push_opt_str_field!("latest_result", v.latest_result);
+    push_opt_str_field!("latest_flow_id", v.latest_flow_id);
+    push_opt_str_field!("latest_flow_log_path", v.latest_flow_log_path);
+    push_opt_int_field!("error_kind", v.error_kind);
+    push_opt_str_field!("error_cause", v.error_cause);
+    push_int_field!("created_at", v.created_at);
+    push_int_field!("updated_at", v.updated_at);
+    push_int_field!("retry_count", v.retry_count);
+    push_str_field!("retry_policy", v.retry_policy);
+    push_int_field!("max_retries", v.max_retries);
+    push_opt_int_field!("max_runtime_secs", v.max_runtime_secs);
+    push_opt_str_field!("last_failure_reason", v.last_failure_reason);
+    push_opt_str_field!("last_failure_class", v.last_failure_class);
+    push_opt_int_field!("started_at", v.started_at);
+    push_int_field!("attempt_count", v.attempt_count);
+    push_opt_int_field!("current_attempt_id", v.current_attempt_id);
+    s.push_str(r#","events":["#);
+    for (i, ev) in v.events.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&render_event_json(ev));
+    }
+    s.push_str(r#"]},"attempts":["#);
+    for (i, a) in e.attempts.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(
+            s,
+            r#"{{"attempt_id":{},"attempt_num":{},"started_at":{},"status":"{}""#,
+            a.attempt_id,
+            a.attempt_num,
+            a.started_at,
+            json_escape(&a.status),
+        );
+        if let Some(x) = a.finished_at {
+            let _ = write!(s, r#","finished_at":{x}"#);
+        }
+        if let Some(ref x) = a.flow_id {
+            let _ = write!(s, r#","flow_id":"{}""#, json_escape(x));
+        }
+        if let Some(ref x) = a.flow_log_path {
+            let _ = write!(s, r#","flow_log_path":"{}""#, json_escape(x));
+        }
+        if let Some(ref x) = a.trace_id {
+            let _ = write!(s, r#","trace_id":"{}""#, json_escape(x));
+        }
+        if let Some(x) = a.error_kind {
+            let _ = write!(s, r#","error_kind":{x}"#);
+        }
+        if let Some(ref x) = a.error_cause {
+            let _ = write!(s, r#","error_cause":"{}""#, json_escape(x));
+        }
+        if let Some(ref x) = a.failure_class {
+            let _ = write!(s, r#","failure_class":"{}""#, json_escape(x));
+        }
+        s.push('}');
+    }
+    s.push_str("]}");
+    s
 }
 
 /// `task.list_cursor` — cursor-paginated task list. Stable
@@ -3411,6 +3625,115 @@ mod tests {
             Err(CoordinatorError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    // ── Phase H: operator export (S5 / retention groundwork) ──────────
+
+    #[test]
+    fn export_task_full_round_trip() {
+        use serde_json::Value;
+        let s = store();
+        let tid = s
+            .create(
+                "export test",
+                "f.sol",
+                "{}",
+                "alice",
+                RetryPolicy::Bounded,
+                3,
+                Some(60),
+            )
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.append_event(&tid, "ops.custom", "operator note").unwrap();
+        s.update(
+            &tid,
+            Some("completed"),
+            Some("done"),
+            Some("flow123"),
+            Some("/tmp/x.log"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let export = s.export_task(&tid).unwrap();
+        assert_eq!(export.task_id, tid);
+        assert_eq!(export.view.status, "completed");
+        assert_eq!(export.attempts.len(), 1);
+        // Chronicle includes both runtime-emitted events and
+        // the operator-defined one.
+        assert!(
+            export
+                .view
+                .events
+                .iter()
+                .any(|e| e.event_type == "ops.custom")
+        );
+        assert!(
+            export
+                .view
+                .events
+                .iter()
+                .any(|e| e.event_type == "task.attempt_started")
+        );
+
+        // Render path produces parseable JSON.
+        let body = render_task_export(&export);
+        let v: Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("export body did not parse:\n{body}\nerror: {e}"));
+        assert_eq!(v.get("schema_version").and_then(|x| x.as_u64()), Some(1));
+        assert!(v.get("exported_at").and_then(|x| x.as_i64()).unwrap_or(0) > 0);
+        assert_eq!(
+            v.get("task_id").and_then(|x| x.as_str()),
+            Some(tid.as_str())
+        );
+        let task = v.get("task").expect("task field");
+        assert_eq!(
+            task.get("status").and_then(|x| x.as_str()),
+            Some("completed")
+        );
+        // Events array must be present and non-empty.
+        let events = task
+            .get("events")
+            .and_then(|x| x.as_array())
+            .expect("events");
+        assert!(!events.is_empty());
+        // Attempts array.
+        let attempts = v
+            .get("attempts")
+            .and_then(|x| x.as_array())
+            .expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].get("status").and_then(|x| x.as_str()),
+            Some("completed")
+        );
+    }
+
+    #[test]
+    fn export_task_unknown_id_is_not_found() {
+        let s = store();
+        match s.export_task("deadbeef") {
+            Err(CoordinatorError::NotFound(id)) => assert_eq!(id, "deadbeef"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_task_renders_with_hostile_chars_safely() {
+        // Operator-defined event with chars that would break
+        // naive JSON escaping. The export body must round-trip.
+        let s = store();
+        let tid = mk(&s, "t\"with quotes\"", "f", "{}", "o");
+        s.append_event(&tid, "ops.test", "key=\"q\" backslash=\\ ctrl=\x01 tab=\t")
+            .unwrap();
+        let export = s.export_task(&tid).unwrap();
+        let body = render_task_export(&export);
+        let _v: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("hostile export failed to parse:\n{body}\nerror: {e}"));
     }
 
     // ── Phase I: hardening for typed envelopes + cursors ──────────────

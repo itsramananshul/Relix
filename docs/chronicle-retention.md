@@ -182,14 +182,27 @@ The export capability lands BEFORE any retention capability —
 deletion that doesn't have a working "save it first" path is
 dangerous to ship.
 
+## Implementation status
+
+- **Step 1 (export-only)** — ✅ shipped. `task.export`
+  Coordinator capability + `/v1/tasks/:id/export` bridge
+  endpoint (Content-Disposition: attachment so browsers save
+  directly). Returns the single-JSON archival artifact
+  described in this doc's "Operator export contract"
+  section. See
+  [`task-runtime.md`](task-runtime.md) for the wire shape.
+- **Step 2 (configurable max age, dry-run)** — pending.
+- **Step 3 (bounded delete)** — pending.
+- **Step 4 (snapshot synthesis)** — pending.
+- **Step 5 (operator triage tooling)** — pending.
+
 ## Suggested implementation order
 
 This is the **recommended** sequence; greenlight required for
-each step.
+each remaining step.
 
-1. **Export-only first.** Implement `task.export` (operator
-   capability) returning the canonical per-task artifact. Add
-   `/v1/tasks/:id/export` to the bridge. Tests + docs.
+1. **Export-only first.** ✅ Shipped. `task.export` capability
+   + `/v1/tasks/:id/export` bridge endpoint.
 2. **Configurable max age, dry-run.** Add `event_max_age_days`
    config + `task.compact_events --dry-run` capability that
    *counts* what would be deleted without deleting. Operators

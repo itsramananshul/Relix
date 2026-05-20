@@ -220,6 +220,42 @@ If `attempts` fails to fetch (older Coordinator, policy denial),
 the lineage is returned with `attempts: []` and the other
 components populated. Fail-soft on degradation.
 
+### `GET /v1/tasks/:id/export`
+
+Archival snapshot for download. Returns one JSON document
+containing the task header, every attempt row, and every
+chronicle event. The response carries
+`Content-Disposition: attachment; filename="task-<id>.json"`
+so browsers save directly to disk.
+
+Response shape:
+
+```json
+{
+  "schema_version": 1,
+  "exported_at":    1700000000,
+  "task_id":        "...",
+  "task": {
+    "title": "...", "status": "...", "owner_subject_id": "...",
+    "flow_template": "...", "params_json": "...",
+    "events": [
+      {"id": 1, "ts": 100, "type": "task.created", "payload": "..."},
+      ...
+    ],
+    ...
+  },
+  "attempts": [
+    {"attempt_id": 1, "attempt_num": 1, "started_at": 100, "status": "completed", ...},
+    ...
+  ]
+}
+```
+
+Use this as the **save-before-delete** artifact before any
+chronicle compaction. See
+[`chronicle-retention.md`](chronicle-retention.md) for the
+retention design contract.
+
 ## Operator actions
 
 ### `POST /v1/tasks/recover`

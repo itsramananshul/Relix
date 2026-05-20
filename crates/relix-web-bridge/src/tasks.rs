@@ -545,6 +545,44 @@ pub async fn events_stream(
     Ok(Sse::new(s).keep_alive(KeepAlive::default()))
 }
 
+/// `GET /v1/tasks/:id/export` — archival snapshot for operator
+/// download. Returns the Coordinator's single-JSON artifact
+/// verbatim with `Content-Disposition: attachment` so browsers
+/// save directly to disk.
+///
+/// This is the "save-before-delete" path the chronicle
+/// retention design requires before destructive deletion lands.
+pub async fn export(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = rec
+        .export(&id)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    let filename = format!("task-{id}.json");
+    Ok(axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(body))
+        .expect("export response builds"))
+}
+
 pub async fn attempts(
     State(state): State<AppState>,
     Path(id): Path<String>,

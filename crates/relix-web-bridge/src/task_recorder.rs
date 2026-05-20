@@ -159,6 +159,13 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.count utf8: {e}"))
     }
 
+    /// `task.export` passthrough. Returns the Coordinator's
+    /// single-JSON archival artifact verbatim.
+    pub async fn export(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.export", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.export utf8: {e}"))
+    }
+
     /// `task.list_cursor` passthrough. Wire format:
     /// `limit|status|cursor`. Empty status / cursor mean "no
     /// filter" / "first page."
