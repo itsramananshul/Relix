@@ -828,6 +828,125 @@ mod tests {
     }
 
     #[test]
+    fn cache_insert_stamps_last_refreshed_at() {
+        // Per multi-node operational realism: every successful
+        // manifest refresh must stamp `last_refreshed_at` so
+        // /v1/topology and /v1/health can compute freshness.
+        // Failures don't reach insert; the timestamp is the
+        // "last successful refresh" by construction.
+        let cache = ManifestCache::new();
+        let manifest = NodeManifest {
+            node_id: n(b"m"),
+            node_name: "m".into(),
+            node_type: "memory".into(),
+            manifest_version: 1,
+            org_id: n(b"o"),
+            endpoints: vec![],
+            capabilities: vec![],
+        };
+        cache.insert(Some("memory".into()), manifest.clone());
+        let entries = cache.entries();
+        assert_eq!(entries.len(), 1);
+        // unix_secs() returns the current time; in unit-test
+        // wall-clock terms this is "definitely not 0 and
+        // definitely within a sane window of now."
+        let now = unix_secs();
+        let stamped = entries[0].last_refreshed_at;
+        assert!(stamped > 0, "expected non-zero timestamp, got {stamped}");
+        assert!(
+            (now - stamped).abs() < 5,
+            "stamped={stamped} should be within 5s of now={now}"
+        );
+    }
+
+    #[test]
+    fn cache_re_insert_advances_last_refreshed_at() {
+        // Background 60s refresh loop calls insert repeatedly.
+        // Each successful refresh must update the timestamp so
+        // freshness verdicts stay accurate even when the
+        // manifest contents haven't changed.
+        let cache = ManifestCache::new();
+        let manifest = NodeManifest {
+            node_id: n(b"m"),
+            node_name: "m".into(),
+            node_type: "memory".into(),
+            manifest_version: 1,
+            org_id: n(b"o"),
+            endpoints: vec![],
+            capabilities: vec![],
+        };
+        cache.insert(Some("memory".into()), manifest.clone());
+        let first = cache.entries()[0].last_refreshed_at;
+        // Force a measurable gap so the second insert's timestamp
+        // is strictly greater. unix_secs() resolution is one
+        // second, so we need ≥1100ms.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        cache.insert(Some("memory".into()), manifest);
+        let second = cache.entries()[0].last_refreshed_at;
+        assert!(
+            second > first,
+            "re-insert should advance the timestamp: first={first} second={second}"
+        );
+    }
+
+    #[test]
+    fn cache_holds_independent_freshness_per_peer() {
+        // Each peer's freshness is independent. Refreshing one
+        // peer must not mutate another's last_refreshed_at —
+        // the multi-node operator view needs per-peer staleness
+        // to be meaningful (failure-modes.md uses it to spot
+        // which peer's refresh has stalled).
+        let cache = ManifestCache::new();
+        let mem = NodeManifest {
+            node_id: n(b"mem"),
+            node_name: "mem".into(),
+            node_type: "memory".into(),
+            manifest_version: 1,
+            org_id: n(b"o"),
+            endpoints: vec![],
+            capabilities: vec![],
+        };
+        let ai = NodeManifest {
+            node_id: n(b"ai"),
+            node_name: "ai".into(),
+            node_type: "ai".into(),
+            manifest_version: 1,
+            org_id: n(b"o"),
+            endpoints: vec![],
+            capabilities: vec![],
+        };
+        cache.insert(Some("memory".into()), mem.clone());
+        let mem_first = cache
+            .entries()
+            .into_iter()
+            .find(|e| e.alias.as_deref() == Some("memory"))
+            .unwrap()
+            .last_refreshed_at;
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Refresh only the AI peer.
+        cache.insert(Some("ai".into()), ai);
+        let entries = cache.entries();
+        let mem_second = entries
+            .iter()
+            .find(|e| e.alias.as_deref() == Some("memory"))
+            .unwrap()
+            .last_refreshed_at;
+        let ai_stamp = entries
+            .iter()
+            .find(|e| e.alias.as_deref() == Some("ai"))
+            .unwrap()
+            .last_refreshed_at;
+        assert_eq!(
+            mem_second, mem_first,
+            "memory's last_refreshed_at must not change when ai is refreshed"
+        );
+        assert!(
+            ai_stamp > mem_first,
+            "ai's stamp ({ai_stamp}) should be > memory's first stamp ({mem_first})"
+        );
+    }
+
+    #[test]
     fn transport_break_heuristic_matches_expected_strings() {
         // Substring matcher is intentionally generous; these are the
         // failure-mode strings libp2p surfaces that we want to retry on.
