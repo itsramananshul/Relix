@@ -19,20 +19,26 @@ where a limitation here corresponds to a SIMP entry there, it's cited.
 ### Coordinator is a Task ledger, not a flow scheduler
 
 The Coordinator node-type owns a durable SQLite ledger of Task records
-+ events (commit `<pending>`; see [`coordinator.md`](coordinator.md)).
-It does **not**:
++ per-attempt execution rows + events (see
+[`coordinator.md`](coordinator.md) and
+[`attempt-lineage.md`](attempt-lineage.md)). It does **not**:
 
 - Watch for peer health.
-- Auto-detect crashed executors or sweep `running` tasks to `abandoned`.
+- Auto-launch interrupted tasks. The C1b recovery scan promotes
+  overdue `running` rows to `interrupted` and closes the open
+  attempt — that's it. Re-launch is operator-driven.
 - Schedule or queue work — there is no auto-scheduler picking up
   `pending` tasks.
+- Auto-retry. The C2c `task.retry` capability validates state +
+  budget and flips metadata; the operator (or the bridge on a fresh
+  request) still has to actually re-run the flow.
 - Resume a flow mid-execution (the SOL VM is synchronous — see
   [`replay-model.md`](replay-model.md) for the honest framing).
 
-What it gives you is durable records of who tried to do what and where
-the per-flow event log lives. Retry decisions are operator-driven via
-`relix-cli task update` (set `status` + re-issue the call); auto-retry
-is Gate 2.
+What it gives you is durable per-attempt records of who tried to do
+what, the chronicle of how it went, and the pointer to where the
+per-flow event log lives. Retry decisions are operator-driven via
+`relix-cli task retry`.
 
 ### Bridge persists every chat as a Task (fail-soft)
 

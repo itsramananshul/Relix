@@ -96,9 +96,10 @@ they verify.
 ## See also
 
 - [`task-runtime.md`](task-runtime.md) — schema + wire format.
+- [`attempt-lineage.md`](attempt-lineage.md) — per-attempt rows,
+  when they open and close, attempt-aware event vocabulary.
 - [`interruption-semantics.md`](interruption-semantics.md) — recovery
   scan contract and the `interrupted` transition.
-- [`retry-model.md`](retry-model.md) — what `retry_policy` /
-  `max_retries` mean today and what they will mean after bounded
-  auto-retry lands.
+- [`retry-model.md`](retry-model.md) — what `task.retry` does today
+  and how `retry_policy` + `max_retries` gate it.
 - [`task-recovery.md`](task-recovery.md) — operator playbook.

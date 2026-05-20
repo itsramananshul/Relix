@@ -88,21 +88,30 @@ every `RemoteCallIssued` / `RemoteCallFailed` for forensic detail.
 ### Re-run from scratch (most common)
 
 ```bash
-# Mark the task as a retry candidate (status change is metadata only;
-# nothing happens until you actually re-run the flow).
-relix-cli task update --peer ... --identity ... --client-key ... \
-    --task-id <hex> --status retrying
+# C2c.1 retry primitive: validate state + budget, emit
+# task.retry_requested, flip to retrying. Refused by default for
+# non-retryable failure classes (policy_denied / invalid_args /
+# permanent); use --force to override.
+relix-cli task retry --peer ... --identity ... --client-key ... \
+    --task-id <hex>
 
 # Re-run with the same flow_template + params. The bridge does this
 # automatically for /chat requests; for CLI tasks you run flow-run
-# yourself.
+# yourself. The flow's success/failure path drives task.update,
+# which opens a NEW attempt row (#N+1) and closes it with the
+# terminal outcome.
 relix-cli flow-run --flow flows/chat_template.sol \
     --identity ... --client-key ... --peers peers.toml
+```
 
-# After it finishes, write the terminal state.
-relix-cli task update --peer ... --identity ... --client-key ... \
-    --task-id <hex> --status completed \
-    --result '...' --flow-id <new-hex> --flow-log-path <path>
+After the new attempt finishes, inspect the full attempt history:
+
+```bash
+relix-cli task attempts --peer ... --identity ... --client-key ... \
+    --task-id <hex>
+#   #  status       started     duration     failure       flow_id
+#   1  failed       1700000000  5s           transient     flowA...
+#   2  completed    1700000020  3s           -             flowB...
 ```
 
 ### Give up on a task
@@ -177,8 +186,12 @@ this kind of pipeline.
 
 - [`runtime-lifecycle.md`](runtime-lifecycle.md) — the status
   transition diagram.
+- [`attempt-lineage.md`](attempt-lineage.md) — per-attempt rows,
+  how they map back to flow logs, and the attempt-aware event
+  vocabulary.
 - [`interruption-semantics.md`](interruption-semantics.md) — what
   `interrupted` does and does not mean.
-- [`retry-model.md`](retry-model.md) — why nothing auto-retries today.
+- [`retry-model.md`](retry-model.md) — what `task.retry` actually
+  does and why nothing auto-retries today.
 - [`task-runtime.md`](task-runtime.md) — schema and wire format.
 - [`coordinator.md`](coordinator.md) — the peer and its trust model.

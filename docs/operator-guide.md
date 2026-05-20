@@ -347,6 +347,23 @@ The full status convention is in
 `pending`, `running`, `retrying`, `interrupted`, `awaiting_input`,
 `completed`, `failed`, `cancelled`.
 
+### Attempt lineage
+
+Every transition through `running` opens an attempt row on the
+Coordinator. To see the per-attempt timeline:
+
+```bash
+relix-cli task attempts --peer ... --identity ... --client-key ... \
+    --task-id <hex>
+#   #  status       started     duration     failure       flow_id
+#   1  failed       1700000000  5s           transient     flowA...
+#   2  completed    1700000020  3s           -             flowB...
+```
+
+Each attempt carries its own `flow_id` + `flow_log_path` + `trace_id`
+so operator forensics work across retries. Detail and contract live
+in [`docs/attempt-lineage.md`](attempt-lineage.md).
+
 ### Interruption recovery
 
 The Coordinator promotes overdue `running` tasks to `interrupted`
@@ -357,6 +374,25 @@ and any time an operator runs:
 relix-cli task recover --peer ... --identity ... --client-key ...
 # Prints one task id per recovered task, then `recovered=N`.
 ```
+
+### Operator-initiated retry
+
+```bash
+# Validates state + retry_policy budget on the Coordinator. Refused
+# by default for non-retryable failure classes (policy_denied /
+# invalid_args / permanent); use --force after operator inspection.
+relix-cli task retry --peer ... --identity ... --client-key ... \
+    --task-id <hex>
+# Prints: accepted attempt=2 of_budget=3
+#         or: exhausted retry_count=3 budget=3
+#         or: refused: last_failure_class=policy_denied ...
+```
+
+`task retry` only updates metadata + emits `task.retry_requested`.
+Re-execution is the operator's job (typically `relix-cli flow-run`
+with the same flow_template + params, or by re-driving through the
+bridge). The bridge does NOT auto-retry today — see
+[`docs/retry-model.md`](retry-model.md) for the rationale.
 
 The scan only touches rows that have BOTH `started_at` and
 `max_runtime_secs` set — a `running` row without a deadline is
@@ -388,6 +424,10 @@ auto-retries yet) is in [`docs/retry-model.md`](retry-model.md).
 
 See also: [`docs/coordinator.md`](coordinator.md),
 [`docs/task-runtime.md`](task-runtime.md),
+[`docs/attempt-lineage.md`](attempt-lineage.md),
+[`docs/runtime-lifecycle.md`](runtime-lifecycle.md),
+[`docs/interruption-semantics.md`](interruption-semantics.md),
+[`docs/retry-model.md`](retry-model.md),
 [`docs/replay-model.md`](replay-model.md).
 
 ## Inspecting flows after the fact
