@@ -3868,6 +3868,13 @@ let topologySelected = null;
 // RECENT_TRANSITION_SECS.
 const recentTransitions = new Map();
 const RECENT_TRANSITION_SECS = 30;
+// Per-peer event log cache for the peer drawer's history
+// section (M43). Keyed by node_id. Populated by
+// renderLifecycleEvents from the same /v1/topology/events
+// fetch; survives across topology refreshes so the drawer
+// always has the latest set.
+const peerEventHistory = new Map();
+const PEER_EVENT_HISTORY_CAP = 30;
 
 function initTopology() {
   document.getElementById('topology-refresh').addEventListener('click', loadTopology);
@@ -3998,6 +4005,23 @@ function renderLifecycleEvents(events) {
   // Age out anything older than the window.
   for (const [id, r] of recentTransitions.entries()) {
     if (r.ts < cutoff) recentTransitions.delete(id);
+  }
+
+  // M43: per-peer event history for the drawer's history
+  // section. Rebuild from this fetch so it stays in sync
+  // with the server-side ring (no need for an incremental
+  // merge — the topology page fetches once per page load
+  // + auto-refresh).
+  peerEventHistory.clear();
+  for (const ev of events) {
+    if (!ev.node_id) continue;
+    if (!peerEventHistory.has(ev.node_id)) {
+      peerEventHistory.set(ev.node_id, []);
+    }
+    const list = peerEventHistory.get(ev.node_id);
+    if (list.length < PEER_EVENT_HISTORY_CAP) {
+      list.push(ev);
+    }
   }
 
   if (!events.length) {
@@ -4191,6 +4215,34 @@ function openPeerDrawer(nodeId) {
   const fresh = peer.freshness || 'unknown';
   const methods = (peer.methods || []).map(m =>
     '<li>' + escapeHtml(m) + '</li>').join('');
+  // M43: render up to PEER_EVENT_HISTORY_CAP per-peer
+  // lifecycle events from the cached log. Empty when no
+  // transitions for this peer (or topology hasn't been
+  // loaded yet).
+  const history = peerEventHistory.get(peer.node_id) || [];
+  const historyHtml = history.length
+    ? '<div class="drawer-section">'
+      + '<h4>Recent transitions (' + history.length + ')</h4>'
+      + history.map(ev => {
+          const dt = new Date((ev.ts || 0) * 1000);
+          const kindCls = ev.kind === 'joined' ? 'ok'
+            : ev.kind === 'dropped' ? 'danger'
+            : (ev.to_freshness === 'fresh' ? 'ok'
+                : ev.to_freshness === 'stale' ? 'warn'
+                : 'danger');
+          return '<div style="font-size: 11px; padding: 3px 0; border-bottom: 1px solid var(--border-soft);">'
+            + '<span class="meta" style="padding:0; margin-right: 6px;">' + escapeHtml(dt.toLocaleTimeString()) + '</span>'
+            + '<span class="badge ' + kindCls + '" style="font-size: 9px;">' + escapeHtml(ev.kind) + '</span>'
+            + ' <span style="color: var(--text-muted);">' + escapeHtml(ev.detail || '') + '</span>'
+            + '</div>';
+        }).join('')
+      + '</div>'
+    : '<div class="drawer-section">'
+      + '<h4>Recent transitions</h4>'
+      + '<p class="meta">(no recent transitions for this peer · '
+      + 'topology must load first to populate history)</p>'
+      + '</div>';
+
   const body =
     '<div class="drawer-section">'
     + '<div class="drawer-grid">'
@@ -4215,6 +4267,7 @@ function openPeerDrawer(nodeId) {
         ? '<ul class="method-list">' + methods + '</ul>'
         : '<p class="meta">(none advertised)</p>')
     + '</div>'
+    + historyHtml
     + (fresh === 'expired' || fresh === 'stale'
       ? '<div class="banner ' + (fresh === 'expired' ? 'danger' : 'warn') + '">'
         + 'Peer state is <strong>' + escapeHtml(fresh) + '</strong>. '
