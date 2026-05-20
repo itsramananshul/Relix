@@ -3183,7 +3183,10 @@ function renderDetail(l) {
       </div>`
     : '<div class="meta" style="padding: 12px 14px;">(no chronicle events)</div>';
 
-  const chainBlock = renderRetryChain(l.attempts || [], l.edges || []);
+  const taskCreatedAt = (l.task && l.task.header && l.task.header.created_at)
+    ? Number(l.task.header.created_at)
+    : null;
+  const chainBlock = renderRetryChain(l.attempts || [], l.edges || [], taskCreatedAt);
   const graphBlock = renderExecGraph(l.attempts || [], l.edges || []);
   const xrefBlock = renderXrefPanel(l);
   const failureBlock = renderFailurePanel(l);
@@ -3235,9 +3238,18 @@ function renderDetail(l) {
      attempt # · status · duration · failure_class (if any)
    The gap between pills shows wait time so operators can
    spot "long backoff" vs "instant retry" patterns. */
-function renderRetryChain(attempts, edges) {
+function renderRetryChain(attempts, edges, taskCreatedAt) {
   if (!attempts || attempts.length === 0) return '';
   edges = edges || [];
+
+  // Queue wait: time the task spent between creation and
+  // the first attempt actually starting. Honest only when
+  // both timestamps are known and the gap is non-trivial
+  // (>= 1s) — we don't want to flag rounding noise as queue
+  // pressure. Hidden when the first attempt has no
+  // started_at yet (task still pending), since we'd be
+  // measuring against "now" instead of execution start.
+  const queueWaitHtml = renderQueueWait(attempts, taskCreatedAt);
 
   // Single attempt: render a compact summary, no chain.
   if (attempts.length === 1) {
@@ -3247,6 +3259,7 @@ function renderRetryChain(attempts, edges) {
       : '(open)';
     return '<div class="retry-chain">'
       + '<h3>execution</h3>'
+      + queueWaitHtml
       + '<div class="chain-strip">'
       +   renderChainPill(a, dur)
       + '</div>'
@@ -3342,12 +3355,38 @@ function renderRetryChain(attempts, edges) {
 
   return '<div class="retry-chain">'
     + '<h3>retry chain (' + sorted.length + ' attempts)</h3>'
+    + queueWaitHtml
     + '<div class="chain-strip">' + parts.join('') + '</div>'
     + budgetHtml
     + '<div class="chain-summary">'
     +   '<span class="total">' + fmtDuration(totalDur) + '</span>'
     +   ' total wall-clock · ' + escapeHtml(outcome)
     + '</div>'
+    + '</div>';
+}
+
+/* Queue wait = first attempt's started_at − task created_at.
+   We emit nothing unless the data is honest:
+   - taskCreatedAt is a finite number
+   - first attempt has a started_at
+   - the gap is >= 1s (sub-second is rounding noise, not a
+     queue pressure signal)
+   When the gap is unusually long (>= 30s) we add a warn
+   accent so operators spot SOL/coordinator backpressure
+   without parsing chronicle timestamps by hand. */
+const QUEUE_WAIT_WARN_SECS = 30;
+function renderQueueWait(attempts, taskCreatedAt) {
+  if (!Number.isFinite(taskCreatedAt) || !attempts.length) return '';
+  const first = attempts.slice().sort((a, b) => a.attempt_num - b.attempt_num)[0];
+  if (typeof first.started_at !== 'number') return '';
+  const wait = first.started_at - taskCreatedAt;
+  if (!Number.isFinite(wait) || wait < 1) return '';
+  const warn = wait >= QUEUE_WAIT_WARN_SECS;
+  const cls = warn ? ' style="color: var(--warn);"' : '';
+  const tag = warn ? ' (backpressure?)' : '';
+  return '<div class="meta queue-wait"' + cls + '>'
+    + 'queued for ' + escapeHtml(fmtDuration(wait))
+    + ' before attempt 1 started' + tag
     + '</div>';
 }
 

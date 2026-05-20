@@ -314,6 +314,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_queue_wait_indicator_present() {
+        // M52 (Track A): retry-chain card now surfaces queue
+        // wait = first_attempt.started_at − task.created_at,
+        // with a backpressure-warn accent when the gap is
+        // >= QUEUE_WAIT_WARN_SECS. Hidden when either
+        // timestamp is missing (honest, no fabricated wait).
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderQueueWait"),
+            "renderQueueWait helper missing"
+        );
+        assert!(
+            body.contains("QUEUE_WAIT_WARN_SECS"),
+            "queue-wait threshold constant missing"
+        );
+        assert!(
+            body.contains("backpressure?"),
+            "queue-wait backpressure accent label missing"
+        );
+        // The chain card should consume created_at via the
+        // detail-render call site.
+        assert!(
+            body.contains("l.task.header.created_at"),
+            "renderRetryChain caller should plumb created_at through"
+        );
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_timing_summary_present() {
         // M49 (Track A): exec graph header now ships a
         // wall-clock summary (total · terminal · retry tax)
