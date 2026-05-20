@@ -87,7 +87,7 @@
 //! | `task.get`      | `task_id` | multi-line `key=value` summary + `events:` JSON array |
 //! | `task.list`     | `` (empty) or `limit\|offset\|status` (limit default 50, all optional) | one `task_id\tstatus\ttitle\n` per line |
 //! | `task.count`    | `` (empty) or `<status>` | `count=N\n` |
-//! | `task.events`   | `task_id\|after_id\|limit` (after_id default 0, limit default 200) | one JSON event per line (`{"id":N,"ts":N,"type":"...","payload":"..."}`) |
+//! | `task.events`   | `task_id\|after_id\|limit\|type\|order` (after_id default 0, limit default 200, type empty = no filter, order in {asc, desc}, default asc) | one JSON event per line (`{"id":N,"ts":N,"type":"...","payload":"..."}`) |
 //! | `task.recover`  | (empty) | one `task_id\n` per recovered task, then `recovered=N\n` |
 //! | `task.attempts` | `task_id` | one `attempt_num\tstatus\tstarted_at\tfinished_at\|-\tfailure_class\|-\tflow_id\|-\n` per attempt |
 //! | `task.retry`    | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted retry_count=N budget=M\n` / INVALID_ARGS with cause |
@@ -240,6 +240,32 @@ impl RetryPolicy {
             "none" | "" => Some(Self::None),
             "once" => Some(Self::Once),
             "bounded" => Some(Self::Bounded),
+            _ => None,
+        }
+    }
+}
+
+/// Direction for [`TaskStore::query_events`]. `Asc` is the
+/// long-poll-friendly default (cursor advances through monotonic
+/// `event_id`s); `Desc` is for "give me the last N events"
+/// tail-queries operators use during interactive triage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventOrder {
+    Asc,
+    Desc,
+}
+
+impl EventOrder {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "asc" | "" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
             _ => None,
         }
     }
@@ -828,6 +854,26 @@ impl TaskStore {
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<TaskEvent>, CoordinatorError> {
+        self.query_events(task_id, after_id, limit, None, EventOrder::Asc)
+    }
+
+    /// Generalised event query. Same NotFound semantics as
+    /// [`list_events_after`] and the same `[1, max_list]` cap on
+    /// `limit`.
+    ///
+    /// - `type_filter`: non-empty exact-match on `event_type`. None
+    ///   (or empty) returns every event.
+    /// - `order`: `Asc` for the standard long-poll pattern
+    ///   (oldest-first, cursor advances); `Desc` for "give me the
+    ///   last N events" tail queries.
+    pub fn query_events(
+        &self,
+        task_id: &str,
+        after_id: i64,
+        limit: usize,
+        type_filter: Option<&str>,
+        order: EventOrder,
+    ) -> Result<Vec<TaskEvent>, CoordinatorError> {
         let cap = limit.clamp(1, self.max_list);
         let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let exists: i64 = conn
@@ -840,27 +886,66 @@ impl TaskStore {
         if exists == 0 {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         }
-        let mut stmt = conn
-            .prepare(
+        // SQLite parameter binding doesn't permit substituting
+        // identifiers (column / direction), so we materialise the
+        // four (order × filter) variants as four static SQL
+        // strings. All four hit the same task_events_task index.
+        let sql_with_type = match order {
+            EventOrder::Asc => {
+                "SELECT event_id, ts, event_type, payload
+                 FROM task_events
+                 WHERE task_id = ?1 AND event_id > ?2 AND event_type = ?4
+                 ORDER BY event_id ASC LIMIT ?3"
+            }
+            EventOrder::Desc => {
+                "SELECT event_id, ts, event_type, payload
+                 FROM task_events
+                 WHERE task_id = ?1 AND event_id > ?2 AND event_type = ?4
+                 ORDER BY event_id DESC LIMIT ?3"
+            }
+        };
+        let sql_no_type = match order {
+            EventOrder::Asc => {
                 "SELECT event_id, ts, event_type, payload
                  FROM task_events
                  WHERE task_id = ?1 AND event_id > ?2
-                 ORDER BY event_id ASC LIMIT ?3",
-            )
-            .map_err(CoordinatorError::Db)?;
-        let rows = stmt
-            .query_map(params![task_id, after_id, cap as i64], |r| {
-                Ok(TaskEvent {
-                    event_id: r.get(0)?,
-                    ts: r.get(1)?,
-                    event_type: r.get(2)?,
-                    payload: r.get(3)?,
-                })
+                 ORDER BY event_id ASC LIMIT ?3"
+            }
+            EventOrder::Desc => {
+                "SELECT event_id, ts, event_type, payload
+                 FROM task_events
+                 WHERE task_id = ?1 AND event_id > ?2
+                 ORDER BY event_id DESC LIMIT ?3"
+            }
+        };
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(TaskEvent {
+                event_id: r.get(0)?,
+                ts: r.get(1)?,
+                event_type: r.get(2)?,
+                payload: r.get(3)?,
             })
-            .map_err(CoordinatorError::Db)?;
+        };
         let mut out = Vec::with_capacity(cap);
-        for r in rows {
-            out.push(r.map_err(CoordinatorError::Db)?);
+        match type_filter.filter(|s| !s.is_empty()) {
+            Some(t) => {
+                let mut stmt = conn.prepare(sql_with_type).map_err(CoordinatorError::Db)?;
+                let rows = stmt
+                    .query_map(params![task_id, after_id, cap as i64, t], map_row)
+                    .map_err(CoordinatorError::Db)?;
+                for r in rows {
+                    out.push(r.map_err(CoordinatorError::Db)?);
+                }
+            }
+            None => {
+                let mut stmt = conn.prepare(sql_no_type).map_err(CoordinatorError::Db)?;
+                let rows = stmt
+                    .query_map(params![task_id, after_id, cap as i64], map_row)
+                    .map_err(CoordinatorError::Db)?;
+                for r in rows {
+                    out.push(r.map_err(CoordinatorError::Db)?);
+                }
+            }
         }
         Ok(out)
     }
@@ -1437,21 +1522,24 @@ fn handle_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
 }
 
 /// `task.events` — incremental chronicle fetch for one task. Arg
-/// shape: `task_id|after_id|limit`. `after_id` defaults to 0 (read
-/// from the beginning); `limit` defaults to 200 (clamped to
-/// `[coordinator] max_list`).
+/// shape: `task_id|after_id|limit|type|order`. `after_id` defaults
+/// to 0 (read from the beginning); `limit` defaults to 200
+/// (clamped to `[coordinator] max_list`). `type`, when non-empty,
+/// is an exact-match event_type filter. `order` is `asc` (default;
+/// the long-poll cursor pattern) or `desc` (newest-first; for
+/// "last N events" tail queries).
 ///
 /// Returns one JSON object per event, one per line:
 /// `{"id":N,"ts":N,"type":"...","payload":"..."}`. Empty body when
-/// the task has no events newer than `after_id`. Returns
-/// INVALID_ARGS on a malformed task id; `not found` if the task
+/// the task has no matching events. Returns INVALID_ARGS on a
+/// malformed task id or unknown order; `not found` if the task
 /// doesn't exist (so polling dashboards drop the row).
 fn handle_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => return invalid(format!("task.events utf8: {e}")),
     };
-    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let parts: Vec<&str> = s.splitn(5, '|').collect();
     let task_id = parts.first().copied().unwrap_or("").trim();
     if task_id.is_empty() {
         return invalid("task.events: task_id required".to_string());
@@ -1468,7 +1556,13 @@ fn handle_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         .filter(|v| !v.is_empty())
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
-    match store.list_events_after(task_id, after_id, limit) {
+    let type_filter = parts.get(3).copied().filter(|v| !v.is_empty());
+    let order_str = parts.get(4).copied().unwrap_or("");
+    let order = match EventOrder::parse(order_str) {
+        Some(o) => o,
+        None => return invalid(format!("task.events: bad order: {order_str}")),
+    };
+    match store.query_events(task_id, after_id, limit, type_filter, order) {
         Ok(events) => {
             let mut buf = String::with_capacity(events.len() * 96);
             for ev in &events {
@@ -2945,6 +3039,81 @@ mod tests {
             Err(CoordinatorError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    // ── Priority A (continuation): chronicle ergonomics ───────────────
+
+    #[test]
+    fn query_events_type_filter_matches_exact() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.append_event(&tid, "task.attempt_started", "a1").unwrap();
+        s.append_event(&tid, "task.attempt_finished", "a1f")
+            .unwrap();
+        s.append_event(&tid, "task.attempt_started", "a2").unwrap();
+        let started = s
+            .query_events(&tid, 0, 100, Some("task.attempt_started"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(started.len(), 2);
+        assert!(
+            started
+                .iter()
+                .all(|e| e.event_type == "task.attempt_started")
+        );
+        let finished = s
+            .query_events(&tid, 0, 100, Some("task.attempt_finished"), EventOrder::Asc)
+            .unwrap();
+        assert_eq!(finished.len(), 1);
+    }
+
+    #[test]
+    fn query_events_desc_order_returns_newest_first() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        for i in 0..5 {
+            s.append_event(&tid, "step", &format!("e{i}")).unwrap();
+        }
+        let desc = s.query_events(&tid, 0, 3, None, EventOrder::Desc).unwrap();
+        assert_eq!(desc.len(), 3);
+        // Newest first → payloads should be e4, e3, e2.
+        assert_eq!(desc[0].payload, "e4");
+        assert_eq!(desc[1].payload, "e3");
+        assert_eq!(desc[2].payload, "e2");
+    }
+
+    #[test]
+    fn query_events_empty_type_filter_equals_no_filter() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.append_event(&tid, "a", "1").unwrap();
+        s.append_event(&tid, "b", "2").unwrap();
+        let empty = s
+            .query_events(&tid, 0, 100, Some(""), EventOrder::Asc)
+            .unwrap();
+        let none = s.query_events(&tid, 0, 100, None, EventOrder::Asc).unwrap();
+        assert_eq!(empty.len(), none.len());
+        assert_eq!(empty.len(), 2);
+    }
+
+    #[test]
+    fn query_events_type_no_match_returns_empty() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.append_event(&tid, "step", "x").unwrap();
+        let v = s
+            .query_events(&tid, 0, 100, Some("nope.no.match"), EventOrder::Asc)
+            .unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn event_order_parse_roundtrip() {
+        assert_eq!(EventOrder::parse("asc"), Some(EventOrder::Asc));
+        assert_eq!(EventOrder::parse(""), Some(EventOrder::Asc));
+        assert_eq!(EventOrder::parse("desc"), Some(EventOrder::Desc));
+        assert!(EventOrder::parse("sideways").is_none());
+        assert_eq!(EventOrder::Asc.as_str(), "asc");
+        assert_eq!(EventOrder::Desc.as_str(), "desc");
     }
 
     // ── Priority F hardening: pagination edge cases ───────────────────

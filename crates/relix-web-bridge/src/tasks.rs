@@ -287,12 +287,22 @@ pub struct EventsQuery {
     /// Cap the response. Clamped by the Coordinator. Defaults to 200.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Exact-match filter on `event_type`. Empty / absent =
+    /// no filter.
+    #[serde(default)]
+    pub r#type: Option<String>,
+    /// `asc` (default) or `desc`. Desc gives "tail N" semantics.
+    #[serde(default)]
+    pub order: Option<String>,
 }
 
-/// `GET /v1/tasks/:id/events?since=N&limit=M` — incremental
-/// chronicle fetch. Long-poll-friendly: read once with `since=0`,
-/// remember the largest id, poll again with that id to fetch only
-/// new events.
+/// `GET /v1/tasks/:id/events?since=N&limit=M&type=...&order=...`
+/// — incremental chronicle fetch. Long-poll-friendly: read once
+/// with `since=0`, remember the largest id, poll again with that
+/// id to fetch only new events. Optional event-type filter and
+/// order. Bridge stays translation-only: every filter / order /
+/// limit is just a passthrough into the Coordinator's wire
+/// format.
 pub async fn events(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -311,8 +321,10 @@ pub async fn events(
     }
     let after = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(200);
+    let event_type = q.r#type.as_deref().unwrap_or("");
+    let order = q.order.as_deref().unwrap_or("");
     let body = rec
-        .events(&id, after, limit)
+        .events_filtered(&id, after, limit, event_type, order)
         .await
         .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
     Ok(Json(parse_events_lines(&body)))

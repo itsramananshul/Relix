@@ -159,14 +159,31 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.count utf8: {e}"))
     }
 
-    /// `task.events` passthrough. Wire format: `task_id|after_id|limit`.
+    /// `task.events` passthrough. Wire format:
+    /// `task_id|after_id|limit|type|order`. `type` empty = no
+    /// filter; `order` empty = asc. Kept for completeness; the
+    /// bridge endpoint always goes through `events_filtered`.
+    #[allow(dead_code)]
     pub async fn events(
         &self,
         task_id: &str,
         after_id: i64,
         limit: usize,
     ) -> Result<String, String> {
-        let arg = format!("{task_id}|{after_id}|{limit}");
+        self.events_filtered(task_id, after_id, limit, "", "").await
+    }
+
+    /// `task.events` with type filter + order. Empty strings on
+    /// `event_type` or `order` mean "no filter" / "default order".
+    pub async fn events_filtered(
+        &self,
+        task_id: &str,
+        after_id: i64,
+        limit: usize,
+        event_type: &str,
+        order: &str,
+    ) -> Result<String, String> {
+        let arg = format!("{task_id}|{after_id}|{limit}|{event_type}|{order}");
         let bytes = self.call("task.events", arg.as_bytes()).await?;
         String::from_utf8(bytes).map_err(|e| format!("task.events utf8: {e}"))
     }
