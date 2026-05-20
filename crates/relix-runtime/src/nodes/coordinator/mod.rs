@@ -893,13 +893,15 @@ impl TaskStore {
         // strings. All four hit the same task_events_task index.
         let sql_with_type = match order {
             EventOrder::Asc => {
-                "SELECT event_id, ts, event_type, payload
+                "SELECT event_id, ts, event_type, payload,
+                        schema_version, attempt_id, trace_id, payload_json
                  FROM task_events
                  WHERE task_id = ?1 AND event_id > ?2 AND event_type = ?4
                  ORDER BY event_id ASC LIMIT ?3"
             }
             EventOrder::Desc => {
-                "SELECT event_id, ts, event_type, payload
+                "SELECT event_id, ts, event_type, payload,
+                        schema_version, attempt_id, trace_id, payload_json
                  FROM task_events
                  WHERE task_id = ?1 AND event_id > ?2 AND event_type = ?4
                  ORDER BY event_id DESC LIMIT ?3"
@@ -907,13 +909,15 @@ impl TaskStore {
         };
         let sql_no_type = match order {
             EventOrder::Asc => {
-                "SELECT event_id, ts, event_type, payload
+                "SELECT event_id, ts, event_type, payload,
+                        schema_version, attempt_id, trace_id, payload_json
                  FROM task_events
                  WHERE task_id = ?1 AND event_id > ?2
                  ORDER BY event_id ASC LIMIT ?3"
             }
             EventOrder::Desc => {
-                "SELECT event_id, ts, event_type, payload
+                "SELECT event_id, ts, event_type, payload,
+                        schema_version, attempt_id, trace_id, payload_json
                  FROM task_events
                  WHERE task_id = ?1 AND event_id > ?2
                  ORDER BY event_id DESC LIMIT ?3"
@@ -925,6 +929,10 @@ impl TaskStore {
                 ts: r.get(1)?,
                 event_type: r.get(2)?,
                 payload: r.get(3)?,
+                schema_version: r.get(4)?,
+                attempt_id: r.get(5)?,
+                trace_id: r.get(6)?,
+                payload_json: r.get(7)?,
             })
         };
         let mut out = Vec::with_capacity(cap);
@@ -1032,7 +1040,8 @@ impl TaskStore {
         };
         let mut stmt = conn
             .prepare(
-                "SELECT event_id, ts, event_type, payload
+                "SELECT event_id, ts, event_type, payload,
+                        schema_version, attempt_id, trace_id, payload_json
                  FROM task_events WHERE task_id = ?1 ORDER BY event_id ASC",
             )
             .map_err(CoordinatorError::Db)?;
@@ -1043,6 +1052,10 @@ impl TaskStore {
                     ts: r.get(1)?,
                     event_type: r.get(2)?,
                     payload: r.get(3)?,
+                    schema_version: r.get(4)?,
+                    attempt_id: r.get(5)?,
+                    trace_id: r.get(6)?,
+                    payload_json: r.get(7)?,
                 })
             })
             .map_err(CoordinatorError::Db)?;
@@ -1274,12 +1287,37 @@ pub struct TaskView {
 }
 
 /// One event appended via `task.event`.
+///
+/// Schema versioning (S2):
+/// - `schema_version = 0`: legacy. Only `payload` (free string)
+///   is populated. Operator-defined events via `task.event` stay
+///   here.
+/// - `schema_version = 1`: structured envelope. `attempt_id` and
+///   `trace_id` are filled when known; `payload_json` carries
+///   typed event data (still optional). Runtime emitters
+///   (attempt open/close, recovery scan, retry request) use this
+///   form. Legacy `payload` is also populated for back-compat
+///   with old renderers.
+///
+/// All four new fields are `Option<_>` so older serialised
+/// representations parse cleanly without bumping the type.
 #[derive(Debug, Clone)]
 pub struct TaskEvent {
     pub event_id: i64,
     pub ts: i64,
     pub event_type: String,
     pub payload: String,
+    /// S2: 0 = legacy, 1 = structured envelope.
+    pub schema_version: i64,
+    /// S2: present on structured events that belong to an attempt.
+    pub attempt_id: Option<i64>,
+    /// S2: present on structured events emitted within a traced
+    /// flow.
+    pub trace_id: Option<String>,
+    /// S2: optional typed payload as a JSON string. Free-form;
+    /// the schema per event_type is documented in
+    /// `docs/event-contract.md`.
+    pub payload_json: Option<String>,
 }
 
 /// Compact Task representation returned by `task.list`.
@@ -2089,6 +2127,13 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         // 'running' transition opens an attempt.
         "ALTER TABLE tasks ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE tasks ADD COLUMN current_attempt_id INTEGER",
+        // S2: typed event envelopes. schema_version=0 = legacy
+        // (string payload only). schema_version=1 = structured;
+        // attempt_id / trace_id / payload_json may be set.
+        "ALTER TABLE task_events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE task_events ADD COLUMN attempt_id INTEGER",
+        "ALTER TABLE task_events ADD COLUMN trace_id TEXT",
+        "ALTER TABLE task_events ADD COLUMN payload_json TEXT",
     ];
     for sql in alters {
         // Best-effort. The only error we expect is "duplicate column
