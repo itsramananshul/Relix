@@ -238,13 +238,24 @@ pub async fn execute_chat_with_tool_flow(
         rec.start_running(tid, &trace_hex).await;
         // Pre-execution capability intent. Useful for operators
         // triaging failures: even if the tool peer rejects the URL,
-        // the task chronicle says what was attempted. The payload
-        // format `method=... target=...` is the convention for
-        // capability.invoked when there's a meaningful target arg.
+        // the task chronicle says what was attempted.
+        //
+        // Payload format: `method=X target=Y peer=Z` where
+        // `peer` is the alias the bridge expects to handle the
+        // call. For chat_with_tool the resolution is static —
+        // the SOL template hardcodes `remote_call("tool", …)`
+        // so the alias is unambiguously "tool". Future flows
+        // that use `capability:method` resolution will pull the
+        // alias from `manifest_cache.find_alias_for_method`.
+        //
+        // The Phase-1D Execution path panel reads this field
+        // and labels the row "recorded" instead of falling back
+        // to the routing snapshot — the operator sees ground
+        // truth, not a current-view inference.
         rec.event(
             tid,
             "capability.invoked",
-            &format!("method=tool.web_fetch target={url}"),
+            &format!("method=tool.web_fetch target={url} peer=tool"),
         )
         .await;
     }
