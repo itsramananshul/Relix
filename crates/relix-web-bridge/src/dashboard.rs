@@ -261,6 +261,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_exec_graph_nodes_clickable_present() {
+        // M46 (Track A): graph nodes carry data-attempt-filter
+        // so clicking a node toggles the timeline filter to
+        // that attempt, the same affordance the chain pills
+        // ship. CSS marks the group as a pointer + selected
+        // state so the affordance is discoverable.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("graph-node"),
+            "exec graph nodes should carry the graph-node class for click affordance"
+        );
+        assert!(
+            body.contains(".exec-graph .graph-node"),
+            "graph-node CSS rule missing"
+        );
+        // The renderExecGraph function should emit
+        // data-attempt-filter on each <g>; this is the same
+        // delegator hook the chain pills use.
+        assert!(
+            body.contains("data-attempt-filter=\"' + a.attempt_id"),
+            "graph node group should carry data-attempt-filter"
+        );
+    }
+
+    #[tokio::test]
     async fn page_provider_enable_disable_present() {
         // M42 (Track C): per-provider enable/disable toggle.
         // PUT /v1/config/providers/:name/enabled + UI button

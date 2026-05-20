@@ -1159,6 +1159,13 @@
       border-radius: 3px;
       border: 1px solid var(--border-soft);
     }
+    .exec-graph .graph-node { cursor: pointer; }
+    .exec-graph .graph-node:hover .node-box { stroke: var(--accent); stroke-width: 2; }
+    .exec-graph .graph-node.selected .node-box {
+      stroke: var(--accent);
+      stroke-width: 3;
+      filter: drop-shadow(0 0 4px var(--accent));
+    }
     .exec-graph .node-box {
       fill: var(--bg-elevated);
       stroke: var(--border);
@@ -3734,13 +3741,23 @@ function renderExecGraph(attempts, edges) {
     const cx = slotW * (i + 0.5);
     positions.set(a.attempt_id, { cx, cy: yMid });
   });
-  // Build SVG.
+  // Build SVG. Each node is wrapped in a <g> carrying
+  // data-attempt-filter so the global click delegator
+  // toggles the timeline filter to this attempt — the
+  // same affordance the chain pills already expose.
   const nodes = sorted.map(a => {
     const p = positions.get(a.attempt_id);
     if (!p) return '';
     const x = p.cx - boxW / 2;
     const y = p.cy - boxH / 2;
+    const isSelected = (attemptFilter != null && attemptFilter === a.attempt_id);
+    const groupCls = 'graph-node' + (isSelected ? ' selected' : '');
+    const title = 'attempt ' + a.attempt_num + ' · ' + a.status
+      + ' · click to filter timeline to this attempt';
     return ''
+      + '<g class="' + groupCls + '"'
+      +   ' data-attempt-filter="' + a.attempt_id + '">'
+      + '<title>' + escapeHtml(title) + '</title>'
       + '<rect class="node-box status-' + escapeHtml(a.status) + '"'
       +   ' x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '"'
       +   ' width="' + boxW + '" height="' + boxH + '" rx="4" />'
@@ -3751,7 +3768,8 @@ function renderExecGraph(attempts, edges) {
       + (a.failure_class
         ? '<text class="node-status" x="' + p.cx + '" y="' + (p.cy + 22) + '" style="fill: var(--danger);">'
             + escapeHtml(a.failure_class) + '</text>'
-        : '');
+        : '')
+      + '</g>';
   }).join('');
   // Draw edges. For each edge with both endpoints in
   // the attempt set, draw an arrow from the parent to
