@@ -233,3 +233,19 @@ README.md                                               # task lifecycle docs
 End of nightly session. No regressions. All pushes through
 `origin/main`. Session-internal artefacts under `docs/internal/`
 (this file + blockers archive).
+
+## Final commit ledger (post-summary)
+
+After the first version of this summary, two more commits landed:
+
+- `d382421` **annotate remaining capabilities with T4 P1 fields** —
+  every shipped capability now carries description / categories /
+  environment_requirements where relevant. Built-ins
+  (node.health, node.manifest), memory (3), ai.chat, coordinator
+  (8 task.* methods), and all four fs capabilities annotated. No
+  behaviour change.
+- `cf3160b` **docs(getting-started)** — new "Inspect tasks" and
+  "See what the mesh can do" sections so first-boot users hit the
+  C1/C2/T4 surfaces immediately instead of finding them later.
+
+**Final count: 25 commits pushed, 292 workspace tests passing.**
