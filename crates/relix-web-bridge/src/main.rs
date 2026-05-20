@@ -40,6 +40,7 @@ mod config;
 mod config_api;
 mod dashboard;
 mod flow;
+mod intervention_audit;
 mod lifecycle;
 mod metrics;
 mod openai;
@@ -300,6 +301,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(config_api::get_telegram).put(config_api::put_telegram),
         )
         .route("/v1/config/telegram/test", post(config_api::test_telegram))
+        // Operator intervention audit ring (M57). Newest-first
+        // record of every mutating operator-facing call:
+        // retry, recover, cancel, provider CRUD/test, telegram
+        // save/test. JSONL on disk under data_dir +
+        // in-memory ring (resets on restart).
+        .route("/v1/intervention/recent", get(intervention_audit::recent))
         // Operator dashboard. Single-page static HTML; consumes
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.

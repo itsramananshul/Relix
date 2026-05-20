@@ -202,6 +202,14 @@ pub struct AppState {
     /// Ring resets on bridge restart — see
     /// `crates/relix-web-bridge/src/lifecycle.rs`.
     pub lifecycle_log: std::sync::Arc<crate::lifecycle::LifecycleLog>,
+    /// Bridge-side operator intervention audit ring (M57).
+    /// Every mutating operator-facing call appends an entry.
+    /// In-memory ring + best-effort JSONL append at
+    /// `<data_dir>/bridge-intervention.log.jsonl` when a
+    /// data_dir is configured. Exposed via
+    /// `/v1/intervention/recent`. See
+    /// `crates/relix-web-bridge/src/intervention_audit.rs`.
+    pub intervention_audit: std::sync::Arc<crate::intervention_audit::InterventionAudit>,
 }
 
 impl AppState {
@@ -264,6 +272,18 @@ impl AppState {
         let initial_secrets = crate::secrets::BridgeSecrets::load_or_empty(&secrets_path);
         let secrets = crate::secrets::SecretsHandle::new(initial_secrets, secrets_path);
 
+        // Intervention audit ring. JSONL persistence lives
+        // next to the data_dir when one is configured; in-
+        // memory only otherwise (so single-binary smoke tests
+        // don't need a writable disk).
+        let intervention_path = cfg
+            .transport
+            .data_dir
+            .as_ref()
+            .map(|d| d.join("bridge-intervention.log.jsonl"));
+        let intervention_audit =
+            crate::intervention_audit::InterventionAudit::new(intervention_path);
+
         Ok(Self {
             cfg: Arc::new(cfg),
             identity_bundle,
@@ -281,6 +301,7 @@ impl AppState {
             secrets,
             stream_metrics: crate::metrics::StreamMetrics::new(),
             lifecycle_log: crate::lifecycle::LifecycleLog::new(),
+            intervention_audit,
         })
     }
 }

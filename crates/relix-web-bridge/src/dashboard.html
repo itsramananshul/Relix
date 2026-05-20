@@ -1694,6 +1694,15 @@
           <div class="empty">no retried_from edges in the last 15 minutes</div>
         </div>
       </div>
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-header">
+          <h3>Recent operator interventions</h3>
+          <span class="meta" id="intervention-status"></span>
+        </div>
+        <div class="card-body dense" id="intervention-host">
+          <div class="empty">no operator actions recorded yet</div>
+        </div>
+      </div>
     </section>
 
     <!-- ── #/tasks ────────────────────────────────────────────── -->
@@ -2383,6 +2392,10 @@ async function backgroundSync() {
       renderOverviewPeers(tRes.peers || []);
       renderAnomalyBanner();
       renderTopRetried(lastEdgesSnapshot);
+      // M57: fire-and-forget intervention audit refresh.
+      // Best-effort; the panel degrades silently on
+      // 404 (older bridge without the endpoint).
+      fetchInterventionAudit();
       const $status = document.getElementById('activity-status');
       if ($status) {
         $status.innerHTML =
@@ -2752,6 +2765,85 @@ function renderTopRetried(edges) {
   if ($status) {
     $status.textContent = counts.size + ' task'
       + (counts.size === 1 ? '' : 's') + ' retrying';
+  }
+}
+
+/* Operator intervention audit panel. Pulls the newest 25
+   entries from /v1/intervention/recent and renders them as
+   a compact newest-first table. The endpoint is read-only —
+   the fetch happens on every overview tick so the panel
+   reflects actions taken from other dashboard tabs without
+   manual refresh. */
+const INTERVENTION_PAGE_LIMIT = 25;
+async function fetchInterventionAudit() {
+  try {
+    const r = await fetch(
+      '/v1/intervention/recent?limit=' + INTERVENTION_PAGE_LIMIT
+    );
+    if (!r.ok) {
+      renderInterventionAudit({items: [], next_cursor: 0}, true);
+      return;
+    }
+    const j = await r.json();
+    renderInterventionAudit(j, false);
+  } catch (_) {
+    renderInterventionAudit({items: [], next_cursor: 0}, true);
+  }
+}
+
+const INTERVENTION_OUTCOME_BADGE = {
+  ok: 'ok',
+  refused: 'warn',
+  error: 'danger',
+};
+function renderInterventionAudit(payload, errored) {
+  const $host = document.getElementById('intervention-host');
+  const $status = document.getElementById('intervention-status');
+  if (!$host) return;
+  const items = payload.items || [];
+  if (errored) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'intervention audit endpoint unavailable'
+      + '</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  if (!items.length) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'no operator actions recorded yet'
+      + '</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const rows = items.map(e => {
+    const ago = fmtDuration(Math.max(0, nowSecs - (e.ts || 0))) + ' ago';
+    const badgeCls = INTERVENTION_OUTCOME_BADGE[e.outcome] || 'muted';
+    // The target may be a 32-hex task id; in that case link it
+    // into the per-task detail view.
+    let targetCell;
+    if (/^[a-f0-9]{32}$/i.test(e.target || '')) {
+      targetCell = '<a href="#/tasks/' + encodeURIComponent(e.target)
+        + '" class="id">' + escapeHtml(e.target) + '</a>';
+    } else {
+      targetCell = '<code>' + escapeHtml(e.target || '—') + '</code>';
+    }
+    return '<tr>'
+      + '<td class="meta">' + escapeHtml(ago) + '</td>'
+      + '<td><code>' + escapeHtml(e.action || '') + '</code></td>'
+      + '<td>' + targetCell + '</td>'
+      + '<td><span class="badge ' + badgeCls + '">'
+        + escapeHtml(e.outcome || '') + '</span></td>'
+      + '<td class="meta">' + escapeHtml(e.detail || '') + '</td>'
+      + '</tr>';
+  }).join('');
+  $host.innerHTML = '<table class="data"><thead><tr>'
+    + '<th>when</th><th>action</th><th>target</th>'
+    + '<th>outcome</th><th>detail</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  if ($status) {
+    $status.textContent = items.length + ' shown · newest seq '
+      + (payload.next_cursor || items[0].seq || '');
   }
 }
 

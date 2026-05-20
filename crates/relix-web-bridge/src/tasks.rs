@@ -347,14 +347,45 @@ pub async fn recover(
     State(state): State<AppState>,
 ) -> Result<Json<RecoverResponse>, (StatusCode, Json<ApiError>)> {
     let Some(rec) = state.task_recorder.as_ref() else {
+        state.intervention_audit.record(
+            "anon",
+            "recover",
+            "all",
+            "error",
+            "no coordinator configured",
+        );
         return Err(no_coordinator());
     };
-    let body = rec
-        .recover()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(ApiError { error: e })))?;
+    let body = match rec.recover().await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "recover",
+                "all",
+                "error",
+                format!("coord call failed: {e}"),
+            );
+            return Err((StatusCode::BAD_GATEWAY, Json(ApiError { error: e })));
+        }
+    };
     let (ids, _count) = parse_recover_body(&body);
     let count = ids.len();
+    // First 5 IDs in the detail is enough to scan; the full
+    // list lives in the response body.
+    let preview: Vec<&str> = ids.iter().take(5).map(String::as_str).collect();
+    let detail = if count == 0 {
+        "no overdue tasks".to_string()
+    } else {
+        format!(
+            "recovered {count} task(s): {}{}",
+            preview.join(", "),
+            if count > preview.len() { ", …" } else { "" }
+        )
+    };
+    state
+        .intervention_audit
+        .record("anon", "recover", "all", "ok", detail);
     Ok(Json(RecoverResponse {
         recovered: ids,
         count,
@@ -471,10 +502,33 @@ pub async fn cancel(
         ));
     }
     let reason = req.reason.unwrap_or_default();
-    rec.cancel(&id, &reason)
-        .await
-        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    if let Err(e) = rec.cancel(&id, &reason).await {
+        state.intervention_audit.record(
+            "anon",
+            "cancel",
+            &id,
+            "error",
+            format!("coord cancel failed: {e}"),
+        );
+        return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+    }
     let flow_still_running = matches!(prior_status.as_str(), "running" | "retrying");
+    let detail = format!(
+        "{prior_status}→cancelled{}{}",
+        if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" · reason={reason}")
+        },
+        if flow_still_running {
+            " · flow still running"
+        } else {
+            ""
+        }
+    );
+    state
+        .intervention_audit
+        .record("anon", "cancel", &id, "ok", detail);
     Ok(Json(CancelResp {
         task_id: id,
         prior_status,
@@ -516,6 +570,13 @@ pub async fn retry(
         if let Some(c) = class.as_deref()
             && NON_RETRYABLE_CLASSES.contains(&c)
         {
+            state.intervention_audit.record(
+                "anon",
+                "retry",
+                &id,
+                "refused",
+                format!("non-retryable failure_class={c}"),
+            );
             return Ok(Json(RetryResponse {
                 outcome: "refused".to_string(),
                 detail: format!(
@@ -528,11 +589,34 @@ pub async fn retry(
         }
     }
 
-    let body = rec
-        .retry(&id)
-        .await
-        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
-    Ok(Json(parse_retry_body(&body)))
+    let body = match rec.retry(&id).await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "retry",
+                &id,
+                "error",
+                format!("coord retry failed: {e}"),
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let parsed = parse_retry_body(&body);
+    let force_suffix = if force { " · force=true" } else { "" };
+    let outcome_label = match parsed.outcome.as_str() {
+        "accepted" => "ok",
+        "exhausted" | "refused" => "refused",
+        _ => "ok",
+    };
+    state.intervention_audit.record(
+        "anon",
+        "retry",
+        &id,
+        outcome_label,
+        format!("{}{}", parsed.detail, force_suffix),
+    );
+    Ok(Json(parsed))
 }
 
 fn parse_failure_class_from_body(body: &str) -> Option<String> {

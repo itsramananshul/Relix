@@ -477,6 +477,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_intervention_audit_panel_present() {
+        // M57 (Track B): overview ships a real operator
+        // intervention audit panel. Pulls from
+        // /v1/intervention/recent. Each entry has a stable
+        // shape (ts, action, target, outcome, detail) so the
+        // dashboard can render an ago-time + clickable
+        // task_id targets + outcome badge.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="intervention-host""#),
+            "intervention audit panel host missing"
+        );
+        assert!(
+            body.contains("function fetchInterventionAudit"),
+            "intervention audit fetcher missing"
+        );
+        assert!(
+            body.contains("/v1/intervention/recent"),
+            "intervention audit endpoint URL missing from dashboard JS"
+        );
+        assert!(
+            body.contains("INTERVENTION_OUTCOME_BADGE"),
+            "outcome badge map missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_top_retried_card_present() {
         // M55 (Track A): overview ships a "Top retried tasks
         // (15 min)" card that groups recent retried_from edges

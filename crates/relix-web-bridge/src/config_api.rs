@@ -142,12 +142,32 @@ pub async fn put_provider(
                 default_model = %status.default_model.as_deref().unwrap_or(""),
                 "config: providers.{name} updated"
             );
+            state.intervention_audit.record(
+                "anon",
+                "provider_save",
+                &name,
+                "ok",
+                format!(
+                    "key …{} · default_model={}",
+                    status.key_preview.as_deref().unwrap_or("none"),
+                    status.default_model.as_deref().unwrap_or("(none)")
+                ),
+            );
             Ok(Json(PutProviderResp {
                 status,
                 restart_required: true,
             }))
         }
-        Err(e) => Err(internal(format!("persist failed: {e}"))),
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "provider_save",
+                &name,
+                "error",
+                format!("persist failed: {e}"),
+            );
+            Err(internal(format!("persist failed: {e}")))
+        }
     }
 }
 
@@ -230,6 +250,25 @@ pub async fn test_provider(
         status_code = ?result.status_code,
         elapsed_ms = result.elapsed_ms,
         "config: providers.{name} test"
+    );
+    state.intervention_audit.record(
+        "anon",
+        "provider_test",
+        &name,
+        if result.ok { "ok" } else { "error" },
+        format!(
+            "{}ms{}{}",
+            result.elapsed_ms,
+            result
+                .status_code
+                .map(|c| format!(" · HTTP {c}"))
+                .unwrap_or_default(),
+            if result.ok {
+                String::new()
+            } else {
+                format!(" · {}", result.detail)
+            }
+        ),
     );
     Ok(Json(result))
 }
@@ -435,6 +474,13 @@ pub async fn set_provider_enabled(
     match result {
         Ok((applied, status)) => {
             if !applied {
+                state.intervention_audit.record(
+                    "anon",
+                    "provider_enabled_set",
+                    &name,
+                    "refused",
+                    "no entry yet — set api_key first",
+                );
                 return Err(unprocessable(format!(
                     "provider '{name}' has no entry; set an api_key first via PUT /v1/config/providers/{name}"
                 )));
@@ -444,12 +490,28 @@ pub async fn set_provider_enabled(
                 enabled = req.enabled,
                 "config: providers.{name} enabled flag updated"
             );
+            state.intervention_audit.record(
+                "anon",
+                "provider_enabled_set",
+                &name,
+                "ok",
+                if req.enabled { "enabled" } else { "disabled" },
+            );
             Ok(Json(PutProviderResp {
                 status,
                 restart_required: true,
             }))
         }
-        Err(e) => Err(internal(format!("persist failed: {e}"))),
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "provider_enabled_set",
+                &name,
+                "error",
+                format!("persist failed: {e}"),
+            );
+            Err(internal(format!("persist failed: {e}")))
+        }
     }
 }
 
@@ -472,9 +534,21 @@ pub async fn delete_provider(
     match status {
         Ok(s) => {
             tracing::info!(provider = %name, "config: providers.{name} deleted");
+            state
+                .intervention_audit
+                .record("anon", "provider_delete", &name, "ok", "");
             Ok(Json(s))
         }
-        Err(e) => Err(internal(format!("persist failed: {e}"))),
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "provider_delete",
+                &name,
+                "error",
+                format!("persist failed: {e}"),
+            );
+            Err(internal(format!("persist failed: {e}")))
+        }
     }
 }
 
@@ -527,12 +601,27 @@ pub async fn put_default_provider(
                 default_provider = ?current,
                 "config: default provider updated"
             );
+            let target = current.clone().unwrap_or_else(|| "(cleared)".to_string());
+            state
+                .intervention_audit
+                .record("anon", "provider_make_default", target, "ok", "");
             Ok(Json(DefaultProviderResp {
                 default_provider: current,
                 restart_required: true,
             }))
         }
-        Err(e) => Err(internal(format!("persist failed: {e}"))),
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "provider_make_default",
+                req.name
+                    .clone()
+                    .unwrap_or_else(|| "(unspecified)".to_string()),
+                "error",
+                format!("persist failed: {e}"),
+            );
+            Err(internal(format!("persist failed: {e}")))
+        }
     }
 }
 
@@ -642,6 +731,30 @@ pub async fn test_telegram(
         status_code = ?result.status_code,
         elapsed_ms = result.elapsed_ms,
         "config: telegram test"
+    );
+    state.intervention_audit.record(
+        "anon",
+        "telegram_test",
+        "telegram",
+        if result.ok { "ok" } else { "error" },
+        format!(
+            "{}ms{}{}{}",
+            result.elapsed_ms,
+            result
+                .status_code
+                .map(|c| format!(" · HTTP {c}"))
+                .unwrap_or_default(),
+            result
+                .bot_username
+                .as_ref()
+                .map(|u| format!(" · @{u}"))
+                .unwrap_or_default(),
+            if result.ok {
+                String::new()
+            } else {
+                format!(" · {}", result.detail)
+            }
+        ),
     );
     Ok(Json(result))
 }
@@ -790,13 +903,36 @@ pub async fn put_telegram(
             } else {
                 None
             };
+            state.intervention_audit.record(
+                "anon",
+                "telegram_save",
+                "telegram",
+                "ok",
+                format!(
+                    "mode={mode_for_log}{}",
+                    if status.webhook_url.is_some() {
+                        " · webhook_url set"
+                    } else {
+                        ""
+                    }
+                ),
+            );
             Ok(Json(PutTelegramResp {
                 status,
                 restart_required: true,
                 note,
             }))
         }
-        Err(e) => Err(internal(format!("persist failed: {e}"))),
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "telegram_save",
+                "telegram",
+                "error",
+                format!("persist failed: {e}"),
+            );
+            Err(internal(format!("persist failed: {e}")))
+        }
     }
 }
 
