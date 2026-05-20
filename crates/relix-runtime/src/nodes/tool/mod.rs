@@ -47,6 +47,7 @@
 //! These ship in later milestones if and when a flow needs them.
 
 pub mod fs;
+pub mod pdf;
 pub mod security;
 pub mod web_extract;
 
@@ -95,6 +96,12 @@ pub struct ToolConfig {
     /// capabilities. The bringup script enables this by default.
     #[serde(default)]
     pub fs: Option<fs::FsJailConfig>,
+    /// Optional PDF parser subsystem (B3). When `None` the
+    /// `tool.pdf` capability is NOT registered. Always-safe to
+    /// enable (pure parser, no network, no shell, no filesystem
+    /// surface beyond the in-memory base64 input).
+    #[serde(default)]
+    pub pdf: Option<pdf::PdfConfig>,
 }
 
 impl Default for ToolConfig {
@@ -107,6 +114,7 @@ impl Default for ToolConfig {
             user_agent: default_user_agent(),
             extract_max_input_bytes: default_extract_max_input_bytes(),
             fs: None,
+            pdf: None,
         }
     }
 }
@@ -380,6 +388,12 @@ impl ToolBackend {
         self.cfg.fs.clone()
     }
 
+    /// Accessor for the optional `[tool.pdf]` subsystem config. When
+    /// `None`, [`register`] does not register `tool.pdf`.
+    pub fn pdf_config(&self) -> Option<pdf::PdfConfig> {
+        self.cfg.pdf.clone()
+    }
+
     /// Run the configured capability against a single URL.
     ///
     /// Order of operations matters for safety:
@@ -622,6 +636,18 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
         tracing::info!(
             "tool node: [tool.fs] not configured; fs subsystem disabled (read/write/search/patch unavailable)"
         );
+    }
+
+    // B3: tool.pdf — pure parser over base64-encoded bytes. Opt-in
+    // via [tool.pdf]; bringup script enables it by default.
+    if let Some(pdf_cfg) = backend.pdf_config() {
+        tracing::info!(
+            max_input_bytes = pdf_cfg.max_input_bytes,
+            max_pages = pdf_cfg.max_pages,
+            max_output_chars = pdf_cfg.max_output_chars,
+            "tool node: registering tool.pdf"
+        );
+        pdf::register(bridge, Arc::new(pdf_cfg));
     }
 }
 

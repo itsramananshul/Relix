@@ -366,6 +366,10 @@ fn register_node_type_handlers(
             manifest.add_capability(crate::nodes::tool::fs::descriptor_search());
             manifest.add_capability(crate::nodes::tool::fs::descriptor_patch());
         }
+        // B3: tool.pdf — only advertised when [tool.pdf] is configured.
+        if tool_cfg.pdf.is_some() {
+            manifest.add_capability(crate::nodes::tool::pdf::capability_descriptor());
+        }
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,
             timeout_secs = tool_cfg.timeout_secs,

@@ -84,6 +84,16 @@ async-stream = "0.3"
 # deps beyond std and nu-ansi-term (optional, default-off).
 diffy = { version = "0.4", default-features = false }
 
+# PDF parsing for tool.pdf. lopdf is pure-Rust and gives us page-count
+# + metadata + raw text streams; we extract text from those directly so
+# we don't have to drag in pdf-extract's freetype binding.
+lopdf = { version = "0.32", default-features = false, features = ["pom_parser"] }
+
+# base64 decode for binary tool inputs that have to travel over the
+# UTF-8 wire (SIMP-016). Currently only tool.pdf; if more binary tools
+# appear we can add a generic transport-layer encoding at Gate 2.
+base64 = "0.22"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

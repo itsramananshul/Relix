@@ -226,6 +226,11 @@ max_read_bytes = 10485760
 max_write_bytes = 10485760
 max_search_results = 200
 
+[tool.pdf]
+max_input_bytes = 20971520
+max_pages = 200
+max_output_chars = 200000
+
 [peers]
 "@ | Set-Content -Encoding utf8 $ToolConfig
     # Ensure the jail root exists before the controller starts.
@@ -326,6 +331,11 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "tool_patch"
 method = "tool.patch"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "tool_pdf"
+method = "tool.pdf"
 allow_groups = ["chat-users"]
 
 [[rules]]
