@@ -1086,6 +1086,7 @@
           </div>
           <div class="actions">
             <button class="btn-primary" id="tg-save">Save</button>
+            <button id="tg-test">Test connection</button>
             <span class="action-status" id="tg-status"></span>
           </div>
         </div>
@@ -2405,6 +2406,28 @@ function initTelegram() {
     $i.type = $i.type === 'password' ? 'text' : 'password';
   });
   document.getElementById('tg-save').addEventListener('click', saveTelegram);
+  document.getElementById('tg-test').addEventListener('click', testTelegram);
+}
+
+async function testTelegram() {
+  const $btn = document.getElementById('tg-test');
+  const $status = document.getElementById('tg-status');
+  $btn.disabled = true;
+  setProviderStatus($status, 'testing…');
+  try {
+    const r = await fetch('/v1/config/telegram/test', { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    const kind = body.ok ? 'ok' : 'error';
+    const msg = (body.ok ? '✓ ' : '✗ ')
+      + (body.detail || '')
+      + ' · ' + body.elapsed_ms + 'ms';
+    setProviderStatus($status, msg, kind);
+  } catch (e) {
+    setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+  } finally {
+    $btn.disabled = false;
+  }
 }
 
 async function enterTelegram() {

@@ -242,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/config/telegram",
             get(config_api::get_telegram).put(config_api::put_telegram),
         )
+        .route("/v1/config/telegram/test", post(config_api::test_telegram))
         // Operator dashboard. Single-page static HTML; consumes
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.

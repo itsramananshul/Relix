@@ -462,6 +462,154 @@ pub struct PutTelegramResp {
     pub restart_required: bool,
 }
 
+/// Result of a `POST /v1/config/telegram/test`. Same shape
+/// as [`ProviderTestResult`] plus an optional `bot_username`
+/// when Telegram returned a usable identity.
+#[derive(Debug, Serialize)]
+pub struct TelegramTestResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    pub elapsed_ms: u64,
+    pub detail: String,
+    /// When the probe succeeds and Telegram returns a `result.username`
+    /// in the getMe response, the bridge surfaces it here so operators
+    /// can verify they wired the right bot. `None` on failure or
+    /// when the response shape is unexpected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
+}
+
+/// `POST /v1/config/telegram/test` — validate the saved bot
+/// token by calling Telegram's `getMe`. Returns success/failure
+/// + optional bot_username + elapsed_ms + a redaction-safe
+/// detail string.
+///
+/// SECURITY NOTE: the Bot API requires the token in the URL
+/// path (`/bot<TOKEN>/getMe`). The constructed URL never reaches
+/// any tracing event; only the redacted detail summary does.
+pub async fn test_telegram(
+    State(state): State<AppState>,
+) -> Result<Json<TelegramTestResult>, (StatusCode, Json<ApiError>)> {
+    let token = state.secrets.read(|s| {
+        s.telegram
+            .as_ref()
+            .map(|t| t.bot_token.clone())
+            .unwrap_or_default()
+    });
+    if token.is_empty() {
+        return Err(unprocessable(
+            "telegram is not configured. Set a bot_token via PUT /v1/config/telegram first.",
+        ));
+    }
+    let started = std::time::Instant::now();
+    let outcome = check_telegram_token(&token).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let result = match outcome {
+        Ok((detail, username)) => TelegramTestResult {
+            ok: true,
+            status_code: Some(200),
+            elapsed_ms,
+            detail,
+            bot_username: username,
+        },
+        Err((status_code, detail)) => TelegramTestResult {
+            ok: false,
+            status_code,
+            elapsed_ms,
+            detail,
+            bot_username: None,
+        },
+    };
+    tracing::info!(
+        ok = result.ok,
+        status_code = ?result.status_code,
+        elapsed_ms = result.elapsed_ms,
+        "config: telegram test"
+    );
+    Ok(Json(result))
+}
+
+/// Returns `Ok((detail, bot_username))` on success;
+/// `Err((status_code, detail))` on failure. Never includes
+/// the raw token in any returned string.
+async fn check_telegram_token(
+    bot_token: &str,
+) -> Result<(String, Option<String>), (Option<u16>, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| (None, format!("http client init failed: {e}")))?;
+    // URL built locally; never logged. We pass the raw token
+    // to reqwest; the token bytes never leave this scope as a
+    // string outside the URL.
+    let url = format!("https://api.telegram.org/bot{bot_token}/getMe");
+    let resp = client.get(&url).send().await.map_err(|e| {
+        // reqwest's Error display includes the URL on transport
+        // failures — strip it before forwarding so the token
+        // can't leak via an error message.
+        (
+            None,
+            format!("network error: {}", scrub_telegram_url(&e.to_string())),
+        )
+    })?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        // Telegram's success shape: { "ok": true, "result": { "username": "...", ... } }
+        let username = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("result")
+                    .and_then(|r| r.get("username"))
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.to_string())
+            });
+        let detail = match &username {
+            Some(u) => format!("ok ({}) · bot @{u}", status.as_u16()),
+            None => format!("ok ({})", status.as_u16()),
+        };
+        Ok((detail, username))
+    } else {
+        Err((
+            Some(status.as_u16()),
+            format!(
+                "upstream returned {}: {}",
+                status.as_u16(),
+                truncate_for_op(&scrub_telegram_url(&body), 200)
+            ),
+        ))
+    }
+}
+
+/// Strip any substring that looks like a Telegram Bot API URL
+/// fragment (`/bot<digits>:<chars>/`). Defensive guard so the
+/// token can't leak via reqwest's error messages or an
+/// unexpected upstream body that echoes the request URL.
+fn scrub_telegram_url(s: &str) -> String {
+    // Quick char-level scan: when we see "/bot" followed by a
+    // digit, replace through to the next '/' (or end of string)
+    // with "/bot<redacted>". Avoids pulling in a regex dep.
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for "/bot" prefix.
+        if i + 5 <= bytes.len() && &bytes[i..i + 4] == b"/bot" && bytes[i + 4].is_ascii_digit() {
+            out.push_str("/bot<redacted>");
+            i += 4;
+            // Skip until next '/' or end.
+            while i < bytes.len() && bytes[i] != b'/' {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// `PUT /v1/config/telegram` — set the bot token + delivery
 /// mode. Idempotent. Returns 422 when `mode` is unknown or
 /// when it's `webhook` (not yet implemented).
@@ -704,6 +852,39 @@ mod tests {
         assert_eq!(urlencode("AIza_abc-DEF.123~"), "AIza_abc-DEF.123~");
         assert_eq!(urlencode("a b"), "a%20b");
         assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn scrub_telegram_url_redacts_token_in_url_fragment() {
+        // The Telegram Bot API requires the token in the path.
+        // If the URL leaks into an error string, the scrubber
+        // must redact the token before the bridge forwards it.
+        let s = scrub_telegram_url(
+            "network error at https://api.telegram.org/bot1234567:ABCDEF-NEVERLEAK/getMe oops",
+        );
+        assert!(!s.contains("NEVERLEAK"), "token leaked: {s}");
+        assert!(!s.contains("1234567:ABCDEF"), "token leaked: {s}");
+        assert!(
+            s.contains("/bot<redacted>/"),
+            "expected redaction marker: {s}"
+        );
+    }
+
+    #[test]
+    fn scrub_telegram_url_handles_multiple_token_occurrences() {
+        let s = scrub_telegram_url("/bot111:AAA/getMe and /bot222:BBB/sendMessage");
+        assert!(!s.contains("AAA"));
+        assert!(!s.contains("BBB"));
+        assert_eq!(s.matches("/bot<redacted>/").count(), 2);
+    }
+
+    #[test]
+    fn scrub_telegram_url_leaves_unrelated_text_alone() {
+        let s = scrub_telegram_url("connection refused after 5s");
+        assert_eq!(s, "connection refused after 5s");
+        // Doesn't false-positive on "/bot" without a digit after it.
+        let s2 = scrub_telegram_url("see /botanical for help");
+        assert_eq!(s2, "see /botanical for help");
     }
 
     #[test]
