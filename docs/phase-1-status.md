@@ -5,7 +5,7 @@ Read this when you want a single page that answers "is X done?"
 without scrolling through commits.
 
 Last updated: 2026-05-20.
-Workspace tests: **376 passing**, `cargo clippy --workspace
+Workspace tests: **395 passing**, `cargo clippy --workspace
 --all-targets -- -D warnings` clean, `cargo fmt --all` clean.
 
 ## What's complete
@@ -34,7 +34,8 @@ Workspace tests: **376 passing**, `cargo clippy --workspace
   / `patch` (jailed FS).
 - **coordinator** — `task.create` / `update` / `event` / `get`
   / `list` / `count` / `list_cursor` / `recover` / `attempts`
-  / `retry` / `events`. SQLite-backed durable Task ledger.
+  / `retry` / `events` / `export` / `compact_events`
+  (dry-run). SQLite-backed durable Task ledger.
 - **web-bridge** — HTTP / SSE / OpenAI shim translation peer.
 
 ### Task runtime (C1 + C2)
@@ -75,10 +76,16 @@ Workspace tests: **376 passing**, `cargo clippy --workspace
 - **S4 Experimental SSE** — `/v1/tasks/:id/events/stream`
   bridge-polled long-poll wrapper. Bridge owns zero
   per-stream state.
-- **S5 Retention design** — `chronicle-retention.md`
-  contract: 6 architectural constraints, 3 approach
-  sketches, 5-step implementation order, operator export
-  contract. No destructive code yet.
+- **S5 Retention design + Step 1 + Step 2** —
+  `chronicle-retention.md` contract: 6 architectural
+  constraints, 3 approach sketches, 5-step implementation
+  order, operator export contract. Step 1 (`task.export`
+  capability + `/v1/tasks/:id/export` with
+  `Content-Disposition: attachment`) and Step 2
+  (`task.compact_events` dry-run candidate counter +
+  `/v1/tasks/compact_events?max_age_secs=N` +
+  `relix-cli task compact`) shipped. No destructive code
+  yet — Step 3 onward stays gated.
 - **S6 Scale tests** — 10k-task cursor walk + 10k-event
   incremental walk smoke tests.
 
@@ -91,10 +98,15 @@ Workspace tests: **376 passing**, `cargo clippy --workspace
   + `GET /v1/tasks/count`.
 - `GET /v1/tasks/:id` + `/summary` + `/attempts` + `/events`
   (with `?type=` / `?order=`) + `/events/stream` (SSE) +
-  `/lineage` (one-call combo).
+  `/lineage` (one-call combo) + `/export` (archival
+  artifact, `Content-Disposition: attachment`).
+- `GET /v1/tasks/compact_events?max_age_secs=N` —
+  chronicle-retention dry-run candidate counter.
 - `POST /v1/tasks/recover` (operator action).
 - `GET /v1/capabilities` + `/:method` (capability discovery).
 - `GET /dashboard` — single-page HTML operator dashboard.
+  Live SSE chronology updates with a fall-back to polling;
+  per-task export button uses the `/export` endpoint.
 
 ### CLI surface
 
@@ -102,16 +114,20 @@ Workspace tests: **376 passing**, `cargo clippy --workspace
 - `relix-cli task create` / `update` / `event` / `get`
   (`--pretty --tail N`) / `list` (`--offset --status`) /
   `count` / `attempts` / `recover` / `retry` (`--force`) /
-  `watch` (live tail).
+  `watch` (live tail) / `compact` (`--max-age-secs N`,
+  dry-run candidate counter).
 - `relix-cli capability ls` (with `--category --tag` filters)
-  + `get`.
+  + `get` + `validate` (manifest linter, 6 rules).
 
 ### Channel infrastructure
 
 - `crates/relix-telegram` scaffold: config + derived identity
   + message types + session-store mapping + `BotApi` trait +
-  `MockBotApi`. 24 tests. Live HTTPS client awaits a Bot API
-  token (archived blocker:
+  `MockBotApi`. `SessionStorage` trait with both in-memory and
+  `SqliteSessionStore` (restart-safe; idempotent schema
+  migration; UNIQUE(chat_id, message_id) + ON CONFLICT
+  REPLACE). Live HTTPS client awaits a Bot API token
+  (archived blocker:
   [`docs/internal/nightly-blockers/20260519-0030-telegram-credentials.md`](internal/nightly-blockers/20260519-0030-telegram-credentials.md)).
 
 ### Capability metadata (T4)
