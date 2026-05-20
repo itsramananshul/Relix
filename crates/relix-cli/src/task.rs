@@ -45,6 +45,19 @@ pub enum Cmd {
         /// Override the owner subject id (defaults to the caller's).
         #[arg(long, default_value = "")]
         owner_subject_id: String,
+        /// Retry policy hint stored on the Task. Operators reference it
+        /// from the chronicle; the runtime does not auto-retry today.
+        /// One of `none` / `once` / `bounded`.
+        #[arg(long, default_value = "")]
+        retry_policy: String,
+        /// Max retries permitted under `bounded`. Ignored otherwise.
+        #[arg(long, default_value_t = 0i64)]
+        max_retries: i64,
+        /// Hard ceiling on execution time. The Coordinator's recovery
+        /// scan flips `running` rows past `started_at + max_runtime_secs`
+        /// to `interrupted`. Omit (0) for no ceiling.
+        #[arg(long, default_value_t = 0i64)]
+        max_runtime_secs: i64,
     },
     /// Mutate a Task. Any of the optional fields are skipped when
     /// omitted; the Coordinator preserves their previous values.
@@ -57,8 +70,9 @@ pub enum Cmd {
         client_key: PathBuf,
         #[arg(long)]
         task_id: String,
-        /// New status (`pending` / `running` / `completed` / `failed` /
-        /// `abandoned`; the Coordinator does not enforce a state machine).
+        /// New status (`pending` / `running` / `retrying` / `interrupted` /
+        /// `awaiting_input` / `completed` / `failed` / `cancelled`; the
+        /// Coordinator does not enforce a state machine).
         #[arg(long, default_value = "")]
         status: String,
         #[arg(long, default_value = "")]
@@ -73,6 +87,22 @@ pub enum Cmd {
         error_kind: i64,
         #[arg(long, default_value = "")]
         error_cause: String,
+        /// `FailureClass` written to `last_failure_class`. One of
+        /// `transient` / `permanent` / `policy_denied` / `invalid_args` /
+        /// `timeout` / `unavailable`. Omit to leave unchanged.
+        #[arg(long, default_value = "")]
+        failure_class: String,
+    },
+    /// Run the recovery scan now. Promotes `running` tasks past their
+    /// `max_runtime_secs` to `interrupted` and appends a
+    /// `task.interrupted` event. Idempotent.
+    Recover {
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        client_key: PathBuf,
     },
     /// Append a free-form event to a Task's history.
     Event {
@@ -99,6 +129,12 @@ pub enum Cmd {
         client_key: PathBuf,
         #[arg(long)]
         task_id: String,
+        /// Reformat the response as a human-readable chronology: header
+        /// fields followed by a timeline of events with absolute and
+        /// relative timestamps. Default keeps the raw `key=value`
+        /// stream, which is grep-friendly for scripts.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
     },
     /// List recent Tasks (most-recently-updated first).
     List {
@@ -110,6 +146,12 @@ pub enum Cmd {
         client_key: PathBuf,
         #[arg(long, default_value_t = 50usize)]
         limit: usize,
+        /// Client-side filter on `status`. The Coordinator does not
+        /// filter today (kept compatible with the existing
+        /// `task.list` wire format); we fetch up to `limit` rows then
+        /// hide ones that don't match. Empty = no filter.
+        #[arg(long, default_value = "")]
+        status: String,
     },
 }
 
@@ -123,8 +165,23 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             flow_template,
             params_json,
             owner_subject_id,
+            retry_policy,
+            max_retries,
+            max_runtime_secs,
         } => {
-            let arg = format!("{title}|{flow_template}|{params_json}|{owner_subject_id}");
+            let max_retries_s = if max_retries == 0 {
+                String::new()
+            } else {
+                max_retries.to_string()
+            };
+            let max_runtime_s = if max_runtime_secs == 0 {
+                String::new()
+            } else {
+                max_runtime_secs.to_string()
+            };
+            let arg = format!(
+                "{title}|{flow_template}|{params_json}|{owner_subject_id}|{retry_policy}|{max_retries_s}|{max_runtime_s}"
+            );
             let body = call(&peer, &identity, &client_key, "task.create", arg.as_bytes()).await?;
             print_text("task_id", &body);
         }
@@ -139,16 +196,33 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             flow_log_path,
             error_kind,
             error_cause,
+            failure_class,
         } => {
             let ek = if error_kind == 0 {
                 String::new()
             } else {
                 error_kind.to_string()
             };
-            let arg =
-                format!("{task_id}|{status}|{result}|{flow_id}|{flow_log_path}|{ek}|{error_cause}");
+            let arg = format!(
+                "{task_id}|{status}|{result}|{flow_id}|{flow_log_path}|{ek}|{error_cause}|{failure_class}"
+            );
             let body = call(&peer, &identity, &client_key, "task.update", arg.as_bytes()).await?;
             print_text("update", &body);
+        }
+        Cmd::Recover {
+            peer,
+            identity,
+            client_key,
+        } => {
+            let body = call(&peer, &identity, &client_key, "task.recover", b"").await?;
+            let s = std::str::from_utf8(&body).unwrap_or("<binary>");
+            for line in s.lines() {
+                if line.starts_with("recovered=") {
+                    println!("{line}");
+                } else if !line.is_empty() {
+                    println!("interrupted {line}");
+                }
+            }
         }
         Cmd::Event {
             peer,
@@ -167,6 +241,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             identity,
             client_key,
             task_id,
+            pretty,
         } => {
             let body = call(
                 &peer,
@@ -176,15 +251,20 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 task_id.as_bytes(),
             )
             .await?;
-            // Coordinator returns a multi-line key=value block already
-            // suitable for printing verbatim.
-            print!("{}", std::str::from_utf8(&body).unwrap_or("<binary>"));
+            let s = std::str::from_utf8(&body).unwrap_or("<binary>");
+            if pretty {
+                print!("{}", render_pretty_task(s));
+            } else {
+                // Default: raw key=value, grep-friendly.
+                print!("{s}");
+            }
         }
         Cmd::List {
             peer,
             identity,
             client_key,
             limit,
+            status,
         } => {
             let body = call(
                 &peer,
@@ -194,7 +274,6 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 limit.to_string().as_bytes(),
             )
             .await?;
-            // Format: `task_id\tstatus\ttitle\n`. Pretty up for stdout.
             let s = std::str::from_utf8(&body).unwrap_or("<binary>");
             let mut count = 0;
             for line in s.lines() {
@@ -203,18 +282,209 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let parts: Vec<&str> = line.splitn(3, '\t').collect();
                 if parts.len() == 3 {
-                    println!("{}  {:<10}  {}", parts[0].split_at(8).0, parts[1], parts[2]);
+                    // Client-side filter — the Coordinator's `task.list`
+                    // is unsorted-by-status by design, and the data is
+                    // already in memory.
+                    if !status.is_empty() && parts[1] != status {
+                        continue;
+                    }
+                    println!("{}  {:<14}  {}", parts[0].split_at(8).0, parts[1], parts[2]);
                 } else {
                     println!("{line}");
                 }
                 count += 1;
             }
             if count == 0 {
-                println!("(no tasks)");
+                if status.is_empty() {
+                    println!("(no tasks)");
+                } else {
+                    println!("(no tasks with status={status})");
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Render the Coordinator's `task.get` body as a human-readable
+/// chronology: header fields on top, blank line, then a timeline of
+/// events with absolute UTC timestamps and `+Δs` deltas from the
+/// previous event. Falls back to the raw text if the JSON `events=`
+/// array can't be parsed.
+fn render_pretty_task(raw: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len() + 256);
+    let mut events_line: Option<&str> = None;
+    let mut header_lines: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("events=") {
+            events_line = Some(rest);
+        } else {
+            header_lines.push(line);
+        }
+    }
+    for line in &header_lines {
+        let _ = writeln!(out, "{line}");
+    }
+    let Some(events) = events_line else {
+        return out;
+    };
+    let parsed = parse_events_array(events);
+    if parsed.is_empty() {
+        return out;
+    }
+    out.push_str("\nchronology:\n");
+    let first_ts = parsed[0].1;
+    for (i, (ev_type, ts, payload)) in parsed.iter().enumerate() {
+        let delta = ts - first_ts;
+        let delta_str = if i == 0 {
+            "      ".to_string()
+        } else {
+            format!("+{delta:>4}s")
+        };
+        let _ = writeln!(out, "  {delta_str}  {ts}  {ev_type:<18}  {payload}");
+    }
+    out
+}
+
+/// Minimal parser for the Coordinator's hand-built JSON event array:
+/// `[{"id":N,"ts":N,"type":"...","payload":"..."},...]`. We don't want
+/// to drag serde_json into the CLI for this; the format is stable and
+/// only the Coordinator produces it. Returns
+/// `Vec<(type, ts, payload)>`. Returns empty on any parse trouble —
+/// callers fall back to the raw text.
+fn parse_events_array(s: &str) -> Vec<(String, i64, String)> {
+    let s = s.trim();
+    let Some(inner) = s.strip_prefix('[').and_then(|x| x.strip_suffix(']')) else {
+        return Vec::new();
+    };
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut buf = String::new();
+    let mut in_str = false;
+    let mut esc = false;
+    for c in inner.chars() {
+        if in_str {
+            buf.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '{' => {
+                depth += 1;
+                buf.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                buf.push(c);
+                if depth == 0 {
+                    if let Some(obj) = parse_event_object(buf.trim()) {
+                        out.push(obj);
+                    }
+                    buf.clear();
+                }
+            }
+            ',' if depth == 0 => { /* between objects */ }
+            '"' => {
+                in_str = true;
+                buf.push(c);
+            }
+            _ => buf.push(c),
+        }
+    }
+    out
+}
+
+fn parse_event_object(obj: &str) -> Option<(String, i64, String)> {
+    // Strip outer braces.
+    let body = obj.strip_prefix('{')?.strip_suffix('}')?;
+    let mut ts: Option<i64> = None;
+    let mut ev_type: Option<String> = None;
+    let mut payload: Option<String> = None;
+    // Walk top-level "key":value pairs.
+    let mut chars = body.chars().peekable();
+    while chars.peek().is_some() {
+        // Skip whitespace and commas.
+        while matches!(chars.peek(), Some(c) if c.is_whitespace() || *c == ',') {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        // Read "key".
+        if chars.next() != Some('"') {
+            return None;
+        }
+        let mut key = String::new();
+        for c in chars.by_ref() {
+            if c == '"' {
+                break;
+            }
+            key.push(c);
+        }
+        // Skip ':'.
+        while matches!(chars.peek(), Some(c) if c.is_whitespace() || *c == ':') {
+            chars.next();
+        }
+        // Read value (string or integer).
+        match chars.peek() {
+            Some('"') => {
+                chars.next();
+                let mut v = String::new();
+                let mut esc = false;
+                for c in chars.by_ref() {
+                    if esc {
+                        match c {
+                            'n' => v.push('\n'),
+                            'r' => v.push('\r'),
+                            't' => v.push('\t'),
+                            '"' => v.push('"'),
+                            '\\' => v.push('\\'),
+                            other => v.push(other),
+                        }
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        break;
+                    } else {
+                        v.push(c);
+                    }
+                }
+                match key.as_str() {
+                    "type" => ev_type = Some(v),
+                    "payload" => payload = Some(v),
+                    _ => {}
+                }
+            }
+            Some(_) => {
+                let mut v = String::new();
+                while let Some(c) = chars.peek() {
+                    if c.is_ascii_digit() || *c == '-' {
+                        v.push(*c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if key == "ts" {
+                    ts = v.parse().ok();
+                }
+            }
+            None => break,
+        }
+    }
+    Some((ev_type?, ts?, payload.unwrap_or_default()))
 }
 
 /// Dial `peer_addr` once, present `identity_bundle`, invoke `method`
@@ -289,5 +559,56 @@ fn print_text(label: &str, body: &[u8]) {
             body.len(),
             hex::encode(body)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_events_array_empty() {
+        assert!(parse_events_array("[]").is_empty());
+        assert!(parse_events_array("").is_empty());
+    }
+
+    #[test]
+    fn parse_events_array_one_event() {
+        let s = r#"[{"id":1,"ts":1700000000,"type":"flow_selected","payload":"chat"}]"#;
+        let out = parse_events_array(s);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "flow_selected");
+        assert_eq!(out[0].1, 1700000000);
+        assert_eq!(out[0].2, "chat");
+    }
+
+    #[test]
+    fn parse_events_array_multiple_events_and_escapes() {
+        let s = r#"[{"id":1,"ts":1700000000,"type":"a","payload":"x"},{"id":2,"ts":1700000005,"type":"b","payload":"with \"quote\" and \\backslash"}]"#;
+        let out = parse_events_array(s);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "a");
+        assert_eq!(out[1].2, "with \"quote\" and \\backslash");
+    }
+
+    #[test]
+    fn render_pretty_task_includes_chronology_block() {
+        let raw = "task_id=abcd1234\nstatus=completed\nevents=[{\"id\":1,\"ts\":1700000000,\"type\":\"flow_selected\",\"payload\":\"chat\"},{\"id\":2,\"ts\":1700000007,\"type\":\"flow_completed\",\"payload\":\"hi\"}]\n";
+        let pretty = render_pretty_task(raw);
+        assert!(pretty.contains("task_id=abcd1234"));
+        assert!(pretty.contains("status=completed"));
+        assert!(pretty.contains("chronology:"));
+        assert!(pretty.contains("flow_selected"));
+        assert!(pretty.contains("flow_completed"));
+        assert!(pretty.contains("+   7s"));
+    }
+
+    #[test]
+    fn render_pretty_task_falls_back_when_events_unparseable() {
+        let raw = "task_id=x\nevents=not-json\n";
+        let pretty = render_pretty_task(raw);
+        // Header preserved; no chronology synthesized.
+        assert!(pretty.contains("task_id=x"));
+        assert!(!pretty.contains("chronology"));
     }
 }

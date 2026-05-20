@@ -18,7 +18,7 @@ The Coordinator owns one SQLite database at `[coordinator] db_path`.
 CREATE TABLE tasks (
     task_id              TEXT PRIMARY KEY,         -- 32 hex chars
     title                TEXT NOT NULL,
-    status               TEXT NOT NULL,            -- 'pending' / 'running' / ...
+    status               TEXT NOT NULL,            -- see "Status convention" below
     owner_subject_id     TEXT NOT NULL,            -- hex NodeId of the requesting identity
     flow_template        TEXT NOT NULL,            -- e.g. 'chat_template.sol'
     params_json          TEXT NOT NULL,            -- caller-supplied; Coordinator does not parse
@@ -28,9 +28,18 @@ CREATE TABLE tasks (
     error_kind           INTEGER,                  -- relix_core::types::error_kinds when failed
     error_cause          TEXT,
     created_at           INTEGER NOT NULL,         -- unix seconds
-    updated_at           INTEGER NOT NULL
+    updated_at           INTEGER NOT NULL,
+    -- C1: retry + recovery metadata.
+    retry_count          INTEGER NOT NULL DEFAULT 0,
+    retry_policy         TEXT    NOT NULL DEFAULT 'none', -- 'none'|'once'|'bounded'
+    max_retries          INTEGER NOT NULL DEFAULT 0,
+    max_runtime_secs     INTEGER,                  -- recovery-scan deadline; NULL = no ceiling
+    last_failure_reason  TEXT,                     -- mirror of error_cause; survives 'retrying'
+    last_failure_class   TEXT,                     -- see interruption-semantics.md
+    started_at           INTEGER                   -- stamped on first transition to 'running'
 );
 CREATE INDEX tasks_updated ON tasks(updated_at DESC);
+CREATE INDEX tasks_status  ON tasks(status);
 
 CREATE TABLE task_events (
     event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,26 +52,36 @@ CREATE TABLE task_events (
 CREATE INDEX task_events_task ON task_events(task_id, event_id);
 ```
 
-Two tables, one foreign key, no triggers. The deliberate minimalism is
-why this can land in a single commit and stay honest about scope.
+Two tables, one foreign key, no triggers. C1 grew the `tasks` row by
+seven columns and added one index; the migration is idempotent
+`ALTER TABLE ADD COLUMN` so older databases upgrade in place.
 
 ## Status convention
 
 `status` is a free string at the database level. The convention used
-by the bridge and recommended for other callers:
+by the bridge and recommended for other callers (C1 expansion):
 
 | Status | Meaning |
 |---|---|
 | `pending` | Task created, no execution attempted yet. |
 | `running` | Some executor took ownership and is running the flow now. |
+| `retrying` | Previous attempt failed; another attempt is scheduled (operator-initiated today). |
+| `interrupted` | Executor died or `max_runtime_secs` was exceeded. The recovery scan owns this transition. |
+| `awaiting_input` | Flow paused on an external dependency. Recorded today; resume primitive is Gate 2. |
 | `completed` | Final attempt succeeded. `latest_result` holds the reply. |
-| `failed` | Final attempt failed. `error_kind` + `error_cause` filled. |
-| `abandoned` | Operator gave up — executor died mid-`running` and the operator does not want to retry. |
+| `failed` | Final attempt failed and the task will not retry. `last_failure_class` + `last_failure_reason` filled. |
+| `cancelled` | Operator explicitly cancelled an active task. |
 
 The Coordinator does **not** enforce transitions. A caller can write
 `status = "blueberry"` and the Coordinator will store it. CLI tooling
 assumes the convention; nothing breaks if you don't, but tooling will
 display whatever you write. State-machine enforcement is a Gate 2 item.
+
+See [`runtime-lifecycle.md`](runtime-lifecycle.md) for the canonical
+transition diagram, [`interruption-semantics.md`](interruption-semantics.md)
+for the recovery-scan contract, and [`retry-model.md`](retry-model.md)
+for what `retry_policy` / `max_retries` mean today (versus when bounded
+auto-retry lands).
 
 ## Wire format (every capability, exact)
 
@@ -71,11 +90,21 @@ the per-method convention; empty fields skip a column.
 
 ### `task.create`
 
-Request: `title|flow_template|params_json|owner_subject_id`
+Request: `title|flow_template|params_json|owner_subject_id|retry_policy|max_retries|max_runtime_secs`
 
 - `title` and `flow_template` are required.
 - `params_json` is opaque — JSON encouraged.
 - `owner_subject_id` defaults to the caller's verified `subject_id`.
+- `retry_policy` (optional) is `none` (default), `once`, or `bounded`.
+- `max_retries` (optional, int) applies under `bounded`; default `0`.
+- `max_runtime_secs` (optional, int > 0) sets the recovery-scan
+  deadline. Omit for no ceiling.
+
+The C1 trailer (retry_policy + max_retries + max_runtime_secs) is
+optional — older callers that omit it keep working unchanged. The
+Coordinator does NOT auto-retry today; these knobs are metadata for
+operators and for future bounded-retry logic (see
+[`retry-model.md`](retry-model.md)).
 
 Response: 32 hex chars (the new `task_id`).
 
@@ -92,15 +121,38 @@ relix-cli task create \
 
 ### `task.update`
 
-Request: `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause`
+Request: `task_id|status|result|flow_id|flow_log_path|error_kind|error_cause|failure_class`
 
-Any of `status` / `result` / `flow_id` / `flow_log_path` / `error_kind` /
-`error_cause` may be empty — the Coordinator preserves the existing
-column value for empty fields. Non-empty `error_kind` must parse as an
-integer.
+Any field may be empty — the Coordinator preserves the existing column
+value for empty fields. Non-empty `error_kind` must parse as an
+integer. Non-empty `failure_class` must be one of `transient` /
+`permanent` / `policy_denied` / `invalid_args` / `timeout` /
+`unavailable`; the Coordinator rejects unknown values with
+`INVALID_ARGS`.
+
+Side effects:
+
+- Transitioning to `running` stamps `started_at` (one-shot via
+  `COALESCE` — subsequent `running` writes don't clobber the original).
+- Setting `error_cause` also mirrors it to `last_failure_reason` so the
+  cause survives a later `retrying` transition that clears
+  `error_cause` itself.
 
 Response: `ok\n` on success; `INVALID_ARGS` with cause
 `task.update: not found: <id>` when the task id is unknown.
+
+### `task.recover`
+
+Request: empty.
+
+Runs the recovery scan immediately. Equivalent to what the
+Coordinator does at startup when `[coordinator] recovery_scan = true`:
+promotes overdue `running` tasks to `interrupted` and appends a
+`task.interrupted` event to each. See
+[`interruption-semantics.md`](interruption-semantics.md).
+
+Response: one task id per line for each recovered task, plus a
+trailing `recovered=N\n` line.
 
 ### `task.event`
 
@@ -224,7 +276,12 @@ See [`current-limitations.md`](current-limitations.md). Highlights:
 - No multi-attempt tracking — only `latest_*` columns. Previous
   attempts live in the flow logs the bridge wrote, not in the
   Coordinator's database.
-- No automatic "abandoned" sweep on Coordinator restart.
+- No bounded auto-retry today — `retry_policy` + `max_retries` are
+  metadata for operators, not an executor primitive. See
+  [`retry-model.md`](retry-model.md) for the rationale.
+- The recovery scan promotes `running` past `max_runtime_secs` to
+  `interrupted` but does NOT re-launch. See
+  [`interruption-semantics.md`](interruption-semantics.md).
 - No state-machine enforcement — `status` is a free string.
 - Single Coordinator instance only. Leadership election + multi-leader
   reconciliation is Gate 2.
@@ -236,5 +293,12 @@ See [`current-limitations.md`](current-limitations.md). Highlights:
 - [`coordinator.md`](coordinator.md) — the peer.
 - [`replay-model.md`](replay-model.md) — what "checkpointed re-run"
   actually delivers.
+- [`runtime-lifecycle.md`](runtime-lifecycle.md) — canonical status
+  transitions.
+- [`task-recovery.md`](task-recovery.md) — operator playbook for
+  recovering interrupted tasks.
+- [`retry-model.md`](retry-model.md) — what retry knobs mean today.
+- [`interruption-semantics.md`](interruption-semantics.md) — recovery
+  scan contract.
 - [`architecture.md`](architecture.md) — where the Coordinator sits in
   the request flow.
