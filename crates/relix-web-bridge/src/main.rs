@@ -181,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // each route is a thin forwarder to a Coordinator capability.
         .route("/v1/tasks", get(tasks::list))
         .route("/v1/tasks/count", get(tasks::count))
+        .route("/v1/tasks/cursor", get(tasks::list_cursor))
         .route("/v1/tasks/:id", get(tasks::get_one))
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
         .route("/v1/tasks/:id/summary", get(tasks::summary))

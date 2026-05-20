@@ -159,6 +159,20 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.count utf8: {e}"))
     }
 
+    /// `task.list_cursor` passthrough. Wire format:
+    /// `limit|status|cursor`. Empty status / cursor mean "no
+    /// filter" / "first page."
+    pub async fn list_cursor(
+        &self,
+        limit: usize,
+        status: &str,
+        cursor: &str,
+    ) -> Result<String, String> {
+        let arg = format!("{limit}|{status}|{cursor}");
+        let bytes = self.call("task.list_cursor", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.list_cursor utf8: {e}"))
+    }
+
     /// `task.events` passthrough. Wire format:
     /// `task_id|after_id|limit|type|order`. `type` empty = no
     /// filter; `order` empty = asc. Kept for completeness; the

@@ -167,6 +167,53 @@ pub async fn list(
     Ok(Json(out))
 }
 
+#[derive(Debug, Serialize)]
+pub struct TaskCursorPage {
+    pub items: Vec<TaskListEntry>,
+    /// Opaque continuation token. Pass back as `?cursor=...` on
+    /// the next request. `None` after the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CursorQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Opaque continuation token from the previous response's
+    /// `next_cursor`. Empty / absent = first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// `GET /v1/tasks/cursor?limit=N&status=...&cursor=...` —
+/// cursor-paginated list. Stable under concurrent inserts and
+/// updates (unlike `/v1/tasks?offset=N` which can repeat or skip
+/// rows when ordering ties shift). Use this when paginating a
+/// live ledger.
+///
+/// Response shape `{items: [...], next_cursor: "..."}`. The cursor
+/// is opaque to the caller; pass back what we returned.
+pub async fn list_cursor(
+    State(state): State<AppState>,
+    Query(q): Query<CursorQuery>,
+) -> Result<Json<TaskCursorPage>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let limit = q.limit.unwrap_or(50);
+    let status = q.status.as_deref().unwrap_or("");
+    let cursor = q.cursor.as_deref().unwrap_or("");
+    let body = rec
+        .list_cursor(limit, status, cursor)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(ApiError { error: e })))?;
+    let (items, next_cursor) = parse_cursor_body(&body);
+    Ok(Json(TaskCursorPage { items, next_cursor }))
+}
+
 /// `GET /v1/tasks/count` — total count, optionally filtered by
 /// status. Returns `{ "count": N }`. Drives pagination UIs that
 /// want "N of M" without walking every page.
@@ -683,6 +730,38 @@ fn parse_events_lines(body: &str) -> Vec<TaskEvent> {
         .collect()
 }
 
+/// Parse a `task.list_cursor` body: tab-delimited
+/// `task_id\tstatus\ttitle\tupdated_at` rows followed by a
+/// trailing `next_cursor=<value>\n`. Returns the rows + the
+/// optional cursor (None on empty value).
+fn parse_cursor_body(body: &str) -> (Vec<TaskListEntry>, Option<String>) {
+    let mut items = Vec::new();
+    let mut next: Option<String> = None;
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("next_cursor=") {
+            if rest.is_empty() {
+                next = None;
+            } else {
+                next = Some(rest.to_string());
+            }
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(4, '\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        items.push(TaskListEntry {
+            task_id: parts[0].to_string(),
+            status: parts[1].to_string(),
+            title: parts[2].to_string(),
+        });
+    }
+    (items, next)
+}
+
 /// Parse the `task.count` body — a single line `count=N`.
 /// Tolerant of trailing whitespace / newlines.
 fn parse_count_body(body: &str) -> Option<i64> {
@@ -886,6 +965,32 @@ mod tests {
     fn parse_events_lines_empty_body_returns_empty() {
         assert!(parse_events_lines("").is_empty());
         assert!(parse_events_lines("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parse_cursor_body_extracts_rows_and_cursor() {
+        let body = "abc\trunning\tt0\t100\ndef\tpending\tt1\t99\nnext_cursor=99:def\n";
+        let (items, next) = parse_cursor_body(body);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].task_id, "abc");
+        assert_eq!(items[1].status, "pending");
+        assert_eq!(next.as_deref(), Some("99:def"));
+    }
+
+    #[test]
+    fn parse_cursor_body_empty_cursor_yields_none() {
+        let body = "abc\trunning\tt0\t100\nnext_cursor=\n";
+        let (items, next) = parse_cursor_body(body);
+        assert_eq!(items.len(), 1);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn parse_cursor_body_empty_page() {
+        let body = "next_cursor=\n";
+        let (items, next) = parse_cursor_body(body);
+        assert!(items.is_empty());
+        assert!(next.is_none());
     }
 
     #[test]
