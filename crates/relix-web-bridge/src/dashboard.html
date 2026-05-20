@@ -30,10 +30,10 @@
       --info:        #3b82f6;
 
       /* Layout */
-      --shell-nav-width:     220px;
-      --shell-topbar-height: 48px;
-      --shell-pad:           20px;
-      --card-radius:         6px;
+      --shell-nav-width:     210px;
+      --shell-topbar-height: 42px;
+      --shell-pad:           16px;
+      --card-radius:         5px;
 
       /* Typography */
       --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI",
@@ -98,38 +98,40 @@
       grid-area: nav;
       background: var(--bg-elevated);
       border-right: 1px solid var(--border);
-      padding: 16px 0;
+      padding: 10px 0;
       overflow-y: auto;
     }
     .sidebar .brand {
-      padding: 0 16px 16px;
-      font-size: var(--text-lg);
+      padding: 2px 14px 10px;
+      font-size: var(--text-md);
       font-weight: 600;
       color: var(--text-strong);
       letter-spacing: 0.02em;
       border-bottom: 1px solid var(--border);
-      margin-bottom: 12px;
+      margin-bottom: 8px;
     }
     .sidebar .brand .subtitle {
       display: block;
-      font-size: var(--text-xs);
+      font-size: 10px;
       color: var(--text-muted);
       font-weight: 400;
-      margin-top: 2px;
+      margin-top: 1px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
     }
     .sidebar .nav-group {
-      padding: 8px 16px 4px;
-      font-size: var(--text-xs);
+      padding: 6px 14px 2px;
+      font-size: 10px;
       font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.08em;
       color: var(--text-dim);
     }
     .sidebar a.nav-item {
       display: block;
-      padding: 6px 16px;
+      padding: 4px 14px;
       color: var(--text-muted);
-      font-size: var(--text-md);
+      font-size: var(--text-sm);
       text-decoration: none;
       border-left: 2px solid transparent;
     }
@@ -186,13 +188,13 @@
     section.page { display: none; }
     section.page.active { display: block; }
     section.page > h2 {
-      margin: 0 0 4px;
-      font-size: var(--text-xl);
+      margin: 0 0 2px;
+      font-size: 17px;
       font-weight: 600;
       color: var(--text-strong);
     }
     section.page > .page-subtitle {
-      margin: 0 0 18px;
+      margin: 0 0 14px;
       font-size: var(--text-sm);
       color: var(--text-muted);
     }
@@ -203,14 +205,16 @@
       border: 1px solid var(--border);
       border-radius: var(--card-radius);
       overflow: hidden;
-      margin-bottom: 16px;
+      margin-bottom: 12px;
     }
     .card-header {
-      padding: 10px 14px;
+      padding: 8px 12px;
       border-bottom: 1px solid var(--border);
-      font-size: var(--text-md);
+      font-size: var(--text-sm);
       font-weight: 600;
-      color: var(--text);
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
       background: var(--bg-row-alt);
       display: flex;
       align-items: center;
@@ -219,11 +223,13 @@
     }
     .card-header h3 {
       margin: 0;
-      font-size: var(--text-md);
+      font-size: var(--text-sm);
       font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
     .card-header .card-actions { display: flex; gap: 6px; }
-    .card-body { padding: 14px; }
+    .card-body { padding: 12px; }
     .card-body.dense { padding: 0; }
     .card .hint {
       color: var(--text-muted);
@@ -232,56 +238,71 @@
     }
 
     /* ── KPI grid (overview page) ──────────────────────────────── */
+    .kpi-section {
+      margin-bottom: 12px;
+    }
+    .kpi-section .section-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      margin: 0 0 6px;
+      padding-left: 2px;
+      font-weight: 600;
+    }
     .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 12px;
-      margin-bottom: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 8px;
     }
     .kpi {
       background: var(--bg-elevated);
       border: 1px solid var(--border);
       border-radius: var(--card-radius);
-      padding: 14px;
+      padding: 10px 12px;
     }
     .kpi .label {
-      font-size: var(--text-xs);
+      font-size: 10px;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.06em;
       color: var(--text-muted);
-      margin: 0 0 6px;
+      margin: 0 0 4px;
     }
     .kpi .value {
-      font-size: 22px;
+      font-size: 19px;
       font-weight: 600;
       color: var(--text-strong);
       font-variant-numeric: tabular-nums;
+      line-height: 1.2;
     }
     .kpi .delta {
-      font-size: var(--text-xs);
+      font-size: 11px;
       color: var(--text-muted);
-      margin-top: 4px;
+      margin-top: 2px;
     }
 
     /* ── Tables ────────────────────────────────────────────────── */
     table.data {
       width: 100%;
       border-collapse: collapse;
-      font-size: var(--text-md);
+      font-size: var(--text-sm);
     }
     table.data th, table.data td {
-      padding: 8px 12px;
+      padding: 5px 10px;
       text-align: left;
-      vertical-align: top;
-      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+      border-bottom: 1px solid var(--border-soft);
     }
     table.data th {
       font-weight: 600;
       color: var(--text-muted);
       background: var(--bg-row-alt);
-      font-size: var(--text-xs);
+      font-size: 10px;
       text-transform: uppercase;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.05em;
+      padding-top: 6px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
     }
     table.data tbody tr { cursor: pointer; }
     table.data tbody tr:hover { background: var(--bg-hover); }
@@ -998,14 +1019,29 @@
     <section class="page" data-page="overview">
       <h2>Overview</h2>
       <p class="page-subtitle">At-a-glance mesh health and recent activity.</p>
-      <div class="kpi-grid" id="overview-kpis">
-        <div class="kpi"><p class="label">status</p><div class="value" id="kpi-status">—</div><div class="delta" id="kpi-status-delta"></div></div>
-        <div class="kpi"><p class="label">uptime</p><div class="value" id="kpi-uptime">—</div><div class="delta">since bridge start</div></div>
-        <div class="kpi"><p class="label">peers</p><div class="value" id="kpi-peers">—</div><div class="delta" id="kpi-peers-delta"></div></div>
-        <div class="kpi"><p class="label">tasks</p><div class="value" id="kpi-tasks">—</div><div class="delta" id="kpi-tasks-delta"></div></div>
-        <div class="kpi"><p class="label">coordinator</p><div class="value" id="kpi-coord">—</div><div class="delta" id="kpi-coord-delta"></div></div>
-        <div class="kpi"><p class="label">reconnects</p><div class="value" id="kpi-reconnect">—</div><div class="delta" id="kpi-reconnect-delta">attempts / successes</div></div>
-        <div class="kpi"><p class="label">live streams</p><div class="value" id="kpi-streams">—</div><div class="delta" id="kpi-streams-delta">active / opened</div></div>
+      <div id="overview-kpis">
+        <div class="kpi-section">
+          <p class="section-label">Mesh</p>
+          <div class="kpi-grid">
+            <div class="kpi"><p class="label">status</p><div class="value" id="kpi-status">—</div><div class="delta" id="kpi-status-delta"></div></div>
+            <div class="kpi"><p class="label">peers</p><div class="value" id="kpi-peers">—</div><div class="delta" id="kpi-peers-delta"></div></div>
+            <div class="kpi"><p class="label">reconnects</p><div class="value" id="kpi-reconnect">—</div><div class="delta" id="kpi-reconnect-delta">attempts / successes</div></div>
+          </div>
+        </div>
+        <div class="kpi-section">
+          <p class="section-label">Runtime</p>
+          <div class="kpi-grid">
+            <div class="kpi"><p class="label">coordinator</p><div class="value" id="kpi-coord">—</div><div class="delta" id="kpi-coord-delta"></div></div>
+            <div class="kpi"><p class="label">tasks</p><div class="value" id="kpi-tasks">—</div><div class="delta" id="kpi-tasks-delta"></div></div>
+            <div class="kpi"><p class="label">live streams</p><div class="value" id="kpi-streams">—</div><div class="delta" id="kpi-streams-delta">active / opened</div></div>
+          </div>
+        </div>
+        <div class="kpi-section">
+          <p class="section-label">Process</p>
+          <div class="kpi-grid">
+            <div class="kpi"><p class="label">uptime</p><div class="value" id="kpi-uptime">—</div><div class="delta">since bridge start</div></div>
+          </div>
+        </div>
       </div>
       <div class="split" style="grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);">
         <div class="card">
