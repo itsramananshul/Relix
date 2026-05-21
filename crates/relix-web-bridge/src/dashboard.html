@@ -3033,6 +3033,10 @@ function openGlobalFirehoseStream() {
       ts:         row.ts || 0,
       event_type: row.type || row.event_type || '',
       payload:    row.payload || '',
+      // H2: bridge enriches both /recent rows and SSE
+      // lines with the same one-line summary projection;
+      // pass it through so the renderer can show it.
+      summary:    row.summary || '',
     };
     firehoseRing = [normalized].concat(firehoseRing).slice(0, FIREHOSE_RING_CAP);
     // Only re-render when overview is visible — keeps the
@@ -3114,18 +3118,23 @@ function renderGlobalFirehose(errored) {
     const taskCell = '<a href="#/tasks/' + encodeURIComponent(e.task_id || '')
       + '" class="id" title="' + escapeHtml(e.task_id || '') + '">'
       + escapeHtml((e.task_id || '').slice(0, 8)) + '</a>';
-    const payloadPreview = (e.payload || '').slice(0, 80);
+    // H2: prefer the server-supplied Hermes-style one-line
+    // summary; fall back to raw payload preview when an older
+    // bridge / ring entry predates the field.
+    const summary = e.summary && e.summary.length
+      ? e.summary
+      : (e.payload || '').slice(0, 80);
     return '<tr>'
       + '<td class="meta">' + escapeHtml(ago) + '</td>'
       + '<td>' + taskCell + '</td>'
       + '<td><code>' + escapeHtml(e.event_type || '') + '</code></td>'
       + '<td class="meta">' + escapeHtml(String(e.event_id || '')) + '</td>'
-      + '<td class="meta">' + escapeHtml(payloadPreview) + '</td>'
+      + '<td class="summary">' + escapeHtml(summary) + '</td>'
       + '</tr>';
   }).join('');
   $host.innerHTML = '<table class="data"><thead><tr>'
     + '<th>when</th><th>task</th><th>event_type</th>'
-    + '<th>event_id</th><th>payload</th>'
+    + '<th>event_id</th><th>summary</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>';
   if ($status) {
     const sseOn = firehoseEventSource

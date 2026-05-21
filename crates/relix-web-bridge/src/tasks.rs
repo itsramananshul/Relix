@@ -1632,6 +1632,10 @@ pub struct GlobalEventRow {
     pub trace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_json: Option<serde_json::Value>,
+    /// H2: Hermes-style one-line summary derived purely from the
+    /// fields above. UI projection — the chronicle row is still
+    /// the source of truth.
+    pub summary: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1737,7 +1741,14 @@ pub async fn events_stream_global(
                         {
                             newest_in_page = id_field;
                         }
-                        yield Ok(Event::default().event("event").data(line));
+                        // H2: enrich the SSE line with the same
+                        // `summary` projection /recent carries so
+                        // dashboard consumers see one shape from
+                        // both code paths. Tolerant of unexpected
+                        // input — non-JSON or malformed lines
+                        // pass through unchanged.
+                        let enriched = enrich_stream_line_with_summary(line);
+                        yield Ok(Event::default().event("event").data(enriched));
                     }
                     if newest_in_page > since {
                         since = newest_in_page;
@@ -1776,6 +1787,42 @@ pub async fn events_stream_global(
         }
     };
     Ok(Sse::new(s).keep_alive(KeepAlive::default()))
+}
+
+/// H2: add a `summary` field to an event line emitted by coord
+/// before forwarding it through the SSE stream. If the line is
+/// non-JSON or missing fields, it passes through unchanged so the
+/// stream stays resilient against unexpected coord additions.
+fn enrich_stream_line_with_summary(line: &str) -> String {
+    let mut v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return line.to_string(),
+    };
+    let event_type = v
+        .get("type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if event_type.is_empty() {
+        return line.to_string();
+    }
+    let payload = v
+        .get("payload")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let attempt_id = v.get("attempt_id").and_then(|x| x.as_i64());
+    let pj_str = v.get("payload_json").map(|j| j.to_string());
+    let summary = relix_runtime::nodes::coordinator::summarize_event_parts(
+        &event_type,
+        &payload,
+        attempt_id,
+        pj_str.as_deref(),
+    );
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("summary".into(), serde_json::Value::String(summary));
+    }
+    v.to_string()
 }
 
 /// Parse one JSON object per line into a typed envelope.
@@ -1820,6 +1867,16 @@ fn parse_global_events_body(since: i64, body: &str) -> GlobalEventsResponse {
         if event_id > newest {
             newest = event_id;
         }
+        // H2: cheap one-line summary projection. Serialise the
+        // payload_json back to a string so the summarizer can
+        // do its best-effort typed pattern match against it.
+        let pj_str = payload_json.as_ref().map(|j| j.to_string());
+        let summary = relix_runtime::nodes::coordinator::summarize_event_parts(
+            &event_type,
+            &payload,
+            attempt_id,
+            pj_str.as_deref(),
+        );
         items.push(GlobalEventRow {
             task_id,
             event_id,
@@ -1829,6 +1886,7 @@ fn parse_global_events_body(since: i64, body: &str) -> GlobalEventsResponse {
             attempt_id,
             trace_id,
             payload_json,
+            summary,
         });
     }
     GlobalEventsResponse {

@@ -143,6 +143,9 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
+pub mod event_summary;
+pub use event_summary::{summarize_event, summarize_event_parts};
+
 /// Lightweight classification of why a flow failed. Written to
 /// `tasks.last_failure_class` by the bridge so operators (and any
 /// future auto-retry policy) can decide whether the failure is worth

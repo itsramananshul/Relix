@@ -717,6 +717,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_firehose_summary_column_present() {
+        // H2 (Hermes-style): the firehose rows render the
+        // server-supplied one-line `summary` projection in
+        // the `summary` column, falling back to raw payload
+        // only when summary is absent.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "<th>when</th><th>task</th><th>event_type</th>",
+            "<th>summary</th>",
+            "summary:    row.summary || ''",
+            "Hermes-style",
+        ] {
+            assert!(body.contains(needle), "H2 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_global_firehose_pane_present() {
         // M67 (Track D): overview ships a global event
         // firehose pane fed by /v1/tasks/events/recent.
