@@ -203,6 +203,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("listen_addr: {e}"))?;
 
+    // M78: production-posture guard. The bridge has no HTTP
+    // auth in alpha (see bridge-invariants.md). When the
+    // operator binds it to anything other than loopback we
+    // emit a single loud WARN at startup so the
+    // "I forgot to put a reverse proxy in front" mistake is
+    // caught immediately, before traffic flows. Honest about
+    // scope: this does NOT refuse to start — operators are
+    // sometimes deliberately running behind a mTLS tunnel or
+    // similar; the warn surfaces the gap, not the verdict.
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            listen_addr = %addr,
+            "bridge: listen_addr is not loopback — the bridge has NO HTTP auth in alpha. \
+             Put a reverse proxy with auth (mTLS / OAuth / basic) in front before exposing \
+             beyond loopback. See docs/production-checklist.md."
+        );
+    }
+
     let app = Router::new()
         .route("/health", get(chat::health))
         .route("/chat", post(chat::chat))

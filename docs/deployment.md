@@ -77,7 +77,11 @@ To stand up:
 
 The alpha is a substrate freeze, not a hardened production
 deployment. Before exposing the bridge beyond loopback, the
-checklist below is mandatory.
+checklist below is mandatory. A standalone, operator-runnable
+version lives at
+[`production-checklist.md`](production-checklist.md) and
+includes a smoke-test command sequence + an incident-response
+pull-point table you can drop into a runbook.
 
 #### Mandatory hardening
 
