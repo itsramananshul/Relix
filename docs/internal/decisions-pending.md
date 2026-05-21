@@ -384,14 +384,22 @@ Windows ConPTY).
   the cross-platform sync I/O complexity of `portable-pty`).
   Smaller scope but operators on Windows lose PTY entirely.
 
-**Recommendation.** (b) — defer for now. The current shell
-posture (pipe stdin + sentinel-based command boundaries)
-covers the highest-value cases (Python REPL, node REPL, shell
-pipelines). Full PTY is a multi-day undertaking with a
-security-critical new dep; revisit when an operator has a
-concrete TUI / isatty workflow blocked.
+**Decision.** (a) — SHIPPED behind `--features terminal-pty`
+(PH-TERM-PTY). Operators flip `[tool.terminal] pty = true` AND
+build with the `terminal-pty` Cargo feature to get a real
+pseudoterminal via the `portable-pty` crate. The default
+pipe-based path is unchanged — operators pick. Selecting
+`pty = true` without the feature is a loud startup error at
+`ToolBackend::new` time (no silent fallback, matching the
+PH-BROWSER-FEATURES posture). TUI / isatty workflows
+(vim, top, interactive REPLs through `tool.terminal.shell.*`)
+now work; output may include ANSI escape sequences, which the
+chronicle audit captures verbatim — ANSI stripping is left to
+the consumer.
 
-**Status.** open.
+**Status.** SHIPPED behind `--features terminal-pty`
+(PH-TERM-PTY). The pipe path remains the default; opt-in PTY is
+purely additive.
 
 ---
 

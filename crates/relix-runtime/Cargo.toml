@@ -64,6 +64,14 @@ headless_chrome = { version = "1.0", optional = true }
 # workspace-level rustls posture.
 fantoccini = { version = "0.21", default-features = false, features = ["rustls-tls"], optional = true }
 
+# PH-TERM-PTY: wezterm's cross-platform pseudoterminal crate.
+# Pulled in only when `--features terminal-pty` is set; default
+# builds do NOT carry this dependency. The crate is blocking
+# (its Child / reader / writer are synchronous), so the PTY
+# backend bridges to tokio via `tokio::task::spawn_blocking`
+# and channels. See `terminal/pty.rs` for the architecture.
+portable-pty = { version = "0.8", optional = true }
+
 [features]
 # PH-BROWSER-FEATURES — per-backend opt-in flags. Default
 # build ships the NoneBackend honest scaffold only.
@@ -81,6 +89,13 @@ browser-all = [
     "browser-playwright",
     "browser-webdriver",
 ]
+# PH-TERM-PTY: opt-in PTY backend for `tool.terminal.*`. When
+# enabled AND `[tool.terminal] pty = true` is set in the
+# controller TOML, terminal.run / spawn / shell.open use a real
+# pseudoterminal via `portable-pty` instead of pipe stdin/stdout.
+# Programs see isatty()=true; ANSI escape sequences may appear
+# in captured output. The default pipe-based path is unchanged.
+terminal-pty = ["dep:portable-pty"]
 
 [dev-dependencies]
 tempfile.workspace = true

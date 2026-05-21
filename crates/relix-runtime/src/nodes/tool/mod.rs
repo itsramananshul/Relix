@@ -445,6 +445,13 @@ impl ToolBackend {
                 ))
             })?;
         }
+        // PH-TERM-PTY: same posture as [tool.browser] — loud
+        // startup error when `[tool.terminal] pty = true` is set
+        // without the `terminal-pty` Cargo feature compiled.
+        // The pipe-mode default (pty = false) is always accepted.
+        if let Some(term_cfg) = &cfg.terminal {
+            terminal::validate_config(term_cfg).map_err(ToolError::Build)?;
+        }
         Ok(Self {
             cfg: cfg.clone(),
             pool: PinnedClientPool::new(cfg, Arc::new(probe)),

@@ -1,6 +1,18 @@
 //! `tool.terminal.run` — sandboxed shell command execution
 //! (Capability Wave CW1).
 //!
+//! ## PH-TERM-PTY (opt-in PTY backend)
+//!
+//! Operators can flip `[tool.terminal] pty = true` AND build
+//! with `--features terminal-pty` to swap the pipe-based
+//! stdin/stdout path for a real pseudoterminal allocated via the
+//! `portable-pty` crate. The default pipe path is unchanged.
+//! Selecting `pty = true` without the feature is a loud startup
+//! error at [`TerminalBackend::new`] time — there is no silent
+//! fallback to the pipe path. See the `pty` submodule for the
+//! trade-offs (programs see isatty()=true, output may contain
+//! ANSI escape sequences).
+//!
 //! ## Security model — fail closed
 //!
 //! Terminal execution is the highest-blast-radius capability
@@ -141,6 +153,12 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
+// PH-TERM-PTY: feature-gated submodule. Only compiled in when
+// `--features terminal-pty` is set. The default pipe-based path
+// in this module is 100% unchanged — PTY is purely additive.
+#[cfg(feature = "terminal-pty")]
+mod pty;
+
 /// Per-node terminal subsystem config. Opt-in: when this
 /// section is missing the capability is not registered.
 #[derive(Clone, Debug, Deserialize)]
@@ -175,15 +193,39 @@ pub struct TerminalConfig {
     /// fs-jail discipline pass a dedicated scratch dir.
     #[serde(default)]
     pub working_dir: Option<std::path::PathBuf>,
+    /// PH-TERM-PTY: when true AND the `terminal-pty` feature is
+    /// compiled, terminal.run / spawn / shell.open use a real
+    /// pseudoterminal (portable_pty) instead of pipe stdin/stdout.
+    /// Default false. Requires opt-in because PTY has different
+    /// semantics — programs see isatty()=true and may emit ANSI
+    /// escape sequences. Selecting `pty = true` without the
+    /// feature is a loud startup error at `TerminalBackend::new`.
+    #[serde(default)]
+    pub pty: bool,
 }
 
 fn default_timeout_secs() -> u64 {
     30
 }
 
+/// PH-TERM-PTY: validate the operator's [tool.terminal] config
+/// against the compiled feature flags. Surfaced fatally by
+/// [`crate::nodes::tool::ToolBackend::new`] so a misconfigured
+/// `pty = true` is a loud startup error rather than a silent
+/// fallback. The pipe-mode posture (the default) is always
+/// available regardless of feature flags.
+pub fn validate_config(cfg: &TerminalConfig) -> Result<(), String> {
+    if cfg.pty && !cfg!(feature = "terminal-pty") {
+        return Err(
+            "[tool.terminal] pty = true requires building with --features terminal-pty".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Hard cap on stdout/stderr capture per stream. Overflow is
 /// truncated + flagged in the response.
-const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MiB
+pub(super) const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MiB
 
 /// PH-TERM-SESSIONS / PH-TERM-CANCEL / PH-TERM-STREAM1: one live
 /// `tool.terminal.run` invocation in flight. Inserted on spawn,
@@ -289,7 +331,7 @@ impl TerminalAuditRing {
 
 /// Default ring capacity. Bounded so a busy operator can't
 /// hold an unbounded history in process memory.
-const TERMINAL_AUDIT_RING_DEFAULT: usize = 256;
+pub(super) const TERMINAL_AUDIT_RING_DEFAULT: usize = 256;
 
 /// Validated terminal config + the allowlist as a hash set
 /// for O(1) lookup.
@@ -316,6 +358,14 @@ pub struct TerminalBackend {
     /// guard across the `write_all` / `flush` awaits.
     shell_stdins:
         Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>>>,
+    /// PH-TERM-PTY: per-session PTY master writer side. Only
+    /// populated for shell sessions opened in PTY mode.
+    /// Feature-gated so the default build's `TerminalBackend`
+    /// has zero size cost from this field. Wrapped in a newtype
+    /// that implements Debug (the inner trait object has no
+    /// Debug impl) so the parent's #[derive(Debug)] still works.
+    #[cfg(feature = "terminal-pty")]
+    pty_shell_writers: pty::PtyShellWriterMap,
 }
 
 impl TerminalBackend {
@@ -346,6 +396,13 @@ impl TerminalBackend {
                     .to_string(),
             );
         }
+        // PH-TERM-PTY: loud fail when `pty = true` is set in the
+        // operator's TOML but the runtime was not built with
+        // `--features terminal-pty`. The parent ToolBackend::new
+        // also enforces this via [`validate_config`]; the
+        // double-check here protects direct callers of
+        // TerminalBackend::new (notably the test suite).
+        validate_config(&cfg)?;
         // PH-TERM-SHELL: shell allowlist validation. Empty is
         // acceptable (shell sessions disabled); a populated list
         // must follow the same bare-program-name rules as
@@ -370,6 +427,8 @@ impl TerminalBackend {
             sessions: Mutex::new(HashMap::new()),
             audit: TerminalAuditRing::new(TERMINAL_AUDIT_RING_DEFAULT),
             shell_stdins: Mutex::new(HashMap::new()),
+            #[cfg(feature = "terminal-pty")]
+            pty_shell_writers: pty::PtyShellWriterMap::new(),
         })
     }
 
@@ -394,44 +453,44 @@ impl TerminalBackend {
 /// Wire-shape request body. Operators submit a JSON object
 /// over the dispatch envelope.
 #[derive(Debug, Deserialize)]
-struct RunRequest {
+pub(super) struct RunRequest {
     /// Bare program name (must be in `allowed_commands`).
-    command: String,
+    pub(super) command: String,
     /// Argv tail. NOT subject to shell interpretation —
     /// passed verbatim to the OS spawn.
     #[serde(default)]
-    args: Vec<String>,
+    pub(super) args: Vec<String>,
     /// Optional per-call timeout. Clamped to
     /// `cfg.max_timeout_secs`. `None` → use the config max.
     #[serde(default)]
-    timeout_secs: Option<u64>,
+    pub(super) timeout_secs: Option<u64>,
 }
 
 /// Wire-shape response body.
 #[derive(Debug, Serialize)]
-struct RunResponse {
+pub(super) struct RunResponse {
     /// Exit status as reported by the OS. `None` when the
     /// process was killed (timeout / cancel — `timed_out` /
     /// `cancelled` disambiguate).
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-    duration_ms: u64,
+    pub(super) exit_code: Option<i32>,
+    pub(super) stdout: String,
+    pub(super) stderr: String,
+    pub(super) duration_ms: u64,
     /// True when the timeout fired and we killed the child
     /// before it exited naturally.
-    timed_out: bool,
+    pub(super) timed_out: bool,
     /// PH-TERM-CANCEL: true when `tool.terminal.cancel` fired
     /// for this session's id and we killed the child. Mutually
     /// exclusive with `timed_out`.
-    cancelled: bool,
+    pub(super) cancelled: bool,
     /// True when stdout exceeded `MAX_OUTPUT_BYTES` and was
     /// truncated.
-    truncated_stdout: bool,
-    truncated_stderr: bool,
+    pub(super) truncated_stdout: bool,
+    pub(super) truncated_stderr: bool,
     /// The command that ran + the effective timeout that was
     /// applied. Operators see both for post-hoc audit.
-    command: String,
-    timeout_secs: u64,
+    pub(super) command: String,
+    pub(super) timeout_secs: u64,
 }
 
 /// Register the `tool.terminal.*` capabilities on the dispatch
@@ -879,9 +938,76 @@ struct SpawnedRun {
 /// `backend.shell_stdins` so `tool.terminal.shell.input` can
 /// write to it later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpawnMode {
+pub(super) enum SpawnMode {
     Run,
     Shell,
+}
+
+/// PH-TERM-PTY: extract the request-validation slice of
+/// [`validate_and_spawn`] so the PTY submodule can reuse the
+/// same allowlist + path-separator checks without dragging in
+/// the tokio::process::Command branch. Returns the resolved
+/// timeout (already clamped to `max_timeout_secs`).
+#[cfg_attr(not(feature = "terminal-pty"), allow(dead_code))]
+pub(super) fn validate_command_only(
+    backend: &Arc<TerminalBackend>,
+    req: &RunRequest,
+    capability: &'static str,
+    mode: SpawnMode,
+) -> Result<(), ErrorEnvelope> {
+    if req.command.is_empty() {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!("{capability}: command required"),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    if req.command.contains('/') || req.command.contains('\\') {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!(
+                "{capability}: command `{}` contains a path separator; \
+                 only bare program names are accepted (operator allowlist \
+                 enforces this)",
+                req.command
+            ),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let (allowlist, allowlist_label) = match mode {
+        SpawnMode::Run => (&backend.allowed, "allowed_commands"),
+        SpawnMode::Shell => (&backend.allowed_shells, "allowed_shells"),
+    };
+    if allowlist.is_empty() {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::POLICY_DENIED,
+            cause: format!(
+                "{capability}: operator has not configured any entries in \
+                 `{allowlist_label}`; the capability fails closed"
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    if !allowlist.contains(&req.command) {
+        let entries = match mode {
+            SpawnMode::Run => backend.cfg.allowed_commands.join(", "),
+            SpawnMode::Shell => backend.cfg.allowed_shells.join(", "),
+        };
+        return Err(ErrorEnvelope {
+            kind: error_kinds::POLICY_DENIED,
+            cause: format!(
+                "{capability}: command `{}` is not in the operator's \
+                 `{allowlist_label}` ({entries})",
+                req.command,
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    Ok(())
 }
 
 /// PH-TERM-SPAWN: validate a [`RunRequest`] against the
@@ -1229,6 +1355,14 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
             });
         }
     };
+    // PH-TERM-PTY: branch on the validated config flag. The
+    // feature-gate is already enforced at TerminalBackend::new,
+    // so by the time we get here, `cfg.pty = true` implies the
+    // `terminal-pty` feature is compiled.
+    #[cfg(feature = "terminal-pty")]
+    if backend.cfg.pty {
+        return pty::handle_run_pty(backend, ctx, req).await;
+    }
     let spawned =
         match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.run", SpawnMode::Run).await {
             Ok(s) => s,
@@ -1245,12 +1379,12 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
 /// can start polling tail / sessions / audit with the
 /// session_id.
 #[derive(Debug, Serialize)]
-struct SpawnResponse {
-    session_id: String,
-    pid: Option<u32>,
-    command: String,
-    timeout_secs: u64,
-    started_at: i64,
+pub(super) struct SpawnResponse {
+    pub(super) session_id: String,
+    pub(super) pid: Option<u32>,
+    pub(super) command: String,
+    pub(super) timeout_secs: u64,
+    pub(super) started_at: i64,
 }
 
 async fn handle_spawn(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
@@ -1265,6 +1399,13 @@ async fn handle_spawn(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Hand
             });
         }
     };
+    // PH-TERM-PTY: PTY-mode spawn — fire-and-forget into the
+    // blocking PTY driver. Same return-shape (session_id, pid,
+    // ...) so callers don't have to know which backend ran.
+    #[cfg(feature = "terminal-pty")]
+    if backend.cfg.pty {
+        return pty::handle_spawn_pty(backend, ctx, req).await;
+    }
     let spawned =
         match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.spawn", SpawnMode::Run).await
         {
@@ -1316,6 +1457,15 @@ async fn handle_shell_open(backend: Arc<TerminalBackend>, ctx: InvocationCtx) ->
             });
         }
     };
+    // PH-TERM-PTY: open a real PTY shell when pty mode is on.
+    // The PTY driver stashes a writer in the shared
+    // `pty_shell_writers` map; `tool.terminal.shell.input` and
+    // `tool.terminal.shell.control` route through that map first
+    // and fall back to `shell_stdins` for the pipe-mode case.
+    #[cfg(feature = "terminal-pty")]
+    if backend.cfg.pty {
+        return pty::handle_shell_open_pty(backend, ctx, req).await;
+    }
     let spawned = match validate_and_spawn(
         &backend,
         &ctx,
@@ -1366,6 +1516,22 @@ async fn write_to_session_stdin(
     capability: &'static str,
 ) -> Result<usize, ErrorEnvelope> {
     use tokio::io::AsyncWriteExt as _;
+    // PH-TERM-PTY: dispatch to the PTY writer first when the
+    // session was opened in PTY mode. The pipe-mode handler
+    // below is unchanged.
+    #[cfg(feature = "terminal-pty")]
+    {
+        let pty_writer = {
+            let g = backend
+                .pty_shell_writers
+                .lock()
+                .expect("tool.terminal pty_shell_writers poisoned");
+            g.get(session_id).cloned()
+        };
+        if let Some(w) = pty_writer {
+            return pty::write_to_pty_session(w, payload, capability).await;
+        }
+    }
     let stdin_arc = {
         let g = backend
             .shell_stdins
@@ -1626,14 +1792,28 @@ fn handle_shell_close(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> Han
             retry_after: None,
         });
     }
-    let removed = {
+    let removed_pipe = {
         let mut g = backend
             .shell_stdins
             .lock()
             .expect("tool.terminal shell_stdins poisoned");
         g.remove(s).is_some()
     };
-    if removed {
+    // PH-TERM-PTY: also drop the PTY writer entry if any.
+    // Dropping the writer half closes the master pipe, which
+    // signals EOF to the slave-side shell — same observable
+    // behaviour as the pipe-mode case.
+    #[cfg(feature = "terminal-pty")]
+    let removed_pty = {
+        let mut g = backend
+            .pty_shell_writers
+            .lock()
+            .expect("tool.terminal pty_shell_writers poisoned");
+        g.remove(s).is_some()
+    };
+    #[cfg(not(feature = "terminal-pty"))]
+    let removed_pty = false;
+    if removed_pipe || removed_pty {
         HandlerOutcome::Ok(format!("ok session={s}\n").into_bytes())
     } else {
         HandlerOutcome::Err(ErrorEnvelope {
@@ -1930,14 +2110,14 @@ fn handle_cancel(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerO
 /// PH-TERM-SESSIONS: 16 hex chars of randomness — matches the
 /// existing CW4 browser session id shape so the operator UX
 /// is consistent across session-bearing capabilities.
-fn new_session_id() -> String {
+pub(super) fn new_session_id() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
-fn unix_secs() -> i64 {
+pub(super) fn unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1950,7 +2130,7 @@ fn unix_secs() -> i64 {
 /// purposes; the bridge audit also records the raw bytes
 /// (caps + flags surface in the response so callers know
 /// when they need to re-run with a different capture path).
-fn truncate_output(mut bytes: Vec<u8>) -> (String, bool) {
+pub(super) fn truncate_output(mut bytes: Vec<u8>) -> (String, bool) {
     let truncated = bytes.len() > MAX_OUTPUT_BYTES;
     if truncated {
         bytes.truncate(MAX_OUTPUT_BYTES);
@@ -1969,6 +2149,7 @@ mod tests {
             max_timeout_secs: 30,
             inherit_env: false,
             working_dir: None,
+            pty: false,
         }
     }
 
@@ -1979,6 +2160,7 @@ mod tests {
             max_timeout_secs: 30,
             inherit_env: false,
             working_dir: None,
+            pty: false,
         }
     }
 
@@ -3082,6 +3264,81 @@ mod tests {
         // does NOT kill the process, only signals EOF).
         assert!(!b.shell_stdins.lock().unwrap().contains_key(session_id));
         assert!(b.sessions.lock().unwrap().contains_key(session_id));
+    }
+
+    // ── PH-TERM-PTY: config plumbing + feature gating ─────────────
+
+    /// `pty = false` is the default — direct struct-init forces
+    /// the field but the serde default is also `false`. The
+    /// flag flows through to the backend and is observable via
+    /// the public config getter.
+    #[test]
+    fn terminal_config_pty_defaults_to_false_via_serde() {
+        let toml_src = r#"
+            allowed_commands = ["echo"]
+            allowed_shells = []
+            max_timeout_secs = 5
+            inherit_env = false
+        "#;
+        let cfg: TerminalConfig = toml::from_str(toml_src).expect("config parses");
+        assert!(!cfg.pty, "pty should default to false when omitted");
+        let b = TerminalBackend::new(cfg).expect("default-pty config must build");
+        assert!(!b.cfg.pty);
+    }
+
+    /// `pty = true` round-trips through serde and through the
+    /// backend constructor when the feature is compiled. With
+    /// the feature OFF, the same input is rejected at backend
+    /// construction time with a clear message.
+    #[test]
+    fn terminal_config_pty_true_flows_through() {
+        let toml_src = r#"
+            allowed_commands = ["echo"]
+            allowed_shells = []
+            max_timeout_secs = 5
+            inherit_env = false
+            pty = true
+        "#;
+        let cfg: TerminalConfig = toml::from_str(toml_src).expect("config parses");
+        assert!(cfg.pty, "pty = true must round-trip through serde");
+
+        #[cfg(feature = "terminal-pty")]
+        {
+            let b = TerminalBackend::new(cfg).expect("pty config builds with feature on");
+            assert!(b.cfg.pty);
+        }
+        #[cfg(not(feature = "terminal-pty"))]
+        {
+            let err = TerminalBackend::new(cfg).unwrap_err();
+            assert!(
+                err.contains("terminal-pty"),
+                "loud-fail error must name the feature: {err}"
+            );
+            assert!(
+                err.contains("pty = true"),
+                "loud-fail error must name the offending flag: {err}"
+            );
+        }
+    }
+
+    /// `validate_config` mirrors the backend constructor for
+    /// callers (e.g., the parent `ToolBackend::new`) that want
+    /// to surface the loud-fail before instantiating the
+    /// backend.
+    #[test]
+    fn validate_config_matches_backend_new_posture() {
+        let mut c = cfg(&["echo"]);
+        // Default-pty config is always accepted.
+        validate_config(&c).expect("default cfg must validate");
+        c.pty = true;
+        let res = validate_config(&c);
+        #[cfg(feature = "terminal-pty")]
+        assert!(res.is_ok(), "pty = true must validate with feature on");
+        #[cfg(not(feature = "terminal-pty"))]
+        {
+            let err = res.unwrap_err();
+            assert!(err.contains("terminal-pty"));
+        }
     }
 
     /// PH-RISK-PIN-ALL: pin the risk tier of every shipped
