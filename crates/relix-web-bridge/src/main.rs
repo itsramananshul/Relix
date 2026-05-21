@@ -392,6 +392,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // docs/dashboard-redesign.md for the contract.
         .route("/v1/config", get(config_api::get_effective_config))
         .route("/v1/config/providers", get(config_api::list_providers))
+        // PH-WAVE2K: consolidated ops endpoint — all provider
+        // statuses + aggregate counters in one fetch.
+        .route("/v1/providers/health", get(config_api::providers_health))
         .route(
             "/v1/config/providers/:name",
             get(config_api::get_provider)

@@ -193,7 +193,7 @@ Highest-leverage parity:
 
 | Capability | Hermes file | Leverage | Effort | Relix status | Counterpart / next |
 |---|---|---|---|---|---|
-| Rate-limit ladder (429 + body detection) | nous_rate_guard.py + account_usage.py + classify_api_error | high | medium | partial | H1 classifier covers detection; no ladder/cooldown yet |
+| Rate-limit ladder (429 + body detection) | nous_rate_guard.py + account_usage.py + classify_api_error | high | medium | shipped (bridge side) | H1 classifies; PH-WAVE2G observation ring; PH-WAVE2I auto-cooldown closes the loop. AI-controller-side cross-provider failover still pending (needs router). |
 | Prompt caching (cache_control) | anthropic_adapter.py prompt caching | high | small | shipped | system block sent as structured array with cache_control ephemeral (PH-WAVE2E) |
 | Extended thinking (o1/o3) | lmstudio_reasoning.py | high | small | shipped | ChatInput.thinking_budget_tokens → Anthropic `thinking:{type:enabled,budget_tokens:N}` (PH-WAVE2F). Reasoning trace surface deferred. |
 | Vision (multi-image, resize, cost est) | vision_tools.py | medium | medium | pending | needs ChatInput.images |
@@ -229,8 +229,9 @@ would gain the most operator value from next:
 2. **Context Compression (aux LLM)** — pending, per D-001
 3. **Memory Persistence (MEMORY.md/USER.md)** — pending, per D-001
 4. **Prompt Caching (Anthropic)** — shipped (PH-WAVE2E) ✓
-5. **Rate Limit Detection + Credential Rotation** — partial (H1
-   classifier covers detection; ladder/cooldown pending)
+5. **Rate Limit Detection + Credential Rotation** — bridge side
+   shipped (H1 + PH-WAVE2G + PH-WAVE2I); AI-controller-side
+   cross-provider failover pending
 6. **Delegation / Subagent Spawning** — partial (M72), needs
    executor
 7. **Extended Thinking (o1/o3)** — shipped (PH-WAVE2F) ✓

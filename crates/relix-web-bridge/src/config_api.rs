@@ -76,6 +76,69 @@ pub async fn list_providers(State(state): State<AppState>) -> Json<ProvidersResp
     Json(ProvidersResponse { providers })
 }
 
+/// PH-WAVE2K: consolidated providers-health response shape.
+/// Carries the same `providers` list as
+/// `GET /v1/config/providers` PLUS aggregate counters across
+/// all providers so an operator (or future cross-provider
+/// router) can answer "is the AI stack OK right now?" in one
+/// fetch.
+#[derive(Debug, Serialize)]
+pub struct ProvidersHealthResponse {
+    pub providers: Vec<ProviderStatus>,
+    pub aggregate: ProvidersAggregate,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProvidersAggregate {
+    /// Number of providers currently in cooldown (auto or operator-set).
+    pub cooldowns_active: u64,
+    /// Number of providers operator-quarantined.
+    pub quarantined: u64,
+    /// Sum of rate_limit_hits_5min across all providers.
+    pub rate_limit_hits_5min: u64,
+    /// Sum of rate_limit_hits_1h across all providers.
+    pub rate_limit_hits_1h: u64,
+    /// Sum of failed_request_count (lifetime).
+    pub failed_request_count: u64,
+    /// Sum of success_request_count (lifetime).
+    pub success_request_count: u64,
+}
+
+/// `GET /v1/providers/health` — one-shot ops endpoint.
+pub async fn providers_health(State(state): State<AppState>) -> Json<ProvidersHealthResponse> {
+    let providers = state.secrets.read(|s| s.all_provider_statuses());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut agg = ProvidersAggregate {
+        cooldowns_active: 0,
+        quarantined: 0,
+        rate_limit_hits_5min: 0,
+        rate_limit_hits_1h: 0,
+        failed_request_count: 0,
+        success_request_count: 0,
+    };
+    for p in &providers {
+        if let Some(cd) = p.cooldown_until
+            && cd > now
+        {
+            agg.cooldowns_active += 1;
+        }
+        if p.quarantined_at.is_some() {
+            agg.quarantined += 1;
+        }
+        agg.rate_limit_hits_5min += p.rate_limit_hits_5min;
+        agg.rate_limit_hits_1h += p.rate_limit_hits_1h;
+        agg.failed_request_count += p.failed_request_count;
+        agg.success_request_count += p.success_request_count;
+    }
+    Json(ProvidersHealthResponse {
+        providers,
+        aggregate: agg,
+    })
+}
+
 /// `GET /v1/config/providers/:name` — redacted status for one
 /// provider. 404 when the name is not in the allowlist.
 pub async fn get_provider(
