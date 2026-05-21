@@ -329,6 +329,29 @@ pub fn descriptor_patch_preview() -> CapabilityDescriptor {
     d
 }
 
+/// PH-FS-PARITY2: `tool.binary_sniff` — classify a file as
+/// text or binary by reading its first few KiB. Useful before
+/// `tool.read_file` (which strictly requires UTF-8) so a
+/// caller can decide whether to read it as text or hand it to
+/// `tool.pdf` / a future binary-aware capability.
+pub fn descriptor_binary_sniff() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.binary_sniff");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["fs:read".into()];
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Classify a file as text/binary by reading the first 8 KiB. Returns \
+         size, sniff_bytes, is_binary, detected_class (utf8/ascii/binary/empty), \
+         null_byte_count, and first_bytes_hex. Does NOT read the whole file."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "fs".into(), "classify".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
 /// CW2: `tool.list_dir` — list direct children of a
 /// jail-relative directory. Returns one line per entry:
 /// `<kind>\t<name>\t<size_bytes>\t<modified_unix_secs>`
@@ -418,12 +441,22 @@ pub fn register(bridge: &mut DispatchBridge, jail: Arc<FsJail>) {
         );
     }
     {
-        let j = jail;
+        let j = jail.clone();
         bridge.register(
             "tool.patch_preview",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let j = j.clone();
                 async move { handle_patch_preview(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail;
+        bridge.register(
+            "tool.binary_sniff",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_binary_sniff(&j, &ctx) }
             })),
         );
     }
@@ -795,6 +828,133 @@ fn handle_patch_preview(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(e) => return invalid(format!("tool.patch_preview: apply failed: {e}")),
     };
     HandlerOutcome::Ok(patched.into_bytes())
+}
+
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+const BINARY_SNIFF_HEX_PREVIEW: usize = 32;
+
+fn handle_binary_sniff(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.binary_sniff arg utf8: {e}")),
+    };
+    let rel = s.trim();
+    if rel.is_empty() {
+        return invalid("tool.binary_sniff: rel_path required".into());
+    }
+    let canonical = match jail.resolve(rel, true) {
+        Ok(p) => p,
+        Err(e) => return e.into(),
+    };
+    let meta = match std::fs::metadata(&canonical) {
+        Ok(m) => m,
+        Err(e) => return invalid(format!("tool.binary_sniff metadata: {e}")),
+    };
+    if !meta.is_file() {
+        return invalid(format!(
+            "tool.binary_sniff: '{}' is not a regular file",
+            jail.display_rel(&canonical)
+        ));
+    }
+    let size = meta.len();
+    let read_cap = (BINARY_SNIFF_BYTES as u64).min(size) as usize;
+    let bytes = match read_prefix(&canonical, read_cap) {
+        Ok(b) => b,
+        Err(e) => return invalid(format!("tool.binary_sniff read: {e}")),
+    };
+    let cls = classify_bytes(&bytes);
+    let preview = hex_preview(&bytes, BINARY_SNIFF_HEX_PREVIEW);
+    let body = format!(
+        "path={}\n\
+         size={size}\n\
+         sniff_bytes={sniff}\n\
+         is_binary={is_binary}\n\
+         detected_class={class}\n\
+         null_byte_count={nulls}\n\
+         first_bytes_hex={hex}\n",
+        jail.display_rel(&canonical),
+        sniff = bytes.len(),
+        is_binary = cls.is_binary,
+        class = cls.detected_class,
+        nulls = cls.null_byte_count,
+        hex = preview,
+    );
+    HandlerOutcome::Ok(body.into_bytes())
+}
+
+/// Read up to `cap` bytes from `path` without loading the whole file.
+fn read_prefix(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    if cap == 0 {
+        return Ok(Vec::new());
+    }
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; cap];
+    let mut read = 0;
+    while read < cap {
+        let n = f.read(&mut buf[read..])?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    buf.truncate(read);
+    Ok(buf)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SniffClass {
+    is_binary: bool,
+    detected_class: &'static str,
+    null_byte_count: usize,
+}
+
+/// Classify a byte buffer. Strategy:
+/// - empty → `empty`, not binary
+/// - any null byte → `binary`
+/// - valid UTF-8 → `utf8` (and `ascii` when all bytes < 0x80)
+/// - else → `binary`
+fn classify_bytes(bytes: &[u8]) -> SniffClass {
+    let null_count = bytes.iter().filter(|b| **b == 0).count();
+    if bytes.is_empty() {
+        return SniffClass {
+            is_binary: false,
+            detected_class: "empty",
+            null_byte_count: 0,
+        };
+    }
+    if null_count > 0 {
+        return SniffClass {
+            is_binary: true,
+            detected_class: "binary",
+            null_byte_count: null_count,
+        };
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(_) => {
+            let all_ascii = bytes.iter().all(|b| *b < 0x80);
+            SniffClass {
+                is_binary: false,
+                detected_class: if all_ascii { "ascii" } else { "utf8" },
+                null_byte_count: 0,
+            }
+        }
+        Err(_) => SniffClass {
+            is_binary: true,
+            detected_class: "binary",
+            null_byte_count: 0,
+        },
+    }
+}
+
+fn hex_preview(bytes: &[u8], cap: usize) -> String {
+    use std::fmt::Write as _;
+    let n = cap.min(bytes.len());
+    let mut out = String::with_capacity(n * 2);
+    for b in &bytes[..n] {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 // ──────────────────────────── Helpers ──────────────────────────────────────
@@ -1595,6 +1755,150 @@ mod tests {
                     e.cause
                 )
             }
+        }
+    }
+
+    // ── PH-FS-PARITY2: tool.binary_sniff ───────────────────────────
+
+    #[test]
+    fn binary_sniff_descriptor_shape() {
+        let d = descriptor_binary_sniff();
+        assert_eq!(d.method_name, "tool.binary_sniff");
+        assert_eq!(d.major_version, 1);
+        assert!(matches!(d.idempotency, Idempotency::Idempotent));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "fs:read"));
+        assert!(d.environment_requirements.iter().any(|r| r == "fs:jail"));
+    }
+
+    #[test]
+    fn classify_bytes_empty() {
+        let c = classify_bytes(b"");
+        assert!(!c.is_binary);
+        assert_eq!(c.detected_class, "empty");
+        assert_eq!(c.null_byte_count, 0);
+    }
+
+    #[test]
+    fn classify_bytes_ascii() {
+        let c = classify_bytes(b"hello, world");
+        assert!(!c.is_binary);
+        assert_eq!(c.detected_class, "ascii");
+    }
+
+    #[test]
+    fn classify_bytes_utf8_non_ascii() {
+        let c = classify_bytes("héllo ☃".as_bytes());
+        assert!(!c.is_binary);
+        assert_eq!(c.detected_class, "utf8");
+    }
+
+    #[test]
+    fn classify_bytes_with_nulls_is_binary() {
+        let c = classify_bytes(b"hello\0world");
+        assert!(c.is_binary);
+        assert_eq!(c.detected_class, "binary");
+        assert_eq!(c.null_byte_count, 1);
+    }
+
+    #[test]
+    fn classify_bytes_invalid_utf8_is_binary() {
+        // 0xFF 0xFE is not valid UTF-8 (lone continuation bytes).
+        let c = classify_bytes(&[0x68, 0xff, 0xfe, 0x69]);
+        assert!(c.is_binary);
+        assert_eq!(c.detected_class, "binary");
+    }
+
+    #[test]
+    fn hex_preview_caps_at_requested_length() {
+        let bytes: Vec<u8> = (0..50u8).collect();
+        let s = hex_preview(&bytes, 4);
+        assert_eq!(s, "00010203");
+    }
+
+    #[test]
+    fn binary_sniff_handler_reports_text_for_utf8_file() {
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("greeting.txt"), "héllo\n").unwrap();
+        let r = handle_binary_sniff(&j, &ctx(b"greeting.txt"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(body.contains("path=greeting.txt"));
+        assert!(body.contains("is_binary=false"));
+        assert!(body.contains("detected_class=utf8"));
+        assert!(body.contains("null_byte_count=0"));
+        assert!(body.contains("first_bytes_hex="));
+    }
+
+    #[test]
+    fn binary_sniff_handler_reports_binary_for_file_with_nulls() {
+        let (td, j) = mk_jail();
+        let payload: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        std::fs::write(td.path().join("img.bin"), payload).unwrap();
+        let r = handle_binary_sniff(&j, &ctx(b"img.bin"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(body.contains("is_binary=true"));
+        assert!(body.contains("detected_class=binary"));
+        // PNG signature has 0x0d 0x0a 0x1a 0x0a; the 0x00 isn't
+        // in the signature itself but lone bytes 0x89 0x50 etc.
+        // make this not valid UTF-8 → still classified binary.
+        assert!(body.contains("first_bytes_hex=8950"));
+    }
+
+    #[test]
+    fn binary_sniff_handler_reports_empty_for_empty_file() {
+        let (td, j) = mk_jail();
+        std::fs::File::create(td.path().join("nothing")).unwrap();
+        let r = handle_binary_sniff(&j, &ctx(b"nothing"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(body.contains("size=0"));
+        assert!(body.contains("sniff_bytes=0"));
+        assert!(body.contains("is_binary=false"));
+        assert!(body.contains("detected_class=empty"));
+    }
+
+    #[test]
+    fn binary_sniff_handler_rejects_directory() {
+        let (td, j) = mk_jail();
+        std::fs::create_dir(td.path().join("d")).unwrap();
+        let r = handle_binary_sniff(&j, &ctx(b"d"));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("not a regular file")),
+            _ => panic!("expected Err for directory target"),
+        }
+    }
+
+    #[test]
+    fn binary_sniff_handler_only_reads_first_8kib_for_large_file() {
+        let (td, j) = mk_jail();
+        // 20 KiB of ASCII A's — sniff should report sniff_bytes=8192.
+        let big = "A".repeat(20 * 1024);
+        std::fs::write(td.path().join("big.txt"), &big).unwrap();
+        let r = handle_binary_sniff(&j, &ctx(b"big.txt"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(body.contains(&format!("size={}", 20 * 1024)));
+        assert!(body.contains(&format!("sniff_bytes={}", 8 * 1024)));
+        assert!(body.contains("detected_class=ascii"));
+    }
+
+    #[test]
+    fn binary_sniff_handler_empty_arg_rejected() {
+        let (_td, j) = mk_jail();
+        let r = handle_binary_sniff(&j, &ctx(b""));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("rel_path required")),
+            _ => panic!("expected Err for empty arg"),
         }
     }
 }

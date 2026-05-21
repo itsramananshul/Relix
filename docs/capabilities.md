@@ -64,6 +64,7 @@ before the backend (visibility + stable contract + honesty).
 | `tool.list_dir` (CW2) | live | Tab-separated rows + paginated |
 | `tool.patch` | live | Unified diff apply |
 | `tool.patch_preview` (PH-FS-PARITY1) | live | Read-only dry-run |
+| `tool.binary_sniff` (PH-FS-PARITY2) | live | Classify text/binary by sniffing first 8 KiB |
 | `tool.pdf` | live | base64-encoded PDF parse |
 
 ### Web

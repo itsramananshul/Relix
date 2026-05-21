@@ -38,7 +38,7 @@ row's status field.
 | patch_parser | parse + validate unified diffs | medium | small | shipped | tool.patch (diffy) | matches Hermes shape |
 | credential_files | read/write credential vaults | medium | medium | partial | bridge-secrets.toml | bridge owns, not a tool |
 | path_security | traversal guards + sandbox | high | trivial | shipped | fs::FsJail + tool.path_security | identical model |
-| binary_extensions | binary sniff | low | trivial | pending | — | small, can ship when needed |
+| binary_extensions | binary sniff | low | trivial | shipped | tool.binary_sniff (PH-FS-PARITY2) | classifies first 8 KiB; UTF-8 + null-byte + ASCII heuristic |
 
 ### Web + network
 

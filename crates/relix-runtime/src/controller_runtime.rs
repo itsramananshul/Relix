@@ -766,6 +766,9 @@ fn register_node_type_handlers(
             // create), patch_preview is read-only dry-run.
             manifest.add_capability(crate::nodes::tool::fs::descriptor_append());
             manifest.add_capability(crate::nodes::tool::fs::descriptor_patch_preview());
+            // PH-FS-PARITY2: tool.binary_sniff — classify a file
+            // as text/binary by reading the first 8 KiB. Same jail.
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_binary_sniff());
         }
         // B3: tool.pdf — only advertised when [tool.pdf] is configured.
         if tool_cfg.pdf.is_some() {
