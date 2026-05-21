@@ -2074,6 +2074,7 @@
               <button id="action-unfreeze">Unfreeze</button>
               <button id="action-note">Add note</button>
               <button id="action-investigate">Investigate</button>
+              <button id="action-replay" title="Clone this task into a brand-new replay (W2-001).">Replay</button>
               <button id="action-cancel" class="btn-danger">Cancel</button>
               <button id="action-recover">Recover</button>
             </div>
@@ -4289,6 +4290,33 @@ function initTasks() {
   document.getElementById('action-investigate').addEventListener('click', async () => {
     if (!selectedTaskId) return;
     await requestInvestigation(selectedTaskId);
+  });
+  // W2-001d: clone the current task into a fresh replay.
+  // Navigates to the new task on success so operators
+  // immediately see what was created.
+  document.getElementById('action-replay').addEventListener('click', async () => {
+    if (!selectedTaskId) return;
+    if (!confirm('Clone this task into a brand-new replay? The new task starts pending with the same flow + params.')) return;
+    try {
+      const r = await fetch('/v1/tasks/' + encodeURIComponent(selectedTaskId) + '/replay', { method: 'POST' });
+      if (!r.ok) {
+        let detail = 'HTTP ' + r.status;
+        try {
+          const body = await r.json();
+          if (body && body.error) detail += ' — ' + body.error;
+        } catch (_) {}
+        throw new Error(detail);
+      }
+      const body = await r.json();
+      const newId = body.new_task_id;
+      if (!newId) throw new Error('coordinator returned empty new_task_id');
+      toast('Replay created: task ' + newId.slice(0, 12) + '…', 'ok');
+      // Refresh the task list + drop into the new task's detail view.
+      await loadTasks();
+      window.location.hash = '#/tasks?task=' + encodeURIComponent(newId);
+    } catch (e) {
+      toast('Replay failed: ' + String(e), 'error');
+    }
   });
   document.getElementById('action-pause').addEventListener('click', async () => {
     if (!selectedTaskId) return;
