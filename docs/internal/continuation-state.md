@@ -445,19 +445,31 @@ all pushed to origin/main):
 | H8  | 971308c | core +18, runtime +2 | Secret redaction (relix-core, chronicle) |
 | H9  | 56f906c | bridge +1 | Secret redaction (intervention audit) |
 | H10 | a0451ec | runtime +3 | Redaction sweep: pause/freeze/error_cause |
+| H15 | fbe3a38 | n/a | Bridge route latency tracing middleware |
+| PH5 | 20f0dcc | runtime +23 | sanitize.rs — JSON arg repair/coerce/truncate |
+| PH-DASH1 | f5449e5 | bridge +1 | click-to-expand firehose payload_json |
+| PH-WAVE2A | a31d81f | core +10 | jittered backoff helper |
+| PH-WAVE2C | cce96e2 | n/a | redaction count KPI tile |
+| PH-WAVE2D | (pending) | runtime +8 | task.todo_* coord capabilities |
+| PH-WAVE2E | (pending) | n/a | Anthropic prompt-caching cache_control |
 
-Aggregate: ~5800 LOC added; runtime tests 291 → 385 (+94),
-bridge tests 192 → 204 (+12), relix-core 33 → 51 (+18). Every
-milestone clean fmt + clippy + tests. Total workspace ≈ 705
-passing tests, 0 failures.
+Aggregate: ~7500+ LOC; runtime tests 291 → 419+, bridge tests
+192 → 208, relix-core 33 → 61. Every milestone clean fmt +
+clippy + tests. Total workspace ≈ 745+ passing tests.
+
+Plus an Explore-agent-generated `docs/internal/hermes-capability-map.md`
+inventorying all 76 Hermes tools / 35 skills / 11+ platforms with
+per-row Relix parity status. New D-007 logged
+(computer_use_tool backend choice).
 
 H3 (iteration budget grace-call) was deferred per D-006 — needs
 an executor consumer that doesn't exist yet. Decision logged.
 
 After H8 + H9 + H10 every operator/provider-supplied free-text
 boundary in the coordinator and bridge is covered by the
-redaction scrubber. Chronicle, audit log, dashboard timeline:
-all secret-safe by default.
+redaction scrubber. PH-WAVE2D extended that to the new
+task.todo_set path so todo text gets scrubbed too. Chronicle,
+audit log, dashboard timeline, todo lists: all secret-safe.
 
 ### What the user paused on tonight
 - Asked the runtime to keep going all night and to log

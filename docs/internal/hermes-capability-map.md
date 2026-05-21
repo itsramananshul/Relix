@@ -99,7 +99,7 @@ row's status field.
 
 | Hermes name | What it does | Leverage | Effort | Relix status | Relix counterpart | Notes |
 |---|---|---|---|---|---|---|
-| todo_tool | task list decomposition | high | trivial | pending | — | small, ship as coord capability |
+| todo_tool | task list decomposition | high | trivial | shipped | task.todo_set / task.todo_list / task.todo_update (PH-WAVE2D) | per-task ordered list w/ open/done status |
 | delegate_task | subagent spawning | high | large | partial | task.spawned_child + task.delegated_to events (M72) | edge events exist; no executor consumer yet |
 | cronjob_tools | schedule/cancel background jobs | medium | medium | pending | — | needs scheduler |
 | skill_manager_tool | load/unload skills | medium | large | pending | — | full skill ecosystem dep |
@@ -175,9 +175,9 @@ The single most leverage-rich subset Hermes ships:
 |---|---|---|---|---|---|
 | conversation_loop.py | turn driver (~3900 LOC): model→tool→retry→compress→fallback | high | very-large | partial | dispatch + AI node together; full Hermes loop = PHASE H9 |
 | error_classifier.py | FailoverReason enum + classify_api_error | high | medium | shipped | H1 failover.rs |
-| retry_utils.py | jittered exponential backoff | high | trivial | pending | small free function in core |
+| retry_utils.py | jittered exponential backoff | high | trivial | shipped | relix_core::retry::Backoff (PH-WAVE2A) |
 | iteration_budget.py | per-agent turn cap | high | trivial | pending | task.max_retries close; no per-turn yet |
-| context_compressor.py | auto-summarize when nearing token limit | high | very-large | pending | per D-001; needs aux LLM client |
+| context_compressor.py | auto-summarize when nearing token limit | high | very-large | pending | per D-001; needs aux LLM client. Note: H2 chronicle summarizer + H14 terminal_summary auto-emit are upstream-of-LLM analogues that already cover the "summarize the chronicle" half of this. |
 | context_engine.py | pluggable context strategies | medium | small | pending | plugin loader needed |
 | memory_manager.py | MEMORY.md/USER.md orchestration | high | medium | pending | per D-001 |
 | memory_provider.py (ABC) | external memory backends (Honcho, Hindsight, Mem0) | medium | large | pending | extends memory_manager |
@@ -194,7 +194,7 @@ Highest-leverage parity:
 | Capability | Hermes file | Leverage | Effort | Relix status | Counterpart / next |
 |---|---|---|---|---|---|
 | Rate-limit ladder (429 + body detection) | nous_rate_guard.py + account_usage.py + classify_api_error | high | medium | partial | H1 classifier covers detection; no ladder/cooldown yet |
-| Prompt caching (cache_control) | anthropic_adapter.py prompt caching | high | small | pending | Anthropic provider; ~30 lines |
+| Prompt caching (cache_control) | anthropic_adapter.py prompt caching | high | small | shipped | system block sent as structured array with cache_control ephemeral (PH-WAVE2E) |
 | Extended thinking (o1/o3) | lmstudio_reasoning.py | high | small | pending | transport-level hook |
 | Vision (multi-image, resize, cost est) | vision_tools.py | medium | medium | pending | needs ChatInput.images |
 | Streaming SSE chunks | chat_completions transports | high | medium | partial | OpenAI shim streams; not all adapters |
@@ -228,8 +228,9 @@ would gain the most operator value from next:
 1. **Error Classifier + Smart Failover** — shipped (H1) ✓
 2. **Context Compression (aux LLM)** — pending, per D-001
 3. **Memory Persistence (MEMORY.md/USER.md)** — pending, per D-001
-4. **Prompt Caching (Anthropic)** — pending, small
-5. **Rate Limit Detection + Credential Rotation** — partial (H1)
+4. **Prompt Caching (Anthropic)** — shipped (PH-WAVE2E) ✓
+5. **Rate Limit Detection + Credential Rotation** — partial (H1
+   classifier covers detection; ladder/cooldown pending)
 6. **Delegation / Subagent Spawning** — partial (M72), needs
    executor
 7. **Extended Thinking (o1/o3)** — pending, small

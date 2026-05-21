@@ -79,7 +79,21 @@ impl ChatProvider for AnthropicProvider {
             "messages": [{ "role": "user", "content": user_content }],
         });
         if let Some(sys) = &input.system_prompt {
-            body["system"] = json!(sys);
+            // PH-WAVE2E: Anthropic prompt caching. When the system
+            // block is sent as the structured `[{"type":"text",
+            // "text":..., "cache_control":{"type":"ephemeral"}}]`
+            // form Anthropic auto-caches it for ~5 minutes. Same
+            // exact prompt within the window pays ~10% the cost
+            // for the cached portion (currently 90% reduction on
+            // input tokens). The marker is harmless when the
+            // model doesn't support caching (Anthropic accepts +
+            // ignores). Operators get the price reduction with
+            // zero per-call code changes.
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": {"type": "ephemeral"},
+            }]);
         }
         if let Some(t) = input.temperature {
             body["temperature"] = json!(t);

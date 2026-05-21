@@ -1090,6 +1090,171 @@ impl TaskStore {
         Ok(closed)
     }
 
+    // ─── PH-WAVE2D: per-task todo list (Hermes todo_tool parity) ────────
+
+    /// Replace the task's todo list with a fresh ordered set.
+    /// Existing rows for the task are deleted; new rows take
+    /// position 0..N matching the input order. Empty input is
+    /// allowed (clears the list).
+    pub fn set_task_todos(
+        &self,
+        task_id: &str,
+        items: &[&str],
+    ) -> Result<Vec<TodoItem>, CoordinatorError> {
+        if items.iter().any(|s| s.trim().is_empty()) {
+            return Err(CoordinatorError::Invalid(
+                "task.todo_set: every todo text must be non-empty (after trim)".into(),
+            ));
+        }
+        if items.iter().any(|s| s.len() > MAX_OPERATOR_NOTE_LEN) {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.todo_set: a todo exceeds {MAX_OPERATOR_NOTE_LEN} bytes"
+            )));
+        }
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        if exists == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        tx.execute(
+            "DELETE FROM task_todos WHERE task_id = ?1",
+            params![task_id],
+        )
+        .map_err(CoordinatorError::Db)?;
+        for (pos, text) in items.iter().enumerate() {
+            // H8/H10 boundary: scrub secrets in operator-supplied
+            // todo text before persisting (operators paste API
+            // keys into anything).
+            let safe = relix_core::redact::redact_secrets(text);
+            tx.execute(
+                "INSERT INTO task_todos (task_id, position, status, text, created_at, updated_at)
+                 VALUES (?1, ?2, 'open', ?3, ?4, ?4)",
+                params![task_id, pos as i64, safe, now],
+            )
+            .map_err(CoordinatorError::Db)?;
+        }
+        tx.commit().map_err(CoordinatorError::Db)?;
+        // Read the post-set list using the SAME guard we already
+        // hold. Calling `self.list_task_todos(task_id)` here would
+        // deadlock because `self.conn` is a `std::sync::Mutex`
+        // (non-reentrant) and we haven't dropped `conn` yet.
+        let mut stmt = conn
+            .prepare(
+                "SELECT todo_id, position, status, text, created_at, updated_at
+                 FROM task_todos
+                 WHERE task_id = ?1
+                 ORDER BY position ASC, todo_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![task_id], |r| {
+                Ok(TodoItem {
+                    todo_id: r.get(0)?,
+                    position: r.get(1)?,
+                    status: r.get(2)?,
+                    text: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// Read the task's todos in `position ASC, todo_id ASC` order.
+    /// Returns an empty Vec when the task has no todos OR when
+    /// the task itself doesn't exist (callers usually want the
+    /// list-or-empty shape; use `task.get` for existence check).
+    pub fn list_task_todos(&self, task_id: &str) -> Result<Vec<TodoItem>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT todo_id, position, status, text, created_at, updated_at
+                 FROM task_todos
+                 WHERE task_id = ?1
+                 ORDER BY position ASC, todo_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![task_id], |r| {
+                Ok(TodoItem {
+                    todo_id: r.get(0)?,
+                    position: r.get(1)?,
+                    status: r.get(2)?,
+                    text: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// Toggle a single todo's status. `new_status` must be
+    /// `open` or `done`. Returns the updated [`TodoItem`].
+    pub fn update_task_todo_status(
+        &self,
+        task_id: &str,
+        todo_id: i64,
+        new_status: &str,
+    ) -> Result<TodoItem, CoordinatorError> {
+        if !matches!(new_status, "open" | "done") {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.todo_update: status must be 'open' or 'done', got '{new_status}'"
+            )));
+        }
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let n = conn
+            .execute(
+                "UPDATE task_todos
+                 SET status = ?1, updated_at = ?2
+                 WHERE task_id = ?3 AND todo_id = ?4",
+                params![new_status, now, task_id, todo_id],
+            )
+            .map_err(CoordinatorError::Db)?;
+        if n == 0 {
+            return Err(CoordinatorError::NotFound(format!(
+                "todo not found: task={task_id} todo_id={todo_id}"
+            )));
+        }
+        let row = conn
+            .query_row(
+                "SELECT todo_id, position, status, text, created_at, updated_at
+                 FROM task_todos
+                 WHERE task_id = ?1 AND todo_id = ?2",
+                params![task_id, todo_id],
+                |r| {
+                    Ok(TodoItem {
+                        todo_id: r.get(0)?,
+                        position: r.get(1)?,
+                        status: r.get(2)?,
+                        text: r.get(3)?,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
+                    })
+                },
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(row)
+    }
+
     /// List all attempts of a task in chronological order. Returns
     /// an empty Vec when the task has no attempts yet (e.g. it was
     /// created but never transitioned to `running`).
@@ -3262,6 +3427,19 @@ pub struct SubtreeMetrics {
     pub max_depth_walked: i64,
 }
 
+/// PH-WAVE2D: one row of a per-task todo list. Operator-facing
+/// shape returned by `task.todo_list`. Order is
+/// `position ASC, todo_id ASC`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub todo_id: i64,
+    pub position: i64,
+    pub status: String,
+    pub text: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// H6: one row of a stuck-task projection. Pure read shape
 /// returned by [`TaskStore::stuck_running`] — task is `running`,
 /// has no `max_runtime_secs` (so the recovery scan can't reach
@@ -3678,9 +3856,142 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.todo_set",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_todo_set(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.todo_list",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_todo_list(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.todo_update",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_todo_update(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
+
+/// PH-WAVE2D: `task.todo_set` — replace a task's todo list.
+/// Arg shape: `<task_id>|<text1>\n<text2>\n...`. Empty input
+/// after the `|` is a valid clear-the-list call. Returns the
+/// post-set list as `<position>\t<todo_id>\t<status>\t<text>\n`
+/// rows + trailing `count=<N>`.
+fn handle_todo_set(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.todo_set utf8: {e}")),
+    };
+    let (task_id, rest) = match raw.split_once('|') {
+        Some(p) => p,
+        None => return invalid("task.todo_set: arg shape `<task_id>|<text...>`".into()),
+    };
+    let task_id = task_id.trim();
+    if task_id.is_empty() {
+        return invalid("task.todo_set: task_id required".into());
+    }
+    let items_owned: Vec<String> = rest
+        .split('\n')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let items: Vec<&str> = items_owned.iter().map(String::as_str).collect();
+    let out = match store.set_task_todos(task_id, &items) {
+        Ok(v) => v,
+        Err(CoordinatorError::NotFound(_)) => {
+            return invalid(format!("task.todo_set: task not found: {task_id}"));
+        }
+        Err(CoordinatorError::Invalid(m)) => return invalid(m),
+        Err(e) => return internal(format!("task.todo_set: {e}")),
+    };
+    HandlerOutcome::Ok(render_todo_list(&out).into_bytes())
+}
+
+/// PH-WAVE2D: `task.todo_list|<task_id>` — read-only.
+fn handle_todo_list(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.todo_list utf8: {e}")),
+    };
+    if raw.is_empty() {
+        return invalid("task.todo_list: task_id required".into());
+    }
+    match store.list_task_todos(raw) {
+        Ok(v) => HandlerOutcome::Ok(render_todo_list(&v).into_bytes()),
+        Err(e) => internal(format!("task.todo_list: {e}")),
+    }
+}
+
+/// PH-WAVE2D: `task.todo_update|<task_id>|<todo_id>|<status>`.
+/// Status must be `open` or `done`.
+fn handle_todo_update(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.todo_update utf8: {e}")),
+    };
+    let parts: Vec<&str> = raw.splitn(3, '|').collect();
+    if parts.len() != 3 {
+        return invalid("task.todo_update: arg shape `<task_id>|<todo_id>|<open|done>`".into());
+    }
+    let task_id = parts[0].trim();
+    let todo_id: i64 = match parts[1].trim().parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return invalid(format!("task.todo_update: invalid todo_id '{}'", parts[1]));
+        }
+    };
+    let status = parts[2].trim();
+    match store.update_task_todo_status(task_id, todo_id, status) {
+        Ok(item) => HandlerOutcome::Ok(
+            format!(
+                "{}\t{}\t{}\t{}\n",
+                item.position,
+                item.todo_id,
+                item.status,
+                tab_safe(&item.text),
+            )
+            .into_bytes(),
+        ),
+        Err(CoordinatorError::NotFound(m)) => invalid(format!("task.todo_update: {m}")),
+        Err(CoordinatorError::Invalid(m)) => invalid(m),
+        Err(e) => internal(format!("task.todo_update: {e}")),
+    }
+}
+
+fn render_todo_list(items: &[TodoItem]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for it in items {
+        let _ = writeln!(
+            s,
+            "{}\t{}\t{}\t{}",
+            it.position,
+            it.todo_id,
+            it.status,
+            tab_safe(&it.text),
+        );
+    }
+    let _ = writeln!(s, "count={}", items.len());
+    s
+}
 
 /// H6: `task.stuck|<threshold_secs>` — read-only stuck-task
 /// projection. Threshold defaults to 300 (5 minutes) when the
@@ -5417,6 +5728,25 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
             ON task_edges(task_id, edge_id);
         CREATE INDEX IF NOT EXISTS task_edges_by_related
             ON task_edges(related_task_id);
+
+        -- PH-WAVE2D: per-task todo list. Ordered subtasks the AI
+        -- (or operator) can use to decompose work. Each row is
+        -- one item: text + status (open|done) + position. Bumping
+        -- a row's position is O(1) (no resort needed); the
+        -- canonical render order is `position ASC` with `id ASC`
+        -- as a tiebreaker.
+        CREATE TABLE IF NOT EXISTS task_todos (
+            todo_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    TEXT    NOT NULL,
+            position   INTEGER NOT NULL,
+            status     TEXT    NOT NULL DEFAULT 'open',
+            text       TEXT    NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+        );
+        CREATE INDEX IF NOT EXISTS task_todos_by_task
+            ON task_todos(task_id, position);
         "#,
     )
     .map_err(CoordinatorError::Db)?;
@@ -6405,6 +6735,100 @@ mod tests {
         let last = v.last_failure_reason.unwrap_or_default();
         assert!(!last.contains("eyJhbGc"));
         assert!(last.contains("[REDACTED:BEARER_TOKEN]"));
+    }
+
+    // ── PH-WAVE2D: task.todo_* coord capabilities ─────────────────────
+
+    #[test]
+    fn todo_set_then_list_roundtrips_ordered() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let items = ["write design doc", "code it", "ship it"];
+        let after = s.set_task_todos(&tid, &items).unwrap();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].position, 0);
+        assert_eq!(after[0].status, "open");
+        assert_eq!(after[0].text, "write design doc");
+        assert_eq!(after[2].text, "ship it");
+        let listed = s.list_task_todos(&tid).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(
+            listed.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            vec!["write design doc", "code it", "ship it"]
+        );
+    }
+
+    #[test]
+    fn todo_set_replaces_previous_list() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.set_task_todos(&tid, &["old1", "old2", "old3"]).unwrap();
+        s.set_task_todos(&tid, &["new"]).unwrap();
+        let listed = s.list_task_todos(&tid).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].text, "new");
+    }
+
+    #[test]
+    fn todo_set_empty_clears_list() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.set_task_todos(&tid, &["a", "b"]).unwrap();
+        s.set_task_todos(&tid, &[]).unwrap();
+        let listed = s.list_task_todos(&tid).unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn todo_update_status_toggles_done() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let after = s.set_task_todos(&tid, &["a"]).unwrap();
+        let id = after[0].todo_id;
+        let updated = s.update_task_todo_status(&tid, id, "done").unwrap();
+        assert_eq!(updated.status, "done");
+        assert!(updated.updated_at >= after[0].created_at);
+        let back = s.update_task_todo_status(&tid, id, "open").unwrap();
+        assert_eq!(back.status, "open");
+    }
+
+    #[test]
+    fn todo_update_rejects_invalid_status() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let after = s.set_task_todos(&tid, &["a"]).unwrap();
+        let err = s
+            .update_task_todo_status(&tid, after[0].todo_id, "wip")
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn todo_set_rejects_empty_text() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let err = s.set_task_todos(&tid, &["valid", "   "]).unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn todo_set_redacts_secrets_in_text() {
+        // H8/H10 boundary discipline: pasted API key in a todo
+        // line must not land in the chronicle/dashboard.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let items = ["fix bug", "tried FAKE_TEST_FIXTURE_REDACTED"];
+        s.set_task_todos(&tid, &items).unwrap();
+        let listed = s.list_task_todos(&tid).unwrap();
+        assert!(!listed[1].text.contains("sk-abcdef"));
+        assert!(listed[1].text.contains("[REDACTED:OPENAI_KEY]"));
+    }
+
+    #[test]
+    fn todo_set_rejects_unknown_task() {
+        let s = store();
+        let err = s.set_task_todos("deadbeef", &["x"]).unwrap_err();
+        assert!(matches!(err, CoordinatorError::NotFound(id) if id == "deadbeef"));
     }
 
     // ── H7: orphan attempt cleanup ────────────────────────────────────

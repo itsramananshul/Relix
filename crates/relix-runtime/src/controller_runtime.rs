@@ -628,6 +628,32 @@ fn register_node_type_handlers(
                 &["task", "read", "diagnostics"],
             ),
             (
+                "task.todo_set",
+                "PH-WAVE2D: replace the full per-task todo list. \
+                 Arg: `<task_id>|<text1>\\n<text2>\\n...`. Each \
+                 text is trimmed and scrubbed via the H8 redactor \
+                 before persisting. Empty input clears the list. \
+                 Returns the resulting list as tab-separated \
+                 `<position>\\t<todo_id>\\t<status>\\t<text>` rows \
+                 + trailing `count=<N>`.",
+                &["task", "todo", "write"],
+            ),
+            (
+                "task.todo_list",
+                "PH-WAVE2D: read-only per-task todo list. Arg: \
+                 `<task_id>`. Returns the same shape as \
+                 task.todo_set. Empty list for tasks with no \
+                 todos.",
+                &["task", "todo", "read"],
+            ),
+            (
+                "task.todo_update",
+                "PH-WAVE2D: toggle a single todo's status. Arg: \
+                 `<task_id>|<todo_id>|<open|done>`. Returns the \
+                 updated row.",
+                &["task", "todo", "write"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
