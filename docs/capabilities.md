@@ -87,6 +87,7 @@ before the backend (visibility + stable contract + honesty).
 | `tool.terminal.sessions` (PH-TERM-SESSIONS) | live | Live in-flight run registry snapshot |
 | `tool.terminal.audit_recent` (PH-TERM-AUDIT) | live | Bounded ring of completed runs (success + timed-out + cancelled) |
 | `tool.terminal.cancel` (PH-TERM-CANCEL) | live | Cooperatively terminate a live `tool.terminal.run` session by id |
+| `tool.terminal.tail` (PH-TERM-STREAM1) | live | Polling-cursor stream tail of a live run's stdout / stderr buffer |
 
 ### Browser (CW4 honest scaffold)
 

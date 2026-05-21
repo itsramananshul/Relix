@@ -1052,6 +1052,9 @@ fn register_node_type_handlers(
             // PH-TERM-CANCEL: tool.terminal.cancel — cooperative
             // termination of a live run by session id.
             manifest.add_capability(crate::nodes::tool::terminal::descriptor_cancel());
+            // PH-TERM-STREAM1: tool.terminal.tail — polling-cursor
+            // stream tail of a live run's stdout / stderr buffer.
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_tail());
         }
         // CW4: tool.browser.* — only advertised when
         // [tool.browser] is configured. Honest: the descriptors

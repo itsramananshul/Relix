@@ -46,10 +46,29 @@
 //! remains the safety floor — cancel is cooperative on top of it,
 //! not a replacement.
 //!
+//! ## Streaming output (PH-TERM-STREAM1)
+//!
+//! The stdout/stderr buffers live on the session record while
+//! the run is in flight. Operators poll
+//! `tool.terminal.tail|<session_id>|<stream>|<offset>` to pull
+//! new bytes by cursor — the response carries `next_offset`,
+//! the chunk (lossy-UTF-8), and a `truncated` flag (64 KiB
+//! per-call cap). Once the session is removed from the registry
+//! the operator should pull the final output from the
+//! `tool.terminal.run` response.
+//!
+//! The bounded buffer cap (`MAX_OUTPUT_BYTES` = 1 MiB per
+//! stream) is unchanged — once the buffer fills, the drainer
+//! stops reading, the OS pipe buffer fills, and the child
+//! blocks on write. Streaming is observability, not
+//! backpressure relief; a future ring-with-consumer-cursor
+//! would relax this.
+//!
 //! ## Still out of scope (alpha)
 //!
-//! - No streaming stdout/stderr to a live consumer (output is
-//!   drained into bounded buffers and surfaced at completion).
+//! - No streaming-with-consumer-drain (tail is read-only; it
+//!   does NOT advance the drainer's write head, so a long-
+//!   running run producing > 1 MiB still stalls).
 //! - No background / detached execution.
 //! - No persistent shell sessions.
 //! - No interactive stdin.
@@ -106,12 +125,14 @@ fn default_timeout_secs() -> u64 {
 /// truncated + flagged in the response.
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MiB
 
-/// PH-TERM-SESSIONS / PH-TERM-CANCEL: one live `tool.terminal.run`
-/// invocation in flight. Inserted on spawn, removed on completion
-/// (success, timeout, cancel, or spawn failure). The run task
-/// awaits `cancel_notify.notified()` in a select with wait /
-/// timeout; the `tool.terminal.cancel` capability triggers the
-/// notify to terminate the child cooperatively.
+/// PH-TERM-SESSIONS / PH-TERM-CANCEL / PH-TERM-STREAM1: one live
+/// `tool.terminal.run` invocation in flight. Inserted on spawn,
+/// removed on completion (success, timeout, cancel, or spawn
+/// failure). The run task awaits `cancel_notify.notified()` in a
+/// select with wait / timeout; the `tool.terminal.cancel` capability
+/// triggers the notify to terminate the child cooperatively. The
+/// stdout/stderr buffers are shared with the drainer tasks and the
+/// `tool.terminal.tail` poller.
 #[derive(Clone, Debug)]
 pub struct TerminalSessionRecord {
     pub session_id: String,
@@ -134,6 +155,13 @@ pub struct TerminalSessionRecord {
     /// even if the run task hasn't yet started awaiting, so the
     /// register-then-await race is closed.
     pub cancel_notify: Arc<tokio::sync::Notify>,
+    /// PH-TERM-STREAM1: live stdout buffer shared with the
+    /// drainer task and the `tool.terminal.tail` poller. Grows
+    /// until `MAX_OUTPUT_BYTES`; never reset.
+    pub stdout_buf: Arc<Mutex<Vec<u8>>>,
+    /// PH-TERM-STREAM1: live stderr buffer — same shape as
+    /// `stdout_buf`.
+    pub stderr_buf: Arc<Mutex<Vec<u8>>>,
 }
 
 /// PH-TERM-AUDIT: one completed `tool.terminal.run` invocation
@@ -349,7 +377,7 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
         );
     }
     {
-        let b = backend;
+        let b = backend.clone();
         bridge.register(
             "tool.terminal.cancel",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -358,6 +386,51 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
             })),
         );
     }
+    {
+        let b = backend;
+        bridge.register(
+            "tool.terminal.tail",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_tail(b, &ctx) }
+            })),
+        );
+    }
+}
+
+/// PH-TERM-STREAM1: per-call cap on bytes returned by
+/// `tool.terminal.tail`. Tighter than `MAX_OUTPUT_BYTES` so a
+/// single tail response stays small; operator polls again with
+/// `next_offset` when `truncated` is true.
+const TAIL_PER_CALL_CAP: usize = 64 * 1024;
+
+/// PH-TERM-STREAM1: `tool.terminal.tail` capability —
+/// polling-cursor stream tail for live `tool.terminal.run`
+/// sessions. The handler reads from the per-session stdout /
+/// stderr buffer at the caller's offset and returns the new
+/// chunk plus `next_offset`. Read-only; does NOT advance the
+/// drainer's write head, so a > 1 MiB producer still stalls
+/// once the buffer fills.
+pub fn descriptor_tail() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.tail");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["shell:audit".into()];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Polling stream tail for a live tool.terminal.run session. \
+         Request JSON: {session_id, stream: \"stdout\"|\"stderr\", offset}. \
+         Returns JSON: {session_id, stream, next_offset, chunk_bytes, \
+         chunk (lossy-UTF-8), truncated}. Capped at 64 KiB per call; \
+         operator polls again with next_offset when truncated. \
+         INVALID_ARGS when the session id is unknown — fetch the final \
+         output from the run response."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "terminal".into(), "streaming".into()];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
 }
 
 /// PH-TERM-CANCEL: `tool.terminal.cancel` capability —
@@ -537,12 +610,16 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
         .take()
         .expect("tool.terminal.run: stderr pipe present (was piped at spawn)");
 
-    // PH-TERM-SESSIONS / PH-TERM-CANCEL: register the live
-    // session BEFORE wiring up the race so a cancel arriving
-    // anytime after spawn finds its target.
+    // PH-TERM-SESSIONS / PH-TERM-CANCEL / PH-TERM-STREAM1:
+    // register the live session BEFORE wiring up the race so a
+    // cancel arriving anytime after spawn finds its target. The
+    // stdout/stderr buffers live on the record so the
+    // `tool.terminal.tail` poller can read them mid-run.
     let session_id = new_session_id();
     let pid = child.id();
     let cancel_notify = Arc::new(tokio::sync::Notify::new());
+    let stdout_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     {
         let mut g = backend
             .sessions
@@ -559,14 +636,16 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
                 caller_subject_id: ctx.caller.subject_id.to_string(),
                 timeout_secs,
                 cancel_notify: cancel_notify.clone(),
+                stdout_buf: stdout_buf.clone(),
+                stderr_buf: stderr_buf.clone(),
             },
         );
     }
 
     // Drain stdout/stderr concurrently with the wait so the OS
-    // pipe buffer never fills (which would block the child).
-    let stdout_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    // pipe buffer never fills (which would block the child). The
+    // drainers write through the shared Arc<Mutex<Vec<u8>>>;
+    // `tool.terminal.tail` reads the same arcs.
     let stdout_drain = tokio::spawn(drain_pipe_into(
         stdout_pipe,
         stdout_buf.clone(),
@@ -814,6 +893,106 @@ where
     }
 }
 
+/// PH-TERM-STREAM1: handle `tool.terminal.tail`. Request body
+/// is JSON `{session_id, stream, offset}`. Response body is
+/// JSON `{session_id, stream, next_offset, chunk_bytes, chunk,
+/// truncated}`. INVALID_ARGS on unknown session / unknown
+/// stream / malformed JSON.
+fn handle_tail(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
+    #[derive(Debug, Deserialize)]
+    struct TailRequest {
+        session_id: String,
+        stream: String,
+        #[serde(default)]
+        offset: u64,
+    }
+    #[derive(Debug, Serialize)]
+    struct TailResponse {
+        session_id: String,
+        stream: String,
+        next_offset: u64,
+        chunk_bytes: usize,
+        chunk: String,
+        truncated: bool,
+    }
+
+    let req: TailRequest = match serde_json::from_slice(&ctx.args) {
+        Ok(r) => r,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.tail: bad request shape: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if req.session_id.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "tool.terminal.tail: session_id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let buf_arc = {
+        let g = backend
+            .sessions
+            .lock()
+            .expect("tool.terminal sessions poisoned");
+        match g.get(&req.session_id) {
+            Some(rec) => match req.stream.as_str() {
+                "stdout" => rec.stdout_buf.clone(),
+                "stderr" => rec.stderr_buf.clone(),
+                other => {
+                    return HandlerOutcome::Err(ErrorEnvelope {
+                        kind: error_kinds::INVALID_ARGS,
+                        cause: format!(
+                            "tool.terminal.tail: unknown stream '{other}'; use 'stdout' or 'stderr'"
+                        ),
+                        retry_hint: 0,
+                        retry_after: None,
+                    });
+                }
+            },
+            None => {
+                return HandlerOutcome::Err(ErrorEnvelope {
+                    kind: error_kinds::INVALID_ARGS,
+                    cause: format!(
+                        "tool.terminal.tail: session not found (id='{}'); it may have already completed",
+                        req.session_id
+                    ),
+                    retry_hint: 0,
+                    retry_after: None,
+                });
+            }
+        }
+    };
+    let (chunk_bytes, next_offset, truncated, chunk_str) = {
+        let g = buf_arc.lock().expect("tool.terminal tail buf poisoned");
+        let len = g.len();
+        let start = (req.offset as usize).min(len);
+        let mut end = len;
+        let mut truncated = false;
+        if end.saturating_sub(start) > TAIL_PER_CALL_CAP {
+            end = start + TAIL_PER_CALL_CAP;
+            truncated = true;
+        }
+        let chunk = &g[start..end];
+        let chunk_str = String::from_utf8_lossy(chunk).into_owned();
+        (chunk.len(), end as u64, truncated, chunk_str)
+    };
+    let resp = TailResponse {
+        session_id: req.session_id,
+        stream: req.stream,
+        next_offset,
+        chunk_bytes,
+        chunk: chunk_str,
+        truncated,
+    };
+    HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
+}
+
 /// PH-TERM-CANCEL: handle `tool.terminal.cancel`. Arg is the
 /// session id from `tool.terminal.sessions`. Looks the session
 /// up in the live registry and triggers its cancel notify.
@@ -1013,6 +1192,8 @@ mod tests {
             caller_subject_id: "deadbeef".into(),
             timeout_secs: 30,
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            stdout_buf: Arc::new(Mutex::new(Vec::new())),
+            stderr_buf: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1357,5 +1538,169 @@ mod tests {
         drop(writer);
         drain_handle.await.unwrap();
         assert_eq!(buf.lock().unwrap().as_slice(), b"hello world\n");
+    }
+
+    // ── PH-TERM-STREAM1: tool.terminal.tail ────────────────────────
+
+    fn insert_session_with_bytes(b: &Arc<TerminalBackend>, id: &str, stdout: &[u8], stderr: &[u8]) {
+        let rec = mk_session_record(id, unix_secs(), "echo");
+        rec.stdout_buf.lock().unwrap().extend_from_slice(stdout);
+        rec.stderr_buf.lock().unwrap().extend_from_slice(stderr);
+        b.sessions.lock().unwrap().insert(id.into(), rec);
+    }
+
+    fn parse_tail(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).expect("tail response is JSON")
+    }
+
+    #[test]
+    fn tail_descriptor_shape() {
+        let d = descriptor_tail();
+        assert_eq!(d.method_name, "tool.terminal.tail");
+        assert!(matches!(d.idempotency, Idempotency::Idempotent));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "shell:audit"));
+        assert!(d.requires_groups.iter().any(|g| g == "operators"));
+        assert!(d.categories.iter().any(|c| c == "streaming"));
+    }
+
+    #[test]
+    fn tail_bad_json_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"not-json");
+        match handle_tail(b, &ctx) {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("bad request shape"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn tail_empty_session_id_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"session_id":"","stream":"stdout","offset":0}"#;
+        match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("session_id required")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn tail_unknown_session_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"session_id":"abc123","stream":"stdout","offset":0}"#;
+        match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("session not found")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn tail_unknown_stream_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        insert_session_with_bytes(&b, "s1", b"hello", b"");
+        let arg = br#"{"session_id":"s1","stream":"banana","offset":0}"#;
+        match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("unknown stream")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn tail_returns_full_chunk_from_offset_zero() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        insert_session_with_bytes(&b, "s1", b"hello world", b"");
+        let arg = br#"{"session_id":"s1","stream":"stdout","offset":0}"#;
+        let body = match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let v = parse_tail(&body);
+        assert_eq!(v["chunk"], "hello world");
+        assert_eq!(v["chunk_bytes"], 11);
+        assert_eq!(v["next_offset"], 11);
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["stream"], "stdout");
+        assert_eq!(v["session_id"], "s1");
+    }
+
+    #[test]
+    fn tail_returns_slice_from_mid_offset() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        insert_session_with_bytes(&b, "s1", b"abcdefghij", b"");
+        let arg = br#"{"session_id":"s1","stream":"stdout","offset":3}"#;
+        let body = match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let v = parse_tail(&body);
+        assert_eq!(v["chunk"], "defghij");
+        assert_eq!(v["chunk_bytes"], 7);
+        assert_eq!(v["next_offset"], 10);
+    }
+
+    #[test]
+    fn tail_offset_past_end_returns_empty_chunk() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        insert_session_with_bytes(&b, "s1", b"abc", b"");
+        let arg = br#"{"session_id":"s1","stream":"stdout","offset":99}"#;
+        let body = match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let v = parse_tail(&body);
+        assert_eq!(v["chunk"], "");
+        assert_eq!(v["chunk_bytes"], 0);
+        // next_offset clamps to current buffer end so a stale
+        // caller can self-correct.
+        assert_eq!(v["next_offset"], 3);
+        assert_eq!(v["truncated"], false);
+    }
+
+    #[test]
+    fn tail_truncates_at_per_call_cap() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let big = vec![b'a'; TAIL_PER_CALL_CAP + 5000];
+        insert_session_with_bytes(&b, "s1", &big, b"");
+        let arg = br#"{"session_id":"s1","stream":"stdout","offset":0}"#;
+        let body = match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let v = parse_tail(&body);
+        assert_eq!(v["chunk_bytes"], TAIL_PER_CALL_CAP);
+        assert_eq!(v["next_offset"], TAIL_PER_CALL_CAP);
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[test]
+    fn tail_stderr_independent_from_stdout() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        insert_session_with_bytes(&b, "s1", b"out", b"ERR");
+        let arg = br#"{"session_id":"s1","stream":"stderr","offset":0}"#;
+        let body = match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let v = parse_tail(&body);
+        assert_eq!(v["chunk"], "ERR");
+        assert_eq!(v["stream"], "stderr");
+    }
+
+    #[test]
+    fn tail_offset_default_is_zero_when_omitted() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        insert_session_with_bytes(&b, "s1", b"hi", b"");
+        // No `offset` field — should default to 0.
+        let arg = br#"{"session_id":"s1","stream":"stdout"}"#;
+        let body = match handle_tail(b, &ctx_with_args(arg)) {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let v = parse_tail(&body);
+        assert_eq!(v["chunk"], "hi");
+        assert_eq!(v["next_offset"], 2);
     }
 }
