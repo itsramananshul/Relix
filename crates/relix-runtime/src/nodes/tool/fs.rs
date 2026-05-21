@@ -285,6 +285,50 @@ pub fn descriptor_patch() -> CapabilityDescriptor {
     d
 }
 
+/// PH-FS-PARITY1: `tool.append_file` — append bytes to an
+/// existing file under the jail root. Strictly additive
+/// (refuses to create new files; use tool.write_file for that).
+/// Useful for log-style append workflows where the AI doesn't
+/// need a full read-modify-write.
+pub fn descriptor_append() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.append_file");
+    d.major_version = 1;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["fs:write".into(), "fs:append".into()];
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Append bytes to an existing file under the jail root. Refuses to \
+         create new files (use tool.write_file). Enforces the same per-file \
+         write cap as tool.write_file."
+            .into(),
+    );
+    d.categories = vec!["mutate".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
+/// PH-FS-PARITY1: `tool.patch_preview` — dry-run a unified
+/// diff. Returns the patched body without writing it. Lets
+/// operators verify a patch lands cleanly before committing.
+pub fn descriptor_patch_preview() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.patch_preview");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["fs:read".into()];
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Dry-run a unified diff against an existing file. Returns the would-be \
+         patched body without writing. Honest about mismatched-context diffs \
+         (returns the same error tool.patch would)."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "fs".into(), "preview".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
 /// CW2: `tool.list_dir` — list direct children of a
 /// jail-relative directory. Returns one line per entry:
 /// `<kind>\t<name>\t<size_bytes>\t<modified_unix_secs>`
@@ -360,6 +404,26 @@ pub fn register(bridge: &mut DispatchBridge, jail: Arc<FsJail>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let j = j.clone();
                 async move { handle_list_dir(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail.clone();
+        bridge.register(
+            "tool.append_file",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_append(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail;
+        bridge.register(
+            "tool.patch_preview",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_patch_preview(&j, &ctx) }
             })),
         );
     }
@@ -622,6 +686,115 @@ fn handle_patch(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
     }
     let body = format!("ok bytes={}\n", patched.len());
     HandlerOutcome::Ok(body.into_bytes())
+}
+
+/// PH-FS-PARITY1: arg shape `<rel_path>|<bytes>`. Append-only;
+/// refuses to create new files (use `tool.write_file`).
+/// Enforces the jail's `max_write_bytes` against the appended
+/// length, not the resulting file size — same posture as
+/// tool.write_file's per-call cap.
+fn handle_append(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    use std::io::Write as _;
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.append_file arg utf8: {e}")),
+    };
+    let (rel, body) = match s.split_once('|') {
+        Some(p) => p,
+        None => {
+            return invalid(
+                "tool.append_file arg shape `<rel_path>|<bytes>` (bytes may be empty)".into(),
+            );
+        }
+    };
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return invalid("tool.append_file: rel_path required".into());
+    }
+    if body.len() > jail.cfg.max_write_bytes {
+        return invalid(format!(
+            "tool.append_file: {} bytes exceeds write cap {}",
+            body.len(),
+            jail.cfg.max_write_bytes
+        ));
+    }
+    // Use resolve(false) so we validate the parent + jail-escape
+    // posture before checking existence; returns the clean
+    // "does not exist" message rather than the raw canonicalize
+    // IO error.
+    let canonical = match jail.resolve(rel, false) {
+        Ok(p) => p,
+        Err(e) => return e.into(),
+    };
+    let meta = match std::fs::metadata(&canonical) {
+        Ok(m) => m,
+        Err(_) => {
+            return invalid(format!(
+                "tool.append_file: '{}' does not exist (use tool.write_file to create)",
+                jail.display_rel(&canonical),
+            ));
+        }
+    };
+    if !meta.is_file() {
+        return invalid(format!(
+            "tool.append_file: '{}' is not a regular file",
+            jail.display_rel(&canonical),
+        ));
+    }
+    let mut f = match std::fs::OpenOptions::new().append(true).open(&canonical) {
+        Ok(f) => f,
+        Err(e) => return invalid(format!("tool.append_file open: {e}")),
+    };
+    if let Err(e) = f.write_all(body.as_bytes()) {
+        return invalid(format!("tool.append_file write: {e}"));
+    }
+    let new_size = std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0);
+    HandlerOutcome::Ok(format!("ok appended={} new_size={new_size}\n", body.len()).into_bytes())
+}
+
+/// PH-FS-PARITY1: arg shape `<rel_path>|<unified_diff_body>`.
+/// Read-only — returns the patched body without writing.
+/// Useful for "would this patch land cleanly?" checks before
+/// committing via tool.patch.
+fn handle_patch_preview(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.patch_preview arg utf8: {e}")),
+    };
+    let (rel, body) = match s.split_once('|') {
+        Some(p) => p,
+        None => {
+            return invalid("tool.patch_preview arg shape `<rel_path>|<unified_diff>`".into());
+        }
+    };
+    let rel = rel.trim();
+    if rel.is_empty() || body.is_empty() {
+        return invalid("tool.patch_preview: rel_path + diff required".into());
+    }
+    if body.len() > jail.cfg.max_write_bytes {
+        return invalid(format!(
+            "tool.patch_preview: diff {} bytes exceeds write cap {}",
+            body.len(),
+            jail.cfg.max_write_bytes
+        ));
+    }
+    let canonical = match jail.resolve(rel, true) {
+        Ok(p) => p,
+        Err(e) => return e.into(),
+    };
+    let original = match std::fs::read_to_string(&canonical) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.patch_preview read: {e}")),
+    };
+    let patch = match diffy::Patch::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return invalid(format!("tool.patch_preview: invalid unified diff: {e}")),
+    };
+    let patched = match diffy::apply(&original, &patch) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.patch_preview: apply failed: {e}")),
+    };
+    HandlerOutcome::Ok(patched.into_bytes())
 }
 
 // ──────────────────────────── Helpers ──────────────────────────────────────
@@ -1327,6 +1500,101 @@ mod tests {
                 assert_eq!(String::from_utf8(b).unwrap(), "abcdefghij");
             }
             HandlerOutcome::Err(e) => panic!("read within cap failed: {}", e.cause),
+        }
+    }
+
+    // ── PH-FS-PARITY1: tool.append_file + tool.patch_preview ──────────
+
+    #[test]
+    fn append_file_appends_to_existing() {
+        let (td, j) = mk_jail();
+        let p = td.path().join("log.txt");
+        std::fs::write(&p, "first\n").unwrap();
+        let r = handle_append(&j, &ctx(b"log.txt|second\n"));
+        match r {
+            HandlerOutcome::Ok(b) => {
+                let s = String::from_utf8(b).unwrap();
+                assert!(s.contains("ok appended=7"));
+            }
+            HandlerOutcome::Err(e) => panic!("append failed: {}", e.cause),
+        }
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(out, "first\nsecond\n");
+    }
+
+    #[test]
+    fn append_file_refuses_missing_target() {
+        let (_td, j) = mk_jail();
+        let r = handle_append(&j, &ctx(b"nope.txt|hi"));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("does not exist")),
+            _ => panic!("expected error for missing file"),
+        }
+    }
+
+    #[test]
+    fn append_file_respects_write_cap() {
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("doc.txt"), "x").unwrap();
+        let big = "y".repeat(j.cfg.max_write_bytes + 1);
+        let arg = format!("doc.txt|{big}");
+        let r = handle_append(&j, &ctx(arg.as_bytes()));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("exceeds write cap")),
+            _ => panic!("expected oversize rejection"),
+        }
+    }
+
+    #[test]
+    fn append_file_rejects_traversal() {
+        let (_td, j) = mk_jail();
+        let r = handle_append(&j, &ctx(b"../escape|hi"));
+        match r {
+            HandlerOutcome::Err(_) => {}
+            _ => panic!("expected traversal rejection"),
+        }
+    }
+
+    #[test]
+    fn patch_preview_returns_patched_without_writing() {
+        let (td, j) = mk_jail();
+        let p = td.path().join("doc.txt");
+        std::fs::write(&p, "line one\nline two\n").unwrap();
+        let diff =
+            "--- a/doc.txt\n+++ b/doc.txt\n@@ -1,2 +1,2 @@\n line one\n-line two\n+line TWO\n";
+        let arg = format!("doc.txt|{diff}");
+        let r = handle_patch_preview(&j, &ctx(arg.as_bytes()));
+        match r {
+            HandlerOutcome::Ok(b) => {
+                assert_eq!(String::from_utf8(b).unwrap(), "line one\nline TWO\n");
+            }
+            HandlerOutcome::Err(e) => panic!("preview failed: {}", e.cause),
+        }
+        // File on disk is unchanged.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "line one\nline two\n");
+    }
+
+    #[test]
+    fn patch_preview_handles_diff_that_parses_to_no_hunks() {
+        // Honest about diffy's behavior: arbitrary text parses
+        // as a Patch with zero hunks. Apply against any file
+        // returns the original content. Test exists to pin that
+        // behavior so a future diffy upgrade either preserves
+        // it or this test catches the change.
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("doc.txt"), "hello\n").unwrap();
+        let arg = "doc.txt|this is not a diff";
+        let r = handle_patch_preview(&j, &ctx(arg.as_bytes()));
+        match r {
+            HandlerOutcome::Ok(b) => {
+                assert_eq!(String::from_utf8(b).unwrap(), "hello\n");
+            }
+            HandlerOutcome::Err(e) => {
+                panic!(
+                    "expected unchanged content for no-hunks diff, got err: {}",
+                    e.cause
+                )
+            }
         }
     }
 }
