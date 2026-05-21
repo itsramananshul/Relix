@@ -3,6 +3,7 @@
 mod capability;
 mod flow_run;
 mod identity;
+mod ops;
 mod ping;
 mod task;
 mod topology;
@@ -71,6 +72,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: topology::Cmd,
     },
+    /// PH-WAVE2L: operator ops snapshots. Currently just
+    /// `providers-health` against the bridge's consolidated
+    /// `/v1/providers/health` endpoint.
+    Ops {
+        #[command(subcommand)]
+        cmd: ops::Cmd,
+    },
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -111,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Task { cmd } => task::run(cmd).await,
         Cmd::Capability { cmd } => capability::run(cmd).await,
         Cmd::Topology { cmd } => topology::run(cmd).await,
+        Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,
