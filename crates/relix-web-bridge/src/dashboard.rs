@@ -559,6 +559,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_exec_graph_critical_segment_present() {
+        // M59 (Track A): exec graph computes + highlights the
+        // single largest wall-clock contributor (attempt or
+        // inter-attempt gap). Honesty contract: when no
+        // segment has both timestamps recorded, the note
+        // reads "(not enough timing data recorded)" rather
+        // than picking a default.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("computeExecCriticalSegment"),
+            "critical-segment computation helper missing"
+        );
+        assert!(
+            body.contains("exec-graph-critical-tag"),
+            "critical-tag CSS class missing"
+        );
+        assert!(
+            body.contains(".exec-graph .graph-node.critical"),
+            "graph-node.critical CSS rule missing"
+        );
+        assert!(
+            body.contains(".exec-graph .edge-line.critical"),
+            "edge-line.critical CSS rule missing"
+        );
+        // Honesty: the "not enough timing data" fallback must
+        // ship so the note never invents a critical segment
+        // when no durations are recorded.
+        assert!(
+            body.contains("not enough timing data recorded"),
+            "critical-segment empty-state honesty label missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_nodes_clickable_present() {
         // M46 (Track A): graph nodes carry data-attempt-filter
         // so clicking a node toggles the timeline filter to

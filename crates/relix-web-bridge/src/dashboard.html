@@ -1166,6 +1166,31 @@
       stroke-width: 3;
       filter: drop-shadow(0 0 4px var(--accent));
     }
+    /* M59: critical-segment highlight. The single largest
+       contributor to wall clock — operators spot the
+       bottleneck instantly. Layered on top of status colors;
+       stroke-dasharray gives a distinct visual marker that
+       doesn't collide with the danger/ok status strokes. */
+    .exec-graph .graph-node.critical .node-box {
+      stroke: var(--warn);
+      stroke-width: 3;
+      stroke-dasharray: 4 3;
+      filter: drop-shadow(0 0 4px var(--warn));
+    }
+    .exec-graph .edge-line.critical {
+      stroke: var(--warn);
+      stroke-width: 3;
+      stroke-dasharray: 4 3;
+    }
+    .exec-graph .edge-label.critical {
+      fill: var(--warn);
+      font-weight: 600;
+    }
+    .exec-graph-critical-tag {
+      color: var(--warn);
+      font-weight: 600;
+      font-style: normal;
+    }
     .exec-graph .node-box {
       fill: var(--bg-elevated);
       stroke: var(--border);
@@ -4062,6 +4087,16 @@ function renderExecGraph(attempts, edges) {
     const cx = slotW * (i + 0.5);
     positions.set(a.attempt_id, { cx, cy: yMid });
   });
+  // M59: compute the critical-segment overlay. This is the
+  // single largest contributor to wall clock — the attempt
+  // OR inter-attempt gap with the longest recorded duration.
+  // Honestly bounded: with only retried_from edges in
+  // production today, the chain is sequential, so the
+  // "critical path" is the entire chain and the highlight
+  // marks the bottleneck within it. When richer edge
+  // producers ship (parallel_branch, delegated_to), this
+  // function will switch to a true longest-path walk.
+  const critical = computeExecCriticalSegment(sorted);
   // Build SVG. Each node is wrapped in a <g> carrying
   // data-attempt-filter so the global click delegator
   // toggles the timeline filter to this attempt — the
@@ -4072,9 +4107,15 @@ function renderExecGraph(attempts, edges) {
     const x = p.cx - boxW / 2;
     const y = p.cy - boxH / 2;
     const isSelected = (attemptFilter != null && attemptFilter === a.attempt_id);
-    const groupCls = 'graph-node' + (isSelected ? ' selected' : '');
+    const isCritical = (critical.kind === 'attempt' && critical.attempt_id === a.attempt_id);
+    const groupCls = 'graph-node'
+      + (isSelected ? ' selected' : '')
+      + (isCritical ? ' critical' : '');
+    const titleSuffix = isCritical
+      ? ' · critical segment (longest contributor: ' + fmtDuration(critical.dur) + ')'
+      : '';
     const title = 'attempt ' + a.attempt_num + ' · ' + a.status
-      + ' · click to filter timeline to this attempt';
+      + ' · click to filter timeline to this attempt' + titleSuffix;
     return ''
       + '<g class="' + groupCls + '"'
       +   ' data-attempt-filter="' + a.attempt_id + '">'
@@ -4098,6 +4139,10 @@ function renderExecGraph(attempts, edges) {
   const arrowMarker = '<defs><marker id="arrow-head" viewBox="0 0 10 10" refX="9" refY="5" '
     + 'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
     + '<path d="M 0 0 L 10 5 L 0 10 z" fill="var(--text-muted)" />'
+    + '</marker>'
+    + '<marker id="arrow-head-critical" viewBox="0 0 10 10" refX="9" refY="5" '
+    + 'markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
+    + '<path d="M 0 0 L 10 5 L 0 10 z" fill="var(--warn)" />'
     + '</marker></defs>';
   const edgeLines = edges.map(e => {
     const child = positions.get(e.attempt_id);
@@ -4109,22 +4154,38 @@ function renderExecGraph(attempts, edges) {
     const y2 = child.cy;
     const midX = (x1 + x2) / 2;
     const midY = y1 - 12;
+    const isCriticalEdge = (critical.kind === 'gap'
+      && critical.parent_attempt_id === e.related_attempt_id
+      && critical.child_attempt_id === e.attempt_id);
+    const lineCls = 'edge-line' + (isCriticalEdge ? ' critical' : '');
+    const labelText = isCriticalEdge
+      ? e.edge_type + ' · ' + fmtDuration(critical.dur)
+      : e.edge_type;
     return ''
-      + '<line class="edge-line" x1="' + x1.toFixed(1) + '" y1="' + y1.toFixed(1)
+      + '<line class="' + lineCls + '" x1="' + x1.toFixed(1) + '" y1="' + y1.toFixed(1)
       + '" x2="' + x2.toFixed(1) + '" y2="' + y2.toFixed(1)
-      + '" marker-end="url(#arrow-head)" />'
-      + '<text class="edge-label" x="' + midX.toFixed(1) + '" y="' + midY.toFixed(1) + '">'
-      + escapeHtml(e.edge_type) + '</text>';
+      + '" marker-end="url(#'
+      + (isCriticalEdge ? 'arrow-head-critical' : 'arrow-head')
+      + ')" />'
+      + '<text class="edge-label' + (isCriticalEdge ? ' critical' : '')
+      + '" x="' + midX.toFixed(1) + '" y="' + midY.toFixed(1) + '">'
+      + escapeHtml(labelText) + '</text>';
   }).join('');
   // Honest note: which edge types are emitted today vs
-  // reserved in the schema.
+  // reserved in the schema, plus critical-segment provenance.
   const reservedTypes = ['spawned', 'blocked_on', 'resumed_from', 'delegated_to', 'parallel_branch', 'awaited'];
+  const criticalNote = (critical.kind !== 'none')
+    ? ' · <span class="exec-graph-critical-tag">critical segment</span>: '
+      + escapeHtml(critical.label)
+      + ' (' + escapeHtml(fmtDuration(critical.dur)) + ')'
+    : ' · critical segment: (not enough timing data recorded)';
   const note =
     '<div class="exec-graph-note">'
     + 'Emitted today: <span class="exec-graph-reserved">retried_from</span>. '
     + 'Reserved (no producer yet): '
     + reservedTypes.map(t => '<span class="exec-graph-reserved">' + t + '</span>').join(', ')
     + '. The graph will branch when other edge types ship.'
+    + criticalNote
     + '</div>';
   return '<div class="exec-graph-card">'
     + '<h4>Execution graph · ' + N + ' attempt' + (N === 1 ? '' : 's') + ' · ' + edges.length + ' edge' + (edges.length === 1 ? '' : 's') + '</h4>'
@@ -4134,6 +4195,51 @@ function renderExecGraph(attempts, edges) {
     + '</svg></div>'
     + note
     + '</div>';
+}
+
+/* Walk the sequential attempt chain + inter-attempt gaps and
+   return the single segment with the largest recorded
+   duration. Returns:
+     { kind: 'none' }                       — no timing data
+     { kind: 'attempt', attempt_id, dur, label }
+     { kind: 'gap', parent_attempt_id, child_attempt_id, dur, label }
+   Honest: missing timestamps are skipped (no fabricated
+   durations); when nothing has both endpoints recorded we
+   return kind=none and the renderer surfaces "(not enough
+   timing data recorded)". */
+function computeExecCriticalSegment(sorted) {
+  let best = { kind: 'none', dur: 0, label: '' };
+  for (let i = 0; i < sorted.length; i++) {
+    const a = sorted[i];
+    if (typeof a.started_at === 'number' && typeof a.finished_at === 'number') {
+      const dur = Math.max(0, a.finished_at - a.started_at);
+      if (dur > best.dur) {
+        best = {
+          kind: 'attempt',
+          attempt_id: a.attempt_id,
+          dur,
+          label: 'attempt ' + a.attempt_num + ' (' + a.status + ')',
+        };
+      }
+    }
+    if (i + 1 < sorted.length) {
+      const next = sorted[i + 1];
+      if (typeof a.finished_at === 'number' && typeof next.started_at === 'number') {
+        const gap = Math.max(0, next.started_at - a.finished_at);
+        if (gap > best.dur) {
+          best = {
+            kind: 'gap',
+            parent_attempt_id: a.attempt_id,
+            child_attempt_id: next.attempt_id,
+            dur: gap,
+            label: 'gap between attempt ' + a.attempt_num
+              + ' and attempt ' + next.attempt_num,
+          };
+        }
+      }
+    }
+  }
+  return best;
 }
 
 /* Wall-clock summary across the retry chain. We compute:
