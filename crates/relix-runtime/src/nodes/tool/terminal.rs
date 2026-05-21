@@ -94,6 +94,26 @@
 //! buffer; operators who need per-command exit codes inject
 //! their own sentinel (e.g., `echo "__RELIX_DONE_$?__"`).
 //!
+//! ## Interactive stdin (PH-TERM-CONTROL)
+//!
+//! `tool.terminal.shell.control` writes a named control byte
+//! sequence (etx / eot / tab / cr / lf / enter / esc /
+//! backspace / sub / nak) to a session's stdin so operators do
+//! not have to know the byte values or base64-encode them.
+//!
+//! **Honest limitation: no PTY.** The current shell sessions
+//! attach the child's stdin to a regular OS pipe, NOT to a
+//! pseudo-terminal. Programs that check `isatty()` will see
+//! `false` and switch to non-interactive mode; programs that
+//! rely on the TTY driver to translate control bytes into
+//! signals (e.g., interactive bash translating `0x03` into
+//! SIGINT to the foreground command) will NOT receive those
+//! signals — the bytes arrive on stdin as ordinary input. A
+//! future PH-TERM-PTY milestone would allocate a real PTY via
+//! the `portable-pty` crate; the architecture mismatch with
+//! `tokio::process::Child` puts it outside this milestone's
+//! scope.
+//!
 //! ## Still out of scope (alpha)
 //!
 //! - No streaming-with-consumer-drain (tail is read-only; it
@@ -499,6 +519,16 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
         );
     }
     {
+        let b = backend.clone();
+        bridge.register(
+            "tool.terminal.shell.control",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_shell_control(b, ctx).await }
+            })),
+        );
+    }
+    {
         let b = backend;
         bridge.register(
             "tool.terminal.shell.close",
@@ -582,6 +612,51 @@ pub fn descriptor_shell_input() -> CapabilityDescriptor {
         "terminal".into(),
         "execute".into(),
         "shell".into(),
+    ];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
+}
+
+/// PH-TERM-CONTROL: `tool.terminal.shell.control` capability —
+/// convenience wrapper that writes a named control byte
+/// sequence (etx/eot/tab/cr/lf/enter/esc/backspace/sub/nak) to
+/// a session's stdin without the caller having to know the
+/// raw byte values or base64-encode them.
+///
+/// **Honest limitation:** without a PTY, the shell sees these
+/// bytes as ordinary stdin input — there is no TTY driver to
+/// translate `etx` (0x03) into SIGINT or `eot` (0x04) into
+/// EOF. Programs that read stdin as bytes (Python REPL, custom
+/// readers) will see the bytes; programs that rely on terminal
+/// signal delivery (e.g., `Ctrl+C` interrupting the foreground
+/// command in an interactive bash) will not be affected.
+pub fn descriptor_shell_control() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.shell.control");
+    d.major_version = 1;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec![
+        "shell:execute".into(),
+        "shell:input".into(),
+        "destructive:potential".into(),
+    ];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Write a named control character sequence to a persistent shell session's \
+         stdin. Request JSON: {session_id, control}. Supported control names: \
+         etx (ctrl_c), eot (ctrl_d), tab, lf, cr, enter (CRLF on Windows, LF on \
+         Unix), esc, backspace (0x7F), bs (0x08), sub (ctrl_z), nak (ctrl_u). \
+         Honest limitation: without PTY allocation, these are bytes on the \
+         stdin pipe — programs relying on TTY signal delivery (Ctrl+C → SIGINT) \
+         will not be affected. Returns {session_id, control, written}."
+            .into(),
+    );
+    d.categories = vec![
+        "mutate".into(),
+        "terminal".into(),
+        "execute".into(),
+        "shell".into(),
+        "control".into(),
     ];
     d.environment_requirements = vec!["shell:allowlist".into()];
     d
@@ -1270,9 +1345,66 @@ async fn handle_shell_open(backend: Arc<TerminalBackend>, ctx: InvocationCtx) ->
 /// decodes input bytes (UTF-8 `bytes` or base64 `bytes_base64`),
 /// writes + flushes. Returns `{session_id, written}` on
 /// success.
+/// PH-TERM-SHELL / PH-TERM-CONTROL: shared stdin writer for
+/// `tool.terminal.shell.input` and `tool.terminal.shell.control`.
+/// Looks the session up in `shell_stdins`, takes the async
+/// mutex, writes + flushes. `capability` is threaded into the
+/// error envelope so callers see which method failed.
+async fn write_to_session_stdin(
+    backend: &Arc<TerminalBackend>,
+    session_id: &str,
+    payload: &[u8],
+    capability: &'static str,
+) -> Result<usize, ErrorEnvelope> {
+    use tokio::io::AsyncWriteExt as _;
+    let stdin_arc = {
+        let g = backend
+            .shell_stdins
+            .lock()
+            .expect("tool.terminal shell_stdins poisoned");
+        match g.get(session_id) {
+            Some(arc) => arc.clone(),
+            None => {
+                return Err(ErrorEnvelope {
+                    kind: error_kinds::INVALID_ARGS,
+                    cause: format!(
+                        "{capability}: session not found or already closed (id='{session_id}')"
+                    ),
+                    retry_hint: 0,
+                    retry_after: None,
+                });
+            }
+        }
+    };
+    let mut guard = stdin_arc.lock().await;
+    let stdin = match guard.as_mut() {
+        Some(s) => s,
+        None => {
+            return Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("{capability}: session stdin has been closed (id='{session_id}')"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    stdin.write_all(payload).await.map_err(|e| ErrorEnvelope {
+        kind: error_kinds::RESPONDER_INTERNAL,
+        cause: format!("{capability}: write failed: {e}"),
+        retry_hint: 2,
+        retry_after: None,
+    })?;
+    stdin.flush().await.map_err(|e| ErrorEnvelope {
+        kind: error_kinds::RESPONDER_INTERNAL,
+        cause: format!("{capability}: flush failed: {e}"),
+        retry_hint: 2,
+        retry_after: None,
+    })?;
+    Ok(payload.len())
+}
+
 async fn handle_shell_input(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
     use base64::Engine as _;
-    use tokio::io::AsyncWriteExt as _;
     #[derive(Debug, Deserialize)]
     struct ShellInputRequest {
         session_id: String,
@@ -1321,62 +1453,141 @@ async fn handle_shell_input(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -
     } else {
         req.bytes.into_bytes()
     };
-    // bytes can legitimately be empty (operator wanted to test
-    // the path or send a no-op write). Accept it.
-    let stdin_arc = {
-        let g = backend
-            .shell_stdins
-            .lock()
-            .expect("tool.terminal shell_stdins poisoned");
-        match g.get(&req.session_id) {
-            Some(arc) => arc.clone(),
-            None => {
-                return HandlerOutcome::Err(ErrorEnvelope {
-                    kind: error_kinds::INVALID_ARGS,
-                    cause: format!(
-                        "tool.terminal.shell.input: session not found or already closed (id='{}')",
-                        req.session_id
-                    ),
-                    retry_hint: 0,
-                    retry_after: None,
-                });
+    let written = match write_to_session_stdin(
+        &backend,
+        &req.session_id,
+        &payload,
+        "tool.terminal.shell.input",
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => return HandlerOutcome::Err(e),
+    };
+    let resp = ShellInputResponse {
+        session_id: req.session_id,
+        written,
+    };
+    HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
+}
+
+/// PH-TERM-CONTROL: map a named control sequence to its byte
+/// representation. Returns `None` for unknown names. The
+/// mapping is platform-aware where it matters: `enter` is
+/// CRLF on Windows and LF on Unix to match what a real terminal
+/// would feed to the program. The others are protocol-defined
+/// single bytes.
+fn control_sequence_bytes(name: &str) -> Option<&'static [u8]> {
+    // Names are case-insensitive — operators may write either
+    // `etx` or `ETX`.
+    let lower = name.to_ascii_lowercase();
+    let bytes: &'static [u8] = match lower.as_str() {
+        // 0x03 — End of Text. Sent by Ctrl+C on most terminals.
+        // Without a PTY, shells reading from a pipe see this as
+        // an input byte, NOT a SIGINT delivery; document this in
+        // the module doc.
+        "etx" | "ctrl_c" => b"\x03",
+        // 0x04 — End of Transmission. Ctrl+D. On Unix terminals
+        // this is the line-buffered EOF marker.
+        "eot" | "ctrl_d" => b"\x04",
+        // 0x09 — horizontal tab.
+        "tab" => b"\x09",
+        // 0x0A — line feed (Unix newline). Matches what a real
+        // shell sees as "command complete".
+        "lf" | "newline" => b"\n",
+        // 0x0D — carriage return.
+        "cr" => b"\r",
+        // Platform-aware enter. CRLF on Windows, LF on Unix.
+        "enter" | "return" => {
+            if cfg!(windows) {
+                b"\r\n"
+            } else {
+                b"\n"
             }
         }
+        // 0x1B — Escape. Beginning of CSI / ANSI sequences.
+        "esc" | "escape" => b"\x1b",
+        // 0x7F — DEL. Used as backspace by most terminals.
+        "backspace" | "del" => b"\x7f",
+        // 0x08 — BS. Some terminals use this for backspace
+        // instead of 0x7F; expose it explicitly so operators
+        // can pick.
+        "bs" | "backspace_bs" => b"\x08",
+        // 0x1A — Substitute. Ctrl+Z. Job-control suspend on
+        // Unix terminals (no effect without a PTY).
+        "sub" | "ctrl_z" => b"\x1a",
+        // 0x15 — NAK. Ctrl+U. Line-kill on Unix terminals.
+        "nak" | "ctrl_u" => b"\x15",
+        _ => return None,
     };
-    let mut guard = stdin_arc.lock().await;
-    let stdin = match guard.as_mut() {
-        Some(s) => s,
+    Some(bytes)
+}
+
+/// PH-TERM-CONTROL: handle `tool.terminal.shell.control`.
+/// Looks up the named control sequence and writes its byte(s)
+/// to the session stdin via the shared writer.
+async fn handle_shell_control(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
+    #[derive(Debug, Deserialize)]
+    struct ShellControlRequest {
+        session_id: String,
+        control: String,
+    }
+    #[derive(Debug, Serialize)]
+    struct ShellControlResponse {
+        session_id: String,
+        control: String,
+        written: usize,
+    }
+    let req: ShellControlRequest = match serde_json::from_slice(&ctx.args) {
+        Ok(r) => r,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.shell.control: bad request shape: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if req.session_id.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "tool.terminal.shell.control: session_id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let bytes = match control_sequence_bytes(&req.control) {
+        Some(b) => b,
         None => {
             return HandlerOutcome::Err(ErrorEnvelope {
                 kind: error_kinds::INVALID_ARGS,
                 cause: format!(
-                    "tool.terminal.shell.input: session stdin has been closed (id='{}')",
-                    req.session_id
+                    "tool.terminal.shell.control: unknown control '{}'; supported: \
+                     etx (ctrl_c), eot (ctrl_d), tab, lf, cr, enter, esc, backspace, \
+                     bs, sub (ctrl_z), nak (ctrl_u)",
+                    req.control
                 ),
                 retry_hint: 0,
                 retry_after: None,
             });
         }
     };
-    if let Err(e) = stdin.write_all(&payload).await {
-        return HandlerOutcome::Err(ErrorEnvelope {
-            kind: error_kinds::RESPONDER_INTERNAL,
-            cause: format!("tool.terminal.shell.input: write failed: {e}"),
-            retry_hint: 2,
-            retry_after: None,
-        });
-    }
-    if let Err(e) = stdin.flush().await {
-        return HandlerOutcome::Err(ErrorEnvelope {
-            kind: error_kinds::RESPONDER_INTERNAL,
-            cause: format!("tool.terminal.shell.input: flush failed: {e}"),
-            retry_hint: 2,
-            retry_after: None,
-        });
-    }
-    let resp = ShellInputResponse {
+    let written = match write_to_session_stdin(
+        &backend,
+        &req.session_id,
+        bytes,
+        "tool.terminal.shell.control",
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => return HandlerOutcome::Err(e),
+    };
+    let resp = ShellControlResponse {
         session_id: req.session_id,
-        written: payload.len(),
+        control: req.control,
+        written,
     };
     HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
 }
@@ -2695,6 +2906,133 @@ mod tests {
         // both).
         assert!(b.snapshot_sessions().is_empty());
         assert!(b.shell_stdins.lock().unwrap().is_empty());
+    }
+
+    // ── PH-TERM-CONTROL: tool.terminal.shell.control ──────────────
+
+    #[test]
+    fn shell_control_descriptor_shape() {
+        let d = descriptor_shell_control();
+        assert_eq!(d.method_name, "tool.terminal.shell.control");
+        assert!(matches!(d.idempotency, Idempotency::AtMostOnce));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "shell:input"));
+        assert!(d.categories.iter().any(|c| c == "control"));
+    }
+
+    #[test]
+    fn control_sequence_bytes_named_singletons() {
+        assert_eq!(control_sequence_bytes("etx"), Some(&b"\x03"[..]));
+        assert_eq!(control_sequence_bytes("ctrl_c"), Some(&b"\x03"[..]));
+        assert_eq!(control_sequence_bytes("eot"), Some(&b"\x04"[..]));
+        assert_eq!(control_sequence_bytes("ctrl_d"), Some(&b"\x04"[..]));
+        assert_eq!(control_sequence_bytes("tab"), Some(&b"\x09"[..]));
+        assert_eq!(control_sequence_bytes("lf"), Some(&b"\n"[..]));
+        assert_eq!(control_sequence_bytes("cr"), Some(&b"\r"[..]));
+        assert_eq!(control_sequence_bytes("esc"), Some(&b"\x1b"[..]));
+        assert_eq!(control_sequence_bytes("escape"), Some(&b"\x1b"[..]));
+        assert_eq!(control_sequence_bytes("backspace"), Some(&b"\x7f"[..]));
+        assert_eq!(control_sequence_bytes("del"), Some(&b"\x7f"[..]));
+        assert_eq!(control_sequence_bytes("bs"), Some(&b"\x08"[..]));
+        assert_eq!(control_sequence_bytes("sub"), Some(&b"\x1a"[..]));
+        assert_eq!(control_sequence_bytes("ctrl_z"), Some(&b"\x1a"[..]));
+        assert_eq!(control_sequence_bytes("nak"), Some(&b"\x15"[..]));
+        assert_eq!(control_sequence_bytes("ctrl_u"), Some(&b"\x15"[..]));
+    }
+
+    #[test]
+    fn control_sequence_bytes_is_case_insensitive() {
+        assert_eq!(control_sequence_bytes("ETX"), Some(&b"\x03"[..]));
+        assert_eq!(control_sequence_bytes("Ctrl_C"), Some(&b"\x03"[..]));
+        assert_eq!(control_sequence_bytes("Escape"), Some(&b"\x1b"[..]));
+    }
+
+    #[test]
+    fn control_sequence_bytes_unknown_returns_none() {
+        assert!(control_sequence_bytes("not-a-control").is_none());
+        assert!(control_sequence_bytes("").is_none());
+        // Aliases that aren't in the mapping table.
+        assert!(control_sequence_bytes("ctrl_a").is_none());
+    }
+
+    #[test]
+    fn control_sequence_bytes_enter_is_platform_aware() {
+        let bytes = control_sequence_bytes("enter").unwrap();
+        if cfg!(windows) {
+            assert_eq!(bytes, b"\r\n");
+        } else {
+            assert_eq!(bytes, b"\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_control_bad_json_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"not-json");
+        match handle_shell_control(b, ctx).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("bad request shape"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_control_empty_session_id_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"session_id":"","control":"etx"}"#;
+        match handle_shell_control(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("session_id required"));
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_control_unknown_control_rejected_with_supported_list() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"session_id":"abc123","control":"f13"}"#;
+        match handle_shell_control(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("unknown control"));
+                // The error lists the supported names so operators
+                // know what they can use.
+                assert!(e.cause.contains("etx"));
+                assert!(e.cause.contains("enter"));
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_control_unknown_session_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        // Control is valid; session_id does not exist.
+        let arg = br#"{"session_id":"missing","control":"etx"}"#;
+        match handle_shell_control(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("session not found or already closed"));
+                assert!(e.cause.contains("tool.terminal.shell.control"));
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_control_unknown_session_includes_no_match_for_control() {
+        // Regression guard: the error message should not look
+        // like the validation failed at the control mapping
+        // step (it should report session-not-found, since the
+        // control name IS valid).
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"session_id":"missing","control":"etx"}"#;
+        match handle_shell_control(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(!e.cause.contains("unknown control"));
+            }
+            _ => panic!("expected Err"),
+        }
     }
 
     #[tokio::test]

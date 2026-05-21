@@ -1067,6 +1067,10 @@ fn register_node_type_handlers(
             manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_open());
             manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_input());
             manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_close());
+            // PH-TERM-CONTROL: tool.terminal.shell.control —
+            // convenience writer for named control chars
+            // (etx/eot/tab/enter/esc/backspace/...).
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_control());
         }
         // CW4: tool.browser.* — only advertised when
         // [tool.browser] is configured. Honest: the descriptors

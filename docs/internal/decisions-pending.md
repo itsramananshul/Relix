@@ -307,6 +307,47 @@ session a head start the moment a target is named.
 
 **Status.** open — runtime continues with PH-MCP-PROTO only.
 
+### D-010  Full PTY backend for `tool.terminal.shell.*` — adopt `portable-pty`?
+
+**Context.** PH-TERM-SHELL spawns shells with stdin attached to a
+regular OS pipe, NOT a pseudo-terminal. Programs that check
+`isatty()` switch to non-interactive mode; programs that rely on
+TTY-driven signal delivery (e.g., bash translating `0x03` on stdin
+into SIGINT for the foreground job) do not see the signals.
+PH-TERM-CONTROL ships `tool.terminal.shell.control` for named
+control bytes, but it can't fix the no-PTY behavior — the bytes
+arrive on the input pipe as ordinary stdin.
+
+The full fix is PTY allocation via `portable-pty` (wezterm's
+cross-platform crate covering Unix `openpty`/`forkpty` and
+Windows ConPTY).
+
+**Options.**
+- (a) Adopt `portable-pty` as a workspace dep + add a new
+  `SpawnMode::Pty` variant. The architectural mismatch is real:
+  `portable-pty`'s `Child` does NOT implement tokio's async
+  APIs, so the existing `validate_and_spawn` /
+  `drive_to_completion` cannot be reused. New code paths
+  needed for spawn, drain, wait, cancel — likely a separate
+  PTY module of ~400-600 LOC plus a sync-to-async bridge via
+  `tokio::task::spawn_blocking` and channels.
+- (b) Defer — accept that `tool.terminal.shell.*` is
+  "non-interactive shell on stdin" and document the gap
+  honestly. Operators driving TUI / isatty-checking programs
+  continue without Relix support.
+- (c) Ship a narrower Unix-only PTY backend via `nix` (avoids
+  the cross-platform sync I/O complexity of `portable-pty`).
+  Smaller scope but operators on Windows lose PTY entirely.
+
+**Recommendation.** (b) — defer for now. The current shell
+posture (pipe stdin + sentinel-based command boundaries)
+covers the highest-value cases (Python REPL, node REPL, shell
+pipelines). Full PTY is a multi-day undertaking with a
+security-critical new dep; revisit when an operator has a
+concrete TUI / isatty workflow blocked.
+
+**Status.** open.
+
 ---
 
 ## Answered
