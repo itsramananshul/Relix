@@ -1,535 +1,379 @@
-# Continuation State — Claude Session Handoff
+# Continuation State — Wave 1 Real Tool Backends
 
-This file is a single-source checkpoint written before a usage-limit
-pause. The next Claude session should treat the **WHEN USER SAYS
-CONTINUE, START HERE** block at the end as the authoritative
-resume command.
+This file is the authoritative handoff for the next Claude session.
+Treat the **WHEN USER SAYS CONTINUE, START HERE** block at the end
+as the resume command.
 
 ---
 
-## Repository state
+## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **Latest commit:** `2839df0c7ea0deb747048564ae4d9eb427ed0aed`
-  - `feat(tool): CW1 terminal_tool capability foundation (sandboxed shell)`
-- **`git status`:** clean working tree, branch up to date with `origin/main`
+- **HEAD:** `e825be6 feat(tool): PH-FS-FUZZY + PH-FS-TREE + PH-FS-STAT filesystem parity`
+- **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Pushed:** yes, CW1 commit included
-- **Modified files:** none (all committed)
-- **Untracked files:** none material
-  - `configs/policies/local.toml` was already untracked at session start
-    (per the initial `gitStatus` snapshot); not session-introduced
+- **Workspace tests:** 995 passing, 0 failures
+  - relix-core: 60
+  - relix-policy: 66
+  - relix-runtime: 615
+  - relix-runtime router_node integration: 6
+  - relix-telegram: 23
+  - relix-cli: 2
+  - relix-web-bridge: 220
+  - bridge invariants: 3
+- **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
-## Workspace test posture at the checkpoint
+---
 
-Last full `cargo test --workspace` run was clean **after** the M76 +
-CW1 commits:
+## What shipped this session (post-shutdown recovery)
 
-```
-relix-core      54 passed
-relix-policy    33 passed
-relix-runtime  291 passed
-relix-telegram  23 passed
-relix-cli        2 passed
-relix-web-bridge 192 passed
-bridge integration tests 3 passed
-all crate tests + doctests 0 failures total
-```
+15 milestones since the post-shutdown recovery, all green:
 
-`cargo clippy --workspace --all-targets -- -D warnings` was clean
-immediately before the checkpoint commit. `cargo fmt --all` ran
-clean.
+| Commit | Milestone | Concept |
+|---|---|---|
+| ca08428 | docs(internal) | recovered-execution-state + D-008 |
+| 8ed8e05 | PH-FS-PARITY3 | tool.search_files `glob` mode (`*`/`**`/`?`) |
+| 47b5db9 | PH-FS-PARITY4 | tool.fs.audit_recent + per-jail mutation ring |
+| 1feb8ce | PH-TERM-SESSIONS | tool.terminal.sessions live run registry |
+| acac673 | PH-MCP-PROTO | MCP JSON-RPC wire layer (no I/O) + D-009 logged |
+| 512e727 | PH-TERM-AUDIT | tool.terminal.audit_recent completion ring |
+| 9d4381d | PH-TERM-CANCEL | tool.terminal.cancel + manual drain refactor |
+| c8d7fcb | PH-TERM-STREAM1 | tool.terminal.tail polling cursor |
+| d5587d2 | PH-TERM-SPAWN | tool.terminal.spawn + validate_and_spawn refactor |
+| 57c575d | PH-TERM-SHELL | tool.terminal.shell.{open,input,close} |
+| cf2ea48 | PH-TERM-CONTROL | tool.terminal.shell.control + D-010 logged |
+| e825be6 | PH-FS-FUZZY + PH-FS-TREE + PH-FS-STAT | filesystem Hermes parity |
 
-## What completed in this session
+Plus 6 docs-only commits tallying each milestone into
+`docs/internal/recovered-execution-state.md`.
 
-Every milestone below shipped real persistent state / real new
-capabilities / real behavioral changes. No fabricated graphs, no
-fake hard-preemption claims, no synthesized edges. Honesty
-contracts preserved per the strict invariants the user has
-emphasized across rotations.
+Aggregate code change: ~4000+ LOC across `tool/fs.rs`,
+`tool/terminal.rs`, `tool/mcp.rs`, `controller_runtime.rs`,
+`docs/capabilities.md`, `docs/internal/hermes-capability-map.md`,
+`docs/internal/decisions-pending.md`,
+`docs/internal/recovered-execution-state.md`.
 
-### Track 1 — Runtime Interruption
+Runtime tests: 507 → 615 (+108). Workspace: 887 → 995 (+108).
 
-- **M70** intent/ack split + generation counters:
-  - Schema migration: `pause_generation`, `freeze_generation`
-    columns on `tasks` (always-incrementing per axis).
-  - Renamed events: `task.paused` → `task.pause_requested`,
-    `task.resumed` → `task.resume_requested` (request side).
-  - New ack event types reserved: `task.pause_observed`,
-    `task.resume_observed`, `task.freeze_propagated`.
-  - New capabilities: `task.interruption_check` (cooperative-poller
-    snapshot), `task.observe_interruption` (runtime ack emit).
-  - 6 new unit tests; legacy chronicle lookup falls back to
-    `task.paused` for pre-M70 paused tasks.
-- **M71** `task.freeze` + `task.unfreeze` workflow-level
-  interruption:
-  - Schema migration: `frozen_at`, `frozen_reason` columns.
-  - New `FREEZABLE_STATUSES` const wider than pause.
-  - `set_frozen` / `set_unfrozen` mutators bump
-    `freeze_generation`, emit `task.freeze_requested` /
-    `task.unfreeze_requested` chronicle events.
-  - Bridge endpoints `POST /v1/tasks/:id/freeze` +
-    `/unfreeze`; dashboard actions next to Pause/Resume.
-  - 5 new unit tests including pause/freeze generation
-    independence.
-- **M74** state-machine matrix:
-  - `TASK_STATES` const + `is_allowed_transition(from, to)`
-    helper documenting every permitted move.
-  - `task.transition_check` capability is informational only —
-    `task.update` not yet enforced against the matrix (honest
-    scope; deferred to future milestone).
-  - 5 unit tests (canonical happy path, disallowed pairs,
-    same-status no-op, unknown-status forward-compat, store
-    integration).
-- **M76** retry suppression when paused/frozen:
-  - `request_retry` now explicitly detects paused/frozen and
-    emits `task.retry_suppressed` chronicle event with
-    payload_json `{suppressed_by, retry_count, budget}`.
-  - 2 new unit tests.
+---
 
-### Track 2 — Execution Graph Producers
+## Wave 1 status by track
 
-- **M72** real cross-task edge producers:
-  - 3 new coord capabilities: `task.record_spawned`,
-    `task.record_delegated`, `task.record_awaited`.
-  - Each writes the edge + a parent chronicle event in one
-    transaction; `spawned_by_event_id` points at the event
-    for dashboard click-through.
-  - `EdgeProducerOutcome` struct carries `edge_id` + `event_id`.
-  - Refuses self-edges, NotFound on unknown task_ids.
-  - Optional metadata (`branch_id`, `context_id`, `reason`)
-    omitted from payload when unset — no fabricated defaults.
-  - 6 new unit tests + 1 lineage integration test confirming
-    M66 walker picks up the new cross-task edges.
+### A. Browser backend — BLOCKED on D-008
 
-### Track 3 — Global Execution Firehose
+CW4 (`tool.browser.*`) still ships as honest scaffold:
+`NoneBackend` returns `BackendNotConnected` on every non-noop.
+D-008 (Playwright sidecar vs headless_chrome vs WebDriver,
+recommendation **b: headless_chrome**) is open and gates the live
+backend. Pure additive once decided; the existing trait + scaffold
+slot in via the existing `build_backend()` path.
 
-- **M73** firehose SSE + drop accounting + dashboard upgrade:
-  - New endpoint `GET /v1/tasks/events/stream` — long-lived
-    SSE, 750ms poll interval, `STREAM_PAGE_LIMIT=500`.
-  - Per-page drop accounting emits `dropped` SSE frame when
-    a page hits the limit (with `next_cursor` + recovery note
-    pointing at `/recent`).
-  - Cursor recovery via `?since=N`, event-type filter via
-    `?event_type=foo`.
-  - Stream metrics register against synthetic `__firehose__`
-    task_id so `/v1/streams` counts firehose consumers.
-  - Dashboard upgraded: `openGlobalFirehoseStream()` opens
-    `EventSource` on first overview tick; `dropped` frames
-    raise warn toasts; status footer reports `SSE live` vs
-    `polling` + cumulative drop count.
+### B. MCP runtime — protocol layer shipped, runtime BLOCKED on D-009
 
-### Capability Wave (new track this session)
+`tool.mcp.list_servers / list_tools / invoke` are registry +
+discovery only (`RuntimeNotConnected` on invoke). PH-MCP-PROTO
+shipped the JSON-RPC wire layer (`mcp::proto` module) with 12
+tests so the next session can wire the stdio transport in a
+follow-up without bootstrapping protocol code. D-009 asks the
+operator to identify a concrete MCP server target before live
+wiring proceeds (recommendation: defer).
 
-- **CW1** terminal_tool capability foundation:
-  - New module `crates/relix-runtime/src/nodes/tool/terminal.rs`.
-  - Opt-in via `[tool.terminal]` config section with required
-    `allowed_commands` allowlist.
-  - 8-layer fail-closed security model (documented in module
-    docstring): opt-in registration, allowlist enforcement,
-    no shell, path-traversal-free command resolution, hard
-    timeout, output caps (1 MiB stdout + stderr each),
-    no-env-inheritance default, optional working_dir.
-  - Wire shape: JSON request `{command, args, timeout_secs?}`
-    → JSON response `{exit_code, stdout, stderr,
-    duration_ms, timed_out, truncated_stdout,
-    truncated_stderr, command, timeout_secs}`.
-  - Manifest descriptor `tool.terminal.run` with sensitivity
-    tags `shell:execute / host:local / destructive:potential`.
-  - Only advertised when config validates (allowlist non-empty
-    + no path separators + non-zero timeout) — no phantom
-    capabilities.
-  - 7 unit tests covering construction validation +
-    output-truncation semantics.
-  - Wired into existing `tool::register` alongside
-    fs/pdf/web_extract — co-located per Explore-agent
-    survey recommendation.
+### C. Filesystem — substantial parity now
 
-## What was in progress when stopped
+Shipped: read / write / append / list_dir / patch / patch_preview /
+binary_sniff / audit_recent / search_files (name/content/glob) /
+fuzzy_replace / tree / stat.
 
-**Nothing partially edited at the source level.** The terminal.rs
-file landed in a coherent, buildable, tested state immediately
-before the stop signal. The 5 mechanical `ErrorEnvelope::new(...)`
-→ struct-literal fixes that the initial drop required were applied
-before the commit; no half-written hunks remain.
+Gaps vs Hermes:
+- `file_state` (per-session undo store) — needs a per-session
+  storage layer that doesn't exist.
+- batch operations wrapper — small.
+- safe `delete` / `mkdir` / `move` / `rename` / `copy` — need
+  policy decisions about which to surface; tool node node has no
+  delete capability today.
 
-The active in-progress task (#72 `CW1 capability runtime
-foundation + terminal_tool`) is **complete** at the foundation
-level. Streaming / interruption / background execution were
-explicitly scoped out as Gate 2 work — that's not "incomplete"
-in this rotation's sense, that's "future milestone with the
-deferral documented in the module docstring."
+### D. Terminal — substantially complete in the no-PTY model
 
-## Unfinished tasks (queued for the next rotation)
+Shipped:
+- `tool.terminal.run` (sync, CW1)
+- `tool.terminal.spawn` (background, PH-TERM-SPAWN)
+- `tool.terminal.sessions` (live registry, PH-TERM-SESSIONS)
+- `tool.terminal.cancel` (cooperative kill, PH-TERM-CANCEL)
+- `tool.terminal.tail` (polling stream, PH-TERM-STREAM1)
+- `tool.terminal.audit_recent` (completion ring, PH-TERM-AUDIT)
+- `tool.terminal.shell.{open,input,close}` (persistent shells,
+  PH-TERM-SHELL)
+- `tool.terminal.shell.control` (named control chars,
+  PH-TERM-CONTROL)
 
-The TaskList is the authoritative reference. As of the
-checkpoint:
+Refactors landed:
+- `validate_and_spawn` + `drive_to_completion` shared by run +
+  spawn + shell.open (SpawnMode enum).
+- `write_to_session_stdin` shared by shell.input + shell.control.
+- Manual stdout/stderr drain replaced `wait_with_output`, enabling
+  cancel + tail.
 
-**Pending (queued, not started this session):**
-- #67 — M75 lineage subtree metrics (Track 2)
-- #69 — M77 provider routing trace foundation (Track 4)
-- #70 — M78 production hardening docs (Track 7)
-- #71 — M79 dashboard density pass (Track 6)
-- #73 — CW2 file_tools capability family
-- #74 — CW3 web_tools capability family
-- #75 — CW4 browser_tool capability foundation
-- #76 — CW5 mcp_tool registration + runtime projection
+Gaps:
+- Full PTY backend (D-010 deferred): TUI / isatty-checking
+  programs.
+- Streaming-with-consumer-drain: tail is read-only; a > 1 MiB
+  producer still stalls when the bounded buffer fills.
+- Command-boundary tracking inside a shell session (operators
+  use their own sentinels today).
 
-**Completed this session (status tracking):**
-- #62 M70, #63 M71, #64 M72, #65 M73, #66 M74, #68 M76, #72 CW1
+### E. Web — no movement this session
 
-**Already completed pre-session (preserved for context):**
-- #48, #49, #51, #52, #53, #54, #55, #56, #57, #58, #59, #60, #61
+`tool.web_fetch / web_get / web_search / web_extract /
+web.robots_check` already shipped. Hermes gaps: POST, cookies,
+URL safety (URLhaus), OSV check, crawl_limited, markdown
+extraction. All decision-free; pick at next session.
 
-**Tracker housekeeping note:** task #50 ("Continue rotation: Track
-B → C → A") was set to in_progress in a much earlier rotation and
-never closed — it's a meta-task and should be marked completed by
-the next session (low priority).
+### F. PDF / document — no movement this session
 
-## Roadmap queue across all 7 active tracks
+`tool.pdf` shipped. Hermes gaps: text chunking helper,
+page-limited extraction, document metadata. Decision-free.
 
-The user has emphasized continuous parallel work across these
-tracks. The next rotation should rotate through them rather
-than depth-first one track.
+### G. Safety / policy — descriptor surface only
 
-### A. Real Execution Orchestration (interruption / state machine)
-- Wire `task.update` path against the M74 transition matrix
-  (audit every existing caller; this is the deferred enforcement)
-- Cooperative-checkpoint helper API on the runtime side that
-  reads `task.interruption_check` + emits
-  `task.observe_interruption` automatically — runtime workers
-  shouldn't have to remember the protocol
-- Cancel propagation groundwork (parallel to freeze
-  propagation; needs M72 cross-task edges to actually
-  propagate)
+Every shipped capability has sensitivity tags + requires_groups
++ idempotency + cost_class set honestly. The dispatch-side
+sanitizer (`sanitize.rs`) covers tool-call repair. No
+**`risk_level`** field on `CapabilityDescriptor` yet; adding it
+would be a broad change touching every descriptor.
 
-### B. Execution Graph + Lineage
-- **M75** subtree metrics (queued task #67): `task.subtree_metrics`
-  capability aggregating wall clock + attempt count over the
-  BFS subtree; dashboard subtree panel
-- Surface the new M72 edge types in the dashboard exec-graph
-  card (the renderer currently labels all reserved types as
-  "no producer yet" — needs an update so spawned/delegated/
-  awaited render as real edges when present)
-- `resumed_from` + `parallel_branch` + `blocked_on` producer
-  capabilities (mirror the M72 pattern for the three remaining
-  reserved edge types)
+### H. Capability registry — current
 
-### C. Global Event Firehose
-- Server-side filter set support (currently only `event_type`
-  exact-match; the user asked for filters by task/node/type)
-- `task.event_replay` capability — replay a window from
-  the chronicle ledger (the cursor only walks forward today)
-- Lag metrics on the streaming endpoint
-- Dashboard event inspector pane (click an event in the
-  firehose → open per-event detail with payload_json
-  formatted)
+Every new capability this session was added to the manifest in
+`controller_runtime.rs`. `docs/capabilities.md` was kept in sync.
+Dashboard explorer (PH-DASH3) was untouched but reads from the
+manifest, so new capabilities appear automatically.
 
-### D. Provider Runtime
-- **M77** provider routing trace foundation (queued task #69):
-  per-provider failed_request_count + last_failure_at +
-  last_routing_decision in bridge secrets; test_provider
-  increments; dashboard provider timeline panel
-- Circuit-breaker state machine on top of M69 cooldown
-- Live failover chain visibility (which provider would route
-  next, given current quarantine + cooldown state)
+### I. Observability / dashboard — no movement this session
 
-### E. Capability Wave
-- **CW2** file_tools (queued task #73): the tool node
-  already has `fs::FsJail` — wire a similar opt-in module
-  pattern; add list/search/patch/binary-detection beyond
-  what fs.rs already does. Path-traversal protection lives
-  in fs.rs; mirror it.
-- **CW3** web_tools (queued task #74): `tool.web_fetch`
-  already exists with SSRF protection. Add `web.search`
-  (provider-routed), `web.extract` (already exists as
-  `tool.web_extract`), `web.crawl` foundations. Reuse
-  `security::resolve_safe_url` for all new endpoints.
-- **CW4** browser_tool (queued task #75): substantial scope.
-  Browser session lifecycle, CDP foundations. Likely a new
-  node type (`browser`) rather than co-located on tool node.
-- **CW5** mcp_tool (queued task #76): strategically massive
-  per the user. MCP server registration, stdio + HTTP
-  transport, capability discovery, runtime projection as
-  native Relix capabilities. Probably its own crate
-  (`crates/relix-mcp/`).
+Existing dashboard surfaces (capability explorer, firehose,
+provider health) still work. Per-tool-family inspectors (browser
+sessions, MCP server explorer, terminal sessions panel, fs audit
+panel) remain pending.
 
-### F. Dashboard / Operator Console
-- **M79** density pass (queued task #71): compact tables,
-  keyboard navigation (j/k between tasks, `/` to focus
-  search, `?` for help), denser detail layout, less card
-  chrome. Reference: `references/OpenClaw`.
-- Topology explorer expansion (current `/topology` page is
-  a good base — needs per-peer panels for the capabilities
-  the peer advertises)
-- Live event rail (separate from firehose pane — narrower,
-  always-visible sidebar fed by same SSE)
+### J. Tests + docs — kept current per milestone
 
-### G. Production Hardening
-- **M78** production docs (queued task #70):
-  - `docs/deployment.md` production checklist
-  - Dashboard local-only warning surface
-  - Auth/RBAC stub interfaces (real impl deferred)
-  - Secret-storage + backup-restore + audit-log docs
-  - Unsafe-exposure warnings
-- Reverse-proxy guidance (the bridge has no HTTP auth in
-  alpha — every config endpoint says so honestly; the docs
-  should consolidate)
+Every milestone shipped tests + updated `docs/capabilities.md` +
+tallied into `docs/internal/recovered-execution-state.md`. The
+Hermes capability map was refreshed (`docs/internal/hermes-capability-map.md`).
 
-## Architectural warnings / things to watch
+---
 
-1. **`task.update` is NOT enforced against the M74 transition
-   matrix.** This is deliberate scope. Every existing caller
-   (8 tests + 4 bridge handlers) needs an audit before
-   enforcement can land. Until then, the matrix is a
-   pre-flight reference operators query via
-   `task.transition_check`.
+## Pending decisions (unblock real backends)
 
-2. **Cooperative interruption is not actually polled by any
-   runtime worker today.** M70/M71 ship the read/write
-   protocol; the SOL VM is synchronous and doesn't yet check
-   `interruption_check`. The chronicle accurately records this:
-   a `task.pause_requested` with no matching
-   `task.pause_observed` means the runtime never noticed.
-   This is the honest design.
+From `docs/internal/decisions-pending.md`:
 
-3. **Provider quarantine (M69) is enforced only at the
-   test-provider endpoint.** The AI controller does NOT
-   live-read provider state — restart required for routing
-   changes. The response `note` field surfaces this
-   gap on every quarantine mutation. M77 (when shipped) will
-   add the routing-trace observation layer; live enforcement
-   needs an AI-controller hot-reload primitive that doesn't
-   exist yet.
+| ID | Topic | Recommendation | Blocks |
+|---|---|---|---|
+| D-001 | task.memory adoption | (b) defer | memory_tool parity |
+| D-002 | MCP trust tiers | (b) single-tier operator-opt-in | None (proceed) |
+| D-003 | Chronicle compaction threshold | (c) on-demand only | H2 backfill |
+| D-004 | `origin_surface` column | (a) ship — additive | None |
+| D-006 | iteration-budget grace-call | (c) — **shipped** | — |
+| D-007 | computer_use_tool backend | (c) defer | computer_use_tool |
+| D-008 | Browser backend (PW vs HC vs WD) | (b) headless_chrome | **CW4 real backend** |
+| D-009 | MCP server target | (c) defer | **MCP stdio runtime** |
+| D-010 | PTY backend (`portable-pty`) | (b) defer | TUI / isatty-true |
 
-4. **Capability handlers do NOT write to task chronicle
-   directly.** Per the existing pattern (verified by Explore
-   agent): tool handlers return `HandlerOutcome::Ok | Err`
-   and rely on the dispatch-side audit log. The chronicle is
-   coord-side only. If/when capabilities should attest
-   themselves into a parent task's chronicle, a new field
-   needs adding to `InvocationCtx`. Deferred to Gate 2.
+D-008 and D-009 are the two material blockers. D-010 has a
+recommendation; the next session can proceed without operator
+intervention if it picks (b).
 
-5. **The terminal capability does NOT have process
-   interruption mid-run.** Hard timeout is the only stop.
-   Documented in module docstring as explicit out-of-scope.
+---
 
-6. **CW1 unit tests use `Result::unwrap_err` which required
-   `Debug` on `TerminalBackend`.** Added the derive. If
-   anyone refactors the backend, keep the derive — tests
-   depend on it.
+## Capability counts (per `docs/capabilities.md`)
 
-7. **CW1 manifest descriptor is only advertised when the
-   allowlist validates** (lines ~670 of controller_runtime.rs
-   check `terminal::TerminalBackend::new(...).is_ok()`).
-   This means the manifest matches what was actually
-   registered — no phantom capabilities — but it also means
-   a misconfigured `[tool.terminal]` results in BOTH the
-   capability missing AND a warn log at startup. The warn
-   log is the operator-facing diagnostic.
+### Filesystem (`tool/fs.rs`)
+- tool.read_file
+- tool.write_file
+- tool.append_file (PH-FS-PARITY1)
+- tool.list_dir (CW2)
+- tool.search_files (name/content/glob; PH-FS-PARITY3)
+- tool.patch
+- tool.patch_preview (PH-FS-PARITY1)
+- tool.binary_sniff (PH-FS-PARITY2)
+- tool.fs.audit_recent (PH-FS-PARITY4)
+- tool.fuzzy_replace (PH-FS-FUZZY)
+- tool.fs.tree (PH-FS-TREE)
+- tool.fs.stat (PH-FS-STAT)
+
+### Terminal (`tool/terminal.rs`)
+- tool.terminal.run (CW1)
+- tool.terminal.spawn (PH-TERM-SPAWN)
+- tool.terminal.cancel (PH-TERM-CANCEL)
+- tool.terminal.sessions (PH-TERM-SESSIONS)
+- tool.terminal.tail (PH-TERM-STREAM1)
+- tool.terminal.audit_recent (PH-TERM-AUDIT)
+- tool.terminal.shell.open (PH-TERM-SHELL)
+- tool.terminal.shell.input (PH-TERM-SHELL)
+- tool.terminal.shell.close (PH-TERM-SHELL)
+- tool.terminal.shell.control (PH-TERM-CONTROL)
+
+### Browser (`tool/browser.rs`) — scaffold
+- tool.browser.{open_session,close_session,navigate,get_text,
+  screenshot,list_sessions} — all `BackendNotConnected` (D-008)
+
+### MCP (`tool/mcp.rs`) — scaffold + protocol layer
+- tool.mcp.{list_servers,list_tools,invoke}
+- `mcp::proto` module: JsonRpcRequest/Response/Notification +
+  ToolsListResult / ToolsCallResult + serialize_request /
+  parse_response_line (PH-MCP-PROTO; D-009)
+
+### Web (`tool/web_*.rs`)
+- tool.web_fetch / tool.web_get / tool.web_search /
+  tool.web_extract / tool.web.robots_check
+
+### PDF
+- tool.pdf
+
+---
+
+## Highest-leverage next moves (decision-free)
+
+1. **PH-WEB-MARKDOWN** — `tool.web.extract_markdown`. Convert
+   HTML to Markdown via a small hand-rolled pass or
+   `pulldown-cmark` (already a transitive dep candidate; verify
+   before adding). Decision-free.
+
+2. **PH-WEB-METADATA** — `tool.web.extract_metadata`. OpenGraph
+   + Twitter Card + standard `<meta>` extraction. Decision-free.
+
+3. **PH-FS-METADATA-RING** — extend `tool.fs.audit_recent` with
+   a `?op=` filter so operators can pull only writes / only
+   appends. Trivial.
+
+4. **PH-CAP-RISK** — add `risk_level` field to
+   `CapabilityDescriptor` and audit every existing descriptor
+   to set it. Broad change but mechanical; touches every tool
+   module + the manifest exposure.
+
+5. **PH-PDF-CHUNK** — `tool.pdf.chunk_text`. Splits a PDF's
+   extracted text into bounded chunks. Decision-free.
+
+6. **PH-MCP-CLI** — `relix-cli ops mcp` subcommand that mirrors
+   `tool.mcp.list_servers / list_tools`. Pure CLI add. Pairs
+   well with the existing `ops capabilities` / `ops events` /
+   `ops route-test` / `ops providers-health` family.
+
+7. **PH-TERM-CLI** — `relix-cli ops terminal-sessions /
+   terminal-audit`. Same shape.
+
+Recommend taking 2-3 in a single session, all decision-free.
+
+---
 
 ## Exact commands to resume
 
 ```bash
-# Verify clean state
+cd D:/DATA/WORK/OpenPrem/Apps/Relix
+
+# Confirm clean state
 git status
 git log --oneline -10
 
-# Re-run the full test suite to confirm nothing rotted while paused
+# Re-run full gates to confirm nothing rotted while paused
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+# Expected: 995 tests passing, 0 failures.
 
-# Resume by picking the next pending task. Recommended order:
-# 1. M75 subtree metrics (Track 2 — small, tightly bound to M66/M72)
-# 2. M77 provider routing trace foundation (Track 4)
-# 3. CW2 file_tools (extends existing fs.rs)
-# 4. M78 production docs (parallel-safe; no code conflict)
-# Avoid: CW5 mcp_tool until a real MCP server target is identified.
+# Read the recovery state to understand what shipped this session
+cat docs/internal/recovered-execution-state.md
+
+# Pick the next milestone. Recommended order if user hasn't
+# answered D-008 / D-009:
+#   1. PH-WEB-MARKDOWN  (web extraction parity, no new dep)
+#   2. PH-PDF-CHUNK     (document chunking parity)
+#   3. PH-MCP-CLI       (CLI surface for MCP registry)
+#   4. PH-TERM-CLI      (CLI surface for terminal sessions/audit)
+#   5. PH-CAP-RISK      (broad: risk_level on descriptors)
 ```
 
-## Tests not run during the checkpoint
+---
 
-None — full workspace test pass succeeded immediately before
-the commit. Nothing skipped.
+## Honesty contract (preserved across the session)
 
-## Errors encountered during this rotation
+1. **No fabricated graph edges** — only real producer events.
+2. **No fake hard-preemption** — cooperative cancel only.
+3. **No fake provider failover** — operator-visible state with
+   restart-required messaging.
+4. **No fake backend success** — `tool.browser.*` returns
+   `BackendNotConnected`; `tool.mcp.invoke` returns
+   `RuntimeNotConnected`. Both refuse to fake.
+5. **Append-only chronicle** — capabilities don't write
+   chronicle directly. Audit rings (PH-FS-PARITY4,
+   PH-TERM-AUDIT) are process-local observability surfaces.
+6. **Honest limitations documented** — every capability with a
+   gap (no PTY, no streaming-with-drain, no command-boundary
+   tracking) carries that limitation in its module doc + the
+   relevant tracking decision (D-008/9/10).
 
-1. **`ErrorEnvelope::new(...)` doesn't exist.** Fixed by
-   converting to struct literal (5 call sites in
-   terminal.rs). The existing `tool/mod.rs` callers all use
-   struct literals — I should have mirrored that pattern
-   immediately.
+---
 
-2. **`iter().cloned().collect::<Vec<_>>().join(...)`
-   triggered `clippy::iter_cloned_collect`** since
-   `allowed_commands` is already `Vec<String>` (just call
-   `.join(", ")` directly). Fixed.
+## Architectural warnings / things to watch
 
-3. **Doc list overindentation in `is_allowed_transition`
-   docstring** flagged by clippy. Fixed by aligning
-   continuation lines to the same indent.
+1. **`tool.terminal.shell.*` uses pipe stdin, not PTY.** Programs
+   that check `isatty()` see false. Programs that rely on TTY-
+   driven signal translation (interactive bash converting `0x03`
+   into SIGINT for the foreground job) do not see the signals.
+   D-010 logged; recommendation is to defer until a concrete
+   isatty-blocked workflow appears.
 
-4. **TaskCreate task #73 was accidentally set to in_progress
-   before CW1 was actually started.** Reverted to pending,
-   set #72 to in_progress instead. Tracker is correct now.
+2. **`tool.terminal.tail` is read-only.** It does NOT advance
+   the drainer's write head, so a > 1 MiB producer still stalls
+   when the bounded buffer fills. A future ring-with-consumer-
+   cursor would relax this.
 
-No source-level errors remain. No compilation warnings. No
-test failures.
+3. **`tool.fuzzy_replace` refuses on multi-match.** Operators
+   who need to disambiguate must rephrase the search block
+   with more surrounding context. This is intentional — no
+   automatic disambiguation.
+
+4. **`SpawnedRun.stdin` is only Some in shell mode.** The
+   `validate_and_spawn` function branches on `SpawnMode`
+   (Run / Shell). When adding new spawn modes (e.g., Pty),
+   extend the enum and the stdio configuration branch
+   alongside.
+
+5. **`backend.allowed_shells` is empty by default.** Operators
+   must explicitly list shells in `[tool.terminal] allowed_shells`
+   for `shell.open` to succeed. Backend construction now
+   requires at least one of `allowed_commands` / `allowed_shells`
+   to be non-empty (was: only `allowed_commands` required).
 
 ---
 
 ## WHEN USER SAYS CONTINUE, START HERE
 
 ```
-1. cd D:\DATA\WORK\OpenPrem\Apps\Relix
+1. cd D:/DATA/WORK/OpenPrem/Apps/Relix
 2. git pull --ff-only origin main
 3. git status   (confirm clean)
 4. cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 5. cargo test --workspace
-   (Expected as of 2026-05-21: 54+33+380+23+2+203+3 = 698 tests, 0 failures)
+   (Expected: 995 tests, 0 failures)
 6. Read THIS file (docs/internal/continuation-state.md) for full context.
-7. Read docs/hermes-deep-dive.md — the Hermes analysis the user wants
-   continuously referenced for adaptation.
-8. Read docs/internal/decisions-pending.md — open D-001..D-006 questions
-   the runtime did NOT resolve on its own; user signs off in the morning.
-9. Read TaskList; pick the next pending milestone. As of this checkpoint:
-   - CW3, H1, H2, H4, H5, H6, H7 all shipped + pushed tonight (commits
-     98f1942 .. 404122e). 7 Hermes-grade adaptations + CW3.
-   - Pending: CW4 (browser_tool — big spec, defer), CW5 (mcp_tool —
-     decisions-pending D-002 blocks shape; defer until operator
-     answers).
-   - Highest-leverage next milestone the runtime can do without
-     decisions: H8 secret-redaction in chronicle + audit. Adapts
-     Hermes redact_sensitive_text. Pure additive; would land in
-     ~30min.
-10. Maintain the HONESTY CONTRACT:
-    - No fabricated graph edges (real producers only).
-    - No fake hard-preemption (cooperative only; intent vs ack split).
-    - No fake provider failover (operator-visible state + restart-
-      required messaging).
-    - "(not recorded yet)" / "(not emitted yet)" labels stay honest
-      where data is missing.
-11. After each milestone:
+7. Read docs/internal/recovered-execution-state.md for the recovery snapshot.
+8. Read docs/internal/decisions-pending.md — operator decisions D-001..D-010.
+9. Read docs/internal/hermes-capability-map.md — Hermes parity status.
+10. Read docs/capabilities.md — canonical capability index.
+11. Pick the next milestone. If the user has answered D-008 / D-009,
+    take the unblocked backend track first. Otherwise pick from the
+    "Highest-leverage next moves" list above.
+12. Maintain the honesty contract (above).
+13. After each milestone:
     - cargo fmt && cargo clippy --workspace --all-targets -- -D warnings
     - cargo test --workspace
     - git add <files> && git commit -m "..." && git push origin main
-12. NO Claude attribution in commit messages.
-13. NO hardcoded provider tokens.
-14. If a decision is genuinely needed and you can't act safely → log
-    to docs/internal/decisions-pending.md and pivot to another track.
-    Never block the night on a question the user can answer tomorrow.
-15. Open issues / gaps still tracked honestly:
-    - task.update enforcement vs M74 matrix (deferred audit)
-    - CW1 has no process-interruption (Gate 2 scope)
-    - AI controller doesn't live-read provider quarantine
-      (M77 ships state; live read requires runtime restart)
-    - H3 iteration-budget grace-call deferred per D-006 (needs an
-      executor consumer that doesn't exist yet)
+    - Tally into docs/internal/recovered-execution-state.md.
+14. NO Claude attribution in commits. NO co-author trailers.
+15. NO hardcoded provider tokens. NO secrets in committed files.
+16. If a decision is genuinely needed and you can't act safely:
+    - log to docs/internal/decisions-pending.md
+    - pivot to another track
+    - never block the night on a question the user can answer tomorrow.
 ```
-
-## Tonight's autonomous run summary (2026-05-20 → 2026-05-21)
-
-Resumed from CW1 checkpoint. Shipped (each as a separate commit,
-all pushed to origin/main):
-
-| Milestone | Commit | Tests added | Concept |
-|---|---|---|---|
-| CW3 | 98f1942 | runtime +16 | tool.web_get + tool.web_search (DDG scrape) |
-| H1  | 5e42d38 | runtime +19, bridge +1 | Structured FailoverReason classifier |
-| H2  | c810937 | runtime +28, bridge +1 | Chronicle one-line summarizer |
-| H4  | 946aa7c | runtime +7 | Anti-thrash auto-mark |
-| H5  | f343c8f | runtime +3 | Synthesized terminal_summary |
-| H6  | d71e2d8 | runtime +3, bridge +4 | Stuck-running detection |
-| H7  | 404122e | runtime +5 | Orphan-attempt cleanup |
-| H8  | 971308c | core +18, runtime +2 | Secret redaction (relix-core, chronicle) |
-| H9  | 56f906c | bridge +1 | Secret redaction (intervention audit) |
-| H10 | a0451ec | runtime +3 | Redaction sweep: pause/freeze/error_cause |
-| H15 | fbe3a38 | n/a | Bridge route latency tracing middleware |
-| PH5 | 20f0dcc | runtime +23 | sanitize.rs — JSON arg repair/coerce/truncate |
-| PH-DASH1 | f5449e5 | bridge +1 | click-to-expand firehose payload_json |
-| PH-WAVE2A | a31d81f | core +10 | jittered backoff helper |
-| PH-WAVE2C | cce96e2 | n/a | redaction count KPI tile |
-| PH-WAVE2D | 0a12bb0 | runtime +8 | task.todo_* coord capabilities (+ deadlock-fix during integration) |
-| PH-WAVE2E | 0a12bb0 | n/a | Anthropic prompt-caching cache_control |
-| PH-WAVE2F | 3d25355 | n/a | Anthropic extended-thinking budget knob |
-| PH-DASH2  | d69b6f1 | bridge +1 | bridge REST + dashboard widget for todos |
-| PH-WAVE2G | 2c77e38 | bridge +6 | rolling rate-limit observation ring + dashboard badge |
-| PH-WAVE2H | c015cf3 | n/a | firehose row category CSS accents (H-event family) |
-| PH-WAVE2I | 9c02c8e | bridge +2 | auto-cooldown on rate-limit storm (closes ladder loop) |
-| PH-WAVE2J | 0a99235 | n/a | auto-cooldown vs operator-quarantine distinction on dashboard |
-| PH-WAVE2K | 5032f80 | n/a | consolidated /v1/providers/health ops endpoint |
-| PH-WAVE2L | 5190ab5 | cli +2 | relix-cli ops providers-health subcommand |
-| CW4 | 36ddf7c | runtime +12 | tool.browser.* honest scaffold (NoneBackend) |
-| CW5 | fced41f | runtime +13 | tool.mcp.* registry + discovery scaffold |
-| PH-DASH3 | 4f69a3a | bridge +1 | #/capabilities dashboard page (filter chips + text) |
-| PH-DASH3-CLI | c9d985d | cli +1 | relix-cli ops capabilities subcommand |
-| PH-ROUTER1 | 40eaa28 | runtime +6 | provider router scaffold (NoopRouter trait) |
-| PH-FS-PARITY1 | 7d39590 | runtime +6 | tool.append_file + tool.patch_preview (Hermes file_operations parity) |
-| docs(capability) | d240309 | n/a | canonical docs/capabilities.md index of every shipped capability |
-| PH-OPS-EVENTS | a738a12 | cli +1 | relix-cli ops events — H2 firehose snapshot |
-| PH-WEB-ROBOTS | 45ea5b3 | runtime +14 | tool.web.robots_check (RFC 9309 robots.txt sniff) |
-| PH-FS-PARITY2 | d134ce5 | runtime +10 | tool.binary_sniff (Hermes binary_extensions parity) |
-| PH-ROUTER2 | 41ee3bb | runtime +11 | HealthAwareRouter — health-aware provider picker |
-| PH-ROUTER-PREVIEW | 16d44c0 | bridge +2 | POST /v1/providers/route_test endpoint |
-| PH-ROUTER-PREVIEW-CLI | b228cf2 | cli +1 | relix-cli ops route-test subcommand |
-| PH-ROUTER-NODE | 689f819 | core +5, runtime +16 (10 unit, 6 acceptance), cli +0 | Router Node — new controller role (role="router"); 4 router.* caps; heartbeat + reaper loops; CLI router status/peers/sessions; configs/router-node.toml; configs/policies/router.toml |
-| D-006 closure | 45ea5b3 | n/a | answered:c — recovery_scan terminal_summary already shipped |
-
-Aggregate: ~10300+ LOC; runtime tests 419 → 497, bridge tests
-192 → 220, relix-core 33 → 61, relix-cli 54 → 61. Every
-milestone clean fmt + clippy + tests. Total workspace = ~796
-passing tests.
-
-The PH-ROUTER cluster (R1 scaffold → R2 health-aware impl →
-PREVIEW bridge endpoint → CLI subcommand) ships a complete
-operator-facing routing-preview stack without touching the AI
-node's live request path. Operators can now ask "given current
-provider state, who would the smart router pick if I sent a
-chat call right now?" via dashboard fetch OR `relix-cli ops
-route-test --candidates X,Y,Z` without sending an actual chat
-call. Pure observability; the AI node wiring lands when the
-single-provider → multi-provider config switch happens.
-
-The PH-WAVE2 cluster (G..L) ships a complete bridge-side
-rate-limit ladder + ops surface: per-provider observation ring →
-auto-cooldown trigger → distinct dashboard banner → consolidated
-endpoint → CLI snapshot. Operators can see what's rate-limited,
-why the bridge stopped trying, and how the AI stack is overall —
-all without grep-driving logs. The remaining work is
-AI-controller-side cross-provider failover (which needs the
-router/executor work that PHASE H9 calls for).
-
-A deadlock was introduced and fixed during PH-WAVE2D: the
-initial `set_task_todos` impl called `self.list_task_todos`
-after `tx.commit()` while still holding the `std::sync::Mutex`
-guard (mutex is non-reentrant). Caught by a hang in the
-`todo_set_empty_clears_list` test; rewritten to re-prepare
-the SELECT inside the same guard scope.
-
-Plus an Explore-agent-generated `docs/internal/hermes-capability-map.md`
-inventorying all 76 Hermes tools / 35 skills / 11+ platforms with
-per-row Relix parity status. New D-007 logged
-(computer_use_tool backend choice).
-
-H3 (iteration budget grace-call) was deferred per D-006 — needs
-an executor consumer that doesn't exist yet. Decision logged.
-
-After H8 + H9 + H10 every operator/provider-supplied free-text
-boundary in the coordinator and bridge is covered by the
-redaction scrubber. PH-WAVE2D extended that to the new
-task.todo_set path so todo text gets scrubbed too. Chronicle,
-audit log, dashboard timeline, todo lists: all secret-safe.
-
-### What the user paused on tonight
-- Asked the runtime to keep going all night and to log
-  decisions it can't safely make to a pending-decisions doc.
-- The pending-decisions doc is the source of truth for what
-  needs operator sign-off in the morning.
-
----
-
-Generated at the request of the user when their Claude usage
-limit was about to exhaust. Treat this file as the source of
-truth for resume — do not require any session-context recovery
-beyond reading it.
