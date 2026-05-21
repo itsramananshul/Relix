@@ -9,16 +9,16 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `aa37f66 feat(tool): PH-WEB-POST tool.web.post with body + cookie support`
+- **HEAD:** `8304d21 test(capability): PH-WEB-POST-RISK-CROSS regression guards on web_post + --risk filter`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1092 passing, 0 failures
+- **Workspace tests:** 1093 passing, 0 failures
   - relix-core: 66
-  - relix-policy: 66
-  - relix-runtime: 663
+  - relix-policy: 72
+  - relix-runtime: 664
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
-  - relix-cli: 34
+  - relix-cli: 31 (lib) + 2 (bin)
   - relix-web-bridge: 232
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
@@ -55,6 +55,7 @@ as the resume command.
 | 10bb4d9 | PH-DASH-MCP | dashboard #/mcp page with server table + expandable tools per row |
 | 155ca06 | PH-BRIDGE-MCP-INVOKE | POST /v1/mcp/invoke bridge proxy (502 until D-009 unblocks runtime) |
 | aa37f66 | PH-WEB-POST | tool.web.post — POST + body + raw cookie header + Set-Cookie response capture |
+| 8304d21 | PH-WEB-POST-RISK-CROSS | regression guards: web POST descriptors are Medium-tier + --risk medium+ surfaces tool.web.post |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
