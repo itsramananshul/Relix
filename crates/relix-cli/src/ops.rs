@@ -1,13 +1,16 @@
-//! PH-WAVE2L — `relix-cli ops` operator-facing CLI snapshots.
+//! `relix-cli ops` — operator-facing CLI snapshots.
 //!
-//! Today: a single subcommand `providers-health` that hits the
-//! bridge's `GET /v1/providers/health` (PH-WAVE2K) and pretty-
-//! prints a one-screen ops view. Useful for status-line scripts,
-//! on-call triage, and tmux dashboards.
+//! Subcommands:
+//! - `providers-health` (PH-WAVE2L) — hits the bridge's
+//!   `/v1/providers/health` and pretty-prints aggregate +
+//!   per-provider state.
+//! - `capabilities` (PH-DASH3-CLI) — hits `/v1/topology` and
+//!   pretty-prints every capability the bridge has discovered,
+//!   mirroring the dashboard's PH-DASH3 explorer for terminal
+//!   operators.
 //!
-//! Future: this module is the right home for additional ops
-//! views — `relix-cli ops stuck`, `relix-cli ops thrash`, etc. —
-//! all of which mirror the per-provider snapshot pattern.
+//! All subcommands are one-shot HTTP-against-bridge — useful
+//! for status-line scripts, on-call triage, and tmux dashboards.
 
 use clap::Subcommand;
 use serde::Deserialize;
@@ -26,11 +29,33 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// List every capability the bridge has discovered across
+    /// every peer in the cached topology. Mirrors the dashboard's
+    /// PH-DASH3 capability explorer for terminal operators.
+    /// Source is `/v1/topology` — each peer's methods[]
+    /// aggregated.
+    Capabilities {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Filter by capability prefix (e.g. `tool.web`).
+        /// Substring match, case-insensitive. Empty = all.
+        #[arg(long, default_value = "")]
+        filter: String,
+        /// Raw JSON instead of the table view.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Cmd::ProvidersHealth { bridge, json } => providers_health(&bridge, json).await,
+        Cmd::Capabilities {
+            bridge,
+            filter,
+            json,
+        } => capabilities(&bridge, &filter, json).await,
     }
 }
 
@@ -116,6 +141,83 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+async fn capabilities(
+    bridge: &str,
+    filter: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/topology", bridge.trim_end_matches('/'));
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let topo: TopologyResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("bridge returned non-JSON body: {e}\nraw:\n{body}"))?;
+    let needle = filter.trim().to_ascii_lowercase();
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for p in &topo.peers {
+        let alias = p.alias.clone().unwrap_or_else(|| "(none)".to_string());
+        for m in &p.methods {
+            if !needle.is_empty() && !m.to_ascii_lowercase().contains(&needle) {
+                continue;
+            }
+            rows.push((
+                m.clone(),
+                alias.clone(),
+                p.node_type.clone(),
+                p.freshness.clone(),
+            ));
+        }
+    }
+    rows.sort();
+    let total_methods: usize = topo.peers.iter().map(|p| p.methods.len()).sum();
+    println!(
+        "capabilities  shown={shown}  total={total}  peers={peers}",
+        shown = rows.len(),
+        total = total_methods,
+        peers = topo.peers.len(),
+    );
+    if rows.is_empty() {
+        if needle.is_empty() {
+            println!("(no capabilities discovered yet)");
+        } else {
+            println!("(no capabilities match filter \"{needle}\")");
+        }
+        return Ok(());
+    }
+    println!();
+    let m_h = "capability";
+    let a_h = "alias";
+    let t_h = "node_type";
+    let f_h = "freshness";
+    println!("{m_h:<36}  {a_h:<14}  {t_h:<14}  {f_h}");
+    for (method, alias, node_type, fresh) in &rows {
+        println!("{method:<36}  {alias:<14}  {node_type:<14}  {fresh}",);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct TopologyResponse {
+    #[serde(default)]
+    peers: Vec<TopologyPeer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopologyPeer {
+    #[serde(default)]
+    alias: Option<String>,
+    node_type: String,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    freshness: String,
 }
 
 async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -216,5 +318,33 @@ mod tests {
         let h: HealthResponse = serde_json::from_str(body).unwrap();
         assert!(h.providers.is_empty());
         assert_eq!(h.aggregate.cooldowns_active, 0);
+    }
+
+    #[test]
+    fn parse_topology_for_capabilities() {
+        // PH-DASH3-CLI: minimal topology body the capabilities
+        // subcommand needs. Aliases optional; methods required;
+        // freshness propagated.
+        let body = r#"{
+            "peers": [
+                {
+                    "alias": "tool",
+                    "node_id": "abc",
+                    "node_type": "tool",
+                    "node_name": "t",
+                    "manifest_version": 1,
+                    "capability_count": 2,
+                    "methods": ["tool.web_fetch", "tool.web_search"],
+                    "last_refreshed_at": 1,
+                    "last_refreshed_secs_ago": 5,
+                    "freshness": "fresh"
+                }
+            ],
+            "generated_at": 0
+        }"#;
+        let t: TopologyResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(t.peers.len(), 1);
+        assert_eq!(t.peers[0].methods.len(), 2);
+        assert_eq!(t.peers[0].freshness, "fresh");
     }
 }
