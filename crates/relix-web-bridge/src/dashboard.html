@@ -399,6 +399,35 @@
     .event.retry       { border-left-color: var(--warn); }
     .event.interrupted { border-left-color: var(--warn); }
     .event.failed      { border-left-color: var(--danger); }
+    /* PH-WAVE2H: category accents for the H-event family.
+       Inherit existing color tokens (var(--warn), var(--danger),
+       var(--ok)) so a single palette switch later cascades to
+       every accent without per-rule edits. */
+    .event.thrash      { border-left-color: var(--danger); }
+    .event.terminal    { border-left-color: var(--ok); }
+    .event.orphan      { border-left-color: var(--warn); }
+    .event.pause       { border-left-color: var(--warn); }
+    .event.freeze      { border-left-color: var(--warn); }
+    .event.investigate { border-left-color: var(--warn); }
+    .event.lineage     { border-left-color: var(--accent); }
+    .event.note        { border-left-color: var(--dim); }
+    /* PH-WAVE2H firehose-row accent: pulled into the
+       leading <td> so the same category tags work on the
+       table cell layout (firehose, intervention audit,
+       per-task chronicle table). */
+    tr.evrow.thrash       td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+    tr.evrow.terminal     td:first-child { box-shadow: inset 3px 0 0 var(--ok); }
+    tr.evrow.orphan       td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    tr.evrow.pause        td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    tr.evrow.freeze       td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    tr.evrow.investigate  td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    tr.evrow.retry        td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    tr.evrow.interrupted  td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+    tr.evrow.failed       td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+    tr.evrow.attempt      td:first-child { box-shadow: inset 3px 0 0 var(--ok); }
+    tr.evrow.lineage      td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+    tr.evrow.note         td:first-child { box-shadow: inset 3px 0 0 var(--dim); }
+    tr.evrow.task         td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
     .event .type    { font-weight: 600; color: var(--text); }
     .event .payload { color: var(--text-muted); margin-left: 8px; }
     .peer-link {
@@ -3476,7 +3505,13 @@ function renderGlobalFirehose(errored) {
     // it's globally unique within the ring.
     const rowId = (e.task_id || 'nt') + '-' + (e.event_id || 0);
     const detail = escapeHtml(eventDetailBody(e));
-    return '<tr class="evrow" data-evrow-id="' + escapeHtml(rowId) + '" style="cursor: pointer;">'
+    // PH-WAVE2H: category-tagged row class so operators get
+    // visual differentiation for H-events (thrash / terminal /
+    // orphan / interruption / lineage / etc.) without changing
+    // the existing layout.
+    const cat = eventClass(e.event_type || '');
+    return '<tr class="evrow ' + escapeHtml(cat) + '" data-evrow-id="'
+      + escapeHtml(rowId) + '" style="cursor: pointer;">'
       + '<td class="meta">' + escapeHtml(ago) + '</td>'
       + '<td>' + taskCell + '</td>'
       + '<td><code>' + escapeHtml(e.event_type || '') + '</code></td>'
@@ -6048,11 +6083,32 @@ function isAttemptBand(e) {
 }
 
 function eventClass(t) {
-  if (t.startsWith('task.attempt')) return 'attempt';
-  if (t.startsWith('task.retry'))   return 'retry';
-  if (t === 'task.interrupted')     return 'interrupted';
-  if (t === 'task.failed')          return 'failed';
-  if (t.startsWith('task.'))        return 'task';
+  // PH-WAVE2H: tighter category mapping for the new H-events
+  // so the firehose + chronology pages color-code them
+  // distinctly from generic task.* events. Categories use
+  // existing CSS hooks where possible (.warn/.danger badges)
+  // so adding a new class doesn't require new stylesheet rules.
+  if (t === 'task.thrash_detected')        return 'thrash danger';
+  if (t === 'task.terminal_summary')       return 'terminal ok';
+  if (t === 'task.attempt_orphan_closed')  return 'orphan warn';
+  if (t === 'task.pause_requested'
+   || t === 'task.pause_observed'
+   || t === 'task.resume_requested'
+   || t === 'task.resume_observed')        return 'pause warn';
+  if (t === 'task.freeze_requested'
+   || t === 'task.unfreeze_requested'
+   || t === 'task.freeze_propagated')      return 'freeze warn';
+  if (t === 'task.investigation_marked')   return 'investigate warn';
+  if (t === 'task.investigation_cleared')  return 'investigate ok';
+  if (t === 'task.operator_note')          return 'note';
+  if (t === 'task.spawned_child'
+   || t === 'task.delegated_to'
+   || t === 'task.awaiting')               return 'lineage';
+  if (t.startsWith('task.attempt'))        return 'attempt';
+  if (t.startsWith('task.retry'))          return 'retry';
+  if (t === 'task.interrupted')            return 'interrupted';
+  if (t === 'task.failed')                 return 'failed';
+  if (t.startsWith('task.'))               return 'task';
   return '';
 }
 
