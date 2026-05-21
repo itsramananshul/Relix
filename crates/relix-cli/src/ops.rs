@@ -77,6 +77,22 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// W2-006c mirror: per-capability invocation + latency
+    /// counters from a peer's DispatchBridge, fetched via
+    /// `GET /v1/dispatch/stats`. Sorted by mean latency desc —
+    /// the slowest capability shows first. Lifetime counters,
+    /// reset on peer restart.
+    DispatchStats {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Target peer alias.
+        #[arg(long, default_value = "tool")]
+        peer: String,
+        /// Raw JSON instead of the table view.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Recent cross-task events from /v1/tasks/events/recent.
     /// Mirrors the dashboard firehose for terminal operators
     /// — shows the H2 one-line summary projection per row.
@@ -121,6 +137,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             candidates,
             json,
         } => route_test(&bridge, &candidates, json).await,
+        Cmd::DispatchStats { bridge, peer, json } => dispatch_stats(&bridge, &peer, json).await,
     }
 }
 
@@ -539,6 +556,113 @@ async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
         return Err(format!("bridge returned HTTP {status}: {body}").into());
     }
     Ok(body)
+}
+
+// W2-006c CLI mirror: GET /v1/dispatch/stats?peer=...
+
+#[derive(Debug, Deserialize)]
+struct DispatchStatsResp {
+    #[serde(default)]
+    peer: String,
+    #[serde(default)]
+    rows: Vec<DispatchStatsRow>,
+    #[serde(default)]
+    count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // last_invoked_at / last_error_at preserved for future "stale" detection
+struct DispatchStatsRow {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    invocations: u64,
+    #[serde(default)]
+    errors: u64,
+    #[serde(default)]
+    denied: u64,
+    #[serde(default)]
+    unknown_method: u64,
+    #[serde(default)]
+    last_invoked_at: i64,
+    #[serde(default)]
+    last_error_at: Option<i64>,
+    #[serde(default)]
+    latency_samples: u64,
+    #[serde(default)]
+    last_elapsed_ms: u64,
+    #[serde(default)]
+    max_elapsed_ms: u64,
+    #[serde(default)]
+    mean_elapsed_ms: u64,
+}
+
+async fn dispatch_stats(
+    bridge: &str,
+    peer: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/v1/dispatch/stats?peer={peer}",
+        bridge.trim_end_matches('/')
+    );
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let parsed: DispatchStatsResp = serde_json::from_str(&body)
+        .map_err(|e| format!("decode /v1/dispatch/stats body: {e} (body={body})"))?;
+    if parsed.rows.is_empty() {
+        println!(
+            "(no dispatch activity on peer '{p}' — count={c})",
+            p = parsed.peer,
+            c = parsed.count
+        );
+        return Ok(());
+    }
+    // Sort by mean elapsed desc (tied: invocations desc).
+    let mut rows = parsed.rows;
+    rows.sort_by(|a, b| {
+        b.mean_elapsed_ms
+            .cmp(&a.mean_elapsed_ms)
+            .then_with(|| b.invocations.cmp(&a.invocations))
+    });
+    let m_h = "method";
+    let i_h = "invocs";
+    let e_h = "errs";
+    let mean_h = "mean";
+    let max_h = "max";
+    let last_h = "last";
+    let samples_h = "samples";
+    println!("{m_h:<36}  {i_h:>7}  {e_h:>5}  {mean_h:>6}  {max_h:>6}  {last_h:>6}  {samples_h:>7}",);
+    for r in &rows {
+        let method = truncate(&r.method, 36);
+        let errs = r.errors + r.denied + r.unknown_method;
+        println!(
+            "{method:<36}  {invocs:>7}  {errs:>5}  {mean:>5}ms  {max:>5}ms  {last:>5}ms  {samples:>7}",
+            method = method,
+            invocs = r.invocations,
+            errs = errs,
+            mean = r.mean_elapsed_ms,
+            max = r.max_elapsed_ms,
+            last = r.last_elapsed_ms,
+            samples = r.latency_samples,
+        );
+    }
+    println!("count={}", parsed.count);
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 // Loose deserializers — we accept whatever the bridge sends and
