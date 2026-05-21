@@ -278,6 +278,16 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.note utf8: {e}"))
     }
 
+    /// Execution-lineage walk from a root task (M66). Args:
+    /// task_id + max_depth (defaulted client-side to 4 when
+    /// 0). Returns the coord body verbatim — the bridge
+    /// handler parses it into a typed JSON envelope.
+    pub async fn lineage(&self, task_id: &str, max_depth: usize) -> Result<String, String> {
+        let arg = format!("{task_id}|{max_depth}");
+        let bytes = self.call("task.lineage", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.lineage utf8: {e}"))
+    }
+
     /// Operator-initiated pause (M65). Args: task_id + optional
     /// reason. Returns the coordinator body verbatim
     /// (`prior_status=<status>`). Same fail-soft handling as

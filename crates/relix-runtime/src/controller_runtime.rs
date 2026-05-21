@@ -490,6 +490,17 @@ fn register_node_type_handlers(
                 &["task", "write", "intervene", "operator"],
             ),
             (
+                "task.lineage",
+                "BFS execution-lineage walk from a root task. \
+                 Args: `task_id|max_depth`. Returns the set of \
+                 related tasks + the edges connecting them. \
+                 Today only `retried_from` edges populate the \
+                 graph (within-task only); other edge types in \
+                 the schema are reserved for future runtime \
+                 producers (spawned/delegated_to/parallel_branch/etc.).",
+                &["task", "read", "graph", "lineage", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -525,7 +536,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage"
         );
     }
     if cfg.controller.node_type == "tool" {

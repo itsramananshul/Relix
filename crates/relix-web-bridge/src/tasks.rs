@@ -1382,6 +1382,150 @@ pub async fn edges(
     Ok(Json(parse_edges(&body)))
 }
 
+// ── M66: execution-lineage traversal ───────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct LineageQuery {
+    #[serde(default)]
+    pub depth: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LineageEdge {
+    pub edge_id: i64,
+    pub edge_type: String,
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_task_id: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LineageResponse {
+    pub root_task_id: String,
+    pub tasks: Vec<String>,
+    pub edges: Vec<LineageEdge>,
+    pub cross_task_edge_count: usize,
+    pub max_depth_walked: usize,
+    /// Honest note — bridge-supplied, surfaces the runtime
+    /// gap to operators consuming the JSON directly (not
+    /// just via the dashboard). Always present.
+    pub note: String,
+}
+
+/// `GET /v1/tasks/:id/lineage?depth=N` — BFS execution
+/// lineage. Returns the set of related tasks + the edges
+/// connecting them. Today only `retried_from` populates the
+/// graph (intra-task only).
+pub async fn lineage_graph(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<LineageQuery>,
+) -> Result<Json<LineageResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let depth = q.depth.unwrap_or(4);
+    let body = rec
+        .lineage(&id, depth)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_lineage_body(&id, &body)))
+}
+
+/// Parse the multi-line tab-delimited body emitted by the
+/// Coordinator's `task.lineage` handler into a typed
+/// envelope. Tolerant of missing header fields (`root=`,
+/// `tasks=`, `cross_task_edges=`, `max_depth=`) — fills
+/// honest defaults.
+fn parse_lineage_body(fallback_root: &str, body: &str) -> LineageResponse {
+    let mut root = fallback_root.to_string();
+    let mut tasks: Vec<String> = vec![fallback_root.to_string()];
+    let mut cross_task_edge_count = 0usize;
+    let mut max_depth_walked = 4usize;
+    let mut edges: Vec<LineageEdge> = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("root=") {
+            root = rest.trim().to_string();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("tasks=") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                tasks = trimmed.split(',').map(str::to_string).collect();
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("cross_task_edges=") {
+            cross_task_edge_count = rest.trim().parse().unwrap_or(0);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("max_depth=") {
+            max_depth_walked = rest.trim().parse().unwrap_or(max_depth_walked);
+            continue;
+        }
+        // Edge row: edge_id\tedge_type\ttask_id\trelated_task_id\tcreated_at
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 5 {
+            continue;
+        }
+        let Ok(edge_id) = parts[0].parse::<i64>() else {
+            continue;
+        };
+        let related = if parts[3] == "-" || parts[3].is_empty() {
+            None
+        } else {
+            Some(parts[3].to_string())
+        };
+        let Ok(created_at) = parts[4].parse::<i64>() else {
+            continue;
+        };
+        edges.push(LineageEdge {
+            edge_id,
+            edge_type: parts[1].to_string(),
+            task_id: parts[2].to_string(),
+            related_task_id: related,
+            created_at,
+        });
+    }
+    let note = if cross_task_edge_count == 0 {
+        // Honest scope note that the dashboard surfaces too.
+        "no cross-task edges recorded yet — only retried_from \
+         producers ship today, and they link a task to itself; \
+         spawned/delegated_to/parallel_branch/blocked_on/awaited/\
+         resumed_from remain reserved in the schema until \
+         runtime primitives emit them."
+            .to_string()
+    } else {
+        format!(
+            "{cross_task_edge_count} cross-task edge(s) recorded \
+             across {} related task(s); only retried_from has a \
+             producer today, so cross-task edges are unusual but \
+             genuine when present.",
+            tasks.len().saturating_sub(1)
+        )
+    };
+    LineageResponse {
+        root_task_id: root,
+        tasks,
+        edges,
+        cross_task_edge_count,
+        max_depth_walked,
+        note,
+    }
+}
+
 /// **Experimental** SSE wrapper around `task.events` polling.
 ///
 /// `GET /v1/tasks/:id/events/stream?since=N` opens an SSE stream
@@ -2132,6 +2276,51 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].updated_at, None);
         assert_eq!(items[0].investigation_marked_at, None);
+    }
+
+    #[test]
+    fn parse_lineage_body_returns_honest_note_when_no_cross_task_edges() {
+        let body = "root=abc\n\
+                    tasks=abc\n\
+                    cross_task_edges=0\n\
+                    max_depth=4\n\
+                    1\tretried_from\tabc\tabc\t1700000000\n";
+        let r = parse_lineage_body("abc", body);
+        assert_eq!(r.root_task_id, "abc");
+        assert_eq!(r.tasks, vec!["abc"]);
+        assert_eq!(r.cross_task_edge_count, 0);
+        assert_eq!(r.max_depth_walked, 4);
+        assert_eq!(r.edges.len(), 1);
+        assert_eq!(r.edges[0].edge_type, "retried_from");
+        assert_eq!(r.edges[0].related_task_id.as_deref(), Some("abc"));
+        // Honest note — operators reading the JSON directly see
+        // the gap surfaced.
+        assert!(r.note.contains("reserved in the schema"));
+    }
+
+    #[test]
+    fn parse_lineage_body_handles_dash_related_task() {
+        // The coord emits `-` for a NULL related_task_id; the
+        // parser must lift that to None rather than carry it
+        // as a literal string.
+        let body = "root=abc\n\
+                    tasks=abc\n\
+                    cross_task_edges=0\n\
+                    max_depth=4\n\
+                    5\tretried_from\tabc\t-\t1700000000\n";
+        let r = parse_lineage_body("abc", body);
+        assert_eq!(r.edges.len(), 1);
+        assert!(r.edges[0].related_task_id.is_none());
+    }
+
+    #[test]
+    fn parse_lineage_body_acknowledges_cross_task_count_in_note() {
+        let body = "root=abc\n\
+                    tasks=abc,xyz\n\
+                    cross_task_edges=2\n\
+                    max_depth=4\n";
+        let r = parse_lineage_body("abc", body);
+        assert!(r.note.contains("2 cross-task edge"));
     }
 
     #[test]

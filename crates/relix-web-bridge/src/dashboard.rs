@@ -697,6 +697,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_lineage_panel_landmarks_present() {
+        // M66 (Track A): execution-lineage panel ships on
+        // task detail. Fetches /v1/tasks/:id/lineage and
+        // renders the typed envelope including the honest
+        // "no cross-task edges recorded yet" note when
+        // applicable.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "function fetchLineageGraph",
+            "function renderLineagePanel",
+            "id=\"lineage-slot\"",
+            "/lineage?depth=",
+            "Execution lineage",
+        ] {
+            assert!(body.contains(needle), "M66 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_critical_segment_present() {
         // M59 (Track A): exec graph computes + highlights the
         // single largest wall-clock contributor (attempt or

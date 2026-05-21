@@ -218,6 +218,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/:id", get(tasks::get_one))
         .route("/v1/tasks/:id/attempts", get(tasks::attempts))
         .route("/v1/tasks/:id/edges", get(tasks::edges))
+        // M66: execution-lineage BFS from a root task. Walks
+        // task_edges in both directions up to ?depth=N
+        // (clamped to [1, 16]). Honest about edge-type
+        // producers — see /v1/tasks/:id/lineage response note.
+        .route("/v1/tasks/:id/lineage", get(tasks::lineage_graph))
         // Cross-task execution edges aggregate. Registered
         // before `/v1/tasks/:id` is matched — axum's static
         // matching prefers exact paths.

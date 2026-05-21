@@ -913,6 +913,111 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// Walk the task execution lineage outward from a root
+    /// task (M66). BFS over the `task_edges` table in both
+    /// directions: downstream when an edge has
+    /// `related_task_id == root` (root spawned/retried-from
+    /// child) and upstream when `task_id == root` and
+    /// `related_task_id != root` (someone else spawned root).
+    /// `max_depth` caps traversal depth to bound runaway
+    /// cycles a future producer might introduce.
+    ///
+    /// Returns the set of task ids reachable + every edge
+    /// connecting them + a `cross_task_edge_count` summary.
+    /// HONEST: with only `retried_from` shipping today (which
+    /// links the same task_id to itself), the cross-task count
+    /// is effectively always zero until other edge producers
+    /// land. The dashboard surfaces this distinction.
+    pub fn task_lineage(
+        &self,
+        root_task_id: &str,
+        max_depth: usize,
+    ) -> Result<TaskLineageGraph, CoordinatorError> {
+        let cap_depth = max_depth.clamp(1, 16);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // BFS frontier. Each entry is (task_id, depth). We
+        // explore both directions in one pass: every row where
+        // task_id == frontier or related_task_id == frontier.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut edges: Vec<TaskEdge> = Vec::new();
+        let mut frontier: Vec<(String, usize)> = vec![(root_task_id.to_string(), 0)];
+        seen.insert(root_task_id.to_string());
+        let mut stmt = conn
+            .prepare(
+                "SELECT edge_id, task_id, attempt_id, edge_type,
+                        related_task_id, related_attempt_id,
+                        spawned_by_event_id, created_at
+                 FROM task_edges
+                 WHERE task_id = ?1 OR related_task_id = ?1
+                 ORDER BY edge_id ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        while let Some((tid, depth)) = frontier.pop() {
+            if depth >= cap_depth {
+                continue;
+            }
+            let rows = stmt
+                .query_map(params![&tid], |r| {
+                    Ok(TaskEdge {
+                        edge_id: r.get(0)?,
+                        task_id: r.get(1)?,
+                        attempt_id: r.get(2)?,
+                        edge_type: r.get(3)?,
+                        related_task_id: r.get(4)?,
+                        related_attempt_id: r.get(5)?,
+                        spawned_by_event_id: r.get(6)?,
+                        created_at: r.get(7)?,
+                    })
+                })
+                .map_err(CoordinatorError::Db)?;
+            for r in rows {
+                let edge = r.map_err(CoordinatorError::Db)?;
+                let other = if edge.task_id == tid {
+                    edge.related_task_id.clone()
+                } else {
+                    Some(edge.task_id.clone())
+                };
+                // Push to frontier if other side is a different
+                // task we haven't visited yet.
+                if let Some(o) = other.as_ref()
+                    && o != &tid
+                    && !seen.contains(o)
+                {
+                    seen.insert(o.clone());
+                    frontier.push((o.clone(), depth + 1));
+                }
+                // Dedupe edges by edge_id while preserving
+                // chronological order.
+                if !edges.iter().any(|e| e.edge_id == edge.edge_id) {
+                    edges.push(edge);
+                }
+            }
+        }
+        edges.sort_by_key(|e| e.edge_id);
+        let cross_task_edges = edges
+            .iter()
+            .filter(|e| {
+                e.related_task_id
+                    .as_deref()
+                    .is_some_and(|other| other != e.task_id)
+            })
+            .count();
+        // Sort the task list for deterministic output: root
+        // first, then the rest lexicographically. Operators
+        // scan the list top-down.
+        let mut tasks: Vec<String> = seen.into_iter().collect();
+        if let Some(pos) = tasks.iter().position(|t| t == root_task_id) {
+            tasks.swap(0, pos);
+        }
+        Ok(TaskLineageGraph {
+            root_task_id: root_task_id.to_string(),
+            tasks,
+            edges,
+            cross_task_edge_count: cross_task_edges,
+            max_depth_walked: cap_depth,
+        })
+    }
+
     /// List the most recent execution edges across ALL tasks.
     /// Operators use this to spot patterns ("retry storm on
     /// task X") without per-task drill-in. Newest-first by
@@ -2033,6 +2138,31 @@ pub struct AttemptView {
     pub failure_class: Option<String>,
 }
 
+/// Aggregate output of [`TaskStore::task_lineage`] (M66).
+/// The set of related tasks + the edges connecting them +
+/// summary fields the dashboard needs to render an honest
+/// lineage panel.
+#[derive(Debug, Clone)]
+pub struct TaskLineageGraph {
+    pub root_task_id: String,
+    /// Distinct task ids in the lineage, root first. With only
+    /// `retried_from` producers shipping today, this is
+    /// typically `[root_task_id]` alone.
+    pub tasks: Vec<String>,
+    /// All edges touching any task in the lineage, ordered
+    /// by `edge_id`.
+    pub edges: Vec<TaskEdge>,
+    /// Edges where `task_id != related_task_id`. Distinct
+    /// from `edges.len()` because intra-task `retried_from`
+    /// dominates today. Operators read this as "how many
+    /// cross-task relationships are recorded for this root."
+    pub cross_task_edge_count: usize,
+    /// The depth the BFS was capped to. Echoed back so the
+    /// dashboard can render "showing edges up to depth N
+    /// (raise depth to see more)" without recomputing.
+    pub max_depth_walked: usize,
+}
+
 /// One row from `task_edges`. An execution edge that originated
 /// from a recorded runtime action — never synthesised. See the
 /// `edge_type` taxonomy in the `task_edges` schema docblock.
@@ -2255,6 +2385,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_resume(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.lineage",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_lineage(&s, &ctx) }
             })),
         );
     }
@@ -3096,6 +3236,55 @@ fn handle_note(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.note: not found: {id}")),
         Err(CoordinatorError::Invalid(msg)) => invalid(msg),
         Err(e) => internal(format!("task.note: {e}")),
+    }
+}
+
+/// `task.lineage` — BFS execution lineage from a root task
+/// (M66). Args: `task_id|max_depth`. max_depth defaults to 4,
+/// clamped to `[1, 16]`. Returns a multi-line tab-delimited
+/// body:
+///   `root=<task_id>`
+///   `tasks=<id1>,<id2>,...`
+///   `cross_task_edges=<count>`
+///   `max_depth=<n>`
+///   one tab-delimited row per edge:
+///   `<edge_id>\t<edge_type>\t<task_id>\t<related_task_id>\t<created_at>`
+/// Empty body (just the header lines) when no edges exist.
+fn handle_lineage(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.lineage utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    let task_id = parts.first().copied().unwrap_or("").trim();
+    if task_id.is_empty() {
+        return invalid("task.lineage: task_id required".to_string());
+    }
+    let max_depth: usize = parts
+        .get(1)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    match store.task_lineage(task_id, max_depth) {
+        Ok(g) => {
+            let mut buf = String::new();
+            buf.push_str(&format!("root={}\n", g.root_task_id));
+            buf.push_str("tasks=");
+            buf.push_str(&g.tasks.join(","));
+            buf.push('\n');
+            buf.push_str(&format!("cross_task_edges={}\n", g.cross_task_edge_count));
+            buf.push_str(&format!("max_depth={}\n", g.max_depth_walked));
+            for e in &g.edges {
+                let related = e.related_task_id.as_deref().unwrap_or("-");
+                buf.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    e.edge_id, e.edge_type, e.task_id, related, e.created_at,
+                ));
+            }
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("task.lineage: {e}")),
     }
 }
 
@@ -5606,6 +5795,66 @@ mod tests {
             elapsed.as_secs() < 5,
             "incremental 5000-event walk took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn task_lineage_with_only_retried_from_returns_self_no_cross_task() {
+        // M66 + honest scope: with only retried_from
+        // producers shipping today, the lineage of a task
+        // walked from itself returns just that task. The
+        // cross_task_edge_count is 0 — we don't fabricate.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        // Force a retry to land a retried_from edge.
+        let _ = s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("oops"),
+            Some("transient"),
+        );
+        let _ = s.request_retry(&tid);
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+
+        let g = s.task_lineage(&tid, 4).unwrap();
+        assert_eq!(g.root_task_id, tid);
+        assert_eq!(g.tasks, vec![tid.clone()]);
+        // retried_from edges are intra-task — cross-task
+        // count must stay 0 even when the edge exists.
+        assert_eq!(g.cross_task_edge_count, 0);
+        // But the edge should be present in `edges`.
+        assert!(g.edges.iter().any(|e| e.edge_type == "retried_from"));
+        assert_eq!(g.max_depth_walked, 4);
+    }
+
+    #[test]
+    fn task_lineage_on_unrelated_task_returns_just_root() {
+        let s = store();
+        let tid = mk(&s, "lonely", "f", "{}", "o");
+        let g = s.task_lineage(&tid, 8).unwrap();
+        assert_eq!(g.tasks, vec![tid]);
+        assert!(g.edges.is_empty());
+        assert_eq!(g.cross_task_edge_count, 0);
+    }
+
+    #[test]
+    fn task_lineage_max_depth_clamped() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Even a max_depth=0 caller gets clamped up to 1, the
+        // minimum (otherwise BFS exits immediately and emits
+        // nothing about the root).
+        let g = s.task_lineage(&tid, 0).unwrap();
+        assert!(g.max_depth_walked >= 1);
+        // Sky-high caller gets clamped down.
+        let g2 = s.task_lineage(&tid, 9999).unwrap();
+        assert!(g2.max_depth_walked <= 16);
     }
 
     #[test]

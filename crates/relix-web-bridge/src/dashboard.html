@@ -3205,6 +3205,75 @@ function initTasks() {
   tasksInited = true;
 }
 
+/* M66: execution-lineage panel. Fetches /v1/tasks/:id/lineage
+   and renders the related-tasks list + edge count + honest
+   note about which edge types have producers. Empty / fail
+   states stay quiet so the panel never invents structure. */
+async function fetchLineageGraph(taskId) {
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/lineage?depth=4');
+    if (!r.ok) {
+      renderLineagePanel(null);
+      return;
+    }
+    const j = await r.json();
+    renderLineagePanel(j);
+  } catch (_) {
+    renderLineagePanel(null);
+  }
+}
+
+function renderLineagePanel(payload) {
+  const $slot = document.getElementById('lineage-slot');
+  if (!$slot) return;
+  if (!payload) {
+    $slot.innerHTML = '';
+    return;
+  }
+  const tasks = payload.tasks || [];
+  const edges = payload.edges || [];
+  const cross = payload.cross_task_edge_count || 0;
+  const relatedTaskRows = tasks
+    .filter(t => t !== payload.root_task_id)
+    .map(t => '<li><a href="#/tasks/' + encodeURIComponent(t)
+      + '" class="id">' + escapeHtml(t) + '</a></li>')
+    .join('');
+  const edgeRows = edges.map(e => {
+    const related = e.related_task_id
+      ? '<a href="#/tasks/' + encodeURIComponent(e.related_task_id)
+        + '" class="id">' + escapeHtml(e.related_task_id) + '</a>'
+      : '<span class="meta">(intra-task)</span>';
+    return '<tr>'
+      + '<td>' + escapeHtml(String(e.edge_id)) + '</td>'
+      + '<td><code>' + escapeHtml(e.edge_type) + '</code></td>'
+      + '<td class="id">' + escapeHtml(e.task_id) + '</td>'
+      + '<td>' + related + '</td>'
+      + '<td class="meta">' + escapeHtml(String(e.created_at || '')) + '</td>'
+      + '</tr>';
+  }).join('');
+  const relatedBlock = relatedTaskRows
+    ? '<div><strong>Related tasks (' + (tasks.length - 1) + '):</strong>'
+      + '<ul style="margin: 4px 0 8px 16px;">' + relatedTaskRows + '</ul></div>'
+    : '<div class="meta">No related tasks reachable from this root within depth '
+      + (payload.max_depth_walked || '?') + '.</div>';
+  const edgeBlock = edges.length
+    ? '<table class="data" style="margin-top: 6px;"><thead><tr>'
+      + '<th>edge_id</th><th>edge_type</th><th>task</th><th>related</th><th>created_at</th>'
+      + '</tr></thead><tbody>' + edgeRows + '</tbody></table>'
+    : '<div class="meta" style="margin-top: 4px;">No edges touching this task yet.</div>';
+  $slot.innerHTML = '<div class="card" style="margin: 12px 14px;">'
+    + '<div class="card-header"><h3>Execution lineage</h3>'
+    + '<span class="meta">' + cross + ' cross-task edge'
+    + (cross === 1 ? '' : 's') + ' · depth '
+    + (payload.max_depth_walked || '?') + '</span></div>'
+    + '<div class="card-body">'
+    + relatedBlock
+    + edgeBlock
+    + '<div class="meta" style="margin-top: 8px; font-style: italic;">'
+    + escapeHtml(payload.note || '') + '</div>'
+    + '</div></div>';
+}
+
 /* Investigation banner — sticky alert at the top of the task
    detail when the operator-set marker is on. Renders nothing
    when unset. Shows the marker timestamp + optional reason +
@@ -3690,6 +3759,11 @@ function renderDetail(l) {
   // has at least one capability.invoked event.
   const execSlot = '<div id="exec-slot"></div>';
   const investigationBanner = renderInvestigationBanner(l);
+  // M66: lineage panel slot — populated async by
+  // fetchLineageGraph after the detail renders. Empty slot
+  // when no task is loaded so a stale graph from the prior
+  // task doesn't flash before the fetch lands.
+  const lineageSlot = '<div id="lineage-slot"></div>';
   document.getElementById('task-detail').innerHTML =
     investigationBanner
     + `<div class="summary">${summaryRow}</div>`
@@ -3698,9 +3772,13 @@ function renderDetail(l) {
     + failureBlock
     + execSlot
     + corrSlot
+    + lineageSlot
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     + eventsBlock
     + xrefBlock;
+  if (l.task && l.task.task_id) {
+    fetchLineageGraph(l.task.task_id);
+  }
   // Fire-and-forget correlation lookup. Status guards
   // mean we only fetch when the operator would actually
   // benefit from the data (interrupted / failed tasks).
