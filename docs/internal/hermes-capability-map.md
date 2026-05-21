@@ -57,7 +57,7 @@ row's status field.
 
 | Hermes name | What it does | Leverage | Effort | Relix status | Relix counterpart | Notes |
 |---|---|---|---|---|---|---|
-| browser_tool | Playwright automation | high | large | pending (CW4) | — | own controller crate likely |
+| browser_tool | Playwright automation | high | large | partial (CW4 scaffold shipped) | tool.browser.* with NoneBackend; live Playwright pending (CW4-A) |
 | browser_camofox | anonymous browser mode | medium | medium | pending | — | extends browser_tool |
 | browser_cdp_tool | direct CDP | medium | large | pending | — | requires CDP client |
 | browser_dialog_tool | modal/alert/confirm | low | trivial | pending | — | trivial once browser shipped |
@@ -122,7 +122,7 @@ row's status field.
 | skills_hub | browse/install from cloud hub | medium | large | pending | — | per D-002 trust-tier decision |
 | skills_tool | manage installed skills | medium | medium | pending | — | needs registry |
 | skills_sync | sync skills between devices | low | large | pending | — | depends on hub |
-| mcp_tool | MCP server discovery | medium | large | pending (CW5) | — | per D-002 |
+| mcp_tool | MCP server discovery | medium | large | partial (CW5 scaffold shipped) | tool.mcp.list_servers/list_tools/invoke; live client pending (CW5-A/B). Trust tier still per D-002. |
 | mcp_oauth_manager | OAuth for MCP | medium | medium | pending | — | follow MCP |
 
 ### Utility + meta
@@ -235,9 +235,11 @@ would gain the most operator value from next:
 6. **Delegation / Subagent Spawning** — partial (M72), needs
    executor
 7. **Extended Thinking (o1/o3)** — shipped (PH-WAVE2F) ✓
-8. **Browser Automation (Playwright)** — pending (CW4)
+8. **Browser Automation (Playwright)** — scaffold shipped (CW4);
+   live Playwright backend pending (CW4-A)
 9. **Multi-Platform Channel Routing** — pending (Discord/Slack/Email)
-10. **Skill Ecosystem + MCP** — pending (CW5), per D-002
+10. **Skill Ecosystem + MCP** — MCP scaffold shipped (CW5);
+   live client pending (CW5-A/B). Skill ecosystem per D-002.
 
 Of those, items 1, 4, 5, 7 are the "small/medium effort, huge
 ops value" cluster the autonomous wave should chase first.

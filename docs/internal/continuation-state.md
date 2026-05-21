@@ -460,6 +460,11 @@ all pushed to origin/main):
 | PH-WAVE2J | 0a99235 | n/a | auto-cooldown vs operator-quarantine distinction on dashboard |
 | PH-WAVE2K | 5032f80 | n/a | consolidated /v1/providers/health ops endpoint |
 | PH-WAVE2L | 5190ab5 | cli +2 | relix-cli ops providers-health subcommand |
+| CW4 | 36ddf7c | runtime +12 | tool.browser.* honest scaffold (NoneBackend) |
+| CW5 | fced41f | runtime +13 | tool.mcp.* registry + discovery scaffold |
+| PH-DASH3 | 4f69a3a | bridge +1 | #/capabilities dashboard page (filter chips + text) |
+| PH-DASH3-CLI | c9d985d | cli +1 | relix-cli ops capabilities subcommand |
+| PH-ROUTER1 | 40eaa28 | runtime +6 | provider router scaffold (NoopRouter trait) |
 
 Aggregate: ~9600+ LOC; runtime tests 291 → 419, bridge tests
 192 → 217, relix-core 33 → 61, relix-cli 54 → 56. Every
