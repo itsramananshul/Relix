@@ -442,9 +442,15 @@ all pushed to origin/main):
 | H5  | f343c8f | runtime +3 | Synthesized terminal_summary |
 | H6  | d71e2d8 | runtime +3, bridge +4 | Stuck-running detection |
 | H7  | 404122e | runtime +5 | Orphan-attempt cleanup |
+| H8  | 971308c | core +18, runtime +2 | Secret redaction (relix-core, chronicle) |
+| H9  | 56f906c | bridge +1 | Secret redaction (intervention audit) |
 
-Aggregate: ~3700 LOC added; runtime tests 291 → 380, bridge tests
-192 → 203. Every milestone clean fmt + clippy + tests.
+Aggregate: ~5500 LOC added; runtime tests 291 → 382, bridge tests
+192 → 204, relix-core 33 → 51. Every milestone clean fmt + clippy
++ tests. Total workspace ≈ 700 passing tests, 0 failures.
+
+H3 (iteration budget grace-call) was deferred per D-006 — needs
+an executor consumer that doesn't exist yet. Decision logged.
 
 ### What the user paused on tonight
 - Asked the runtime to keep going all night and to log
