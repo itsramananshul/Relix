@@ -53,6 +53,7 @@ pub mod pdf;
 pub mod sanitize;
 pub mod security;
 pub mod terminal;
+pub mod text_chunk;
 pub mod web_extract;
 pub mod web_robots;
 pub mod web_tools;
@@ -713,6 +714,12 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
     // re-validation all apply. Pure safety surface — does NOT enforce.
     tracing::info!("tool node: registering tool.web.robots_check (PH-WEB-ROBOTS)");
     web_robots::register(bridge, backend.clone());
+
+    // PH-PDF-CHUNK: tool.text.chunk — pure CPU text chunker. No
+    // config gating; always registered alongside the parsing
+    // capabilities since it's stateless and decision-free.
+    tracing::info!("tool node: registering tool.text.chunk (PH-PDF-CHUNK)");
+    text_chunk::register(bridge);
 
     // B2: tool.read_file / write_file / search_files / patch.
     // Only registered when the operator opted in by setting

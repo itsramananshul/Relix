@@ -71,6 +71,7 @@ before the backend (visibility + stable contract + honesty).
 | `tool.fs.tree` (PH-FS-TREE) | live | Depth-capped recursive directory walk |
 | `tool.fs.stat` (PH-FS-STAT) | live | Single-path metadata (kind/size/mtime/is_symlink/exists) |
 | `tool.pdf` | live | base64-encoded PDF parse |
+| `tool.text.chunk` (PH-PDF-CHUNK) | live | Split text into bounded chunks (paragraph > sentence > word > char) for retrieval / context-window prep |
 
 ### Web
 

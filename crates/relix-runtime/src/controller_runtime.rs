@@ -1003,6 +1003,10 @@ fn register_node_type_handlers(
         // PH-WEB-ROBOTS: tool.web.robots_check — robots.txt sniff.
         // Same SSRF + pin + redirect machinery as web_fetch.
         manifest.add_capability(crate::nodes::tool::web_robots::robots_check_descriptor());
+        // PH-PDF-CHUNK: tool.text.chunk — pure CPU text chunker
+        // for retrieval / context-window-fit use cases. Always
+        // advertised when the tool node is up.
+        manifest.add_capability(crate::nodes::tool::text_chunk::capability_descriptor());
         // B2: jailed filesystem subsystem. Only advertised when
         // `[tool.fs]` is configured -- node-type tool with no
         // `[tool.fs]` keeps fs out of the manifest.

@@ -106,6 +106,7 @@ row's status field.
 | session_search_tool | full-text search history | medium | medium | partial | task.recent_events + dashboard filter | no FTS yet |
 | checkpoint_manager | conversation snapshots | high | medium | pending | — | per user PHASE H6 |
 | tool_result_storage | cache large outputs | medium | small | pending | — | cheap chronicle extension |
+| text_chunker | split text for retrieval / context-fit | high | small | shipped (PH-PDF-CHUNK) | tool.text.chunk | paragraph > sentence > word > char break priority; char-counted; chunk_size capped at 100k |
 
 ### Planning + orchestration
 
