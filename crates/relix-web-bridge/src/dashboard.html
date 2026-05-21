@@ -6355,6 +6355,12 @@ function renderTimeline(events) {
     const timeAbs = dt.toLocaleTimeString();
     const rel = (e.ts || 0) - t0;
     const relLabel = rel === 0 ? '' : '+' + fmtDuration(rel);
+    // W2-001: per-step duration (delta from previous event).
+    // Helps operators spot "this step took 8s, the rest took
+    // <100ms" at a glance. Absent for the first event.
+    const stepLabel = (i > 0)
+      ? '+' + fmtDuration((e.ts || 0) - (events[i - 1].ts || 0)) + ' since prev'
+      : '';
     const markerCls = timelineMarkerClass(e);
     const attemptTag = (e.attempt_id != null)
       ? `<span class="attempt-num">· attempt ${e.attempt_id}</span>`
@@ -6377,8 +6383,11 @@ function renderTimeline(events) {
     // bidirectional sync).
     const attemptIdAttr = e.attempt_id != null
       ? ' data-timeline-attempt-id="' + e.attempt_id + '"' : '';
+    const stepLabelHtml = stepLabel
+      ? `<span class="rel step-rel" title="duration since previous event">${escapeHtml(stepLabel)}</span>`
+      : '';
     return `<div class="timeline-row${rowCls}${failed ? ' attempt-failed' : ''}${i === events.length - 1 ? ' timeline-last' : ''}"${eventIdAttr}${attemptIdAttr}>
-      <div class="timeline-time">${escapeHtml(timeAbs)}<span class="rel">${escapeHtml(relLabel)}</span></div>
+      <div class="timeline-time">${escapeHtml(timeAbs)}<span class="rel">${escapeHtml(relLabel)}</span>${stepLabelHtml}</div>
       <div class="timeline-track"><span class="timeline-marker ${markerCls}"></span></div>
       <div class="timeline-body">
         <div class="timeline-type">${escapeHtml(e.event_type || '')}${attemptTag}</div>
