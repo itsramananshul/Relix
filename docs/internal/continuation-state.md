@@ -9,19 +9,30 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `6f31093 feat(tool): PH-TERM-PTY — portable-pty backend behind terminal-pty feature`
+- **HEAD:** `4ea1311 feat(tool): W2-002d — structured event-trace logging on browser handlers`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Wave 1 status: CLOSED.** All decision-blocked tracks shipped:
-  - D-008 → multi-backend browsers shipped (PH-BROWSER-FEATURES + HC + PW + WD).
-  - D-009 → live stdio MCP runtime shipped (PH-MCP-RUNTIME).
-  - D-010 → portable-pty backend shipped (PH-TERM-PTY).
-- **Workspace tests:** **1201 passing on default features**; **1221
-  under `--features relix-runtime/browser-all,relix-runtime/terminal-pty`**
-  (+18 from the three live browser drivers, +2 from PTY).
+- **Wave 1 status: CLOSED.** All decision-blocked tracks shipped.
+  All five open Wave 1 decisions (D-001/2/3/4/7) resolved at
+  Wave 1 close: D-004 shipped (PH-ORIGIN-SURFACE);
+  D-001/2/3/7 answered:defer.
+- **Wave 2 status: IN PROGRESS.** Track W2-002 (Browser
+  automation) substantively shipped — trait extended with
+  click / type_text / wait_for_selector + HC live impl +
+  screenshot-on-failure + structured event-trace logging.
+  Remaining: PW/WD click/type live impls + dashboard
+  screenshot viewer. Other Wave 2 tracks (W2-001 replay UX,
+  W2-003 dashboard UX, W2-005 failure system, W2-006
+  observability, W2-007 policy hardening, W2-008 local-first
+  polish) not yet started.
+- **Workspace tests:** **1213 passing on default features**;
+  **+5 under `--features browser-headless-chrome`** (HC live
+  W2-002a/b paths exercised). Per-feature totals (default →
+  with all features) preserved across Wave 2:
   - relix-cli: 110
   - relix-policy: 72
-  - relix-runtime: 709 (727 with all features)
+  - relix-runtime: 721 (was 709 at Wave 1 close — D-004 +5,
+    W2-002a trait-extension defaults +7)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
@@ -81,6 +92,14 @@ as the resume command.
 | 0ab93a6 | PH-CLI-BROWSER | `relix-cli browser sessions` HTTP mirror of `GET /v1/browser/sessions`; padded table; new `browser` sibling under main.rs; 3 wire-shape tests |
 | 2dc516c | PH-MCP-RUNTIME | live stdio MCP runtime closes D-009. New `mcp_stdio.rs` `McpStdioClient` (lazy subprocess spawn, mutex-serialised JSON-RPC, notification-tolerant read loop, kill_on_drop); `McpServerConfig.{command,args}`; `tool.mcp.invoke` + `tool.mcp.list_tools` now route through live client when transport=stdio; runtime tests +16; integration test against `@modelcontextprotocol/server-everything` via npx |
 | 6f31093 | PH-TERM-PTY | portable-pty backend behind `--features terminal-pty` closes D-010. New `TerminalConfig.pty: bool`; `terminal.rs` → `terminal/` directory split; new `terminal/pty.rs` (~580 LOC); loud-fail at `ToolBackend::new` when `pty=true` and feature off; PTY path uniformly registered with the existing sessions/audit/cancel infrastructure; runtime tests +3 default / +2 more with feature on |
+| b01ce75 | (docs) | Wave 1 CLOSED tally — D-008/9/10 status flips, full track-by-track wave-1 status table refreshed |
+| 7b40a13 | PH-DEFER-DECISIONS | answered D-001/D-002/D-003/D-007 = defer; rationale captured in decisions-pending |
+| 4b81913 | PH-ORIGIN-SURFACE | D-004 shipped — `origin_surface TEXT` column on tasks + `Coordinator::create` 8th param + `handle_create` parses 8th slot + TaskView field + 5 tests |
+| 429f5b2 | W2-002a | BrowserBackend trait extension: `click` / `type_text` / `wait_for_selector` with default-impl BackendNotConnected; descriptors + handlers + manifest entries + 7 tests |
+| a349c59 | W2-002b | HeadlessChromeBackend overrides defaults with live CDP click / type_into / wait_for_element_with_custom_timeout; per-call error reasons |
+| 5a0e5ec | (D-004 follow-up) | `task.get` body emits `origin_surface=...` line so bridge `TaskDetail.header` map carries it to the dashboard |
+| 27b33a0 | W2-002c | screenshot-on-failure: opt-in `[tool.browser] screenshot_on_failure_dir` persists a PNG of the failure state and appends `; screenshot=<path>` to the error reason — replay-friendly post-mortem aid |
+| 4ea1311 | W2-002d | structured `tracing::info!` event traces on navigate / click / type_text / wait_for_selector handlers (`method`, `backend`, `session_id`, `elapsed_ms`, `outcome`, `reason`, ...) — text payload deliberately NOT logged (form-credential safety) |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
