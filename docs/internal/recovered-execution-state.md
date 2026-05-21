@@ -320,10 +320,11 @@ After writing this doc, the session shipped six commits on `main`:
 | 512e727 | PH-TERM-AUDIT | runtime +8 | tool.terminal.audit_recent + per-backend completion ring |
 | 9d4381d | PH-TERM-CANCEL | runtime +7 | tool.terminal.cancel + manual stdout/stderr drain refactor |
 | c8d7fcb | PH-TERM-STREAM1 | runtime +11 | tool.terminal.tail — polling-cursor live stdout/stderr stream |
+| d5587d2 | PH-TERM-SPAWN | runtime +6 | tool.terminal.spawn — fire-and-forget background variant; validate_and_spawn / drive_to_completion refactor |
 
-Aggregate: ~1800+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
+Aggregate: ~2200+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
 controller_runtime.rs, docs/capabilities.md. Runtime tests
-507 → 569 (+62). Workspace 887 → 949 passing. fmt + clippy clean
+507 → 575 (+68). Workspace 887 → 955 passing. fmt + clippy clean
 on every commit.
 
 **Decisions logged but unanswered:** D-008 (browser backend),
@@ -332,9 +333,9 @@ operator picks; the surfaces themselves keep the honesty contract
 (NoneBackend / RuntimeNotConnected).
 
 **Wave 1 tracks still pending after this session:**
-- Terminal background / detached / persistent shell / interactive
-  stdin — each is a different shape from the existing run path
-  and needs a consumer on the other side.
+- Terminal persistent shell / interactive stdin — different
+  shape from the existing run path; each needs a consumer on
+  the other side.
 - Terminal streaming-with-consumer-drain (the current tail is
   read-only; a > 1 MiB producer still stalls when the buffer
   fills).
@@ -344,6 +345,8 @@ operator picks; the surfaces themselves keep the honesty contract
   module docstring (alpha decision).
 
 **Wave 1 tracks now complete:**
+- Terminal background execution — `tool.terminal.spawn`
+  fire-and-forget (PH-TERM-SPAWN).
 - Terminal cancel — `tool.terminal.cancel` cooperative termination
   (PH-TERM-CANCEL).
 - Terminal streaming (read-only tail) — `tool.terminal.tail`
