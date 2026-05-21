@@ -1722,6 +1722,167 @@ impl TaskStore {
         Ok(pre_freeze_status)
     }
 
+    /// Aggregate runtime metrics over an execution subtree
+    /// (M75). Walks the M66 lineage from `root_task_id`, then
+    /// reads each task's status + timing + attempt count and
+    /// rolls them up into a single envelope.
+    ///
+    /// Metrics computed:
+    /// - `total_tasks` — distinct tasks in the subtree.
+    /// - `terminal_*` — counts per terminal status
+    ///   (completed/failed/cancelled).
+    /// - `active_*` — counts per active status
+    ///   (running/retrying/pending/paused/frozen/awaiting_input).
+    /// - `total_attempts` — sum of `attempt_count` across the
+    ///   subtree (real work performed).
+    /// - `total_wall_clock_secs` — sum of per-task durations
+    ///   (`updated_at - started_at` for terminal tasks,
+    ///   `now - started_at` for live tasks; skipped when
+    ///   `started_at` is None — no fabricated durations).
+    /// - `oldest_started_at` / `newest_updated_at` — the
+    ///   span of the subtree's activity.
+    /// - `tasks_with_missing_timing` — honesty counter:
+    ///   tasks that had no `started_at` and therefore did
+    ///   not contribute to wall-clock aggregation.
+    ///
+    /// HONEST: with only `retried_from` + the M72 producers
+    /// shipping today, the subtree is usually just the root.
+    /// Operators see real per-task aggregates even in the
+    /// single-task case, and the count of related tasks
+    /// reveals when the M72 cross-task edges start landing.
+    pub fn subtree_metrics(
+        &self,
+        root_task_id: &str,
+        max_depth: usize,
+    ) -> Result<SubtreeMetrics, CoordinatorError> {
+        // Validate the root exists up front. `task_lineage`
+        // is permissive (it returns the root in `tasks` even
+        // when unknown so callers can render an empty graph),
+        // but for metrics an unknown root is a real error —
+        // operators get NotFound instead of an all-zeros
+        // aggregate.
+        {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                    params![root_task_id],
+                    |r| r.get(0),
+                )
+                .map_err(CoordinatorError::Db)?;
+            if exists == 0 {
+                return Err(CoordinatorError::NotFound(root_task_id.to_string()));
+            }
+        }
+        let lineage = self.task_lineage(root_task_id, max_depth)?;
+        let now = unix_secs();
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut terminal_completed = 0i64;
+        let mut terminal_failed = 0i64;
+        let mut terminal_cancelled = 0i64;
+        let mut active_pending = 0i64;
+        let mut active_running = 0i64;
+        let mut active_retrying = 0i64;
+        let mut active_paused = 0i64;
+        let mut active_frozen = 0i64;
+        let mut active_interrupted = 0i64;
+        let mut active_awaiting_input = 0i64;
+        let mut other_status = 0i64;
+        let mut total_attempts: i64 = 0;
+        let mut total_wall_clock_secs: i64 = 0;
+        let mut oldest_started_at: Option<i64> = None;
+        let mut newest_updated_at: Option<i64> = None;
+        let mut tasks_with_missing_timing: i64 = 0;
+        for tid in &lineage.tasks {
+            // Single-row read per task. The bounded subtree
+            // size (BFS depth clamp at 16) keeps this O(N)
+            // with a small N — no N+1-query worry at the
+            // scales the alpha runtime targets.
+            let row = conn
+                .query_row(
+                    "SELECT status, started_at, updated_at, attempt_count
+                     FROM tasks WHERE task_id = ?1",
+                    params![tid],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            let Some((status, started_at, updated_at, attempt_count)) = row else {
+                // Task vanished between the lineage walk and
+                // this metric read. Don't fabricate — just
+                // skip + count as missing-timing.
+                tasks_with_missing_timing += 1;
+                continue;
+            };
+            total_attempts += attempt_count;
+            match status.as_str() {
+                "completed" => terminal_completed += 1,
+                "failed" => terminal_failed += 1,
+                "cancelled" => terminal_cancelled += 1,
+                "pending" => active_pending += 1,
+                "running" => active_running += 1,
+                "retrying" => active_retrying += 1,
+                "paused" => active_paused += 1,
+                "frozen" => active_frozen += 1,
+                "interrupted" => active_interrupted += 1,
+                "awaiting_input" => active_awaiting_input += 1,
+                _ => other_status += 1,
+            }
+            // Wall-clock aggregation. Terminal statuses use
+            // updated_at as the "ended at"; active statuses
+            // use `now`. Both require started_at — without
+            // it we skip (and count for honesty).
+            let is_terminal = matches!(status.as_str(), "completed" | "failed" | "cancelled");
+            match started_at {
+                Some(start) => {
+                    let end = if is_terminal { updated_at } else { now };
+                    let dur = (end - start).max(0);
+                    total_wall_clock_secs += dur;
+                    oldest_started_at = Some(match oldest_started_at {
+                        Some(prev) => prev.min(start),
+                        None => start,
+                    });
+                }
+                None => {
+                    tasks_with_missing_timing += 1;
+                }
+            }
+            newest_updated_at = Some(match newest_updated_at {
+                Some(prev) => prev.max(updated_at),
+                None => updated_at,
+            });
+        }
+        Ok(SubtreeMetrics {
+            root_task_id: root_task_id.to_string(),
+            total_tasks: lineage.tasks.len() as i64,
+            cross_task_edge_count: lineage.cross_task_edge_count as i64,
+            terminal_completed,
+            terminal_failed,
+            terminal_cancelled,
+            active_pending,
+            active_running,
+            active_retrying,
+            active_paused,
+            active_frozen,
+            active_interrupted,
+            active_awaiting_input,
+            other_status,
+            total_attempts,
+            total_wall_clock_secs,
+            oldest_started_at,
+            newest_updated_at,
+            tasks_with_missing_timing,
+            max_depth_walked: lineage.max_depth_walked as i64,
+        })
+    }
+
     /// Record a `spawned_task` edge attesting that the
     /// caller (a runtime worker or operator-driven tool)
     /// observed `parent_task_id` spawning `child_task_id`
@@ -2800,6 +2961,56 @@ pub struct AttemptView {
     pub failure_class: Option<String>,
 }
 
+/// Aggregate metrics over an execution subtree (M75).
+/// Computed by [`TaskStore::subtree_metrics`] from REAL
+/// per-task state — no synthesis. Status buckets are
+/// distinct fields rather than a map so consumers don't
+/// need a separate vocab decoder.
+#[derive(Debug, Clone)]
+pub struct SubtreeMetrics {
+    pub root_task_id: String,
+    /// Total distinct tasks reachable in the lineage (M66
+    /// BFS at `max_depth_walked`).
+    pub total_tasks: i64,
+    /// Edges where `task_id != related_task_id` — the same
+    /// honest counter the lineage walker computes.
+    pub cross_task_edge_count: i64,
+    pub terminal_completed: i64,
+    pub terminal_failed: i64,
+    pub terminal_cancelled: i64,
+    pub active_pending: i64,
+    pub active_running: i64,
+    pub active_retrying: i64,
+    pub active_paused: i64,
+    pub active_frozen: i64,
+    pub active_interrupted: i64,
+    pub active_awaiting_input: i64,
+    /// Any status outside the canonical vocabulary. Lets
+    /// operators see when callers wrote custom states
+    /// (intentional) vs when the schema drifted.
+    pub other_status: i64,
+    /// Sum of `attempt_count` across the subtree. Real
+    /// work done — distinct from the count of tasks.
+    pub total_attempts: i64,
+    /// Sum of per-task wall-clock durations. Terminal
+    /// tasks count `updated_at - started_at`; active
+    /// tasks count `now - started_at`. Tasks with no
+    /// `started_at` contribute zero (and bump
+    /// `tasks_with_missing_timing`).
+    pub total_wall_clock_secs: i64,
+    pub oldest_started_at: Option<i64>,
+    pub newest_updated_at: Option<i64>,
+    /// Honesty counter — tasks excluded from wall-clock
+    /// aggregation because they had no started_at (or
+    /// vanished between the lineage walk and the metric
+    /// read).
+    pub tasks_with_missing_timing: i64,
+    /// Echoes back the BFS depth cap so the consumer
+    /// renders "showing metrics up to depth N" without
+    /// recomputing.
+    pub max_depth_walked: i64,
+}
+
 /// Outcome of an M72 edge-producer call. Carries both the
 /// new edge_id AND the chronicle event_id so callers can
 /// surface either side to operators.
@@ -3170,6 +3381,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_transition_check(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.subtree_metrics",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_subtree_metrics(&s, &ctx) }
             })),
         );
     }
@@ -4257,6 +4478,69 @@ fn handle_resume(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.resume: not found: {id}")),
         Err(CoordinatorError::Invalid(msg)) => invalid(msg),
         Err(e) => internal(format!("task.resume: {e}")),
+    }
+}
+
+/// `task.subtree_metrics` — aggregate per-status counts +
+/// total wall-clock + total attempts across the BFS subtree
+/// from a root (M75). Args: `task_id|max_depth` (default 4,
+/// clamped to [1, 16]). Returns multi-line k=v body so
+/// existing dashboard parsers handle it the same way as
+/// `task.lineage`. Pure read — does NOT mutate.
+fn handle_subtree_metrics(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.subtree_metrics utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    let task_id = parts.first().copied().unwrap_or("").trim();
+    if task_id.is_empty() {
+        return invalid("task.subtree_metrics: task_id required".to_string());
+    }
+    let max_depth: usize = parts
+        .get(1)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    match store.subtree_metrics(task_id, max_depth) {
+        Ok(m) => {
+            use std::fmt::Write as _;
+            let mut buf = String::new();
+            let _ = writeln!(buf, "root={}", m.root_task_id);
+            let _ = writeln!(buf, "total_tasks={}", m.total_tasks);
+            let _ = writeln!(buf, "cross_task_edges={}", m.cross_task_edge_count);
+            let _ = writeln!(buf, "max_depth={}", m.max_depth_walked);
+            let _ = writeln!(buf, "terminal_completed={}", m.terminal_completed);
+            let _ = writeln!(buf, "terminal_failed={}", m.terminal_failed);
+            let _ = writeln!(buf, "terminal_cancelled={}", m.terminal_cancelled);
+            let _ = writeln!(buf, "active_pending={}", m.active_pending);
+            let _ = writeln!(buf, "active_running={}", m.active_running);
+            let _ = writeln!(buf, "active_retrying={}", m.active_retrying);
+            let _ = writeln!(buf, "active_paused={}", m.active_paused);
+            let _ = writeln!(buf, "active_frozen={}", m.active_frozen);
+            let _ = writeln!(buf, "active_interrupted={}", m.active_interrupted);
+            let _ = writeln!(buf, "active_awaiting_input={}", m.active_awaiting_input);
+            let _ = writeln!(buf, "other_status={}", m.other_status);
+            let _ = writeln!(buf, "total_attempts={}", m.total_attempts);
+            let _ = writeln!(buf, "total_wall_clock_secs={}", m.total_wall_clock_secs);
+            if let Some(v) = m.oldest_started_at {
+                let _ = writeln!(buf, "oldest_started_at={v}");
+            }
+            if let Some(v) = m.newest_updated_at {
+                let _ = writeln!(buf, "newest_updated_at={v}");
+            }
+            let _ = writeln!(
+                buf,
+                "tasks_with_missing_timing={}",
+                m.tasks_with_missing_timing
+            );
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(CoordinatorError::NotFound(id)) => {
+            invalid(format!("task.subtree_metrics: not found: {id}"))
+        }
+        Err(e) => internal(format!("task.subtree_metrics: {e}")),
     }
 }
 
@@ -7282,6 +7566,96 @@ mod tests {
         assert_eq!(view.status, "pending");
         assert!(is_allowed_transition(&view.status, "running"));
         assert!(!is_allowed_transition(&view.status, "completed"));
+    }
+
+    #[test]
+    fn subtree_metrics_single_task_no_edges() {
+        // Lone task, no spawned children. Metrics still
+        // report real aggregates for the root.
+        let s = store();
+        let tid = mk(&s, "lonely", "f", "{}", "o");
+        let m = s.subtree_metrics(&tid, 4).unwrap();
+        assert_eq!(m.root_task_id, tid);
+        assert_eq!(m.total_tasks, 1);
+        assert_eq!(m.cross_task_edge_count, 0);
+        assert_eq!(m.active_pending, 1);
+        assert_eq!(m.terminal_completed, 0);
+        assert_eq!(m.total_attempts, 0);
+        // No started_at on a fresh `pending` task — wall
+        // clock is 0 and the honesty counter ticks.
+        assert_eq!(m.total_wall_clock_secs, 0);
+        assert_eq!(m.tasks_with_missing_timing, 1);
+    }
+
+    #[test]
+    fn subtree_metrics_buckets_status_correctly() {
+        // Two tasks: one completed, one running. Both
+        // accounted in the right bucket; wall-clock
+        // aggregates across them.
+        let s = store();
+        let parent = mk(&s, "p", "f", "{}", "o");
+        let child = mk(&s, "c", "f", "{}", "o");
+        // Walk parent into completed, child into running.
+        s.update(&parent, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &parent,
+            Some("completed"),
+            Some("ok"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.update(&child, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        // Connect them with a spawned edge so the lineage
+        // walker picks up both tasks.
+        s.record_spawned(&parent, &child, None, None, "worker")
+            .unwrap();
+        let m = s.subtree_metrics(&parent, 4).unwrap();
+        assert_eq!(m.total_tasks, 2);
+        assert_eq!(m.cross_task_edge_count, 1);
+        assert_eq!(m.terminal_completed, 1);
+        assert_eq!(m.active_running, 1);
+        // Both tasks have started_at set (the `running`
+        // transition stamped it) — no missing-timing.
+        assert_eq!(m.tasks_with_missing_timing, 0);
+        // Wall clock is small but non-negative.
+        assert!(m.total_wall_clock_secs >= 0);
+        assert_eq!(m.total_attempts, 2);
+    }
+
+    #[test]
+    fn subtree_metrics_unknown_root_returns_not_found() {
+        let s = store();
+        let err = s.subtree_metrics("deadbeef", 4).unwrap_err();
+        assert!(matches!(err, CoordinatorError::NotFound(id) if id == "deadbeef"));
+    }
+
+    #[test]
+    fn subtree_metrics_other_status_bucket_counts_caller_defined() {
+        // A future status outside TASK_STATES lands in
+        // `other_status` — operators see caller-defined
+        // schema drift instead of a silent miscount.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(
+            &tid,
+            Some("custom-state"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let m = s.subtree_metrics(&tid, 4).unwrap();
+        assert_eq!(m.other_status, 1);
+        assert_eq!(m.active_pending, 0);
     }
 
     #[test]

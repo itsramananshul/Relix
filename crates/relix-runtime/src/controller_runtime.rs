@@ -603,6 +603,19 @@ fn register_node_type_handlers(
                 &["task", "read", "state-machine"],
             ),
             (
+                "task.subtree_metrics",
+                "Aggregate runtime metrics over an execution \
+                 subtree. Args: `task_id|max_depth` \
+                 (max_depth defaults to 4, clamped to [1, 16]). \
+                 Walks the M66 lineage + rolls up per-task \
+                 status, attempt count, and wall-clock \
+                 durations into a single k=v envelope. Pure \
+                 read. Honest about missing timing — tasks \
+                 with no started_at contribute zero to wall \
+                 clock and increment tasks_with_missing_timing.",
+                &["task", "read", "graph", "metrics"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -638,7 +651,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze / record_spawned / record_delegated / record_awaited / transition_check"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze / record_spawned / record_delegated / record_awaited / transition_check / subtree_metrics"
         );
     }
     if cfg.controller.node_type == "tool" {
