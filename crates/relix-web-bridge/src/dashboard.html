@@ -1814,6 +1814,7 @@
     <a href="#/fsaudit"      class="nav-item" data-route="fsaudit">FS Audit</a>
     <a href="#/termaudit"    class="nav-item" data-route="termaudit">Terminal Audit</a>
     <a href="#/browser"      class="nav-item" data-route="browser">Browser</a>
+    <a href="#/metrics"      class="nav-item" data-route="metrics">Metrics</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2440,6 +2441,48 @@
       </p>
     </section>
 
+    <!-- ── #/metrics (W2-006d) ────────────────────────────────────── -->
+    <section class="page" data-page="metrics">
+      <h2>Dispatch metrics</h2>
+      <p class="page-subtitle">
+        Per-capability invocation counters + latency stats from
+        the named peer's DispatchBridge. Sourced from
+        <code>/v1/dispatch/stats</code> which proxies
+        <code>node.dispatch.stats</code>. Lifetime counters —
+        reset on peer restart. Latency tracks only Ok / Err
+        outcomes (handler ran); policy-denied / unknown-method
+        attempts don't contribute to latency.
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px;">
+        <label for="metrics-peer-input" class="meta">peer alias:</label>
+        <input
+          type="text"
+          id="metrics-peer-input"
+          value="tool"
+          placeholder="tool"
+          autocomplete="off"
+          spellcheck="false"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 140px;"
+        />
+        <button class="chip" id="metrics-refresh-btn">refresh</button>
+        <span class="meta" id="metrics-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Capabilities by mean latency</h3>
+          <span class="meta" id="metrics-summary"></span>
+        </div>
+        <div class="card-body dense" id="metrics-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Rows are sorted by mean elapsed (descending) — slowest
+        capability first. A spike in max relative to mean is a
+        signal of a tail-latency outlier worth investigating.
+      </p>
+    </section>
+
     <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
@@ -2658,6 +2701,7 @@ const PAGES = {
   fsaudit:      { label: 'FS Audit',     init: initFsAudit,      enter: enterFsAudit },
   termaudit:    { label: 'Terminal Audit', init: initTermAudit,  enter: enterTermAudit },
   browser:      { label: 'Browser',      init: initBrowser,      enter: enterBrowser },
+  metrics:      { label: 'Metrics',      init: initMetrics,      enter: enterMetrics },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -7394,6 +7438,124 @@ async function loadBrowserSessions() {
       + '<th>current url</th>'
       + '<th>status</th>'
       + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = 'failed';
+    if ($summary) $summary.textContent = '';
+  }
+}
+
+/* W2-006d: dashboard panel for the dispatch-stats snapshot.
+   Reads /v1/dispatch/stats which proxies node.dispatch.stats
+   over libp2p. Sorted by mean elapsed desc — operators see the
+   slowest capability first. */
+function initMetrics() {
+  const $refresh = document.getElementById('metrics-refresh-btn');
+  if ($refresh) {
+    $refresh.addEventListener('click', () => loadMetrics());
+  }
+  const $peer = document.getElementById('metrics-peer-input');
+  if ($peer) {
+    $peer.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadMetrics();
+      }
+    });
+  }
+}
+
+function enterMetrics() {
+  loadMetrics();
+}
+
+function currentMetricsPeer() {
+  const $peer = document.getElementById('metrics-peer-input');
+  const v = $peer ? ($peer.value || '').trim() : '';
+  return v || 'tool';
+}
+
+async function loadMetrics() {
+  const $host = document.getElementById('metrics-host');
+  const $status = document.getElementById('metrics-status');
+  const $summary = document.getElementById('metrics-summary');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  if ($status) $status.textContent = 'querying…';
+  const peer = currentMetricsPeer();
+  try {
+    const r = await fetch('/v1/dispatch/stats?peer=' + encodeURIComponent(peer));
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const rows = (body.rows || []).slice();
+    // Sort by mean elapsed desc; tied rows fall back to
+    // invocations desc so a method with one slow call doesn't
+    // outrank a method with thousands of consistent calls
+    // forever.
+    rows.sort((a, b) => {
+      const m = (b.mean_elapsed_ms || 0) - (a.mean_elapsed_ms || 0);
+      if (m !== 0) return m;
+      return (b.invocations || 0) - (a.invocations || 0);
+    });
+    const count = body.count || rows.length;
+    if ($status) {
+      $status.textContent = 'peer=' + (body.peer || peer)
+        + ' rows=' + rows.length;
+    }
+    if ($summary) {
+      $summary.textContent = count === 0
+        ? 'no invocations yet'
+        : count + ' capability row(s)';
+    }
+    if (rows.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no dispatch activity recorded yet on peer <code>'
+        + escapeHtml(peer) + '</code> — invoke any capability '
+        + '(e.g. <code>node.health</code>) to populate the counters'
+        + '</div>';
+      return;
+    }
+    const tr = rows.map(s => {
+      const err = (s.errors || 0) + (s.denied || 0) + (s.unknown_method || 0);
+      const errCls = err === 0 ? 'ok'
+        : err > 5 ? 'danger'
+        : 'warn';
+      // Visual cue: red mean if max / mean > 5x (tail outlier).
+      const tailRatio = s.mean_elapsed_ms > 0
+        ? (s.max_elapsed_ms / s.mean_elapsed_ms)
+        : 1;
+      const meanCls = tailRatio > 5 ? 'danger'
+        : tailRatio > 2 ? 'warn'
+        : 'ok';
+      return '<tr>'
+        + '<td><code>' + escapeHtml(s.method || '') + '</code></td>'
+        + '<td>' + (s.invocations || 0) + '</td>'
+        + '<td><span class="badge ' + errCls + '">'
+        + err + '</span></td>'
+        + '<td><span class="badge ' + meanCls + '">'
+        + (s.mean_elapsed_ms || 0) + ' ms</span></td>'
+        + '<td>' + (s.max_elapsed_ms || 0) + ' ms</td>'
+        + '<td>' + (s.last_elapsed_ms || 0) + ' ms</td>'
+        + '<td>' + (s.latency_samples || 0) + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>method</th>'
+      + '<th>invocations</th>'
+      + '<th>errs+denied</th>'
+      + '<th>mean</th>'
+      + '<th>max</th>'
+      + '<th>last</th>'
+      + '<th>samples</th>'
+      + '</tr></thead><tbody>' + tr + '</tbody></table>';
   } catch (e) {
     $host.innerHTML = '<div class="error">load failed: '
       + escapeHtml(String(e)) + '</div>';

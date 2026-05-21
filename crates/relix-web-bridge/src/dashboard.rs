@@ -118,7 +118,7 @@ mod tests {
         );
         assert!(body.contains("Operator Console"), "missing brand subtitle");
 
-        // All eleven routes register a nav item AND a
+        // All twelve routes register a nav item AND a
         // corresponding page section.
         for route in [
             "overview",
@@ -129,6 +129,7 @@ mod tests {
             "fsaudit",
             "termaudit",
             "browser",
+            "metrics",
             "providers",
             "telegram",
             "config",
@@ -483,6 +484,47 @@ mod tests {
             body.contains("'7': 'termaudit'"),
             "kbd shortcut 7 should switch to termaudit"
         );
+    }
+
+    #[tokio::test]
+    async fn page_metrics_landmarks_present() {
+        // W2-006d: dispatch-stats dashboard panel. Reads
+        // /v1/dispatch/stats (bridge proxy → node.dispatch.stats)
+        // and renders per-capability latency + invocation
+        // counters sorted by mean elapsed desc.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"data-page="metrics""#),
+            "metrics page section missing"
+        );
+        assert!(
+            body.contains(r#"data-route="metrics""#),
+            "metrics nav item missing"
+        );
+        assert!(
+            body.contains("/v1/dispatch/stats"),
+            "metrics page should consume /v1/dispatch/stats"
+        );
+        assert!(
+            body.contains(r#"id="metrics-peer-input""#),
+            "metrics peer alias input missing"
+        );
+        assert!(
+            body.contains(r#"id="metrics-refresh-btn""#),
+            "metrics refresh button missing"
+        );
+        assert!(
+            body.contains(r#"id="metrics-host""#),
+            "metrics host slot missing"
+        );
+        assert!(body.contains("initMetrics"), "initMetrics handler missing");
+        assert!(
+            body.contains("enterMetrics"),
+            "enterMetrics handler missing"
+        );
+        assert!(body.contains("loadMetrics"), "loadMetrics handler missing");
     }
 
     #[tokio::test]
