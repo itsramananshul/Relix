@@ -9,21 +9,19 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `6dcc670 fix(tool): browser BrowserConfig struct-literal sites use ..default() after WD field`
+- **HEAD:** `f7f4f2e feat(bridge+dash): PH-DASH-BROWSER proxy + dashboard panel for tool.browser.list_sessions`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1174 passing on default features
-  (delta this milestone: +1 from PW's always-on
-  `list_sessions_empty_before_any_open`); **1192 under
-  `--features relix-runtime/browser-all`** (HC +5, PW +5, WD +8
-  feature-gated live driver tests).
+- **Workspace tests:** 1183 passing on default features (delta
+  this milestone: +9 in `browser_sessions::tests` + landmark);
+  **1201 under `--features relix-runtime/browser-all`**.
   - relix-cli: 107
   - relix-policy: 72
   - relix-runtime: 694 (712 under browser-all)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 267
+  - relix-web-bridge: 276 (was 267; +9 this milestone)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -74,6 +72,8 @@ as the resume command.
 | b7f30c9 | PH-BROWSER-HC | live `headless_chrome` crate backend behind `browser-headless-chrome` — Chrome DevTools Protocol; lazy Browser launch; per-session Tab cached in Mutex<HashMap>; 5 tests incl. runtime-gated chromium-in-PATH probe; subagent-authored, orchestrator-verified |
 | 1d24c46 | PH-BROWSER-WD | live `fantoccini` WebDriver backend behind `browser-webdriver` — sync→async bridge via block_in_place; new `webdriver_url` BrowserConfig field (default `http://127.0.0.1:9515`); lazy driver connect; 8 tests incl. runtime-gated `/status` probe; subagent-authored, orchestrator-verified |
 | 6dcc670 | (fix) | HC + PW struct-literal `cfg()` test helpers updated with `..BrowserConfig::default()` so `--features browser-all` clippy + tests compile after the WD field addition |
+| 2e706d1 | PH-BROWSER-D008-RESOLVE | flipped D-008 from "open" to "SHIPPED" in decisions-pending; Wave 1 status track A reflects all three live drivers behind feature flags |
+| f7f4f2e | PH-DASH-BROWSER | `GET /v1/browser/sessions` bridge proxy + new `#/browser` dashboard page (peer-alias input, refresh, session table with truncated id + on-hover full id + status badge + "(no navigation yet)" empty current_url); 8 parser tests + 1 landmark |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
