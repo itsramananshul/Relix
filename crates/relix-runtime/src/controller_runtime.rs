@@ -670,6 +670,17 @@ fn register_node_type_handlers(
         if tool_cfg.pdf.is_some() {
             manifest.add_capability(crate::nodes::tool::pdf::capability_descriptor());
         }
+        // CW1: tool.terminal.run — sandboxed shell. Only advertised
+        // when [tool.terminal] is configured AND construction
+        // succeeds (allowlist validation may fail; the
+        // descriptor advertisement matches the actual
+        // registration so consumers don't see a phantom
+        // capability).
+        if let Some(term_cfg) = tool_cfg.terminal.as_ref()
+            && crate::nodes::tool::terminal::TerminalBackend::new(term_cfg.clone()).is_ok()
+        {
+            manifest.add_capability(crate::nodes::tool::terminal_descriptor());
+        }
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,
             timeout_secs = tool_cfg.timeout_secs,

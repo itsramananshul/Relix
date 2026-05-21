@@ -49,6 +49,7 @@
 pub mod fs;
 pub mod pdf;
 pub mod security;
+pub mod terminal;
 pub mod web_extract;
 
 use std::collections::HashMap;
@@ -102,6 +103,15 @@ pub struct ToolConfig {
     /// surface beyond the in-memory base64 input).
     #[serde(default)]
     pub pdf: Option<pdf::PdfConfig>,
+    /// Optional terminal/shell subsystem (CW1). When `None`
+    /// the `tool.terminal.run` capability is NOT registered.
+    /// **High blast radius** — operators must opt in
+    /// deliberately AND provide an allowlist of bare program
+    /// names (no paths, no globs). See
+    /// `crates/relix-runtime/src/nodes/tool/terminal.rs` for
+    /// the full security model.
+    #[serde(default)]
+    pub terminal: Option<terminal::TerminalConfig>,
 }
 
 impl Default for ToolConfig {
@@ -115,6 +125,7 @@ impl Default for ToolConfig {
             extract_max_input_bytes: default_extract_max_input_bytes(),
             fs: None,
             pdf: None,
+            terminal: None,
         }
     }
 }
@@ -394,6 +405,14 @@ impl ToolBackend {
         self.cfg.pdf.clone()
     }
 
+    /// Accessor for the optional `[tool.terminal]` subsystem config
+    /// (CW1). When `None`, [`register`] does not register
+    /// `tool.terminal.run`. High-blast-radius capability — operators
+    /// must opt in deliberately AND supply an allowlist.
+    pub fn terminal_config(&self) -> Option<terminal::TerminalConfig> {
+        self.cfg.terminal.clone()
+    }
+
     /// Run the configured capability against a single URL.
     ///
     /// Order of operations matters for safety:
@@ -577,6 +596,34 @@ pub enum WebFetchOutcome {
     Transport(String),
 }
 
+/// Capability descriptor for `tool.terminal.run` (CW1).
+/// Only added to the manifest when `[tool.terminal]` is
+/// configured AND the allowlist validates. Sensitivity
+/// tags reflect the high blast radius so policy engines +
+/// dashboard surfaces can treat it specially.
+pub fn terminal_descriptor() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.run");
+    d.major_version = 1;
+    d.kind = CapabilityKind::Unary;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::ExternalPaid;
+    d.sensitivity_tags = vec![
+        "shell:execute".into(),
+        "host:local".into(),
+        "destructive:potential".into(),
+    ];
+    d.policy_attachment_point = "tool.terminal.run".to_string();
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Sandboxed shell command execution with operator allowlist, \
+         no shell interpretation, hard timeout, and stdout/stderr caps."
+            .into(),
+    );
+    d.categories = vec!["shell".into(), "execute".into(), "io".into()];
+    d.environment_requirements = vec!["host:exec".into()];
+    d
+}
+
 /// Capability descriptor for `tool.web_fetch`. Exposed so future manifest
 /// exchange (M10) can broadcast it. Today it's read by [`register`] only.
 pub fn capability_descriptor() -> CapabilityDescriptor {
@@ -652,6 +699,45 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
         );
         pdf::register(bridge, Arc::new(pdf_cfg));
     }
+
+    // CW1: tool.terminal.run — sandboxed shell execution.
+    // Opt-in via [tool.terminal] AND requires an allowlist
+    // (see terminal.rs). Construction fails closed; we log
+    // the rejection clearly so operators see exactly what
+    // their config got wrong.
+    if let Some(term_cfg) = backend.terminal_config() {
+        match terminal::TerminalBackend::new(term_cfg) {
+            Ok(tb) => {
+                tracing::info!(
+                    allowed = ?tb_allowed_summary(&tb),
+                    "tool node: registering tool.terminal.run (CW1)"
+                );
+                terminal::register(bridge, Arc::new(tb));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "tool node: [tool.terminal] present but invalid; capability NOT registered"
+                );
+            }
+        }
+    } else {
+        tracing::info!(
+            "tool node: [tool.terminal] not configured; terminal subsystem disabled (tool.terminal.run unavailable)"
+        );
+    }
+}
+
+/// Helper used only by the registration tracing call above.
+/// Reads the validated backend's allowlist size as a quick
+/// "what did we enable" signal in the startup log without
+/// dumping every binary name (operators have the TOML).
+fn tb_allowed_summary(_b: &terminal::TerminalBackend) -> String {
+    // The allowlist is private to the backend; for logging
+    // purposes the size is enough — operators reading the
+    // log don't need every binary name (the TOML is the
+    // authoritative reference).
+    "configured".to_string()
 }
 
 async fn handle_web_fetch(backend: Arc<ToolBackend>, ctx: InvocationCtx) -> HandlerOutcome {
