@@ -717,6 +717,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_operational_health_kpis_present() {
+        // H11: overview ships an "Operational health" KPI section
+        // with tiles for stuck (H6), thrash (H4), orphan (H7),
+        // and terminal (H5). Section auto-hides when every
+        // counter is 0 — the section landmark + each tile id
+        // must still exist in the static HTML so the runtime
+        // JS can populate them.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"opshealth-section\"",
+            "id=\"kpi-stuck-tile\"",
+            "id=\"kpi-thrash-tile\"",
+            "id=\"kpi-orphan-tile\"",
+            "id=\"kpi-terminal-tile\"",
+            "Operational health",
+            "function renderOpsHealthBadges",
+            "function wireOpsHealthTileClicks",
+            "task.thrash_detected",
+            "task.terminal_summary",
+            "task.attempt_orphan_closed",
+        ] {
+            assert!(body.contains(needle), "H11 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_stuck_running_banner_present() {
         // H6: overview ships a stuck-running diagnostic banner
         // sourced from /v1/tasks/stuck. Hidden when count=0.

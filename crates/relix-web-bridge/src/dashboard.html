@@ -1830,6 +1830,45 @@
           </div>
           <div id="streams-detail-host"></div>
         </div>
+        <!-- H11: operational health KPIs derived from the new
+             Hermes-grade events (H4 thrash, H5 terminal, H6 stuck,
+             H7 orphan). All counters are computed client-side from
+             the firehose ring + /v1/tasks/stuck, so there's no new
+             backend surface. The whole section is hidden when every
+             counter is 0 to keep the overview compact on healthy
+             systems — visible the moment something starts going
+             sideways. -->
+        <div class="kpi-section" id="opshealth-section" style="display: none;">
+          <p class="section-label">Operational health
+            <span class="meta" id="opshealth-window-label" style="margin-left: 8px;"></span>
+          </p>
+          <div class="kpi-grid">
+            <div class="kpi" id="kpi-stuck-tile" style="cursor: pointer;"
+                 title="tasks running > 5min without a deadline (recovery scan can't reach them)">
+              <p class="label">stuck</p>
+              <div class="value" id="kpi-stuck">0</div>
+              <div class="delta">running, no deadline</div>
+            </div>
+            <div class="kpi" id="kpi-thrash-tile" style="cursor: pointer;"
+                 title="tasks that hit 3+ consecutive failures with the same class (auto-marked for investigation)">
+              <p class="label">thrash</p>
+              <div class="value" id="kpi-thrash">0</div>
+              <div class="delta">recent auto-marks</div>
+            </div>
+            <div class="kpi" id="kpi-orphan-tile" style="cursor: pointer;"
+                 title="task_attempts closed by the recovery scan because their task was already terminal">
+              <p class="label">orphan</p>
+              <div class="value" id="kpi-orphan">0</div>
+              <div class="delta">attempts cleaned</div>
+            </div>
+            <div class="kpi" id="kpi-terminal-tile" style="cursor: pointer;"
+                 title="recovery scan synthesized terminal_summary events">
+              <p class="label">terminal</p>
+              <div class="value" id="kpi-terminal">0</div>
+              <div class="delta">post-mortems</div>
+            </div>
+          </div>
+        </div>
         <div class="kpi-section">
           <p class="section-label">Process</p>
           <div class="kpi-grid">
@@ -2716,6 +2755,65 @@ function renderOverviewKpis(hRes, taskCount) {
   } else {
     document.getElementById('kpi-streams').textContent = '—';
   }
+  renderOpsHealthBadges();
+}
+
+/* H11: Compute operational-health counters from the firehose ring
+   (H4 thrash, H5 terminal, H7 orphan) + the stuck-task projection
+   (H6). Renders compact KPI tiles. The whole section auto-hides
+   when every counter is 0 so a healthy mesh keeps the overview
+   tight. Click each tile → filtered firehose for that event_type. */
+let opsHealthStuckCount = 0;
+function renderOpsHealthBadges() {
+  const section = document.getElementById('opshealth-section');
+  if (!section) return;
+  // Walk the existing firehose ring (already populated by
+  // openGlobalFirehoseStream + fetchGlobalFirehose). Counts cover
+  // whatever window is in the ring (FIREHOSE_RING_CAP entries).
+  let thrash = 0, terminal = 0, orphan = 0;
+  for (const e of firehoseRing) {
+    const t = e.event_type || '';
+    if (t === 'task.thrash_detected') thrash += 1;
+    else if (t === 'task.terminal_summary') terminal += 1;
+    else if (t === 'task.attempt_orphan_closed') orphan += 1;
+  }
+  const stuck = opsHealthStuckCount;
+  // Update each tile's value.
+  document.getElementById('kpi-stuck').textContent = stuck;
+  document.getElementById('kpi-thrash').textContent = thrash;
+  document.getElementById('kpi-orphan').textContent = orphan;
+  document.getElementById('kpi-terminal').textContent = terminal;
+  // Window label: how much firehose we're showing counts over.
+  const ringSize = firehoseRing.length;
+  document.getElementById('opshealth-window-label').textContent =
+    ringSize === 0
+      ? '(no firehose data yet)'
+      : '(last ' + ringSize + ' event' + (ringSize === 1 ? '' : 's') + ')';
+  // Hide the section entirely when nothing's wrong — keeps the
+  // overview tight on healthy systems.
+  const any = stuck > 0 || thrash > 0 || terminal > 0 || orphan > 0;
+  section.style.display = any ? '' : 'none';
+}
+
+/* H11: each tile is click-through to a filtered firehose URL.
+   Wired once at DOMContentLoaded — the elements exist from the
+   start (just hidden until a counter goes non-zero). */
+function wireOpsHealthTileClicks() {
+  const wire = (id, route) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('click', () => {
+      window.location.hash = route;
+    });
+  };
+  // Stuck has its own banner card; navigate to overview (current
+  // page) so the banner gets visual focus.
+  wire('kpi-stuck-tile', '#/overview');
+  // Other three: navigate to overview (firehose lives there) —
+  // future iteration could deep-link to a filtered firehose page.
+  wire('kpi-thrash-tile', '#/overview');
+  wire('kpi-orphan-tile', '#/overview');
+  wire('kpi-terminal-tile', '#/overview');
 }
 
 function renderOverviewPeers(peers) {
@@ -3056,7 +3154,13 @@ function openGlobalFirehoseStream() {
     // Only re-render when overview is visible — keeps the
     // SSE-event handler cheap when the operator is on
     // another page.
-    if (currentRoute === 'overview') renderGlobalFirehose(false);
+    if (currentRoute === 'overview') {
+      renderGlobalFirehose(false);
+      // H11: re-tally ops-health counts now that a new event
+      // landed in the ring. Cheap — walks at most
+      // FIREHOSE_RING_CAP entries.
+      renderOpsHealthBadges();
+    }
   });
   es.addEventListener('dropped', (m) => {
     firehoseDroppedCount += 1;
@@ -3091,6 +3195,9 @@ async function fetchStuckTasks() {
     }
     const j = await r.json();
     const items = j.items || [];
+    // H11: feed the operational-health badges with the stuck count.
+    opsHealthStuckCount = items.length;
+    renderOpsHealthBadges();
     if (items.length === 0) {
       $card.style.display = 'none';
       return;
@@ -4895,6 +5002,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (ev.target === $backdrop) toggleKbdHelp(false);
     });
   }
+  // H11: wire ops-health KPI tile clicks. The tiles themselves
+  // exist from initial render (just hidden when counts=0).
+  wireOpsHealthTileClicks();
 });
 
 document.addEventListener('click', (ev) => {
