@@ -11,6 +11,7 @@ mod router;
 mod task;
 mod terminal;
 mod topology;
+mod web;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -109,6 +110,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: fs::Cmd,
     },
+    /// PH-CLI-WEB-BLOCKLIST: web-tool operator surface.
+    /// `web blocklist` snapshots `[tool] blocked_hosts` via
+    /// the bridge's `GET /v1/tool/blocklist` proxy
+    /// (PH-DASH-BLOCKLIST). HTTP-against-bridge — no identity
+    /// bundle required.
+    Web {
+        #[command(subcommand)]
+        cmd: web::Cmd,
+    },
     /// PH-TERM-CLI: inspect + control tool.terminal.* on a
     /// tool node. `terminal sessions` lists live runs;
     /// `terminal audit` snapshots the completion ring;
@@ -162,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,
+        Cmd::Web { cmd } => web::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
