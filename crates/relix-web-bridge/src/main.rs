@@ -100,6 +100,7 @@ mod mcp;
 mod mcp_audit;
 mod metrics;
 mod openai;
+mod policy_simulate;
 mod secrets;
 mod sse;
 mod task_recorder;
@@ -427,6 +428,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Returns per-capability invocation + latency counters
         // (lifetime, reset on peer restart). Read-only.
         .route("/v1/dispatch/stats", get(dispatch_stats::stats))
+        // W2-007b: proxy for `node.policy.simulate`. Operators
+        // ask "what would the policy decide if a caller with
+        // groups Y called method M?" without invoking M.
+        .route("/v1/policy/simulate", get(policy_simulate::simulate))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
