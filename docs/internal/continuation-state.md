@@ -470,12 +470,25 @@ all pushed to origin/main):
 | PH-OPS-EVENTS | a738a12 | cli +1 | relix-cli ops events — H2 firehose snapshot |
 | PH-WEB-ROBOTS | 45ea5b3 | runtime +14 | tool.web.robots_check (RFC 9309 robots.txt sniff) |
 | PH-FS-PARITY2 | d134ce5 | runtime +10 | tool.binary_sniff (Hermes binary_extensions parity) |
+| PH-ROUTER2 | 41ee3bb | runtime +11 | HealthAwareRouter — health-aware provider picker |
+| PH-ROUTER-PREVIEW | 16d44c0 | bridge +2 | POST /v1/providers/route_test endpoint |
+| PH-ROUTER-PREVIEW-CLI | b228cf2 | cli +1 | relix-cli ops route-test subcommand |
 | D-006 closure | 45ea5b3 | n/a | answered:c — recovery_scan terminal_summary already shipped |
 
-Aggregate: ~9900+ LOC; runtime tests 419 → 491, bridge tests
-192 → 218, relix-core 33 → 61, relix-cli 54 → 60. Every
-milestone clean fmt + clippy + tests. Total workspace = ~790
+Aggregate: ~10300+ LOC; runtime tests 419 → 497, bridge tests
+192 → 220, relix-core 33 → 61, relix-cli 54 → 61. Every
+milestone clean fmt + clippy + tests. Total workspace = ~796
 passing tests.
+
+The PH-ROUTER cluster (R1 scaffold → R2 health-aware impl →
+PREVIEW bridge endpoint → CLI subcommand) ships a complete
+operator-facing routing-preview stack without touching the AI
+node's live request path. Operators can now ask "given current
+provider state, who would the smart router pick if I sent a
+chat call right now?" via dashboard fetch OR `relix-cli ops
+route-test --candidates X,Y,Z` without sending an actual chat
+call. Pure observability; the AI node wiring lands when the
+single-provider → multi-provider config switch happens.
 
 The PH-WAVE2 cluster (G..L) ships a complete bridge-side
 rate-limit ladder + ops surface: per-provider observation ring →
