@@ -1,7 +1,7 @@
 //! PH-BRIDGE-MCP — HTTP proxy for the MCP registry on a tool
 //! node.
 //!
-//! Two endpoints:
+//! Three endpoints:
 //!
 //! - `GET /v1/mcp/servers?peer=<alias>` — proxies
 //!   `tool.mcp.list_servers` to the named tool peer (default
@@ -12,12 +12,22 @@
 //!   `tool.mcp.list_tools`. Returns JSON `{peer, server_id,
 //!   tools:[...]}`.
 //!
+//! - `POST /v1/mcp/invoke` (PH-BRIDGE-MCP-INVOKE) — proxies
+//!   `tool.mcp.invoke`. Body JSON: `{peer?, server_id,
+//!   tool_name, args}`. Response: `{peer, server_id, tool_name,
+//!   result}` on success. Honest about D-009: the underlying
+//!   runtime returns `RuntimeNotConnected` today, which the
+//!   bridge surfaces as 502 Bad Gateway with the responder's
+//!   cause string. The proxy itself is ready for the moment
+//!   the stdio runtime wiring lands.
+//!
 //! Pure translation: the bridge dispatches via the existing
 //! `MeshClient::call(alias, envelope)` path (same one
 //! `TaskRecorder` uses for `task.*`) and parses the tab-delim
 //! response into structured JSON for dashboard / HTTP-tool
 //! consumption. No new auth surface, no new dispatch surface;
-//! just a read-only projection of the tool node's MCP registry.
+//! just a projection of the tool node's MCP registry +
+//! invocation surface.
 //!
 //! Fail modes:
 //! - Bridge mesh client not initialized → 503 ServiceUnavailable.
@@ -25,7 +35,9 @@
 //!   underlying `MeshClient::call` error message classification).
 //! - Tool node doesn't have MCP configured → 502 BadGateway with
 //!   the responder's INVALID_ARGS cause propagated.
-//! - `server_id` empty on `/v1/mcp/tools` → 400 BadRequest.
+//! - `server_id` empty on `/v1/mcp/tools` or
+//!   `/v1/mcp/invoke` → 400 BadRequest.
+//! - `tool_name` empty on `/v1/mcp/invoke` → 400 BadRequest.
 
 use axum::{
     Json,
@@ -113,6 +125,77 @@ pub async fn tools(
         server_id: q.server_id,
         tools,
     }))
+}
+
+/// PH-BRIDGE-MCP-INVOKE: request body for `POST /v1/mcp/invoke`.
+#[derive(Debug, Deserialize)]
+pub struct InvokeRequest {
+    #[serde(default)]
+    pub peer: Option<String>,
+    pub server_id: String,
+    pub tool_name: String,
+    /// Tool arguments forwarded verbatim. Typically a JSON
+    /// string (matching the tool's declared `inputSchema`), but
+    /// the bridge does not interpret it — it joins
+    /// `<server_id>|<tool_name>|<args>` into the SIMP-016 wire
+    /// shape and forwards.
+    #[serde(default)]
+    pub args: String,
+}
+
+/// PH-BRIDGE-MCP-INVOKE: response shape on success. On failure
+/// the standard `ApiError` is returned with an appropriate
+/// status code (see module doc for the error-classification
+/// table).
+#[derive(Debug, Serialize)]
+pub struct InvokeResponse {
+    pub peer: String,
+    pub server_id: String,
+    pub tool_name: String,
+    /// Verbatim responder body. Today (D-009) the runtime is
+    /// not wired so this path returns 502 BadGateway with a
+    /// `RuntimeNotConnected` cause — but the response shape is
+    /// ready for the moment the live runtime ships.
+    pub result: String,
+}
+
+pub async fn invoke(
+    State(state): State<AppState>,
+    Json(req): Json<InvokeRequest>,
+) -> Result<Json<InvokeResponse>, (StatusCode, Json<ApiError>)> {
+    if req.server_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "server_id required".into(),
+            }),
+        ));
+    }
+    if req.tool_name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "tool_name required".into(),
+            }),
+        ));
+    }
+    let peer = req.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
+    let wire_arg = build_invoke_arg(&req.server_id, &req.tool_name, &req.args);
+    let result = call_peer(&state, &peer, "tool.mcp.invoke", wire_arg.as_bytes()).await?;
+    Ok(Json(InvokeResponse {
+        peer,
+        server_id: req.server_id,
+        tool_name: req.tool_name,
+        result,
+    }))
+}
+
+/// PH-BRIDGE-MCP-INVOKE: build the SIMP-016 wire arg for
+/// `tool.mcp.invoke`. Wire shape is `<server_id>|<tool_name>|<args>`;
+/// the responder's parser uses `splitn(3, '|')` so `args` may
+/// contain pipes itself without breaking the split.
+fn build_invoke_arg(server_id: &str, tool_name: &str, args: &str) -> String {
+    format!("{server_id}|{tool_name}|{args}")
 }
 
 /// PH-BRIDGE-MCP: invoke a capability on a tool peer via the
@@ -273,5 +356,40 @@ mod tests {
     fn parse_tools_empty_body_returns_empty_vec() {
         assert!(parse_tools("").is_empty());
         assert!(parse_tools("count=0").is_empty());
+    }
+
+    // ── PH-BRIDGE-MCP-INVOKE: wire arg builder ──────────────────────
+
+    #[test]
+    fn build_invoke_arg_three_pipes() {
+        // Standard JSON args.
+        let a = build_invoke_arg("mcp-srv", "search", r#"{"q":"rust"}"#);
+        assert_eq!(a, r#"mcp-srv|search|{"q":"rust"}"#);
+    }
+
+    #[test]
+    fn build_invoke_arg_args_may_contain_pipes() {
+        // The responder uses splitn(3, '|') so args MAY contain
+        // pipes — they end up in the third field intact. Verify
+        // the builder doesn't escape or strip pipes from args.
+        let a = build_invoke_arg("srv", "fetch", "a|b|c|d");
+        assert_eq!(a, "srv|fetch|a|b|c|d");
+    }
+
+    #[test]
+    fn build_invoke_arg_empty_args_ok() {
+        // tool.mcp.invoke accepts empty args (the dispatch
+        // parser checks server_id + tool_name non-empty;
+        // args may be the empty string).
+        let a = build_invoke_arg("srv", "noop", "");
+        assert_eq!(a, "srv|noop|");
+    }
+
+    #[test]
+    fn build_invoke_arg_preserves_whitespace_in_args() {
+        // Whitespace inside args is meaningful (e.g. multi-line
+        // JSON); the builder should not trim or normalize.
+        let a = build_invoke_arg("srv", "tool", "  {  \"k\": 1  }  ");
+        assert_eq!(a, "srv|tool|  {  \"k\": 1  }  ");
     }
 }

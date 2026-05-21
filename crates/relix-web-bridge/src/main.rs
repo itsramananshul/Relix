@@ -386,6 +386,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // into JSON for dashboard / curl consumption.
         .route("/v1/mcp/servers", get(mcp::servers))
         .route("/v1/mcp/tools", get(mcp::tools))
+        // PH-BRIDGE-MCP-INVOKE: invocation proxy. Honest about
+        // D-009: returns 502 with `RuntimeNotConnected` until
+        // the stdio runtime ships, but the surface is ready.
+        .route("/v1/mcp/invoke", post(mcp::invoke))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).

@@ -82,6 +82,7 @@ before the backend (visibility + stable contract + honesty).
 | `relix-cli capability ls --risk <tier[+]>` (PH-CAP-RISK3) | live | Filter ls output by risk tier; `+` means at-or-above |
 | `GET /v1/mcp/servers?peer=<alias>` (PH-BRIDGE-MCP) | live | Bridge HTTP proxy → tool.mcp.list_servers; returns structured JSON |
 | `GET /v1/mcp/tools?peer=<alias>&server_id=<id>` (PH-BRIDGE-MCP) | live | Bridge HTTP proxy → tool.mcp.list_tools |
+| `POST /v1/mcp/invoke` (PH-BRIDGE-MCP-INVOKE) | live (surface) | Bridge HTTP proxy → tool.mcp.invoke; returns 502 RuntimeNotConnected until D-009 unblocks |
 | `relix-cli terminal sessions --peer ...` (PH-TERM-CLI) | live | Lists live in-flight terminal sessions |
 | `relix-cli terminal audit --peer ... [--max N]` (PH-TERM-CLI) | live | Snapshots the completion ring; renders status (ok/timed_out/cancelled) |
 | `relix-cli terminal cancel --peer ... --session-id ...` (PH-TERM-CLI) | live | Triggers cooperative cancel for a live session |
