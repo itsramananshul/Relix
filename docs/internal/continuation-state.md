@@ -9,17 +9,17 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `8ae5ff1 feat(bridge): PH-BRIDGE-MCP HTTP proxy for MCP registry`
+- **HEAD:** `10bb4d9 feat(operator-ui): PH-DASH-MCP dashboard MCP registry panel`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1081 passing, 0 failures
+- **Workspace tests:** 1082 passing, 0 failures
   - relix-core: 66
   - relix-policy: 66
   - relix-runtime: 657
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli: 34
-  - relix-web-bridge: 227
+  - relix-web-bridge: 228
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -52,6 +52,7 @@ as the resume command.
 | f570a9b | PH-CAP-RISK stage 2 | sweep every shipped descriptor with explicit risk tier |
 | 4de4a53 | PH-CAP-RISK3 | relix-cli capability ls --risk filter (exact + at-or-above) |
 | 8ae5ff1 | PH-BRIDGE-MCP | GET /v1/mcp/{servers,tools} bridge HTTP proxy for MCP registry |
+| 10bb4d9 | PH-DASH-MCP | dashboard #/mcp page with server table + expandable tools per row |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
