@@ -465,6 +465,8 @@ all pushed to origin/main):
 | PH-DASH3 | 4f69a3a | bridge +1 | #/capabilities dashboard page (filter chips + text) |
 | PH-DASH3-CLI | c9d985d | cli +1 | relix-cli ops capabilities subcommand |
 | PH-ROUTER1 | 40eaa28 | runtime +6 | provider router scaffold (NoopRouter trait) |
+| PH-FS-PARITY1 | 7d39590 | runtime +6 | tool.append_file + tool.patch_preview (Hermes file_operations parity) |
+| docs(capability) | d240309 | n/a | canonical docs/capabilities.md index of every shipped capability |
 
 Aggregate: ~9600+ LOC; runtime tests 291 → 419, bridge tests
 192 → 217, relix-core 33 → 61, relix-cli 54 → 56. Every
