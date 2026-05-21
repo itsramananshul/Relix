@@ -270,6 +270,43 @@ about and matches Relix's existing prefer-explicit-args posture.
 
 **Status.** open.
 
+### D-009  MCP stdio runtime — which real server to bind against?
+
+**Context.** CW5 ships the MCP registry + discovery scaffold;
+`tool.mcp.invoke` returns `RuntimeNotConnected` always.
+PH-MCP-PROTO ships the JSON-RPC wire layer as a tested data
+module (no I/O). The next step (PH-MCP-STDIO1) wires it into
+the registry: spawn the operator-declared stdio process,
+initialize handshake, tools/list cache, tools/call dispatch.
+
+That step is blocked by something subtle: there is no concrete
+MCP server target identified in this codebase. Continuation
+state explicitly warned: "Avoid CW5 mcp_tool until a real MCP
+server target is identified." Without a target, the protocol
+implementation has no end-to-end test path and risks
+implementing against an imagined server shape that the operator
+will eventually replace.
+
+**Options.**
+- (a) Pick the official MCP SDK reference server
+  (https://github.com/modelcontextprotocol/servers) and bind
+  against its `filesystem` example. Stable, official-shaped.
+- (b) Bind against Anthropic's MCP server bundle. Requires the
+  operator to install the bundle independently. Tighter
+  ecosystem alignment.
+- (c) Defer all MCP stdio runtime work until an operator
+  brings a concrete server target. Ship only the protocol
+  layer (PH-MCP-PROTO) which is pure data + safe.
+
+**Recommendation.** (c) — defer the runtime wiring. The
+protocol layer is honest and forward-compatible; binding to a
+specific server without operator-confirmed need risks the same
+"shipped scaffold, no real consumer" problem CW5 was meant to
+avoid. The protocol layer alone is testable and gives the next
+session a head start the moment a target is named.
+
+**Status.** open — runtime continues with PH-MCP-PROTO only.
+
 ---
 
 ## Answered
