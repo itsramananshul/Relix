@@ -9,39 +9,40 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `48fa803 feat(bridge): W2-007b — GET /v1/policy/simulate HTTP proxy for node.policy.simulate`
+- **HEAD:** `e12ad4b feat(dash): W2-001d — Replay button on task detail action bar`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
 - **Wave 2 status: IN PROGRESS.**
+  - **W2-001 (Replay UX):** substantively CLOSED — per-step
+    duration in timeline (W2-001a) + `task.replay` capability
+    (W2-001b) + `POST /v1/tasks/:id/replay` bridge route
+    (W2-001c) + Replay button (W2-001d). Remaining:
+    replay-diff mode, failure-screenshot inline rendering.
   - **W2-002 (Browser):** substantively shipped — trait
-    extension (click/type/wait), HC live impl, WD live impl,
-    screenshot-on-failure, event-trace logging. PW live
-    click/type/wait still pending; dashboard screenshot
-    viewer pending.
-  - **W2-006 (Observability):** CLOSED end-to-end —
-    latency on CapStats → `node.dispatch.stats` runtime
-    capability → `GET /v1/dispatch/stats` bridge proxy →
-    `#/metrics` dashboard page → `relix-cli ops
-    dispatch-stats` CLI mirror.
-  - **W2-001 (Replay UX):** started — per-step duration in
-    chronicle timeline. Replay button / diff mode / failure
-    screenshot rendering pending.
+    extension + HC live + WD live + screenshot-on-failure +
+    event-trace logging. PW live click/type/wait + dashboard
+    screenshot viewer pending.
   - **W2-005 (Failure system):** substantively shipped via
-    Wave 1 (RetryPolicy, FailureClass, structured reasons,
-    cancellation). Visualization is W2-003 overlap.
-  - **W2-003 (Dashboard UX):** partial — Metrics page
-    shipped; live feed / status pills / filtering pending.
-  - **W2-004 / W2-007 / W2-008:** not started.
-- **Workspace tests:** **1226 passing on default features**;
+    Wave 1.
+  - **W2-006 (Observability):** CLOSED end-to-end (runtime →
+    bridge → dashboard → CLI).
+  - **W2-003 (Dashboard UX):** partial — Metrics + What-If
+    form added; live feed / status pills pending.
+  - **W2-007 (Policy hardening):** CLOSED end-to-end —
+    `node.policy.simulate` (W2-007a) + bridge proxy
+    (W2-007b) + dashboard "What If" form (W2-007c). Decision
+    viewer / dry-run mode pending.
+  - **W2-004 / W2-008:** not started.
+- **Workspace tests:** **1232 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
   - relix-cli: 110
   - relix-policy: 72
-  - relix-runtime: 722
+  - relix-runtime: 727 (+5 task.replay)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 289 (+6 policy_simulate parser tests)
+  - relix-web-bridge: 290 (+1 policy what-if landmark)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -116,6 +117,10 @@ as the resume command.
 | d9015a8 | docs | Wave 2 tally |
 | 0fd853d | W2-007a | `node.policy.simulate` built-in capability — operators ask "what would the policy decide?" without invoking; synthetic VerifiedIdentity inherits caller identity but swaps groups; name suffix `:simulate` |
 | 48fa803 | W2-007b | `GET /v1/policy/simulate` bridge HTTP proxy; `matched_rule` / `reason` Option-shaped with skip_serializing_if; 6 parser tests; 400 on missing method |
+| 4e19f60 | W2-007c | Dashboard "Policy What If" card on Capabilities page; allow/deny badge + rule + reason render; Enter-to-submit + landmark test |
+| 134c2b1 | W2-001b | `task.replay` capability + `TaskStore::replay_from` clones a task (title `(replay)`, fresh retry_count) + writes `retried_from` edge + `task.replayed_from` chronicle event; 5 tests |
+| 6408ea4 | W2-001c | `POST /v1/tasks/:id/replay` bridge endpoint returns `{original_task_id, new_task_id}`; intervention_audit records the action |
+| e12ad4b | W2-001d | Dashboard "Replay" button on task detail action bar with confirm-guard + auto-navigate to new task on success — W2-001 substantively closed end-to-end |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
