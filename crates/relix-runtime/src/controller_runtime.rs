@@ -1028,6 +1028,10 @@ fn register_node_type_handlers(
         // PH-WEB-POST: tool.web.post — POST with body + cookie
         // headers, same SSRF + DNS pin posture as web_fetch.
         manifest.add_capability(crate::nodes::tool::web_tools::web_post_descriptor());
+        // PH-DASH-BLOCKLIST: tool.web.blocklist_summary — read
+        // the operator-curated `[tool] blocked_hosts` set. Pure
+        // config read, no I/O.
+        manifest.add_capability(crate::nodes::tool::web_tools::web_blocklist_summary_descriptor());
         // PH-WEB-ROBOTS: tool.web.robots_check — robots.txt sniff.
         // Same SSRF + pin + redirect machinery as web_fetch.
         manifest.add_capability(crate::nodes::tool::web_robots::robots_check_descriptor());

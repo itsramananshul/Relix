@@ -131,6 +131,36 @@ pub fn web_search_descriptor() -> CapabilityDescriptor {
     d
 }
 
+/// PH-DASH-BLOCKLIST: descriptor for `tool.web.blocklist_summary`.
+/// Pure-read of the operator-curated `[tool] blocked_hosts` set —
+/// no I/O, no network, no DNS. Surfaced so the dashboard / CLI
+/// can show operators what they've configured without going
+/// through the config file directly. Risk Safe (the blocklist is
+/// already operator-controlled; exposing its contents is no more
+/// sensitive than reading the config itself, which the operator
+/// already has access to).
+pub fn web_blocklist_summary_descriptor() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.web.blocklist_summary");
+    d.major_version = 1;
+    d.kind = CapabilityKind::Unary;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["read:config".into()];
+    d.policy_attachment_point = "tool.web.blocklist_summary".to_string();
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Read-only snapshot of `[tool] blocked_hosts`. No args; \
+         returns `count=N` then one host per line, lexicographically \
+         sorted. Used by the dashboard PH-DASH-BLOCKLIST card and \
+         `relix-cli web blocklist`. Pure config read — no I/O."
+            .into(),
+    );
+    d.categories = vec!["observe".into(), "config".into()];
+    d.environment_requirements = vec![];
+    d.risk_level = RiskLevel::Safe;
+    d
+}
+
 /// PH-WEB-POST: descriptor for `tool.web.post`. Same blast radius
 /// as `tool.web_fetch` (network egress, SSRF gate, DNS pin) plus
 /// the caller-supplied body is forwarded verbatim. Cookies are
@@ -187,7 +217,7 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
         })),
     );
 
-    let b_post = backend;
+    let b_post = backend.clone();
     bridge.register(
         "tool.web.post",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -195,6 +225,43 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
             async move { handle_web_post(backend, ctx).await }
         })),
     );
+
+    let b_bl = backend;
+    bridge.register(
+        "tool.web.blocklist_summary",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let backend = b_bl.clone();
+            async move { handle_blocklist_summary(backend, ctx) }
+        })),
+    );
+}
+
+// ─────────────────────────── tool.web.blocklist_summary ─────────────
+
+/// PH-DASH-BLOCKLIST: handle `tool.web.blocklist_summary`. Arg is
+/// ignored (caller may send empty or any bytes). Returns a body
+/// of:
+///
+/// ```text
+/// count=N
+/// host-1
+/// host-2
+/// …
+/// ```
+///
+/// Entries are sorted lexicographically (the HostBlocklist stores
+/// them in a HashSet; sort here gives operators a stable order
+/// regardless of insertion sequence).
+fn handle_blocklist_summary(backend: Arc<ToolBackend>, _ctx: InvocationCtx) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    let bl = backend.blocklist();
+    let hosts = bl.snapshot_sorted();
+    let mut buf = String::new();
+    let _ = writeln!(buf, "count={}", hosts.len());
+    for h in hosts {
+        let _ = writeln!(buf, "{h}");
+    }
+    HandlerOutcome::Ok(buf.into_bytes())
 }
 
 // ─────────────────────────── tool.web_get ───────────────────────────
@@ -1241,6 +1308,100 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""set_cookies":["sid=abc; Path=/","csrf=xyz"]"#));
         assert!(s.contains(r#""final_url":"https://example.com/api""#));
+    }
+
+    // ── PH-DASH-BLOCKLIST: tool.web.blocklist_summary ────────────────
+
+    /// Build a `ToolConfig` with the given blocked hosts. Avoids
+    /// pulling in `default_max_bytes` etc. — uses `Default` and
+    /// then overrides the blocklist.
+    fn cfg_with_blocked(hosts: &[&str]) -> super::super::ToolConfig {
+        super::super::ToolConfig {
+            blocked_hosts: hosts.iter().map(|s| (*s).to_string()).collect(),
+            ..super::super::ToolConfig::default()
+        }
+    }
+
+    fn bl_ctx(args: &[u8]) -> InvocationCtx {
+        use relix_core::identity::VerifiedIdentity;
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "".into(),
+                clearance: "".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args: args.to_vec(),
+        }
+    }
+
+    fn unwrap_ok_body(out: HandlerOutcome) -> String {
+        if let HandlerOutcome::Ok(body) = out {
+            String::from_utf8(body).unwrap()
+        } else {
+            // `HandlerOutcome` does not impl Debug, so we can't
+            // include the value in the panic. If this fires the
+            // outcome was Err / StreamHandle — neither is expected
+            // for this read-only capability under any input.
+            panic!("expected HandlerOutcome::Ok, got Err or StreamHandle");
+        }
+    }
+
+    #[test]
+    fn blocklist_summary_descriptor_shape() {
+        let d = web_blocklist_summary_descriptor();
+        assert_eq!(d.method_name, "tool.web.blocklist_summary");
+        assert!(matches!(d.idempotency, Idempotency::Idempotent));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(matches!(d.risk_level, RiskLevel::Safe));
+        // Read-config sensitivity tag; no network egress tag.
+        assert!(d.sensitivity_tags.iter().any(|t| t == "read:config"));
+        assert!(!d.sensitivity_tags.iter().any(|t| t == "egress:http"));
+    }
+
+    #[test]
+    fn blocklist_summary_handler_renders_empty_ring() {
+        let backend = Arc::new(super::super::ToolBackend::new(cfg_with_blocked(&[])).unwrap());
+        let s = unwrap_ok_body(handle_blocklist_summary(backend, bl_ctx(b"")));
+        assert_eq!(s, "count=0\n");
+    }
+
+    #[test]
+    fn blocklist_summary_handler_renders_sorted_entries() {
+        let backend = Arc::new(
+            super::super::ToolBackend::new(cfg_with_blocked(&[
+                "zebra.example.com",
+                "alpha.example.com",
+                "MIDDLE.example.com",
+            ]))
+            .unwrap(),
+        );
+        let body = unwrap_ok_body(handle_blocklist_summary(backend, bl_ctx(b"")));
+        // Sorted lexicographically, lowercase-normalized.
+        let expected = "count=3\nalpha.example.com\nmiddle.example.com\nzebra.example.com\n";
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn blocklist_summary_ignores_args() {
+        // The handler intentionally accepts and ignores arg bytes —
+        // callers shouldn't need to send anything but operators
+        // running `relix-cli capability invoke ... '<anything>'`
+        // shouldn't see a 400 either.
+        let backend =
+            Arc::new(super::super::ToolBackend::new(cfg_with_blocked(&["only.host"])).unwrap());
+        let s = unwrap_ok_body(handle_blocklist_summary(
+            backend,
+            bl_ctx(b"some unrelated garbage"),
+        ));
+        assert!(s.starts_with("count=1\n"));
+        assert!(s.contains("only.host"));
     }
 
     #[test]

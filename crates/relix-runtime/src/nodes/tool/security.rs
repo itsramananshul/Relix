@@ -184,6 +184,16 @@ impl HostBlocklist {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Snapshot every entry, sorted lexicographically. Used by the
+    /// `tool.web.blocklist_summary` capability (PH-DASH-BLOCKLIST)
+    /// — operators get a stable order regardless of HashSet's
+    /// non-deterministic iteration order.
+    pub fn snapshot_sorted(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.entries.iter().cloned().collect();
+        out.sort();
+        out
+    }
 }
 
 /// Validate a URL string and (if it has a hostname) resolve it. Returns

@@ -409,6 +409,25 @@ mod tests {
             body.contains("'6': 'fsaudit'"),
             "kbd shortcut 6 should switch to fsaudit"
         );
+        // PH-DASH-BLOCKLIST: host blocklist card lives on this
+        // page (same peer-alias control). Assert the card +
+        // endpoint + JS handler.
+        assert!(
+            body.contains(r#"id="blocklist-card""#),
+            "blocklist card missing"
+        );
+        assert!(
+            body.contains(r#"id="blocklist-host""#),
+            "blocklist host slot missing"
+        );
+        assert!(
+            body.contains("/v1/tool/blocklist"),
+            "fsaudit page should consume /v1/tool/blocklist"
+        );
+        assert!(
+            body.contains("loadBlocklist"),
+            "loadBlocklist handler missing"
+        );
     }
 
     #[tokio::test]

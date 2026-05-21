@@ -2317,6 +2317,23 @@
         fingerprint. The op filter is enforced by the responder —
         passing an unknown op yields HTTP 400.
       </p>
+      <!-- PH-DASH-BLOCKLIST: operator-curated host blocklist card -->
+      <div class="card" id="blocklist-card">
+        <div class="card-header">
+          <h3>Web host blocklist</h3>
+          <span class="meta" id="blocklist-summary"></span>
+        </div>
+        <div class="card-body dense" id="blocklist-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Sourced from <code>/v1/tool/blocklist</code> which proxies
+        <code>tool.web.blocklist_summary</code>. Operator-curated
+        via <code>[tool] blocked_hosts</code>; refresh with a tool-node
+        restart. Honest: <em>not</em> a live threat feed — see the
+        URLhaus refresh recipe in the tool-node security doc.
+      </p>
     </section>
 
     <!-- ── #/termaudit (PH-BRIDGE-TERM-AUDIT) ────────────────────── -->
@@ -6918,7 +6935,10 @@ async function loadMcpAudit() {
 function initFsAudit() {
   const $refresh = document.getElementById('fsaudit-refresh-btn');
   if ($refresh) {
-    $refresh.addEventListener('click', () => loadFsAudit());
+    $refresh.addEventListener('click', () => {
+      loadFsAudit();
+      loadBlocklist();
+    });
   }
   const $peer = document.getElementById('fsaudit-peer-input');
   if ($peer) {
@@ -6926,6 +6946,7 @@ function initFsAudit() {
       if (ev.key === 'Enter') {
         ev.preventDefault();
         loadFsAudit();
+        loadBlocklist();
       }
     });
   }
@@ -6944,6 +6965,69 @@ function initFsAudit() {
 
 function enterFsAudit() {
   loadFsAudit();
+  loadBlocklist();
+}
+
+/* PH-DASH-BLOCKLIST: load + render the operator-curated host
+   blocklist for the current peer. Reads /v1/tool/blocklist which
+   proxies tool.web.blocklist_summary. Read-only — to change the
+   list, operators edit `[tool] blocked_hosts` and restart the
+   tool node. */
+async function loadBlocklist() {
+  const $host = document.getElementById('blocklist-host');
+  const $summary = document.getElementById('blocklist-summary');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  const peer = currentFsAuditPeer();
+  try {
+    const r = await fetch('/v1/tool/blocklist?peer=' + encodeURIComponent(peer));
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const hosts = body.hosts || [];
+    const count = body.count || 0;
+    if ($summary) {
+      $summary.textContent = count === 0
+        ? 'empty (not configured)'
+        : count + ' host(s) blocked';
+    }
+    if (hosts.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no hosts on the blocklist for peer <code>'
+        + escapeHtml(peer) + '</code> — set '
+        + '<code>[tool] blocked_hosts</code> in the tool node\'s '
+        + 'config and restart to populate'
+        + '</div>';
+      return;
+    }
+    // Cap on-screen rendering to first 200 entries; URLhaus dumps
+    // can produce huge lists and the browser doesn't need every
+    // one. Show the count + a hint if truncated.
+    const VISIBLE_CAP = 200;
+    const visible = hosts.slice(0, VISIBLE_CAP);
+    const rows = visible
+      .map(h => '<tr><td><code>' + escapeHtml(h) + '</code></td></tr>')
+      .join('');
+    let table = '<table class="data"><thead><tr><th>host</th></tr></thead><tbody>'
+      + rows + '</tbody></table>';
+    if (hosts.length > VISIBLE_CAP) {
+      table += '<p class="meta" style="padding: 6px 14px;">'
+        + 'showing first ' + VISIBLE_CAP + ' of '
+        + hosts.length + ' entries; query <code>/v1/tool/blocklist</code> '
+        + 'directly for the full list</p>';
+    }
+    $host.innerHTML = table;
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+    if ($summary) $summary.textContent = '';
+  }
 }
 
 function currentFsAuditPeer() {

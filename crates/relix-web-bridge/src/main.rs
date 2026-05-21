@@ -84,6 +84,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
     resp
 }
 
+mod blocklist;
 mod capabilities;
 mod chat;
 mod config;
@@ -409,6 +410,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // intentionally drops args from the audit body — only
         // the command is shipped.
         .route("/v1/terminal/audit", get(term_audit::audit))
+        // PH-DASH-BLOCKLIST: proxy for `tool.web.blocklist_summary`
+        // on the tool peer. Returns the operator-curated host
+        // blocklist as JSON. Read-only — to change it, edit
+        // `[tool] blocked_hosts` and restart the tool node.
+        .route("/v1/tool/blocklist", get(blocklist::blocklist))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
