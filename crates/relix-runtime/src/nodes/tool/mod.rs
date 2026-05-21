@@ -48,6 +48,7 @@
 
 pub mod fs;
 pub mod pdf;
+pub mod sanitize;
 pub mod security;
 pub mod terminal;
 pub mod web_extract;
