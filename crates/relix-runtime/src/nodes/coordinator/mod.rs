@@ -379,7 +379,10 @@ impl TaskStore {
     /// Insert a new Task. Returns the freshly-minted `task_id`
     /// (32 hex chars). Optional retry / timeout metadata defaults to
     /// "no retry, no timeout" for backwards compatibility with pre-C1
-    /// callers that don't supply them.
+    /// callers that don't supply them. `origin_surface` (D-004 /
+    /// PH-ORIGIN-SURFACE) is an operator-curated label naming
+    /// which dispatch surface created the task — `None` writes
+    /// NULL and the dashboard renders it as "unknown".
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -390,6 +393,7 @@ impl TaskStore {
         retry_policy: RetryPolicy,
         max_retries: i64,
         max_runtime_secs: Option<i64>,
+        origin_surface: Option<&str>,
     ) -> Result<String, CoordinatorError> {
         let task_id = new_task_id();
         let now = unix_secs();
@@ -399,9 +403,9 @@ impl TaskStore {
                                 flow_template, params_json,
                                 created_at, updated_at,
                                 retry_count, retry_policy, max_retries,
-                                max_runtime_secs)
+                                max_runtime_secs, origin_surface)
              VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?6,
-                     0, ?7, ?8, ?9)",
+                     0, ?7, ?8, ?9, ?10)",
             params![
                 task_id,
                 title,
@@ -412,6 +416,7 @@ impl TaskStore {
                 retry_policy.as_str(),
                 max_retries,
                 max_runtime_secs,
+                origin_surface,
             ],
         )
         .map_err(CoordinatorError::Db)?;
@@ -2794,7 +2799,7 @@ impl TaskStore {
                         attempt_count, current_attempt_id,
                         investigation_marked_at, investigation_reason,
                         pause_generation, freeze_generation,
-                        frozen_at, frozen_reason
+                        frozen_at, frozen_reason, origin_surface
                  FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 |r| {
@@ -2827,6 +2832,7 @@ impl TaskStore {
                         freeze_generation: r.get(24)?,
                         frozen_at: r.get(25)?,
                         frozen_reason: r.get(26)?,
+                        origin_surface: r.get(27)?,
                         events: Vec::new(),
                     })
                 },
@@ -3210,6 +3216,14 @@ pub struct TaskView {
     /// M71: optional operator-supplied reason captured at
     /// freeze time. Cleared on unfreeze.
     pub frozen_reason: Option<String>,
+    /// PH-ORIGIN-SURFACE (D-004): which dispatch surface
+    /// created this task. `None` on rows created before the
+    /// migration OR by callers that didn't stamp the value.
+    /// Expected values: `"chat"`, `"dashboard"`, `"cli"`,
+    /// `"channel"`, `"flow-engine"`, or any short
+    /// operator-supplied label. The dashboard treats `None`
+    /// as "unknown" for filter rendering.
+    pub origin_surface: Option<String>,
     pub events: Vec<TaskEvent>,
 }
 
@@ -4052,11 +4066,14 @@ fn handle_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(s) => s,
         Err(e) => return invalid(format!("task.create utf8: {e}")),
     };
-    // `title|flow_template|params_json|owner_subject_id|retry_policy|max_retries|max_runtime_secs`.
-    // Retry/runtime trailer is optional; callers can leave the suffix
-    // off entirely or send empty slots. params_json that contains `|`
-    // should be base64-encoded by the caller (SIMP-016).
-    let parts: Vec<&str> = s.splitn(7, '|').collect();
+    // `title|flow_template|params_json|owner_subject_id|retry_policy|max_retries|max_runtime_secs|origin_surface`.
+    // Retry/runtime/origin trailers are optional; callers can leave
+    // the suffix off entirely or send empty slots. params_json that
+    // contains `|` should be base64-encoded by the caller (SIMP-016).
+    // PH-ORIGIN-SURFACE (D-004): the 8th slot is the dispatch
+    // surface label — empty / missing → NULL → dashboard renders
+    // as "unknown".
+    let parts: Vec<&str> = s.splitn(8, '|').collect();
     let title = parts.first().copied().unwrap_or("");
     let flow_template = parts.get(1).copied().unwrap_or("");
     let params_json = parts.get(2).copied().unwrap_or("");
@@ -4064,6 +4081,7 @@ fn handle_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let retry_policy_str = parts.get(4).copied().unwrap_or("");
     let max_retries_str = parts.get(5).copied().unwrap_or("");
     let max_runtime_str = parts.get(6).copied().unwrap_or("");
+    let origin_surface_str = parts.get(7).copied().unwrap_or("").trim();
     if title.is_empty() || flow_template.is_empty() {
         return invalid("task.create: `title` and `flow_template` are required".to_string());
     }
@@ -4100,6 +4118,11 @@ fn handle_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
             }
         }
     };
+    let origin_surface = if origin_surface_str.is_empty() {
+        None
+    } else {
+        Some(origin_surface_str)
+    };
     match store.create(
         title,
         flow_template,
@@ -4108,6 +4131,7 @@ fn handle_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         retry_policy,
         max_retries,
         max_runtime_secs,
+        origin_surface,
     ) {
         Ok(id) => HandlerOutcome::Ok(id.into_bytes()),
         Err(e) => internal(format!("task.create: {e}")),
@@ -5822,6 +5846,17 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         // logs. NULL/0 means no failures yet — the field is
         // additive and a fresh DB starts at 0.
         "ALTER TABLE tasks ADD COLUMN consecutive_same_class_count INTEGER NOT NULL DEFAULT 0",
+        // PH-ORIGIN-SURFACE (D-004): which dispatch surface
+        // created this task. One of: "chat" / "dashboard" /
+        // "cli" / "channel" / "flow-engine" / "unknown".
+        // Operator-curated label set; the bridge stamps the
+        // value on task creation via the per-route knowledge.
+        // NULL on rows created before this migration; the
+        // coordinator treats NULL as "unknown" for dashboard
+        // rendering / filtering. Default NULL (the existing
+        // `caller` field still captures *who* authorized it;
+        // this captures *which surface* dispatched it).
+        "ALTER TABLE tasks ADD COLUMN origin_surface TEXT",
     ];
     for sql in alters {
         // Best-effort. The only error we expect is "duplicate column
@@ -6283,7 +6318,7 @@ mod tests {
     /// to repeat the `RetryPolicy::None, 0, None` trailer at every call
     /// site.
     fn mk(s: &TaskStore, title: &str, flow: &str, params: &str, owner: &str) -> String {
-        s.create(title, flow, params, owner, RetryPolicy::None, 0, None)
+        s.create(title, flow, params, owner, RetryPolicy::None, 0, None, None)
             .unwrap()
     }
 
@@ -6430,6 +6465,7 @@ mod tests {
                 RetryPolicy::Bounded,
                 3,
                 Some(120),
+                None,
             )
             .unwrap();
         let v = s.get(&tid).unwrap().unwrap();
@@ -6481,12 +6517,108 @@ mod tests {
     fn bump_retry_count_increments_and_returns_new_value() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
             .unwrap();
         assert_eq!(s.bump_retry_count(&tid).unwrap(), 1);
         assert_eq!(s.bump_retry_count(&tid).unwrap(), 2);
         let v = s.get(&tid).unwrap().unwrap();
         assert_eq!(v.retry_count, 2);
+    }
+
+    // ── PH-ORIGIN-SURFACE (D-004) ───────────────────────────────────
+
+    #[test]
+    fn create_with_no_origin_surface_writes_null() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, None, None)
+            .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.origin_surface, None);
+    }
+
+    #[test]
+    fn create_with_origin_surface_roundtrips() {
+        let s = store();
+        for surface in ["chat", "dashboard", "cli", "channel", "flow-engine"] {
+            let tid = s
+                .create(
+                    &format!("t-{surface}"),
+                    "f",
+                    "{}",
+                    "o",
+                    RetryPolicy::None,
+                    0,
+                    None,
+                    Some(surface),
+                )
+                .unwrap();
+            let v = s.get(&tid).unwrap().unwrap();
+            assert_eq!(v.origin_surface.as_deref(), Some(surface));
+        }
+    }
+
+    fn ctx(args: &[u8]) -> InvocationCtx {
+        use relix_core::identity::VerifiedIdentity;
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "".into(),
+                clearance: "".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args: args.to_vec(),
+        }
+    }
+
+    #[test]
+    fn handle_create_parses_origin_surface_from_eighth_slot() {
+        let s = store();
+        // 8 slots: title|flow|params|owner|retry|max_retries|max_runtime|origin
+        let arg = b"my-task|demo.sol|{}|alice|none|0||dashboard";
+        let out = handle_create(&s, &ctx(arg));
+        let tid = match out {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            _ => panic!("expected Ok"),
+        };
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.origin_surface.as_deref(), Some("dashboard"));
+    }
+
+    #[test]
+    fn handle_create_empty_origin_surface_slot_writes_null() {
+        let s = store();
+        // 7 pipes → 8 slots; the 8th is empty → origin_surface NULL.
+        let arg = b"my-task|demo.sol|{}|alice|none|0||";
+        let out = handle_create(&s, &ctx(arg));
+        let tid = match out {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            _ => panic!("expected Ok"),
+        };
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.origin_surface, None);
+    }
+
+    #[test]
+    fn handle_create_missing_origin_surface_slot_writes_null() {
+        // Backwards-compat: callers that send only 7 slots (the
+        // pre-D-004 shape) still work; origin_surface defaults
+        // to NULL.
+        let s = store();
+        let arg = b"my-task|demo.sol|{}|alice|none|0|";
+        let out = handle_create(&s, &ctx(arg));
+        let tid = match out {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            _ => panic!("expected Ok"),
+        };
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.origin_surface, None);
     }
 
     #[test]
@@ -6913,7 +7045,7 @@ mod tests {
         let s = store();
         // Task A: legitimate deadline candidate.
         let a = s
-            .create("a", "f", "{}", "o", RetryPolicy::None, 0, Some(10))
+            .create("a", "f", "{}", "o", RetryPolicy::None, 0, Some(10), None)
             .unwrap();
         s.update(&a, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -6957,7 +7089,16 @@ mod tests {
             .unwrap();
         // 2. Running, with deadline → NOT stuck (recovery scan owns it).
         let with_dl = s
-            .create("with-dl", "f", "{}", "o", RetryPolicy::None, 0, Some(3600))
+            .create(
+                "with-dl",
+                "f",
+                "{}",
+                "o",
+                RetryPolicy::None,
+                0,
+                Some(3600),
+                None,
+            )
             .unwrap();
         s.update(
             &with_dl,
@@ -7027,7 +7168,7 @@ mod tests {
     fn recovery_scan_flips_overdue_running_tasks_to_interrupted() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(10))
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(10), None)
             .unwrap();
         // started_at gets stamped to "now" when we transition to running.
         s.update(&tid, Some("running"), None, None, None, None, None, None)
@@ -7057,7 +7198,7 @@ mod tests {
         // needing an executor consumer to write it.
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(10))
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(10), None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7097,7 +7238,7 @@ mod tests {
     fn recovery_scan_leaves_running_tasks_inside_deadline_alone() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(3600))
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(3600), None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7111,7 +7252,7 @@ mod tests {
     fn recovery_scan_is_idempotent() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5), None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7135,7 +7276,7 @@ mod tests {
     fn recovery_scan_skips_completed_and_failed_rows() {
         let s = store();
         let t_done = s
-            .create("done", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .create("done", "f", "{}", "o", RetryPolicy::None, 0, Some(5), None)
             .unwrap();
         s.update(&t_done, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7267,7 +7408,7 @@ mod tests {
     fn retry_cycle_creates_second_attempt() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
             .unwrap();
         // Attempt 1: running -> failed.
         s.update(&tid, Some("running"), None, None, None, None, None, None)
@@ -7314,7 +7455,7 @@ mod tests {
     fn recovery_scan_closes_open_attempt_as_interrupted() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5), None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7348,7 +7489,7 @@ mod tests {
         // attempt-2's.
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, Some(2))
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, Some(2), None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7426,7 +7567,7 @@ mod tests {
     fn request_retry_accepted_then_exhausted_with_once_policy() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Once, 0, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Once, 0, None, None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7505,7 +7646,7 @@ mod tests {
     fn request_retry_clears_error_columns_but_preserves_last_failure_record() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -7630,7 +7771,16 @@ mod tests {
         // covers the single-store serialized path.)
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 99, Some(60))
+            .create(
+                "t",
+                "f",
+                "{}",
+                "o",
+                RetryPolicy::Bounded,
+                99,
+                Some(60),
+                None,
+            )
             .unwrap();
         for _ in 0..10 {
             s.update(&tid, Some("running"), None, None, None, None, None, None)
@@ -7785,6 +7935,7 @@ mod tests {
                 RetryPolicy::Bounded,
                 3,
                 Some(60),
+                None,
             )
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
@@ -7889,7 +8040,7 @@ mod tests {
         use serde_json::Value;
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, Some(5))
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, Some(5), None)
             .unwrap();
         // attempt_started + attempt_finished
         s.update_with_trace(
@@ -8093,7 +8244,7 @@ mod tests {
     fn task_interrupted_event_has_typed_fields() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5))
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(5), None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -8115,7 +8266,7 @@ mod tests {
     fn retry_requested_event_has_typed_fields() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -8452,8 +8603,17 @@ mod tests {
         let s = TaskStore::in_memory().expect("open");
         let start = std::time::Instant::now();
         for i in 0..1000 {
-            s.create(&format!("t{i}"), "f", "{}", "o", RetryPolicy::None, 0, None)
-                .unwrap();
+            s.create(
+                &format!("t{i}"),
+                "f",
+                "{}",
+                "o",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         }
         let create_elapsed = start.elapsed();
         // Counts.
@@ -8497,8 +8657,17 @@ mod tests {
         // Inline `create` is the bottleneck; bound the whole test at
         // 30s on a typical dev machine.
         for i in 0..10_000 {
-            s.create(&format!("t{i}"), "f", "{}", "o", RetryPolicy::None, 0, None)
-                .unwrap();
+            s.create(
+                &format!("t{i}"),
+                "f",
+                "{}",
+                "o",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         }
         let create = start.elapsed();
         assert!(create.as_secs() < 30, "create 10k tasks took {create:?}");
@@ -9137,7 +9306,7 @@ mod tests {
         // chronicle event so operators see the gating.
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -9166,7 +9335,7 @@ mod tests {
     fn retry_suppressed_when_task_is_frozen() {
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -10114,7 +10283,7 @@ mod tests {
         // task.retry_requested as the trigger.
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
             .unwrap();
         s.update(&tid, Some("running"), None, None, None, None, None, None)
             .unwrap();
@@ -10180,7 +10349,7 @@ mod tests {
         let s = store();
         for label in ["a", "b"] {
             let tid = s
-                .create(label, "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+                .create(label, "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
                 .unwrap();
             s.update(&tid, Some("running"), None, None, None, None, None, None)
                 .unwrap();
@@ -10214,7 +10383,7 @@ mod tests {
         let s = store();
         for _ in 0..3 {
             let tid = s
-                .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+                .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None, None)
                 .unwrap();
             s.update(&tid, Some("running"), None, None, None, None, None, None)
                 .unwrap();
@@ -10250,7 +10419,7 @@ mod tests {
         // prior attempt; chain reads linearly.
         let s = store();
         let tid = s
-            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 5, None)
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 5, None, None)
             .unwrap();
         for _ in 0..3 {
             s.update(&tid, Some("running"), None, None, None, None, None, None)
