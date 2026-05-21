@@ -9,17 +9,17 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `10bb4d9 feat(operator-ui): PH-DASH-MCP dashboard MCP registry panel`
+- **HEAD:** `155ca06 feat(bridge): PH-BRIDGE-MCP-INVOKE POST /v1/mcp/invoke proxy`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1082 passing, 0 failures
+- **Workspace tests:** 1086 passing, 0 failures
   - relix-core: 66
   - relix-policy: 66
   - relix-runtime: 657
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli: 34
-  - relix-web-bridge: 228
+  - relix-web-bridge: 232
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -53,6 +53,7 @@ as the resume command.
 | 4de4a53 | PH-CAP-RISK3 | relix-cli capability ls --risk filter (exact + at-or-above) |
 | 8ae5ff1 | PH-BRIDGE-MCP | GET /v1/mcp/{servers,tools} bridge HTTP proxy for MCP registry |
 | 10bb4d9 | PH-DASH-MCP | dashboard #/mcp page with server table + expandable tools per row |
+| 155ca06 | PH-BRIDGE-MCP-INVOKE | POST /v1/mcp/invoke bridge proxy (502 until D-009 unblocks runtime) |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
