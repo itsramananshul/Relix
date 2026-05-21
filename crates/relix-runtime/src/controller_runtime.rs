@@ -501,6 +501,17 @@ fn register_node_type_handlers(
                 &["task", "read", "graph", "lineage", "operator"],
             ),
             (
+                "task.recent_events",
+                "Cross-task event firehose. Args: \
+                 `since_event_id|limit|event_type_filter` \
+                 (all optional). Returns one JSON object per \
+                 line, newest-first by `event_id`. Each row \
+                 carries `task_id` so consumers render without \
+                 a second round-trip. Operators wire this into \
+                 a global live tail.",
+                &["task", "read", "events", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -536,7 +547,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events"
         );
     }
     if cfg.controller.node_type == "tool" {

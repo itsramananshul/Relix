@@ -913,6 +913,83 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// Cross-task event firehose (M67). Returns the newest
+    /// `limit` events strictly newer than `since_event_id`
+    /// across ALL tasks. Distinct from `query_events` which
+    /// is per-task. Operators use this for the dashboard's
+    /// global live tail.
+    ///
+    /// `event_type_filter` is exact-match when set; None
+    /// returns every event_type. `limit` is clamped to
+    /// `[1, max_list]`.
+    ///
+    /// Returns `(events, task_id_for_each_event)` zipped so
+    /// the bridge can render the task_id alongside the
+    /// event without a second query. Order is newest-first
+    /// by event_id.
+    pub fn recent_events_cross_task(
+        &self,
+        since_event_id: i64,
+        limit: usize,
+        event_type_filter: Option<&str>,
+    ) -> Result<Vec<(String, TaskEvent)>, CoordinatorError> {
+        let cap = limit.clamp(1, self.max_list);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok((
+                r.get::<_, String>(0)?,
+                TaskEvent {
+                    event_id: r.get(1)?,
+                    ts: r.get(2)?,
+                    event_type: r.get(3)?,
+                    payload: r.get(4)?,
+                    schema_version: r.get(5)?,
+                    attempt_id: r.get(6)?,
+                    trace_id: r.get(7)?,
+                    payload_json: r.get(8)?,
+                },
+            ))
+        };
+        let mut out: Vec<(String, TaskEvent)> = Vec::with_capacity(cap);
+        match event_type_filter.filter(|s| !s.is_empty()) {
+            Some(t) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT task_id, event_id, ts, event_type, payload,
+                                schema_version, attempt_id, trace_id, payload_json
+                         FROM task_events
+                         WHERE event_id > ?1 AND event_type = ?3
+                         ORDER BY event_id DESC LIMIT ?2",
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                let rows = stmt
+                    .query_map(params![since_event_id, cap as i64, t], map_row)
+                    .map_err(CoordinatorError::Db)?;
+                for r in rows {
+                    out.push(r.map_err(CoordinatorError::Db)?);
+                }
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT task_id, event_id, ts, event_type, payload,
+                                schema_version, attempt_id, trace_id, payload_json
+                         FROM task_events
+                         WHERE event_id > ?1
+                         ORDER BY event_id DESC LIMIT ?2",
+                    )
+                    .map_err(CoordinatorError::Db)?;
+                let rows = stmt
+                    .query_map(params![since_event_id, cap as i64], map_row)
+                    .map_err(CoordinatorError::Db)?;
+                for r in rows {
+                    out.push(r.map_err(CoordinatorError::Db)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Walk the task execution lineage outward from a root
     /// task (M66). BFS over the `task_edges` table in both
     /// directions: downstream when an edge has
@@ -2398,6 +2475,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.recent_events",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_recent_events(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
@@ -3236,6 +3323,57 @@ fn handle_note(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.note: not found: {id}")),
         Err(CoordinatorError::Invalid(msg)) => invalid(msg),
         Err(e) => internal(format!("task.note: {e}")),
+    }
+}
+
+/// `task.recent_events` — cross-task event firehose (M67).
+/// Args: `since_event_id|limit|event_type_filter`. All
+/// optional (defaults 0 / 100 / empty). Returns one JSON
+/// object per line, newest-first. Each object includes the
+/// task_id so consumers can render the event without a
+/// second round-trip.
+fn handle_recent_events(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.recent_events utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let since: i64 = parts
+        .first()
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = parts
+        .get(1)
+        .copied()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let type_filter = parts.get(2).copied().filter(|v| !v.is_empty());
+    match store.recent_events_cross_task(since, limit, type_filter) {
+        Ok(rows) => {
+            let mut buf = String::new();
+            for (task_id, ev) in &rows {
+                // Reuse the per-task envelope renderer and
+                // splice in the task_id field. The renderer
+                // emits `{"id":N,...}` — we replace the
+                // opening brace with `{"task_id":"...",`.
+                let line = render_event_json(ev);
+                if let Some(rest) = line.strip_prefix('{') {
+                    buf.push_str(&format!(r#"{{"task_id":"{}","#, json_escape(task_id)));
+                    buf.push_str(rest);
+                } else {
+                    // Defensive: render_event_json always
+                    // begins with '{', but if it ever
+                    // changes we fall back to the raw line.
+                    buf.push_str(&line);
+                }
+                buf.push('\n');
+            }
+            HandlerOutcome::Ok(buf.into_bytes())
+        }
+        Err(e) => internal(format!("task.recent_events: {e}")),
     }
 }
 
@@ -5795,6 +5933,54 @@ mod tests {
             elapsed.as_secs() < 5,
             "incremental 5000-event walk took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn recent_events_cross_task_returns_newest_first_across_tasks() {
+        // M67: global firehose. Events from multiple tasks
+        // interleave by event_id; newest must come first.
+        let s = store();
+        let a = mk(&s, "ta", "f", "{}", "o");
+        let b = mk(&s, "tb", "f", "{}", "o");
+        s.append_event(&a, "ops.x", "p1").unwrap();
+        s.append_event(&b, "ops.x", "p2").unwrap();
+        s.append_event(&a, "ops.x", "p3").unwrap();
+        let rows = s.recent_events_cross_task(0, 100, None).unwrap();
+        // Returns ALL events from a fresh store (created
+        // ones too) — that's fine as long as our 3 ops.x
+        // events appear in DESC order.
+        let ops_x: Vec<&(String, TaskEvent)> = rows
+            .iter()
+            .filter(|(_, ev)| ev.event_type == "ops.x")
+            .collect();
+        assert_eq!(ops_x.len(), 3);
+        assert!(ops_x[0].1.event_id > ops_x[1].1.event_id);
+        assert!(ops_x[1].1.event_id > ops_x[2].1.event_id);
+    }
+
+    #[test]
+    fn recent_events_cross_task_since_cursor_advances() {
+        let s = store();
+        let a = mk(&s, "ta", "f", "{}", "o");
+        let e1 = s.append_event(&a, "ops.x", "p1").unwrap();
+        let e2 = s.append_event(&a, "ops.x", "p2").unwrap();
+        // since=e1 must return only e2 (and any newer)
+        let rows = s.recent_events_cross_task(e1, 100, None).unwrap();
+        assert!(rows.iter().all(|(_, ev)| ev.event_id > e1));
+        assert!(rows.iter().any(|(_, ev)| ev.event_id == e2));
+    }
+
+    #[test]
+    fn recent_events_cross_task_filters_by_type() {
+        let s = store();
+        let a = mk(&s, "ta", "f", "{}", "o");
+        s.append_event(&a, "ops.keep", "k").unwrap();
+        s.append_event(&a, "ops.skip", "s").unwrap();
+        let rows = s
+            .recent_events_cross_task(0, 100, Some("ops.keep"))
+            .unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|(_, ev)| ev.event_type == "ops.keep"));
     }
 
     #[test]

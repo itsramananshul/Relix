@@ -593,6 +593,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_global_firehose_pane_present() {
+        // M67 (Track D): overview ships a global event
+        // firehose pane fed by /v1/tasks/events/recent.
+        // Cursor-paginated, ring-bounded client-side.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"firehose-host\"",
+            "function fetchGlobalFirehose",
+            "function renderGlobalFirehose",
+            "FIREHOSE_RING_CAP",
+            "/v1/tasks/events/recent",
+        ] {
+            assert!(body.contains(needle), "M67 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_intervention_audit_panel_present() {
         // M57 (Track B): overview ships a real operator
         // intervention audit panel. Pulls from

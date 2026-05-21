@@ -1382,6 +1382,122 @@ pub async fn edges(
     Ok(Json(parse_edges(&body)))
 }
 
+// ── M67: cross-task event firehose ─────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RecentEventsQuery {
+    #[serde(default)]
+    pub since: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Exact-match event_type filter. None / empty returns
+    /// every event_type.
+    #[serde(default)]
+    pub event_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlobalEventRow {
+    pub task_id: String,
+    pub event_id: i64,
+    pub ts: i64,
+    pub event_type: String,
+    pub payload: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlobalEventsResponse {
+    pub items: Vec<GlobalEventRow>,
+    /// Newest event_id returned, suitable as the next
+    /// `?since=` cursor. Empty pages echo the caller's
+    /// cursor unchanged so polling clients don't reset.
+    pub next_cursor: i64,
+}
+
+/// `GET /v1/tasks/events/recent?since=N&limit=N&event_type=foo`
+/// — cross-task event firehose. Newest-first. Operators
+/// poll this for a global runtime tail.
+pub async fn recent_events(
+    State(state): State<AppState>,
+    Query(q): Query<RecentEventsQuery>,
+) -> Result<Json<GlobalEventsResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let since = q.since.unwrap_or(0);
+    let limit = q.limit.unwrap_or(100).min(500);
+    let body = rec
+        .recent_events(since, limit, q.event_type.as_deref())
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_global_events_body(since, &body)))
+}
+
+/// Parse one JSON object per line into a typed envelope.
+/// Tolerant of partial-shape rows — anything failing to
+/// deserialize is silently skipped (the firehose stays
+/// resilient against unexpected runtime additions).
+fn parse_global_events_body(since: i64, body: &str) -> GlobalEventsResponse {
+    let mut items: Vec<GlobalEventRow> = Vec::new();
+    let mut newest = since;
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let task_id = match v.get("task_id").and_then(|x| x.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let event_id = match v.get("id").and_then(|x| x.as_i64()) {
+            Some(i) => i,
+            None => continue,
+        };
+        let ts = v.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
+        let event_type = v
+            .get("type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let payload = v
+            .get("payload")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let attempt_id = v.get("attempt_id").and_then(|x| x.as_i64());
+        let trace_id = v
+            .get("trace_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string);
+        let payload_json = v.get("payload_json").cloned();
+        if event_id > newest {
+            newest = event_id;
+        }
+        items.push(GlobalEventRow {
+            task_id,
+            event_id,
+            ts,
+            event_type,
+            payload,
+            attempt_id,
+            trace_id,
+            payload_json,
+        });
+    }
+    GlobalEventsResponse {
+        items,
+        next_cursor: newest,
+    }
+}
+
 // ── M66: execution-lineage traversal ───────────────────────
 
 #[derive(Debug, Deserialize, Default)]
@@ -2276,6 +2392,44 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].updated_at, None);
         assert_eq!(items[0].investigation_marked_at, None);
+    }
+
+    #[test]
+    fn parse_global_events_body_advances_cursor_to_newest_event_id() {
+        // M67: each row's `id` field feeds the next_cursor.
+        // Newest event id (largest in the page) wins.
+        let body = r#"{"task_id":"abc","id":5,"ts":100,"type":"ops.x","payload":"p"}"#.to_string()
+            + "\n"
+            + r#"{"task_id":"abc","id":7,"ts":101,"type":"ops.y","payload":"q"}"#
+            + "\n";
+        let r = parse_global_events_body(0, &body);
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.next_cursor, 7);
+    }
+
+    #[test]
+    fn parse_global_events_body_skips_malformed_lines_resiliently() {
+        let body = r#"{"task_id":"abc","id":1,"ts":1,"type":"ops.x","payload":""}"#.to_string()
+            + "\n"
+            + "this is not json\n"
+            + r#"{"missing":"task_id"}"#
+            + "\n"
+            + r#"{"task_id":"def","id":2,"ts":2,"type":"ops.y","payload":""}"#
+            + "\n";
+        let r = parse_global_events_body(0, &body);
+        // Two valid rows; the malformed and the missing-
+        // task_id rows are dropped.
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.next_cursor, 2);
+    }
+
+    #[test]
+    fn parse_global_events_body_empty_returns_echoed_cursor() {
+        let r = parse_global_events_body(42, "");
+        assert!(r.items.is_empty());
+        // Empty page must echo the caller's cursor unchanged
+        // so polling clients don't reset.
+        assert_eq!(r.next_cursor, 42);
     }
 
     #[test]

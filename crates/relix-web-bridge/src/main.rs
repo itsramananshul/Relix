@@ -227,6 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // before `/v1/tasks/:id` is matched — axum's static
         // matching prefers exact paths.
         .route("/v1/tasks/edges/recent", get(tasks::recent_edges))
+        // M67: cross-task event firehose. Same static-prefix
+        // discipline — register before /v1/tasks/:id paths.
+        .route("/v1/tasks/events/recent", get(tasks::recent_events))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
         .route("/v1/tasks/:id/events", get(tasks::events))
         // Experimental SSE wrapper around task.events polling.

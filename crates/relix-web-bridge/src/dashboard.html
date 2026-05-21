@@ -1801,6 +1801,15 @@
           <div class="empty">no operator actions recorded yet</div>
         </div>
       </div>
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-header">
+          <h3>Live event firehose (cross-task)</h3>
+          <span class="meta" id="firehose-status"></span>
+        </div>
+        <div class="card-body dense" id="firehose-host">
+          <div class="empty">no events yet</div>
+        </div>
+      </div>
     </section>
 
     <!-- ── #/tasks ────────────────────────────────────────────── -->
@@ -2499,6 +2508,9 @@ async function backgroundSync() {
       // Best-effort; the panel degrades silently on
       // 404 (older bridge without the endpoint).
       fetchInterventionAudit();
+      // M67: global firehose poll. Best-effort; the panel
+      // degrades silently when the endpoint is unavailable.
+      fetchGlobalFirehose();
       const $status = document.getElementById('activity-status');
       if ($status) {
         $status.innerHTML =
@@ -2868,6 +2880,87 @@ function renderTopRetried(edges) {
   if ($status) {
     $status.textContent = counts.size + ' task'
       + (counts.size === 1 ? '' : 's') + ' retrying';
+  }
+}
+
+/* M67: global event firehose. Polls /v1/tasks/events/recent
+   cursor-style — every overview tick fetches events strictly
+   newer than the last cursor and prepends them to a bounded
+   ring (capped at FIREHOSE_RING_CAP rows). When the dashboard
+   first lands, the cursor is 0 so we get the most recent
+   FIREHOSE_PAGE_LIMIT events. Polling after that walks
+   forward, which keeps the payload small + bounded.
+   Operators get a real distributed runtime tail without
+   per-task drill-in. */
+const FIREHOSE_PAGE_LIMIT = 50;
+const FIREHOSE_RING_CAP = 200;
+let firehoseCursor = 0;
+let firehoseRing = [];
+async function fetchGlobalFirehose() {
+  try {
+    const url = '/v1/tasks/events/recent?limit=' + FIREHOSE_PAGE_LIMIT
+      + (firehoseCursor > 0 ? '&since=' + firehoseCursor : '');
+    const r = await fetch(url);
+    if (!r.ok) {
+      renderGlobalFirehose(true);
+      return;
+    }
+    const j = await r.json();
+    const items = j.items || [];
+    if (typeof j.next_cursor === 'number') {
+      firehoseCursor = j.next_cursor;
+    }
+    if (items.length) {
+      // Newest-first from the bridge. Prepend, cap the ring.
+      firehoseRing = items.concat(firehoseRing).slice(0, FIREHOSE_RING_CAP);
+    }
+    renderGlobalFirehose(false);
+  } catch (_) {
+    renderGlobalFirehose(true);
+  }
+}
+
+function renderGlobalFirehose(errored) {
+  const $host = document.getElementById('firehose-host');
+  const $status = document.getElementById('firehose-status');
+  if (!$host) return;
+  if (errored) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'firehose endpoint unavailable'
+      + '</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  if (!firehoseRing.length) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'no events yet — once tasks run, this tail will populate'
+      + '</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const rows = firehoseRing.map(e => {
+    const ago = fmtDuration(Math.max(0, nowSecs - (e.ts || 0))) + ' ago';
+    const taskCell = '<a href="#/tasks/' + encodeURIComponent(e.task_id || '')
+      + '" class="id" title="' + escapeHtml(e.task_id || '') + '">'
+      + escapeHtml((e.task_id || '').slice(0, 8)) + '</a>';
+    const payloadPreview = (e.payload || '').slice(0, 80);
+    return '<tr>'
+      + '<td class="meta">' + escapeHtml(ago) + '</td>'
+      + '<td>' + taskCell + '</td>'
+      + '<td><code>' + escapeHtml(e.event_type || '') + '</code></td>'
+      + '<td class="meta">' + escapeHtml(String(e.event_id || '')) + '</td>'
+      + '<td class="meta">' + escapeHtml(payloadPreview) + '</td>'
+      + '</tr>';
+  }).join('');
+  $host.innerHTML = '<table class="data"><thead><tr>'
+    + '<th>when</th><th>task</th><th>event_type</th>'
+    + '<th>event_id</th><th>payload</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  if ($status) {
+    $status.textContent = firehoseRing.length + ' event'
+      + (firehoseRing.length === 1 ? '' : 's')
+      + ' · cursor ' + firehoseCursor;
   }
 }
 

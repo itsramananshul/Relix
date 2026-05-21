@@ -278,6 +278,19 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.note utf8: {e}"))
     }
 
+    /// Cross-task event firehose passthrough (M67). Args:
+    /// since_event_id + limit + optional event_type filter.
+    pub async fn recent_events(
+        &self,
+        since_event_id: i64,
+        limit: usize,
+        event_type: Option<&str>,
+    ) -> Result<String, String> {
+        let arg = format!("{since_event_id}|{limit}|{}", event_type.unwrap_or(""));
+        let bytes = self.call("task.recent_events", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.recent_events utf8: {e}"))
+    }
+
     /// Execution-lineage walk from a root task (M66). Args:
     /// task_id + max_depth (defaulted client-side to 4 when
     /// 0). Returns the coord body verbatim — the bridge
