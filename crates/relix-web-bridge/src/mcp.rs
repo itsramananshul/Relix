@@ -39,6 +39,8 @@
 //!   `/v1/mcp/invoke` → 400 BadRequest.
 //! - `tool_name` empty on `/v1/mcp/invoke` → 400 BadRequest.
 
+use std::time::Instant;
+
 use axum::{
     Json,
     extract::{Query, State},
@@ -50,6 +52,7 @@ use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
 use crate::config::AppState;
+use crate::mcp_audit::McpAuditEntry;
 
 /// Default peer alias when the caller doesn't supply `?peer=`.
 /// Matches the `peers.toml` convention for the tool node.
@@ -100,7 +103,9 @@ pub async fn servers(
     Query(q): Query<ServersQuery>,
 ) -> Result<Json<ServersResponse>, (StatusCode, Json<ApiError>)> {
     let peer = q.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
-    let body = call_peer(&state, &peer, "tool.mcp.list_servers", b"").await?;
+    let body = call_peer(&state, &peer, "tool.mcp.list_servers", b"")
+        .await
+        .map_err(drop_kind)?;
     let servers = parse_servers(&body);
     Ok(Json(ServersResponse { peer, servers }))
 }
@@ -118,13 +123,43 @@ pub async fn tools(
         ));
     }
     let peer = q.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
-    let body = call_peer(&state, &peer, "tool.mcp.list_tools", q.server_id.as_bytes()).await?;
+    let body = call_peer(&state, &peer, "tool.mcp.list_tools", q.server_id.as_bytes())
+        .await
+        .map_err(drop_kind)?;
     let tools = parse_tools(&body);
     Ok(Json(ToolsResponse {
         peer,
         server_id: q.server_id,
         tools,
     }))
+}
+
+/// PH-BRIDGE-MCP-AUDIT: query for `GET /v1/mcp/audit`.
+#[derive(Debug, Deserialize)]
+pub struct AuditQuery {
+    /// Maximum entries returned (snapshot is newest-first).
+    /// Clamped to ring capacity. Default 100.
+    #[serde(default)]
+    pub max: Option<usize>,
+}
+
+/// PH-BRIDGE-MCP-AUDIT: response for `GET /v1/mcp/audit`.
+#[derive(Debug, Serialize)]
+pub struct AuditResponse {
+    pub entries: Vec<McpAuditEntry>,
+    /// Total entries currently held by the ring (may exceed
+    /// `entries.len()` when `max` capped the snapshot).
+    pub count: usize,
+}
+
+pub async fn audit(
+    State(state): State<AppState>,
+    Query(q): Query<AuditQuery>,
+) -> Json<AuditResponse> {
+    let max = q.max.unwrap_or(100).max(1);
+    let entries = state.mcp_audit.snapshot_newest_first(max);
+    let count = state.mcp_audit.len();
+    Json(AuditResponse { entries, count })
 }
 
 /// PH-BRIDGE-MCP-INVOKE: request body for `POST /v1/mcp/invoke`.
@@ -163,6 +198,11 @@ pub async fn invoke(
     State(state): State<AppState>,
     Json(req): Json<InvokeRequest>,
 ) -> Result<Json<InvokeResponse>, (StatusCode, Json<ApiError>)> {
+    // PH-BRIDGE-MCP-AUDIT: argument-validation rejects don't
+    // touch the mesh, so they aren't recorded in the ring. The
+    // ring is for *dispatched* invocations — anything that
+    // reached the tool peer (or tried to). Same posture the
+    // intervention-audit ring uses.
     if req.server_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -181,13 +221,47 @@ pub async fn invoke(
     }
     let peer = req.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
     let wire_arg = build_invoke_arg(&req.server_id, &req.tool_name, &req.args);
-    let result = call_peer(&state, &peer, "tool.mcp.invoke", wire_arg.as_bytes()).await?;
-    Ok(Json(InvokeResponse {
-        peer,
-        server_id: req.server_id,
-        tool_name: req.tool_name,
-        result,
-    }))
+    let args_len = req.args.len();
+    let started = Instant::now();
+    let dispatched = call_peer(&state, &peer, "tool.mcp.invoke", wire_arg.as_bytes()).await;
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let ts_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match dispatched {
+        Ok(result) => {
+            state.mcp_audit.push(McpAuditEntry {
+                ts_secs,
+                peer_alias: peer.clone(),
+                server_id: req.server_id.clone(),
+                tool_name: req.tool_name.clone(),
+                args_len,
+                outcome: "ok".into(),
+                error_kind: None,
+                duration_ms,
+            });
+            Ok(Json(InvokeResponse {
+                peer,
+                server_id: req.server_id,
+                tool_name: req.tool_name,
+                result,
+            }))
+        }
+        Err((status, kind, body)) => {
+            state.mcp_audit.push(McpAuditEntry {
+                ts_secs,
+                peer_alias: peer,
+                server_id: req.server_id,
+                tool_name: req.tool_name,
+                args_len,
+                outcome: "err".into(),
+                error_kind: Some(kind),
+                duration_ms,
+            });
+            Err((status, body))
+        }
+    }
 }
 
 /// PH-BRIDGE-MCP-INVOKE: build the SIMP-016 wire arg for
@@ -200,15 +274,30 @@ fn build_invoke_arg(server_id: &str, tool_name: &str, args: &str) -> String {
 
 /// PH-BRIDGE-MCP: invoke a capability on a tool peer via the
 /// existing MeshClient and return its body as a UTF-8 string.
-/// Classifies errors into HTTP status codes.
+/// Classifies errors into HTTP status codes and surfaces a
+/// short `error_kind` tag (alongside the user-facing message)
+/// so the audit ring can record what went wrong without
+/// regexing the message back apart.
+///
+/// Error kinds:
+/// - `"mesh_unavailable"` — bridge mesh client wasn't built.
+/// - `"unknown_alias"` — `peers.toml` doesn't know the alias.
+/// - `"mesh_error"` — any other libp2p / transport failure.
+/// - `"decode_error"` — response envelope failed to parse.
+/// - `"response_utf8"` — Ok body wasn't valid UTF-8.
+/// - `"unexpected_stream"` — responder streamed instead of replied.
+/// - `"responder_<kind>"` — responder returned a structured
+///   error envelope; `<kind>` is the envelope's `kind` field
+///   (`"runtime_not_connected"`, `"invalid_args"`, etc.).
 async fn call_peer(
     state: &AppState,
     alias: &str,
     method: &str,
     arg: &[u8],
-) -> Result<String, (StatusCode, Json<ApiError>)> {
+) -> Result<String, (StatusCode, String, Json<ApiError>)> {
     let mesh = state.mesh_client.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
+        "mesh_unavailable".to_string(),
         Json(ApiError {
             error: "bridge mesh client not initialized (peer discovery failed at startup)".into(),
         }),
@@ -221,21 +310,18 @@ async fn call_peer(
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
         let msg = e.to_string();
-        // MeshClient's error messages contain "unknown alias" or
-        // "no peer" when peers.toml doesn't have the alias.
-        // Classify those as 404 so curl gets a meaningful code.
-        let status = if msg.to_ascii_lowercase().contains("unknown alias")
-            || msg.to_ascii_lowercase().contains("no peer")
-        {
-            StatusCode::NOT_FOUND
+        let lower = msg.to_ascii_lowercase();
+        let (status, kind) = if lower.contains("unknown alias") || lower.contains("no peer") {
+            (StatusCode::NOT_FOUND, "unknown_alias".to_string())
         } else {
-            StatusCode::BAD_GATEWAY
+            (StatusCode::BAD_GATEWAY, "mesh_error".to_string())
         };
-        (status, Json(ApiError { error: msg }))
+        (status, kind, Json(ApiError { error: msg }))
     })?;
     let resp = decode_response(&resp_bytes).map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
+            "decode_error".to_string(),
             Json(ApiError {
                 error: format!("decode response: {e}"),
             }),
@@ -245,24 +331,37 @@ async fn call_peer(
         ResponseResult::Ok(body) => String::from_utf8(body.to_vec()).map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
+                "response_utf8".to_string(),
                 Json(ApiError {
                     error: format!("response body utf8: {e}"),
                 }),
             )
         }),
-        ResponseResult::Err(env) => Err((
-            StatusCode::BAD_GATEWAY,
-            Json(ApiError {
-                error: format!("responder err kind={} cause={}", env.kind, env.cause),
-            }),
-        )),
+        ResponseResult::Err(env) => {
+            let kind = format!("responder_{}", env.kind);
+            Err((
+                StatusCode::BAD_GATEWAY,
+                kind,
+                Json(ApiError {
+                    error: format!("responder err kind={} cause={}", env.kind, env.cause),
+                }),
+            ))
+        }
         ResponseResult::StreamHandle(_) => Err((
             StatusCode::BAD_GATEWAY,
+            "unexpected_stream".to_string(),
             Json(ApiError {
                 error: "unexpected stream response from list capability".into(),
             }),
         )),
     }
+}
+
+/// PH-BRIDGE-MCP-AUDIT: drop the `error_kind` from a
+/// [`call_peer`] error so handlers that don't audit (servers /
+/// tools) keep their old `(StatusCode, Json<ApiError>)` shape.
+fn drop_kind(err: (StatusCode, String, Json<ApiError>)) -> (StatusCode, Json<ApiError>) {
+    (err.0, err.2)
 }
 
 /// PH-BRIDGE-MCP: parse tool.mcp.list_servers body
@@ -391,5 +490,25 @@ mod tests {
         // JSON); the builder should not trim or normalize.
         let a = build_invoke_arg("srv", "tool", "  {  \"k\": 1  }  ");
         assert_eq!(a, "srv|tool|  {  \"k\": 1  }  ");
+    }
+
+    // ── PH-BRIDGE-MCP-AUDIT: error_kind classification ──────────────
+
+    #[test]
+    fn drop_kind_collapses_three_tuple_to_two() {
+        // The two non-audit callers (servers / tools) use
+        // `drop_kind` to discard the new middle field so their
+        // `?` returns keep their old `(StatusCode, Json<ApiError>)`
+        // shape. Verify the adapter actually drops the middle.
+        let err = (
+            StatusCode::BAD_GATEWAY,
+            "mesh_error".to_string(),
+            Json(ApiError {
+                error: "boom".into(),
+            }),
+        );
+        let (status, body) = drop_kind(err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body.0.error, "boom");
     }
 }

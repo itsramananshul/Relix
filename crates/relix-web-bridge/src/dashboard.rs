@@ -332,6 +332,23 @@ mod tests {
         // PAGES registry entry + handler functions.
         assert!(body.contains("initMcp"), "initMcp handler missing");
         assert!(body.contains("enterMcp"), "enterMcp handler missing");
+        // PH-BRIDGE-MCP-AUDIT: invocation ring card + JS.
+        assert!(
+            body.contains(r#"id="mcp-audit-card""#),
+            "MCP invocation audit card missing"
+        );
+        assert!(
+            body.contains(r#"id="mcp-audit-host""#),
+            "MCP invocation audit host missing"
+        );
+        assert!(
+            body.contains("/v1/mcp/audit"),
+            "MCP page should consume /v1/mcp/audit"
+        );
+        assert!(
+            body.contains("loadMcpAudit"),
+            "loadMcpAudit handler missing"
+        );
     }
 
     #[tokio::test]

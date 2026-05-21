@@ -93,6 +93,7 @@ mod flow;
 mod intervention_audit;
 mod lifecycle;
 mod mcp;
+mod mcp_audit;
 mod metrics;
 mod openai;
 mod secrets;
@@ -390,6 +391,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // D-009: returns 502 with `RuntimeNotConnected` until
         // the stdio runtime ships, but the surface is ready.
         .route("/v1/mcp/invoke", post(mcp::invoke))
+        // PH-BRIDGE-MCP-AUDIT: bounded in-memory audit ring of
+        // every dispatched `/v1/mcp/invoke` call. Resets on
+        // bridge restart. Honest about scope: argument-validation
+        // rejects (400) are not recorded; only invocations that
+        // reached the mesh (success or responder failure) are.
+        .route("/v1/mcp/audit", get(mcp::audit))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).

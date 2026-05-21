@@ -2235,6 +2235,24 @@
         via <code>tools/list</code> lands when the stdio runtime is
         wired (decisions-pending D-009).
       </p>
+      <!-- PH-BRIDGE-MCP-AUDIT: invocation ring -->
+      <div class="card" id="mcp-audit-card">
+        <div class="card-header">
+          <h3>Recent invocations</h3>
+          <span class="meta" id="mcp-audit-summary"></span>
+        </div>
+        <div class="card-body dense" id="mcp-audit-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Bounded ring of every dispatched <code>POST /v1/mcp/invoke</code>
+        call (capacity 256, newest first). Sourced from
+        <code>/v1/mcp/audit</code> (PH-BRIDGE-MCP-AUDIT). Resets on
+        bridge restart. Args are <em>not</em> stored — only the
+        argument byte count, the outcome, and (on failure) the
+        responder envelope kind.
+      </p>
     </section>
 
     <!-- ── #/providers ─────────────────────────────────────────── -->
@@ -6526,7 +6544,10 @@ let mcpServersCache = [];
 function initMcp() {
   const $refresh = document.getElementById('mcp-refresh-btn');
   if ($refresh) {
-    $refresh.addEventListener('click', () => loadMcpServers());
+    $refresh.addEventListener('click', () => {
+      loadMcpServers();
+      loadMcpAudit();
+    });
   }
   const $peer = document.getElementById('mcp-peer-input');
   if ($peer) {
@@ -6534,6 +6555,7 @@ function initMcp() {
       if (ev.key === 'Enter') {
         ev.preventDefault();
         loadMcpServers();
+        loadMcpAudit();
       }
     });
   }
@@ -6541,6 +6563,7 @@ function initMcp() {
 
 function enterMcp() {
   loadMcpServers();
+  loadMcpAudit();
 }
 
 function currentMcpPeer() {
@@ -6692,6 +6715,76 @@ async function toggleMcpToolsRow(serverId, btn) {
   } catch (e) {
     $toolsHost.innerHTML = '<span class="error">load failed: '
       + escapeHtml(String(e)) + '</span>';
+  }
+}
+
+/* PH-BRIDGE-MCP-AUDIT: load + render the bridge-side ring of
+   recent /v1/mcp/invoke calls. The ring is bridge-process
+   global (not per-peer) — the peer input on this page
+   controls *what* gets invoked, not what gets shown here.
+   Calling it on peer change is intentional refresh ergonomics,
+   not a filter. */
+async function loadMcpAudit() {
+  const $host = document.getElementById('mcp-audit-host');
+  const $summary = document.getElementById('mcp-audit-summary');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/mcp/audit?max=50');
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const entries = body.entries || [];
+    const count = body.count || 0;
+    if ($summary) {
+      $summary.textContent = count === 0
+        ? 'ring empty'
+        : entries.length === count
+          ? count + ' total'
+          : 'showing ' + entries.length + ' of ' + count + ' total';
+    }
+    if (entries.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no invocations yet — make a <code>POST /v1/mcp/invoke</code> '
+        + 'call (or use the relix-cli) and refresh'
+        + '</div>';
+      return;
+    }
+    const rows = entries.map(e => {
+      const when = new Date((e.ts_secs || 0) * 1000);
+      const outcomeCls = e.outcome === 'ok' ? 'ok' : 'danger';
+      return '<tr>'
+        + '<td class="meta">' + escapeHtml(when.toLocaleTimeString()) + '</td>'
+        + '<td><code>' + escapeHtml(e.peer_alias || '') + '</code></td>'
+        + '<td><code>' + escapeHtml(e.server_id || '') + '</code></td>'
+        + '<td><code>' + escapeHtml(e.tool_name || '') + '</code></td>'
+        + '<td>' + escapeHtml(String(e.args_len || 0)) + ' B</td>'
+        + '<td><span class="badge ' + outcomeCls + '">'
+        + escapeHtml(e.outcome || '') + '</span></td>'
+        + '<td class="meta">' + escapeHtml(e.error_kind || '') + '</td>'
+        + '<td>' + escapeHtml(String(e.duration_ms || 0)) + ' ms</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>time</th>'
+      + '<th>peer</th>'
+      + '<th>server</th>'
+      + '<th>tool</th>'
+      + '<th>args</th>'
+      + '<th>outcome</th>'
+      + '<th>error_kind</th>'
+      + '<th>duration</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+    if ($summary) $summary.textContent = '';
   }
 }
 

@@ -210,6 +210,11 @@ pub struct AppState {
     /// `/v1/intervention/recent`. See
     /// `crates/relix-web-bridge/src/intervention_audit.rs`.
     pub intervention_audit: std::sync::Arc<crate::intervention_audit::InterventionAudit>,
+    /// PH-BRIDGE-MCP-AUDIT: bridge-side audit ring for
+    /// `POST /v1/mcp/invoke`. Bounded in-memory; surfaced via
+    /// `GET /v1/mcp/audit`. Resets on bridge restart. See
+    /// `crates/relix-web-bridge/src/mcp_audit.rs`.
+    pub mcp_audit: std::sync::Arc<crate::mcp_audit::McpAuditRing>,
 }
 
 impl AppState {
@@ -302,6 +307,7 @@ impl AppState {
             stream_metrics: crate::metrics::StreamMetrics::new(),
             lifecycle_log: crate::lifecycle::LifecycleLog::new(),
             intervention_audit,
+            mcp_audit: Arc::new(crate::mcp_audit::McpAuditRing::default()),
         })
     }
 }
