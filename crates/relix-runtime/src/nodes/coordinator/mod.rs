@@ -5567,6 +5567,13 @@ fn render_task_view(v: &TaskView) -> String {
     if let Some(x) = v.frozen_reason.as_ref() {
         let _ = writeln!(s, "frozen_reason={}", x);
     }
+    // PH-ORIGIN-SURFACE (D-004): which dispatch surface created
+    // the task. Skipped when NULL (older rows or callers that
+    // didn't stamp the label) — the bridge / dashboard treat
+    // absence as "unknown".
+    if let Some(x) = v.origin_surface.as_ref() {
+        let _ = writeln!(s, "origin_surface={}", x);
+    }
     let _ = writeln!(s, "event_count={}", v.events.len());
     // Events as a simple JSON array. We hand-build the JSON to avoid
     // pulling serde_json into this hot path; payloads are escaped
