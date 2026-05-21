@@ -12,7 +12,9 @@ use std::time::Duration;
 use clap::Subcommand;
 
 use relix_core::bundle::Bundle;
-use relix_core::capability::{CapabilityDescriptor, CapabilityKind, CostClass, Idempotency};
+use relix_core::capability::{
+    CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
+};
 use relix_core::codec;
 use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::manifest::NodeManifest;
@@ -239,18 +241,29 @@ fn validate_manifest(manifest: &NodeManifest) -> Vec<String> {
                 ));
             }
         }
+        // PH-CAP-RISK: flag any descriptor that hasn't been
+        // audited for risk classification. Operators see this
+        // in CI / pre-deploy and can either set an explicit
+        // tier or document the deferral.
+        if cap.risk_level == RiskLevel::Unknown {
+            issues.push(format!(
+                "`{}`: risk_level is `unknown` — set an explicit tier via .with_risk(...) before deploying",
+                cap.method_name
+            ));
+        }
     }
     issues
 }
 
 fn render_oneline(cap: &CapabilityDescriptor) -> String {
     let mut s = format!(
-        "{:<28}  v{}  {}  {}  {}",
+        "{:<28}  v{}  {}  {}  {}  {}",
         cap.method_name,
         cap.major_version,
         kind_label(cap.kind),
         idempotency_label(cap.idempotency),
         cost_class_label(cap.cost_class),
+        risk_level_label(cap.risk_level),
     );
     if !cap.categories.is_empty() {
         s.push_str(&format!("  [{}]", cap.categories.join(",")));
@@ -266,6 +279,7 @@ fn render_detail(manifest: &NodeManifest, cap: &CapabilityDescriptor) -> String 
     let _ = writeln!(s, "kind:            {}", kind_label(cap.kind));
     let _ = writeln!(s, "idempotency:     {}", idempotency_label(cap.idempotency));
     let _ = writeln!(s, "cost_class:      {}", cost_class_label(cap.cost_class));
+    let _ = writeln!(s, "risk_level:      {}", risk_level_label(cap.risk_level));
     let _ = writeln!(s, "policy_attach:   {}", cap.policy_attachment_point);
     if !cap.sensitivity_tags.is_empty() {
         let _ = writeln!(s, "sensitivity:     {}", cap.sensitivity_tags.join(", "));
@@ -314,6 +328,17 @@ fn cost_class_label(c: CostClass) -> &'static str {
         CostClass::Cheap => "cheap",
         CostClass::Expensive => "expensive",
         CostClass::ExternalPaid => "paid",
+    }
+}
+
+fn risk_level_label(r: RiskLevel) -> &'static str {
+    match r {
+        RiskLevel::Unknown => "unknown",
+        RiskLevel::Safe => "safe",
+        RiskLevel::Low => "low",
+        RiskLevel::Medium => "medium",
+        RiskLevel::High => "high",
+        RiskLevel::Critical => "critical",
     }
 }
 
@@ -459,6 +484,10 @@ mod tests {
         d.requires_groups = vec!["chat-users".into()];
         d.sensitivity_tags = vec!["reads:internal".into()];
         d.environment_requirements = vec!["fs:jail".into()];
+        // PH-CAP-RISK: explicit tier so the validator's
+        // unknown-risk check doesn't fire in tests that
+        // exercise OTHER rules.
+        d.risk_level = RiskLevel::Safe;
         d
     }
 
@@ -618,5 +647,76 @@ mod tests {
         assert_eq!(cost_class_label(CostClass::Cheap), "cheap");
         assert_eq!(cost_class_label(CostClass::Expensive), "expensive");
         assert_eq!(cost_class_label(CostClass::ExternalPaid), "paid");
+    }
+
+    // ── PH-CAP-RISK: risk_level surface ──────────────────────────
+
+    #[test]
+    fn risk_level_labels_are_stable() {
+        assert_eq!(risk_level_label(RiskLevel::Unknown), "unknown");
+        assert_eq!(risk_level_label(RiskLevel::Safe), "safe");
+        assert_eq!(risk_level_label(RiskLevel::Low), "low");
+        assert_eq!(risk_level_label(RiskLevel::Medium), "medium");
+        assert_eq!(risk_level_label(RiskLevel::High), "high");
+        assert_eq!(risk_level_label(RiskLevel::Critical), "critical");
+    }
+
+    #[test]
+    fn validate_flags_unknown_risk_level() {
+        // A descriptor with the unaudited default risk_level
+        // MUST be flagged so operators see the gap.
+        let mut manifest = mk_manifest("tool");
+        let mut c = CapabilityDescriptor::unary("tool.example");
+        c.requires_groups = vec!["chat-users".into()];
+        c.sensitivity_tags = vec!["fs:read".into()];
+        c.policy_attachment_point = "tool.example".into();
+        // Leave risk_level at default Unknown.
+        manifest.capabilities.push(c);
+        let issues = validate_manifest(&manifest);
+        assert!(
+            issues.iter().any(|s| s.contains("risk_level is `unknown`")),
+            "issues = {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_explicit_risk_levels() {
+        // Each non-Unknown tier must pass the validator's
+        // unknown-risk check.
+        for tier in [
+            RiskLevel::Safe,
+            RiskLevel::Low,
+            RiskLevel::Medium,
+            RiskLevel::High,
+            RiskLevel::Critical,
+        ] {
+            let mut manifest = mk_manifest("tool");
+            let mut c = cap_ok("tool.example");
+            c.risk_level = tier;
+            manifest.capabilities.push(c);
+            let issues = validate_manifest(&manifest);
+            assert!(
+                !issues.iter().any(|s| s.contains("risk_level is `unknown`")),
+                "tier {tier:?} flagged unexpectedly: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_oneline_includes_risk_label() {
+        let mut c = cap("tool.terminal.run");
+        c.risk_level = RiskLevel::High;
+        let s = render_oneline(&c);
+        assert!(s.contains("high"), "rendered: {s}");
+    }
+
+    #[test]
+    fn render_detail_includes_risk_line() {
+        let mut manifest = mk_manifest("tool");
+        let mut c = cap("tool.write_file");
+        c.risk_level = RiskLevel::Medium;
+        manifest.capabilities.push(c.clone());
+        let s = render_detail(&manifest, &c);
+        assert!(s.contains("risk_level:      medium"), "rendered: {s}");
     }
 }

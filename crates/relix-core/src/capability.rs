@@ -36,6 +36,55 @@ pub enum CostClass {
     ExternalPaid,
 }
 
+/// PH-CAP-RISK: operator-facing risk classification for a
+/// capability. Honest worst-case-impact label, not a strict
+/// formal model — the goal is to give operators a one-glance
+/// sense of which capabilities deserve scrutiny in their
+/// policy + dashboard surfaces.
+///
+/// `Unknown` is the serde default so a descriptor that hasn't
+/// been audited surfaces as a clear gap rather than implicitly
+/// claiming `Safe`. The validator (in `relix-cli capability
+/// validate`) flags `Unknown` as a deployment warning so the
+/// gap is caught before production.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    /// Descriptor has not been audited for risk. Validator
+    /// flags this; treat as "investigate before deploying".
+    #[default]
+    Unknown,
+    /// Read-only / pure observation. No persistent state change,
+    /// no external side effects, no privilege escalation.
+    /// Example: `tool.read_file`, `tool.list_dir`,
+    /// `tool.fs.audit_recent`, `node.health`.
+    Safe,
+    /// Bounded internal state change. Mutates registry-internal
+    /// state (todos, session records, audit rings) but does NOT
+    /// touch the host file system, network, or external
+    /// processes. Cancellable. Example: `task.todo_set`,
+    /// `tool.terminal.cancel`, `tool.terminal.shell.close`.
+    Low,
+    /// Controlled side effect outside the responder. Writes to
+    /// the host file system (jailed), reaches external network
+    /// endpoints (SSRF-guarded), or invokes paid services.
+    /// Example: `tool.write_file`, `tool.web_fetch`, `ai.chat`,
+    /// `tool.web_search`.
+    Medium,
+    /// Spawns external processes / drives an external execution
+    /// surface. Allowlisted but potentially destructive.
+    /// Example: `tool.terminal.run`, `tool.terminal.spawn`,
+    /// `tool.terminal.shell.open`, `tool.mcp.invoke`,
+    /// `tool.browser.navigate`.
+    High,
+    /// Reserved for capabilities that act on the host outside
+    /// the existing allowlist / jail model (e.g. desktop
+    /// control, raw network egress without SSRF guards). No
+    /// shipped capability uses this tier today; included so
+    /// the surface is forward-compatible.
+    Critical,
+}
+
 /// Alpha capability descriptor. Reduced subset of RELIX-6 §6.4.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapabilityDescriptor {
@@ -79,6 +128,12 @@ pub struct CapabilityDescriptor {
     /// during deployment planning. Not validated at runtime.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment_requirements: Vec<String>,
+    /// PH-CAP-RISK: operator-facing risk classification.
+    /// Defaults to `Unknown` so unaudited descriptors are
+    /// visible. The validator flags `Unknown` as a deployment
+    /// warning. See [`RiskLevel`] for the full taxonomy.
+    #[serde(default)]
+    pub risk_level: RiskLevel,
 }
 
 impl CapabilityDescriptor {
@@ -97,6 +152,7 @@ impl CapabilityDescriptor {
             description: None,
             categories: vec![],
             environment_requirements: vec![],
+            risk_level: RiskLevel::Unknown,
         }
     }
 
@@ -115,6 +171,7 @@ impl CapabilityDescriptor {
             description: None,
             categories: vec![],
             environment_requirements: vec![],
+            risk_level: RiskLevel::Unknown,
         }
     }
 
@@ -149,6 +206,14 @@ impl CapabilityDescriptor {
     /// these when deciding deployment.
     pub fn with_environment_requirements(mut self, reqs: impl IntoIterator<Item = String>) -> Self {
         self.environment_requirements.extend(reqs);
+        self
+    }
+
+    /// PH-CAP-RISK: set the operator-facing risk classification.
+    /// Defaults to `Unknown` from the constructor; every shipped
+    /// descriptor should call this to set an explicit tier.
+    pub fn with_risk(mut self, risk: RiskLevel) -> Self {
+        self.risk_level = risk;
         self
     }
 }
@@ -273,5 +338,106 @@ mod tests {
             !keys.iter().any(|k| k == "environment_requirements"),
             "empty environment_requirements were emitted: keys = {keys:?}"
         );
+    }
+
+    // ── PH-CAP-RISK: risk_level field ──────────────────────────────
+
+    #[test]
+    fn risk_level_default_is_unknown() {
+        let d = CapabilityDescriptor::unary("x.y");
+        assert_eq!(d.risk_level, RiskLevel::Unknown);
+    }
+
+    #[test]
+    fn risk_level_default_via_derive() {
+        assert_eq!(RiskLevel::default(), RiskLevel::Unknown);
+    }
+
+    #[test]
+    fn with_risk_builder_sets_field() {
+        let d = CapabilityDescriptor::unary("tool.terminal.run").with_risk(RiskLevel::High);
+        assert_eq!(d.risk_level, RiskLevel::High);
+    }
+
+    #[test]
+    fn risk_level_round_trips_through_codec() {
+        for r in [
+            RiskLevel::Unknown,
+            RiskLevel::Safe,
+            RiskLevel::Low,
+            RiskLevel::Medium,
+            RiskLevel::High,
+            RiskLevel::Critical,
+        ] {
+            let d = CapabilityDescriptor::unary("x.y").with_risk(r);
+            let bytes = crate::codec::encode(&d).expect("encode");
+            let back: CapabilityDescriptor = crate::codec::decode(&bytes).expect("decode");
+            assert_eq!(back.risk_level, r, "round-trip mismatch for {r:?}");
+        }
+    }
+
+    #[test]
+    fn risk_level_serializes_snake_case_in_wire_form() {
+        // The wire form should use snake_case spellings of the
+        // enum variants, matching the rest of the descriptor
+        // surface (CapabilityKind, Idempotency, CostClass).
+        let d = CapabilityDescriptor::unary("x.y").with_risk(RiskLevel::Medium);
+        let bytes = crate::codec::encode(&d).expect("encode");
+        let v: ciborium::Value = ciborium::from_reader(&bytes[..]).expect("decode");
+        let map = match v {
+            ciborium::Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        // Find the risk_level entry and confirm it serialises as
+        // `"medium"`, not `"Medium"`.
+        let risk = map
+            .iter()
+            .find_map(|(k, vv)| match k {
+                ciborium::Value::Text(s) if s == "risk_level" => Some(vv.clone()),
+                _ => None,
+            })
+            .expect("risk_level present in encoded form");
+        match risk {
+            ciborium::Value::Text(s) => assert_eq!(s, "medium"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn descriptor_from_pre_risk_serialised_bytes_still_decodes() {
+        // Simulate an older manifest (pre-PH-CAP-RISK) that
+        // doesn't include risk_level. Should decode with
+        // risk_level defaulting to Unknown.
+        use ciborium::Value;
+        let map = vec![
+            (
+                Value::Text("method_name".into()),
+                Value::Text("memory.search".into()),
+            ),
+            (
+                Value::Text("major_version".into()),
+                Value::Integer(1u8.into()),
+            ),
+            (Value::Text("kind".into()), Value::Text("unary".into())),
+            (
+                Value::Text("idempotency".into()),
+                Value::Text("idempotent".into()),
+            ),
+            (
+                Value::Text("cost_class".into()),
+                Value::Text("cheap".into()),
+            ),
+            (
+                Value::Text("policy_attachment_point".into()),
+                Value::Text("memory.search".into()),
+            ),
+            (Value::Text("sensitivity_tags".into()), Value::Array(vec![])),
+            (Value::Text("requires_groups".into()), Value::Array(vec![])),
+        ];
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&Value::Map(map), &mut bytes).expect("encode");
+        let back: CapabilityDescriptor =
+            ciborium::from_reader(&bytes[..]).expect("decode pre-RISK manifest");
+        assert_eq!(back.risk_level, RiskLevel::Unknown);
     }
 }
