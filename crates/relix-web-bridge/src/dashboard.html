@@ -1215,6 +1215,30 @@
       stroke-width: 3;
       filter: drop-shadow(0 0 4px var(--accent));
     }
+    /* M64: brief flash applied by flashGraphNode when the
+       operator clicks a timeline row that maps to this
+       attempt. Wraps a 1.2s drop-shadow pulse so the
+       operator's eye lands on the right node without making
+       the highlight permanent. */
+    @keyframes graph-node-flash {
+      0%   { filter: drop-shadow(0 0 0 var(--accent)); }
+      30%  { filter: drop-shadow(0 0 10px var(--accent)); }
+      100% { filter: drop-shadow(0 0 0 var(--accent)); }
+    }
+    .exec-graph .graph-node.flash .node-box {
+      stroke: var(--accent);
+      stroke-width: 3;
+      animation: graph-node-flash 1.2s ease-out;
+    }
+    /* Show that timeline rows belonging to an attempt are
+       clickable. Hover gives a subtle accent so the
+       affordance is discoverable. */
+    .timeline-row[data-timeline-attempt-id] {
+      cursor: pointer;
+    }
+    .timeline-row[data-timeline-attempt-id]:hover .timeline-time {
+      color: var(--accent);
+    }
     /* M59: critical-segment highlight. The single largest
        contributor to wall clock — operators spot the
        bottleneck instantly. Layered on top of status colors;
@@ -4246,7 +4270,61 @@ document.addEventListener('click', (ev) => {
     }
     return;
   }
+  // M64: timeline → graph sync. Clicking a timeline row that
+  // belongs to an attempt flashes the matching graph node and
+  // toggles the attempt filter (same affordance the chain
+  // pills + graph nodes already expose, just reachable from
+  // the chronicle). Guard against clicks on nested
+  // interactive elements so the <details> toggle and links
+  // inside the row still work.
+  const tlRow = ev.target.closest('[data-timeline-attempt-id]');
+  if (tlRow) {
+    const innerInteractive = ev.target.closest(
+      'a, button, summary, details, [data-jump-to-event], [data-peer-alias]'
+    );
+    if (!innerInteractive) {
+      const aid = parseInt(tlRow.dataset.timelineAttemptId, 10);
+      flashGraphNode(aid);
+      attemptFilter = (attemptFilter === aid) ? null : aid;
+      if (lastDetailLineage) renderDetail(lastDetailLineage);
+      return;
+    }
+  }
 });
+
+/* Briefly highlight a graph node by attempt_id. Adds a
+   transient `flash` class that the M59/M46 SVG render
+   already styles. Scrolls the exec-graph viewport to bring
+   the node into view if it's off-screen. */
+function flashGraphNode(attemptId) {
+  // Wait one frame so the re-render from attemptFilter has
+  // a chance to land — otherwise we flash a node that's
+  // about to be replaced.
+  requestAnimationFrame(() => {
+    const node = document.querySelector(
+      '.exec-graph .graph-node[data-attempt-filter="' + attemptId + '"]'
+    );
+    if (!node) return;
+    node.classList.add('flash');
+    setTimeout(() => node.classList.remove('flash'), 1200);
+    const viewport = node.closest('.exec-graph-viewport');
+    if (viewport) {
+      const rect = node.getBoundingClientRect();
+      const vbox = viewport.getBoundingClientRect();
+      if (rect.left < vbox.left || rect.right > vbox.right) {
+        // scrollIntoView on the SVG group works in modern
+        // browsers; fall back to setting scrollLeft manually
+        // if it doesn't.
+        try {
+          node.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+        } catch (_) {
+          // SVG scrollIntoView is widely supported; the
+          // catch is purely defensive.
+        }
+      }
+    }
+  });
+}
 
 /* Execution graph (DAG view): SVG visualization of
    attempts as nodes + task_edges as labeled arrows.
@@ -4713,7 +4791,13 @@ function renderTimeline(events) {
       && e.payload_json.failure_class;
     const eventIdAttr = e.event_id != null
       ? ' data-event-id="' + e.event_id + '"' : '';
-    return `<div class="timeline-row${rowCls}${failed ? ' attempt-failed' : ''}${i === events.length - 1 ? ' timeline-last' : ''}"${eventIdAttr}>
+    // M64: emit data-attempt-id on rows that belong to an
+    // attempt so the click delegator can route to the
+    // matching graph node + chain pill (timeline → graph
+    // bidirectional sync).
+    const attemptIdAttr = e.attempt_id != null
+      ? ' data-timeline-attempt-id="' + e.attempt_id + '"' : '';
+    return `<div class="timeline-row${rowCls}${failed ? ' attempt-failed' : ''}${i === events.length - 1 ? ' timeline-last' : ''}"${eventIdAttr}${attemptIdAttr}>
       <div class="timeline-time">${escapeHtml(timeAbs)}<span class="rel">${escapeHtml(relLabel)}</span></div>
       <div class="timeline-track"><span class="timeline-marker ${markerCls}"></span></div>
       <div class="timeline-body">

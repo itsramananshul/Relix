@@ -625,6 +625,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_timeline_to_graph_sync_present() {
+        // M64 (Track A): clicking a timeline row that belongs
+        // to an attempt highlights the matching graph node +
+        // toggles the timeline attempt filter (timeline →
+        // graph bidirectional sync). M46 wired the reverse
+        // direction.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "data-timeline-attempt-id",
+            "function flashGraphNode",
+            "graph-node.flash",
+            "data-timeline-attempt-id]:hover",
+        ] {
+            assert!(body.contains(needle), "M64 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_zoom_and_tooltip_present() {
         // M61 (Track A): graph gets zoom controls (in/out/fit)
         // + a rich hover tooltip. SVG viewBox stays untouched
