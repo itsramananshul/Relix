@@ -678,7 +678,28 @@ fn handle_navigate(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) -> HandlerO
             url: url.to_string(),
         });
     }
-    match b.navigate(id, url) {
+    // W2-002d: structured event trace. The dispatch bridge
+    // already audits the call; this info line gives operators
+    // a per-call latency + outcome label suitable for
+    // log-aggregation / metrics scrape.
+    let started = std::time::Instant::now();
+    let result = b.navigate(id, url);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (outcome, reason) = match &result {
+        Ok(()) => ("ok", String::new()),
+        Err(e) => ("err", e.to_string()),
+    };
+    tracing::info!(
+        method = "tool.browser.navigate",
+        backend = b.name(),
+        session_id = id,
+        target_url = url,
+        elapsed_ms = elapsed_ms,
+        outcome = outcome,
+        reason = %reason,
+        "browser navigate"
+    );
+    match result {
         Ok(()) => HandlerOutcome::Ok("navigated\n".to_string().into_bytes()),
         Err(e) => to_envelope(&e),
     }
@@ -757,7 +778,24 @@ fn handle_click(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) -> HandlerOutc
                 .into(),
         );
     }
-    match b.click(id, selector) {
+    let started = std::time::Instant::now();
+    let result = b.click(id, selector);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (outcome, reason) = match &result {
+        Ok(()) => ("ok", String::new()),
+        Err(e) => ("err", e.to_string()),
+    };
+    tracing::info!(
+        method = "tool.browser.click",
+        backend = b.name(),
+        session_id = id,
+        selector = selector,
+        elapsed_ms = elapsed_ms,
+        outcome = outcome,
+        reason = %reason,
+        "browser click"
+    );
+    match result {
         Ok(()) => HandlerOutcome::Ok("clicked\n".to_string().into_bytes()),
         Err(e) => to_envelope(&e),
     }
@@ -781,7 +819,28 @@ fn handle_type_text(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) -> Handler
                 .into(),
         );
     }
-    match b.type_text(id, selector, text) {
+    let started = std::time::Instant::now();
+    let result = b.type_text(id, selector, text);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (outcome, reason) = match &result {
+        Ok(()) => ("ok", String::new()),
+        Err(e) => ("err", e.to_string()),
+    };
+    // Honest: log the char count, NOT the text payload. The
+    // text may include user credentials (form passwords); the
+    // structured log must never carry secrets.
+    tracing::info!(
+        method = "tool.browser.type_text",
+        backend = b.name(),
+        session_id = id,
+        selector = selector,
+        text_chars = text.chars().count(),
+        elapsed_ms = elapsed_ms,
+        outcome = outcome,
+        reason = %reason,
+        "browser type_text"
+    );
+    match result {
         Ok(()) => HandlerOutcome::Ok("typed\n".to_string().into_bytes()),
         Err(e) => to_envelope(&e),
     }
@@ -817,7 +876,25 @@ fn handle_wait_for_selector(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) ->
             }
         }
     };
-    match b.wait_for_selector(id, selector, timeout_ms) {
+    let started = std::time::Instant::now();
+    let result = b.wait_for_selector(id, selector, timeout_ms);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (outcome, reason) = match &result {
+        Ok(()) => ("ok", String::new()),
+        Err(e) => ("err", e.to_string()),
+    };
+    tracing::info!(
+        method = "tool.browser.wait_for_selector",
+        backend = b.name(),
+        session_id = id,
+        selector = selector,
+        timeout_ms = timeout_ms,
+        elapsed_ms = elapsed_ms,
+        outcome = outcome,
+        reason = %reason,
+        "browser wait_for_selector"
+    );
+    match result {
         Ok(()) => HandlerOutcome::Ok("found\n".to_string().into_bytes()),
         Err(e) => to_envelope(&e),
     }
