@@ -656,6 +656,15 @@ impl TaskStore {
                         failure_class,
                         now,
                     )?;
+                    // H14: synthesize the post-mortem terminal_summary
+                    // for every terminal-status transition (not just
+                    // deadline recovery — H5 covers that). Pulls the
+                    // facts we already own. Emitted at most once per
+                    // task: a second update to a terminal status
+                    // (which the state machine should reject anyway)
+                    // would be a no-op because we already detected
+                    // we just transitioned.
+                    emit_terminal_summary_in_txn(&tx, task_id, v, now)?;
                 }
                 _ => {}
             }
@@ -5759,6 +5768,83 @@ fn close_open_attempt_if_any(
     Ok(())
 }
 
+/// H14: synthesize a one-line terminal post-mortem event for a
+/// task that just transitioned to a terminal status. Pulls the
+/// facts the coordinator already owns (attempts, retries,
+/// started_at, last_failure_class) and writes them as a
+/// `task.terminal_summary` chronicle event in the same
+/// transaction as the status flip.
+///
+/// Idempotent guard: if the chronicle already contains a
+/// `task.terminal_summary` event for this task we skip — this
+/// keeps the helper safe to call across any caller path that
+/// might land more than once. (The state machine should refuse
+/// re-entering a terminal status anyway; this is belt + braces.)
+fn emit_terminal_summary_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    new_status: &str,
+    now: i64,
+) -> Result<(), CoordinatorError> {
+    let already: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM task_events
+             WHERE task_id = ?1 AND event_type = 'task.terminal_summary'",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .map_err(CoordinatorError::Db)?;
+    if already > 0 {
+        return Ok(());
+    }
+    let row = tx
+        .query_row(
+            "SELECT attempt_count, retry_count, started_at, last_failure_class
+             FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)?;
+    let Some((attempts, retries, started_at, last_class)) = row else {
+        return Ok(());
+    };
+    let wall = started_at.map(|s| (now - s).max(0)).unwrap_or(0);
+    let cls = last_class.as_deref().unwrap_or("");
+    // Mirror the new_status into the payload's reason field. We
+    // keep a separate name here because the recovery-scan path
+    // (H5) sets a more specific reason ("deadline_exceeded")
+    // for the same event_type.
+    let reason = new_status;
+    let legacy = format!(
+        "{reason} · attempts={attempts} retries={retries} \
+         wall_clock_secs={wall} last_failure_class={cls}",
+    );
+    let json = format!(
+        r#"{{"reason":"{}","attempts":{attempts},"retries":{retries},"wall_clock_secs":{wall},"last_failure_class":"{}","auto_emitted_by":"update_task"}}"#,
+        json_escape(reason),
+        json_escape(cls),
+    );
+    insert_typed_event(
+        tx,
+        task_id,
+        now,
+        "task.terminal_summary",
+        &legacy,
+        None,
+        None,
+        Some(&json),
+    )?;
+    Ok(())
+}
+
 /// H7: close `task_attempts` rows that are still open (no
 /// `finished_at`) but whose owning task has reached a terminal
 /// status. These orphans appear when a task transitions to a
@@ -6170,6 +6256,81 @@ mod tests {
         assert!(!ev.payload.contains("ghp_abcdef"));
         let pj = ev.payload_json.as_deref().unwrap();
         assert!(!pj.contains("ghp_abcdef"));
+    }
+
+    // ── H14: auto terminal_summary on every terminal transition ───────
+
+    #[test]
+    fn terminal_summary_emitted_on_completed_transition() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&tid, Some("completed"), None, None, None, None, None, None)
+            .unwrap();
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let ts = events
+            .iter()
+            .find(|e| e.event_type == "task.terminal_summary")
+            .expect("terminal_summary missing");
+        let pj: serde_json::Value =
+            serde_json::from_str(ts.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["reason"], "completed");
+        assert_eq!(pj["auto_emitted_by"], "update_task");
+        assert!(pj["attempts"].as_i64().unwrap() >= 1);
+        assert_eq!(pj["retries"].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn terminal_summary_emitted_on_failed_transition_carries_failure_class() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("upstream 500"),
+            Some("transport"),
+        )
+        .unwrap();
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let ts = events
+            .iter()
+            .find(|e| e.event_type == "task.terminal_summary")
+            .expect("terminal_summary missing");
+        let pj: serde_json::Value =
+            serde_json::from_str(ts.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["reason"], "failed");
+        assert_eq!(pj["last_failure_class"], "transport");
+    }
+
+    #[test]
+    fn terminal_summary_is_only_emitted_once_per_task() {
+        // Calling update twice with the same terminal status must
+        // not emit two summary events. The idempotent guard
+        // queries existing chronicle rows and skips when one is
+        // already present.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&tid, Some("completed"), None, None, None, None, None, None)
+            .unwrap();
+        // Second terminal-status update (e.g. an idempotent
+        // operator retry of the same call).
+        s.update(&tid, Some("completed"), None, None, None, None, None, None)
+            .unwrap();
+        let events = s.list_events_after(&tid, 0, 100).unwrap();
+        let n = events
+            .iter()
+            .filter(|e| e.event_type == "task.terminal_summary")
+            .count();
+        assert_eq!(n, 1, "expected exactly one terminal_summary, got {n}");
     }
 
     // ── H10: redaction sweep across pause/freeze/error_cause ──────────
@@ -8008,9 +8169,11 @@ mod tests {
         let now = std::time::Instant::now();
         let r = s.count_compact_candidates(cutoff).unwrap();
         let elapsed = now.elapsed();
+        // 100 completed tasks × (50 user events + 1 H14
+        // task.terminal_summary) = 5100 candidate events.
         assert_eq!(
-            r.candidate_events, 5000,
-            "expected 5000 candidates (100 completed * 50 events)"
+            r.candidate_events, 5100,
+            "expected 5100 candidates (100 completed × (50 user + 1 H14) events)"
         );
         assert_eq!(r.candidate_tasks, 100);
         // 500ms budget on a dev machine. The SQL is two
@@ -9290,14 +9453,15 @@ mod tests {
     fn compact_dry_run_counts_only_terminal_state_tasks() {
         // R5 invariant: events belonging to a `running` task
         // must not appear in the candidate count. The fixture
-        // has 5 tasks * 3 events each, but only the 4 terminal
-        // tasks contribute (= 12 events). The running task
-        // (3 events) is excluded.
+        // has 5 tasks * 3 user events each, and the 4 terminal
+        // tasks each pick up ONE auto-emitted task.terminal_summary
+        // (H14) when they transition. So: 4 tasks × (3 + 1) = 16
+        // candidate events. The running task (3 events) is excluded.
         let (s, cutoff) = compact_fixture();
         let r = s.count_compact_candidates(cutoff).unwrap();
         assert_eq!(
-            r.candidate_events, 12,
-            "candidate_events should be 4 terminal tasks × 3 events"
+            r.candidate_events, 16,
+            "candidate_events should be 4 terminal tasks × (3 user + 1 H14 terminal_summary) events"
         );
         assert_eq!(
             r.candidate_tasks, 4,
@@ -9313,11 +9477,16 @@ mod tests {
         let (s, cutoff) = compact_fixture();
         let r = s.count_compact_candidates(cutoff).unwrap();
         // Alphabetical sort: cancelled, completed, failed.
-        // The `running` cohort must be absent (R5).
+        // The `running` cohort must be absent (R5). H14 adds one
+        // task.terminal_summary per terminal task → +1 per status
+        // cohort.
         let m: std::collections::HashMap<String, i64> = r.by_task_status.into_iter().collect();
-        assert_eq!(m.get("completed").copied(), Some(6)); // 2 tasks × 3 events
-        assert_eq!(m.get("failed").copied(), Some(3));
-        assert_eq!(m.get("cancelled").copied(), Some(3));
+        // 2 completed tasks × (3 user + 1 H14) = 8
+        assert_eq!(m.get("completed").copied(), Some(8));
+        // 1 failed × 4 = 4
+        assert_eq!(m.get("failed").copied(), Some(4));
+        // 1 cancelled × 4 = 4
+        assert_eq!(m.get("cancelled").copied(), Some(4));
         assert!(
             !m.contains_key("running"),
             "running cohort must not appear in compact candidates (R5)"
@@ -9348,9 +9517,11 @@ mod tests {
             parsed.get("destructive").and_then(|v| v.as_bool()),
             Some(false)
         );
+        // H14 added one task.terminal_summary per terminal task
+        // → 16 candidate events instead of the pre-H14 12.
         assert_eq!(
             parsed.get("candidate_events").and_then(|v| v.as_i64()),
-            Some(12)
+            Some(16)
         );
         assert_eq!(
             parsed.get("candidate_tasks").and_then(|v| v.as_i64()),
