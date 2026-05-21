@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `39114af feat(cli): W2-008a — relix-cli doctor environment health check`
+- **HEAD:** `4f90f76 feat(bridge): W2-007e — GET /v1/policy/denials bridge proxy`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -43,15 +43,15 @@ as the resume command.
     PASS/WARN/FAIL report. Remaining: one-command startup
     script, demo scripts, Open WebUI integration, Docker
     reliability.
-- **Workspace tests:** **1248 passing on default features**;
+- **Workspace tests:** **1257 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
-  - relix-cli: 126 (+8 sol templates, +8 doctor)
+  - relix-cli: 126
   - relix-policy: 72
-  - relix-runtime: 727
+  - relix-runtime: 732 (+5 W2-007d denial ring)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 290
+  - relix-web-bridge: 294 (+4 W2-007e denials parser)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
