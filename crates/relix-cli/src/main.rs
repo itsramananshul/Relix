@@ -2,6 +2,7 @@
 
 mod browser;
 mod capability;
+mod doctor;
 mod flow_run;
 mod fs;
 mod identity;
@@ -137,6 +138,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: sol::Cmd,
     },
+    /// W2-008a: one-command environment health check. Hits
+    /// the bridge's `/v1/health` and prints an opinionated
+    /// PASS/WARN/FAIL report. Exits non-zero on any FAIL so
+    /// CI / shell scripts can gate on it.
+    Doctor(doctor::DoctorArgs),
     /// PH-TERM-CLI: inspect + control tool.terminal.* on a
     /// tool node. `terminal sessions` lists live runs;
     /// `terminal audit` snapshots the completion ring;
@@ -193,6 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Web { cmd } => web::run(cmd).await,
         Cmd::Browser { cmd } => browser::run(cmd).await,
         Cmd::Sol { cmd } => sol::run(cmd).await,
+        Cmd::Doctor(args) => doctor::run(args).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
