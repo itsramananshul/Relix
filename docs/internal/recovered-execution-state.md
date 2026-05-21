@@ -321,10 +321,11 @@ After writing this doc, the session shipped six commits on `main`:
 | 9d4381d | PH-TERM-CANCEL | runtime +7 | tool.terminal.cancel + manual stdout/stderr drain refactor |
 | c8d7fcb | PH-TERM-STREAM1 | runtime +11 | tool.terminal.tail — polling-cursor live stdout/stderr stream |
 | d5587d2 | PH-TERM-SPAWN | runtime +6 | tool.terminal.spawn — fire-and-forget background variant; validate_and_spawn / drive_to_completion refactor |
+| 57c575d | PH-TERM-SHELL | runtime +11 | tool.terminal.shell.{open,input,close} — persistent shell sessions; SpawnMode enum on validate_and_spawn |
 
-Aggregate: ~2200+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
+Aggregate: ~2900+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
 controller_runtime.rs, docs/capabilities.md. Runtime tests
-507 → 575 (+68). Workspace 887 → 955 passing. fmt + clippy clean
+507 → 586 (+79). Workspace 887 → 966 passing. fmt + clippy clean
 on every commit.
 
 **Decisions logged but unanswered:** D-008 (browser backend),
@@ -333,18 +334,20 @@ operator picks; the surfaces themselves keep the honesty contract
 (NoneBackend / RuntimeNotConnected).
 
 **Wave 1 tracks still pending after this session:**
-- Terminal persistent shell / interactive stdin — different
-  shape from the existing run path; each needs a consumer on
-  the other side.
 - Terminal streaming-with-consumer-drain (the current tail is
   read-only; a > 1 MiB producer still stalls when the buffer
   fills).
+- Terminal command-boundary tracking inside a shell session
+  (today the shell is a single bytes-in / bytes-out stream;
+  per-command exit codes need operator-supplied sentinels).
 - Browser real backend — D-008 blocked.
 - MCP stdio runtime wiring — D-009 blocked.
 - Filesystem fuzzy_replace — explicitly out-of-scope per fs.rs
   module docstring (alpha decision).
 
 **Wave 1 tracks now complete:**
+- Terminal persistent shell — `tool.terminal.shell.{open,input,
+  close}` (PH-TERM-SHELL).
 - Terminal background execution — `tool.terminal.spawn`
   fire-and-forget (PH-TERM-SPAWN).
 - Terminal cancel — `tool.terminal.cancel` cooperative termination
