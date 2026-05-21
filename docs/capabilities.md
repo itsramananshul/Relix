@@ -143,6 +143,8 @@ operator-facing endpoints:
 | `relix-cli flow-run` | SOL flow execution |
 | `relix-cli ops providers-health` (PH-WAVE2L) | Consolidated AI-stack snapshot |
 | `relix-cli ops capabilities` (PH-DASH3-CLI) | Mesh-wide capability list |
+| `relix-cli ops stuck` (PH-OPS-STUCK) | H6 stuck-running projection |
+| `relix-cli ops events` (PH-OPS-EVENTS) | H2 firehose snapshot for terminal operators |
 | `relix-cli ping` | Direct libp2p ping to a peer |
 
 ## Per-feature docs

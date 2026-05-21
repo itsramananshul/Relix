@@ -60,6 +60,24 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Recent cross-task events from /v1/tasks/events/recent.
+    /// Mirrors the dashboard firehose for terminal operators
+    /// — shows the H2 one-line summary projection per row.
+    Events {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Page limit (server caps at 500).
+        #[arg(long, default_value_t = 50usize)]
+        limit: usize,
+        /// Filter by event_type substring (e.g.
+        /// `task.retry`). Empty = all.
+        #[arg(long, default_value = "")]
+        filter: String,
+        /// Raw JSON instead of the table view.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -75,6 +93,12 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             threshold_secs,
             json,
         } => stuck(&bridge, threshold_secs, json).await,
+        Cmd::Events {
+            bridge,
+            limit,
+            filter,
+            json,
+        } => events(&bridge, limit, &filter, json).await,
     }
 }
 
@@ -267,6 +291,98 @@ async fn stuck(
     Ok(())
 }
 
+async fn events(
+    bridge: &str,
+    limit: usize,
+    filter: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cap = limit.clamp(1, 500);
+    let url = format!(
+        "{}/v1/tasks/events/recent?limit={}",
+        bridge.trim_end_matches('/'),
+        cap,
+    );
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let resp: EventsResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("bridge returned non-JSON body: {e}\nraw:\n{body}"))?;
+    let needle = filter.trim().to_ascii_lowercase();
+    let filtered: Vec<&EventRow> = resp
+        .items
+        .iter()
+        .filter(|r| needle.is_empty() || r.event_type.to_ascii_lowercase().contains(&needle))
+        .collect();
+    println!(
+        "events  shown={shown}  fetched={fetched}  next_cursor={cursor}",
+        shown = filtered.len(),
+        fetched = resp.items.len(),
+        cursor = resp.next_cursor,
+    );
+    if filtered.is_empty() {
+        if needle.is_empty() {
+            println!("(no events)");
+        } else {
+            println!("(no events match filter \"{needle}\")");
+        }
+        return Ok(());
+    }
+    println!();
+    let ev_h = "event_type";
+    let tid_h = "task_id";
+    let id_h = "id";
+    let sum_h = "summary";
+    println!("{ev_h:<28}  {tid_h:<10}  {id_h:>6}  {sum_h}");
+    for r in &filtered {
+        let short = if r.task_id.len() > 8 {
+            &r.task_id[..8]
+        } else {
+            &r.task_id
+        };
+        let sum = if r.summary.is_empty() {
+            r.payload.as_str()
+        } else {
+            r.summary.as_str()
+        };
+        println!(
+            "{et:<28}  {tid:<10}  {id:>6}  {sum}",
+            et = r.event_type,
+            tid = short,
+            id = r.event_id,
+            sum = sum,
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsResponse {
+    #[serde(default)]
+    items: Vec<EventRow>,
+    #[serde(default)]
+    next_cursor: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventRow {
+    #[serde(default)]
+    task_id: String,
+    #[serde(default)]
+    event_id: i64,
+    #[serde(default)]
+    event_type: String,
+    #[serde(default)]
+    payload: String,
+    #[serde(default)]
+    summary: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct StuckResponse {
     #[serde(default)]
@@ -401,6 +517,24 @@ mod tests {
         let h: HealthResponse = serde_json::from_str(body).unwrap();
         assert!(h.providers.is_empty());
         assert_eq!(h.aggregate.cooldowns_active, 0);
+    }
+
+    #[test]
+    fn parse_events_response() {
+        let body = r#"{
+            "items": [
+                {"task_id": "abc123",
+                 "event_id": 5,
+                 "event_type": "task.retry_requested",
+                 "payload": "raw payload",
+                 "summary": "[retry] requested (#2/5)"}
+            ],
+            "next_cursor": 5
+        }"#;
+        let r: EventsResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.next_cursor, 5);
+        assert_eq!(r.items[0].summary, "[retry] requested (#2/5)");
     }
 
     #[test]
