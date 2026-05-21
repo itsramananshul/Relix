@@ -9,14 +9,14 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `6c091fb feat(cli): PH-CLI-AUDIT-MIRRORS — relix-cli fs audit + terminal audit-http`
+- **HEAD:** `5cb3ab4 feat(tool): PH-WEB-BLOCKLIST operator-curated host blocklist on every web entry point`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1142 passing, 0 failures (delta this milestone: +10
-  — 7 in `fs::tests` + 3 in `terminal::tests` HTTP wire-shape guards).
-  - relix-cli: 104 (was 94; +10 this milestone)
+- **Workspace tests:** 1151 passing, 0 failures (delta this milestone: +9
+  — 9 in `security::tests` for `HostBlocklist` + integration).
+  - relix-cli: 104
   - relix-policy: 72
-  - relix-runtime: 673
+  - relix-runtime: 682 (was 673; +9 this milestone)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
@@ -63,6 +63,7 @@ as the resume command.
 | 8cbaa2a | PH-BRIDGE-FS-AUDIT | `GET /v1/fs/audit` proxy for `tool.fs.audit_recent`; new `#/fsaudit` dashboard page with peer/op/max controls + table; kbd 6 reassigned; 400 on INVALID_ARGS; 8 parser tests + landmark |
 | 3e8dc5e | PH-BRIDGE-TERM-AUDIT | `GET /v1/terminal/audit` proxy for `tool.terminal.audit_recent`; new `#/termaudit` dashboard page with status badge derived from exit/timed_out/cancelled; kbd 7 → termaudit (Configure → 8/9/0); 8 parser tests + landmark |
 | 6c091fb | PH-CLI-AUDIT-MIRRORS | `relix-cli fs audit` (new fs module) + `relix-cli terminal audit-http` (HTTP sibling of libp2p audit); padded tables; status-badge derived from exit/flags; urlencode_token for op-filter safety; 10 wire-shape tests |
+| 5cb3ab4 | PH-WEB-BLOCKLIST | `[tool] blocked_hosts` operator-curated hostname blocklist; new `HostBlocklist` type + `SsrfError::HostBlocked`; runs before scheme/DNS + on every redirect; exact-match-only (no subdomain widening) honesty contract; URLhaus refresh recipe in module doc; 9 tests + 14 existing call sites threaded |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
