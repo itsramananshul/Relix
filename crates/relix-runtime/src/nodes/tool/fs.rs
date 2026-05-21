@@ -32,7 +32,7 @@
 //! |---|---|---|
 //! | `tool.read_file`    | `<rel_path>` *or* `<rel_path>\|<max_bytes>` | file contents (UTF-8) |
 //! | `tool.write_file`   | `<rel_path>\|<mode>\|<content>` where mode is `overwrite` or `create_new` | `ok bytes=<N> path=<canonical>\n` |
-//! | `tool.search_files` | `<mode>\|<pattern>\|<max_results>` where mode is `name` or `content` | one match per line; `path` for name mode, `path:line:text` for content mode |
+//! | `tool.search_files` | `<mode>\|<pattern>\|<max_results>` where mode is `name`, `content`, or `glob` | one match per line; `path` for name and glob modes, `path:line:text` for content mode |
 //! | `tool.patch`        | `<rel_path>\|unified_diff\|<diff body>` | `ok bytes=<N>\n` |
 //!
 //! All paths in args are jail-relative. Returns expose paths
@@ -259,8 +259,9 @@ pub fn descriptor_search() -> CapabilityDescriptor {
     d.sensitivity_tags = vec!["fs:read".into()];
     d.requires_groups = vec!["chat-users".into()];
     d.description = Some(
-        "Name or substring-content search under the jail root. Linear walker \
-         (no index)."
+        "Search under the jail root. Modes: `name` (basename substring), \
+         `content` (file-content substring), `glob` (jail-relative path \
+         glob — supports *, **, ?). Linear walker (no index)."
             .into(),
     );
     d.categories = vec!["search".into(), "fs".into()];
@@ -588,7 +589,8 @@ fn handle_search(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
         .min(jail.cfg.max_search_results);
     if mode.is_empty() || pattern.is_empty() {
         return invalid(
-            "tool.search_files arg must be `mode|pattern|max_results` (mode: name|content)".into(),
+            "tool.search_files arg must be `mode|pattern|max_results` (mode: name|content|glob)"
+                .into(),
         );
     }
     let mut hits: Vec<String> = Vec::new();
@@ -646,6 +648,21 @@ fn handle_search(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
                         let trimmed_line = if line.len() > 240 { &line[..240] } else { line };
                         hits.push(format!("{}:{}:{}", rel, i + 1, trimmed_line));
                     }
+                }
+            }
+        }
+        "glob" => {
+            // Match jail-relative path (forward-slash normalized)
+            // against pattern using `*`, `**`, `?` semantics. See
+            // `glob_match` for the supported pattern grammar.
+            for p in walked {
+                if hits.len() >= cap {
+                    break;
+                }
+                let rel = jail.display_rel(&p);
+                let normalized = rel.replace('\\', "/");
+                if glob_match(pattern, &normalized) {
+                    hits.push(rel);
                 }
             }
         }
@@ -993,6 +1010,73 @@ fn walk_under(root: &Path, _orig: &Path, out: &mut Vec<PathBuf>, max_entries: us
                 queue.push_back(path);
             } else if ft.is_file() {
                 out.push(path);
+            }
+        }
+    }
+}
+
+/// Minimal glob matcher used by `tool.search_files` in `glob` mode.
+///
+/// Supported wildcards:
+///   * `*`  — matches any run of characters NOT containing `/`.
+///   * `**` — matches any run of characters, including `/`. A
+///     trailing `/` in the pattern (`**/foo`) is consumed by the
+///     wildcard so `**/foo` matches both `foo` and `bar/baz/foo`.
+///   * `?`  — matches a single character that is NOT `/`.
+///   * everything else matches literally.
+///
+/// Paths are expected to be forward-slash normalized by the
+/// caller (Windows backslashes are translated to `/`).
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = path.chars().collect();
+    glob_inner(&p, 0, &s, 0)
+}
+
+fn glob_inner(p: &[char], pi: usize, s: &[char], si: usize) -> bool {
+    if pi >= p.len() {
+        return si >= s.len();
+    }
+    match p[pi] {
+        '*' if pi + 1 < p.len() && p[pi + 1] == '*' => {
+            // `**` — matches zero or more characters including `/`.
+            // Optionally consume the trailing `/` in the pattern.
+            let mut after = pi + 2;
+            if after < p.len() && p[after] == '/' {
+                after += 1;
+            }
+            for off in 0..=s.len().saturating_sub(si) {
+                if glob_inner(p, after, s, si + off) {
+                    return true;
+                }
+            }
+            false
+        }
+        '*' => {
+            let after = pi + 1;
+            for off in 0..=s.len().saturating_sub(si) {
+                if off > 0 && s[si + off - 1] == '/' {
+                    // Single * may not span a path separator.
+                    return false;
+                }
+                if glob_inner(p, after, s, si + off) {
+                    return true;
+                }
+            }
+            false
+        }
+        '?' => {
+            if si < s.len() && s[si] != '/' {
+                glob_inner(p, pi + 1, s, si + 1)
+            } else {
+                false
+            }
+        }
+        c => {
+            if si < s.len() && s[si] == c {
+                glob_inner(p, pi + 1, s, si + 1)
+            } else {
+                false
             }
         }
     }
@@ -1900,5 +1984,116 @@ mod tests {
             HandlerOutcome::Err(e) => assert!(e.cause.contains("rel_path required")),
             _ => panic!("expected Err for empty arg"),
         }
+    }
+
+    // ── PH-FS-PARITY3: tool.search_files glob mode ─────────────────
+
+    #[test]
+    fn glob_match_star_does_not_span_path_sep() {
+        assert!(glob_match("*.rs", "main.rs"));
+        assert!(!glob_match("*.rs", "src/main.rs"));
+    }
+
+    #[test]
+    fn glob_match_double_star_spans_path_sep() {
+        assert!(glob_match("**/*.rs", "main.rs"));
+        assert!(glob_match("**/*.rs", "src/main.rs"));
+        assert!(glob_match("**/*.rs", "src/nodes/tool/fs.rs"));
+        assert!(!glob_match("**/*.rs", "src/main.txt"));
+    }
+
+    #[test]
+    fn glob_match_question_mark_matches_one_non_slash() {
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(!glob_match("a?c", "a/c"));
+    }
+
+    #[test]
+    fn glob_match_literal_segment_match() {
+        assert!(glob_match("src/main.rs", "src/main.rs"));
+        assert!(!glob_match("src/main.rs", "src/lib.rs"));
+    }
+
+    #[test]
+    fn glob_match_double_star_only_matches_anything() {
+        assert!(glob_match("**", "anything"));
+        assert!(glob_match("**", "a/b/c/d"));
+        assert!(glob_match("**", ""));
+    }
+
+    #[test]
+    fn glob_match_empty_pattern_only_matches_empty() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+    }
+
+    #[test]
+    fn search_files_glob_mode_finds_rust_files() {
+        let (td, j) = mk_jail();
+        // Build a small tree.
+        std::fs::create_dir_all(td.path().join("src/nodes")).unwrap();
+        std::fs::write(td.path().join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(td.path().join("src/lib.rs"), "// lib").unwrap();
+        std::fs::write(td.path().join("src/nodes/mod.rs"), "// mod").unwrap();
+        std::fs::write(td.path().join("README.md"), "# readme").unwrap();
+
+        let r = handle_search(&j, &ctx(b"glob|**/*.rs|100"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        // Normalize OS path separators for the assertions.
+        let lines: Vec<String> = body.lines().map(|l| l.replace('\\', "/")).collect();
+        assert!(lines.iter().any(|l| l == "src/main.rs"), "lines={lines:?}");
+        assert!(lines.iter().any(|l| l == "src/lib.rs"), "lines={lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "src/nodes/mod.rs"),
+            "lines={lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l == "README.md"));
+    }
+
+    #[test]
+    fn search_files_glob_mode_respects_single_star_segment() {
+        let (td, j) = mk_jail();
+        std::fs::create_dir_all(td.path().join("src/nodes")).unwrap();
+        std::fs::write(td.path().join("src/main.rs"), "x").unwrap();
+        std::fs::write(td.path().join("src/nodes/mod.rs"), "x").unwrap();
+
+        // `src/*.rs` matches only files directly under src/, not nested ones.
+        let r = handle_search(&j, &ctx(b"glob|src/*.rs|100"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<String> = body.lines().map(|l| l.replace('\\', "/")).collect();
+        assert!(lines.iter().any(|l| l == "src/main.rs"));
+        assert!(!lines.iter().any(|l| l == "src/nodes/mod.rs"));
+    }
+
+    #[test]
+    fn search_files_unknown_mode_rejected() {
+        let (_td, j) = mk_jail();
+        let r = handle_search(&j, &ctx(b"regex|.*|10"));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("unknown mode")),
+            _ => panic!("expected Err for unknown mode"),
+        }
+    }
+
+    #[test]
+    fn search_files_glob_mode_respects_max_results_cap() {
+        let (td, j) = mk_jail();
+        for i in 0..10 {
+            std::fs::write(td.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        // Cap is 100 by default; ask for 3 explicitly.
+        let r = handle_search(&j, &ctx(b"glob|*.txt|3"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert_eq!(body.lines().count(), 3);
     }
 }
