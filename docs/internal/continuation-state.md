@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `a643f99 feat(cli): W2-006e — relix-cli ops dispatch-stats mirrors GET /v1/dispatch/stats`
+- **HEAD:** `48fa803 feat(bridge): W2-007b — GET /v1/policy/simulate HTTP proxy for node.policy.simulate`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -33,18 +33,15 @@ as the resume command.
   - **W2-003 (Dashboard UX):** partial — Metrics page
     shipped; live feed / status pills / filtering pending.
   - **W2-004 / W2-007 / W2-008:** not started.
-- **Workspace tests:** **1220 passing on default features**;
+- **Workspace tests:** **1226 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
   - relix-cli: 110
   - relix-policy: 72
-  - relix-runtime: 722 (+6 dispatch latency / D-004 / browser
-    trait defaults)
+  - relix-runtime: 722
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 283 (+9 dispatch_stats parser + 1
-    metrics landmark + 1 browser_sessions landmark + earlier
-    additions)
+  - relix-web-bridge: 289 (+6 policy_simulate parser tests)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -116,6 +113,9 @@ as the resume command.
 | 48a073a | W2-006d | `#/metrics` dashboard page renders the snapshot sorted by mean elapsed desc; visual cues for tail-ratio (max÷mean > 5x) + err count tier |
 | ee71e3d | W2-001a | per-step duration ("+1.2s since prev") in chronicle timeline rows — operators spot which step took 8s |
 | a643f99 | W2-006e | `relix-cli ops dispatch-stats` mirrors GET /v1/dispatch/stats — terminal twin of the Metrics dashboard panel |
+| d9015a8 | docs | Wave 2 tally |
+| 0fd853d | W2-007a | `node.policy.simulate` built-in capability — operators ask "what would the policy decide?" without invoking; synthetic VerifiedIdentity inherits caller identity but swaps groups; name suffix `:simulate` |
+| 48fa803 | W2-007b | `GET /v1/policy/simulate` bridge HTTP proxy; `matched_rule` / `reason` Option-shaped with skip_serializing_if; 6 parser tests; 400 on missing method |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
