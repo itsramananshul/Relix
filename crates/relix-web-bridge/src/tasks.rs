@@ -1560,6 +1560,86 @@ fn parse_recent_edges(body: &str) -> Vec<RecentEdge> {
     out
 }
 
+// ── H6: stuck-running projection ─────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StuckQuery {
+    /// Stuck-threshold in seconds. Defaults to 300 (5 minutes)
+    /// when omitted. The threshold is forwarded to the coord
+    /// capability; values <0 are rejected there.
+    #[serde(default)]
+    pub threshold_secs: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StuckTask {
+    pub task_id: String,
+    pub title: String,
+    pub started_at: i64,
+    pub age_secs: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StuckResponse {
+    pub items: Vec<StuckTask>,
+    pub count: usize,
+    pub threshold_secs: i64,
+}
+
+/// `GET /v1/tasks/stuck?threshold_secs=N` — H6 diagnostic
+/// projection. Lists tasks that are `running`, have no
+/// `max_runtime_secs` (so the recovery scan can't reach them),
+/// and have been running longer than the threshold. Pure read.
+pub async fn stuck(
+    State(state): State<AppState>,
+    Query(q): Query<StuckQuery>,
+) -> Result<Json<StuckResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let threshold = q.threshold_secs.unwrap_or(300).max(0);
+    let body = rec
+        .stuck(threshold)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_stuck_body(threshold, &body)))
+}
+
+fn parse_stuck_body(threshold: i64, body: &str) -> StuckResponse {
+    let mut items: Vec<StuckTask> = Vec::new();
+    let mut explicit_count: Option<usize> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("count=") {
+            explicit_count = rest.parse().ok();
+            continue;
+        }
+        let mut parts = trimmed.splitn(4, '\t');
+        let task_id = parts.next().unwrap_or("").to_string();
+        let title = parts.next().unwrap_or("").to_string();
+        let started_at = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let age_secs = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if task_id.is_empty() {
+            continue;
+        }
+        items.push(StuckTask {
+            task_id,
+            title,
+            started_at,
+            age_secs,
+        });
+    }
+    let count = explicit_count.unwrap_or(items.len());
+    StuckResponse {
+        items,
+        count,
+        threshold_secs: threshold,
+    }
+}
+
 /// `GET /v1/tasks/edges/recent?since_edge_id=N&limit=M` —
 /// cross-task execution edges, newest-first. Phase-1E M39
 /// surface. Operators use this to spot patterns ("retry
@@ -2789,6 +2869,40 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].updated_at, None);
         assert_eq!(items[0].investigation_marked_at, None);
+    }
+
+    #[test]
+    fn parse_stuck_body_basic() {
+        // H6: tab-separated rows with trailing count=<N>.
+        let body = "deadbeef\tmy task\t1700000000\t900\n\
+                    cafebabe\tother\t1699999999\t1800\n\
+                    count=2\n";
+        let r = parse_stuck_body(300, body);
+        assert_eq!(r.count, 2);
+        assert_eq!(r.threshold_secs, 300);
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].task_id, "deadbeef");
+        assert_eq!(r.items[0].title, "my task");
+        assert_eq!(r.items[0].started_at, 1700000000);
+        assert_eq!(r.items[0].age_secs, 900);
+    }
+
+    #[test]
+    fn parse_stuck_body_empty_body_count_zero() {
+        let r = parse_stuck_body(300, "count=0\n");
+        assert_eq!(r.count, 0);
+        assert!(r.items.is_empty());
+    }
+
+    #[test]
+    fn parse_stuck_body_falls_back_to_items_len_when_count_missing() {
+        // Older bridge / partial fetch — still produce a useful
+        // response. The trailing `count=` is convenience, not
+        // load-bearing.
+        let body = "abc\tt\t100\t10\n";
+        let r = parse_stuck_body(60, body);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.count, 1);
     }
 
     #[test]

@@ -278,6 +278,14 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.note utf8: {e}"))
     }
 
+    /// H6: stuck-running projection passthrough. Arg is the
+    /// threshold in seconds (default 300 when caller passes 0).
+    pub async fn stuck(&self, threshold_secs: i64) -> Result<String, String> {
+        let arg = threshold_secs.to_string();
+        let bytes = self.call("task.stuck", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.stuck utf8: {e}"))
+    }
+
     /// Cross-task event firehose passthrough (M67). Args:
     /// since_event_id + limit + optional event_type filter.
     pub async fn recent_events(

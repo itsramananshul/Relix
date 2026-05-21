@@ -717,6 +717,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_stuck_running_banner_present() {
+        // H6: overview ships a stuck-running diagnostic banner
+        // sourced from /v1/tasks/stuck. Hidden when count=0.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"stuck-card\"",
+            "function fetchStuckTasks",
+            "/v1/tasks/stuck?threshold_secs=300",
+            "Stuck running tasks",
+        ] {
+            assert!(body.contains(needle), "H6 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_provider_failover_reason_badge_present() {
         // H1 (Hermes-style): provider routing-trace block renders
         // the typed failover-reason badge (rate-limit / context-overflow

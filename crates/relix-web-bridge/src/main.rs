@@ -252,6 +252,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // /events/recent, served as a stream so dashboards
         // get sub-second runtime visibility without polling.
         .route("/v1/tasks/events/stream", get(tasks::events_stream_global))
+        // H6: stuck-running task projection. Read-only diagnostic
+        // that surfaces tasks the recovery scan can't reach.
+        // Register before /v1/tasks/:id paths so axum's static
+        // matcher prefers it.
+        .route("/v1/tasks/stuck", get(tasks::stuck))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
         .route("/v1/tasks/:id/events", get(tasks::events))
         // Experimental SSE wrapper around task.events polling.

@@ -1879,6 +1879,17 @@
           <div class="empty">no operator actions recorded yet</div>
         </div>
       </div>
+      <!-- H6: stuck-running banner. Renders only when the
+           /v1/tasks/stuck projection returns >0 items. Pulls
+           operator attention to executors that died without
+           leaving a deadline behind. Hidden when count=0. -->
+      <div class="card" id="stuck-card" style="margin-top: 12px; display: none;">
+        <div class="card-header">
+          <h3>⚠ Stuck running tasks</h3>
+          <span class="meta" id="stuck-status"></span>
+        </div>
+        <div class="card-body dense" id="stuck-host"></div>
+      </div>
       <div class="card" style="margin-top: 12px;">
         <div class="card-header">
           <h3>Live event firehose (cross-task)</h3>
@@ -2623,6 +2634,9 @@ async function backgroundSync() {
       // M67: global firehose poll. Best-effort; the panel
       // degrades silently when the endpoint is unavailable.
       fetchGlobalFirehose();
+      // H6: stuck-running diagnostic. Hidden when count=0;
+      // visible banner when operators need to look at it.
+      fetchStuckTasks();
       const $status = document.getElementById('activity-status');
       if ($status) {
         $status.innerHTML =
@@ -3059,6 +3073,53 @@ function openGlobalFirehoseStream() {
       firehoseEventSource = null;
     }
   });
+}
+
+/* H6: pull /v1/tasks/stuck and render the warn banner on the
+   overview page. Hidden when count=0. Threshold is hard-coded
+   to 300s today; future iteration can expose a tunable. */
+async function fetchStuckTasks() {
+  const $card = document.getElementById('stuck-card');
+  const $host = document.getElementById('stuck-host');
+  const $status = document.getElementById('stuck-status');
+  if (!$card || !$host) return;
+  try {
+    const r = await fetch('/v1/tasks/stuck?threshold_secs=300');
+    if (!r.ok) {
+      $card.style.display = 'none';
+      return;
+    }
+    const j = await r.json();
+    const items = j.items || [];
+    if (items.length === 0) {
+      $card.style.display = 'none';
+      return;
+    }
+    $card.style.display = '';
+    const rows = items.map(t => {
+      const taskCell = '<a href="#/tasks/' + encodeURIComponent(t.task_id || '')
+        + '" class="id" title="' + escapeHtml(t.task_id || '') + '">'
+        + escapeHtml((t.task_id || '').slice(0, 8)) + '</a>';
+      return '<tr>'
+        + '<td>' + taskCell + '</td>'
+        + '<td>' + escapeHtml(t.title || '') + '</td>'
+        + '<td class="meta">' + escapeHtml(fmtDuration(Math.max(0, Number(t.age_secs || 0))))
+        + ' ago</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>task</th><th>title</th><th>running for</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    if ($status) {
+      $status.textContent = items.length + ' task'
+        + (items.length === 1 ? '' : 's')
+        + ' running > ' + (j.threshold_secs || 300) + 's without deadline';
+    }
+  } catch (_) {
+    // Network blip — leave whatever was last rendered visible
+    // so the operator sees the most recent state instead of an
+    // empty banner.
+  }
 }
 
 async function fetchGlobalFirehose() {

@@ -616,6 +616,18 @@ fn register_node_type_handlers(
                 &["task", "read", "graph", "metrics"],
             ),
             (
+                "task.stuck",
+                "H6: stuck-running task projection. Arg: \
+                 `<threshold_secs>` (default 300). Returns one \
+                 tab-separated row per task that is `running`, \
+                 has no max_runtime_secs, and has been running \
+                 longer than the threshold (so the recovery scan \
+                 cannot reach it). Output: \
+                 `<task_id>\\t<title>\\t<started_at>\\t<age_secs>` \
+                 + trailing `count=<N>`. Pure read; no side effects.",
+                &["task", "read", "diagnostics"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \

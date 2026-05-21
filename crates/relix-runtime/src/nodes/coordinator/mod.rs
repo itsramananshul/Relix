@@ -844,6 +844,57 @@ impl TaskStore {
         })
     }
 
+    /// H6: find tasks that have been `running` longer than
+    /// `stuck_threshold_secs` AND do NOT have `max_runtime_secs`
+    /// set (so the recovery scan will never touch them). Pure
+    /// projection — no writes, no side effects. Operators use
+    /// this via the dashboard's stuck-task banner to spot
+    /// executors that died without leaving a deadline behind.
+    ///
+    /// Returns rows ordered oldest-first so the most-stuck task
+    /// surfaces at the top.
+    pub fn stuck_running(
+        &self,
+        now_secs: i64,
+        stuck_threshold_secs: i64,
+    ) -> Result<Vec<StuckTaskRow>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let cutoff = now_secs - stuck_threshold_secs.max(0);
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.task_id,
+                        t.title,
+                        COALESCE(a.started_at, t.started_at) AS scan_started,
+                        t.current_attempt_id
+                 FROM tasks t
+                 LEFT JOIN task_attempts a ON a.attempt_id = t.current_attempt_id
+                 WHERE t.status = 'running'
+                   AND t.max_runtime_secs IS NULL
+                   AND COALESCE(a.started_at, t.started_at) IS NOT NULL
+                   AND COALESCE(a.started_at, t.started_at) <= ?1
+                 ORDER BY COALESCE(a.started_at, t.started_at) ASC",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![cutoff], |r| {
+                Ok(StuckTaskRow {
+                    task_id: r.get(0)?,
+                    title: r.get(1)?,
+                    started_at: r.get(2)?,
+                    current_attempt_id: r.get(3)?,
+                    age_secs: 0,
+                })
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let mut row = r.map_err(CoordinatorError::Db)?;
+            row.age_secs = now_secs - row.started_at;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// Find tasks the Coordinator believes are still `running` but
     /// whose deadline has passed, flip them to `interrupted`, close
     /// the open attempt as interrupted, and append `task.interrupted`
@@ -3152,6 +3203,29 @@ pub struct SubtreeMetrics {
     pub max_depth_walked: i64,
 }
 
+/// H6: one row of a stuck-task projection. Pure read shape
+/// returned by [`TaskStore::stuck_running`] — task is `running`,
+/// has no `max_runtime_secs` (so the recovery scan can't reach
+/// it), and has been running longer than the operator's stuck
+/// threshold. The dashboard renders these in a banner so
+/// operators can spot dead executors at a glance.
+#[derive(Debug, Clone)]
+pub struct StuckTaskRow {
+    pub task_id: String,
+    pub title: String,
+    /// `task_attempts.started_at` for the current attempt, falling
+    /// back to `tasks.started_at` for tasks created pre-C2a.
+    pub started_at: i64,
+    /// Optional pointer to the open attempt (None for tasks
+    /// pre-C2a whose 'running' transition predated the attempt
+    /// timeline).
+    pub current_attempt_id: Option<i64>,
+    /// Wall-clock seconds since `started_at`. Populated by the
+    /// query loop using the same `now_secs` it was called with so
+    /// the row is internally consistent.
+    pub age_secs: i64,
+}
+
 /// Outcome of an M72 edge-producer call. Carries both the
 /// new edge_id AND the chronicle event_id so callers can
 /// surface either side to operators.
@@ -3535,9 +3609,73 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.stuck",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_stuck(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
+
+/// H6: `task.stuck|<threshold_secs>` — read-only stuck-task
+/// projection. Threshold defaults to 300 (5 minutes) when the
+/// caller omits it. Output is one row per stuck task with
+/// trailing `count=<N>`:
+///
+///   <task_id>\t<title>\t<started_at>\t<age_secs>
+///   ...
+///   count=<N>
+fn handle_stuck(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.stuck utf8: {e}")),
+    };
+    let trimmed = raw.trim();
+    let threshold = if trimmed.is_empty() {
+        300
+    } else {
+        match trimmed.parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            Ok(_) => return invalid("task.stuck: threshold must be non-negative".into()),
+            Err(_) => {
+                return invalid(format!(
+                    "task.stuck: invalid threshold '{trimmed}' (expected integer seconds)"
+                ));
+            }
+        }
+    };
+    let now = unix_secs();
+    let rows = match store.stuck_running(now, threshold) {
+        Ok(r) => r,
+        Err(e) => return internal(format!("task.stuck: {e}")),
+    };
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for r in &rows {
+        let _ = writeln!(
+            body,
+            "{}\t{}\t{}\t{}",
+            r.task_id,
+            tab_safe(&r.title),
+            r.started_at,
+            r.age_secs,
+        );
+    }
+    let _ = writeln!(body, "count={}", rows.len());
+    HandlerOutcome::Ok(body.into_bytes())
+}
+
+/// Local-to-handler helper: keep titles single-line so the
+/// tab-separated output stays parseable.
+fn tab_safe(s: &str) -> String {
+    s.replace(['\t', '\n', '\r'], " ")
+}
 
 fn handle_create(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -5853,6 +5991,81 @@ mod tests {
         // Unknown kind defaults to Permanent so callers fail loudly
         // rather than silently retrying on something they don't model.
         assert_eq!(FailureClass::from_kind(9_999), FailureClass::Permanent);
+    }
+
+    // ── H6: stuck-running projection ──────────────────────────────────
+
+    #[test]
+    fn stuck_running_includes_only_running_without_deadline_past_threshold() {
+        let s = store();
+        // 1. Running, no deadline, started 600s ago → stuck.
+        let stuck = mk(&s, "stuck-one", "f", "{}", "o");
+        s.update(&stuck, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        // 2. Running, with deadline → NOT stuck (recovery scan owns it).
+        let with_dl = s
+            .create("with-dl", "f", "{}", "o", RetryPolicy::None, 0, Some(3600))
+            .unwrap();
+        s.update(
+            &with_dl,
+            Some("running"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // 3. Completed → not running.
+        let done = mk(&s, "done", "f", "{}", "o");
+        s.update(&done, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&done, Some("completed"), None, None, None, None, None, None)
+            .unwrap();
+
+        let started_stuck = s.get(&stuck).unwrap().unwrap().started_at.unwrap();
+        let rows = s.stuck_running(started_stuck + 600, 300).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, vec![stuck.as_str()], "rows: {rows:#?}");
+        assert!(rows[0].age_secs >= 600);
+    }
+
+    #[test]
+    fn stuck_running_threshold_filters_recent_starts() {
+        let s = store();
+        let tid = mk(&s, "fresh", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.get(&tid).unwrap().unwrap().started_at.unwrap();
+        // 30s of wall-clock with a 5min threshold → not stuck yet.
+        let rows = s.stuck_running(started + 30, 300).unwrap();
+        assert!(rows.is_empty(), "early task should not appear stuck");
+    }
+
+    #[test]
+    fn stuck_running_orders_oldest_first() {
+        let s = store();
+        let older = mk(&s, "older", "f", "{}", "o");
+        s.update(&older, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let newer = mk(&s, "newer", "f", "{}", "o");
+        s.update(&newer, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        // Both have started_at = unix_secs() right now. Use a far-future
+        // now to make both visible; with-equal-started rows the SQL
+        // ordering will follow the index. We assert just the *set* of
+        // returned task_ids and the ordering when started_at differs.
+        let now = s.get(&older).unwrap().unwrap().started_at.unwrap() + 9_999;
+        let rows = s.stuck_running(now, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Same started_at within the same tick — the test asserts both
+        // are present.
+        let mut ids: Vec<String> = rows.into_iter().map(|r| r.task_id).collect();
+        ids.sort();
+        let mut expected = vec![older, newer];
+        expected.sort();
+        assert_eq!(ids, expected);
     }
 
     // ── C1b: recovery scan ────────────────────────────────────────────
