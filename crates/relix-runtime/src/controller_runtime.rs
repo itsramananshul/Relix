@@ -458,6 +458,15 @@ fn register_node_type_handlers(
                 &["task", "write", "annotate", "operator"],
             ),
             (
+                "task.mark_investigation",
+                "Toggle the operator-set investigation marker on a \
+                 Task. Persists `investigation_marked_at` + optional \
+                 `investigation_reason` on the task row and emits a \
+                 `task.investigation_marked` / `task.investigation_cleared` \
+                 chronicle event. Used to flag tasks that need follow-up.",
+                &["task", "write", "annotate", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -493,7 +502,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation"
         );
     }
     if cfg.controller.node_type == "tool" {

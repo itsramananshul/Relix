@@ -278,6 +278,28 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.note utf8: {e}"))
     }
 
+    /// Toggle the operator-set investigation marker on a task
+    /// (M62). `marked=true` stamps `investigation_marked_at`
+    /// with the current time + records an optional short
+    /// reason; `marked=false` clears both and emits a
+    /// `task.investigation_cleared` event. Returns the
+    /// coordinator body verbatim (`marked_at=<ts>` or
+    /// `marked_at=` for a clear).
+    pub async fn mark_investigation(
+        &self,
+        task_id: &str,
+        marked: bool,
+        reason: Option<&str>,
+    ) -> Result<String, String> {
+        let arg = format!(
+            "{task_id}|{}|{}",
+            if marked { "1" } else { "0" },
+            reason.unwrap_or("")
+        );
+        let bytes = self.call("task.mark_investigation", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.mark_investigation utf8: {e}"))
+    }
+
     /// Operator-triggered cancellation. Two steps:
     ///
     /// 1. Append a `task.cancelled` event with the operator-

@@ -1839,6 +1839,7 @@
               <button id="action-export">Export</button>
               <button id="action-retry">Retry</button>
               <button id="action-note">Add note</button>
+              <button id="action-investigate">Investigate</button>
               <button id="action-cancel" class="btn-danger">Cancel</button>
               <button id="action-recover">Recover</button>
             </div>
@@ -3146,8 +3147,60 @@ function initTasks() {
     if (!selectedTaskId) return;
     await requestNote(selectedTaskId);
   });
+  document.getElementById('action-investigate').addEventListener('click', async () => {
+    if (!selectedTaskId) return;
+    await requestInvestigation(selectedTaskId);
+  });
 
   tasksInited = true;
+}
+
+/* Investigation banner — sticky alert at the top of the task
+   detail when the operator-set marker is on. Renders nothing
+   when unset. Shows the marker timestamp + optional reason +
+   a one-click clear control. */
+function renderInvestigationBanner(l) {
+  const header = (l.task && l.task.header) || {};
+  const markedAtRaw = header.investigation_marked_at;
+  if (markedAtRaw == null || markedAtRaw === '' || markedAtRaw === '0') return '';
+  const markedAt = Number(markedAtRaw);
+  const reason = header.investigation_reason || '';
+  const ago = fmtDuration(Math.max(0, Math.floor(Date.now() / 1000) - markedAt));
+  return '<div class="banner warn" style="margin: 0 14px 12px; display: flex; align-items: center; gap: 8px;">'
+    + '<span style="flex: 1;">'
+    + '<strong>Under investigation</strong> · marked ' + escapeHtml(ago) + ' ago'
+    + (reason ? ' · ' + escapeHtml(reason) : '')
+    + '</span>'
+    + '<button data-action="clear-investigation">Clear marker</button>'
+    + '</div>';
+}
+
+async function requestInvestigationToggle(taskId, marked, reason) {
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/investigation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ marked, reason: reason || null }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    toast(marked ? 'investigation marker set' : 'investigation marker cleared', 'ok');
+    loadDetail(taskId);
+  } catch (e) {
+    toast('investigation toggle failed: ' + String(e.message || e), 'error');
+  }
+}
+
+async function requestInvestigation(taskId) {
+  const reason = prompt(
+    'Mark this task for investigation. Optional short reason '
+    + '(empty = mark with no reason). The marker persists on '
+    + 'the task row + emits a `task.investigation_marked` '
+    + 'chronicle event with the verified caller as the author.',
+    ''
+  );
+  if (reason === null) return;
+  await requestInvestigationToggle(taskId, true, reason.trim());
 }
 
 async function requestNote(taskId) {
@@ -3513,8 +3566,10 @@ function renderDetail(l) {
   // after /v1/routing returns. Visible whenever the chronicle
   // has at least one capability.invoked event.
   const execSlot = '<div id="exec-slot"></div>';
+  const investigationBanner = renderInvestigationBanner(l);
   document.getElementById('task-detail').innerHTML =
-    `<div class="summary">${summaryRow}</div>`
+    investigationBanner
+    + `<div class="summary">${summaryRow}</div>`
     + chainBlock
     + graphBlock
     + failureBlock
@@ -4087,6 +4142,12 @@ document.addEventListener('click', (ev) => {
   if (zoomBtn) {
     const card = zoomBtn.closest('.exec-graph-card');
     if (card) applyExecGraphZoom(card, zoomBtn.dataset.graphZoom);
+    return;
+  }
+  // M62: investigation banner clear button.
+  const clearInv = ev.target.closest('button[data-action="clear-investigation"]');
+  if (clearInv) {
+    if (selectedTaskId) requestInvestigationToggle(selectedTaskId, false, null);
     return;
   }
   const copyBtn = ev.target.closest('button[data-copy]');

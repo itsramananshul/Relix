@@ -743,6 +743,119 @@ pub async fn note(
     }))
 }
 
+// ── M62: investigation marker ──────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct InvestigationReq {
+    /// `true` to mark, `false` to clear. Required.
+    pub marked: bool,
+    /// Optional short reason captured at mark time. Ignored
+    /// on clear. Capped at `NOTE_BRIDGE_MAX_LEN`.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvestigationResp {
+    pub task_id: String,
+    /// `Some(unix_secs)` after a mark, `None` after a clear.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marked_at: Option<i64>,
+}
+
+/// `POST /v1/tasks/:id/investigation` — toggle the operator-set
+/// investigation marker. Validates the reason text bridge-side,
+/// forwards to the Coordinator's `task.mark_investigation`
+/// capability, and records into the intervention audit ring.
+pub async fn investigation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<InvestigationReq>,
+) -> Result<Json<InvestigationResp>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        state.intervention_audit.record(
+            "anon",
+            "task_investigation_set",
+            &id,
+            "error",
+            "no coordinator",
+        );
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    // Bridge-side reason validation — mirror the note rules.
+    let trimmed_reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(r) = trimmed_reason {
+        if r.len() > NOTE_BRIDGE_MAX_LEN {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiError {
+                    error: format!(
+                        "reason: too long (max {NOTE_BRIDGE_MAX_LEN} bytes, got {})",
+                        r.len()
+                    ),
+                }),
+            ));
+        }
+        if r.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "reason: must not contain control characters".into(),
+                }),
+            ));
+        }
+    }
+    let body = match rec
+        .mark_investigation(&id, req.marked, trimmed_reason)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "task_investigation_set",
+                &id,
+                "error",
+                format!("coord task.mark_investigation failed: {e}"),
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let marked_at: Option<i64> = body
+        .lines()
+        .find_map(|l| l.strip_prefix("marked_at="))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok());
+    let detail = if req.marked {
+        match trimmed_reason {
+            Some(r) => format!("marked · {r}"),
+            None => "marked".to_string(),
+        }
+    } else {
+        "cleared".to_string()
+    };
+    state
+        .intervention_audit
+        .record("anon", "task_investigation_set", &id, "ok", detail);
+    Ok(Json(InvestigationResp {
+        task_id: id,
+        marked_at,
+    }))
+}
+
 fn parse_failure_class_from_body(body: &str) -> Option<String> {
     body.lines()
         .find_map(|line| line.strip_prefix("last_failure_class="))

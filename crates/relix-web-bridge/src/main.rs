@@ -247,6 +247,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // author; the bridge records the call in the
         // intervention audit ring too.
         .route("/v1/tasks/:id/note", post(tasks::note))
+        // Operator-set investigation marker (M62). Body:
+        // {marked: bool, reason?: string}. Toggles persistent
+        // state on the task row + emits a chronicle event.
+        .route("/v1/tasks/:id/investigation", post(tasks::investigation))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered
         // manifest cache (no extra mesh I/O).

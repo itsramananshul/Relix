@@ -502,6 +502,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_investigation_marker_landmarks_present() {
+        // M62 (Track B): the investigation marker is real
+        // per-task state on the coordinator. The dashboard
+        // ships an Investigate button + sticky banner with
+        // clear-marker affordance.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"action-investigate\"",
+            "function renderInvestigationBanner",
+            "function requestInvestigation",
+            "/investigation",
+            "data-action=\"clear-investigation\"",
+            "header.investigation_marked_at",
+        ] {
+            assert!(body.contains(needle), "M62 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_action_note_button_present() {
         // M60 (Track B): task detail panel ships an "Add note"
         // button that posts to /v1/tasks/:id/note. The

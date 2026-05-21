@@ -1113,6 +1113,110 @@ impl TaskStore {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Set or clear the operator-set investigation marker on
+    /// a task (M62). When `marked` is true, stamps the marker
+    /// with the current time + records the supplied reason and
+    /// emits a `task.investigation_marked` chronicle event.
+    /// When false, clears both columns and emits
+    /// `task.investigation_cleared`.
+    ///
+    /// `reason` is optional; when present at mark time it's
+    /// stored verbatim (cap [`MAX_OPERATOR_NOTE_LEN`]). At
+    /// clear time the reason argument is ignored.
+    ///
+    /// Returns the new marker value (`Some(ts)` after a mark,
+    /// `None` after a clear).
+    pub fn set_investigation_marker(
+        &self,
+        task_id: &str,
+        marked: bool,
+        reason: Option<&str>,
+        author_subject_id: &str,
+    ) -> Result<Option<i64>, CoordinatorError> {
+        let trimmed_reason = reason.map(|s| s.trim()).filter(|s| !s.is_empty());
+        if let Some(r) = trimmed_reason
+            && r.len() > MAX_OPERATOR_NOTE_LEN
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.mark_investigation: reason exceeds {MAX_OPERATOR_NOTE_LEN} bytes (got {})",
+                r.len()
+            )));
+        }
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        if exists == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        if marked {
+            tx.execute(
+                "UPDATE tasks
+                   SET investigation_marked_at = ?2,
+                       investigation_reason = ?3,
+                       updated_at = ?2
+                 WHERE task_id = ?1",
+                params![task_id, now, trimmed_reason],
+            )
+            .map_err(CoordinatorError::Db)?;
+            let payload_json = serde_json::json!({
+                "marked": true,
+                "reason": trimmed_reason,
+                "author": author_subject_id,
+            })
+            .to_string();
+            let legacy = match trimmed_reason {
+                Some(r) => format!("marked · {r}"),
+                None => "marked".to_string(),
+            };
+            insert_typed_event(
+                &tx,
+                task_id,
+                now,
+                "task.investigation_marked",
+                &legacy,
+                None,
+                None,
+                Some(&payload_json),
+            )?;
+            tx.commit().map_err(CoordinatorError::Db)?;
+            Ok(Some(now))
+        } else {
+            tx.execute(
+                "UPDATE tasks
+                   SET investigation_marked_at = NULL,
+                       investigation_reason = NULL,
+                       updated_at = ?2
+                 WHERE task_id = ?1",
+                params![task_id, now],
+            )
+            .map_err(CoordinatorError::Db)?;
+            let payload_json = serde_json::json!({
+                "marked": false,
+                "author": author_subject_id,
+            })
+            .to_string();
+            insert_typed_event(
+                &tx,
+                task_id,
+                now,
+                "task.investigation_cleared",
+                "cleared",
+                None,
+                None,
+                Some(&payload_json),
+            )?;
+            tx.commit().map_err(CoordinatorError::Db)?;
+            Ok(None)
+        }
+    }
+
     /// Append an operator-authored note as a structured
     /// `task.operator_note` chronicle event (M60). The note
     /// becomes part of the immutable task history and is
@@ -1200,7 +1304,8 @@ impl TaskStore {
                         retry_count, retry_policy, max_retries,
                         max_runtime_secs, last_failure_reason,
                         last_failure_class, started_at,
-                        attempt_count, current_attempt_id
+                        attempt_count, current_attempt_id,
+                        investigation_marked_at, investigation_reason
                  FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 |r| {
@@ -1227,6 +1332,8 @@ impl TaskStore {
                         started_at: r.get(18)?,
                         attempt_count: r.get(19)?,
                         current_attempt_id: r.get(20)?,
+                        investigation_marked_at: r.get(21)?,
+                        investigation_reason: r.get(22)?,
                         events: Vec::new(),
                     })
                 },
@@ -1575,6 +1682,17 @@ pub struct TaskView {
     /// via [`TaskStore::list_attempts`].
     pub attempt_count: i64,
     pub current_attempt_id: Option<i64>,
+    /// M62: operator investigation marker. `Some(ts)` when the
+    /// operator most recently called `task.mark_investigation`
+    /// with `marked=true`; `None` when never marked or last
+    /// cleared. The chronicle preserves the full toggle history
+    /// via `task.investigation_marked` / `task.investigation_cleared`
+    /// events.
+    pub investigation_marked_at: Option<i64>,
+    /// M62: operator-supplied short reason captured at the most
+    /// recent mark. Cleared to `None` when the marker is
+    /// cleared.
+    pub investigation_reason: Option<String>,
     pub events: Vec<TaskEvent>,
 }
 
@@ -1930,6 +2048,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_note(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.mark_investigation",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_mark_investigation(&s, &ctx) }
             })),
         );
     }
@@ -2302,6 +2430,8 @@ fn render_task_export(e: &TaskExport) -> String {
     push_opt_int_field!("started_at", v.started_at);
     push_int_field!("attempt_count", v.attempt_count);
     push_opt_int_field!("current_attempt_id", v.current_attempt_id);
+    push_opt_int_field!("investigation_marked_at", v.investigation_marked_at);
+    push_opt_str_field!("investigation_reason", v.investigation_reason);
     s.push_str(r#","events":["#);
     for (i, ev) in v.events.iter().enumerate() {
         if i > 0 {
@@ -2757,6 +2887,49 @@ fn handle_note(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// `task.mark_investigation` — operator-set per-task
+/// investigation flag (M62). Args: `task_id|0|...` to clear,
+/// `task_id|1|<reason>` to mark. Reason is optional even on
+/// mark (operators flagging quickly don't always have one);
+/// splitn(3) keeps `|` in the reason intact.
+///
+/// Returns `marked_at=<ts>` on a mark, `marked_at=` (empty)
+/// after a clear, so callers can parse a single shape.
+fn handle_mark_investigation(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.mark_investigation utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let task_id = parts.first().copied().unwrap_or("");
+    let marked_flag = parts.get(1).copied().unwrap_or("");
+    let reason = parts.get(2).copied().filter(|v| !v.is_empty());
+    if task_id.is_empty() {
+        return invalid(
+            "task.mark_investigation: task_id required (arg shape: task_id|0|1|reason)".to_string(),
+        );
+    }
+    let marked = match marked_flag {
+        "1" | "true" => true,
+        "0" | "false" | "" => false,
+        other => {
+            return invalid(format!(
+                "task.mark_investigation: invalid marked flag '{other}' (expected 0|1)"
+            ));
+        }
+    };
+    let author = ctx.caller.subject_id.to_string();
+    match store.set_investigation_marker(task_id, marked, reason, &author) {
+        Ok(Some(ts)) => HandlerOutcome::Ok(format!("marked_at={ts}\n").into_bytes()),
+        Ok(None) => HandlerOutcome::Ok(b"marked_at=\n".to_vec()),
+        Err(CoordinatorError::NotFound(id)) => {
+            invalid(format!("task.mark_investigation: not found: {id}"))
+        }
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.mark_investigation: {e}")),
+    }
+}
+
 /// Render a TaskView as a multi-line `key=value` block followed by an
 /// `events:` JSON array. Stable + grep-friendly for `relix-cli task get`.
 fn render_task_view(v: &TaskView) -> String {
@@ -2803,6 +2976,12 @@ fn render_task_view(v: &TaskView) -> String {
     let _ = writeln!(s, "attempt_count={}", v.attempt_count);
     if let Some(x) = v.current_attempt_id {
         let _ = writeln!(s, "current_attempt_id={}", x);
+    }
+    if let Some(x) = v.investigation_marked_at {
+        let _ = writeln!(s, "investigation_marked_at={}", x);
+    }
+    if let Some(x) = v.investigation_reason.as_ref() {
+        let _ = writeln!(s, "investigation_reason={}", x);
     }
     let _ = writeln!(s, "event_count={}", v.events.len());
     // Events as a simple JSON array. We hand-build the JSON to avoid
@@ -3017,6 +3196,18 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         "ALTER TABLE task_events ADD COLUMN attempt_id INTEGER",
         "ALTER TABLE task_events ADD COLUMN trace_id TEXT",
         "ALTER TABLE task_events ADD COLUMN payload_json TEXT",
+        // M62: operator-set investigation marker. NULL when not
+        // marked; set to unix_secs() of the most recent
+        // `task.mark_investigation` call. Clearing the marker
+        // writes NULL (and emits a `task.investigation_cleared`
+        // chronicle event). The marker is per-task durable
+        // state — operators flag tasks they want to come back
+        // to without polluting the task list with manual notes.
+        "ALTER TABLE tasks ADD COLUMN investigation_marked_at INTEGER",
+        // Optional short operator-supplied reason captured at
+        // mark time; surfaced in the dashboard banner so the
+        // marker isn't just a flag in isolation.
+        "ALTER TABLE tasks ADD COLUMN investigation_reason TEXT",
     ];
     for sql in alters {
         // Best-effort. The only error we expect is "duplicate column
@@ -5156,6 +5347,84 @@ mod tests {
             elapsed.as_secs() < 5,
             "incremental 5000-event walk took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn investigation_marker_mark_clear_round_trip() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Initially unset.
+        let v0 = s.get(&tid).unwrap().unwrap();
+        assert!(v0.investigation_marked_at.is_none());
+        assert!(v0.investigation_reason.is_none());
+        // Mark with reason.
+        let ts = s
+            .set_investigation_marker(&tid, true, Some(" check logs "), "subj-op")
+            .unwrap();
+        assert!(ts.is_some());
+        let v1 = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v1.investigation_marked_at, ts);
+        assert_eq!(v1.investigation_reason.as_deref(), Some("check logs"));
+        // Mark again with no reason — reason cleared.
+        let ts2 = s
+            .set_investigation_marker(&tid, true, None, "subj-op")
+            .unwrap();
+        let v2 = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v2.investigation_marked_at, ts2);
+        assert!(v2.investigation_reason.is_none());
+        // Clear.
+        let cleared = s
+            .set_investigation_marker(&tid, false, None, "subj-op")
+            .unwrap();
+        assert!(cleared.is_none());
+        let v3 = s.get(&tid).unwrap().unwrap();
+        assert!(v3.investigation_marked_at.is_none());
+        assert!(v3.investigation_reason.is_none());
+    }
+
+    #[test]
+    fn investigation_marker_emits_chronicle_events() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.set_investigation_marker(&tid, true, Some("triage"), "op")
+            .unwrap();
+        s.set_investigation_marker(&tid, false, None, "op").unwrap();
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let marked = events
+            .iter()
+            .find(|e| e.event_type == "task.investigation_marked")
+            .expect("marked event missing");
+        assert!(marked.payload.contains("marked"));
+        let pj: serde_json::Value =
+            serde_json::from_str(marked.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["marked"], true);
+        assert_eq!(pj["reason"], "triage");
+        assert_eq!(pj["author"], "op");
+        let cleared = events
+            .iter()
+            .find(|e| e.event_type == "task.investigation_cleared")
+            .expect("cleared event missing");
+        assert_eq!(cleared.payload, "cleared");
+    }
+
+    #[test]
+    fn investigation_marker_rejects_unknown_task() {
+        let s = store();
+        let err = s
+            .set_investigation_marker("deadbeef", true, None, "op")
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::NotFound(id) if id == "deadbeef"));
+    }
+
+    #[test]
+    fn investigation_marker_rejects_oversize_reason() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let big = "x".repeat(MAX_OPERATOR_NOTE_LEN + 1);
+        let err = s
+            .set_investigation_marker(&tid, true, Some(&big), "op")
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
     }
 
     #[test]
