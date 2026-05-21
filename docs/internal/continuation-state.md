@@ -9,18 +9,18 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `8cbaa2a feat(bridge): PH-BRIDGE-FS-AUDIT proxy + dashboard panel for tool.fs.audit_recent`
+- **HEAD:** `3e8dc5e feat(bridge): PH-BRIDGE-TERM-AUDIT proxy + dashboard panel for tool.terminal.audit_recent`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1123 passing, 0 failures (delta this milestone: +9
-  — 8 in `fs_audit::tests` + 1 dashboard landmark).
+- **Workspace tests:** 1132 passing, 0 failures (delta this milestone: +9
+  — 8 in `term_audit::tests` + 1 dashboard landmark).
   - relix-cli: 94
   - relix-policy: 72
   - relix-runtime: 673
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 250 (was 241; +9 this milestone)
+  - relix-web-bridge: 259 (was 250; +9 this milestone)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -61,6 +61,7 @@ as the resume command.
 | 685aa1e | PH-BRIDGE-MCP-AUDIT | bridge-side bounded ring for `POST /v1/mcp/invoke`; `GET /v1/mcp/audit`; dashboard card; classified `error_kind`; args content never recorded |
 | 5fd8af4 | PH-CLI-MCP-AUDIT | `relix-cli mcp audit` — HTTP mirror of the bridge ring; `--bridge`, `--max`, `--raw`; padded table render; 3 forward-compat tests |
 | 8cbaa2a | PH-BRIDGE-FS-AUDIT | `GET /v1/fs/audit` proxy for `tool.fs.audit_recent`; new `#/fsaudit` dashboard page with peer/op/max controls + table; kbd 6 reassigned; 400 on INVALID_ARGS; 8 parser tests + landmark |
+| 3e8dc5e | PH-BRIDGE-TERM-AUDIT | `GET /v1/terminal/audit` proxy for `tool.terminal.audit_recent`; new `#/termaudit` dashboard page with status badge derived from exit/timed_out/cancelled; kbd 7 → termaudit (Configure → 8/9/0); 8 parser tests + landmark |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
