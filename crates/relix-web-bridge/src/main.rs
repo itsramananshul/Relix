@@ -317,6 +317,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/config/providers/:name/enabled",
             axum::routing::put(config_api::set_provider_enabled),
         )
+        // M69: operator quarantine + cooldown for a provider.
+        // The bridge enforces the cooldown at the
+        // test-provider endpoint immediately; the AI
+        // controller does NOT live-read this yet (response
+        // `note` field surfaces the gap honestly).
+        .route(
+            "/v1/config/providers/:name/quarantine",
+            axum::routing::put(config_api::set_provider_quarantine),
+        )
         .route(
             "/v1/config/providers/default",
             axum::routing::put(config_api::put_default_provider),

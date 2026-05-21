@@ -5820,7 +5820,24 @@ function renderProviderCard(p) {
     : '<span class="badge muted">not set</span> ';
   if (p.is_default) badge += '<span class="badge info">default</span> ';
   if (p.configured && p.enabled === false) {
-    badge += '<span class="badge warn">disabled</span>';
+    badge += '<span class="badge warn">disabled</span> ';
+  }
+  // M69: quarantine + cooldown badges. Live cooldown gets
+  // a remaining-time hint so operators see when the gate
+  // lifts; quarantined entries get a persistent danger badge.
+  if (p.quarantined_at != null) {
+    const reason = p.quarantine_reason ? ' · ' + p.quarantine_reason : '';
+    badge += '<span class="badge danger" title="operator-quarantined'
+      + escapeHtml(reason) + '">quarantined</span> ';
+  }
+  if (p.cooldown_until != null) {
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const rem = Number(p.cooldown_until) - nowSecs;
+    if (rem > 0) {
+      badge += '<span class="badge warn" title="bridge will refuse test-provider during cooldown">'
+        + 'cooldown ' + escapeHtml(fmtDuration(rem))
+        + '</span> ';
+    }
   }
   const previewBlock = p.configured
     ? '<div class="provider-meta">key <span class="key-preview">'
@@ -5875,6 +5892,11 @@ function renderProviderCard(p) {
         ? '<button data-action="toggle-enabled" data-name="' + escapeHtml(p.name)
           + '" data-current-enabled="' + (p.enabled !== false ? 'true' : 'false') + '">'
           + (p.enabled !== false ? 'Disable' : 'Enable') + '</button>'
+        : '')
+    +   (p.configured
+        ? '<button data-action="toggle-quarantine" data-name="' + escapeHtml(p.name)
+          + '" data-quarantined="' + (p.quarantined_at != null ? 'true' : 'false') + '">'
+          + (p.quarantined_at != null ? 'Lift quarantine' : 'Quarantine') + '</button>'
         : '')
     +   deleteBtn
     +   '<span class="action-status" data-role="status"></span>'
@@ -5973,6 +5995,63 @@ function wireProviderCard(name) {
         setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
       } finally {
         $toggle.disabled = false;
+      }
+    });
+  }
+  // M69: quarantine + cooldown.
+  const $quar = card.querySelector('[data-action="toggle-quarantine"]');
+  if ($quar) {
+    $quar.addEventListener('click', async () => {
+      const currentlyQuarantined = $quar.dataset.quarantined === 'true';
+      let reason = null;
+      let cooldownSecs = null;
+      if (!currentlyQuarantined) {
+        // Setting a quarantine — prompt for an optional
+        // reason + cooldown. Empty input skips the field.
+        reason = prompt(
+          'Quarantine ' + name + '. Optional short reason '
+          + '(empty = no reason).\n\n'
+          + 'HONEST: this is operator-visible state. The AI '
+          + 'controller does not live-read it yet; restart '
+          + 'the AI controller for routing to honour the '
+          + 'flag. The bridge enforces the cooldown at the '
+          + 'test-provider endpoint immediately.',
+          ''
+        );
+        if (reason === null) return;
+        const cdRaw = prompt(
+          'Cooldown window in seconds (empty = no cooldown). '
+          + 'The bridge refuses to run test-provider for this '
+          + 'entry during the cooldown.',
+          ''
+        );
+        if (cdRaw === null) return;
+        const parsed = parseInt(cdRaw.trim(), 10);
+        if (!Number.isNaN(parsed) && parsed > 0) cooldownSecs = parsed;
+      }
+      $quar.disabled = true;
+      setProviderStatus($status,
+        currentlyQuarantined ? 'lifting quarantine…' : 'quarantining…');
+      try {
+        const r = await fetch('/v1/config/providers/' + encodeURIComponent(name) + '/quarantine', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            quarantine: !currentlyQuarantined,
+            reason: reason && reason.trim() ? reason.trim() : null,
+            cooldown_secs: cooldownSecs,
+          }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+        toast(name + ' '
+          + (currentlyQuarantined ? 'quarantine lifted' : 'quarantined')
+          + ' · ' + (body.note || ''), 'ok');
+        replaceProviderCard(body.status);
+      } catch (e) {
+        setProviderStatus($status, 'failed: ' + String(e.message || e), 'error');
+      } finally {
+        $quar.disabled = false;
       }
     });
   }

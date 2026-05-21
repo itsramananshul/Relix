@@ -214,6 +214,38 @@ pub async fn test_provider(
             }),
         ));
     }
+    // M69: real cooldown enforcement. When an operator-set
+    // cooldown is active for this provider, the bridge
+    // refuses to run live test calls. Mirrors the bridge's
+    // "we enforce what we control" stance — the AI controller
+    // won't see this until restart, but the test-provider
+    // path is bridge-side and we honour it immediately.
+    let cooldown_remaining = state.secrets.read(|s| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        s.cooldown_remaining_secs(&name, now)
+    });
+    if let Some(rem) = cooldown_remaining {
+        state.intervention_audit.record_with_id(
+            "anon",
+            "provider_test",
+            &name,
+            "refused",
+            format!("cooldown active · {rem}s remaining"),
+            corr,
+        );
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiError {
+                error: format!(
+                    "provider '{name}' is in operator-set cooldown for {rem} more second(s). \
+                     Clear the cooldown via PUT /v1/config/providers/{name}/quarantine."
+                ),
+            }),
+        ));
+    }
     // Read the key from secrets under the lock; clone it
     // immediately so the lock is released before the network
     // round-trip.
@@ -535,6 +567,156 @@ pub async fn set_provider_enabled(
             state.intervention_audit.record_with_id(
                 "anon",
                 "provider_enabled_set",
+                &name,
+                "error",
+                format!("persist failed: {e}"),
+                corr,
+            );
+            Err(internal(format!("persist failed: {e}")))
+        }
+    }
+}
+
+// ── M69: provider quarantine ────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PutQuarantineReq {
+    /// `true` to mark this provider as operator-quarantined,
+    /// `false` to clear the flag. Required.
+    pub quarantine: bool,
+    /// Optional short reason captured at quarantine time.
+    /// Ignored on clear. Capped bridge-side at 2000 bytes;
+    /// rejected with 422 on overflow.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Optional cooldown window in seconds. When `Some(N>0)`
+    /// the bridge sets `cooldown_until = now + N` and the
+    /// test-provider endpoint refuses live calls against
+    /// this entry until that time. `Some(0)` / `None` clears
+    /// any active cooldown. Independent of `quarantine` —
+    /// operators can:
+    /// - quarantine without cooldown (manual review path),
+    /// - cooldown without quarantine (auto-recovery window),
+    /// - both.
+    #[serde(default)]
+    pub cooldown_secs: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PutQuarantineResp {
+    pub status: ProviderStatus,
+    /// Always `true` — like every other provider mutation
+    /// today, this is operator-visible state. The AI
+    /// controller live-reads provider config at startup, so
+    /// flipping this without restarting the AI controller
+    /// changes only what the bridge enforces (today: the
+    /// test-provider endpoint cooldown gate). Honestly
+    /// surfaced as `note` so operators don't expect live
+    /// routing change.
+    pub restart_required: bool,
+    pub note: String,
+}
+
+/// `PUT /v1/config/providers/:name/quarantine` — set or
+/// clear the operator-quarantine flag on a provider entry
+/// (M69). Persistent state in `bridge-secrets.toml`. The
+/// bridge enforces it at the boundaries it controls (today:
+/// the test-provider endpoint refuses live calls during a
+/// cooldown). The AI controller does NOT live-read this
+/// state yet — that requires a runtime reload primitive
+/// (separate milestone). The `note` field on the response
+/// surfaces this honestly.
+pub async fn set_provider_quarantine(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<PutQuarantineReq>,
+) -> Result<Json<PutQuarantineResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
+    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
+        return Err(unprocessable(format!(
+            "unknown provider '{name}'. allowed: {}",
+            ALLOWED_PROVIDERS.join(", ")
+        )));
+    }
+    let trimmed_reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(r) = trimmed_reason
+        && r.len() > 2_000
+    {
+        return Err(unprocessable(format!(
+            "reason: too long (max 2000 bytes, got {})",
+            r.len()
+        )));
+    }
+    let cooldown_secs = req.cooldown_secs.filter(|s| *s > 0);
+    let applied = state.secrets.mutate(|s| {
+        let applied = s.set_provider_quarantine(
+            &name,
+            req.quarantine,
+            trimmed_reason.map(str::to_string),
+            cooldown_secs,
+        );
+        (applied, s.provider_status(&name))
+    });
+    match applied {
+        Ok((true, status)) => {
+            tracing::info!(
+                provider = %name,
+                quarantined = req.quarantine,
+                cooldown_secs = ?cooldown_secs,
+                "config: providers.{name} quarantine updated"
+            );
+            let detail = if req.quarantine {
+                let cooldown_part = cooldown_secs
+                    .map(|s| format!(" · cooldown {s}s"))
+                    .unwrap_or_default();
+                match trimmed_reason {
+                    Some(r) => format!("quarantined · {r}{cooldown_part}"),
+                    None => format!("quarantined{cooldown_part}"),
+                }
+            } else if cooldown_secs.is_some() {
+                format!("cleared · cooldown {}s", cooldown_secs.unwrap_or(0))
+            } else {
+                "cleared".to_string()
+            };
+            state.intervention_audit.record_with_id(
+                "anon",
+                "provider_quarantine",
+                &name,
+                "ok",
+                detail,
+                corr,
+            );
+            Ok(Json(PutQuarantineResp {
+                status,
+                restart_required: true,
+                note: "Operator-visible flag stored locally. The AI controller \
+                       does not live-read this state yet; it picks up provider \
+                       config at startup. The bridge enforces the cooldown at \
+                       the test-provider endpoint immediately."
+                    .to_string(),
+            }))
+        }
+        Ok((false, _)) => {
+            state.intervention_audit.record_with_id(
+                "anon",
+                "provider_quarantine",
+                &name,
+                "refused",
+                "no entry yet — set api_key first",
+                corr,
+            );
+            Err(unprocessable(format!(
+                "provider '{name}' has no entry; set an api_key first via PUT /v1/config/providers/{name}"
+            )))
+        }
+        Err(e) => {
+            state.intervention_audit.record_with_id(
+                "anon",
+                "provider_quarantine",
                 &name,
                 "error",
                 format!("persist failed: {e}"),

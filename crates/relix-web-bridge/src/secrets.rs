@@ -105,6 +105,33 @@ pub struct ProviderEntry {
     /// NEVER includes the raw key or arbitrary upstream body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_test_detail: Option<String>,
+    // ── M69: operator-set quarantine ────────────────────────
+    //
+    // Real persistent state. The bridge enforces it at the
+    // boundaries it controls (today: the test-provider
+    // endpoint refuses live calls during a cooldown). The
+    // AI controller does NOT live-read this flag yet — that
+    // requires a runtime reload primitive (separate milestone).
+    // Operators see the gap in the dashboard's quarantine
+    // banner copy.
+    /// Unix seconds at which the operator most recently set
+    /// the quarantine. `None` when not quarantined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<i64>,
+    /// Operator-supplied short reason captured at quarantine
+    /// time. Capped at `MAX_OPERATOR_NOTE_LEN` (validated
+    /// by the bridge endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    /// Unix seconds before which the bridge refuses to run
+    /// `test_provider` against this entry. `None` = no
+    /// active cooldown. Independent of `quarantined_at`:
+    /// operators can quarantine without a cooldown (manual
+    /// review) or set a cooldown without a permanent
+    /// quarantine (auto-recovery window after a known
+    /// flap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -179,6 +206,13 @@ pub struct ProviderStatus {
     /// Redaction-safe summary from the most recent test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_test_detail: Option<String>,
+    // ── M69: quarantine + cooldown projection ──────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<i64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -289,6 +323,9 @@ impl BridgeSecrets {
                 last_test_status_code: e.last_test_status_code,
                 last_test_elapsed_ms: e.last_test_elapsed_ms,
                 last_test_detail: e.last_test_detail.clone(),
+                quarantined_at: e.quarantined_at,
+                quarantine_reason: e.quarantine_reason.clone(),
+                cooldown_until: e.cooldown_until,
             },
             None => ProviderStatus {
                 name: name.to_string(),
@@ -303,8 +340,70 @@ impl BridgeSecrets {
                 last_test_status_code: None,
                 last_test_elapsed_ms: None,
                 last_test_detail: None,
+                quarantined_at: None,
+                quarantine_reason: None,
+                cooldown_until: None,
             },
         }
+    }
+
+    /// Set or clear the operator-set quarantine flag on a
+    /// provider entry (M69). Returns `false` when the
+    /// provider has no entry (operator must set a key
+    /// first); `true` on success.
+    ///
+    /// `cooldown_secs` is optional. When `Some(N)`, the
+    /// resulting `cooldown_until` is set to `now + N` and
+    /// the test-provider endpoint refuses to run live calls
+    /// against this entry until that time passes.
+    /// Independent of `quarantine` so operators can:
+    /// - quarantine without cooldown (manual review)
+    /// - set a cooldown without quarantining (auto-recovery
+    ///   window after a known flap)
+    /// - both
+    ///
+    /// `reason` is captured at set time; ignored on clear.
+    pub fn set_provider_quarantine(
+        &mut self,
+        name: &str,
+        quarantine: bool,
+        reason: Option<String>,
+        cooldown_secs: Option<i64>,
+    ) -> bool {
+        match self.providers.get_mut(name) {
+            Some(e) => {
+                let now = unix_secs();
+                if quarantine {
+                    e.quarantined_at = Some(now);
+                    e.quarantine_reason = reason
+                        .map(|r| r.trim().to_string())
+                        .filter(|r| !r.is_empty());
+                } else {
+                    e.quarantined_at = None;
+                    e.quarantine_reason = None;
+                }
+                e.cooldown_until = cooldown_secs.filter(|s| *s > 0).map(|s| now + s);
+                e.set_at = now;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Inspect the active cooldown for a provider name.
+    /// Returns `Some(seconds_remaining)` when an active
+    /// cooldown is in effect; `None` when no cooldown is
+    /// set OR the cooldown has elapsed. Pure read — the
+    /// bridge's test-provider handler uses this as a soft
+    /// gate.
+    pub fn cooldown_remaining_secs(&self, name: &str, now: i64) -> Option<i64> {
+        self.providers
+            .get(name)
+            .and_then(|e| e.cooldown_until)
+            .and_then(|until| {
+                let rem = until - now;
+                if rem > 0 { Some(rem) } else { None }
+            })
     }
 
     /// Set the operator-marked enabled flag on a provider
@@ -368,24 +467,21 @@ impl BridgeSecrets {
     /// Caller is responsible for validating `name` against
     /// [`ALLOWED_PROVIDERS`] + rejecting empty `api_key`.
     pub fn set_provider(&mut self, name: &str, api_key: String, default_model: Option<String>) {
-        let prior_enabled = self.providers.get(name).map(|e| e.enabled).unwrap_or(true);
-        // Preserve the last-test cache across key overwrites.
-        // The key may have changed underneath, but the cache
-        // accurately describes "the most recent test" — which
-        // until the next test rerun reflects the OLD key.
-        // The dashboard renders both `last_test_at` and
-        // `key_set_at` so operators can tell they need to
-        // re-test after a key swap (if last_test_at <
-        // key_set_at the cache is stale).
-        let prior_cache = self.providers.get(name).map(|e| {
-            (
-                e.last_test_at,
-                e.last_test_ok,
-                e.last_test_status_code,
-                e.last_test_elapsed_ms,
-                e.last_test_detail.clone(),
-            )
-        });
+        // Preserve operator-set flags across key overwrites.
+        // The key may have changed underneath; the flags
+        // (enabled, quarantine, cooldown) and the test cache
+        // remain the operator's prior intent. They get cleared
+        // explicitly via dedicated endpoints, not by a key swap.
+        let prior = self.providers.get(name);
+        let prior_enabled = prior.map(|e| e.enabled).unwrap_or(true);
+        let prior_last_test_at = prior.and_then(|e| e.last_test_at);
+        let prior_last_test_ok = prior.and_then(|e| e.last_test_ok);
+        let prior_last_test_status_code = prior.and_then(|e| e.last_test_status_code);
+        let prior_last_test_elapsed_ms = prior.and_then(|e| e.last_test_elapsed_ms);
+        let prior_last_test_detail = prior.and_then(|e| e.last_test_detail.clone());
+        let prior_quarantined_at = prior.and_then(|e| e.quarantined_at);
+        let prior_quarantine_reason = prior.and_then(|e| e.quarantine_reason.clone());
+        let prior_cooldown_until = prior.and_then(|e| e.cooldown_until);
         self.providers.insert(
             name.to_string(),
             ProviderEntry {
@@ -393,11 +489,14 @@ impl BridgeSecrets {
                 default_model,
                 set_at: unix_secs(),
                 enabled: prior_enabled,
-                last_test_at: prior_cache.as_ref().and_then(|c| c.0),
-                last_test_ok: prior_cache.as_ref().and_then(|c| c.1),
-                last_test_status_code: prior_cache.as_ref().and_then(|c| c.2),
-                last_test_elapsed_ms: prior_cache.as_ref().and_then(|c| c.3),
-                last_test_detail: prior_cache.and_then(|c| c.4),
+                last_test_at: prior_last_test_at,
+                last_test_ok: prior_last_test_ok,
+                last_test_status_code: prior_last_test_status_code,
+                last_test_elapsed_ms: prior_last_test_elapsed_ms,
+                last_test_detail: prior_last_test_detail,
+                quarantined_at: prior_quarantined_at,
+                quarantine_reason: prior_quarantine_reason,
+                cooldown_until: prior_cooldown_until,
             },
         );
     }
@@ -587,6 +686,53 @@ mod tests {
             !json.contains("1234567890"),
             "key body leaked into ProviderStatus JSON: {json}"
         );
+    }
+
+    #[test]
+    fn set_provider_quarantine_round_trips_with_reason_and_cooldown() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        let applied =
+            s.set_provider_quarantine("openai", true, Some(" upstream flap ".into()), Some(120));
+        assert!(applied);
+        let p = s.provider_status("openai");
+        assert!(p.quarantined_at.is_some());
+        assert_eq!(p.quarantine_reason.as_deref(), Some("upstream flap"));
+        assert!(p.cooldown_until.is_some());
+    }
+
+    #[test]
+    fn set_provider_quarantine_refuses_when_no_entry() {
+        let mut s = BridgeSecrets::default();
+        let applied = s.set_provider_quarantine("openai", true, None, None);
+        assert!(!applied);
+    }
+
+    #[test]
+    fn cooldown_remaining_secs_is_none_when_elapsed_or_unset() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        // Unset
+        assert!(s.cooldown_remaining_secs("openai", 1_700_000_000).is_none());
+        // Set, but `now` is past the cooldown
+        s.set_provider_quarantine("openai", false, None, Some(60));
+        let entry = s.providers.get("openai").unwrap();
+        let until = entry.cooldown_until.unwrap();
+        assert!(s.cooldown_remaining_secs("openai", until + 1).is_none());
+        // Set, `now` is mid-cooldown
+        assert!(s.cooldown_remaining_secs("openai", until - 30).is_some());
+    }
+
+    #[test]
+    fn set_provider_preserves_quarantine_across_key_overwrite() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-old".into(), None);
+        s.set_provider_quarantine("openai", true, Some("flap".into()), Some(60));
+        s.set_provider("openai", "sk-new".into(), None);
+        let p = s.provider_status("openai");
+        assert!(p.quarantined_at.is_some());
+        assert!(p.cooldown_until.is_some());
+        assert_eq!(p.quarantine_reason.as_deref(), Some("flap"));
     }
 
     #[test]

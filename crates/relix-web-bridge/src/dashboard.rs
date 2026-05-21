@@ -395,6 +395,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_provider_quarantine_controls_present() {
+        // M69 (Track C): provider card ships quarantine +
+        // cooldown badges and a toggle action that POSTs to
+        // /v1/config/providers/:name/quarantine. The HONEST
+        // copy about the AI controller live-read gap appears
+        // in the prompt.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "data-action=\"toggle-quarantine\"",
+            "p.quarantined_at",
+            "p.cooldown_until",
+            "/quarantine",
+            "does not live-read",
+        ] {
+            assert!(body.contains(needle), "M69 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_provider_last_test_badge_present() {
         // M58 (Track C): provider card renders a persistent
         // last-test badge with ok/fail, HTTP status, elapsed,
