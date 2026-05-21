@@ -467,6 +467,29 @@ fn register_node_type_handlers(
                 &["task", "write", "annotate", "operator"],
             ),
             (
+                "task.pause",
+                "Operator-initiated pause. Transitions the task to \
+                 `paused` and emits a `task.paused` chronicle event \
+                 with the pre-pause status + reason + verified \
+                 caller identity. HONEST: no flow-pause primitive \
+                 exists yet — a currently-executing flow continues \
+                 running and its write-back may overwrite the \
+                 `paused` status. Same caveat as `task.cancel`.",
+                &["task", "write", "intervene", "operator"],
+            ),
+            (
+                "task.resume",
+                "Operator-initiated resume. Refuses any status \
+                 other than `paused`. Restores to `pending` so a \
+                 subsequent runtime tick can open a new attempt. \
+                 Emits a `task.resumed` event recording the \
+                 pre-pause status (read from the last `task.paused` \
+                 event). Does NOT re-dispatch the flow; the \
+                 operator must trigger re-execution via the retry \
+                 path if needed.",
+                &["task", "write", "intervene", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -502,7 +525,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume"
         );
     }
     if cfg.controller.node_type == "tool" {

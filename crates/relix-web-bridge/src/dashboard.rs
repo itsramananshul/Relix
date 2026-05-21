@@ -542,6 +542,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_pause_resume_actions_present() {
+        // M65 (Track B): real coord pause/resume capabilities
+        // backed by status transitions + chronicle events.
+        // Dashboard surfaces them as detail actions with
+        // honest copy about the "flow doesn't actually stop"
+        // caveat (same as cancel).
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"action-pause\"",
+            "id=\"action-resume\"",
+            "function requestPause",
+            "function requestResume",
+            "/pause",
+            "/resume",
+            // The HONEST caveat must ship in the confirm copy
+            // so operators understand the runtime gap.
+            "flow-pause primitive",
+        ] {
+            assert!(body.contains(needle), "M65 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_action_note_button_present() {
         // M60 (Track B): task detail panel ships an "Add note"
         // button that posts to /v1/tasks/:id/note. The

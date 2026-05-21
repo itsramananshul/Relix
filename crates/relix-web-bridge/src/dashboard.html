@@ -1863,6 +1863,8 @@
             <div class="card-actions" id="detail-actions" style="display:none;">
               <button id="action-export">Export</button>
               <button id="action-retry">Retry</button>
+              <button id="action-pause">Pause</button>
+              <button id="action-resume">Resume</button>
               <button id="action-note">Add note</button>
               <button id="action-investigate">Investigate</button>
               <button id="action-cancel" class="btn-danger">Cancel</button>
@@ -3191,6 +3193,14 @@ function initTasks() {
     if (!selectedTaskId) return;
     await requestInvestigation(selectedTaskId);
   });
+  document.getElementById('action-pause').addEventListener('click', async () => {
+    if (!selectedTaskId) return;
+    await requestPause(selectedTaskId);
+  });
+  document.getElementById('action-resume').addEventListener('click', async () => {
+    if (!selectedTaskId) return;
+    await requestResume(selectedTaskId);
+  });
 
   tasksInited = true;
 }
@@ -3241,6 +3251,56 @@ async function requestInvestigation(taskId) {
   );
   if (reason === null) return;
   await requestInvestigationToggle(taskId, true, reason.trim());
+}
+
+async function requestPause(taskId) {
+  const reason = prompt(
+    'Pause this task. Optional short reason (empty = no reason).\n\n'
+    + 'HONEST: the runtime has no flow-pause primitive today — a '
+    + 'currently-executing flow continues to run; its write-back '
+    + 'may overwrite the `paused` status. The chronicle records '
+    + 'operator intent. Same caveat as cancel.',
+    ''
+  );
+  if (reason === null) return;
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/pause', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: reason.trim() || null }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    const flowMsg = body.flow_still_running
+      ? ' · WARN: in-flight flow may overwrite this status'
+      : '';
+    toast('paused (was ' + (body.prior_status || '?') + ')' + flowMsg,
+      body.flow_still_running ? 'warn' : 'ok');
+    loadDetail(taskId);
+    loadTasks();
+  } catch (e) {
+    toast('pause failed: ' + String(e.message || e), 'error');
+  }
+}
+
+async function requestResume(taskId) {
+  if (!confirm(
+    'Resume this task? Status becomes `pending`. The runtime does NOT '
+    + 'automatically re-execute the flow — operators wanting a fresh '
+    + 'attempt should use the Retry action after resume.'
+  )) return;
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/resume', {
+      method: 'POST',
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    toast('resumed → pending (was ' + (body.pre_pause_status || '?') + ')', 'ok');
+    loadDetail(taskId);
+    loadTasks();
+  } catch (e) {
+    toast('resume failed: ' + String(e.message || e), 'error');
+  }
 }
 
 async function requestNote(taskId) {

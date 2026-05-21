@@ -1113,6 +1113,173 @@ impl TaskStore {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Operator-initiated pause (M65). Refuses terminal +
+    /// already-paused statuses. Emits a `task.paused`
+    /// chronicle event with author + optional reason.
+    ///
+    /// HONEST: like `cancel`, this is metadata-only today.
+    /// The runtime has no flow-pause primitive — a currently-
+    /// executing flow continues running and its eventual
+    /// write-back may overwrite the `paused` status. The
+    /// chronicle event records operator intent; the dashboard
+    /// surfaces the `flow_still_running` caveat in the
+    /// confirm flow.
+    ///
+    /// Returns the prior status so the caller can attach it
+    /// to the eventual `task.resumed` event (operators want
+    /// to see what state the task was returning to).
+    pub fn set_paused(
+        &self,
+        task_id: &str,
+        reason: Option<&str>,
+        author_subject_id: &str,
+    ) -> Result<String, CoordinatorError> {
+        let trimmed_reason = reason.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(r) = trimmed_reason
+            && r.len() > MAX_OPERATOR_NOTE_LEN
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.pause: reason exceeds {MAX_OPERATOR_NOTE_LEN} bytes (got {})",
+                r.len()
+            )));
+        }
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let prior_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let prior_status = prior_status.ok_or(CoordinatorError::NotFound(task_id.to_string()))?;
+        if !PAUSABLE_STATUSES.contains(&prior_status.as_str()) {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.pause: status '{prior_status}' is not pausable (allowed: {})",
+                PAUSABLE_STATUSES.join(", ")
+            )));
+        }
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        tx.execute(
+            "UPDATE tasks
+               SET status = 'paused',
+                   updated_at = ?2
+             WHERE task_id = ?1",
+            params![task_id, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let payload_json = serde_json::json!({
+            "prior_status": prior_status,
+            "reason": trimmed_reason,
+            "author": author_subject_id,
+        })
+        .to_string();
+        let legacy = match trimmed_reason {
+            Some(r) => format!("from {prior_status} · {r}"),
+            None => format!("from {prior_status}"),
+        };
+        insert_typed_event(
+            &tx,
+            task_id,
+            now,
+            "task.paused",
+            &legacy,
+            None,
+            None,
+            Some(&payload_json),
+        )?;
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(prior_status)
+    }
+
+    /// Operator-initiated resume (M65). Refuses any status
+    /// other than `paused`. Transitions to `pending` so a
+    /// subsequent runtime tick can open a new attempt.
+    /// Emits `task.resumed` with the pre-pause status (read
+    /// from the most recent `task.paused` event for
+    /// chronological accuracy).
+    ///
+    /// HONEST: this is purely a state restoration; it does
+    /// not re-dispatch the flow. The operator must trigger
+    /// re-execution separately (e.g. via the retry flow).
+    pub fn set_resumed(
+        &self,
+        task_id: &str,
+        author_subject_id: &str,
+    ) -> Result<String, CoordinatorError> {
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let prior_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let prior_status = prior_status.ok_or(CoordinatorError::NotFound(task_id.to_string()))?;
+        if prior_status != "paused" {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.resume: status '{prior_status}' is not resumable (only 'paused' is)"
+            )));
+        }
+        // Find the last task.paused event to recover the
+        // pre-pause status. Best-effort: when missing, the
+        // resumed event still lands with prior_status=paused
+        // so the timeline is honest.
+        let pre_pause_status: String = conn
+            .query_row(
+                "SELECT payload_json FROM task_events
+                  WHERE task_id = ?1
+                    AND event_type = 'task.paused'
+                  ORDER BY event_id DESC LIMIT 1",
+                params![task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?
+            .flatten()
+            .and_then(|pj| {
+                serde_json::from_str::<serde_json::Value>(&pj)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("prior_status")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string)
+                    })
+            })
+            .unwrap_or_else(|| "paused".to_string());
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        tx.execute(
+            "UPDATE tasks
+               SET status = 'pending',
+                   updated_at = ?2
+             WHERE task_id = ?1",
+            params![task_id, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let payload_json = serde_json::json!({
+            "pre_pause_status": pre_pause_status,
+            "new_status": "pending",
+            "author": author_subject_id,
+        })
+        .to_string();
+        let legacy = format!("paused→pending (was {pre_pause_status})");
+        insert_typed_event(
+            &tx,
+            task_id,
+            now,
+            "task.resumed",
+            &legacy,
+            None,
+            None,
+            Some(&payload_json),
+        )?;
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(pre_pause_status)
+    }
+
     /// Set or clear the operator-set investigation marker on
     /// a task (M62). When `marked` is true, stamps the marker
     /// with the current time + records the supplied reason and
@@ -2071,6 +2238,26 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.pause",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_pause(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.resume",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_resume(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
@@ -2870,6 +3057,13 @@ fn handle_recover(store: &TaskStore, _ctx: &InvocationCtx) -> HandlerOutcome {
 /// that's what `task.export` + on-disk grep are for.
 pub const MAX_OPERATOR_NOTE_LEN: usize = 2_000;
 
+/// Statuses from which an operator-initiated pause is
+/// allowed. Terminal statuses (`completed`/`failed`/`cancelled`)
+/// reject; `awaiting_input` has its own semantic (user-input)
+/// so the operator pause path leaves it alone; `paused` itself
+/// rejects to keep the toggle idempotent.
+pub const PAUSABLE_STATUSES: &[&str] = &["pending", "running", "retrying"];
+
 /// `task.note` — operator-authored chronicle annotation. Args:
 /// `task_id|note_text`. The note text may contain `|` (splitn(2)
 /// keeps the remainder intact). The author is taken from
@@ -2902,6 +3096,53 @@ fn handle_note(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.note: not found: {id}")),
         Err(CoordinatorError::Invalid(msg)) => invalid(msg),
         Err(e) => internal(format!("task.note: {e}")),
+    }
+}
+
+/// `task.pause` — operator-initiated pause (M65). Args:
+/// `task_id|<reason>`. Reason optional. Returns
+/// `prior_status=<status>` so the caller can render an
+/// honest transition message ("running → paused"). The
+/// runtime has no flow-pause primitive today; the chronicle
+/// records intent — see `set_paused` for the caveat.
+fn handle_pause(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.pause utf8: {e}")),
+    };
+    let mut parts = s.splitn(2, '|');
+    let task_id = parts.next().unwrap_or("");
+    let reason = parts.next().filter(|v| !v.is_empty());
+    if task_id.is_empty() {
+        return invalid("task.pause: task_id required".to_string());
+    }
+    let author = ctx.caller.subject_id.to_string();
+    match store.set_paused(task_id, reason, &author) {
+        Ok(prior) => HandlerOutcome::Ok(format!("prior_status={prior}\n").into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.pause: not found: {id}")),
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.pause: {e}")),
+    }
+}
+
+/// `task.resume` — operator-initiated resume (M65). Args:
+/// `task_id`. Refuses any status other than `paused`. Returns
+/// `pre_pause_status=<status>` (looked up from the most recent
+/// `task.paused` event's payload_json).
+fn handle_resume(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.resume utf8: {e}")),
+    };
+    if task_id.is_empty() {
+        return invalid("task.resume: task_id required".to_string());
+    }
+    let author = ctx.caller.subject_id.to_string();
+    match store.set_resumed(task_id, &author) {
+        Ok(pre) => HandlerOutcome::Ok(format!("pre_pause_status={pre}\n").into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.resume: not found: {id}")),
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.resume: {e}")),
     }
 }
 
@@ -5365,6 +5606,101 @@ mod tests {
             elapsed.as_secs() < 5,
             "incremental 5000-event walk took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn pause_from_running_transitions_to_paused_with_chronicle() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Walk the task into `running` via the update path.
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let prior = s
+            .set_paused(&tid, Some("debugging upstream"), "op")
+            .unwrap();
+        assert_eq!(prior, "running");
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "paused");
+        // Chronicle event has the structured envelope.
+        let ev = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "task.paused")
+            .expect("task.paused event");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["prior_status"], "running");
+        assert_eq!(pj["reason"], "debugging upstream");
+        assert_eq!(pj["author"], "op");
+    }
+
+    #[test]
+    fn pause_refuses_terminal_and_already_paused() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(
+            &tid,
+            Some("completed"),
+            Some("result"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let err = s.set_paused(&tid, None, "op").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+
+        let tid2 = mk(&s, "t2", "f", "{}", "o");
+        s.update(&tid2, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_paused(&tid2, None, "op").unwrap();
+        let err = s.set_paused(&tid2, None, "op").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn resume_restores_to_pending_with_pre_pause_status_in_event() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_paused(&tid, Some("ops triage"), "op").unwrap();
+        let pre = s.set_resumed(&tid, "op").unwrap();
+        assert_eq!(pre, "running");
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "pending");
+        let ev = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "task.resumed")
+            .expect("task.resumed event");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["pre_pause_status"], "running");
+        assert_eq!(pj["new_status"], "pending");
+    }
+
+    #[test]
+    fn resume_refuses_non_paused_status() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let err = s.set_resumed(&tid, "op").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn pause_oversize_reason_rejected() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let big = "x".repeat(MAX_OPERATOR_NOTE_LEN + 1);
+        let err = s.set_paused(&tid, Some(&big), "op").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
     }
 
     #[test]

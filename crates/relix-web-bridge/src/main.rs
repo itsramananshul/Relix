@@ -251,6 +251,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // {marked: bool, reason?: string}. Toggles persistent
         // state on the task row + emits a chronicle event.
         .route("/v1/tasks/:id/investigation", post(tasks::investigation))
+        // Operator pause / resume (M65). Pause transitions
+        // pending|running|retrying → paused with a
+        // task.paused chronicle event. Resume transitions
+        // paused → pending. HONEST: no flow-pause primitive
+        // exists yet — same caveat as cancel.
+        .route("/v1/tasks/:id/pause", post(tasks::pause))
+        .route("/v1/tasks/:id/resume", post(tasks::resume))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered
         // manifest cache (no extra mesh I/O).

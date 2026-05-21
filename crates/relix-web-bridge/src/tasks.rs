@@ -751,6 +751,181 @@ pub async fn note(
     }))
 }
 
+// ── M65: pause / resume ────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PauseReq {
+    /// Optional operator-supplied reason. Capped at
+    /// `NOTE_BRIDGE_MAX_LEN`. Surfaced in the
+    /// `task.paused` chronicle event.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PauseResp {
+    pub task_id: String,
+    pub prior_status: String,
+    pub new_status: String,
+    /// HONEST: the runtime has no flow-pause primitive today.
+    /// When prior_status was `running`/`retrying`, an in-flight
+    /// flow continues — the dashboard surfaces this caveat in
+    /// the confirm UI. Same shape as cancel's flow_still_running.
+    pub flow_still_running: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResumeResp {
+    pub task_id: String,
+    /// Status before the most recent pause, recovered from the
+    /// chronicle. `paused` when no prior `task.paused` event
+    /// can be found (defensive fallback).
+    pub pre_pause_status: String,
+    pub new_status: String,
+}
+
+/// `POST /v1/tasks/:id/pause` — operator-initiated pause.
+/// Forwards to the Coordinator's `task.pause`, records into
+/// the intervention audit ring.
+pub async fn pause(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<PauseReq>,
+) -> Result<Json<PauseResp>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        state
+            .intervention_audit
+            .record("anon", "pause", &id, "error", "no coordinator");
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let trimmed_reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(r) = trimmed_reason {
+        if r.len() > NOTE_BRIDGE_MAX_LEN {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiError {
+                    error: format!(
+                        "reason: too long (max {NOTE_BRIDGE_MAX_LEN} bytes, got {})",
+                        r.len()
+                    ),
+                }),
+            ));
+        }
+        if r.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "reason: must not contain control characters".into(),
+                }),
+            ));
+        }
+    }
+    let body = match rec.pause(&id, trimmed_reason).await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "pause",
+                &id,
+                "error",
+                format!("coord task.pause failed: {e}"),
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let prior_status = body
+        .lines()
+        .find_map(|l| l.strip_prefix("prior_status="))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let flow_still_running = matches!(prior_status.as_str(), "running" | "retrying");
+    let detail = format!(
+        "{prior_status}→paused{}{}",
+        trimmed_reason
+            .map(|r| format!(" · {r}"))
+            .unwrap_or_default(),
+        if flow_still_running {
+            " · flow still running"
+        } else {
+            ""
+        }
+    );
+    state
+        .intervention_audit
+        .record("anon", "pause", &id, "ok", detail);
+    Ok(Json(PauseResp {
+        task_id: id,
+        prior_status,
+        new_status: "paused".to_string(),
+        flow_still_running,
+    }))
+}
+
+/// `POST /v1/tasks/:id/resume` — operator-initiated resume.
+/// Forwards to the Coordinator's `task.resume`. Status must
+/// be `paused`; the new status is always `pending`.
+pub async fn resume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ResumeResp>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        state
+            .intervention_audit
+            .record("anon", "resume", &id, "error", "no coordinator");
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = match rec.resume(&id).await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "resume",
+                &id,
+                "error",
+                format!("coord task.resume failed: {e}"),
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let pre_pause_status = body
+        .lines()
+        .find_map(|l| l.strip_prefix("pre_pause_status="))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "paused".to_string());
+    state.intervention_audit.record(
+        "anon",
+        "resume",
+        &id,
+        "ok",
+        format!("paused→pending (was {pre_pause_status})"),
+    );
+    Ok(Json(ResumeResp {
+        task_id: id,
+        pre_pause_status,
+        new_status: "pending".to_string(),
+    }))
+}
+
 // ── M62: investigation marker ──────────────────────────────
 
 #[derive(Debug, Deserialize)]

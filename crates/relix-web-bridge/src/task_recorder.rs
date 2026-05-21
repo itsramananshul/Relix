@@ -278,6 +278,23 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.note utf8: {e}"))
     }
 
+    /// Operator-initiated pause (M65). Args: task_id + optional
+    /// reason. Returns the coordinator body verbatim
+    /// (`prior_status=<status>`). Same fail-soft handling as
+    /// other operator passthroughs.
+    pub async fn pause(&self, task_id: &str, reason: Option<&str>) -> Result<String, String> {
+        let arg = format!("{task_id}|{}", reason.unwrap_or(""));
+        let bytes = self.call("task.pause", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.pause utf8: {e}"))
+    }
+
+    /// Operator-initiated resume (M65). Returns the coordinator
+    /// body verbatim (`pre_pause_status=<status>`).
+    pub async fn resume(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.resume", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.resume utf8: {e}"))
+    }
+
     /// Toggle the operator-set investigation marker on a task
     /// (M62). `marked=true` stamps `investigation_marked_at`
     /// with the current time + records an optional short
