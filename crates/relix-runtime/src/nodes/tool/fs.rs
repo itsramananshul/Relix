@@ -285,6 +285,31 @@ pub fn descriptor_patch() -> CapabilityDescriptor {
     d
 }
 
+/// CW2: `tool.list_dir` — list direct children of a
+/// jail-relative directory. Returns one line per entry:
+/// `<kind>\t<name>\t<size_bytes>\t<modified_unix_secs>`
+/// where kind is `dir` / `file` / `symlink` / `other`.
+/// Caps at `FsJailConfig::max_search_results` entries
+/// (same cap as search_files; operators paginate via
+/// `<rel_path>|<offset>` if they need more).
+pub fn descriptor_list() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.list_dir");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["fs:read".into()];
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "List direct children of a directory under the jail root. \
+         Tab-delimited rows (kind\\tname\\tsize\\tmtime). Capped at the \
+         operator's max_search_results."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
 // ──────────────────────────── Registration ─────────────────────────────────
 
 pub fn register(bridge: &mut DispatchBridge, jail: Arc<FsJail>) {
@@ -325,6 +350,16 @@ pub fn register(bridge: &mut DispatchBridge, jail: Arc<FsJail>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let j = j.clone();
                 async move { handle_patch(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail.clone();
+        bridge.register(
+            "tool.list_dir",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_list_dir(&j, &ctx) }
             })),
         );
     }
@@ -654,6 +689,105 @@ fn invalid(cause: String) -> HandlerOutcome {
     })
 }
 
+/// CW2: `tool.list_dir` handler. Args: `<rel_path>` for the
+/// jail root → list directory entries. Optional `|<offset>`
+/// tail enables stable pagination (`0` = first page,
+/// `max_search_results` per page). Returns one tab-delim row
+/// per entry:
+///   `<kind>\t<name>\t<size_bytes>\t<modified_unix_secs>`
+/// where kind ∈ {dir, file, symlink, other}. Final row is
+/// `next_offset=<N>` so callers can drive pagination
+/// (empty string when no more results).
+fn handle_list_dir(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.list_dir arg utf8: {e}")),
+    };
+    // `<rel_path>` or `<rel_path>|<offset>`.
+    let (rel, offset): (&str, usize) = match s.rsplit_once('|') {
+        Some((p, n_str)) if n_str.trim().parse::<usize>().is_ok() => {
+            (p.trim(), n_str.trim().parse::<usize>().unwrap())
+        }
+        _ => (s.trim(), 0),
+    };
+    let canonical = match jail.resolve(rel, true) {
+        Ok(p) => p,
+        Err(e) => return e.into(),
+    };
+    let meta = match std::fs::metadata(&canonical) {
+        Ok(m) => m,
+        Err(e) => return invalid(format!("tool.list_dir metadata: {e}")),
+    };
+    if !meta.is_dir() {
+        return invalid(format!(
+            "tool.list_dir: '{}' is not a directory",
+            jail.display_rel(&canonical)
+        ));
+    }
+    let read_dir = match std::fs::read_dir(&canonical) {
+        Ok(it) => it,
+        Err(e) => return invalid(format!("tool.list_dir read_dir: {e}")),
+    };
+    // Collect + sort by name for deterministic pagination.
+    let mut entries: Vec<std::fs::DirEntry> = match read_dir.collect::<Result<Vec<_>, _>>() {
+        Ok(v) => v,
+        Err(e) => return invalid(format!("tool.list_dir iterate: {e}")),
+    };
+    entries.sort_by_key(|a| a.file_name());
+    let cap = jail.cfg.max_search_results;
+    let total = entries.len();
+    let end = offset.saturating_add(cap).min(total);
+    let mut buf = String::new();
+    use std::fmt::Write as _;
+    for entry in entries.iter().skip(offset).take(cap) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => {
+                // Skip the entry rather than failing the whole
+                // listing — operators get an honest count via
+                // `next_offset` advance.
+                continue;
+            }
+        };
+        let kind = if ft.is_dir() {
+            "dir"
+        } else if ft.is_file() {
+            "file"
+        } else if ft.is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+        let (size, mtime) = match entry.metadata() {
+            Ok(m) => {
+                let size = m.len();
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                (size, mtime)
+            }
+            Err(_) => (0u64, 0i64),
+        };
+        // Sanitize name — operators may have weird filenames,
+        // but tabs + newlines would break the line format.
+        let safe_name = name.replace(['\t', '\n'], " ");
+        let _ = writeln!(buf, "{kind}\t{safe_name}\t{size}\t{mtime}");
+    }
+    // Trailer for stable pagination. Empty value when the
+    // page completed the directory.
+    let next = if end < total {
+        end.to_string()
+    } else {
+        String::new()
+    };
+    let _ = writeln!(buf, "next_offset={next}");
+    HandlerOutcome::Ok(buf.into_bytes())
+}
+
 // ──────────────────────────── Tests ────────────────────────────────────────
 
 #[cfg(test)]
@@ -716,6 +850,96 @@ mod tests {
             j.resolve("subdir/../escape.txt", true),
             Err(JailError::Traversal(_))
         ));
+    }
+
+    #[test]
+    fn list_dir_returns_sorted_entries_with_next_offset() {
+        // CW2: list_dir lists direct children with stable
+        // alphabetical sort + tab-delimited rows + the
+        // next_offset trailer.
+        let (_td, j) = mk_jail();
+        // Seed: two files + one subdir.
+        handle_write(&j, &ctx(b"a.txt|create_new|first"));
+        handle_write(&j, &ctx(b"b.txt|create_new|second"));
+        std::fs::create_dir(j.canonical_root.join("subdir")).unwrap();
+        // List the jail root.
+        let r = handle_list_dir(&j, &ctx(b"."));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("list_dir failed: {}", e.cause),
+        };
+        // Three rows + trailer; sorted alphabetically.
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines.len() >= 4);
+        assert!(lines[0].starts_with("file\ta.txt\t"));
+        assert!(lines[1].starts_with("file\tb.txt\t"));
+        assert!(lines[2].starts_with("dir\tsubdir\t"));
+        assert_eq!(*lines.last().unwrap(), "next_offset=");
+    }
+
+    #[test]
+    fn list_dir_paginates_with_offset() {
+        let (_td, j) = mk_jail();
+        // Cap is 100 by default — force a smaller cap to
+        // exercise pagination without spamming the test.
+        let small_cfg = FsJailConfig {
+            root: j.canonical_root.clone(),
+            max_read_bytes: 1024,
+            max_write_bytes: 1024,
+            max_search_results: 2,
+        };
+        let small_jail = Arc::new(FsJail::new(small_cfg).unwrap());
+        for i in 0..5 {
+            handle_write(
+                &small_jail,
+                &ctx(format!("f{i}.txt|create_new|x").as_bytes()),
+            );
+        }
+        // First page: 2 results, next_offset=2.
+        let r = handle_list_dir(&small_jail, &ctx(b"."));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("list_dir page 1: {}", e.cause),
+        };
+        let trailer = body.lines().last().unwrap();
+        assert_eq!(trailer, "next_offset=2");
+        // Second page: 2 more, next_offset=4.
+        let r = handle_list_dir(&small_jail, &ctx(b".|2"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("list_dir page 2: {}", e.cause),
+        };
+        let trailer = body.lines().last().unwrap();
+        assert_eq!(trailer, "next_offset=4");
+        // Final page: 1 result, trailer empty.
+        let r = handle_list_dir(&small_jail, &ctx(b".|4"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("list_dir page 3: {}", e.cause),
+        };
+        let trailer = body.lines().last().unwrap();
+        assert_eq!(trailer, "next_offset=");
+    }
+
+    #[test]
+    fn list_dir_rejects_non_directory() {
+        let (_td, j) = mk_jail();
+        handle_write(&j, &ctx(b"a.txt|create_new|x"));
+        let r = handle_list_dir(&j, &ctx(b"a.txt"));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("not a directory")),
+            HandlerOutcome::Ok(_) => panic!("expected error on file target"),
+        }
+    }
+
+    #[test]
+    fn list_dir_respects_jail_traversal_protections() {
+        let (_td, j) = mk_jail();
+        let r = handle_list_dir(&j, &ctx(b"../."));
+        match r {
+            HandlerOutcome::Err(_) => {}
+            HandlerOutcome::Ok(_) => panic!("expected jail rejection"),
+        }
     }
 
     #[test]

@@ -678,6 +678,9 @@ fn register_node_type_handlers(
             manifest.add_capability(crate::nodes::tool::fs::descriptor_write());
             manifest.add_capability(crate::nodes::tool::fs::descriptor_search());
             manifest.add_capability(crate::nodes::tool::fs::descriptor_patch());
+            // CW2: tool.list_dir — read-side directory
+            // enumeration with stable pagination. Same jail.
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_list());
         }
         // B3: tool.pdf — only advertised when [tool.pdf] is configured.
         if tool_cfg.pdf.is_some() {
