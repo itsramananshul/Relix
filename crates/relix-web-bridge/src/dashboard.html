@@ -4198,6 +4198,13 @@ let lastEventId = 0;
 // Set by clicking a chain pill; cleared via the
 // "× clear filter" affordance.
 let attemptFilter = null;
+// W2-003c: chronicle category + text filters for the task
+// detail timeline. Category is one of '' (all), 'capability',
+// 'attempt', 'error', 'retry', 'pause', 'lifecycle'. Text
+// filter matches event_type + payload substring. Both reset
+// when the operator switches to a different task.
+let chronicleCategoryFilter = '';
+let chronicleTextFilter = '';
 // Cached lineage so we can re-render the timeline when
 // the attempt filter changes without re-fetching.
 let lastDetailLineage = null;
@@ -5009,7 +5016,13 @@ async function loadDetail(id) {
   // Selecting a different task clears any per-attempt
   // timeline filter so the operator doesn't see stale
   // selection state on the new task.
-  if (selectedTaskId !== id) attemptFilter = null;
+  if (selectedTaskId !== id) {
+    attemptFilter = null;
+    // W2-003c: reset chronicle filters on task change so
+    // stale selection state doesn't leak across tasks.
+    chronicleCategoryFilter = '';
+    chronicleTextFilter = '';
+  }
   selectedTaskId = id;
   lastEventId = 0;
   document.querySelectorAll('#task-list tbody tr').forEach(tr => {
@@ -5073,9 +5086,24 @@ function renderDetail(l) {
   // task-level transitions like task.created) are excluded
   // when a filter is active — operators wanting them switch
   // off the filter via × clear.
-  const events = (attemptFilter != null)
+  const attemptScoped = (attemptFilter != null)
     ? allEvents.filter(e => e.attempt_id === attemptFilter)
     : allEvents;
+  // W2-003c: apply category + text filters on top of the
+  // attempt scope. Operators can stack "attempt 3 only" +
+  // "errors only" + needle text without losing context.
+  const events = attemptScoped.filter(e => {
+    if (chronicleCategoryFilter
+        && chronicleCategory(e) !== chronicleCategoryFilter) {
+      return false;
+    }
+    if (chronicleTextFilter) {
+      const needle = chronicleTextFilter.toLowerCase();
+      const hay = ((e.event_type || '') + ' ' + (e.payload || '')).toLowerCase();
+      if (!hay.includes(needle)) return false;
+    }
+    return true;
+  });
   const timelineHtml = renderTimeline(events);
   const rawHtml = events.length
     ? events.map(e => {
@@ -5089,9 +5117,49 @@ function renderDetail(l) {
       + 'attempt ' + attemptFilter + ' only ×'
       + '</span>'
     : '';
-  const countLabel = attemptFilter != null
-    ? events.length + ' of ' + allEvents.length
-    : String(allEvents.length);
+  // W2-003c: count vs attempt-scope (denominator already
+  // honors attempt filter), and vs all events.
+  const scopedTotal = attemptScoped.length;
+  const allTotal = allEvents.length;
+  const anyChronFilter = chronicleCategoryFilter !== ''
+    || chronicleTextFilter !== '';
+  const countLabel = (attemptFilter != null || anyChronFilter)
+    ? events.length + ' of ' + (anyChronFilter ? scopedTotal : allTotal)
+    : String(allTotal);
+  // W2-003c: chronicle filter strip — chips for common
+  // categories + a freeform substring search. Renders
+  // above the timeline so it's discoverable without
+  // crowding the chronology heading.
+  const chronCats = [
+    { id: '',           label: 'all' },
+    { id: 'capability', label: 'capability' },
+    { id: 'attempt',    label: 'attempt' },
+    { id: 'error',      label: 'error' },
+    { id: 'retry',      label: 'retry' },
+    { id: 'pause',      label: 'pause' },
+    { id: 'lifecycle',  label: 'lifecycle' },
+  ];
+  const chipsHtml = chronCats.map(c => {
+    const active = c.id === chronicleCategoryFilter ? ' active' : '';
+    return '<button class="chip' + active
+      + '" data-chronicle-cat="' + escapeHtml(c.id) + '">'
+      + escapeHtml(c.label) + '</button>';
+  }).join('');
+  const clearTextChip = chronicleTextFilter
+    ? '<button class="chip" data-action="clear-chronicle-text" title="clear text filter">clear text ×</button>'
+    : '';
+  const filterStrip = allEvents.length
+    ? '<div class="row" style="gap: 6px; flex-wrap: wrap; align-items: center; margin: 8px 0 6px;">'
+      + chipsHtml
+      + '<input type="text" id="chronicle-text-filter"'
+      +   ' placeholder="filter: event_type / payload substring"'
+      +   ' autocomplete="off" spellcheck="false"'
+      +   ' value="' + escapeHtml(chronicleTextFilter) + '"'
+      +   ' style="flex: 1; min-width: 200px; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px;"'
+      +   ' oninput="onChronicleTextInput(this.value)" />'
+      + clearTextChip
+      + '</div>'
+    : '';
   const eventsBlock = allEvents.length
     ? `<div class="events">
         <h3 style="display: flex; align-items: center; justify-content: space-between;">
@@ -5101,6 +5169,7 @@ function renderDetail(l) {
             <span class="seg" data-view="raw">Raw</span>
           </span>
         </h3>
+        ${filterStrip}
         <div id="detail-view-timeline">${timelineHtml}</div>
         <div id="detail-view-raw" hidden>${rawHtml}</div>
       </div>`
@@ -5925,6 +5994,22 @@ document.addEventListener('click', (ev) => {
     if (lastDetailLineage) renderDetail(lastDetailLineage);
     return;
   }
+  // W2-003c: chronicle category chip toggle.
+  const chronCatChip = ev.target.closest('[data-chronicle-cat]');
+  if (chronCatChip) {
+    const next = chronCatChip.dataset.chronicleCat || '';
+    // Re-clicking the active chip clears the filter.
+    chronicleCategoryFilter = (chronicleCategoryFilter === next) ? '' : next;
+    if (lastDetailLineage) renderDetail(lastDetailLineage);
+    return;
+  }
+  // W2-003c: clear chronicle text filter affordance.
+  const clearChronText = ev.target.closest('[data-action="clear-chronicle-text"]');
+  if (clearChronText) {
+    chronicleTextFilter = '';
+    if (lastDetailLineage) renderDetail(lastDetailLineage);
+    return;
+  }
   const jumpEvent = ev.target.closest('[data-jump-to-event]');
   if (jumpEvent) {
     const eventId = parseInt(jumpEvent.dataset.jumpToEvent, 10);
@@ -6533,6 +6618,64 @@ function renderTimelinePayload(eventType, payload) {
   parts.push('peer=<span class="peer-link" data-peer-alias="' + escapeHtml(parsed.peer)
     + '" title="open peer detail">' + escapeHtml(parsed.peer) + '</span>');
   return parts.join(' ');
+}
+
+// W2-003c: bucket a chronicle event into a coarse
+// category for the filter chips. Operators don't think in
+// 30 distinct event_types — they think "show me the errors"
+// or "show me the capability invocations". Buckets:
+//   capability — capability.invoked
+//   attempt    — task.attempt_started / finished (success)
+//   error      — failures, thrash, orphan, task.failed,
+//                attempt_finished w/ failure_class
+//   retry      — task.retry_requested / exhausted
+//   pause      — pause / resume / freeze family
+//   lifecycle  — task.created / completed / cancelled,
+//                flow.* and anything else
+function chronicleCategory(e) {
+  const t = e.event_type || '';
+  if (t === 'capability.invoked') return 'capability';
+  if (t === 'task.attempt_started') return 'attempt';
+  if (t === 'task.attempt_finished') {
+    if (e.payload_json && e.payload_json.failure_class) return 'error';
+    return 'attempt';
+  }
+  if (t === 'task.failed'
+      || t === 'task.thrash_detected'
+      || t === 'task.attempt_orphan_closed') {
+    return 'error';
+  }
+  if (t === 'task.retry_requested' || t === 'task.retry_exhausted') {
+    return 'retry';
+  }
+  if (t.startsWith('task.pause_')
+      || t.startsWith('task.resume_')
+      || t.startsWith('task.freeze_')) {
+    return 'pause';
+  }
+  return 'lifecycle';
+}
+
+// W2-003c: text-filter input handler. Debounce via
+// requestAnimationFrame so a fast typist doesn't trigger
+// a re-render on every keystroke.
+let chronicleTextRaf = 0;
+function onChronicleTextInput(val) {
+  chronicleTextFilter = (val || '').trim().toLowerCase();
+  if (chronicleTextRaf) return;
+  chronicleTextRaf = requestAnimationFrame(() => {
+    chronicleTextRaf = 0;
+    if (lastDetailLineage) renderDetail(lastDetailLineage);
+    // Re-focus + place caret at end after re-render so the
+    // operator's typing flow isn't interrupted.
+    const $tf = document.getElementById('chronicle-text-filter');
+    if ($tf) {
+      $tf.focus();
+      const v = $tf.value;
+      $tf.value = '';
+      $tf.value = v;
+    }
+  });
 }
 
 function timelineMarkerClass(e) {
