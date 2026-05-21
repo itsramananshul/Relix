@@ -322,10 +322,11 @@ After writing this doc, the session shipped six commits on `main`:
 | c8d7fcb | PH-TERM-STREAM1 | runtime +11 | tool.terminal.tail — polling-cursor live stdout/stderr stream |
 | d5587d2 | PH-TERM-SPAWN | runtime +6 | tool.terminal.spawn — fire-and-forget background variant; validate_and_spawn / drive_to_completion refactor |
 | 57c575d | PH-TERM-SHELL | runtime +11 | tool.terminal.shell.{open,input,close} — persistent shell sessions; SpawnMode enum on validate_and_spawn |
+| cf2ea48 | PH-TERM-CONTROL | runtime +10 | tool.terminal.shell.control — named control char writer (etx/eot/tab/enter/...); D-010 PTY decision logged |
 
-Aggregate: ~2900+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
+Aggregate: ~3300+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
 controller_runtime.rs, docs/capabilities.md. Runtime tests
-507 → 586 (+79). Workspace 887 → 966 passing. fmt + clippy clean
+507 → 596 (+89). Workspace 887 → 976 passing. fmt + clippy clean
 on every commit.
 
 **Decisions logged but unanswered:** D-008 (browser backend),
@@ -334,6 +335,10 @@ operator picks; the surfaces themselves keep the honesty contract
 (NoneBackend / RuntimeNotConnected).
 
 **Wave 1 tracks still pending after this session:**
+- Full PTY backend for `tool.terminal.shell.*` — D-010 blocked.
+  Current shells use a pipe stdin, not a pseudo-terminal;
+  isatty()-checking and TTY-signal-translating programs are
+  not supported.
 - Terminal streaming-with-consumer-drain (the current tail is
   read-only; a > 1 MiB producer still stalls when the buffer
   fills).
@@ -345,7 +350,9 @@ operator picks; the surfaces themselves keep the honesty contract
 - Filesystem fuzzy_replace — explicitly out-of-scope per fs.rs
   module docstring (alpha decision).
 
-**Wave 1 tracks now complete:**
+**Wave 1 tracks now complete (within the no-PTY model):**
+- Terminal control characters — `tool.terminal.shell.control`
+  named control writer (PH-TERM-CONTROL).
 - Terminal persistent shell — `tool.terminal.shell.{open,input,
   close}` (PH-TERM-SHELL).
 - Terminal background execution — `tool.terminal.spawn`
