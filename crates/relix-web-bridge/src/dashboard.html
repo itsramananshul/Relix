@@ -1151,14 +1151,63 @@
       font-weight: 600;
       color: var(--text-muted);
     }
-    .exec-graph svg {
+    .exec-graph-viewport {
+      position: relative;
       width: 100%;
-      height: 100px;
-      display: block;
+      max-height: 220px;
+      overflow: auto;
       background: var(--bg);
       border-radius: 3px;
       border: 1px solid var(--border-soft);
     }
+    .exec-graph svg {
+      display: block;
+      height: 100px;
+      /* width set via JS for zoom; defaults to viewport width */
+      min-width: 100%;
+    }
+    .exec-graph-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 6px 0;
+      font-size: 11px;
+    }
+    .exec-graph-controls button {
+      padding: 2px 8px;
+      font-family: var(--font-mono);
+    }
+    .exec-graph-controls .zoom-level {
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      min-width: 48px;
+      text-align: center;
+    }
+    .exec-graph-controls .perf-hint {
+      margin-left: auto;
+      color: var(--text-dim);
+      font-style: italic;
+    }
+    /* HTML tooltip that follows pointer hover — more
+       structured than the SVG <title> element. */
+    .exec-graph-tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 6px 8px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: var(--text);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+      z-index: 20;
+      max-width: 320px;
+      white-space: pre-wrap;
+      display: none;
+    }
+    .exec-graph-tooltip.visible { display: block; }
+    .exec-graph-tooltip strong { color: var(--accent); }
     .exec-graph .graph-node { cursor: pointer; }
     .exec-graph .graph-node:hover .node-box { stroke: var(--accent); stroke-width: 2; }
     .exec-graph .graph-node.selected .node-box {
@@ -4030,6 +4079,16 @@ function fallbackCopy(text) {
    - data-action="clear-attempt-filter" → clear filter
 */
 document.addEventListener('click', (ev) => {
+  // M61: exec-graph zoom controls. The button data-graph-zoom
+  // attribute encodes the requested change. We hop up to the
+  // nearest .exec-graph-card so multiple graphs on the page
+  // (a future possibility) zoom independently.
+  const zoomBtn = ev.target.closest('button[data-graph-zoom]');
+  if (zoomBtn) {
+    const card = zoomBtn.closest('.exec-graph-card');
+    if (card) applyExecGraphZoom(card, zoomBtn.dataset.graphZoom);
+    return;
+  }
   const copyBtn = ev.target.closest('button[data-copy]');
   if (copyBtn) {
     copyToClipboard(copyBtn.dataset.copy);
@@ -4223,14 +4282,179 @@ function renderExecGraph(attempts, edges) {
     + '. The graph will branch when other edge types ship.'
     + criticalNote
     + '</div>';
+  // Stash the natural width on the SVG element via a data
+  // attribute so the JS zoom code knows the unscaled width
+  // (used as the basis for zoom-level math).
+  const perfHint = N >= 50
+    ? '<span class="perf-hint">'
+        + 'large chain · use zoom + scroll'
+      + '</span>'
+    : '';
+  // Per-attempt metadata for the HTML tooltip — JSON-encoded
+  // once and embedded on the wrapper so the JS handler can
+  // pick it up without re-querying the bridge. Sized fields
+  // only; no payload echo.
+  const tooltipDataset = sorted.map(a => ({
+    id: a.attempt_id,
+    num: a.attempt_num,
+    status: a.status,
+    started_at: a.started_at || null,
+    finished_at: a.finished_at || null,
+    failure_class: a.failure_class || null,
+    flow_id: a.flow_id || null,
+    trace_id: a.trace_id || null,
+  }));
   return '<div class="exec-graph-card">'
     + '<h4>Execution graph · ' + N + ' attempt' + (N === 1 ? '' : 's') + ' · ' + edges.length + ' edge' + (edges.length === 1 ? '' : 's') + '</h4>'
     + renderExecGraphTimingSummary(sorted)
-    + '<div class="exec-graph"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">'
+    + '<div class="exec-graph-controls">'
+    +   '<button data-graph-zoom="out" title="zoom out">−</button>'
+    +   '<button data-graph-zoom="reset" title="fit width">fit</button>'
+    +   '<button data-graph-zoom="in" title="zoom in">+</button>'
+    +   '<span class="zoom-level" data-graph-zoom-display>100%</span>'
+    +   perfHint
+    + '</div>'
+    + '<div class="exec-graph"><div class="exec-graph-viewport" '
+    +   'data-graph-natural-width="' + W + '" '
+    +   'data-graph-tooltips=\'' + escapeHtml(JSON.stringify(tooltipDataset)) + '\'>'
+    + '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">'
     + arrowMarker + edgeLines + nodes
-    + '</svg></div>'
+    + '</svg>'
+    + '<div class="exec-graph-tooltip" data-graph-tooltip></div>'
+    + '</div></div>'
     + note
     + '</div>';
+}
+
+/* M61: exec-graph zoom + hover-tooltip wiring.
+
+   Zoom is implemented by changing the SVG's width attribute
+   while leaving viewBox alone. The viewport div has
+   overflow:auto so the operator pans horizontally by
+   scrolling. preserveAspectRatio=xMidYMid keeps the nodes
+   sharp at any zoom — SVG vector scales without re-render.
+
+   Zoom levels: 0.5, 0.75, 1, 1.5, 2, 3, 5. Capped at both
+   ends so a misclick can't break the layout. 1.0 = fit
+   viewport width (the natural width stored in the
+   viewport's data attribute is multiplied by the zoom). */
+const EXEC_GRAPH_ZOOM_LEVELS = [0.5, 0.75, 1, 1.5, 2, 3, 5];
+function applyExecGraphZoom(card, action) {
+  const viewport = card.querySelector('.exec-graph-viewport');
+  const svg = viewport.querySelector('svg');
+  const display = card.querySelector('[data-graph-zoom-display]');
+  if (!viewport || !svg) return;
+  const cur = parseFloat(viewport.dataset.graphZoom || '1') || 1;
+  let next = cur;
+  if (action === 'reset') {
+    next = 1;
+  } else {
+    const idx = EXEC_GRAPH_ZOOM_LEVELS.indexOf(cur);
+    if (action === 'in') {
+      const target = idx >= 0 ? idx + 1 : EXEC_GRAPH_ZOOM_LEVELS.findIndex(z => z > cur);
+      if (target < EXEC_GRAPH_ZOOM_LEVELS.length && target >= 0) {
+        next = EXEC_GRAPH_ZOOM_LEVELS[target];
+      }
+    } else if (action === 'out') {
+      const target = idx >= 0 ? idx - 1 : EXEC_GRAPH_ZOOM_LEVELS.findLastIndex
+        ? EXEC_GRAPH_ZOOM_LEVELS.findLastIndex(z => z < cur)
+        : -1;
+      if (target >= 0) next = EXEC_GRAPH_ZOOM_LEVELS[target];
+    }
+  }
+  viewport.dataset.graphZoom = String(next);
+  if (next === 1) {
+    svg.style.width = '100%';
+  } else {
+    // Pixel-based width so the viewport's overflow:auto kicks
+    // in. The natural width was stamped on the viewport at
+    // render time.
+    const natural = parseInt(viewport.dataset.graphNaturalWidth || '560', 10);
+    svg.style.width = Math.round(natural * next) + 'px';
+  }
+  if (display) display.textContent = Math.round(next * 100) + '%';
+}
+
+/* Node hover surfaces a richer tooltip than the SVG <title>
+   element — multi-line, formatted timestamps, monospace font.
+   The data is JSON-encoded onto the viewport at render time so
+   we don't fetch anything on hover.
+
+   Bound once per page via document-level listeners; the
+   handler ignores hovers outside an exec-graph node group. */
+document.addEventListener('pointermove', (ev) => {
+  const nodeGroup = ev.target.closest
+    ? ev.target.closest('.exec-graph .graph-node')
+    : null;
+  if (!nodeGroup) {
+    hideExecGraphTooltip();
+    return;
+  }
+  const viewport = nodeGroup.closest('.exec-graph-viewport');
+  if (!viewport) return;
+  const tooltip = viewport.querySelector('[data-graph-tooltip]');
+  if (!tooltip) return;
+  const attemptId = parseInt(nodeGroup.dataset.attemptFilter, 10);
+  // Parse the JSON dataset once and cache on the viewport
+  // element so repeated hovers don't re-parse. The dataset
+  // is small (one entry per attempt) so re-parsing per
+  // attempt change is fine.
+  if (!viewport._graphTooltipsParsed) {
+    try {
+      viewport._graphTooltipsParsed = JSON.parse(viewport.dataset.graphTooltips || '[]');
+    } catch (_) {
+      viewport._graphTooltipsParsed = [];
+    }
+  }
+  const entry = viewport._graphTooltipsParsed.find(e => e.id === attemptId);
+  if (!entry) return;
+  tooltip.innerHTML = renderExecGraphTooltipBody(entry);
+  positionExecGraphTooltip(tooltip, viewport, ev);
+  tooltip.classList.add('visible');
+});
+document.addEventListener('pointerleave', () => hideExecGraphTooltip(), true);
+
+function hideExecGraphTooltip() {
+  document.querySelectorAll('.exec-graph-tooltip.visible')
+    .forEach(t => t.classList.remove('visible'));
+}
+
+function positionExecGraphTooltip(tooltip, viewport, ev) {
+  const vbox = viewport.getBoundingClientRect();
+  // Offset by viewport scroll so the tooltip sticks with
+  // the node even when the viewport is scrolled horizontally.
+  const x = ev.clientX - vbox.left + viewport.scrollLeft + 10;
+  const y = ev.clientY - vbox.top + viewport.scrollTop + 10;
+  tooltip.style.left = x + 'px';
+  tooltip.style.top = y + 'px';
+}
+
+function renderExecGraphTooltipBody(e) {
+  const dur = (typeof e.started_at === 'number'
+    && typeof e.finished_at === 'number')
+    ? fmtDuration(Math.max(0, e.finished_at - e.started_at))
+    : '(open)';
+  const lines = [
+    '<strong>attempt ' + escapeHtml(String(e.num)) + '</strong> · '
+      + escapeHtml(e.status),
+    'duration ' + escapeHtml(dur),
+  ];
+  if (e.started_at) {
+    lines.push('started ' + new Date(e.started_at * 1000).toLocaleTimeString());
+  }
+  if (e.finished_at) {
+    lines.push('finished ' + new Date(e.finished_at * 1000).toLocaleTimeString());
+  }
+  if (e.failure_class) {
+    lines.push('failure_class ' + escapeHtml(e.failure_class));
+  }
+  if (e.flow_id) {
+    lines.push('flow_id ' + escapeHtml(e.flow_id));
+  }
+  if (e.trace_id) {
+    lines.push('trace_id ' + escapeHtml(e.trace_id));
+  }
+  return lines.join('\n');
 }
 
 /* Walk the sequential attempt chain + inter-attempt gaps and

@@ -585,6 +585,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_exec_graph_zoom_and_tooltip_present() {
+        // M61 (Track A): graph gets zoom controls (in/out/fit)
+        // + a rich hover tooltip. SVG viewBox stays untouched
+        // so vector scaling stays crisp at any zoom; the
+        // viewport div's overflow:auto handles pan.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "data-graph-zoom=\"out\"",
+            "data-graph-zoom=\"in\"",
+            "data-graph-zoom=\"reset\"",
+            "data-graph-zoom-display",
+            "function applyExecGraphZoom",
+            "EXEC_GRAPH_ZOOM_LEVELS",
+            "renderExecGraphTooltipBody",
+            "exec-graph-viewport",
+            "exec-graph-tooltip",
+        ] {
+            assert!(
+                body.contains(needle),
+                "M61 landmark `{needle}` missing from dashboard"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn page_exec_graph_critical_segment_present() {
         // M59 (Track A): exec graph computes + highlights the
         // single largest wall-clock contributor (attempt or
