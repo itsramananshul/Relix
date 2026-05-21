@@ -92,6 +92,7 @@ mod dashboard;
 mod flow;
 mod intervention_audit;
 mod lifecycle;
+mod mcp;
 mod metrics;
 mod openai;
 mod secrets;
@@ -379,6 +380,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // now under the first-match-in-cache policy. Pure
         // projection of the manifest cache.
         .route("/v1/routing", get(topology::routing_snapshot))
+        // PH-BRIDGE-MCP: HTTP proxy for the MCP registry on a
+        // tool peer. Pure translation — dispatches via the
+        // existing MeshClient and parses the tab-delim response
+        // into JSON for dashboard / curl consumption.
+        .route("/v1/mcp/servers", get(mcp::servers))
+        .route("/v1/mcp/tools", get(mcp::tools))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
