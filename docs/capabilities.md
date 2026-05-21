@@ -85,7 +85,8 @@ before the backend (visibility + stable contract + honesty).
 |---|---|---|
 | `tool.terminal.run` (CW1) | live | Sandboxed shell; operator allowlist required |
 | `tool.terminal.sessions` (PH-TERM-SESSIONS) | live | Live in-flight run registry snapshot |
-| `tool.terminal.audit_recent` (PH-TERM-AUDIT) | live | Bounded ring of completed runs (success + timed-out) |
+| `tool.terminal.audit_recent` (PH-TERM-AUDIT) | live | Bounded ring of completed runs (success + timed-out + cancelled) |
+| `tool.terminal.cancel` (PH-TERM-CANCEL) | live | Cooperatively terminate a live `tool.terminal.run` session by id |
 
 ### Browser (CW4 honest scaffold)
 

@@ -36,12 +36,20 @@
 //!    sees an empty env unless `inherit_env: true` in
 //!    config. Operators must opt in deliberately.
 //!
-//! ## Out of scope (alpha)
+//! ## Cancellation
 //!
-//! - No process interruption mid-run (cooperative cancellation
-//!   would require flow-runner integration; today the only
-//!   stop is the hard timeout).
-//! - No streaming stdout/stderr (whole-buffer at completion).
+//! As of PH-TERM-CANCEL the run path races `child.wait()` against
+//! an `Arc<tokio::sync::Notify>` held on the session record. The
+//! companion capability `tool.terminal.cancel|<session_id>`
+//! triggers the notify; the run task then kills the child and
+//! returns a response with `cancelled: true`. Hard timeout
+//! remains the safety floor — cancel is cooperative on top of it,
+//! not a replacement.
+//!
+//! ## Still out of scope (alpha)
+//!
+//! - No streaming stdout/stderr to a live consumer (output is
+//!   drained into bounded buffers and surfaced at completion).
 //! - No background / detached execution.
 //! - No persistent shell sessions.
 //! - No interactive stdin.
@@ -49,8 +57,8 @@
 //! These are explicit future-work items, not silent omissions.
 //! The chronicle entry the bridge would write against a calling
 //! task records the exit code + duration, which is enough for
-//! post-hoc debugging; streaming + interruption land at Gate 2
-//! alongside the resumable VM.
+//! post-hoc debugging; streaming lands alongside the live
+//! firehose consumer that needs it.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -98,11 +106,12 @@ fn default_timeout_secs() -> u64 {
 /// truncated + flagged in the response.
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MiB
 
-/// PH-TERM-SESSIONS: one live `tool.terminal.run` invocation
-/// in flight. Inserted on spawn, removed on completion (success,
-/// timeout, or spawn failure). Pure observability — does NOT
-/// give an outside caller a kill handle yet; that lands in a
-/// follow-up milestone alongside `tool.terminal.cancel`.
+/// PH-TERM-SESSIONS / PH-TERM-CANCEL: one live `tool.terminal.run`
+/// invocation in flight. Inserted on spawn, removed on completion
+/// (success, timeout, cancel, or spawn failure). The run task
+/// awaits `cancel_notify.notified()` in a select with wait /
+/// timeout; the `tool.terminal.cancel` capability triggers the
+/// notify to terminate the child cooperatively.
 #[derive(Clone, Debug)]
 pub struct TerminalSessionRecord {
     pub session_id: String,
@@ -120,13 +129,18 @@ pub struct TerminalSessionRecord {
     /// Effective per-call timeout (after clamping against
     /// `max_timeout_secs`).
     pub timeout_secs: u64,
+    /// PH-TERM-CANCEL: trigger handle for `tool.terminal.cancel`.
+    /// `notify_one()` from the cancel handler stores a permit
+    /// even if the run task hasn't yet started awaiting, so the
+    /// register-then-await race is closed.
+    pub cancel_notify: Arc<tokio::sync::Notify>,
 }
 
 /// PH-TERM-AUDIT: one completed `tool.terminal.run` invocation
 /// observation. Pushed onto the bounded audit ring after every
 /// terminated run regardless of outcome (normal exit, timeout,
-/// or wait-error). Pure in-memory observability — does NOT
-/// replace the dispatch-level audit log, does NOT duplicate
+/// cancel, or wait-error). Pure in-memory observability — does
+/// NOT replace the dispatch-level audit log, does NOT duplicate
 /// chronicle.
 #[derive(Clone, Debug)]
 pub struct TerminalAuditEntry {
@@ -135,12 +149,17 @@ pub struct TerminalAuditEntry {
     pub command: String,
     pub args: Vec<String>,
     /// Exit code as reported by the OS. `None` when the child
-    /// was killed (timeout) or wait failed.
+    /// was killed (timeout / cancel) or wait failed.
     pub exit_code: Option<i32>,
     /// Wall-clock elapsed from spawn to termination, in
     /// milliseconds.
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// PH-TERM-CANCEL: true when the run was terminated by
+    /// `tool.terminal.cancel` rather than by natural exit or
+    /// timeout. `timed_out` and `cancelled` are mutually
+    /// exclusive — at most one is set on any given entry.
+    pub cancelled: bool,
     /// Hex `subject_id` of the caller.
     pub caller_subject_id: String,
 }
@@ -272,8 +291,8 @@ struct RunRequest {
 #[derive(Debug, Serialize)]
 struct RunResponse {
     /// Exit status as reported by the OS. `None` when the
-    /// process was killed (timeout / signal — `timed_out`
-    /// disambiguates).
+    /// process was killed (timeout / cancel — `timed_out` /
+    /// `cancelled` disambiguate).
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
@@ -281,6 +300,10 @@ struct RunResponse {
     /// True when the timeout fired and we killed the child
     /// before it exited naturally.
     timed_out: bool,
+    /// PH-TERM-CANCEL: true when `tool.terminal.cancel` fired
+    /// for this session's id and we killed the child. Mutually
+    /// exclusive with `timed_out`.
+    cancelled: bool,
     /// True when stdout exceeded `MAX_OUTPUT_BYTES` and was
     /// truncated.
     truncated_stdout: bool,
@@ -316,7 +339,7 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
         );
     }
     {
-        let b = backend;
+        let b = backend.clone();
         bridge.register(
             "tool.terminal.audit_recent",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -325,6 +348,44 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
             })),
         );
     }
+    {
+        let b = backend;
+        bridge.register(
+            "tool.terminal.cancel",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_cancel(b, &ctx) }
+            })),
+        );
+    }
+}
+
+/// PH-TERM-CANCEL: `tool.terminal.cancel` capability —
+/// cooperatively terminates a live `tool.terminal.run` session
+/// by triggering its cancel notify. The run task observes the
+/// notify, kills the child, and returns a `cancelled: true`
+/// response. Idempotent: calling cancel on an already-completed
+/// session returns INVALID_ARGS (session not present in the
+/// registry); calling cancel twice in a row on the same live
+/// session returns ok both times (the second call notifies a
+/// notify whose waiter already left, which is a harmless no-op).
+pub fn descriptor_cancel() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.cancel");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["shell:control".into()];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Signal a running tool.terminal.run session to cancel. Arg is the \
+         session id from tool.terminal.sessions. Returns `ok session=<id>` \
+         on hit, INVALID_ARGS when the id is not present in the live \
+         registry."
+            .into(),
+    );
+    d.categories = vec!["mutate".into(), "terminal".into(), "control".into()];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
 }
 
 /// PH-TERM-AUDIT: `tool.terminal.audit_recent` capability —
@@ -456,7 +517,7 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
     // against runaway processes if the runtime panics mid-await.
     command.kill_on_drop(true);
 
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             return HandlerOutcome::Err(ErrorEnvelope {
@@ -467,11 +528,21 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
             });
         }
     };
-    // PH-TERM-SESSIONS: register the live session BEFORE awaiting
-    // wait_with_output (which consumes the Child). The session
-    // record is removed unconditionally on completion.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .expect("tool.terminal.run: stdout pipe present (was piped at spawn)");
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .expect("tool.terminal.run: stderr pipe present (was piped at spawn)");
+
+    // PH-TERM-SESSIONS / PH-TERM-CANCEL: register the live
+    // session BEFORE wiring up the race so a cancel arriving
+    // anytime after spawn finds its target.
     let session_id = new_session_id();
     let pid = child.id();
+    let cancel_notify = Arc::new(tokio::sync::Notify::new());
     {
         let mut g = backend
             .sessions
@@ -487,14 +558,51 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
                 started_at: unix_secs(),
                 caller_subject_id: ctx.caller.subject_id.to_string(),
                 timeout_secs,
+                cancel_notify: cancel_notify.clone(),
             },
         );
     }
-    let wait_fut = child.wait_with_output();
-    let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await;
+
+    // Drain stdout/stderr concurrently with the wait so the OS
+    // pipe buffer never fills (which would block the child).
+    let stdout_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let stdout_drain = tokio::spawn(drain_pipe_into(
+        stdout_pipe,
+        stdout_buf.clone(),
+        MAX_OUTPUT_BYTES,
+    ));
+    let stderr_drain = tokio::spawn(drain_pipe_into(
+        stderr_pipe,
+        stderr_buf.clone(),
+        MAX_OUTPUT_BYTES,
+    ));
+
+    // Race wait against cancel + timeout. `biased` keeps the
+    // ordering deterministic: a child that already exited wins
+    // over a cancel that arrives at the same tick.
+    let cancel_fut = cancel_notify.notified();
+    tokio::pin!(cancel_fut);
+    let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout_fut);
+    let outcome = tokio::select! {
+        biased;
+        res = child.wait() => Termination::Exited(res),
+        _ = &mut cancel_fut => {
+            let _ = child.kill().await;
+            Termination::Cancelled
+        }
+        _ = &mut timeout_fut => {
+            let _ = child.kill().await;
+            Termination::TimedOut
+        }
+    };
     let duration_ms = started.elapsed().as_millis() as u64;
-    // Drop the session record now that the child has exited (or
-    // timed out and been killed via kill_on_drop).
+    // Drainers see EOF once the pipes close (child exit / kill);
+    // join them so we have the final byte buffers in hand.
+    let _ = stdout_drain.await;
+    let _ = stderr_drain.await;
+    // Drop the session record now that the child has terminated.
     {
         let mut g = backend
             .sessions
@@ -502,89 +610,79 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
             .expect("tool.terminal sessions poisoned");
         g.remove(&session_id);
     }
+    let stdout_bytes = std::mem::take(&mut *stdout_buf.lock().expect("stdout buf poisoned"));
+    let stderr_bytes = std::mem::take(&mut *stderr_buf.lock().expect("stderr buf poisoned"));
+    let (stdout, truncated_stdout) = truncate_output(stdout_bytes);
+    let (stderr, truncated_stderr) = truncate_output(stderr_bytes);
 
-    match outcome {
-        Ok(Ok(out)) => {
-            let (stdout, truncated_stdout) = truncate_output(out.stdout);
-            let (stderr, truncated_stderr) = truncate_output(out.stderr);
-            let resp = RunResponse {
-                exit_code: out.status.code(),
-                stdout,
-                stderr,
-                duration_ms,
-                timed_out: false,
-                truncated_stdout,
-                truncated_stderr,
-                command: req.command,
-                timeout_secs,
-            };
-            let body = serde_json::to_vec(&resp).unwrap_or_default();
-            tracing::info!(
-                caller = %ctx.caller.subject_id,
-                command = %resp.command,
-                exit_code = ?resp.exit_code,
-                duration_ms = resp.duration_ms,
-                timeout_secs = resp.timeout_secs,
-                truncated_stdout = resp.truncated_stdout,
-                truncated_stderr = resp.truncated_stderr,
-                "tool.terminal.run completed"
-            );
-            // PH-TERM-AUDIT: record the completed run on the
-            // ring. Pure observability; happens regardless of
-            // exit code (an exit-1 is still a completed run).
-            backend.audit.push(TerminalAuditEntry {
-                ts_secs: unix_secs(),
-                command: resp.command.clone(),
-                args: req.args.clone(),
-                exit_code: resp.exit_code,
-                duration_ms: resp.duration_ms,
-                timed_out: false,
-                caller_subject_id: ctx.caller.subject_id.to_string(),
+    let (exit_code, timed_out, cancelled) = match outcome {
+        Termination::Exited(Ok(status)) => (status.code(), false, false),
+        Termination::Exited(Err(e)) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::RESPONDER_INTERNAL,
+                cause: format!("tool.terminal.run: wait failed: {e}"),
+                retry_hint: 2,
+                retry_after: None,
             });
-            HandlerOutcome::Ok(body)
         }
-        Ok(Err(e)) => HandlerOutcome::Err(ErrorEnvelope {
-            kind: error_kinds::RESPONDER_INTERNAL,
-            cause: format!("tool.terminal.run: wait failed: {e}"),
-            retry_hint: 2,
-            retry_after: None,
-        }),
-        Err(_elapsed) => {
-            // Timed out — child was killed by kill_on_drop
-            // when wait_with_output's owned Child was dropped.
-            // We don't have output in this path; surface what
-            // we know honestly.
-            tracing::warn!(
-                caller = %ctx.caller.subject_id,
-                command = %req.command,
-                timeout_secs,
-                duration_ms,
-                "tool.terminal.run timed out — child killed"
-            );
-            let resp = RunResponse {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                duration_ms,
-                timed_out: true,
-                truncated_stdout: false,
-                truncated_stderr: false,
-                command: req.command,
-                timeout_secs,
-            };
-            // PH-TERM-AUDIT: record the timed-out run too.
-            backend.audit.push(TerminalAuditEntry {
-                ts_secs: unix_secs(),
-                command: resp.command.clone(),
-                args: req.args.clone(),
-                exit_code: None,
-                duration_ms: resp.duration_ms,
-                timed_out: true,
-                caller_subject_id: ctx.caller.subject_id.to_string(),
-            });
-            HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
-        }
+        Termination::TimedOut => (None, true, false),
+        Termination::Cancelled => (None, false, true),
+    };
+
+    let resp = RunResponse {
+        exit_code,
+        stdout,
+        stderr,
+        duration_ms,
+        timed_out,
+        cancelled,
+        truncated_stdout,
+        truncated_stderr,
+        command: req.command.clone(),
+        timeout_secs,
+    };
+    if timed_out {
+        tracing::warn!(
+            caller = %ctx.caller.subject_id,
+            command = %resp.command,
+            timeout_secs,
+            duration_ms,
+            "tool.terminal.run timed out — child killed"
+        );
+    } else if cancelled {
+        tracing::warn!(
+            caller = %ctx.caller.subject_id,
+            command = %resp.command,
+            duration_ms,
+            session_id = %session_id,
+            "tool.terminal.run cancelled — child killed"
+        );
+    } else {
+        tracing::info!(
+            caller = %ctx.caller.subject_id,
+            command = %resp.command,
+            exit_code = ?resp.exit_code,
+            duration_ms = resp.duration_ms,
+            timeout_secs = resp.timeout_secs,
+            truncated_stdout = resp.truncated_stdout,
+            truncated_stderr = resp.truncated_stderr,
+            "tool.terminal.run completed"
+        );
     }
+    // PH-TERM-AUDIT: record the terminated run on the ring. One
+    // entry per run regardless of outcome; the response fields
+    // disambiguate normal exit / timeout / cancel.
+    backend.audit.push(TerminalAuditEntry {
+        ts_secs: unix_secs(),
+        command: resp.command.clone(),
+        args: req.args.clone(),
+        exit_code: resp.exit_code,
+        duration_ms: resp.duration_ms,
+        timed_out: resp.timed_out,
+        cancelled: resp.cancelled,
+        caller_subject_id: ctx.caller.subject_id.to_string(),
+    });
+    HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
 }
 
 /// PH-TERM-SESSIONS: handle `tool.terminal.sessions`. Returns
@@ -620,7 +718,7 @@ fn handle_sessions(backend: Arc<TerminalBackend>, _ctx: &InvocationCtx) -> Handl
 /// an optional decimal `<max>` (default 256, capped at ring
 /// capacity). Returns one row per entry, newest first,
 /// tab-delimited:
-/// `ts_secs\tcommand\texit_code\tduration_ms\ttimed_out\tcaller_subject_id`.
+/// `ts_secs\tcommand\texit_code\tduration_ms\ttimed_out\tcancelled\tcaller_subject_id`.
 /// Final row is `count=<N>`.
 fn handle_audit_recent(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
     use std::fmt::Write as _;
@@ -659,7 +757,7 @@ fn handle_audit_recent(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> Ha
         let safe_cmd = e.command.replace(['\t', '\n'], " ");
         let _ = writeln!(
             buf,
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             e.ts_secs,
             safe_cmd,
             e.exit_code
@@ -667,11 +765,104 @@ fn handle_audit_recent(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> Ha
                 .unwrap_or_else(|| "?".into()),
             e.duration_ms,
             e.timed_out,
+            e.cancelled,
             e.caller_subject_id,
         );
     }
     let _ = writeln!(buf, "count={count}");
     HandlerOutcome::Ok(buf.into_bytes())
+}
+
+/// PH-TERM-CANCEL: terminal-run termination cause.
+enum Termination {
+    /// Child exited (could be Ok status or wait IO error).
+    Exited(std::io::Result<std::process::ExitStatus>),
+    /// Hard timeout fired before the child exited; the run task
+    /// killed the child.
+    TimedOut,
+    /// `tool.terminal.cancel` fired for this session; the run
+    /// task killed the child.
+    Cancelled,
+}
+
+/// PH-TERM-CANCEL: drain a piped stdio stream into a bounded
+/// buffer. Reads until EOF (child closes the pipe), or until
+/// the buffer hits `cap` bytes. Errors during read are treated
+/// as EOF — a partial buffer is honest output for a kill.
+async fn drain_pipe_into<R>(mut pipe: R, buf: Arc<Mutex<Vec<u8>>>, cap: usize)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let mut tmp = [0u8; 8192];
+    loop {
+        match pipe.read(&mut tmp).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let mut g = buf.lock().expect("drain buf poisoned");
+                if g.len() >= cap {
+                    return;
+                }
+                let space = cap - g.len();
+                let take = n.min(space);
+                g.extend_from_slice(&tmp[..take]);
+                if g.len() >= cap {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// PH-TERM-CANCEL: handle `tool.terminal.cancel`. Arg is the
+/// session id from `tool.terminal.sessions`. Looks the session
+/// up in the live registry and triggers its cancel notify.
+/// Returns `ok session=<id>\n` on hit, INVALID_ARGS otherwise.
+fn handle_cancel(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.cancel arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if s.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "tool.terminal.cancel: session_id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let notify = {
+        let g = backend
+            .sessions
+            .lock()
+            .expect("tool.terminal sessions poisoned");
+        g.get(s).map(|r| r.cancel_notify.clone())
+    };
+    match notify {
+        Some(n) => {
+            // notify_one() stores a permit even if the awaiter
+            // hasn't started yet, so a cancel that arrives
+            // moments after spawn (between register and select!)
+            // is not lost.
+            n.notify_one();
+            HandlerOutcome::Ok(format!("ok session={s}\n").into_bytes())
+        }
+        None => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!(
+                "tool.terminal.cancel: session not found (id='{s}'); it may have already completed"
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+    }
 }
 
 /// PH-TERM-SESSIONS: 16 hex chars of randomness — matches the
@@ -812,22 +1003,25 @@ mod tests {
         assert_eq!(body.trim(), "count=0");
     }
 
+    fn mk_session_record(id: &str, started_at: i64, command: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            session_id: id.into(),
+            pid: Some(42),
+            command: command.into(),
+            args: vec![],
+            started_at,
+            caller_subject_id: "deadbeef".into(),
+            timeout_secs: 30,
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
     #[test]
     fn snapshot_reflects_manual_insert_and_remove() {
         let b = TerminalBackend::new(cfg(&["echo"])).unwrap();
         // Manually insert to exercise the snapshot path
-        // without spawning a real process (the spawn path is
-        // covered by handle_run's existing behavior + the
-        // controller integration).
-        let rec = TerminalSessionRecord {
-            session_id: "abc123".into(),
-            pid: Some(42),
-            command: "echo".into(),
-            args: vec!["hi".into()],
-            started_at: 1_700_000_000,
-            caller_subject_id: "deadbeef".into(),
-            timeout_secs: 30,
-        };
+        // without spawning a real process.
+        let rec = mk_session_record("abc123", 1_700_000_000, "echo");
         b.sessions.lock().unwrap().insert("abc123".into(), rec);
         let snap = b.snapshot_sessions();
         assert_eq!(snap.len(), 1);
@@ -845,30 +1039,8 @@ mod tests {
         // ordering assertion is meaningful.
         {
             let mut g = b.sessions.lock().unwrap();
-            g.insert(
-                "old".into(),
-                TerminalSessionRecord {
-                    session_id: "old".into(),
-                    pid: Some(10),
-                    command: "echo".into(),
-                    args: vec![],
-                    started_at: 100,
-                    caller_subject_id: "aa".into(),
-                    timeout_secs: 30,
-                },
-            );
-            g.insert(
-                "new".into(),
-                TerminalSessionRecord {
-                    session_id: "new".into(),
-                    pid: Some(11),
-                    command: "ls".into(),
-                    args: vec![],
-                    started_at: 200,
-                    caller_subject_id: "bb".into(),
-                    timeout_secs: 30,
-                },
-            );
+            g.insert("old".into(), mk_session_record("old", 100, "echo"));
+            g.insert("new".into(), mk_session_record("new", 200, "ls"));
         }
         let ctx = test_ctx();
         let r = handle_sessions(b, &ctx);
@@ -937,6 +1109,7 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: 1,
                 timed_out: false,
+                cancelled: false,
                 caller_subject_id: "x".into(),
             });
         }
@@ -954,6 +1127,7 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: 1,
                 timed_out: false,
+                cancelled: false,
                 caller_subject_id: "x".into(),
             });
         }
@@ -985,6 +1159,7 @@ mod tests {
             exit_code: Some(0),
             duration_ms: 5,
             timed_out: false,
+            cancelled: false,
             caller_subject_id: "aa".into(),
         });
         b.audit.push(TerminalAuditEntry {
@@ -994,6 +1169,7 @@ mod tests {
             exit_code: None,
             duration_ms: 30000,
             timed_out: true,
+            cancelled: false,
             caller_subject_id: "bb".into(),
         });
         let ctx = test_ctx();
@@ -1004,9 +1180,10 @@ mod tests {
         };
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 3);
-        // Newest first — ts 200 row before ts 100 row.
-        assert!(lines[0].starts_with("200\tls\t?\t30000\ttrue\tbb"));
-        assert!(lines[1].starts_with("100\techo\t0\t5\tfalse\taa"));
+        // Newest first — ts 200 row before ts 100 row. Format:
+        // ts\tcommand\texit_code\tduration_ms\ttimed_out\tcancelled\tcaller.
+        assert!(lines[0].starts_with("200\tls\t?\t30000\ttrue\tfalse\tbb"));
+        assert!(lines[1].starts_with("100\techo\t0\t5\tfalse\tfalse\taa"));
         assert_eq!(lines[2], "count=2");
     }
 
@@ -1021,6 +1198,7 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: 1,
                 timed_out: false,
+                cancelled: false,
                 caller_subject_id: "x".into(),
             });
         }
@@ -1044,5 +1222,140 @@ mod tests {
             HandlerOutcome::Err(e) => assert!(e.cause.contains("positive integer")),
             _ => panic!("expected Err"),
         }
+    }
+
+    // ── PH-TERM-CANCEL: tool.terminal.cancel ───────────────────────
+
+    #[test]
+    fn cancel_descriptor_shape() {
+        let d = descriptor_cancel();
+        assert_eq!(d.method_name, "tool.terminal.cancel");
+        assert!(matches!(d.idempotency, Idempotency::Idempotent));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "shell:control"));
+        assert!(d.requires_groups.iter().any(|g| g == "operators"));
+    }
+
+    #[test]
+    fn cancel_empty_arg_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"");
+        match handle_cancel(b, &ctx) {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("session_id required")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn cancel_unknown_session_returns_invalid_args() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"deadbeef0000");
+        match handle_cancel(b, &ctx) {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("session not found"));
+                assert_eq!(e.kind, relix_core::types::error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_known_session_triggers_notify() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let session_id = "session-abc".to_string();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut g = b.sessions.lock().unwrap();
+            let mut rec = mk_session_record(&session_id, unix_secs(), "echo");
+            rec.cancel_notify = notify.clone();
+            g.insert(session_id.clone(), rec);
+        }
+        // Set up an awaiter on the same notify BEFORE issuing
+        // cancel, so we can prove the wakeup actually delivers.
+        let awaited = notify.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), awaited.notified())
+                .await
+                .is_ok()
+        });
+        // Issue cancel. Use a brief yield to let the awaiter
+        // register its waker; notify_one's stored permit also
+        // covers the race, but the await round-trip exercises
+        // the wakeup path either way.
+        tokio::task::yield_now().await;
+        let ctx = ctx_with_args(session_id.as_bytes());
+        match handle_cancel(b.clone(), &ctx) {
+            HandlerOutcome::Ok(bytes) => {
+                let s = String::from_utf8(bytes).unwrap();
+                assert!(s.contains(&format!("ok session={session_id}")));
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        }
+        let observed = handle.await.unwrap();
+        assert!(observed, "awaiter should have observed the cancel notify");
+    }
+
+    #[tokio::test]
+    async fn cancel_uses_notify_one_so_permit_survives_no_awaiter() {
+        // notify_one() stores a permit; the next notified()
+        // future resolves immediately. This protects against
+        // the race between session register and the run task's
+        // select! creating its notified() future.
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let session_id = "session-xyz".to_string();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut g = b.sessions.lock().unwrap();
+            let mut rec = mk_session_record(&session_id, unix_secs(), "echo");
+            rec.cancel_notify = notify.clone();
+            g.insert(session_id.clone(), rec);
+        }
+        // Cancel BEFORE any awaiter exists.
+        let ctx = ctx_with_args(session_id.as_bytes());
+        match handle_cancel(b.clone(), &ctx) {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        }
+        // Now create an awaiter — it must resolve immediately
+        // because notify_one stored a permit.
+        let n = notify.clone();
+        let got = tokio::time::timeout(Duration::from_millis(500), n.notified())
+            .await
+            .is_ok();
+        assert!(got, "stored permit should fire immediately");
+    }
+
+    #[tokio::test]
+    async fn drain_pipe_into_caps_at_capacity() {
+        // Feed more than MAX_OUTPUT_BYTES through a tokio duplex
+        // and verify the drainer stops at the cap rather than
+        // growing unbounded.
+        use tokio::io::AsyncWriteExt;
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let drain_handle = tokio::spawn(drain_pipe_into(reader, buf.clone(), MAX_OUTPUT_BYTES));
+        let chunk = vec![b'a'; 8192];
+        let mut written = 0usize;
+        while written < MAX_OUTPUT_BYTES + 16_384 {
+            if writer.write_all(&chunk).await.is_err() {
+                break;
+            }
+            written += chunk.len();
+        }
+        drop(writer);
+        let _ = drain_handle.await;
+        assert_eq!(buf.lock().unwrap().len(), MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn drain_pipe_into_stops_on_eof_below_cap() {
+        use tokio::io::AsyncWriteExt;
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let drain_handle = tokio::spawn(drain_pipe_into(reader, buf.clone(), MAX_OUTPUT_BYTES));
+        writer.write_all(b"hello world\n").await.unwrap();
+        drop(writer);
+        drain_handle.await.unwrap();
+        assert_eq!(buf.lock().unwrap().as_slice(), b"hello world\n");
     }
 }
