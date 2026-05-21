@@ -1025,6 +1025,9 @@ fn register_node_type_handlers(
         // web_fetch since they share the SSRF/pin/redirect machinery.
         manifest.add_capability(crate::nodes::tool::web_tools::web_get_descriptor());
         manifest.add_capability(crate::nodes::tool::web_tools::web_search_descriptor());
+        // PH-WEB-POST: tool.web.post — POST with body + cookie
+        // headers, same SSRF + DNS pin posture as web_fetch.
+        manifest.add_capability(crate::nodes::tool::web_tools::web_post_descriptor());
         // PH-WEB-ROBOTS: tool.web.robots_check — robots.txt sniff.
         // Same SSRF + pin + redirect machinery as web_fetch.
         manifest.add_capability(crate::nodes::tool::web_robots::robots_check_descriptor());

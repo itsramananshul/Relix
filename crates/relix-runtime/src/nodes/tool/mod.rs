@@ -420,6 +420,14 @@ impl ToolBackend {
         self.cfg.extract_max_input_bytes
     }
 
+    /// PH-WEB-POST: accessor for the body-size cap. Used by
+    /// `tool.web.post` when the caller doesn't supply
+    /// `max_bytes`. Reads the same `[tool] max_bytes` knob the
+    /// fetch path uses.
+    pub fn max_bytes(&self) -> usize {
+        self.cfg.max_bytes
+    }
+
     /// Accessor for the optional `[tool.fs]` subsystem config. When
     /// `None`, [`register`] does not register the fs capabilities.
     pub fn fs_config(&self) -> Option<fs::FsJailConfig> {
@@ -587,6 +595,142 @@ impl ToolBackend {
             Err(_) => WebFetchOutcome::NotUtf8 { final_url },
         }
     }
+
+    /// PH-WEB-POST: HTTP POST against an external URL with the
+    /// same SSRF + DNS pin + redirect re-validation pipeline as
+    /// [`Self::fetch`]. The body is sent verbatim; the optional
+    /// `cookie` parameter is forwarded as a raw `Cookie:` header
+    /// (no jar / parsing / expiry tracking on Relix's side —
+    /// operators thread cookies through manually for now).
+    /// Returns the responder's `Set-Cookie` headers verbatim in
+    /// the success / non-2xx / not-utf8 paths.
+    pub async fn post(
+        &self,
+        raw_url: &str,
+        body: &str,
+        content_type: &str,
+        cookie: &str,
+        max_bytes_request: usize,
+    ) -> WebPostOutcome {
+        let cap = max_bytes_request.min(self.cfg.max_bytes).max(1);
+
+        let target = match resolve_safe_url(raw_url, self.cfg.allow_http).await {
+            Ok(t) => t,
+            Err(e) => return WebPostOutcome::Rejected(e),
+        };
+
+        let host_str = target
+            .normalized_url
+            .host_str()
+            .expect("resolve_safe_url guarantees a host")
+            .to_string();
+        let port = target.normalized_url.port_or_known_default().unwrap_or(
+            if target.normalized_url.scheme() == "https" {
+                443
+            } else {
+                80
+            },
+        );
+        let pinned_addrs: Vec<SocketAddr> = target
+            .resolved
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect();
+        let is_ip_literal = host_str.parse::<IpAddr>().is_ok();
+
+        let client = if is_ip_literal {
+            self.pool.unpinned()
+        } else {
+            match self.pool.pinned(host_str.as_str(), pinned_addrs.as_slice()) {
+                Ok(c) => c,
+                Err(e) => {
+                    return WebPostOutcome::Transport(format!("client build with pin: {e}"));
+                }
+            }
+        };
+
+        let url = target.normalized_url.clone();
+        let mut req = client.post(url).body(body.to_string());
+        if !content_type.is_empty() {
+            req = req.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        if !cookie.is_empty() {
+            req = req.header(reqwest::header::COOKIE, cookie);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return WebPostOutcome::Transport(e.to_string()),
+        };
+
+        // Collect Set-Cookie headers before consuming the body.
+        let set_cookies: Vec<String> = resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+            .collect();
+
+        let status = resp.status();
+        let final_url = resp.url().to_string();
+        if !status.is_success() {
+            return WebPostOutcome::HttpStatus {
+                status: status.as_u16(),
+                final_url,
+                set_cookies,
+            };
+        }
+
+        let content_type_resp = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if !is_textual_content_type(&content_type_resp) {
+            return WebPostOutcome::ContentTypeRejected {
+                content_type: content_type_resp,
+                final_url,
+            };
+        }
+        if let Some(len) = resp.content_length()
+            && (len as usize) > cap
+        {
+            return WebPostOutcome::TooLarge {
+                declared_bytes: len,
+                cap,
+            };
+        }
+
+        let mut acc: Vec<u8> = Vec::with_capacity(cap.min(16 * 1024));
+        let mut stream = resp.bytes_stream();
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => return WebPostOutcome::Transport(e.to_string()),
+            };
+            if acc.len() + bytes.len() > cap {
+                return WebPostOutcome::TooLarge {
+                    declared_bytes: (acc.len() + bytes.len()) as u64,
+                    cap,
+                };
+            }
+            acc.extend_from_slice(&bytes);
+        }
+
+        match String::from_utf8(acc) {
+            Ok(body) => WebPostOutcome::Ok {
+                body,
+                final_url,
+                content_type: content_type_resp,
+                set_cookies,
+            },
+            Err(_) => WebPostOutcome::NotUtf8 {
+                final_url,
+                set_cookies,
+            },
+        }
+    }
 }
 
 fn is_textual_content_type(ct: &str) -> bool {
@@ -634,6 +778,40 @@ pub enum WebFetchOutcome {
     /// Body bytes did not decode as UTF-8.
     NotUtf8 { final_url: String },
     /// Transport-level failure (DNS during reqwest, TLS, RST, etc.).
+    Transport(String),
+}
+
+/// PH-WEB-POST: outcome of [`ToolBackend::post`]. Parallel to
+/// [`WebFetchOutcome`] but the success path additionally
+/// carries the responder's `Set-Cookie` headers verbatim, so
+/// SOL flows / chat sessions can stitch a session token across
+/// calls without losing the raw bytes.
+#[derive(Debug)]
+pub enum WebPostOutcome {
+    Ok {
+        body: String,
+        final_url: String,
+        content_type: String,
+        set_cookies: Vec<String>,
+    },
+    Rejected(SsrfError),
+    TooLarge {
+        declared_bytes: u64,
+        cap: usize,
+    },
+    HttpStatus {
+        status: u16,
+        final_url: String,
+        set_cookies: Vec<String>,
+    },
+    ContentTypeRejected {
+        content_type: String,
+        final_url: String,
+    },
+    NotUtf8 {
+        final_url: String,
+        set_cookies: Vec<String>,
+    },
     Transport(String),
 }
 

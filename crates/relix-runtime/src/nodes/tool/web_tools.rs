@@ -59,6 +59,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use relix_core::capability::{
     CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
 };
@@ -67,6 +69,7 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 use super::WebFetchOutcome;
+use super::WebPostOutcome;
 use super::web_extract::{Extracted, extract};
 use super::{ToolBackend, is_textual_content_type};
 
@@ -128,6 +131,39 @@ pub fn web_search_descriptor() -> CapabilityDescriptor {
     d
 }
 
+/// PH-WEB-POST: descriptor for `tool.web.post`. Same blast radius
+/// as `tool.web_fetch` (network egress, SSRF gate, DNS pin) plus
+/// the caller-supplied body is forwarded verbatim. Cookies are
+/// passed as a raw header value — no jar / parsing on Relix's
+/// side. Set-Cookie headers from the responder are returned
+/// verbatim so SOL flows can stitch session tokens across calls.
+pub fn web_post_descriptor() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.web.post");
+    d.major_version = 1;
+    d.kind = CapabilityKind::Unary;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::ExternalPaid;
+    d.sensitivity_tags = vec![
+        "external:network".into(),
+        "egress:http".into(),
+        "http:method:post".into(),
+    ];
+    d.policy_attachment_point = "tool.web.post".to_string();
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "HTTP POST against an external URL. Request JSON: \
+         {url, body?, content_type?, cookie?, max_bytes?}. Returns JSON: \
+         {body, final_url, content_type, set_cookies}. SSRF + DNS pin + \
+         redirect re-validation identical to tool.web_fetch. Cookie field \
+         is forwarded as a raw `Cookie:` header (no jar)."
+            .into(),
+    );
+    d.categories = vec!["fetch".into(), "io".into(), "mutate".into()];
+    d.environment_requirements = vec!["network:outbound".into()];
+    d.risk_level = RiskLevel::Medium;
+    d
+}
+
 // ─────────────────────────── Register ───────────────────────────
 
 /// Wire both CW3 capabilities onto the dispatch bridge. Caller is the
@@ -142,12 +178,21 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
         })),
     );
 
-    let b_search = backend;
+    let b_search = backend.clone();
     bridge.register(
         "tool.web_search",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let backend = b_search.clone();
             async move { handle_web_search(backend, ctx).await }
+        })),
+    );
+
+    let b_post = backend;
+    bridge.register(
+        "tool.web.post",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let backend = b_post.clone();
+            async move { handle_web_post(backend, ctx).await }
         })),
     );
 }
@@ -486,6 +531,142 @@ fn decode_ddg_href(raw: &str) -> String {
         return format!("https://{rest}");
     }
     trimmed.to_string()
+}
+
+// ─────────────────────────── tool.web.post (PH-WEB-POST) ─────────
+
+#[derive(Debug, Deserialize)]
+struct WebPostRequest {
+    url: String,
+    #[serde(default)]
+    body: String,
+    /// `Content-Type` header. Default `application/json`. Empty
+    /// string is treated as "no Content-Type header" — useful
+    /// when the server infers from body shape.
+    #[serde(default = "default_post_content_type")]
+    content_type: String,
+    /// Raw `Cookie:` header value (e.g. `"sid=abc; user=bob"`).
+    /// No jar / parsing on Relix's side; operators thread it
+    /// through manually.
+    #[serde(default)]
+    cookie: String,
+    /// Per-call body cap. Defaults to the tool node's
+    /// `[tool] max_bytes`. Clamped at the responder side.
+    #[serde(default)]
+    max_bytes: Option<usize>,
+}
+
+fn default_post_content_type() -> String {
+    "application/json".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct WebPostResponseBody {
+    body: String,
+    final_url: String,
+    content_type: String,
+    /// Set-Cookie headers returned by the responder, verbatim.
+    /// Empty when none were sent.
+    set_cookies: Vec<String>,
+}
+
+async fn handle_web_post(backend: Arc<ToolBackend>, ctx: InvocationCtx) -> HandlerOutcome {
+    let req: WebPostRequest = match serde_json::from_slice(&ctx.args) {
+        Ok(r) => r,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.web.post: bad request shape: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if req.url.trim().is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "tool.web.post: url required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let max_bytes = req.max_bytes.unwrap_or(backend.max_bytes());
+    let outcome = backend
+        .post(
+            &req.url,
+            &req.body,
+            &req.content_type,
+            &req.cookie,
+            max_bytes,
+        )
+        .await;
+    match outcome {
+        WebPostOutcome::Ok {
+            body,
+            final_url,
+            content_type,
+            set_cookies,
+        } => {
+            let resp = WebPostResponseBody {
+                body,
+                final_url,
+                content_type,
+                set_cookies,
+            };
+            HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
+        }
+        WebPostOutcome::Rejected(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::POLICY_DENIED,
+            cause: format!("tool.web.post: rejected: {e}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+        WebPostOutcome::TooLarge {
+            declared_bytes,
+            cap,
+        } => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!("tool.web.post: response {declared_bytes} bytes exceeds cap {cap}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+        WebPostOutcome::HttpStatus {
+            status,
+            final_url,
+            set_cookies: _,
+        } => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("tool.web.post: HTTP {status} from {final_url}"),
+            retry_hint: 2,
+            retry_after: None,
+        }),
+        WebPostOutcome::ContentTypeRejected {
+            content_type,
+            final_url,
+        } => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!(
+                "tool.web.post: non-text content-type '{content_type}' from {final_url}"
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+        WebPostOutcome::NotUtf8 {
+            final_url,
+            set_cookies: _,
+        } => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!("tool.web.post: response body from {final_url} is not UTF-8"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+        WebPostOutcome::Transport(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("tool.web.post: transport: {e}"),
+            retry_hint: 2,
+            retry_after: None,
+        }),
+    }
 }
 
 // ─────────────────────────── HTML helpers (local) ───────────────────────────
@@ -966,5 +1147,79 @@ mod tests {
             url,
             "https://html.duckduckgo.com/html/?q=rust+async+tutorials"
         );
+    }
+
+    // ── PH-WEB-POST: descriptor + request shape ────────────────────
+
+    #[test]
+    fn web_post_descriptor_shape() {
+        let d = web_post_descriptor();
+        assert_eq!(d.method_name, "tool.web.post");
+        assert!(matches!(d.idempotency, Idempotency::AtMostOnce));
+        assert!(matches!(d.cost_class, CostClass::ExternalPaid));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "http:method:post"));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "external:network"));
+        assert!(matches!(d.risk_level, RiskLevel::Medium));
+    }
+
+    #[test]
+    fn web_post_request_minimal_decodes() {
+        // Only `url` is required; every other field has a default.
+        let arg = br#"{"url":"https://example.com/api"}"#;
+        let req: WebPostRequest = serde_json::from_slice(arg).unwrap();
+        assert_eq!(req.url, "https://example.com/api");
+        assert_eq!(req.body, "");
+        assert_eq!(req.content_type, "application/json");
+        assert_eq!(req.cookie, "");
+        assert!(req.max_bytes.is_none());
+    }
+
+    #[test]
+    fn web_post_request_full_decodes() {
+        let arg = br#"{
+            "url":"https://example.com/api",
+            "body":"{\"q\":\"rust\"}",
+            "content_type":"text/plain",
+            "cookie":"sid=abc; user=bob",
+            "max_bytes":4096
+        }"#;
+        let req: WebPostRequest = serde_json::from_slice(arg).unwrap();
+        assert_eq!(req.body, r#"{"q":"rust"}"#);
+        assert_eq!(req.content_type, "text/plain");
+        assert_eq!(req.cookie, "sid=abc; user=bob");
+        assert_eq!(req.max_bytes, Some(4096));
+    }
+
+    #[test]
+    fn web_post_request_content_type_default_is_application_json() {
+        // Even when explicitly omitted, the default kicks in.
+        let arg = br#"{"url":"https://example.com/api","body":"x"}"#;
+        let req: WebPostRequest = serde_json::from_slice(arg).unwrap();
+        assert_eq!(req.content_type, "application/json");
+    }
+
+    #[test]
+    fn web_post_response_serializes_set_cookies_array() {
+        let r = WebPostResponseBody {
+            body: "ok".into(),
+            final_url: "https://example.com/api".into(),
+            content_type: "application/json".into(),
+            set_cookies: vec!["sid=abc; Path=/".into(), "csrf=xyz".into()],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""set_cookies":["sid=abc; Path=/","csrf=xyz"]"#));
+        assert!(s.contains(r#""final_url":"https://example.com/api""#));
+    }
+
+    #[test]
+    fn web_post_response_empty_set_cookies_renders_as_empty_array() {
+        let r = WebPostResponseBody {
+            body: "".into(),
+            final_url: "https://example.com/".into(),
+            content_type: "text/plain".into(),
+            set_cookies: vec![],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""set_cookies":[]"#));
     }
 }

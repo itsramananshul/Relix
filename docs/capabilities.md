@@ -92,6 +92,7 @@ before the backend (visibility + stable contract + honesty).
 | Method | Status | Notes |
 |---|---|---|
 | `tool.web_fetch` | live | SSRF + DNS pin + per-hop redirect re-check |
+| `tool.web.post` (PH-WEB-POST) | live | HTTP POST with body + raw cookie header; surfaces Set-Cookie verbatim |
 | `tool.web_extract` | live | Hand-rolled HTML state machine — modes: text/title/links/meta/markdown (PH-WEB-MARKDOWN)/all |
 | `tool.web_get` (CW3) | live | Fetch + extract in one call |
 | `tool.web_search` (CW3) | live | DuckDuckGo HTML scrape |
