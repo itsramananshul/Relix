@@ -1810,6 +1810,7 @@
     <a href="#/tasks"    class="nav-item" data-route="tasks">Tasks</a>
     <a href="#/topology" class="nav-item" data-route="topology">Topology</a>
     <a href="#/capabilities" class="nav-item" data-route="capabilities">Capabilities</a>
+    <a href="#/mcp"          class="nav-item" data-route="mcp">MCP</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2190,6 +2191,52 @@
       </p>
     </section>
 
+    <!-- ── #/mcp (PH-DASH-MCP) ──────────────────────────────────── -->
+    <section class="page" data-page="mcp">
+      <h2>MCP Registry</h2>
+      <p class="page-subtitle">
+        Model Context Protocol servers registered on the tool node.
+        Sourced from <code>/v1/mcp/servers</code> + <code>/v1/mcp/tools</code>
+        (PH-BRIDGE-MCP) — bridge proxies the live registry via the
+        existing mesh client. Honest: per D-009 the stdio runtime
+        is not yet wired, so <code>invoke</code> returns
+        <code>RuntimeNotConnected</code>; the registry contents
+        shown here are operator-declared in
+        <code>[[tool.mcp.servers]]</code>.
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px;">
+        <label for="mcp-peer-input" class="meta">peer alias:</label>
+        <input
+          type="text"
+          id="mcp-peer-input"
+          value="tool"
+          placeholder="tool"
+          autocomplete="off"
+          spellcheck="false"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 140px;"
+        />
+        <button class="chip" id="mcp-refresh-btn">refresh</button>
+        <span class="meta" id="mcp-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Registered servers</h3>
+          <span class="meta" id="mcp-server-summary"></span>
+        </div>
+        <div class="card-body dense" id="mcp-server-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Click <code>expand tools</code> on any row to fetch
+        <code>tool.mcp.list_tools</code> for that server. The
+        declared tool count comes from the operator's
+        <code>declared_tools</code> config field — live discovery
+        via <code>tools/list</code> lands when the stdio runtime is
+        wired (decisions-pending D-009).
+      </p>
+    </section>
+
     <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
@@ -2404,6 +2451,7 @@ const PAGES = {
   tasks:        { label: 'Tasks',        init: initTasks,        enter: enterTasks },
   topology:     { label: 'Topology',     init: initTopology,     enter: enterTopology },
   capabilities: { label: 'Capabilities', init: initCapabilities, enter: enterCapabilities },
+  mcp:          { label: 'MCP',          init: initMcp,          enter: enterMcp },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -5369,9 +5417,10 @@ const KBD_ROUTE_MAP = {
   '2': 'tasks',
   '3': 'topology',
   '4': 'capabilities',
-  '5': 'providers',
-  '6': 'telegram',
-  '7': 'config',
+  '5': 'mcp',
+  '6': 'providers',
+  '7': 'telegram',
+  '8': 'config',
 };
 
 document.addEventListener('keydown', (ev) => {
@@ -6463,6 +6512,199 @@ function renderCapabilityTable() {
       ? filtered.length + ' of ' + capabilityRows.length + ' shown'
       : '';
   }
+}
+
+/* PH-DASH-MCP: dashboard panel for the MCP registry. Calls the
+   bridge proxy endpoints added by PH-BRIDGE-MCP:
+     GET /v1/mcp/servers?peer=<alias>
+     GET /v1/mcp/tools?peer=<alias>&server_id=<id>
+   Servers are loaded on each enter / refresh; tools are loaded
+   lazily on row expand to avoid N fetches when only one server's
+   details are wanted. */
+let mcpServersCache = [];
+
+function initMcp() {
+  const $refresh = document.getElementById('mcp-refresh-btn');
+  if ($refresh) {
+    $refresh.addEventListener('click', () => loadMcpServers());
+  }
+  const $peer = document.getElementById('mcp-peer-input');
+  if ($peer) {
+    $peer.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadMcpServers();
+      }
+    });
+  }
+}
+
+function enterMcp() {
+  loadMcpServers();
+}
+
+function currentMcpPeer() {
+  const $peer = document.getElementById('mcp-peer-input');
+  const v = $peer ? ($peer.value || '').trim() : '';
+  return v || 'tool';
+}
+
+async function loadMcpServers() {
+  const $host = document.getElementById('mcp-server-host');
+  const $status = document.getElementById('mcp-status');
+  const $summary = document.getElementById('mcp-server-summary');
+  if ($host) $host.innerHTML = '<div class="loading">loading…</div>';
+  if ($status) $status.textContent = 'querying…';
+  const peer = currentMcpPeer();
+  try {
+    const r = await fetch('/v1/mcp/servers?peer=' + encodeURIComponent(peer));
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const servers = body.servers || [];
+    mcpServersCache = servers;
+    renderMcpServers(servers, peer);
+    if ($status) {
+      $status.textContent = 'peer=' + peer + ' servers=' + servers.length;
+    }
+    if ($summary) {
+      $summary.textContent = servers.length === 0
+        ? '0 servers configured'
+        : servers.length + ' configured';
+    }
+  } catch (e) {
+    if ($host) {
+      $host.innerHTML = '<div class="error">load failed: '
+        + escapeHtml(String(e)) + '</div>';
+    }
+    if ($status) $status.textContent = 'failed';
+    if ($summary) $summary.textContent = '';
+  }
+}
+
+function renderMcpServers(servers, peer) {
+  const $host = document.getElementById('mcp-server-host');
+  if (!$host) return;
+  if (servers.length === 0) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'no MCP servers configured on peer <code>'
+      + escapeHtml(peer) + '</code> — declare them in '
+      + '<code>[[tool.mcp.servers]]</code> in the tool node\'s '
+      + 'config'
+      + '</div>';
+    return;
+  }
+  const rows = servers.map((s, idx) => {
+    const statusCls = s.status === 'connected' ? 'ok'
+      : s.status === 'configured' ? 'warn'
+      : 'danger';
+    const safeId = escapeHtml(s.id);
+    return '<tr data-mcp-server-id="' + safeId + '">'
+      + '<td><code>' + safeId + '</code></td>'
+      + '<td>' + escapeHtml(s.transport) + '</td>'
+      + '<td class="meta"><code>' + escapeHtml(s.endpoint) + '</code></td>'
+      + '<td>' + escapeHtml(String(s.declared_tool_count)) + '</td>'
+      + '<td><span class="badge ' + statusCls + '">'
+      + escapeHtml(s.status) + '</span></td>'
+      + '<td>'
+      + '<button class="chip" data-mcp-expand="' + safeId
+      + '" data-row-idx="' + idx + '">expand tools</button>'
+      + '</td>'
+      + '</tr>'
+      // Placeholder row for the expanded tool list — hidden until
+      // expand is clicked.
+      + '<tr class="mcp-tools-row" data-mcp-tools-for="' + safeId
+      + '" style="display: none;">'
+      + '<td colspan="6" class="meta" style="padding-left: 24px;">'
+      + '<div data-mcp-tools-host="' + safeId + '">'
+      + '<span class="meta">click expand to load</span>'
+      + '</div>'
+      + '</td>'
+      + '</tr>';
+  }).join('');
+  $host.innerHTML = '<table class="data"><thead><tr>'
+    + '<th>server_id</th>'
+    + '<th>transport</th>'
+    + '<th>endpoint</th>'
+    + '<th>declared_tools</th>'
+    + '<th>status</th>'
+    + '<th></th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  // Wire expand buttons.
+  $host.querySelectorAll('button[data-mcp-expand]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const serverId = btn.getAttribute('data-mcp-expand');
+      toggleMcpToolsRow(serverId, btn);
+    });
+  });
+}
+
+async function toggleMcpToolsRow(serverId, btn) {
+  const $row = document.querySelector(
+    'tr.mcp-tools-row[data-mcp-tools-for="'
+    + cssEscape(serverId) + '"]');
+  const $toolsHost = document.querySelector(
+    '[data-mcp-tools-host="' + cssEscape(serverId) + '"]');
+  if (!$row || !$toolsHost) return;
+  const isOpen = $row.style.display !== 'none';
+  if (isOpen) {
+    $row.style.display = 'none';
+    if (btn) btn.textContent = 'expand tools';
+    return;
+  }
+  $row.style.display = '';
+  if (btn) btn.textContent = 'collapse';
+  // Only fetch on first expand (cache in dataset).
+  if ($toolsHost.dataset.mcpLoaded === '1') return;
+  $toolsHost.innerHTML = '<span class="meta">loading…</span>';
+  const peer = currentMcpPeer();
+  try {
+    const r = await fetch('/v1/mcp/tools?peer='
+      + encodeURIComponent(peer)
+      + '&server_id=' + encodeURIComponent(serverId));
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const tools = body.tools || [];
+    if (tools.length === 0) {
+      $toolsHost.innerHTML = '<span class="meta">'
+        + 'server has not declared any tools (and live discovery is '
+        + 'gated on D-009)</span>';
+    } else {
+      $toolsHost.innerHTML = '<div class="meta" style="margin-bottom: 4px;">'
+        + tools.length + ' declared tool(s):</div>'
+        + tools.map(t => '<code style="margin-right: 8px;">'
+            + escapeHtml(t) + '</code>').join('');
+    }
+    $toolsHost.dataset.mcpLoaded = '1';
+  } catch (e) {
+    $toolsHost.innerHTML = '<span class="error">load failed: '
+      + escapeHtml(String(e)) + '</span>';
+  }
+}
+
+/* Tiny CSS.escape fallback for browsers that haven't shipped it
+   (every modern browser has, but the bridge ships static HTML —
+   keep the polyfill cost trivial). Returns a string safe inside
+   an attribute selector for the limited subset of chars MCP
+   server ids actually contain (alphanumerics, hyphens, dots,
+   underscores). */
+function cssEscape(s) {
+  if (window.CSS && CSS.escape) return CSS.escape(s);
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, ch =>
+    '\\' + ch.charCodeAt(0).toString(16) + ' ');
 }
 
 async function loadTopology() {

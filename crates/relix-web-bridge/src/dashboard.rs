@@ -118,12 +118,13 @@ mod tests {
         );
         assert!(body.contains("Operator Console"), "missing brand subtitle");
 
-        // All seven routes register a nav item AND a corresponding page section.
+        // All eight routes register a nav item AND a corresponding page section.
         for route in [
             "overview",
             "tasks",
             "topology",
             "capabilities",
+            "mcp",
             "providers",
             "telegram",
             "config",
@@ -286,6 +287,51 @@ mod tests {
             body.contains("c.providers_enabled"),
             "renderEffectiveConfig should consume providers_enabled from /v1/config"
         );
+    }
+
+    #[tokio::test]
+    async fn page_mcp_landmarks_present() {
+        // PH-DASH-MCP: dashboard panel for the MCP registry.
+        // Asserts the page exists, wires to the PH-BRIDGE-MCP
+        // proxy endpoints, and exposes the operator-facing
+        // controls (peer alias input, refresh button, expand
+        // tools button).
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // The page section + nav exist (covered structurally by
+        // page_body_contains_redesign_landmarks too; this test
+        // is the MCP-specific landmark assertion).
+        assert!(
+            body.contains(r#"data-page="mcp""#),
+            "MCP page section missing"
+        );
+        assert!(body.contains(r#"data-route="mcp""#), "MCP nav item missing");
+        // Wired to the bridge proxy endpoints.
+        assert!(
+            body.contains("/v1/mcp/servers"),
+            "MCP page should consume /v1/mcp/servers"
+        );
+        assert!(
+            body.contains("/v1/mcp/tools"),
+            "MCP page should consume /v1/mcp/tools"
+        );
+        // Operator-facing controls.
+        assert!(
+            body.contains(r#"id="mcp-peer-input""#),
+            "peer alias input missing"
+        );
+        assert!(
+            body.contains(r#"id="mcp-refresh-btn""#),
+            "refresh button missing"
+        );
+        assert!(
+            body.contains("data-mcp-expand"),
+            "expand-tools button hook missing"
+        );
+        // PAGES registry entry + handler functions.
+        assert!(body.contains("initMcp"), "initMcp handler missing");
+        assert!(body.contains("enterMcp"), "enterMcp handler missing");
     }
 
     #[tokio::test]
