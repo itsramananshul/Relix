@@ -2425,6 +2425,12 @@ impl TaskStore {
                 r.len()
             )));
         }
+        // H8: redact known secrets before persisting the reason.
+        // Same posture as task.operator_note — anything that lands
+        // on a task row OR in the chronicle gets the scrubber.
+        let redacted_reason: Option<String> =
+            trimmed_reason.map(relix_core::redact::redact_secrets);
+        let store_reason: Option<&str> = redacted_reason.as_deref();
         let now = unix_secs();
         let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let exists: i64 = conn
@@ -2445,16 +2451,16 @@ impl TaskStore {
                        investigation_reason = ?3,
                        updated_at = ?2
                  WHERE task_id = ?1",
-                params![task_id, now, trimmed_reason],
+                params![task_id, now, store_reason],
             )
             .map_err(CoordinatorError::Db)?;
             let payload_json = serde_json::json!({
                 "marked": true,
-                "reason": trimmed_reason,
+                "reason": store_reason,
                 "author": author_subject_id,
             })
             .to_string();
-            let legacy = match trimmed_reason {
+            let legacy = match store_reason {
                 Some(r) => format!("marked · {r}"),
                 None => "marked".to_string(),
             };
@@ -2536,6 +2542,13 @@ impl TaskStore {
                 trimmed.len()
             )));
         }
+        // H8: scrub known-shape secrets BEFORE persisting. Operator
+        // notes get replayed via the dashboard forever, so a pasted
+        // API key in a "investigating prod outage" note would
+        // become a permanent leak. redact_secrets is idempotent +
+        // non-destructive for non-secret text.
+        let redacted = relix_core::redact::redact_secrets(trimmed);
+        let safe_text = redacted.as_str();
         let now = unix_secs();
         let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let exists: i64 = conn
@@ -2550,11 +2563,11 @@ impl TaskStore {
         }
         // Structured envelope. Author + ts let the dashboard
         // render notes consistently with retry/cancel events.
-        // The legacy `payload` string carries the trimmed note
+        // The legacy `payload` string carries the redacted note
         // verbatim so older grep-driven CLIs see the text;
         // payload_json carries the typed envelope.
         let payload_json = serde_json::json!({
-            "note": trimmed,
+            "note": safe_text,
             "author": author_subject_id,
         })
         .to_string();
@@ -2564,7 +2577,7 @@ impl TaskStore {
             task_id,
             now,
             "task.operator_note",
-            trimmed,
+            safe_text,
             None,
             None,
             Some(&payload_json),
@@ -6077,6 +6090,69 @@ mod tests {
         // Unknown kind defaults to Permanent so callers fail loudly
         // rather than silently retrying on something they don't model.
         assert_eq!(FailureClass::from_kind(9_999), FailureClass::Permanent);
+    }
+
+    // ── H8: secret redaction at chronicle write boundary ──────────────
+
+    #[test]
+    fn operator_note_with_openai_key_redacted_before_persist() {
+        // H8: a pasted API key in an operator note must NOT land
+        // in the chronicle. The redaction runs at write time —
+        // operators can't accidentally bake a secret into the
+        // forever-replayable audit log.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let note = "tried FAKE_TEST_FIXTURE_REDACTED in prod";
+        s.append_operator_note(&tid, note, "operator").unwrap();
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let ev = events
+            .iter()
+            .find(|e| e.event_type == "task.operator_note")
+            .expect("operator_note missing");
+        assert!(
+            !ev.payload.contains("sk-abcdef"),
+            "raw key leaked into payload: {}",
+            ev.payload
+        );
+        assert!(
+            ev.payload.contains("[REDACTED:OPENAI_KEY]"),
+            "redaction marker missing: {}",
+            ev.payload
+        );
+        let pj = ev.payload_json.as_deref().unwrap();
+        assert!(!pj.contains("sk-abcdef"), "key in payload_json: {pj}");
+        assert!(pj.contains("[REDACTED:OPENAI_KEY]"));
+    }
+
+    #[test]
+    fn investigation_marker_reason_redacted() {
+        // H8: same posture for investigation_marker reason — both
+        // the task row and the chronicle event must carry the
+        // redacted form.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.set_investigation_marker(
+            &tid,
+            true,
+            Some("found ghp_abcdefghij1234567890 in env"),
+            "op",
+        )
+        .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let reason = v.investigation_reason.unwrap();
+        assert!(
+            !reason.contains("ghp_abcdef"),
+            "raw PAT in task row: {reason}"
+        );
+        assert!(reason.contains("[REDACTED:GITHUB_PAT]"));
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let ev = events
+            .iter()
+            .find(|e| e.event_type == "task.investigation_marked")
+            .expect("investigation_marked missing");
+        assert!(!ev.payload.contains("ghp_abcdef"));
+        let pj = ev.payload_json.as_deref().unwrap();
+        assert!(!pj.contains("ghp_abcdef"));
     }
 
     // ── H7: orphan attempt cleanup ────────────────────────────────────

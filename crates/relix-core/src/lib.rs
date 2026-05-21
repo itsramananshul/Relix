@@ -33,6 +33,7 @@ pub mod codec;
 pub mod eventlog;
 pub mod identity;
 pub mod policy;
+pub mod redact;
 pub mod types;
 
 /// Crate-wide result type alias for caller convenience.
