@@ -454,10 +454,13 @@ all pushed to origin/main):
 | PH-WAVE2E | 0a12bb0 | n/a | Anthropic prompt-caching cache_control |
 | PH-WAVE2F | 3d25355 | n/a | Anthropic extended-thinking budget knob |
 | PH-DASH2  | d69b6f1 | bridge +1 | bridge REST + dashboard widget for todos |
+| PH-WAVE2G | 2c77e38 | bridge +6 | rolling rate-limit observation ring + dashboard badge |
+| PH-WAVE2H | c015cf3 | n/a | firehose row category CSS accents (H-event family) |
+| PH-WAVE2I | 9c02c8e | bridge +2 | auto-cooldown on rate-limit storm (closes ladder loop) |
 
-Aggregate: ~8500+ LOC; runtime tests 291 → 419, bridge tests
-192 → 209, relix-core 33 → 61. Every milestone clean fmt +
-clippy + tests. Total workspace = 754 passing tests.
+Aggregate: ~9100+ LOC; runtime tests 291 → 419, bridge tests
+192 → 217, relix-core 33 → 61. Every milestone clean fmt +
+clippy + tests. Total workspace = 762 passing tests.
 
 A deadlock was introduced and fixed during PH-WAVE2D: the
 initial `set_task_todos` impl called `self.list_task_todos`
