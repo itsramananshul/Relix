@@ -662,6 +662,74 @@ pub struct NoteResp {
     pub event_id: i64,
 }
 
+/// W2-001c: response shape for `POST /v1/tasks/:id/replay`.
+#[derive(Debug, Serialize)]
+pub struct ReplayResponse {
+    /// The original task that was replayed.
+    pub original_task_id: String,
+    /// The freshly-minted replay task. 32 hex chars.
+    pub new_task_id: String,
+}
+
+/// W2-001c: `POST /v1/tasks/:id/replay` — operator-triggered
+/// replay. Asks the Coordinator to clone the original task
+/// (preserves flow_template / params / retry-policy /
+/// origin_surface; fresh retry_count) and wire a `retried_from`
+/// edge from the new task back to the original. Returns the
+/// new task_id so the dashboard can navigate to it.
+pub async fn replay(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ReplayResponse>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = match rec.replay(&id).await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record_with_id(
+                "anon",
+                "replay",
+                &id,
+                "error",
+                format!("coord replay failed: {e}"),
+                corr,
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let new_task_id = body.trim().to_string();
+    if new_task_id.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "coordinator replay returned empty body".into(),
+            }),
+        ));
+    }
+    state.intervention_audit.record_with_id(
+        "anon",
+        "replay",
+        &id,
+        "ok",
+        format!("new_task_id={new_task_id}"),
+        corr,
+    );
+    Ok(Json(ReplayResponse {
+        original_task_id: id,
+        new_task_id,
+    }))
+}
+
 /// `POST /v1/tasks/:id/note` — append an operator annotation
 /// to a task's chronicle. Validates the note body bridge-side
 /// (length, control chars), forwards to the Coordinator's

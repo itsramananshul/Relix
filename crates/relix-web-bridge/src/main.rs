@@ -339,6 +339,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/tasks/recover", post(tasks::recover))
         .route("/v1/tasks/:id/retry", post(tasks::retry))
+        // W2-001c: operator-triggered replay. Clones the task
+        // (preserves flow_template / params / retry-policy /
+        // origin_surface; fresh retry_count) and wires a
+        // retried_from edge from new → original.
+        .route("/v1/tasks/:id/replay", post(tasks::replay))
         .route("/v1/tasks/:id/cancel", post(tasks::cancel))
         // Operator-authored annotation as a chronicle event
         // (M60). Body: {note: string}. The Coordinator records

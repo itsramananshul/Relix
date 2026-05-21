@@ -266,6 +266,17 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.retry utf8: {e}"))
     }
 
+    /// W2-001c: operator-triggered `task.replay` passthrough.
+    /// Returns the new task_id (32 hex chars) on success. The
+    /// coordinator handles the actual clone + edge insertion
+    /// (see W2-001b).
+    pub async fn replay(&self, original_task_id: &str) -> Result<String, String> {
+        let bytes = self
+            .call("task.replay", original_task_id.as_bytes())
+            .await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.replay utf8: {e}"))
+    }
+
     /// Operator-authored chronicle annotation (M60). Appends a
     /// `task.operator_note` event with the supplied text. The
     /// coordinator surfaces the bridge's verified caller
