@@ -1051,8 +1051,28 @@ impl TaskStore {
             )?;
             recovered.push(tid);
         }
+        // H7: opportunistic orphan-attempt cleanup in the same
+        // transaction as the deadline recovery. Catches attempts
+        // that were left open because their owning task was
+        // already in a terminal state when the per-attempt
+        // close path was skipped (legacy bug / crash mid-update /
+        // pre-C2a tasks). Pure additive: the dashboard sees the
+        // attempt row close + a chronicle event explaining why.
+        close_orphan_attempts_in_txn(&tx, now_secs)?;
         tx.commit().map_err(CoordinatorError::Db)?;
         Ok(recovered)
+    }
+
+    /// H7: standalone orphan-attempt cleanup entrypoint. Useful
+    /// when an operator wants to run cleanup without waiting for
+    /// the next recovery scan tick. Returns the closed
+    /// `attempt_id` list (empty when there are no orphans).
+    pub fn close_orphan_attempts(&self, now_secs: i64) -> Result<Vec<i64>, CoordinatorError> {
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        let closed = close_orphan_attempts_in_txn(&tx, now_secs)?;
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(closed)
     }
 
     /// List all attempts of a task in chronological order. Returns
@@ -5709,6 +5729,72 @@ fn close_open_attempt_if_any(
     Ok(())
 }
 
+/// H7: close `task_attempts` rows that are still open (no
+/// `finished_at`) but whose owning task has reached a terminal
+/// status. These orphans appear when a task transitions to a
+/// terminal state via a non-attempt-aware path (legacy data,
+/// crash mid-update, pre-C2a tasks). Emits a
+/// `task.attempt_orphan_closed` event per orphan so the
+/// chronicle is honest about the cleanup. Returns the list of
+/// closed attempt_ids (empty when there are no orphans).
+fn close_orphan_attempts_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    now: i64,
+) -> Result<Vec<i64>, CoordinatorError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT a.attempt_id, a.task_id, t.status
+             FROM task_attempts a
+             JOIN tasks t ON t.task_id = a.task_id
+             WHERE a.finished_at IS NULL
+               AND t.status IN ('completed', 'failed', 'cancelled', 'interrupted')",
+        )
+        .map_err(CoordinatorError::Db)?;
+    let orphans: Vec<(i64, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(CoordinatorError::Db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CoordinatorError::Db)?;
+    drop(stmt);
+
+    let mut closed = Vec::with_capacity(orphans.len());
+    for (aid, tid, task_status) in orphans {
+        tx.execute(
+            "UPDATE task_attempts
+             SET finished_at = ?1,
+                 status = 'interrupted',
+                 failure_class = COALESCE(failure_class, 'orphan'),
+                 error_cause = COALESCE(
+                     error_cause,
+                     'attempt left open while task reached terminal status'
+                 )
+             WHERE attempt_id = ?2
+               AND finished_at IS NULL",
+            params![now, aid],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let legacy = format!(
+            "attempt_id={aid} closed_as=interrupted reason=orphan task_status={task_status}",
+        );
+        let json = format!(
+            r#"{{"attempt_id":{aid},"closed_as":"interrupted","reason":"orphan","task_status":"{}"}}"#,
+            json_escape(&task_status)
+        );
+        insert_typed_event(
+            tx,
+            &tid,
+            now,
+            "task.attempt_orphan_closed",
+            &legacy,
+            Some(aid),
+            None,
+            Some(&json),
+        )?;
+        closed.push(aid);
+    }
+    Ok(closed)
+}
+
 // rusqlite::OptionalExtension brings `.optional()` into scope; importing
 // here keeps the trait local rather than re-exporting it everywhere.
 use rusqlite::OptionalExtension as _;
@@ -5991,6 +6077,121 @@ mod tests {
         // Unknown kind defaults to Permanent so callers fail loudly
         // rather than silently retrying on something they don't model.
         assert_eq!(FailureClass::from_kind(9_999), FailureClass::Permanent);
+    }
+
+    // ── H7: orphan attempt cleanup ────────────────────────────────────
+
+    #[test]
+    fn close_orphan_attempts_closes_attempts_whose_task_is_terminal() {
+        // H7: an attempt was opened (task transitioned to 'running')
+        // but the task later reached a terminal state without the
+        // attempt-close codepath running. Cleanup must close the
+        // attempt + emit task.attempt_orphan_closed.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        // Forcibly mark terminal status via a back-door (simulate a
+        // legacy bypass that didn't close the attempt). Use the
+        // direct rusqlite handle through `update` with status only
+        // — but update() goes through close_open_attempt_if_any,
+        // so we have to drop the close behaviour. We achieve the
+        // same orphan by deleting the attempt's finished_at via
+        // direct SQL after a normal close, then forcing the task
+        // back to terminal: easier path is to use a sibling helper.
+        //
+        // For the test, force the orphan condition deterministically
+        // by setting status='failed' via update() then re-opening the
+        // attempt manually.
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        // Re-open the attempt to simulate a crash that left it open.
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE task_attempts SET finished_at = NULL WHERE task_id = ?1",
+            params![tid],
+        )
+        .unwrap();
+        drop(conn);
+
+        let closed = s.close_orphan_attempts(unix_secs()).unwrap();
+        assert_eq!(closed.len(), 1);
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let orphan = events
+            .iter()
+            .find(|e| e.event_type == "task.attempt_orphan_closed")
+            .expect("orphan event missing");
+        let pj: serde_json::Value =
+            serde_json::from_str(orphan.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["reason"], "orphan");
+        assert_eq!(pj["closed_as"], "interrupted");
+        assert_eq!(pj["task_status"], "failed");
+    }
+
+    #[test]
+    fn close_orphan_attempts_leaves_open_attempts_of_running_tasks_alone() {
+        // A still-running task with an open attempt is NOT an
+        // orphan. Cleanup must not touch it.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let closed = s.close_orphan_attempts(unix_secs()).unwrap();
+        assert!(
+            closed.is_empty(),
+            "running task's open attempt must not be closed"
+        );
+    }
+
+    #[test]
+    fn recovery_scan_also_closes_orphan_attempts_inline() {
+        // recover_interrupted runs close_orphan_attempts_in_txn
+        // as a side effect. A pre-existing orphan from an
+        // unrelated task should be cleaned up alongside the
+        // deadline-recovered tasks.
+        let s = store();
+        // Task A: legitimate deadline candidate.
+        let a = s
+            .create("a", "f", "{}", "o", RetryPolicy::None, 0, Some(10))
+            .unwrap();
+        s.update(&a, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let a_started = s.get(&a).unwrap().unwrap().started_at.unwrap();
+        // Task B: orphan attempt — task ended terminal without
+        // closing the attempt.
+        let b = mk(&s, "b", "f", "{}", "o");
+        s.update(&b, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.update(&b, Some("completed"), None, None, None, None, None, None)
+            .unwrap();
+        // Forcibly orphan b's attempt.
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE task_attempts SET finished_at = NULL WHERE task_id = ?1",
+            params![b],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recovered = s.recover_interrupted(a_started + 60).unwrap();
+        assert_eq!(recovered, vec![a.clone()]);
+        // b's events should now include orphan closure.
+        let b_events = s.list_events_after(&b, 0, 50).unwrap();
+        assert!(
+            b_events
+                .iter()
+                .any(|e| e.event_type == "task.attempt_orphan_closed"),
+            "recover_interrupted must run orphan cleanup as a side effect"
+        );
     }
 
     // ── H6: stuck-running projection ──────────────────────────────────

@@ -119,6 +119,7 @@ pub fn summarize_event(ev: &TaskEvent) -> String {
         "task.interrupted" => summarize_interrupted(payload.as_ref()),
         "task.thrash_detected" => summarize_thrash(payload.as_ref()),
         "task.terminal_summary" => summarize_terminal(payload.as_ref()),
+        "task.attempt_orphan_closed" => summarize_orphan_close(payload.as_ref()),
         other => format!("[event] {other}"),
     }
 }
@@ -338,6 +339,21 @@ fn summarize_interrupted(payload: Option<&Value>) -> String {
         (false, None) => format!("[interrupt] {kind}"),
         (true, Some(g)) => format!("[interrupt] gen={g}"),
         (true, None) => "[interrupt]".to_string(),
+    }
+}
+
+fn summarize_orphan_close(payload: Option<&Value>) -> String {
+    let aid = payload
+        .and_then(|p| p.get("attempt_id").and_then(Value::as_i64))
+        .unwrap_or(0);
+    let st = payload
+        .and_then(|p| p.get("task_status").and_then(Value::as_str))
+        .unwrap_or("");
+    match (aid, st.is_empty()) {
+        (0, true) => "[orphan] attempt closed".to_string(),
+        (a, true) => format!("[orphan] a#{a} closed"),
+        (0, false) => format!("[orphan] attempt closed (task={st})"),
+        (a, false) => format!("[orphan] a#{a} closed (task={st})"),
     }
 }
 
@@ -655,6 +671,23 @@ mod tests {
     }
 
     #[test]
+    fn orphan_close_full() {
+        let s = summarize_event(&ev(
+            "task.attempt_orphan_closed",
+            Some(
+                r#"{"attempt_id":7,"closed_as":"interrupted","reason":"orphan","task_status":"failed"}"#,
+            ),
+        ));
+        assert_eq!(s, "[orphan] a#7 closed (task=failed)");
+    }
+
+    #[test]
+    fn orphan_close_minimal() {
+        let s = summarize_event(&ev("task.attempt_orphan_closed", None));
+        assert_eq!(s, "[orphan] attempt closed");
+    }
+
+    #[test]
     fn unknown_event_falls_through() {
         let s = summarize_event(&ev("task.fancy_new_event_type", None));
         assert_eq!(s, "[event] task.fancy_new_event_type");
@@ -710,6 +743,7 @@ mod tests {
             "task.interrupted",
             "task.thrash_detected",
             "task.terminal_summary",
+            "task.attempt_orphan_closed",
             "task.someday_unknown",
         ] {
             let s = summarize_event(&ev(event_type, None));
