@@ -431,6 +431,19 @@ impl ToolBackend {
         let probe =
             build_client(&cfg, None).map_err(|e| ToolError::Build(format!("client probe: {e}")))?;
         let blocklist = HostBlocklist::new(cfg.blocked_hosts.iter().cloned());
+        // PH-BROWSER-FEATURES: fail-fast at construction time if
+        // `[tool.browser]` selects an uncompiled / unknown
+        // backend. Honest startup error — no silent NoneBackend
+        // fallback in `register()`.
+        if let Some(br_cfg) = &cfg.browser {
+            browser::validate_config(br_cfg).map_err(|e| {
+                ToolError::Build(format!(
+                    "[tool.browser] config rejected: {e}. \
+                     Fix `backend = \"<name>\"` (one of {}) or rebuild Relix with the required feature.",
+                    browser::KNOWN_BACKENDS.join("|")
+                ))
+            })?;
+        }
         Ok(Self {
             cfg: cfg.clone(),
             pool: PinnedClientPool::new(cfg, Arc::new(probe)),
@@ -1007,19 +1020,25 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
     // in the manifest + dashboard, and so a future Playwright
     // backend slots in without touching this register path.
     if let Some(br_cfg) = backend.browser_config() {
+        // PH-BROWSER-FEATURES: ToolBackend::new validated the
+        // browser config at startup, so build_backend cannot
+        // fail here under normal control flow. The defensive
+        // branch logs + skips registration rather than
+        // panicking — but the failure path should never fire.
         match browser::build_backend(&br_cfg) {
             Ok(bb) => {
                 tracing::info!(
                     backend = bb.name(),
                     max_sessions = br_cfg.max_sessions,
-                    "tool node: registering tool.browser.* (CW4 honest scaffold)"
+                    "tool node: registering tool.browser.* (PH-BROWSER-FEATURES — see browser/mod.rs)"
                 );
                 browser::register(bridge, bb);
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     error = %e,
-                    "tool node: [tool.browser] present but invalid; browser surface NOT registered"
+                    "tool node: browser::build_backend failed AFTER validate_config passed; \
+                     this should be unreachable — file a bug"
                 );
             }
         }

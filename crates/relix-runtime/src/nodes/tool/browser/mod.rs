@@ -4,9 +4,27 @@
 //! full headless-browser automation. Relix's CW4 foundation
 //! lands the **honest scaffold**: capability descriptors,
 //! session model, wire format, dispatch, error envelope, and
-//! dashboard / CLI visibility — but does NOT yet ship a real
-//! browser backend. Operators get a working surface that
-//! advertises the gap clearly.
+//! dashboard / CLI visibility. PH-BROWSER-FEATURES (this
+//! milestone) refactors the single-backend scaffold into a
+//! pluggable trait + three feature-gated backend modules so
+//! the live implementations can land independently:
+//!
+//! - [`headless_chrome`] — Chrome DevTools Protocol driver. The
+//!   recommended default per D-008 (smallest install — no Node,
+//!   no sidecar; just a `chrome` / `chromium` binary). Gated on
+//!   `--features browser-headless-chrome`.
+//! - [`playwright`] — Playwright sidecar over stdio JSON-RPC.
+//!   Best multi-engine coverage (Chromium / Firefox / WebKit)
+//!   but heaviest install (Node + browsers + npm package).
+//!   Gated on `--features browser-playwright`.
+//! - [`webdriver`] — fantoccini / WebDriver-over-HTTP against
+//!   an operator-supplied `chromedriver` / `geckodriver`
+//!   sidecar. Most standards-y. Gated on
+//!   `--features browser-webdriver`.
+//!
+//! Each backend module ships only when its feature is compiled
+//! in. Without any feature, only [`NoneBackend`] is available
+//! (and the operator must set `backend = "none"` to use it).
 //!
 //! ## Honesty contract
 //!
@@ -15,20 +33,28 @@
 //! contracts and explicit backend-missing errors. No mock
 //! success."*
 //!
-//! Concrete posture:
+//! Concrete posture (PH-BROWSER-FEATURES update):
 //!
 //! - `[tool.browser] backend = "none"` (default when the
 //!   section is present at all) makes every navigate /
 //!   get_text / screenshot call return a typed
 //!   `BackendNotConnected` error.
-//! - `[tool.browser] backend = "playwright"` is reserved for a
-//!   future milestone. Today selecting it returns the same
-//!   `BackendNotConnected` error with a `reason` field hinting
-//!   the integration is pending.
-//! - `tool.browser.open_session` always succeeds in `"none"`
-//!   mode — it allocates a session id, stores nothing, and
-//!   lets the operator see the capability is wired. Subsequent
-//!   navigate / screenshot calls against that id fail loudly.
+//! - `backend = "headless_chrome"` / `"playwright"` /
+//!   `"webdriver"` with the corresponding feature compiled →
+//!   returns the live backend (TODAY: a labeled scaffold that
+//!   names the upcoming milestone in its BackendNotConnected
+//!   reason; TOMORROW: PH-BROWSER-HC / -PW / -WD will replace
+//!   each scaffold with a real driver).
+//! - `backend = X` with the corresponding feature NOT compiled
+//!   → returns [`BrowserError::FeatureNotCompiled`] at startup.
+//!   The tool node fails to construct (loud error), no silent
+//!   fallback to NoneBackend.
+//! - Unknown backend name → [`BrowserError::InvalidBackend`] at
+//!   startup. Same loud-fail posture.
+//! - `tool.browser.open_session` always succeeds — it allocates
+//!   a session id and tracks it so `list_sessions` surfaces
+//!   what the operator opened. Downstream calls follow the
+//!   backend's behaviour.
 //!
 //! Operators reading the chronicle / audit will never see a
 //! fake "navigated to https://…" event.
@@ -48,11 +74,10 @@
 //!   `<session_id>\t<opened_at>\t<current_url>\t<status>\n`
 //!   + trailing `count=<N>`.
 //!
-//! All non-noop methods return `BackendNotConnected` until a
-//! real backend ships.
+//! All non-noop methods return `BackendNotConnected` until the
+//! corresponding live backend ships.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -63,26 +88,41 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
+mod none;
+pub use none::NoneBackend;
+
+#[cfg(feature = "browser-headless-chrome")]
+pub mod headless_chrome;
+#[cfg(feature = "browser-playwright")]
+pub mod playwright;
+#[cfg(feature = "browser-webdriver")]
+pub mod webdriver;
+
 /// Per-node config for the browser subsystem. Lives under
 /// `[tool.browser]`. When the whole section is absent the
 /// capability is NOT registered (see `register()`).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct BrowserConfig {
-    /// Backend selector. `"none"` (the default when the section
-    /// is present) wires the capability surface but every
-    /// non-noop method returns BackendNotConnected. `"playwright"`
-    /// is reserved for a future milestone; today selecting it
-    /// returns BackendNotConnected with a different `reason`.
+    /// Backend selector. One of:
+    /// - `"none"` — scaffold; every non-noop returns
+    ///   BackendNotConnected.
+    /// - `"headless_chrome"` — requires `browser-headless-chrome`
+    ///   feature.
+    /// - `"playwright"` — requires `browser-playwright` feature.
+    /// - `"webdriver"` — requires `browser-webdriver` feature.
+    ///
+    /// Selecting a backend whose feature isn't compiled fails
+    /// LOUDLY at startup (no silent NoneBackend fallback).
     #[serde(default = "default_backend")]
     pub backend: String,
     /// Maximum live browser sessions per node. Caps the
-    /// session-id ring; protects future real backends from
-    /// runaway allocation. Defaults to 16.
+    /// session-id ring; protects real backends from runaway
+    /// allocation. Defaults to 16.
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
-    /// Per-call deadline in seconds. Today returned as part of
-    /// every error envelope so operators see the configured
-    /// limit even though no real call ever times out yet.
+    /// Per-call deadline in seconds. Surfaced via error
+    /// envelopes so operators see the configured limit even
+    /// when the scaffold has nothing to time out yet.
     #[serde(default = "default_call_timeout_secs")]
     pub call_timeout_secs: u64,
 }
@@ -97,13 +137,13 @@ fn default_call_timeout_secs() -> u64 {
     30
 }
 
-/// Recognised backend names. Anything else is a config error
-/// reported at startup.
-const KNOWN_BACKENDS: &[&str] = &["none", "playwright"];
+/// Recognised backend names. The set is closed — anything else
+/// is a config error reported at startup. Each non-"none" entry
+/// is gated on a Cargo feature; selecting one whose feature is
+/// disabled yields [`BrowserError::FeatureNotCompiled`].
+pub const KNOWN_BACKENDS: &[&str] = &["none", "headless_chrome", "playwright", "webdriver"];
 
-/// One row of [`BrowserBackend::list_sessions`] output. The
-/// honesty contract above means most fields are `None` /
-/// `"unconnected"` until a real backend ships.
+/// One row of [`BrowserBackend::list_sessions`] output.
 #[derive(Debug, Clone)]
 pub struct BrowserSessionView {
     pub session_id: String,
@@ -113,9 +153,11 @@ pub struct BrowserSessionView {
     pub status: String,
 }
 
-/// Public backend interface. The `"none"` backend ([`NoneBackend`])
-/// implements all four mutating methods as `BackendNotConnected`
-/// — see module docs.
+/// Public backend interface. Implemented by [`NoneBackend`] and
+/// by each feature-gated backend module. The trait surface is
+/// FROZEN in PH-BROWSER-FEATURES — subagents working on
+/// PH-BROWSER-HC / -PW / -WD must not extend it without a
+/// coordinated migration.
 pub trait BrowserBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn open_session(&self) -> Result<String, BrowserError>;
@@ -127,8 +169,10 @@ pub trait BrowserBackend: Send + Sync {
 }
 
 /// Backend error variants. `BackendNotConnected` is the
-/// honesty-contract default for every non-trivial method
-/// until a real backend lands.
+/// honesty-contract default for non-trivial methods until a
+/// live backend lands. `FeatureNotCompiled` /
+/// `InvalidBackend` are the loud startup errors from
+/// [`build_backend`] / [`validate_config`].
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BrowserError {
     #[error("backend not connected: {reason}")]
@@ -139,144 +183,106 @@ pub enum BrowserError {
     SessionCapReached { max: usize },
     #[error("invalid url: {url}")]
     InvalidUrl { url: String },
-    #[error("invalid backend '{name}' (allowed: none|playwright)")]
+    /// PH-BROWSER-FEATURES: the operator's `backend = "..."`
+    /// selector doesn't match any known backend name.
+    #[error("invalid backend '{name}' (allowed: {})", KNOWN_BACKENDS.join("|"))]
     InvalidBackend { name: String },
+    /// PH-BROWSER-FEATURES: the operator's `backend = "..."`
+    /// selector matches a known backend, but this Relix build
+    /// was compiled without the corresponding Cargo feature.
+    /// Loud-fail at startup; no silent fallback.
+    #[error(
+        "backend '{backend}' requires the '{feature}' Cargo feature; \
+         rebuild with `--features {feature}` or set `backend = \"none\"` \
+         in `[tool.browser]`"
+    )]
+    FeatureNotCompiled {
+        backend: String,
+        feature: &'static str,
+    },
 }
 
-/// The shipped backend. Allocates session ids on `open_session`
-/// (and tracks them in a small in-memory map so `list_sessions`
-/// surfaces what the operator opened) but refuses every
-/// downstream navigate / get_text / screenshot call with a
-/// `BackendNotConnected` error. Honest scaffold; future
-/// `PlaywrightBackend` will satisfy the same trait.
-pub struct NoneBackend {
-    max_sessions: usize,
-    sessions: Mutex<HashMap<String, NoneSession>>,
-    reason: String,
-}
-
-#[derive(Debug, Clone)]
-struct NoneSession {
-    opened_at: i64,
-}
-
-impl NoneBackend {
-    pub fn new(cfg: &BrowserConfig, reason: impl Into<String>) -> Self {
-        Self {
-            max_sessions: cfg.max_sessions,
-            sessions: Mutex::new(HashMap::new()),
-            reason: reason.into(),
-        }
-    }
-}
-
-impl BrowserBackend for NoneBackend {
-    fn name(&self) -> &'static str {
-        "none"
-    }
-
-    fn open_session(&self) -> Result<String, BrowserError> {
-        let mut guard = self.sessions.lock().expect("none backend lock");
-        if guard.len() >= self.max_sessions {
-            return Err(BrowserError::SessionCapReached {
-                max: self.max_sessions,
-            });
-        }
-        let id = new_session_id();
-        guard.insert(
-            id.clone(),
-            NoneSession {
-                opened_at: unix_secs(),
-            },
-        );
-        Ok(id)
-    }
-
-    fn close_session(&self, session_id: &str) -> Result<(), BrowserError> {
-        let mut guard = self.sessions.lock().expect("none backend lock");
-        guard
-            .remove(session_id)
-            .map(|_| ())
-            .ok_or(BrowserError::SessionNotFound {
-                session_id: session_id.to_string(),
-            })
-    }
-
-    fn navigate(&self, session_id: &str, _url: &str) -> Result<(), BrowserError> {
-        self.require_session(session_id)?;
-        Err(BrowserError::BackendNotConnected {
-            reason: self.reason.clone(),
-        })
-    }
-
-    fn get_text(&self, session_id: &str) -> Result<String, BrowserError> {
-        self.require_session(session_id)?;
-        Err(BrowserError::BackendNotConnected {
-            reason: self.reason.clone(),
-        })
-    }
-
-    fn screenshot(&self, session_id: &str) -> Result<Vec<u8>, BrowserError> {
-        self.require_session(session_id)?;
-        Err(BrowserError::BackendNotConnected {
-            reason: self.reason.clone(),
-        })
-    }
-
-    fn list_sessions(&self) -> Result<Vec<BrowserSessionView>, BrowserError> {
-        let guard = self.sessions.lock().expect("none backend lock");
-        let mut out: Vec<BrowserSessionView> = guard
-            .iter()
-            .map(|(id, sess)| BrowserSessionView {
-                session_id: id.clone(),
-                opened_at: sess.opened_at,
-                current_url: None,
-                page_title: None,
-                status: "unconnected".to_string(),
-            })
-            .collect();
-        out.sort_by_key(|r| r.opened_at);
-        Ok(out)
-    }
-}
-
-impl NoneBackend {
-    fn require_session(&self, session_id: &str) -> Result<(), BrowserError> {
-        let guard = self.sessions.lock().expect("none backend lock");
-        if guard.contains_key(session_id) {
-            Ok(())
-        } else {
-            Err(BrowserError::SessionNotFound {
-                session_id: session_id.to_string(),
-            })
-        }
-    }
-}
-
-/// Construct a backend from operator config. `cfg.backend`
-/// values:
-/// - `"none"` (default) → [`NoneBackend`] with a neutral reason
-/// - `"playwright"`     → [`NoneBackend`] with a reason that
-///   names the missing integration (operators see the gap; we
-///   never silently downgrade)
-/// - anything else      → `InvalidBackend` config error
+/// Construct a backend from operator config.
+///
+/// Outcomes:
+/// - `cfg.backend == "none"` → [`NoneBackend`] with a neutral
+///   "operator selected none" reason.
+/// - `cfg.backend == "<known>"` and that backend's Cargo
+///   feature is compiled → live backend (today: a labeled
+///   scaffold that returns BackendNotConnected and names the
+///   upcoming milestone).
+/// - `cfg.backend == "<known>"` and the feature is NOT
+///   compiled → [`BrowserError::FeatureNotCompiled`].
+/// - Anything else → [`BrowserError::InvalidBackend`].
+///
+/// The error variants are designed to be surfaced fatally by
+/// the caller (see `ToolBackend::new` which calls
+/// [`validate_config`] at startup). The tool node never falls
+/// back to NoneBackend silently when an operator selected a
+/// different backend.
 pub fn build_backend(cfg: &BrowserConfig) -> Result<Arc<dyn BrowserBackend>, BrowserError> {
-    if !KNOWN_BACKENDS.contains(&cfg.backend.as_str()) {
-        return Err(BrowserError::InvalidBackend {
-            name: cfg.backend.clone(),
-        });
+    match cfg.backend.as_str() {
+        "none" => {
+            let reason = "operator selected backend=\"none\" — capability surface is wired \
+                          but no real browser backend is active in this Relix build"
+                .to_string();
+            Ok(Arc::new(NoneBackend::new(cfg, reason)))
+        }
+        "headless_chrome" => build_headless_chrome(cfg),
+        "playwright" => build_playwright(cfg),
+        "webdriver" => build_webdriver(cfg),
+        other => Err(BrowserError::InvalidBackend {
+            name: other.to_string(),
+        }),
     }
-    let reason = match cfg.backend.as_str() {
-        "none" => "operator selected backend=\"none\" — capability surface is wired \
-                   but no real browser backend ships in this Relix build yet"
-            .to_string(),
-        "playwright" => "backend=\"playwright\" is reserved for a future CW4 follow-up milestone; \
-             today the surface is wired but the live integration is not connected. \
-             See docs/browser-tool.md."
-            .to_string(),
-        _ => unreachable!("KNOWN_BACKENDS check above"),
-    };
-    Ok(Arc::new(NoneBackend::new(cfg, reason)))
+}
+
+/// PH-BROWSER-FEATURES: cheap pre-flight check used by
+/// `ToolBackend::new` to surface a fatal startup error before
+/// the dispatch bridge is wired. Functionally equivalent to
+/// `build_backend(cfg).map(|_| ())` — kept as a separate
+/// function so the caller's intent ("validate, don't keep the
+/// backend") is explicit at the call site.
+pub fn validate_config(cfg: &BrowserConfig) -> Result<(), BrowserError> {
+    build_backend(cfg).map(|_| ())
+}
+
+// ── Feature-gated build helpers ───────────────────────────────────
+
+#[cfg(feature = "browser-headless-chrome")]
+fn build_headless_chrome(cfg: &BrowserConfig) -> Result<Arc<dyn BrowserBackend>, BrowserError> {
+    headless_chrome::try_build(cfg)
+}
+#[cfg(not(feature = "browser-headless-chrome"))]
+fn build_headless_chrome(_cfg: &BrowserConfig) -> Result<Arc<dyn BrowserBackend>, BrowserError> {
+    Err(BrowserError::FeatureNotCompiled {
+        backend: "headless_chrome".to_string(),
+        feature: "browser-headless-chrome",
+    })
+}
+
+#[cfg(feature = "browser-playwright")]
+fn build_playwright(cfg: &BrowserConfig) -> Result<Arc<dyn BrowserBackend>, BrowserError> {
+    playwright::try_build(cfg)
+}
+#[cfg(not(feature = "browser-playwright"))]
+fn build_playwright(_cfg: &BrowserConfig) -> Result<Arc<dyn BrowserBackend>, BrowserError> {
+    Err(BrowserError::FeatureNotCompiled {
+        backend: "playwright".to_string(),
+        feature: "browser-playwright",
+    })
+}
+
+#[cfg(feature = "browser-webdriver")]
+fn build_webdriver(cfg: &BrowserConfig) -> Result<Arc<dyn BrowserBackend>, BrowserError> {
+    webdriver::try_build(cfg)
+}
+#[cfg(not(feature = "browser-webdriver"))]
+fn build_webdriver(_cfg: &BrowserConfig) -> Result<Arc<dyn BrowserBackend>, BrowserError> {
+    Err(BrowserError::FeatureNotCompiled {
+        backend: "webdriver".to_string(),
+        feature: "browser-webdriver",
+    })
 }
 
 // ─────────────────────────── Capability descriptors ───────────────────────
@@ -330,7 +336,7 @@ pub fn descriptor_navigate() -> CapabilityDescriptor {
     d.requires_groups = vec!["operators".into()];
     d.description = Some(
         "Navigate a browser session to a URL. Honesty: returns \
-         BackendNotConnected today; a future milestone wires a real backend."
+         BackendNotConnected until the selected backend's live impl ships."
             .into(),
     );
     d.categories = vec!["browser".into(), "navigation".into()];
@@ -382,8 +388,9 @@ pub fn descriptor_list_sessions() -> CapabilityDescriptor {
 }
 
 /// Register every browser.* capability onto the dispatch bridge.
-/// Caller is `tool::register` in `mod.rs` — only invoked when
-/// `[tool.browser]` is present in the operator config.
+/// Caller is `tool::register` in `tool/mod.rs` — only invoked
+/// when `[tool.browser]` is present in the operator config AND
+/// the config validated successfully at `ToolBackend::new` time.
 pub fn register(bridge: &mut DispatchBridge, backend: Arc<dyn BrowserBackend>) {
     let b = backend.clone();
     bridge.register(
@@ -476,9 +483,9 @@ fn handle_navigate(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) -> HandlerO
                 .into(),
         );
     }
-    // Cheap URL sanity check — refuse `javascript:` / data:
-    // anywhere even though no real navigation happens today,
-    // so the contract holds when a real backend lands.
+    // Cheap URL sanity check — refuse `javascript:` / `data:`
+    // anywhere even though no real navigation happens today, so
+    // the contract holds when a real backend lands.
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("javascript:") || lower.starts_with("data:") {
         return to_envelope(&BrowserError::InvalidUrl {
@@ -555,10 +562,11 @@ fn utf8_arg(ctx: &InvocationCtx, who: &str) -> Result<String, HandlerOutcome> {
 fn to_envelope(e: &BrowserError) -> HandlerOutcome {
     let kind = match e {
         BrowserError::BackendNotConnected { .. } => error_kinds::RESPONDER_INTERNAL,
-        BrowserError::SessionNotFound { .. } => error_kinds::INVALID_ARGS,
-        BrowserError::SessionCapReached { .. } => error_kinds::INVALID_ARGS,
-        BrowserError::InvalidUrl { .. } => error_kinds::INVALID_ARGS,
-        BrowserError::InvalidBackend { .. } => error_kinds::INVALID_ARGS,
+        BrowserError::SessionNotFound { .. }
+        | BrowserError::SessionCapReached { .. }
+        | BrowserError::InvalidUrl { .. }
+        | BrowserError::InvalidBackend { .. }
+        | BrowserError::FeatureNotCompiled { .. } => error_kinds::INVALID_ARGS,
     };
     HandlerOutcome::Err(ErrorEnvelope {
         kind,
@@ -577,7 +585,7 @@ fn invalid(cause: String) -> HandlerOutcome {
     })
 }
 
-fn new_session_id() -> String {
+pub(crate) fn new_session_id() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -589,7 +597,7 @@ fn new_session_id() -> String {
     s
 }
 
-fn unix_secs() -> i64 {
+pub(crate) fn unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -617,27 +625,135 @@ mod tests {
     }
 
     #[test]
-    fn build_backend_playwright_returns_unconnected_none() {
+    fn build_backend_rejects_unknown_name() {
+        let mut c = cfg();
+        c.backend = "chrome-extension-thing".into();
+        match build_backend(&c) {
+            Ok(_) => panic!("expected InvalidBackend, got Ok"),
+            Err(BrowserError::InvalidBackend { name }) => {
+                assert_eq!(name, "chrome-extension-thing");
+            }
+            Err(other) => panic!("expected InvalidBackend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_config_passes_for_none() {
+        let mut c = cfg();
+        c.backend = "none".into();
+        validate_config(&c).expect("none must validate");
+    }
+
+    #[test]
+    fn validate_config_loud_fail_unknown_backend() {
+        let mut c = cfg();
+        c.backend = "made-up".into();
+        let res = validate_config(&c);
+        match res {
+            Err(BrowserError::InvalidBackend { name }) => assert_eq!(name, "made-up"),
+            Err(other) => panic!("expected InvalidBackend, got {other:?}"),
+            Ok(()) => panic!("expected InvalidBackend, got Ok"),
+        }
+    }
+
+    /// PH-BROWSER-FEATURES: with NO browser features compiled
+    /// (the default `cargo build` posture), each non-"none"
+    /// backend must fail-loudly at startup. This test asserts
+    /// the shape of that failure for each backend name. When
+    /// the corresponding feature IS enabled, the failure
+    /// switches to a scaffold success (see the
+    /// `feature_*_compiled_builds_scaffold` tests below).
+    /// `Result<Arc<dyn BrowserBackend>, BrowserError>` cannot be
+    /// Debug-formatted (trait object lacks Debug). Helpers below
+    /// reduce a `build_backend` result to "succeeded with name X"
+    /// or "failed with FeatureNotCompiled(backend, feature)" so
+    /// the per-backend tests don't try to format the trait
+    /// object.
+    #[allow(dead_code)] // only used when the matching feature is OFF
+    fn assert_feature_not_compiled(
+        res: Result<Arc<dyn BrowserBackend>, BrowserError>,
+        expected_backend: &str,
+        expected_feature: &str,
+    ) {
+        match res {
+            Err(BrowserError::FeatureNotCompiled { backend, feature }) => {
+                assert_eq!(backend, expected_backend);
+                assert_eq!(feature, expected_feature);
+            }
+            Err(other) => {
+                panic!("expected FeatureNotCompiled for {expected_backend}, got {other:?}")
+            }
+            Ok(_) => panic!("expected FeatureNotCompiled for {expected_backend}, got Ok"),
+        }
+    }
+
+    #[allow(dead_code)] // only used under the three browser-* features
+    fn assert_scaffold_built_with_name(
+        res: Result<Arc<dyn BrowserBackend>, BrowserError>,
+        expected_name: &str,
+    ) {
+        match res {
+            Ok(b) => assert_eq!(b.name(), expected_name),
+            Err(e) => panic!(
+                "expected scaffold success with feature enabled for {expected_name}, got {e:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn build_backend_headless_chrome_without_feature_fails_loud() {
+        let mut c = cfg();
+        c.backend = "headless_chrome".into();
+        let res = build_backend(&c);
+        #[cfg(not(feature = "browser-headless-chrome"))]
+        assert_feature_not_compiled(res, "headless_chrome", "browser-headless-chrome");
+        #[cfg(feature = "browser-headless-chrome")]
+        assert_scaffold_built_with_name(res, "headless_chrome");
+    }
+
+    #[test]
+    fn build_backend_playwright_without_feature_fails_loud() {
         let mut c = cfg();
         c.backend = "playwright".into();
-        // Today playwright resolves to a NoneBackend (with a
-        // pointed reason). When the real impl ships it would
-        // return a PlaywrightBackend wired up.
-        let b = build_backend(&c).unwrap();
+        let res = build_backend(&c);
+        #[cfg(not(feature = "browser-playwright"))]
+        assert_feature_not_compiled(res, "playwright", "browser-playwright");
+        #[cfg(feature = "browser-playwright")]
+        assert_scaffold_built_with_name(res, "playwright");
+    }
+
+    #[test]
+    fn build_backend_webdriver_without_feature_fails_loud() {
+        let mut c = cfg();
+        c.backend = "webdriver".into();
+        let res = build_backend(&c);
+        #[cfg(not(feature = "browser-webdriver"))]
+        assert_feature_not_compiled(res, "webdriver", "browser-webdriver");
+        #[cfg(feature = "browser-webdriver")]
+        assert_scaffold_built_with_name(res, "webdriver");
+    }
+
+    /// PH-BROWSER-FEATURES: under any feature combination, the
+    /// "none" path always succeeds — operators can fall back to
+    /// it deliberately by editing `[tool.browser] backend =
+    /// "none"`, but the build path never silently downgrades
+    /// to it from a different selector.
+    #[test]
+    fn build_backend_none_always_succeeds_regardless_of_features() {
+        let mut c = cfg();
+        c.backend = "none".into();
+        let b = build_backend(&c).expect("none must always build");
         assert_eq!(b.name(), "none");
     }
 
     #[test]
-    fn build_backend_rejects_unknown_name() {
-        let mut c = cfg();
-        c.backend = "chrome-extension-thing".into();
-        // build_backend returns Result<Arc<dyn ...>, BrowserError>;
-        // Arc<dyn trait> doesn't derive Debug, so explicit match.
-        match build_backend(&c) {
-            Ok(_) => panic!("expected InvalidBackend, got Ok"),
-            Err(BrowserError::InvalidBackend { .. }) => {}
-            Err(other) => panic!("expected InvalidBackend, got {other:?}"),
-        }
+    fn known_backends_constant_covers_every_named_path() {
+        // Honesty contract: the closed set must match the
+        // match arms in build_backend. If a future commit adds
+        // a fifth backend name without updating KNOWN_BACKENDS,
+        // this test fires.
+        let expected = ["none", "headless_chrome", "playwright", "webdriver"];
+        assert_eq!(KNOWN_BACKENDS, expected);
     }
 
     #[test]
@@ -659,6 +775,21 @@ mod tests {
         b.open_session().unwrap();
         let err = b.open_session().unwrap_err();
         assert!(matches!(err, BrowserError::SessionCapReached { max: 2 }));
+    }
+
+    /// PH-BROWSER-FEATURES: even with a max_sessions of 1 the
+    /// session cap must be enforced (regression guard for the
+    /// off-by-one that a future refactor could introduce).
+    #[test]
+    fn open_session_cap_of_one_is_enforced() {
+        let mut c = cfg();
+        c.max_sessions = 1;
+        let b = build_backend(&c).unwrap();
+        b.open_session().unwrap();
+        match b.open_session() {
+            Err(BrowserError::SessionCapReached { max: 1 }) => {}
+            other => panic!("expected SessionCapReached(1), got {other:?}"),
+        }
     }
 
     #[test]
@@ -729,14 +860,9 @@ mod tests {
     }
 
     /// PH-RISK-PIN-ALL: pin the risk tier of every browser
-    /// descriptor. Pure reads (get_text / screenshot / list)
-    /// are Safe; session lifecycle (open / close — internal
-    /// allocation only) is Low; navigate (network egress) is
-    /// Medium. Tiers reflect the EVENTUAL backend behavior;
-    /// today the NoneBackend returns BackendNotConnected, but
-    /// when the live backend lands (D-008) the tiers already
-    /// describe what each capability does — no scaffold→live
-    /// transition surprise.
+    /// descriptor. PH-BROWSER-FEATURES preserves the pinned
+    /// tiers — the trait surface didn't change, so the risk
+    /// posture per capability doesn't either.
     #[test]
     fn browser_descriptors_have_explicit_non_unknown_risk() {
         let pinned: &[(&str, CapabilityDescriptor, RiskLevel)] = &[
@@ -782,5 +908,53 @@ mod tests {
                 "{name} risk tier drifted (expected {expected:?})"
             );
         }
+    }
+
+    /// PH-BROWSER-FEATURES: per-feature scaffold check. The
+    /// scaffold for each backend must:
+    /// 1. Report `name()` matching the canonical backend label
+    ///    (not "none") — so the dashboard shows what the
+    ///    operator chose.
+    /// 2. Refuse navigate / get_text / screenshot with
+    ///    BackendNotConnected (no fake success).
+    ///
+    /// These tests only run when the corresponding feature is
+    /// compiled. With no features the runtime tests still
+    /// cover the "none" path + the feature-not-compiled error
+    /// shape above.
+    #[cfg(feature = "browser-headless-chrome")]
+    #[test]
+    fn feature_headless_chrome_compiled_builds_scaffold() {
+        let mut c = cfg();
+        c.backend = "headless_chrome".into();
+        let b = build_backend(&c).expect("scaffold should build");
+        assert_eq!(b.name(), "headless_chrome");
+        let id = b.open_session().expect("session");
+        let err = b.navigate(&id, "https://example.com/").unwrap_err();
+        assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
+    }
+
+    #[cfg(feature = "browser-playwright")]
+    #[test]
+    fn feature_playwright_compiled_builds_scaffold() {
+        let mut c = cfg();
+        c.backend = "playwright".into();
+        let b = build_backend(&c).expect("scaffold should build");
+        assert_eq!(b.name(), "playwright");
+        let id = b.open_session().expect("session");
+        let err = b.navigate(&id, "https://example.com/").unwrap_err();
+        assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
+    }
+
+    #[cfg(feature = "browser-webdriver")]
+    #[test]
+    fn feature_webdriver_compiled_builds_scaffold() {
+        let mut c = cfg();
+        c.backend = "webdriver".into();
+        let b = build_backend(&c).expect("scaffold should build");
+        assert_eq!(b.name(), "webdriver");
+        let id = b.open_session().expect("session");
+        let err = b.navigate(&id, "https://example.com/").unwrap_err();
+        assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
     }
 }

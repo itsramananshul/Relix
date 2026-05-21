@@ -243,11 +243,29 @@ be found / launched, the backend continues to return
 `BackendNotConnected` with the specific reason — never fakes
 success.
 
-**Status.** open — answer needed before CW4 ships a live
-backend. Pure additive change once decided; the existing
-`BrowserBackend` trait + `NoneBackend` impl + descriptors
-stay in place and a `HeadlessChromeBackend` / `PlaywrightBackend`
-slot in via the existing build_backend() path.
+**Status.** PH-BROWSER-FEATURES — multi-backend feature plan
+accepted. Operator picks at runtime via `[tool.browser] backend
+= "..."` from `{none | headless_chrome | playwright | webdriver}`;
+each non-`none` backend is gated on its own Cargo feature
+(`browser-headless-chrome` / `-playwright` / `-webdriver`).
+Selecting a backend whose feature isn't compiled in fails
+LOUDLY at startup (`ToolError::Build`) — no silent
+`NoneBackend` fallback. The three live drivers land in
+follow-up milestones (PH-BROWSER-HC, PH-BROWSER-PW,
+PH-BROWSER-WD); today each feature compiles a labeled
+scaffold that surfaces the operator's choice in the
+dashboard but refuses navigate / get_text / screenshot
+with a `BackendNotConnected` reason naming the upcoming
+milestone tag.
+
+Recommendation note for operators who don't want to install
+extra runtimes: pick `headless_chrome` — no Node, no sidecar,
+just the operator's existing `chrome` / `chromium` binary.
+This is now reflected in `docs/browser-tool.md` ("Recommended
+default" section).
+
+PH-BROWSER-D008-RESOLVE will flip this entry to "shipped" once
+the three live drivers land.
 
 **Context.** Hermes uses `contextvars.ContextVar` to thread the
 write-origin label through nested async tool calls without

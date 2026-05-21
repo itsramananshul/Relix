@@ -1,12 +1,19 @@
-# Browser tool (CW4)
+# Browser tool (CW4 / PH-BROWSER-FEATURES)
 
 `tool.browser.*` ships the **capability surface** for browser
-automation. As of this milestone there is **no live browser
-backend** wired — every navigate / get_text / screenshot call
-returns a typed `BackendNotConnected` error. The wire format,
-session model, capability descriptors, manifest advertisement,
-and dispatch path are all real. A future milestone wires a
-real Playwright (or CDP) backend behind the same trait.
+automation behind a pluggable `BrowserBackend` trait. As of
+PH-BROWSER-FEATURES the runtime is structured for three live
+backends — `headless_chrome`, `playwright`, and `webdriver` —
+each gated on a Cargo feature. Their implementations land in
+follow-up milestones (PH-BROWSER-HC / -PW / -WD). Until the
+respective live driver lands, each feature-stub returns a
+labeled scaffold that surfaces the operator's chosen backend
+name in `list_sessions` / dashboard but refuses every
+navigate / get_text / screenshot call with a
+`BackendNotConnected` error whose reason explicitly names the
+upcoming milestone tag. The wire format, session model,
+capability descriptors, manifest advertisement, and dispatch
+path are stable across the scaffold→live transition.
 
 ## Honesty contract
 
@@ -35,23 +42,70 @@ The operator CANNOT today:
 
 ```toml
 [tool.browser]
-# "none" (default) wires the surface but returns
-# BackendNotConnected on every navigate/get_text/screenshot.
-# "playwright" is reserved for a future milestone — selecting
-# it today returns BackendNotConnected with a pointed reason
-# explaining the integration is pending.
+# One of: "none" | "headless_chrome" | "playwright" | "webdriver"
+# - "none" (default) wires the surface but returns
+#   BackendNotConnected on every navigate / get_text /
+#   screenshot.
+# - "headless_chrome" requires --features browser-headless-chrome.
+#   PH-BROWSER-FEATURES ships a scaffold; PH-BROWSER-HC will
+#   land the live Chrome DevTools Protocol driver.
+# - "playwright" requires --features browser-playwright.
+#   PH-BROWSER-PW will land the live Playwright sidecar driver.
+# - "webdriver" requires --features browser-webdriver.
+#   PH-BROWSER-WD will land the live fantoccini / WebDriver
+#   driver.
 backend = "none"
-# Per-node cap on live sessions. Protects future real backends
-# from runaway allocation.
+# Per-node cap on live sessions. Enforced by every backend
+# (including scaffolds) — protects future real backends from
+# runaway allocation.
 max_sessions = 16
 # Per-call deadline (seconds). Returned in error envelopes
-# even though no real call ever times out today.
+# even when the scaffold has nothing to time out yet.
 call_timeout_secs = 30
 ```
+
+Selecting a backend whose feature flag isn't compiled into
+this Relix build is a **loud startup error** —
+`ToolBackend::new` returns `ToolError::Build` and the tool node
+fails to construct. There is **no silent fallback** to
+`NoneBackend`: the operator's intent ("I chose
+`headless_chrome`") is not quietly overridden.
 
 When the `[tool.browser]` section is absent the capability
 family is NOT registered (operators see no `tool.browser.*`
 methods in `relix-cli capability ls`).
+
+## Building with backends enabled
+
+```bash
+# Default — only the "none" backend is available.
+cargo build -p relix-controller
+
+# Compile a single backend in.
+cargo build -p relix-controller --features relix-runtime/browser-headless-chrome
+cargo build -p relix-controller --features relix-runtime/browser-playwright
+cargo build -p relix-controller --features relix-runtime/browser-webdriver
+
+# All three at once (handy for the dev test matrix).
+cargo build -p relix-controller --features relix-runtime/browser-all
+```
+
+The flags are additive — multiple backends can be compiled in
+the same binary, with the active one selected at runtime via
+`[tool.browser] backend = "..."`. Operators on machines with
+only one runtime installed should compile only the matching
+feature to keep the binary small.
+
+## Recommended default (D-008)
+
+`headless_chrome` is the recommended default for operators
+who don't want to install extra runtimes — no Node, no
+sidecar driver process, no npm package. Just a `chrome` /
+`chromium` binary that's already on most operator machines.
+Operators who need multi-engine coverage (Firefox / WebKit)
+should pick `playwright`; operators who want W3C-standards
+alignment with their existing automation should pick
+`webdriver`.
 
 ## Why ship the surface before the backend?
 
@@ -69,14 +123,26 @@ methods in `relix-cli capability ls`).
 
 ## Future milestones
 
-- **CW4-A**: Playwright backend. Pure backend swap behind the
-  existing `BrowserBackend` trait. Adds tab management,
-  click/type/scroll primitives, screenshot persistence.
-- **CW4-B**: dashboard browser-session inspector — live page
-  title, current URL, last screenshot thumbnail.
-- **CW4-C**: chronicle event for every navigate (post-real-
-  backend).
-- **CW4-D**: cooperative cancel via the existing
+- **PH-BROWSER-HC**: live Chrome DevTools Protocol driver
+  behind `--features browser-headless-chrome`. Replaces the
+  scaffold in `browser/headless_chrome.rs` with a real
+  driver against the operator's `chrome` / `chromium`
+  binary. Recommended default per D-008.
+- **PH-BROWSER-PW**: live Playwright sidecar driver behind
+  `--features browser-playwright`. Best multi-engine
+  coverage; heaviest install.
+- **PH-BROWSER-WD**: live fantoccini / WebDriver driver
+  behind `--features browser-webdriver`. Most W3C-y;
+  requires operator-supplied driver binary.
+- **PH-BROWSER-D008-RESOLVE**: flip D-008 from "open" to
+  "shipped all three behind features" once the live drivers
+  land.
+- **PH-BROWSER-DASH**: dashboard browser-session inspector —
+  live page title, current URL, last screenshot thumbnail
+  (post-real-backend).
+- **PH-BROWSER-CHRONICLE**: chronicle event for every
+  navigate (post-real-backend).
+- **PH-BROWSER-CANCEL**: cooperative cancel via the existing
   `task.pause` / `task.freeze` semantics.
 
 ## Security model (forward-looking)

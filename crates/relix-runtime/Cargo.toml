@@ -49,6 +49,23 @@ hyper.workspace = true
 # Logging
 tracing.workspace = true
 
+[features]
+# PH-BROWSER-FEATURES — per-backend opt-in flags. Default
+# build ships the NoneBackend honest scaffold only.
+# Selecting `backend = "<name>"` in `[tool.browser]` requires
+# the corresponding feature; otherwise the tool node fails
+# loudly at startup (no silent fallback to NoneBackend).
+default = []
+browser-headless-chrome = []
+browser-playwright = []
+browser-webdriver = []
+# Convenience: turn on all three backend features at once.
+browser-all = [
+    "browser-headless-chrome",
+    "browser-playwright",
+    "browser-webdriver",
+]
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
