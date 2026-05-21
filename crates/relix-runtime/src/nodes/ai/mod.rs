@@ -52,7 +52,12 @@
 //! Provider keys live ONLY here on the AI node — never in `relix-web-bridge`
 //! or any presentation peer.
 
+pub mod failover;
 pub mod provider;
+
+pub use failover::{
+    FailoverCategory, FailoverReason, classify_http_failure, classify_transport_failure,
+};
 
 use std::sync::Arc;
 

@@ -6190,12 +6190,22 @@ function renderProviderRoutingTraceBlock(p) {
           ? ' (HTTP ' + escapeHtml(String(p.last_failure_status_code)) + ')'
           : '')
     : '';
+  // H1: Hermes-style failover-reason badge surfaces the
+  // typed classification (rate-limit / context-overflow /
+  // auth-rejected / …) so operators don't have to parse
+  // free-form detail strings to know what broke.
+  const reasonBadge = p.last_failure_reason
+    ? ' <span class="badge warn" title="failover reason">'
+        + escapeHtml(String(p.last_failure_reason))
+        + '</span>'
+    : '';
   return '<div class="provider-meta">routing trace '
     + '<span class="badge ' + relCls + '">'
     + (reliability != null ? reliability + '% ok' : '—')
     + '</span> &middot; '
     + oks + ' ok / ' + fails + ' fail'
     + lastFailPart
+    + reasonBadge
     + '</div>';
 }
 

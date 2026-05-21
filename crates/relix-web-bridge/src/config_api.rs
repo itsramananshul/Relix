@@ -292,6 +292,28 @@ pub async fn test_provider(
     // last-tested badge on the provider card without re-running.
     // Best-effort — a persist failure logs at warn but the
     // live response still ships, so the operator isn't blocked.
+    //
+    // H1: when the test failed AND we have an upstream HTTP
+    // status, classify the failure into a typed
+    // FailoverReason so the dashboard surfaces "rate-limit"
+    // vs "context-overflow" vs "auth-rejected" etc. without
+    // parsing the free-form detail string.
+    let failure_reason_label = if result.ok {
+        None
+    } else if let Some(code) = result.status_code {
+        Some(
+            relix_runtime::nodes::ai::classify_http_failure(code, &result.detail)
+                .label()
+                .to_string(),
+        )
+    } else {
+        // Transport-class failure: no HTTP status came back.
+        Some(
+            relix_runtime::nodes::ai::classify_transport_failure(&result.detail)
+                .label()
+                .to_string(),
+        )
+    };
     let cache_persist = state.secrets.mutate(|s| {
         s.record_provider_test(
             &name,
@@ -299,6 +321,7 @@ pub async fn test_provider(
             result.status_code,
             result.elapsed_ms,
             result.detail.clone(),
+            failure_reason_label.as_deref(),
         )
     });
     if let Err(e) = cache_persist {

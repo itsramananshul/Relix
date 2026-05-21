@@ -717,6 +717,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_provider_failover_reason_badge_present() {
+        // H1 (Hermes-style): provider routing-trace block renders
+        // the typed failover-reason badge (rate-limit / context-overflow
+        // / auth-rejected / …) when present.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "p.last_failure_reason",
+            "Hermes-style failover-reason badge",
+            "title=\"failover reason\"",
+        ] {
+            assert!(body.contains(needle), "H1 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_firehose_summary_column_present() {
         // H2 (Hermes-style): the firehose rows render the
         // server-supplied one-line `summary` projection in

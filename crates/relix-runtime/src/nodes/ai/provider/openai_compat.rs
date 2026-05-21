@@ -112,7 +112,17 @@ impl ChatProvider for OpenAICompatibleProvider {
         }
 
         let resp = req.send().await.map_err(|e| {
-            ProviderError::Transient(format!("{provider}: http: {e}", provider = self.name))
+            let reason = crate::nodes::ai::classify_transport_failure(&e.to_string());
+            tracing::warn!(
+                provider = %self.name,
+                failover.reason = %reason.label(),
+                "ai.provider: transport failure"
+            );
+            ProviderError::Transient(format!(
+                "{provider}: http [{label}]: {e}",
+                provider = self.name,
+                label = reason.label(),
+            ))
         })?;
         let status = resp.status();
         let text = resp.text().await.map_err(|e| {
@@ -120,8 +130,29 @@ impl ChatProvider for OpenAICompatibleProvider {
         })?;
 
         if !status.is_success() {
-            let perm = !(status.as_u16() == 429 || status.is_server_error());
-            let msg = format!("{}: HTTP {status}: {text}", self.name);
+            // H1: classify the failure into a typed FailoverReason
+            // BEFORE collapsing into Transient/Permanent. The label
+            // lands in both the structured tracing field and the
+            // error message itself so the bridge / dashboard can
+            // surface "rate-limit" vs "context-overflow" vs
+            // "model-not-found" without parsing free-form text.
+            let reason = crate::nodes::ai::classify_http_failure(status.as_u16(), &text);
+            let perm = matches!(
+                reason.category(),
+                crate::nodes::ai::FailoverCategory::Permanent
+            );
+            tracing::warn!(
+                provider = %self.name,
+                http.status = status.as_u16(),
+                failover.reason = %reason.label(),
+                failover.category = ?reason.category(),
+                "ai.provider: http failure"
+            );
+            let msg = format!(
+                "{}: HTTP {status} [{label}]: {text}",
+                self.name,
+                label = reason.label(),
+            );
             return Err(if perm {
                 ProviderError::Permanent(msg)
             } else {

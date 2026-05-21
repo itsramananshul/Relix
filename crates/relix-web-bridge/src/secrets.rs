@@ -161,6 +161,13 @@ pub struct ProviderEntry {
     /// transport-layer failures or when never failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_status_code: Option<u16>,
+    /// H1: Hermes-style structured failover reason label
+    /// (`rate-limit`, `context-overflow`, `auth-rejected`, …)
+    /// captured from the most recent failure. Lets operators
+    /// scan for "always failing the same way" vs "flapping
+    /// across reasons" without parsing free-form bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_reason: Option<String>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -261,6 +268,11 @@ pub struct ProviderStatus {
     /// Most recent failure HTTP status code (when reached).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure_status_code: Option<u16>,
+    /// H1: Hermes-style failover reason label of the most
+    /// recent failure (e.g. `rate-limit`, `context-overflow`).
+    /// `None` when the provider has never failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_reason: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -378,6 +390,7 @@ impl BridgeSecrets {
                 success_request_count: e.success_request_count,
                 last_failure_at: e.last_failure_at,
                 last_failure_status_code: e.last_failure_status_code,
+                last_failure_reason: e.last_failure_reason.clone(),
             },
             None => ProviderStatus {
                 name: name.to_string(),
@@ -399,6 +412,7 @@ impl BridgeSecrets {
                 success_request_count: 0,
                 last_failure_at: None,
                 last_failure_status_code: None,
+                last_failure_reason: None,
             },
         }
     }
@@ -542,6 +556,7 @@ impl BridgeSecrets {
         let prior_success_count = prior.map(|e| e.success_request_count).unwrap_or(0);
         let prior_last_failure_at = prior.and_then(|e| e.last_failure_at);
         let prior_last_failure_status_code = prior.and_then(|e| e.last_failure_status_code);
+        let prior_last_failure_reason = prior.and_then(|e| e.last_failure_reason.clone());
         self.providers.insert(
             name.to_string(),
             ProviderEntry {
@@ -561,6 +576,7 @@ impl BridgeSecrets {
                 success_request_count: prior_success_count,
                 last_failure_at: prior_last_failure_at,
                 last_failure_status_code: prior_last_failure_status_code,
+                last_failure_reason: prior_last_failure_reason,
             },
         );
     }
@@ -575,6 +591,11 @@ impl BridgeSecrets {
     /// current time. Returns `false` when there's no entry to
     /// stamp (defensive — the test handler validates this
     /// itself before calling).
+    ///
+    /// `failure_reason` is the H1 [`FailoverReason::label`] when
+    /// `ok = false`; ignored on success. Pass `None` when the
+    /// caller hasn't classified the failure (e.g. legacy paths
+    /// that pre-date the H1 classifier).
     pub fn record_provider_test(
         &mut self,
         name: &str,
@@ -582,6 +603,7 @@ impl BridgeSecrets {
         status_code: Option<u16>,
         elapsed_ms: u64,
         detail: impl Into<String>,
+        failure_reason: Option<&str>,
     ) -> bool {
         match self.providers.get_mut(name) {
             Some(e) => {
@@ -601,6 +623,7 @@ impl BridgeSecrets {
                     e.failed_request_count = e.failed_request_count.saturating_add(1);
                     e.last_failure_at = Some(now);
                     e.last_failure_status_code = status_code;
+                    e.last_failure_reason = failure_reason.map(str::to_string);
                 }
                 true
             }
@@ -818,16 +841,32 @@ mod tests {
         // the M58 snapshot.
         let mut s = BridgeSecrets::default();
         s.set_provider("openai", "sk-x".into(), None);
-        s.record_provider_test("openai", true, Some(200), 100, "ok");
-        s.record_provider_test("openai", true, Some(200), 110, "ok");
-        s.record_provider_test("openai", false, Some(429), 50, "rate limited");
-        s.record_provider_test("openai", false, Some(500), 80, "upstream 500");
-        s.record_provider_test("openai", true, Some(200), 120, "ok");
+        s.record_provider_test("openai", true, Some(200), 100, "ok", None);
+        s.record_provider_test("openai", true, Some(200), 110, "ok", None);
+        s.record_provider_test(
+            "openai",
+            false,
+            Some(429),
+            50,
+            "rate limited",
+            Some("rate-limit"),
+        );
+        s.record_provider_test(
+            "openai",
+            false,
+            Some(500),
+            80,
+            "upstream 500",
+            Some("server-5xx"),
+        );
+        s.record_provider_test("openai", true, Some(200), 120, "ok", None);
         let p = s.provider_status("openai");
         assert_eq!(p.success_request_count, 3);
         assert_eq!(p.failed_request_count, 2);
         assert!(p.last_failure_at.is_some());
         assert_eq!(p.last_failure_status_code, Some(500));
+        // H1: most-recent failure reason label is what was passed in.
+        assert_eq!(p.last_failure_reason.as_deref(), Some("server-5xx"));
     }
 
     #[test]
@@ -838,13 +877,15 @@ mod tests {
         // any single API key.
         let mut s = BridgeSecrets::default();
         s.set_provider("openai", "sk-old".into(), None);
-        s.record_provider_test("openai", false, Some(500), 100, "boom");
-        s.record_provider_test("openai", true, Some(200), 90, "ok");
+        s.record_provider_test("openai", false, Some(500), 100, "boom", Some("server-5xx"));
+        s.record_provider_test("openai", true, Some(200), 90, "ok", None);
         s.set_provider("openai", "sk-new".into(), Some("gpt-4o".into()));
         let p = s.provider_status("openai");
         assert_eq!(p.failed_request_count, 1);
         assert_eq!(p.success_request_count, 1);
         assert!(p.last_failure_at.is_some());
+        // H1: failure reason survives the key overwrite.
+        assert_eq!(p.last_failure_reason.as_deref(), Some("server-5xx"));
     }
 
     #[test]
@@ -853,13 +894,21 @@ mod tests {
         let path = tmp.path().join("bridge-secrets.toml");
         let mut s = BridgeSecrets::default();
         s.set_provider("openai", "sk-x".into(), None);
-        s.record_provider_test("openai", false, Some(429), 88, "rate limited");
+        s.record_provider_test(
+            "openai",
+            false,
+            Some(429),
+            88,
+            "rate limited",
+            Some("rate-limit"),
+        );
         s.save(&path).expect("save");
         let s2 = BridgeSecrets::load_or_empty(&path);
         let p = s2.provider_status("openai");
         assert_eq!(p.failed_request_count, 1);
         assert_eq!(p.success_request_count, 0);
         assert_eq!(p.last_failure_status_code, Some(429));
+        assert_eq!(p.last_failure_reason.as_deref(), Some("rate-limit"));
     }
 
     #[test]
@@ -869,7 +918,7 @@ mod tests {
         let p0 = s.provider_status("openai");
         assert!(p0.last_test_at.is_none());
 
-        let applied = s.record_provider_test("openai", true, Some(200), 123, "ok");
+        let applied = s.record_provider_test("openai", true, Some(200), 123, "ok", None);
         assert!(applied);
         let p1 = s.provider_status("openai");
         assert_eq!(p1.last_test_ok, Some(true));
@@ -884,7 +933,7 @@ mod tests {
         let mut s = BridgeSecrets::default();
         // No prior set_provider — the entry doesn't exist, so
         // recording a test against it must noop.
-        let applied = s.record_provider_test("openai", true, None, 0, "noop");
+        let applied = s.record_provider_test("openai", true, None, 0, "noop", None);
         assert!(!applied);
         let p = s.provider_status("openai");
         assert!(p.last_test_at.is_none());
@@ -894,7 +943,7 @@ mod tests {
     fn set_provider_preserves_last_test_cache_across_key_overwrite() {
         let mut s = BridgeSecrets::default();
         s.set_provider("openai", "sk-old".into(), Some("gpt-4o".into()));
-        s.record_provider_test("openai", true, Some(200), 42, "ok ({200})");
+        s.record_provider_test("openai", true, Some(200), 42, "ok ({200})", None);
         // Overwrite the key. The cache must survive — operators
         // can tell the cache is stale by comparing
         // `last_test_at` with `key_set_at`.
@@ -919,7 +968,14 @@ mod tests {
         let path = tmp.path().join("bridge-secrets.toml");
         let mut s = BridgeSecrets::default();
         s.set_provider("openai", "sk-x".into(), None);
-        s.record_provider_test("openai", false, Some(401), 88, "upstream returned 401");
+        s.record_provider_test(
+            "openai",
+            false,
+            Some(401),
+            88,
+            "upstream returned 401",
+            Some("auth-rejected"),
+        );
         s.save(&path).expect("save");
         let s2 = BridgeSecrets::load_or_empty(&path);
         let p = s2.provider_status("openai");

@@ -95,7 +95,18 @@ impl ChatProvider for AnthropicProvider {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(format!("anthropic: http: {e}")))?;
+            .map_err(|e| {
+                let reason = crate::nodes::ai::classify_transport_failure(&e.to_string());
+                tracing::warn!(
+                    provider = "anthropic",
+                    failover.reason = %reason.label(),
+                    "ai.provider: transport failure"
+                );
+                ProviderError::Transient(format!(
+                    "anthropic: http [{label}]: {e}",
+                    label = reason.label(),
+                ))
+            })?;
 
         let status = resp.status();
         let text = resp
@@ -104,8 +115,23 @@ impl ChatProvider for AnthropicProvider {
             .map_err(|e| ProviderError::Transient(format!("anthropic: read body: {e}")))?;
 
         if !status.is_success() {
-            let perm = !(status.as_u16() == 429 || status.is_server_error());
-            let msg = format!("anthropic: HTTP {status}: {text}");
+            // H1: structured classification.
+            let reason = crate::nodes::ai::classify_http_failure(status.as_u16(), &text);
+            let perm = matches!(
+                reason.category(),
+                crate::nodes::ai::FailoverCategory::Permanent
+            );
+            tracing::warn!(
+                provider = "anthropic",
+                http.status = status.as_u16(),
+                failover.reason = %reason.label(),
+                failover.category = ?reason.category(),
+                "ai.provider: http failure"
+            );
+            let msg = format!(
+                "anthropic: HTTP {status} [{label}]: {text}",
+                label = reason.label(),
+            );
             return Err(if perm {
                 ProviderError::Permanent(msg)
             } else {
