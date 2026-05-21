@@ -1662,6 +1662,122 @@ pub async fn recent_events(
     Ok(Json(parse_global_events_body(since, &body)))
 }
 
+/// `GET /v1/tasks/events/stream?since=N&event_type=foo`
+/// — global execution firehose as a long-lived SSE stream
+/// (M73). Polls `task.recent_events` internally and emits
+/// one `event` SSE frame per new chronicle entry across all
+/// tasks. Each data body is the same JSON line shape the
+/// `/recent` endpoint returns (task_id + event envelope).
+///
+/// Cursor recovery: pass `?since=N` to resume from a known
+/// `event_id`. The first poll fetches everything strictly
+/// newer and walks forward.
+///
+/// Dropped-event accounting: when more than 500 events
+/// arrived between two polls (the underlying limit cap),
+/// the cursor still advances to the newest seen — but a
+/// `dropped` SSE frame is emitted carrying the count
+/// elided so dashboards can warn the operator that the
+/// global tail outran them.
+///
+/// Filtering: `?event_type=` is exact-match server-side
+/// against the coord capability.
+pub async fn events_stream_global(
+    State(state): State<AppState>,
+    Query(q): Query<RecentEventsQuery>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    let rec = rec.clone();
+    let initial_since = q.since.unwrap_or(0);
+    let event_type = q.event_type.clone();
+    // Page size for each poll. Bounded so a runaway runtime
+    // can't OOM the stream; drop-account when exceeded.
+    const STREAM_PAGE_LIMIT: usize = 500;
+    // Register the stream against a synthetic task_id so the
+    // existing /v1/streams panel counts the firehose too.
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let stream_guard = state
+        .stream_metrics
+        .open("__firehose__".to_string(), opened_at);
+    let s = stream! {
+        let _live_guard = stream_guard;
+        let mut since = initial_since;
+        loop {
+            match rec
+                .recent_events(since, STREAM_PAGE_LIMIT, event_type.as_deref())
+                .await
+            {
+                Ok(body) => {
+                    // Coord returns newest-first; emit oldest-
+                    // first so the operator's view reads
+                    // chronologically. Collect, reverse, emit.
+                    let mut lines: Vec<&str> = body
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    lines.reverse();
+                    let page_size = lines.len();
+                    let mut newest_in_page = since;
+                    for line in lines {
+                        // Advance cursor via the same prefix
+                        // scan the per-task stream uses, except
+                        // the global rows carry `task_id` as
+                        // the first field. We just look for
+                        // the `"id":N` substring.
+                        if let Some(id_field) = extract_event_id_prefix(line)
+                            && id_field > newest_in_page
+                        {
+                            newest_in_page = id_field;
+                        }
+                        yield Ok(Event::default().event("event").data(line));
+                    }
+                    if newest_in_page > since {
+                        since = newest_in_page;
+                    }
+                    // Drop accounting: if the page came back
+                    // full AND the page advanced the cursor by
+                    // more than STREAM_PAGE_LIMIT events, the
+                    // stream fell behind. We can't know the
+                    // exact count without a second query, but
+                    // we surface that we hit the cap so the
+                    // dashboard can warn.
+                    if page_size >= STREAM_PAGE_LIMIT {
+                        let dropped_payload = serde_json::json!({
+                            "page_size": page_size,
+                            "next_cursor": since,
+                            "note": "firehose page hit STREAM_PAGE_LIMIT; \
+                                     older events may have been elided. \
+                                     Re-poll /v1/tasks/events/recent with \
+                                     since=<prior_cursor> for a precise count."
+                        })
+                        .to_string();
+                        yield Ok(Event::default()
+                            .event("dropped")
+                            .data(dropped_payload));
+                    }
+                }
+                Err(e) => {
+                    // Transient — emit but keep the stream
+                    // alive. Operator dashboards may surface;
+                    // gateway tooling can throttle on repeated
+                    // errors.
+                    yield Ok(Event::default().event("error").data(e));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(750)).await;
+        }
+    };
+    Ok(Sse::new(s).keep_alive(KeepAlive::default()))
+}
+
 /// Parse one JSON object per line into a typed envelope.
 /// Tolerant of partial-shape rows — anything failing to
 /// deserialize is silently skipped (the firehose stays

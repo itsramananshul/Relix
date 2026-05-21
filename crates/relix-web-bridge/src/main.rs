@@ -230,6 +230,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // M67: cross-task event firehose. Same static-prefix
         // discipline — register before /v1/tasks/:id paths.
         .route("/v1/tasks/events/recent", get(tasks::recent_events))
+        // M73: long-lived SSE firehose. Same data source as
+        // /events/recent, served as a stream so dashboards
+        // get sub-second runtime visibility without polling.
+        .route("/v1/tasks/events/stream", get(tasks::events_stream_global))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
         .route("/v1/tasks/:id/events", get(tasks::events))
         // Experimental SSE wrapper around task.events polling.

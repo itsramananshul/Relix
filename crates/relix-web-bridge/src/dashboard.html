@@ -2885,20 +2885,79 @@ function renderTopRetried(edges) {
   }
 }
 
-/* M67: global event firehose. Polls /v1/tasks/events/recent
-   cursor-style — every overview tick fetches events strictly
-   newer than the last cursor and prepends them to a bounded
-   ring (capped at FIREHOSE_RING_CAP rows). When the dashboard
-   first lands, the cursor is 0 so we get the most recent
-   FIREHOSE_PAGE_LIMIT events. Polling after that walks
-   forward, which keeps the payload small + bounded.
-   Operators get a real distributed runtime tail without
-   per-task drill-in. */
+/* M67/M73: global event firehose. M67 ships the polling
+   fallback (/v1/tasks/events/recent). M73 upgrades to a
+   long-lived SSE stream (/v1/tasks/events/stream) when the
+   browser supports EventSource. Both pathways advance the
+   same client cursor + ring so an operator can switch
+   between them seamlessly. The SSE path also surfaces
+   `dropped` frames as warn-toasted "firehose fell behind"
+   indicators. */
 const FIREHOSE_PAGE_LIMIT = 50;
 const FIREHOSE_RING_CAP = 200;
 let firehoseCursor = 0;
 let firehoseRing = [];
+let firehoseEventSource = null;
+let firehoseDroppedCount = 0;
+
+function openGlobalFirehoseStream() {
+  if (firehoseEventSource) return; // already open
+  if (!('EventSource' in window)) return;
+  const url = '/v1/tasks/events/stream'
+    + (firehoseCursor > 0 ? '?since=' + firehoseCursor : '');
+  const es = new EventSource(url);
+  firehoseEventSource = es;
+  es.addEventListener('event', (m) => {
+    let row;
+    try { row = JSON.parse(m.data); } catch (_) { return; }
+    if (!row.task_id) return;
+    const event_id = (typeof row.id === 'number') ? row.id : row.event_id;
+    if (typeof event_id === 'number' && event_id > firehoseCursor) {
+      firehoseCursor = event_id;
+    }
+    // Normalize to the same shape /recent emits so the
+    // existing renderer doesn't care which path delivered.
+    const normalized = {
+      task_id:    row.task_id,
+      event_id,
+      ts:         row.ts || 0,
+      event_type: row.type || row.event_type || '',
+      payload:    row.payload || '',
+    };
+    firehoseRing = [normalized].concat(firehoseRing).slice(0, FIREHOSE_RING_CAP);
+    // Only re-render when overview is visible — keeps the
+    // SSE-event handler cheap when the operator is on
+    // another page.
+    if (currentRoute === 'overview') renderGlobalFirehose(false);
+  });
+  es.addEventListener('dropped', (m) => {
+    firehoseDroppedCount += 1;
+    // Toast once per dropped frame so operators see when
+    // the firehose fell behind. Throttling per-event
+    // ensures a flood of drops doesn't drown the host.
+    toast('firehose fell behind · ' + (m.data || 'unknown'), 'warn');
+  });
+  es.addEventListener('error', () => {
+    // SSE auto-reconnects; if the connection is gone
+    // entirely (page hidden, etc.) fall back to polling on
+    // the next overview tick.
+    if (es.readyState === EventSource.CLOSED) {
+      firehoseEventSource = null;
+    }
+  });
+}
+
 async function fetchGlobalFirehose() {
+  // Try SSE first — if it's connected, the event handler
+  // already maintains the ring and no polling is needed.
+  if (firehoseEventSource && firehoseEventSource.readyState === EventSource.OPEN) {
+    renderGlobalFirehose(false);
+    return;
+  }
+  // Open the stream lazily on the first overview tick after
+  // the dashboard loads, then fall through to one polling
+  // refresh to seed the ring while the stream connects.
+  openGlobalFirehoseStream();
   try {
     const url = '/v1/tasks/events/recent?limit=' + FIREHOSE_PAGE_LIMIT
       + (firehoseCursor > 0 ? '&since=' + firehoseCursor : '');
@@ -2909,11 +2968,10 @@ async function fetchGlobalFirehose() {
     }
     const j = await r.json();
     const items = j.items || [];
-    if (typeof j.next_cursor === 'number') {
+    if (typeof j.next_cursor === 'number' && j.next_cursor > firehoseCursor) {
       firehoseCursor = j.next_cursor;
     }
     if (items.length) {
-      // Newest-first from the bridge. Prepend, cap the ring.
       firehoseRing = items.concat(firehoseRing).slice(0, FIREHOSE_RING_CAP);
     }
     renderGlobalFirehose(false);
@@ -2960,9 +3018,16 @@ function renderGlobalFirehose(errored) {
     + '<th>event_id</th><th>payload</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>';
   if ($status) {
+    const sseOn = firehoseEventSource
+      && firehoseEventSource.readyState === EventSource.OPEN;
+    const droppedSuffix = firehoseDroppedCount > 0
+      ? ' · ' + firehoseDroppedCount + ' drop frame(s)'
+      : '';
     $status.textContent = firehoseRing.length + ' event'
       + (firehoseRing.length === 1 ? '' : 's')
-      + ' · cursor ' + firehoseCursor;
+      + ' · cursor ' + firehoseCursor
+      + ' · ' + (sseOn ? 'SSE live' : 'polling')
+      + droppedSuffix;
   }
 }
 

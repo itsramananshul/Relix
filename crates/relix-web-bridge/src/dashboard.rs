@@ -653,6 +653,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_firehose_sse_upgrade_landmarks_present() {
+        // M73 (Track D): the firehose pane upgrades to SSE
+        // when EventSource is available, surfaces drop frames
+        // as warn toasts, and reports `SSE live` vs `polling`
+        // in the status footer.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "function openGlobalFirehoseStream",
+            "/v1/tasks/events/stream",
+            "addEventListener('dropped'",
+            "firehoseDroppedCount",
+            "SSE live",
+        ] {
+            assert!(body.contains(needle), "M73 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_global_firehose_pane_present() {
         // M67 (Track D): overview ships a global event
         // firehose pane fed by /v1/tasks/events/recent.
