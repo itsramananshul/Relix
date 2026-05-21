@@ -118,9 +118,10 @@ mod tests {
         );
         assert!(body.contains("Operator Console"), "missing brand subtitle");
 
-        // All nine routes register a nav item AND a corresponding
+        // All ten routes register a nav item AND a corresponding
         // page section (eight Operate + Configure tabs plus the
-        // PH-BRIDGE-FS-AUDIT fsaudit page).
+        // PH-BRIDGE-FS-AUDIT fsaudit page and the
+        // PH-BRIDGE-TERM-AUDIT termaudit page).
         for route in [
             "overview",
             "tasks",
@@ -128,6 +129,7 @@ mod tests {
             "capabilities",
             "mcp",
             "fsaudit",
+            "termaudit",
             "providers",
             "telegram",
             "config",
@@ -406,6 +408,62 @@ mod tests {
         assert!(
             body.contains("'6': 'fsaudit'"),
             "kbd shortcut 6 should switch to fsaudit"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_termaudit_landmarks_present() {
+        // PH-BRIDGE-TERM-AUDIT: dashboard panel for the
+        // per-backend terminal completion ring. Reads
+        // /v1/terminal/audit (bridge proxy) and renders the
+        // runtime-side ring as a table. Route name is
+        // `termaudit` to keep parseHash's `[\w]+` capture happy.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"data-page="termaudit""#),
+            "termaudit page section missing"
+        );
+        assert!(
+            body.contains(r#"data-route="termaudit""#),
+            "termaudit nav item missing"
+        );
+        assert!(
+            body.contains("/v1/terminal/audit"),
+            "termaudit page should consume /v1/terminal/audit"
+        );
+        // Operator-facing controls.
+        assert!(
+            body.contains(r#"id="termaudit-peer-input""#),
+            "termaudit peer alias input missing"
+        );
+        assert!(
+            body.contains(r#"id="termaudit-max-input""#),
+            "termaudit max input missing"
+        );
+        assert!(
+            body.contains(r#"id="termaudit-refresh-btn""#),
+            "termaudit refresh button missing"
+        );
+        // PAGES registry entry + handler functions.
+        assert!(
+            body.contains("initTermAudit"),
+            "initTermAudit handler missing"
+        );
+        assert!(
+            body.contains("enterTermAudit"),
+            "enterTermAudit handler missing"
+        );
+        assert!(
+            body.contains("loadTermAudit"),
+            "loadTermAudit handler missing"
+        );
+        // kbd shortcut 7 → termaudit (Configure group shifted to
+        // 8/9/0).
+        assert!(
+            body.contains("'7': 'termaudit'"),
+            "kbd shortcut 7 should switch to termaudit"
         );
     }
 

@@ -1812,6 +1812,7 @@
     <a href="#/capabilities" class="nav-item" data-route="capabilities">Capabilities</a>
     <a href="#/mcp"          class="nav-item" data-route="mcp">MCP</a>
     <a href="#/fsaudit"      class="nav-item" data-route="fsaudit">FS Audit</a>
+    <a href="#/termaudit"    class="nav-item" data-route="termaudit">Terminal Audit</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2318,6 +2319,60 @@
       </p>
     </section>
 
+    <!-- ── #/termaudit (PH-BRIDGE-TERM-AUDIT) ────────────────────── -->
+    <section class="page" data-page="termaudit">
+      <h2>Terminal Audit</h2>
+      <p class="page-subtitle">
+        Per-backend completion ring on the tool node — every
+        finished <code>tool.terminal.run</code> / <code>.spawn</code>
+        pushes one row when the child exits (or is killed by
+        timeout / <code>tool.terminal.cancel</code>). Sourced from
+        <code>/v1/terminal/audit</code> which proxies
+        <code>tool.terminal.audit_recent</code> via the existing
+        mesh client. Bounded; resets on tool-node restart.
+        Args are <em>not</em> shipped — only the command, exit
+        code, duration, and termination flags.
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px;">
+        <label for="termaudit-peer-input" class="meta">peer alias:</label>
+        <input
+          type="text"
+          id="termaudit-peer-input"
+          value="tool"
+          placeholder="tool"
+          autocomplete="off"
+          spellcheck="false"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 140px;"
+        />
+        <label for="termaudit-max-input" class="meta">max:</label>
+        <input
+          type="number"
+          id="termaudit-max-input"
+          value="100"
+          min="1"
+          max="500"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 80px;"
+        />
+        <button class="chip" id="termaudit-refresh-btn">refresh</button>
+        <span class="meta" id="termaudit-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Recent completions</h3>
+          <span class="meta" id="termaudit-summary"></span>
+        </div>
+        <div class="card-body dense" id="termaudit-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Killed rows (timeout / cancelled) show <code>—</code> in
+        the exit column; the badge in the status column flags
+        which one. Caller ids are abbreviated; hover for the full
+        fingerprint.
+      </p>
+    </section>
+
     <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
@@ -2472,7 +2527,7 @@
         <tr><td><kbd>/</kbd></td><td>focus the search input</td></tr>
         <tr><td><kbd>Esc</kbd></td><td>clear search focus or close this overlay</td></tr>
         <tr><th colspan="2">Routes</th></tr>
-        <tr><td><kbd>1</kbd>…<kbd>9</kbd></td><td>switch to overview/tasks/topology/capabilities/mcp/fs&#x2011;audit/providers/telegram/config</td></tr>
+        <tr><td><kbd>1</kbd>…<kbd>9</kbd>,<kbd>0</kbd></td><td>switch to overview/tasks/topology/capabilities/mcp/fs&#x2011;audit/term&#x2011;audit/providers/telegram/config</td></tr>
         <tr><th colspan="2">Help</th></tr>
         <tr><td><kbd>?</kbd> / <kbd>h</kbd></td><td>toggle this overlay</td></tr>
       </tbody>
@@ -2534,6 +2589,7 @@ const PAGES = {
   capabilities: { label: 'Capabilities', init: initCapabilities, enter: enterCapabilities },
   mcp:          { label: 'MCP',          init: initMcp,          enter: enterMcp },
   fsaudit:      { label: 'FS Audit',     init: initFsAudit,      enter: enterFsAudit },
+  termaudit:    { label: 'Terminal Audit', init: initTermAudit,  enter: enterTermAudit },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -5501,9 +5557,10 @@ const KBD_ROUTE_MAP = {
   '4': 'capabilities',
   '5': 'mcp',
   '6': 'fsaudit',
-  '7': 'providers',
-  '8': 'telegram',
-  '9': 'config',
+  '7': 'termaudit',
+  '8': 'providers',
+  '9': 'telegram',
+  '0': 'config',
 };
 
 document.addEventListener('keydown', (ev) => {
@@ -6965,6 +7022,140 @@ async function loadFsAudit() {
       + '<th>op</th>'
       + '<th>path</th>'
       + '<th>bytes</th>'
+      + '<th>caller</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = 'failed';
+    if ($summary) $summary.textContent = '';
+  }
+}
+
+/* PH-BRIDGE-TERM-AUDIT: dashboard panel for the per-backend
+   terminal completion ring on the tool node. Reads
+   /v1/terminal/audit which proxies tool.terminal.audit_recent
+   over libp2p. No op filter (the runtime ring doesn't carry
+   tags). */
+function initTermAudit() {
+  const $refresh = document.getElementById('termaudit-refresh-btn');
+  if ($refresh) {
+    $refresh.addEventListener('click', () => loadTermAudit());
+  }
+  const $peer = document.getElementById('termaudit-peer-input');
+  if ($peer) {
+    $peer.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadTermAudit();
+      }
+    });
+  }
+  const $max = document.getElementById('termaudit-max-input');
+  if ($max) {
+    $max.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadTermAudit();
+      }
+    });
+  }
+}
+
+function enterTermAudit() {
+  loadTermAudit();
+}
+
+function currentTermAuditPeer() {
+  const $peer = document.getElementById('termaudit-peer-input');
+  const v = $peer ? ($peer.value || '').trim() : '';
+  return v || 'tool';
+}
+
+async function loadTermAudit() {
+  const $host = document.getElementById('termaudit-host');
+  const $status = document.getElementById('termaudit-status');
+  const $summary = document.getElementById('termaudit-summary');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  if ($status) $status.textContent = 'querying…';
+  const peer = currentTermAuditPeer();
+  const max = parseInt(
+    (document.getElementById('termaudit-max-input') || {}).value || '100',
+    10
+  );
+  const url = '/v1/terminal/audit?peer=' + encodeURIComponent(peer)
+    + '&max=' + (isFinite(max) && max > 0 ? max : 100);
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const entries = body.entries || [];
+    const count = body.count || 0;
+    if ($status) {
+      $status.textContent = 'peer=' + (body.peer || peer)
+        + ' rows=' + entries.length;
+    }
+    if ($summary) {
+      $summary.textContent = count === 0
+        ? 'ring empty'
+        : count + ' row(s)';
+    }
+    if (entries.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no terminal runs recorded yet on peer <code>'
+        + escapeHtml(peer) + '</code> — run something via '
+        + '<code>tool.terminal.run</code> and refresh'
+        + '</div>';
+      return;
+    }
+    const rows = entries.map(e => {
+      const when = new Date((e.ts_secs || 0) * 1000);
+      const hasExit = (e.exit_code !== undefined && e.exit_code !== null);
+      // Status cell: ok / nonzero / timed_out / cancelled.
+      // The runtime invariant says timed_out and cancelled are
+      // mutually exclusive, but if both arrive we surface both.
+      let statusCls, statusText;
+      if (e.timed_out) {
+        statusCls = 'danger'; statusText = 'timed_out';
+      } else if (e.cancelled) {
+        statusCls = 'warn'; statusText = 'cancelled';
+      } else if (!hasExit) {
+        statusCls = 'danger'; statusText = 'killed';
+      } else if (e.exit_code === 0) {
+        statusCls = 'ok'; statusText = 'ok';
+      } else {
+        statusCls = 'warn'; statusText = 'exit=' + e.exit_code;
+      }
+      const exitCell = hasExit
+        ? escapeHtml(String(e.exit_code))
+        : '<span class="meta">—</span>';
+      const callerShort = (e.caller_subject_id || '').slice(0, 10);
+      return '<tr>'
+        + '<td class="meta">' + escapeHtml(when.toLocaleTimeString()) + '</td>'
+        + '<td><code>' + escapeHtml(e.command || '') + '</code></td>'
+        + '<td>' + exitCell + '</td>'
+        + '<td>' + escapeHtml(String(e.duration_ms || 0)) + ' ms</td>'
+        + '<td><span class="badge ' + statusCls + '">'
+        + escapeHtml(statusText) + '</span></td>'
+        + '<td class="meta" title="' + escapeHtml(e.caller_subject_id || '') + '">'
+        + '<code>' + escapeHtml(callerShort) + '…</code>'
+        + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>time</th>'
+      + '<th>command</th>'
+      + '<th>exit</th>'
+      + '<th>duration</th>'
+      + '<th>status</th>'
       + '<th>caller</th>'
       + '</tr></thead><tbody>' + rows + '</tbody></table>';
   } catch (e) {

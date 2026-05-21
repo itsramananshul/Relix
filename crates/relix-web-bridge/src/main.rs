@@ -101,6 +101,7 @@ mod secrets;
 mod sse;
 mod task_recorder;
 mod tasks;
+mod term_audit;
 mod topology;
 mod validate;
 
@@ -402,6 +403,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // on the tool peer. Returns the runtime-side mutation
         // ring as JSON. Query: `?peer=&max=&op=`.
         .route("/v1/fs/audit", get(fs_audit::audit))
+        // PH-BRIDGE-TERM-AUDIT: proxy for `tool.terminal.audit_recent`
+        // on the tool peer. Returns the runtime-side completion
+        // ring as JSON. Query: `?peer=&max=`. The runtime
+        // intentionally drops args from the audit body — only
+        // the command is shipped.
+        .route("/v1/terminal/audit", get(term_audit::audit))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
