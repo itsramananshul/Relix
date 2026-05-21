@@ -9,19 +9,23 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `f7f4f2e feat(bridge+dash): PH-DASH-BROWSER proxy + dashboard panel for tool.browser.list_sessions`
+- **HEAD:** `6f31093 feat(tool): PH-TERM-PTY — portable-pty backend behind terminal-pty feature`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1183 passing on default features (delta
-  this milestone: +9 in `browser_sessions::tests` + landmark);
-  **1201 under `--features relix-runtime/browser-all`**.
-  - relix-cli: 107
+- **Wave 1 status: CLOSED.** All decision-blocked tracks shipped:
+  - D-008 → multi-backend browsers shipped (PH-BROWSER-FEATURES + HC + PW + WD).
+  - D-009 → live stdio MCP runtime shipped (PH-MCP-RUNTIME).
+  - D-010 → portable-pty backend shipped (PH-TERM-PTY).
+- **Workspace tests:** **1201 passing on default features**; **1221
+  under `--features relix-runtime/browser-all,relix-runtime/terminal-pty`**
+  (+18 from the three live browser drivers, +2 from PTY).
+  - relix-cli: 110
   - relix-policy: 72
-  - relix-runtime: 694 (712 under browser-all)
+  - relix-runtime: 709 (727 with all features)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 276 (was 267; +9 this milestone)
+  - relix-web-bridge: 276
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -74,6 +78,9 @@ as the resume command.
 | 6dcc670 | (fix) | HC + PW struct-literal `cfg()` test helpers updated with `..BrowserConfig::default()` so `--features browser-all` clippy + tests compile after the WD field addition |
 | 2e706d1 | PH-BROWSER-D008-RESOLVE | flipped D-008 from "open" to "SHIPPED" in decisions-pending; Wave 1 status track A reflects all three live drivers behind feature flags |
 | f7f4f2e | PH-DASH-BROWSER | `GET /v1/browser/sessions` bridge proxy + new `#/browser` dashboard page (peer-alias input, refresh, session table with truncated id + on-hover full id + status badge + "(no navigation yet)" empty current_url); 8 parser tests + 1 landmark |
+| 0ab93a6 | PH-CLI-BROWSER | `relix-cli browser sessions` HTTP mirror of `GET /v1/browser/sessions`; padded table; new `browser` sibling under main.rs; 3 wire-shape tests |
+| 2dc516c | PH-MCP-RUNTIME | live stdio MCP runtime closes D-009. New `mcp_stdio.rs` `McpStdioClient` (lazy subprocess spawn, mutex-serialised JSON-RPC, notification-tolerant read loop, kill_on_drop); `McpServerConfig.{command,args}`; `tool.mcp.invoke` + `tool.mcp.list_tools` now route through live client when transport=stdio; runtime tests +16; integration test against `@modelcontextprotocol/server-everything` via npx |
+| 6f31093 | PH-TERM-PTY | portable-pty backend behind `--features terminal-pty` closes D-010. New `TerminalConfig.pty: bool`; `terminal.rs` → `terminal/` directory split; new `terminal/pty.rs` (~580 LOC); loud-fail at `ToolBackend::new` when `pty=true` and feature off; PTY path uniformly registered with the existing sessions/audit/cancel infrastructure; runtime tests +3 default / +2 more with feature on |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
@@ -106,15 +113,24 @@ when the runtime isn't present and surfaces the missing
 runtime via a `BackendNotConnected { reason: "<backend>:
 <cause>" }` envelope on the first call.
 
-### B. MCP runtime — protocol layer shipped, runtime BLOCKED on D-009
+### B. MCP runtime — SHIPPED (D-009 closed)
 
-`tool.mcp.list_servers / list_tools / invoke` are registry +
-discovery only (`RuntimeNotConnected` on invoke). PH-MCP-PROTO
-shipped the JSON-RPC wire layer (`mcp::proto` module) with 12
-tests so the next session can wire the stdio transport in a
-follow-up without bootstrapping protocol code. D-009 asks the
-operator to identify a concrete MCP server target before live
-wiring proceeds (recommendation: defer).
+PH-MCP-PROTO shipped the JSON-RPC wire layer first
+(`mcp::proto` module, 12 tests). PH-MCP-RUNTIME then landed
+a live `McpStdioClient` in `tool/mcp_stdio.rs` (~500 LOC)
+that spawns the operator-configured server subprocess
+lazily on first `tool.mcp.invoke`, serialises one request
+at a time over a mutex, drains server-side notifications
+between responses, and surfaces every failure as a typed
+`mcp: <reason>` envelope. `McpServerConfig` gained `command`
++ `args`; `tool.mcp.list_tools` does a live `tools/list`
+for stdio transports and falls back to the operator-declared
+list on transport failure. HTTP transport still returns
+`RuntimeNotConnected` (no fake fallback) — operators wanting
+HTTP MCP file a follow-up. Integration test against
+`@modelcontextprotocol/server-everything` via `npx` runs
+end-to-end (~2.5s). D-009 flipped from "open" to "shipped"
+in decisions-pending.
 
 ### C. Filesystem — substantial parity now
 
@@ -130,9 +146,9 @@ Gaps vs Hermes:
   policy decisions about which to surface; tool node node has no
   delete capability today.
 
-### D. Terminal — substantially complete in the no-PTY model
+### D. Terminal — SHIPPED including PTY (D-010 closed)
 
-Shipped:
+Default-features shipped:
 - `tool.terminal.run` (sync, CW1)
 - `tool.terminal.spawn` (background, PH-TERM-SPAWN)
 - `tool.terminal.sessions` (live registry, PH-TERM-SESSIONS)
@@ -144,20 +160,30 @@ Shipped:
 - `tool.terminal.shell.control` (named control chars,
   PH-TERM-CONTROL)
 
+PH-TERM-PTY (D-010 closed): opt-in PTY backend behind
+`--features terminal-pty`. Operators flipping
+`[tool.terminal] pty = true` get a real pseudoterminal via
+`portable-pty`; TUI / isatty-checking programs now work.
+The default pipe-based path is unchanged. Loud-fail at
+`ToolBackend::new` when `pty = true` is set without the
+feature compiled.
+
 Refactors landed:
 - `validate_and_spawn` + `drive_to_completion` shared by run +
   spawn + shell.open (SpawnMode enum).
 - `write_to_session_stdin` shared by shell.input + shell.control.
 - Manual stdout/stderr drain replaced `wait_with_output`, enabling
   cancel + tail.
+- `terminal.rs` → `terminal/` directory split with feature-gated
+  `terminal/pty.rs`.
 
-Gaps:
-- Full PTY backend (D-010 deferred): TUI / isatty-checking
-  programs.
+Remaining honest gaps (not Wave 1 blockers, deferred):
 - Streaming-with-consumer-drain: tail is read-only; a > 1 MiB
   producer still stalls when the bounded buffer fills.
-- Command-boundary tracking inside a shell session (operators
-  use their own sentinels today).
+- Command-boundary tracking inside a shell session.
+- PTY: stdout+stderr muxed on one stream (kernel limitation;
+  PTY-mode rows have stderr empty); 80x24 fixed size, no
+  SIGWINCH; ANSI escapes pass through `tail` verbatim.
 
 ### E. Web — markdown extraction shipped
 
@@ -222,12 +248,14 @@ From `docs/internal/decisions-pending.md`:
 | D-006 | iteration-budget grace-call | (c) — **shipped** | — |
 | D-007 | computer_use_tool backend | (c) defer | computer_use_tool |
 | D-008 | Browser backend (PW vs HC vs WD) | multi-backend — **shipped all three behind features** | — |
-| D-009 | MCP server target | (c) defer | **MCP stdio runtime** |
-| D-010 | PTY backend (`portable-pty`) | (b) defer | TUI / isatty-true |
+| D-009 | MCP server target | **shipped** live stdio runtime (PH-MCP-RUNTIME) — operator supplies `command` + `args` per server | — |
+| D-010 | PTY backend (`portable-pty`) | **shipped** behind `--features terminal-pty` (PH-TERM-PTY) | — |
 
-D-008 and D-009 are the two material blockers. D-010 has a
-recommendation; the next session can proceed without operator
-intervention if it picks (b).
+All three Wave 1 blockers (D-008 / D-009 / D-010) closed.
+The remaining decisions (D-001/2/3/4/6/7) are out of Wave 1
+scope; they'd unlock Hermes-parity follow-ups (task.memory,
+MCP trust tiers, chronicle compaction, etc.) but no Wave 1
+capability surface depends on them.
 
 ---
 
