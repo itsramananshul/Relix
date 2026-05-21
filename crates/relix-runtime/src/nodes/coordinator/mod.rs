@@ -868,7 +868,9 @@ impl TaskStore {
                 "SELECT t.task_id,
                         COALESCE(a.started_at, t.started_at) AS scan_started,
                         t.max_runtime_secs,
-                        t.current_attempt_id
+                        t.current_attempt_id,
+                        t.retry_count,
+                        t.attempt_count
                  FROM tasks t
                  LEFT JOIN task_attempts a ON a.attempt_id = t.current_attempt_id
                  WHERE t.status = 'running'
@@ -877,13 +879,15 @@ impl TaskStore {
                    AND (COALESCE(a.started_at, t.started_at) + t.max_runtime_secs) < ?1",
             )
             .map_err(CoordinatorError::Db)?;
-        let candidates: Vec<(String, i64, i64, Option<i64>)> = stmt
+        let candidates: Vec<(String, i64, i64, Option<i64>, i64, i64)> = stmt
             .query_map(params![now_secs], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })
             .map_err(CoordinatorError::Db)?
@@ -893,7 +897,7 @@ impl TaskStore {
 
         let tx = conn.transaction().map_err(CoordinatorError::Db)?;
         let mut recovered = Vec::with_capacity(candidates.len());
-        for (tid, started, max, current_attempt) in candidates {
+        for (tid, started, max, current_attempt, retry_count, attempt_count) in candidates {
             let n = tx
                 .execute(
                     "UPDATE tasks
@@ -965,6 +969,35 @@ impl TaskStore {
                     Some(&finished_json),
                 )?;
             }
+            // H5: synthesized terminal summary. The recovery scan
+            // is the moment we have all the post-mortem facts in
+            // one place: total wall-clock since the task first
+            // started, attempt + retry counts, the final failure
+            // class. Hermes generates a similar summary via an
+            // LLM call after iteration-budget exhaustion; in
+            // Relix the same role is played by the recovery scan,
+            // and we synthesize from facts the coord already
+            // owns (no executor consumer required). Single
+            // task.terminal_summary event per recovery; the
+            // chronicle row is the authoritative replay.
+            let wall_clock_secs = (now_secs - started).max(0);
+            let terminal_legacy = format!(
+                "interrupted by deadline · attempts={attempt_count} retries={retry_count} \
+                 wall_clock_secs={wall_clock_secs} last_failure_class=timeout",
+            );
+            let terminal_json = format!(
+                r#"{{"reason":"deadline_exceeded","attempts":{attempt_count},"retries":{retry_count},"wall_clock_secs":{wall_clock_secs},"last_failure_class":"timeout","auto_emitted_by":"recover_interrupted"}}"#
+            );
+            insert_typed_event(
+                &tx,
+                &tid,
+                now_secs,
+                "task.terminal_summary",
+                &terminal_legacy,
+                current_attempt,
+                None,
+                Some(&terminal_json),
+            )?;
             recovered.push(tid);
         }
         tx.commit().map_err(CoordinatorError::Db)?;
@@ -5847,6 +5880,39 @@ mod tests {
                 .contains("deadline_exceeded")
         );
         assert!(v.events.iter().any(|e| e.event_type == "task.interrupted"));
+    }
+
+    #[test]
+    fn recovery_scan_emits_terminal_summary_with_attempt_and_wallclock() {
+        // H5: every recovered task gets a synthesized
+        // task.terminal_summary event with attempts, retries,
+        // wall_clock_secs, and the final failure class. Operators
+        // see a one-line post-mortem in the chronicle without
+        // needing an executor consumer to write it.
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::None, 0, Some(10))
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let started = s.get(&tid).unwrap().unwrap().started_at.unwrap();
+        let recovered = s.recover_interrupted(started + 90).unwrap();
+        assert_eq!(recovered, vec![tid.clone()]);
+
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let term = events
+            .iter()
+            .find(|e| e.event_type == "task.terminal_summary")
+            .expect("terminal_summary event missing");
+        let pj: serde_json::Value =
+            serde_json::from_str(term.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["reason"], "deadline_exceeded");
+        assert_eq!(pj["last_failure_class"], "timeout");
+        assert_eq!(pj["auto_emitted_by"], "recover_interrupted");
+        assert_eq!(pj["wall_clock_secs"].as_i64().unwrap(), 90);
+        // attempts is 1 because the 'running' transition opened one attempt.
+        assert_eq!(pj["attempts"].as_i64().unwrap(), 1);
+        assert_eq!(pj["retries"].as_i64().unwrap(), 0);
     }
 
     #[test]

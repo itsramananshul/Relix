@@ -118,6 +118,7 @@ pub fn summarize_event(ev: &TaskEvent) -> String {
         "task.operator_note" => summarize_operator_note(payload.as_ref(), &ev.payload),
         "task.interrupted" => summarize_interrupted(payload.as_ref()),
         "task.thrash_detected" => summarize_thrash(payload.as_ref()),
+        "task.terminal_summary" => summarize_terminal(payload.as_ref()),
         other => format!("[event] {other}"),
     }
 }
@@ -337,6 +338,47 @@ fn summarize_interrupted(payload: Option<&Value>) -> String {
         (false, None) => format!("[interrupt] {kind}"),
         (true, Some(g)) => format!("[interrupt] gen={g}"),
         (true, None) => "[interrupt]".to_string(),
+    }
+}
+
+fn summarize_terminal(payload: Option<&Value>) -> String {
+    let reason = payload
+        .and_then(|p| p.get("reason").and_then(Value::as_str))
+        .unwrap_or("");
+    let attempts = payload
+        .and_then(|p| p.get("attempts").and_then(Value::as_i64))
+        .unwrap_or(-1);
+    let retries = payload
+        .and_then(|p| p.get("retries").and_then(Value::as_i64))
+        .unwrap_or(-1);
+    let wall = payload
+        .and_then(|p| p.get("wall_clock_secs").and_then(Value::as_i64))
+        .unwrap_or(-1);
+    let class = payload
+        .and_then(|p| p.get("last_failure_class").and_then(Value::as_str))
+        .unwrap_or("");
+    let head = if reason.is_empty() {
+        "[terminal]".to_string()
+    } else {
+        format!("[terminal] {reason}")
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if attempts >= 0 {
+        parts.push(format!("attempts={attempts}"));
+    }
+    if retries >= 0 {
+        parts.push(format!("retries={retries}"));
+    }
+    if wall >= 0 {
+        parts.push(format!("wall={wall}s"));
+    }
+    if !class.is_empty() {
+        parts.push(format!("class={class}"));
+    }
+    if parts.is_empty() {
+        head
+    } else {
+        format!("{head} · {}", parts.join(" "))
     }
 }
 
@@ -593,6 +635,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_summary_full_payload() {
+        let s = summarize_event(&ev(
+            "task.terminal_summary",
+            Some(
+                r#"{"reason":"deadline_exceeded","attempts":3,"retries":2,"wall_clock_secs":120,"last_failure_class":"timeout"}"#,
+            ),
+        ));
+        assert_eq!(
+            s,
+            "[terminal] deadline_exceeded · attempts=3 retries=2 wall=120s class=timeout"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_no_payload() {
+        let s = summarize_event(&ev("task.terminal_summary", None));
+        assert_eq!(s, "[terminal]");
+    }
+
+    #[test]
     fn unknown_event_falls_through() {
         let s = summarize_event(&ev("task.fancy_new_event_type", None));
         assert_eq!(s, "[event] task.fancy_new_event_type");
@@ -647,6 +709,7 @@ mod tests {
             "task.operator_note",
             "task.interrupted",
             "task.thrash_detected",
+            "task.terminal_summary",
             "task.someday_unknown",
         ] {
             let s = summarize_event(&ev(event_type, None));
