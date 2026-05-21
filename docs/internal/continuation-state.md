@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `4f90f76 feat(bridge): W2-007e — GET /v1/policy/denials bridge proxy`
+- **HEAD:** `58fc55e feat(dashboard): W2-007f — Recent denials card on Capabilities`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -29,10 +29,14 @@ as the resume command.
     bridge → dashboard → CLI).
   - **W2-003 (Dashboard UX):** partial — Metrics + What-If
     form added; live feed / status pills pending.
-  - **W2-007 (Policy hardening):** CLOSED end-to-end —
-    `node.policy.simulate` (W2-007a) + bridge proxy
-    (W2-007b) + dashboard "What If" form (W2-007c). Decision
-    viewer / dry-run mode pending.
+  - **W2-007 (Policy hardening):** CLOSED end-to-end (both
+    pillars) —
+    `node.policy.simulate` (W2-007a) → bridge proxy
+    (W2-007b) → dashboard "What If" form (W2-007c);
+    policy denial ring `node.policy.recent_denials`
+    (W2-007d) → bridge proxy `GET /v1/policy/denials`
+    (W2-007e) → dashboard "Recent denials" card (W2-007f).
+    Dry-run replay mode pending.
   - **W2-004 (SOLFlow):** started — `relix-cli sol templates`
     + `sol new --template ping --out path.sol` ship the
     quick-add workflow. Visual-editor sub-items (slash
