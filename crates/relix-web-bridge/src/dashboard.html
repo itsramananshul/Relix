@@ -1813,6 +1813,7 @@
     <a href="#/mcp"          class="nav-item" data-route="mcp">MCP</a>
     <a href="#/fsaudit"      class="nav-item" data-route="fsaudit">FS Audit</a>
     <a href="#/termaudit"    class="nav-item" data-route="termaudit">Terminal Audit</a>
+    <a href="#/browser"      class="nav-item" data-route="browser">Browser</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2390,6 +2391,55 @@
       </p>
     </section>
 
+    <!-- ── #/browser (PH-DASH-BROWSER) ────────────────────────────── -->
+    <section class="page" data-page="browser">
+      <h2>Browser sessions</h2>
+      <p class="page-subtitle">
+        Currently-open <code>tool.browser.*</code> sessions on
+        the tool node. Sourced from
+        <code>/v1/browser/sessions</code> which proxies
+        <code>tool.browser.list_sessions</code> via the existing
+        mesh client. Read-only — open / navigate / close go
+        through the libp2p dispatch path (or the AI flow that
+        is driving the session). Reflects the operator-selected
+        backend
+        (<code>none</code>/<code>headless_chrome</code>/<code>playwright</code>/<code>webdriver</code>);
+        the <code>none</code> scaffold shows
+        <code>unconnected</code> status with no current URL.
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px;">
+        <label for="browser-peer-input" class="meta">peer alias:</label>
+        <input
+          type="text"
+          id="browser-peer-input"
+          value="tool"
+          placeholder="tool"
+          autocomplete="off"
+          spellcheck="false"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 140px;"
+        />
+        <button class="chip" id="browser-refresh-btn">refresh</button>
+        <span class="meta" id="browser-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Open sessions</h3>
+          <span class="meta" id="browser-summary"></span>
+        </div>
+        <div class="card-body dense" id="browser-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Empty state means either no sessions have been opened
+        OR the tool node is configured with
+        <code>[tool.browser] backend = "none"</code> + nobody
+        has called <code>tool.browser.open_session</code> yet.
+        Use <code>relix-cli capability invoke tool.browser.open_session</code>
+        (or an AI flow) to allocate one.
+      </p>
+    </section>
+
     <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
@@ -2607,6 +2657,7 @@ const PAGES = {
   mcp:          { label: 'MCP',          init: initMcp,          enter: enterMcp },
   fsaudit:      { label: 'FS Audit',     init: initFsAudit,      enter: enterFsAudit },
   termaudit:    { label: 'Terminal Audit', init: initTermAudit,  enter: enterTermAudit },
+  browser:      { label: 'Browser',      init: initBrowser,      enter: enterBrowser },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -7241,6 +7292,107 @@ async function loadTermAudit() {
       + '<th>duration</th>'
       + '<th>status</th>'
       + '<th>caller</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = 'failed';
+    if ($summary) $summary.textContent = '';
+  }
+}
+
+/* PH-DASH-BROWSER: dashboard panel for live browser sessions.
+   Reads /v1/browser/sessions which proxies
+   tool.browser.list_sessions over libp2p. Read-only — open /
+   close go through the existing libp2p dispatch path. */
+function initBrowser() {
+  const $refresh = document.getElementById('browser-refresh-btn');
+  if ($refresh) {
+    $refresh.addEventListener('click', () => loadBrowserSessions());
+  }
+  const $peer = document.getElementById('browser-peer-input');
+  if ($peer) {
+    $peer.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadBrowserSessions();
+      }
+    });
+  }
+}
+
+function enterBrowser() {
+  loadBrowserSessions();
+}
+
+function currentBrowserPeer() {
+  const $peer = document.getElementById('browser-peer-input');
+  const v = $peer ? ($peer.value || '').trim() : '';
+  return v || 'tool';
+}
+
+async function loadBrowserSessions() {
+  const $host = document.getElementById('browser-host');
+  const $status = document.getElementById('browser-status');
+  const $summary = document.getElementById('browser-summary');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  if ($status) $status.textContent = 'querying…';
+  const peer = currentBrowserPeer();
+  try {
+    const r = await fetch('/v1/browser/sessions?peer=' + encodeURIComponent(peer));
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const sessions = body.sessions || [];
+    const count = body.count || 0;
+    if ($status) {
+      $status.textContent = 'peer=' + (body.peer || peer)
+        + ' sessions=' + sessions.length;
+    }
+    if ($summary) {
+      $summary.textContent = count === 0
+        ? '0 open'
+        : count + ' open';
+    }
+    if (sessions.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no browser sessions open on peer <code>'
+        + escapeHtml(peer) + '</code> — use '
+        + '<code>tool.browser.open_session</code> to allocate one'
+        + '</div>';
+      return;
+    }
+    const rows = sessions.map(s => {
+      const when = new Date((s.opened_at || 0) * 1000);
+      const statusCls = s.status === 'connected' ? 'ok'
+        : s.status === 'unconnected' ? 'warn'
+        : 'danger';
+      const url = s.current_url
+        ? '<code>' + escapeHtml(s.current_url) + '</code>'
+        : '<span class="meta">(no navigation yet)</span>';
+      const sidShort = (s.session_id || '').slice(0, 12);
+      return '<tr>'
+        + '<td class="meta" title="' + escapeHtml(s.session_id || '') + '">'
+        + '<code>' + escapeHtml(sidShort) + '…</code>'
+        + '</td>'
+        + '<td class="meta">' + escapeHtml(when.toLocaleTimeString()) + '</td>'
+        + '<td>' + url + '</td>'
+        + '<td><span class="badge ' + statusCls + '">'
+        + escapeHtml(s.status || '') + '</span></td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>session</th>'
+      + '<th>opened</th>'
+      + '<th>current url</th>'
+      + '<th>status</th>'
       + '</tr></thead><tbody>' + rows + '</tbody></table>';
   } catch (e) {
     $host.innerHTML = '<div class="error">load failed: '

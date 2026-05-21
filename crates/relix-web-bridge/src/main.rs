@@ -85,6 +85,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
 }
 
 mod blocklist;
+mod browser_sessions;
 mod capabilities;
 mod chat;
 mod config;
@@ -415,6 +416,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // blocklist as JSON. Read-only — to change it, edit
         // `[tool] blocked_hosts` and restart the tool node.
         .route("/v1/tool/blocklist", get(blocklist::blocklist))
+        // PH-DASH-BROWSER: proxy for `tool.browser.list_sessions`
+        // on the tool peer. Returns the currently-open browser
+        // sessions as JSON (session_id, opened_at, current_url,
+        // status). Read-only — open/close go through the
+        // existing libp2p dispatch.
+        .route("/v1/browser/sessions", get(browser_sessions::sessions))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).

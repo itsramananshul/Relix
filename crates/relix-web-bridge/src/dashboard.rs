@@ -118,10 +118,8 @@ mod tests {
         );
         assert!(body.contains("Operator Console"), "missing brand subtitle");
 
-        // All ten routes register a nav item AND a corresponding
-        // page section (eight Operate + Configure tabs plus the
-        // PH-BRIDGE-FS-AUDIT fsaudit page and the
-        // PH-BRIDGE-TERM-AUDIT termaudit page).
+        // All eleven routes register a nav item AND a
+        // corresponding page section.
         for route in [
             "overview",
             "tasks",
@@ -130,6 +128,7 @@ mod tests {
             "mcp",
             "fsaudit",
             "termaudit",
+            "browser",
             "providers",
             "telegram",
             "config",
@@ -483,6 +482,49 @@ mod tests {
         assert!(
             body.contains("'7': 'termaudit'"),
             "kbd shortcut 7 should switch to termaudit"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_browser_landmarks_present() {
+        // PH-DASH-BROWSER: dashboard panel for live browser
+        // sessions. Reads /v1/browser/sessions (bridge proxy)
+        // and renders the runtime-side session list as a table.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"data-page="browser""#),
+            "browser page section missing"
+        );
+        assert!(
+            body.contains(r#"data-route="browser""#),
+            "browser nav item missing"
+        );
+        assert!(
+            body.contains("/v1/browser/sessions"),
+            "browser page should consume /v1/browser/sessions"
+        );
+        assert!(
+            body.contains(r#"id="browser-peer-input""#),
+            "browser peer alias input missing"
+        );
+        assert!(
+            body.contains(r#"id="browser-refresh-btn""#),
+            "browser refresh button missing"
+        );
+        assert!(
+            body.contains(r#"id="browser-host""#),
+            "browser host slot missing"
+        );
+        assert!(body.contains("initBrowser"), "initBrowser handler missing");
+        assert!(
+            body.contains("enterBrowser"),
+            "enterBrowser handler missing"
+        );
+        assert!(
+            body.contains("loadBrowserSessions"),
+            "loadBrowserSessions handler missing"
         );
     }
 
