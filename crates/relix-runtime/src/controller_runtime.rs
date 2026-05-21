@@ -1162,6 +1162,14 @@ fn register_node_type_handlers(
                  status to retrying, emits task.retry_requested.",
                 &["task", "retry", "operator"],
             ),
+            (
+                "task.replay",
+                "W2-001b: clone a task into a brand-new replay. Args: <original_task_id>. \
+                 New task inherits flow_template/params/retry-policy/origin_surface; \
+                 retry_count starts at zero; a retried_from edge links the new task back \
+                 to the original. Returns the new task_id.",
+                &["task", "retry", "operator", "replay"],
+            ),
         ];
         for (m, desc, cats) in coord_caps {
             // PH-CAP-RISK: coord task caps fall into two

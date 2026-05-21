@@ -678,6 +678,63 @@ impl TaskStore {
         Ok(())
     }
 
+    /// W2-001b: clone a task into a brand-new replay. The new
+    /// task inherits the original's flow_template, params_json,
+    /// retry policy/budget, max_runtime_secs, and origin_surface.
+    /// Title is suffixed with ` (replay)` so it's distinguishable
+    /// in task lists. retry_count starts at zero on the replay —
+    /// operators want to see the full retry chain on the new task
+    /// fresh, not a continuation of the old one.
+    ///
+    /// Wires a `retried_from` cross-task edge from the NEW task
+    /// to the ORIGINAL plus a `task.replayed_from` chronicle
+    /// event on the new task with payload
+    /// `from=<original_task_id>`.
+    ///
+    /// Returns the new task_id on success; NotFound when the
+    /// original doesn't exist.
+    pub fn replay_from(
+        &self,
+        original_task_id: &str,
+        producer_subject_id: &str,
+    ) -> Result<String, CoordinatorError> {
+        // Re-use the existing `get` projection so any new fields
+        // added to TaskView automatically flow into the replay
+        // without further changes here.
+        let original = match self.get(original_task_id)? {
+            Some(v) => v,
+            None => return Err(CoordinatorError::NotFound(original_task_id.to_string())),
+        };
+        let retry_policy = RetryPolicy::parse(&original.retry_policy).unwrap_or(RetryPolicy::None);
+        let replay_title = format!("{} (replay)", original.title);
+        let new_id = self.create(
+            &replay_title,
+            &original.flow_template,
+            &original.params_json,
+            &original.owner_subject_id,
+            retry_policy,
+            original.max_retries,
+            original.max_runtime_secs,
+            original.origin_surface.as_deref(),
+        )?;
+        // Wire the cross-task edge + chronicle event on the new
+        // task. `record_cross_task_edge` requires parent !=
+        // related which is guaranteed here (new_id was just
+        // freshly minted).
+        let payload_reason = format!("replay of {original_task_id}");
+        let _ = self.record_cross_task_edge(
+            &new_id,
+            original_task_id,
+            "retried_from",
+            "task.replayed_from",
+            None,
+            None,
+            Some(&payload_reason),
+            producer_subject_id,
+        )?;
+        Ok(new_id)
+    }
+
     /// Bump `retry_count` by one. Low-level primitive — does NOT
     /// validate retry policy or emit events. Prefer [`request_retry`]
     /// for the operator-facing flow. Returns the new count.
@@ -3641,6 +3698,18 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
         );
     }
     {
+        // W2-001b: task.replay — clone a task into a new one
+        // with a retried_from cross-task edge.
+        let s = store.clone();
+        bridge.register(
+            "task.replay",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_replay(&s, &ctx) }
+            })),
+        );
+    }
+    {
         let s = store.clone();
         bridge.register(
             "task.count",
@@ -4671,6 +4740,26 @@ fn handle_count(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
 /// the flow (bridge auto-retry is not wired today). Returns one
 /// line: `accepted attempt=N of budget`, `exhausted retry_count=N
 /// budget=M`, or just the rejection cause.
+/// W2-001b: handle `task.replay`. Args: `<original_task_id>`.
+/// Returns the new task_id on success. The caller's
+/// subject_id is stamped as the producer of the retried_from
+/// edge so the chronicle row attributes the action correctly.
+fn handle_replay(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let original_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.replay utf8: {e}")),
+    };
+    if original_id.is_empty() {
+        return invalid("task.replay: original task_id required".to_string());
+    }
+    let producer = ctx.caller.subject_id.to_string();
+    match store.replay_from(original_id, &producer) {
+        Ok(new_id) => HandlerOutcome::Ok(new_id.into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.replay: not found: {id}")),
+        Err(e) => internal(format!("task.replay: {e}")),
+    }
+}
+
 fn handle_retry(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let task_id = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s.trim(),
@@ -6610,6 +6699,100 @@ mod tests {
         };
         let v = s.get(&tid).unwrap().unwrap();
         assert_eq!(v.origin_surface, None);
+    }
+
+    // ── W2-001b: task.replay ────────────────────────────────────
+
+    #[test]
+    fn replay_from_clones_task_and_writes_retried_from_edge() {
+        let s = store();
+        let original = s
+            .create(
+                "original",
+                "demo.sol",
+                r#"{"k":1}"#,
+                "alice",
+                RetryPolicy::Bounded,
+                3,
+                Some(60),
+                Some("dashboard"),
+            )
+            .unwrap();
+        let new_id = s.replay_from(&original, "alice").unwrap();
+        assert_ne!(new_id, original);
+        let v = s.get(&new_id).unwrap().unwrap();
+        // Title suffixed; inherited fields preserved.
+        assert_eq!(v.title, "original (replay)");
+        assert_eq!(v.flow_template, "demo.sol");
+        assert_eq!(v.params_json, r#"{"k":1}"#);
+        assert_eq!(v.owner_subject_id, "alice");
+        assert_eq!(v.retry_policy, "bounded");
+        assert_eq!(v.max_retries, 3);
+        assert_eq!(v.max_runtime_secs, Some(60));
+        assert_eq!(v.origin_surface.as_deref(), Some("dashboard"));
+        // retry_count starts fresh on the replay.
+        assert_eq!(v.retry_count, 0);
+    }
+
+    #[test]
+    fn replay_from_returns_not_found_for_unknown_task() {
+        let s = store();
+        match s.replay_from("nope", "alice") {
+            Err(CoordinatorError::NotFound(id)) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_replay_returns_new_task_id() {
+        let s = store();
+        let original = s
+            .create(
+                "t",
+                "f",
+                "{}",
+                "alice",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let out = handle_replay(&s, &ctx(original.as_bytes()));
+        let new_id = match out {
+            HandlerOutcome::Ok(body) => String::from_utf8(body).unwrap(),
+            _ => panic!("expected Ok"),
+        };
+        assert_ne!(new_id, original);
+        // Both tasks exist + the replay's title is suffixed.
+        assert!(s.get(&original).unwrap().is_some());
+        let replay = s.get(&new_id).unwrap().unwrap();
+        assert_eq!(replay.title, "t (replay)");
+    }
+
+    #[test]
+    fn handle_replay_rejects_empty_arg() {
+        let s = store();
+        let out = handle_replay(&s, &ctx(b""));
+        match out {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected INVALID_ARGS"),
+        }
+    }
+
+    #[test]
+    fn handle_replay_returns_invalid_args_when_unknown_task() {
+        let s = store();
+        let out = handle_replay(&s, &ctx(b"nonexistent-id"));
+        match out {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("not found"));
+            }
+            _ => panic!("expected INVALID_ARGS for unknown task"),
+        }
     }
 
     #[test]
