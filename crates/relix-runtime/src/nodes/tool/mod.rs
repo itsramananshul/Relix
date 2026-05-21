@@ -66,7 +66,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use relix_core::capability::{CapabilityDescriptor, CapabilityKind, CostClass, Idempotency};
+use relix_core::capability::{
+    CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
+};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
@@ -660,6 +662,7 @@ pub fn terminal_descriptor() -> CapabilityDescriptor {
     );
     d.categories = vec!["shell".into(), "execute".into(), "io".into()];
     d.environment_requirements = vec!["host:exec".into()];
+    d.risk_level = RiskLevel::High;
     d
 }
 
@@ -679,6 +682,7 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
     d.description = Some("Fetch a URL with SSRF + DNS pin + per-hop redirect re-check.".into());
     d.categories = vec!["fetch".into(), "io".into()];
     d.environment_requirements = vec!["network:outbound".into()];
+    d.risk_level = RiskLevel::Medium;
     d
 }
 

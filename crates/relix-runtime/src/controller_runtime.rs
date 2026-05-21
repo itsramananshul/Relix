@@ -367,12 +367,14 @@ fn register_builtins(
     manifest.add_capability(
         relix_core::capability::CapabilityDescriptor::unary("node.health")
             .with_description("Liveness probe. Returns 'ok' if the node is up.")
-            .with_categories(["health".into()]),
+            .with_categories(["health".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
     );
     manifest.add_capability(
         relix_core::capability::CapabilityDescriptor::unary("node.manifest")
             .with_description("Return this node's manifest (capability list + node identity).")
-            .with_categories(["discover".into()]),
+            .with_categories(["discover".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
     );
 }
 
@@ -381,34 +383,38 @@ fn register_builtins(
 /// Advertise the four router.* capabilities in the manifest.
 /// Called from `run()` only when `[controller] role = "router"`.
 fn register_router_descriptors(manifest: &ManifestProvider) {
-    use relix_core::capability::CapabilityDescriptor;
+    use relix_core::capability::{CapabilityDescriptor, RiskLevel};
     manifest.add_capability(
         CapabilityDescriptor::unary("router.heartbeat")
             .with_description(
                 "Controller-only: register or refresh this peer's liveness + capability list.",
             )
-            .with_categories(["router".into(), "health".into()]),
+            .with_categories(["router".into(), "health".into()])
+            .with_risk(RiskLevel::Low),
     );
     manifest.add_capability(
         CapabilityDescriptor::unary("router.network_summary")
             .with_description(
                 "Operator-facing mesh overview: known peers, active sessions, uptime.",
             )
-            .with_categories(["router".into(), "observability".into()]),
+            .with_categories(["router".into(), "observability".into()])
+            .with_risk(RiskLevel::Safe),
     );
     manifest.add_capability(
         CapabilityDescriptor::unary("router.session_list")
             .with_description(
                 "Operator-facing session browser. Supports status filter + pagination.",
             )
-            .with_categories(["router".into(), "observability".into()]),
+            .with_categories(["router".into(), "observability".into()])
+            .with_risk(RiskLevel::Safe),
     );
     manifest.add_capability(
         CapabilityDescriptor::unary("router.log")
             .with_description(
                 "Controller-only: push a structured log line to the router for aggregation.",
             )
-            .with_categories(["router".into(), "observability".into()]),
+            .with_categories(["router".into(), "observability".into()])
+            .with_risk(RiskLevel::Low),
     );
 }
 
@@ -559,11 +565,19 @@ fn register_node_type_handlers(
             ),
         ];
         for (m, desc, cats, tags) in memory_caps {
+            // PH-CAP-RISK: memory caps are either reads (Safe) or
+            // writes to the per-task memory store (Low).
+            let risk = if cats.contains(&"search") || cats.contains(&"read") {
+                relix_core::capability::RiskLevel::Safe
+            } else {
+                relix_core::capability::RiskLevel::Low
+            };
             manifest.add_capability(
                 CapabilityDescriptor::unary(*m)
                     .with_description(*desc)
                     .with_categories(cats.iter().map(|s| (*s).into()))
-                    .with_sensitivity(tags.iter().map(|s| (*s).into())),
+                    .with_sensitivity(tags.iter().map(|s| (*s).into()))
+                    .with_risk(risk),
             );
         }
         tracing::info!(
@@ -594,7 +608,8 @@ fn register_node_type_handlers(
                      as a sensitivity tag.",
                 )
                 .with_categories(["generate".into(), "ai".into()])
-                .with_environment_requirements([format!("provider:{provider_name}")]),
+                .with_environment_requirements([format!("provider:{provider_name}")])
+                .with_risk(relix_core::capability::RiskLevel::Medium),
         );
         tracing::info!(
             provider = %provider_name,
@@ -966,10 +981,20 @@ fn register_node_type_handlers(
             ),
         ];
         for (m, desc, cats) in coord_caps {
+            // PH-CAP-RISK: coord task caps fall into two
+            // operator-visible buckets — pure reads (`read` in
+            // categories) are Safe, every other mutates
+            // chronicle / task state in bounded ways, so Low.
+            let risk = if cats.contains(&"read") {
+                relix_core::capability::RiskLevel::Safe
+            } else {
+                relix_core::capability::RiskLevel::Low
+            };
             manifest.add_capability(
                 CapabilityDescriptor::unary(*m)
                     .with_description(*desc)
-                    .with_categories(cats.iter().map(|s| (*s).into())),
+                    .with_categories(cats.iter().map(|s| (*s).into()))
+                    .with_risk(risk),
             );
         }
         tracing::info!(

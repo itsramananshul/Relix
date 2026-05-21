@@ -52,7 +52,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use relix_core::capability::{CapabilityDescriptor, CapabilityKind, CostClass, Idempotency};
+use relix_core::capability::{
+    CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
+};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
@@ -94,6 +96,7 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
             .into(),
     );
     d.categories = vec!["parse".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 

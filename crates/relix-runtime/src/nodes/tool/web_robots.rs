@@ -48,7 +48,9 @@
 
 use std::sync::Arc;
 
-use relix_core::capability::{CapabilityDescriptor, CapabilityKind, CostClass, Idempotency};
+use relix_core::capability::{
+    CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
+};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 use reqwest::Url;
 
@@ -83,6 +85,7 @@ pub fn robots_check_descriptor() -> CapabilityDescriptor {
     );
     d.categories = vec!["fetch".into(), "parse".into(), "safety".into()];
     d.environment_requirements = vec!["network:outbound".into()];
+    d.risk_level = RiskLevel::Medium;
     d
 }
 

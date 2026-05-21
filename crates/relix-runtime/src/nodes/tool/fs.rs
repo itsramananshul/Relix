@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 
-use relix_core::capability::{CapabilityDescriptor, CostClass, Idempotency};
+use relix_core::capability::{CapabilityDescriptor, CostClass, Idempotency, RiskLevel};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
@@ -318,6 +318,7 @@ pub fn descriptor_read() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -337,6 +338,7 @@ pub fn descriptor_write() -> CapabilityDescriptor {
     );
     d.categories = vec!["mutate".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Medium;
     d
 }
 
@@ -355,6 +357,7 @@ pub fn descriptor_search() -> CapabilityDescriptor {
     );
     d.categories = vec!["search".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -372,6 +375,7 @@ pub fn descriptor_patch() -> CapabilityDescriptor {
     );
     d.categories = vec!["mutate".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Medium;
     d
 }
 
@@ -395,6 +399,7 @@ pub fn descriptor_append() -> CapabilityDescriptor {
     );
     d.categories = vec!["mutate".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Medium;
     d
 }
 
@@ -416,6 +421,7 @@ pub fn descriptor_patch_preview() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "fs".into(), "preview".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -439,6 +445,7 @@ pub fn descriptor_binary_sniff() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "fs".into(), "classify".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -465,6 +472,7 @@ pub fn descriptor_audit_recent() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "fs".into(), "audit".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -490,6 +498,7 @@ pub fn descriptor_list() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -518,6 +527,7 @@ pub fn descriptor_fuzzy_replace() -> CapabilityDescriptor {
     );
     d.categories = vec!["mutate".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Medium;
     d
 }
 
@@ -541,6 +551,7 @@ pub fn descriptor_tree() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -561,6 +572,7 @@ pub fn descriptor_stat() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "fs".into()];
     d.environment_requirements = vec!["fs:jail".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 

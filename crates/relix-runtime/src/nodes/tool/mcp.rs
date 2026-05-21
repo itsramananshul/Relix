@@ -40,7 +40,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use relix_core::capability::{CapabilityDescriptor, CapabilityKind, CostClass, Idempotency};
+use relix_core::capability::{
+    CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
+};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
@@ -454,6 +456,7 @@ pub fn descriptor_list_servers() -> CapabilityDescriptor {
     d.description =
         Some("List operator-declared MCP servers + their wire metadata. Pure read.".into());
     d.categories = vec!["mcp".into(), "registry".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -471,6 +474,7 @@ pub fn descriptor_list_tools() -> CapabilityDescriptor {
             .into(),
     );
     d.categories = vec!["mcp".into(), "registry".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -494,6 +498,7 @@ pub fn descriptor_invoke() -> CapabilityDescriptor {
             .into(),
     );
     d.categories = vec!["mcp".into(), "execute".into()];
+    d.risk_level = RiskLevel::High;
     d
 }
 

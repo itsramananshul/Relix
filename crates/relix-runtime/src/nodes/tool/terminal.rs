@@ -136,7 +136,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use relix_core::capability::{CapabilityDescriptor, CostClass, Idempotency};
+use relix_core::capability::{CapabilityDescriptor, CostClass, Idempotency, RiskLevel};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
@@ -578,6 +578,7 @@ pub fn descriptor_shell_open() -> CapabilityDescriptor {
         "persistent".into(),
     ];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::High;
     d
 }
 
@@ -614,6 +615,7 @@ pub fn descriptor_shell_input() -> CapabilityDescriptor {
         "shell".into(),
     ];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::High;
     d
 }
 
@@ -659,6 +661,7 @@ pub fn descriptor_shell_control() -> CapabilityDescriptor {
         "control".into(),
     ];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::High;
     d
 }
 
@@ -688,6 +691,7 @@ pub fn descriptor_shell_close() -> CapabilityDescriptor {
         "shell".into(),
     ];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::Low;
     d
 }
 
@@ -728,6 +732,7 @@ pub fn descriptor_spawn() -> CapabilityDescriptor {
         "background".into(),
     ];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::High;
     d
 }
 
@@ -763,6 +768,7 @@ pub fn descriptor_tail() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "terminal".into(), "streaming".into()];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -791,6 +797,7 @@ pub fn descriptor_cancel() -> CapabilityDescriptor {
     );
     d.categories = vec!["mutate".into(), "terminal".into(), "control".into()];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::Low;
     d
 }
 
@@ -814,6 +821,7 @@ pub fn descriptor_audit_recent() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "terminal".into(), "audit".into()];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -837,6 +845,7 @@ pub fn descriptor_sessions() -> CapabilityDescriptor {
     );
     d.categories = vec!["read".into(), "terminal".into(), "audit".into()];
     d.environment_requirements = vec!["shell:allowlist".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 

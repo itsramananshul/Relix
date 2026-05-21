@@ -56,7 +56,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 
-use relix_core::capability::{CapabilityDescriptor, CapabilityKind, CostClass, Idempotency};
+use relix_core::capability::{
+    CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
+};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
@@ -296,6 +298,7 @@ pub fn descriptor_open_session() -> CapabilityDescriptor {
     );
     d.categories = vec!["browser".into(), "session".into()];
     d.environment_requirements = vec!["browser:host".into()];
+    d.risk_level = RiskLevel::Low;
     d
 }
 
@@ -309,6 +312,7 @@ pub fn descriptor_close_session() -> CapabilityDescriptor {
     d.requires_groups = vec!["operators".into()];
     d.description = Some("Close a browser session.".into());
     d.categories = vec!["browser".into(), "session".into()];
+    d.risk_level = RiskLevel::Low;
     d
 }
 
@@ -331,6 +335,7 @@ pub fn descriptor_navigate() -> CapabilityDescriptor {
     );
     d.categories = vec!["browser".into(), "navigation".into()];
     d.environment_requirements = vec!["browser:host".into(), "network:outbound".into()];
+    d.risk_level = RiskLevel::Medium;
     d
 }
 
@@ -344,6 +349,7 @@ pub fn descriptor_get_text() -> CapabilityDescriptor {
     d.requires_groups = vec!["operators".into()];
     d.description = Some("Extract visible text from the current page.".into());
     d.categories = vec!["browser".into(), "extract".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -357,6 +363,7 @@ pub fn descriptor_screenshot() -> CapabilityDescriptor {
     d.requires_groups = vec!["operators".into()];
     d.description = Some("Capture a PNG screenshot of the current page.".into());
     d.categories = vec!["browser".into(), "screenshot".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
@@ -370,6 +377,7 @@ pub fn descriptor_list_sessions() -> CapabilityDescriptor {
     d.requires_groups = vec!["operators".into()];
     d.description = Some("List currently open browser sessions.".into());
     d.categories = vec!["browser".into(), "read".into()];
+    d.risk_level = RiskLevel::Safe;
     d
 }
 
