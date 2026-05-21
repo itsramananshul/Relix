@@ -1,24 +1,37 @@
-//! `relix-cli mcp ...` — PH-MCP-CLI operator surface for the
-//! MCP registry on a tool node.
+//! `relix-cli mcp ...` — operator surface for the MCP registry
+//! on a tool node, plus a bridge-side audit mirror.
 //!
-//! Read-only. Each subcommand dials one tool-node peer over
-//! libp2p, presents the caller's identity bundle, calls the
-//! `tool.mcp.list_servers` or `tool.mcp.list_tools` capability
-//! through the full admission pipeline (identity → policy →
-//! handler → audit), parses the tab-delim response, and
-//! pretty-prints.
+//! Three subcommands:
+//!
+//! - PH-MCP-CLI `mcp servers` / `mcp tools` — read-only.
+//!   Dial one tool-node peer over libp2p, present the caller's
+//!   identity bundle, call `tool.mcp.list_servers` or
+//!   `tool.mcp.list_tools` through the full admission pipeline
+//!   (identity → policy → handler → audit), parse the tab-delim
+//!   response, and pretty-print.
+//!
+//! - PH-CLI-MCP-AUDIT `mcp audit` — read-only HTTP mirror of
+//!   the bridge's `GET /v1/mcp/audit` ring (PH-BRIDGE-MCP-AUDIT).
+//!   Different surface from the other two: the audit ring lives
+//!   in the bridge process, not on the tool node, so the CLI
+//!   reaches it over HTTP (same shape as `relix-cli ops events`
+//!   / `ops route-test`).
 //!
 //! Why a sibling of `relix-cli capability` rather than an
-//! `ops mcp` HTTP-against-bridge subcommand: the bridge does
-//! not proxy MCP registry endpoints today. Direct libp2p dial
-//! is the same shape as `relix-cli ping` / `capability`, and
-//! avoids adding a bridge route for a tool-node-local registry
-//! that the operator can already see in the manifest.
+//! `ops mcp` HTTP-against-bridge subcommand for `servers` /
+//! `tools`: the bridge proxies the registry now
+//! (PH-BRIDGE-MCP) but originally didn't, and direct libp2p
+//! dial is still the same shape as `relix-cli ping` /
+//! `capability` — clearer when the operator is troubleshooting
+//! a peer in isolation. `audit` has no libp2p equivalent — the
+//! ring is bridge-only — so it lives here under HTTP as the
+//! cleanest place for "mcp anything" to live.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Subcommand;
+use serde::Deserialize;
 
 use relix_core::bundle::Bundle;
 use relix_core::codec;
@@ -63,6 +76,22 @@ pub enum Cmd {
         /// MCP server id (from `mcp servers`).
         #[arg(long)]
         server_id: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// PH-CLI-MCP-AUDIT: show the bridge's audit ring of
+    /// `POST /v1/mcp/invoke` calls. Newest first. Bounded by
+    /// the bridge (capacity 256); resets on bridge restart.
+    Audit {
+        /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Maximum entries to fetch (capped server-side by ring
+        /// capacity).
+        #[arg(long, default_value_t = 50)]
+        max: usize,
+        /// Print raw JSON from the bridge instead of the
+        /// formatted table.
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
@@ -130,8 +159,119 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("count={}", tools.len());
         }
+        Cmd::Audit { bridge, max, raw } => {
+            let url = format!("{}/v1/mcp/audit?max={max}", bridge.trim_end_matches('/'),);
+            let body = http_get(&url).await?;
+            if raw {
+                print_raw(&body);
+                return Ok(());
+            }
+            let parsed: AuditResp = serde_json::from_str(&body)
+                .map_err(|e| format!("decode /v1/mcp/audit body: {e} (body={body})"))?;
+            render_audit(&parsed);
+        }
     }
     Ok(())
+}
+
+/// PH-CLI-MCP-AUDIT: mirror of the bridge's
+/// `mcp_audit::McpAuditEntry`. Field-for-field — `error_kind`
+/// is optional, matching the bridge's
+/// `#[serde(skip_serializing_if = "Option::is_none")]` on the
+/// success path.
+#[derive(Debug, Deserialize)]
+struct AuditEntry {
+    #[serde(default)]
+    ts_secs: i64,
+    #[serde(default)]
+    peer_alias: String,
+    #[serde(default)]
+    server_id: String,
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    args_len: usize,
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    error_kind: Option<String>,
+    #[serde(default)]
+    duration_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditResp {
+    #[serde(default)]
+    entries: Vec<AuditEntry>,
+    #[serde(default)]
+    count: usize,
+}
+
+fn render_audit(resp: &AuditResp) {
+    if resp.entries.is_empty() {
+        println!(
+            "(no invocations recorded yet — ring count={}; make a \
+             POST /v1/mcp/invoke call and retry)",
+            resp.count
+        );
+        return;
+    }
+    let ts_h = "ts";
+    let peer_h = "peer";
+    let srv_h = "server";
+    let tool_h = "tool";
+    let args_h = "args";
+    let oc_h = "outcome";
+    let err_h = "error_kind";
+    let dur_h = "ms";
+    println!(
+        "{ts_h:<10}  {peer_h:<10}  {srv_h:<12}  {tool_h:<20}  \
+         {args_h:>6}  {oc_h:<7}  {err_h:<28}  {dur_h:>6}",
+    );
+    for e in &resp.entries {
+        let srv = truncate(&e.server_id, 12);
+        let tool = truncate(&e.tool_name, 20);
+        let peer = truncate(&e.peer_alias, 10);
+        let err = truncate(e.error_kind.as_deref().unwrap_or(""), 28);
+        println!(
+            "{ts:<10}  {peer:<10}  {srv:<12}  {tool:<20}  \
+             {args:>6}  {oc:<7}  {err:<28}  {dur:>6}",
+            ts = e.ts_secs,
+            peer = peer,
+            srv = srv,
+            tool = tool,
+            args = e.args_len,
+            oc = e.outcome,
+            err = err,
+            dur = e.duration_ms,
+        );
+    }
+    if resp.entries.len() < resp.count {
+        println!(
+            "(showing {shown} of {total} total; rerun with --max to see more)",
+            shown = resp.entries.len(),
+            total = resp.count,
+        );
+    } else {
+        println!("count={}", resp.count);
+    }
+}
+
+/// PH-CLI-MCP-AUDIT: small GET helper. Mirrors `ops::http_get`
+/// (same shape; intentionally duplicated to keep `mcp.rs`
+/// standalone — see PH-CLI-DIAL-REFACTOR in the future-cleanup
+/// list).
+async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let resp = client.get(url).send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("bridge returned HTTP {status}: {body}").into());
+    }
+    Ok(body)
 }
 
 fn print_raw(body: &str) {
@@ -320,5 +460,81 @@ mod tests {
         // We assert that the byte-count fits in <= max chars by
         // counting chars on the result.
         assert!(s.chars().count() <= 10);
+    }
+
+    // ── PH-CLI-MCP-AUDIT: shape parsing + renderer guard rails ───────
+
+    #[test]
+    fn audit_resp_round_trips_through_serde() {
+        // Mirrors the bridge's `mcp_audit::McpAuditEntry` JSON
+        // shape. The bridge omits `error_kind` on ok via
+        // `skip_serializing_if = "Option::is_none"` — the CLI
+        // must accept both forms.
+        let json = r#"{
+            "entries": [
+                {
+                    "ts_secs": 100,
+                    "peer_alias": "tool",
+                    "server_id": "srv-a",
+                    "tool_name": "search",
+                    "args_len": 12,
+                    "outcome": "ok",
+                    "duration_ms": 42
+                },
+                {
+                    "ts_secs": 200,
+                    "peer_alias": "tool",
+                    "server_id": "srv-b",
+                    "tool_name": "fetch",
+                    "args_len": 0,
+                    "outcome": "err",
+                    "error_kind": "responder_runtime_not_connected",
+                    "duration_ms": 5
+                }
+            ],
+            "count": 2
+        }"#;
+        let parsed: AuditResp = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.count, 2);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].tool_name, "search");
+        assert_eq!(parsed.entries[0].error_kind, None);
+        assert_eq!(
+            parsed.entries[1].error_kind.as_deref(),
+            Some("responder_runtime_not_connected")
+        );
+    }
+
+    #[test]
+    fn audit_resp_tolerates_missing_count_and_entries() {
+        // Defensive: bridge always sends both, but the CLI
+        // should not crash on a partial body (e.g. an older
+        // bridge build, or a manually crafted curl response).
+        let parsed: AuditResp = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.count, 0);
+        assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn audit_resp_unknown_fields_are_ignored() {
+        // Forward-compat: when the bridge grows a new field,
+        // an older CLI build should still parse the response.
+        let json = r#"{
+            "count": 1,
+            "entries": [{
+                "ts_secs": 1,
+                "peer_alias": "x",
+                "server_id": "y",
+                "tool_name": "z",
+                "args_len": 0,
+                "outcome": "ok",
+                "duration_ms": 0,
+                "future_field": "shrug"
+            }],
+            "future_top_level": 99
+        }"#;
+        let parsed: AuditResp = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.count, 1);
+        assert_eq!(parsed.entries[0].tool_name, "z");
     }
 }
