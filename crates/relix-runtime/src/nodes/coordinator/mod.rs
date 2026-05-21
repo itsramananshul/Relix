@@ -620,6 +620,39 @@ impl TaskStore {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
         };
 
+        // M76: explicit retry suppression when paused/frozen.
+        // Per the cooperative interruption protocol (M70/M71)
+        // an operator pause/freeze records intent that future
+        // runtime cycles should not advance the task. The
+        // retry path is one such advancement — we refuse it
+        // here AND emit a `task.retry_suppressed` chronicle
+        // event so operators see the suppression alongside
+        // the original interruption request.
+        if matches!(status.as_str(), "paused" | "frozen") {
+            let suppression_legacy =
+                format!("retry suppressed: task is `{status}` (cooperative interruption)");
+            let suppression_json = format!(
+                r#"{{"suppressed_by":"{}","retry_count":{retry_count},"budget":{max_retries}}}"#,
+                json_escape(&status),
+            );
+            insert_typed_event(
+                &tx,
+                task_id,
+                now,
+                "task.retry_suppressed",
+                &suppression_legacy,
+                None,
+                None,
+                Some(&suppression_json),
+            )?;
+            tx.commit().map_err(CoordinatorError::Db)?;
+            return Ok(RetryDecision::Rejected {
+                reason: format!(
+                    "task is `{status}` — retry suppressed by cooperative \
+                     interruption (clear via task.resume / task.unfreeze)"
+                ),
+            });
+        }
         // Only retry from terminal-bad states.
         match status.as_str() {
             "failed" | "interrupted" => {}
@@ -7367,6 +7400,56 @@ mod tests {
         assert!(g.tasks.contains(&parent));
         assert!(g.tasks.contains(&child));
         assert_eq!(g.cross_task_edge_count, 1);
+    }
+
+    #[test]
+    fn retry_suppressed_when_task_is_paused() {
+        // M76: cooperative interruption — a paused task
+        // refuses retry AND emits a task.retry_suppressed
+        // chronicle event so operators see the gating.
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_paused(&tid, Some("operator hold"), "op").unwrap();
+        let decision = s.request_retry(&tid).unwrap();
+        match decision {
+            RetryDecision::Rejected { reason } => {
+                assert!(reason.contains("paused"));
+                assert!(reason.contains("cooperative interruption"));
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+        // Chronicle gets the suppression event.
+        let ev = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "task.retry_suppressed")
+            .expect("task.retry_suppressed event missing");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["suppressed_by"], "paused");
+    }
+
+    #[test]
+    fn retry_suppressed_when_task_is_frozen() {
+        let s = store();
+        let tid = s
+            .create("t", "f", "{}", "o", RetryPolicy::Bounded, 3, None)
+            .unwrap();
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_frozen(&tid, None, "op").unwrap();
+        let decision = s.request_retry(&tid).unwrap();
+        assert!(
+            matches!(decision, RetryDecision::Rejected { reason } if reason.contains("frozen"))
+        );
+        // Status is still frozen — suppression doesn't change it.
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "frozen");
     }
 
     #[test]
