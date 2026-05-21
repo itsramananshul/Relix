@@ -132,6 +132,39 @@ pub struct ProviderEntry {
     /// flap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_until: Option<i64>,
+    // ── M77: cumulative routing-trace counters ─────────────
+    //
+    // Counts every failed test against this provider's saved
+    // key. Distinct from `last_test_ok` (snapshot of the
+    // most recent call) — this is the long-running
+    // reliability signal an operator uses to spot a degraded
+    // provider that mostly works but flaps. Increments on
+    // every fail; never decrements. Reset deliberately by
+    // operator-clearing the field via a future endpoint (not
+    // shipped — until then operators see the lifetime count).
+    /// Total count of failed test calls since the entry was
+    /// created OR since the operator last reset. Lifetime
+    /// counter — never decrements automatically.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub failed_request_count: u64,
+    /// Total count of successful test calls — same lifetime
+    /// semantics as `failed_request_count`. The ratio gives
+    /// operators a real health signal.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub success_request_count: u64,
+    /// Unix seconds of the most recent failure observed by
+    /// a test call. `None` when never failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<i64>,
+    /// Upstream HTTP status code of the most recent failure
+    /// (when the request reached the provider). None for
+    /// transport-layer failures or when never failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_status_code: Option<u16>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 fn default_true() -> bool {
@@ -213,6 +246,21 @@ pub struct ProviderStatus {
     pub quarantine_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_until: Option<i64>,
+    // ── M77: routing-trace counters projection ─────────────
+    /// Lifetime count of failed test calls. Zero suppressed
+    /// from serialization so unused providers don't surface
+    /// a noisy "0" in the dashboard.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub failed_request_count: u64,
+    /// Lifetime count of successful test calls.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub success_request_count: u64,
+    /// Most recent failure timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<i64>,
+    /// Most recent failure HTTP status code (when reached).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure_status_code: Option<u16>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -326,6 +374,10 @@ impl BridgeSecrets {
                 quarantined_at: e.quarantined_at,
                 quarantine_reason: e.quarantine_reason.clone(),
                 cooldown_until: e.cooldown_until,
+                failed_request_count: e.failed_request_count,
+                success_request_count: e.success_request_count,
+                last_failure_at: e.last_failure_at,
+                last_failure_status_code: e.last_failure_status_code,
             },
             None => ProviderStatus {
                 name: name.to_string(),
@@ -343,6 +395,10 @@ impl BridgeSecrets {
                 quarantined_at: None,
                 quarantine_reason: None,
                 cooldown_until: None,
+                failed_request_count: 0,
+                success_request_count: 0,
+                last_failure_at: None,
+                last_failure_status_code: None,
             },
         }
     }
@@ -482,6 +538,10 @@ impl BridgeSecrets {
         let prior_quarantined_at = prior.and_then(|e| e.quarantined_at);
         let prior_quarantine_reason = prior.and_then(|e| e.quarantine_reason.clone());
         let prior_cooldown_until = prior.and_then(|e| e.cooldown_until);
+        let prior_failed_count = prior.map(|e| e.failed_request_count).unwrap_or(0);
+        let prior_success_count = prior.map(|e| e.success_request_count).unwrap_or(0);
+        let prior_last_failure_at = prior.and_then(|e| e.last_failure_at);
+        let prior_last_failure_status_code = prior.and_then(|e| e.last_failure_status_code);
         self.providers.insert(
             name.to_string(),
             ProviderEntry {
@@ -497,6 +557,10 @@ impl BridgeSecrets {
                 quarantined_at: prior_quarantined_at,
                 quarantine_reason: prior_quarantine_reason,
                 cooldown_until: prior_cooldown_until,
+                failed_request_count: prior_failed_count,
+                success_request_count: prior_success_count,
+                last_failure_at: prior_last_failure_at,
+                last_failure_status_code: prior_last_failure_status_code,
             },
         );
     }
@@ -521,11 +585,23 @@ impl BridgeSecrets {
     ) -> bool {
         match self.providers.get_mut(name) {
             Some(e) => {
-                e.last_test_at = Some(unix_secs());
+                let now = unix_secs();
+                e.last_test_at = Some(now);
                 e.last_test_ok = Some(ok);
                 e.last_test_status_code = status_code;
                 e.last_test_elapsed_ms = Some(elapsed_ms);
                 e.last_test_detail = Some(detail.into());
+                // M77: routing-trace counters. Lifetime
+                // counts — never decrement automatically.
+                // Saturating add so a long-lived bridge can't
+                // wrap a u64 counter.
+                if ok {
+                    e.success_request_count = e.success_request_count.saturating_add(1);
+                } else {
+                    e.failed_request_count = e.failed_request_count.saturating_add(1);
+                    e.last_failure_at = Some(now);
+                    e.last_failure_status_code = status_code;
+                }
                 true
             }
             None => false,
@@ -733,6 +809,57 @@ mod tests {
         assert!(p.quarantined_at.is_some());
         assert!(p.cooldown_until.is_some());
         assert_eq!(p.quarantine_reason.as_deref(), Some("flap"));
+    }
+
+    #[test]
+    fn routing_trace_increments_lifetime_counters() {
+        // M77: success/fail counters accumulate across many
+        // test calls. Real lifetime signal — distinct from
+        // the M58 snapshot.
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        s.record_provider_test("openai", true, Some(200), 100, "ok");
+        s.record_provider_test("openai", true, Some(200), 110, "ok");
+        s.record_provider_test("openai", false, Some(429), 50, "rate limited");
+        s.record_provider_test("openai", false, Some(500), 80, "upstream 500");
+        s.record_provider_test("openai", true, Some(200), 120, "ok");
+        let p = s.provider_status("openai");
+        assert_eq!(p.success_request_count, 3);
+        assert_eq!(p.failed_request_count, 2);
+        assert!(p.last_failure_at.is_some());
+        assert_eq!(p.last_failure_status_code, Some(500));
+    }
+
+    #[test]
+    fn routing_trace_counters_preserved_across_key_overwrite() {
+        // M77: rotating a key must not zero the lifetime
+        // counters — operators care about reliability over
+        // the LIFE of the provider entry, not the LIFE of
+        // any single API key.
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-old".into(), None);
+        s.record_provider_test("openai", false, Some(500), 100, "boom");
+        s.record_provider_test("openai", true, Some(200), 90, "ok");
+        s.set_provider("openai", "sk-new".into(), Some("gpt-4o".into()));
+        let p = s.provider_status("openai");
+        assert_eq!(p.failed_request_count, 1);
+        assert_eq!(p.success_request_count, 1);
+        assert!(p.last_failure_at.is_some());
+    }
+
+    #[test]
+    fn routing_trace_round_trips_through_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bridge-secrets.toml");
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        s.record_provider_test("openai", false, Some(429), 88, "rate limited");
+        s.save(&path).expect("save");
+        let s2 = BridgeSecrets::load_or_empty(&path);
+        let p = s2.provider_status("openai");
+        assert_eq!(p.failed_request_count, 1);
+        assert_eq!(p.success_request_count, 0);
+        assert_eq!(p.last_failure_status_code, Some(429));
     }
 
     #[test]

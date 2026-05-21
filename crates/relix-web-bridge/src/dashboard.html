@@ -5894,6 +5894,38 @@ function renderProviders(providers) {
    given provider. Empty string when the provider isn't in
    PROVIDER_MODEL_PRESETS (operators still get a plain text
    input — datalist is purely an autocomplete affordance). */
+/* M77: routing-trace counters panel. Lifetime success/fail
+   counts give operators a reliability signal distinct from
+   the M58 last-test snapshot. Empty when neither counter
+   has fired so unused providers stay compact. Reliability
+   ratio renders as a percentage when there are >0 total
+   requests; below 90% gets a warn accent. */
+function renderProviderRoutingTraceBlock(p) {
+  const fails = Number(p.failed_request_count || 0);
+  const oks = Number(p.success_request_count || 0);
+  if (fails === 0 && oks === 0) return '';
+  const total = fails + oks;
+  const reliability = total > 0 ? Math.round((oks * 100) / total) : null;
+  const relCls = reliability != null && reliability < 90
+    ? 'warn' : 'ok';
+  const lastFailPart = (p.last_failure_at != null)
+    ? ' &middot; last fail '
+      + escapeHtml(fmtDuration(Math.max(0,
+          Math.floor(Date.now() / 1000) - Number(p.last_failure_at))))
+      + ' ago'
+      + (p.last_failure_status_code != null
+          ? ' (HTTP ' + escapeHtml(String(p.last_failure_status_code)) + ')'
+          : '')
+    : '';
+  return '<div class="provider-meta">routing trace '
+    + '<span class="badge ' + relCls + '">'
+    + (reliability != null ? reliability + '% ok' : '—')
+    + '</span> &middot; '
+    + oks + ' ok / ' + fails + ' fail'
+    + lastFailPart
+    + '</div>';
+}
+
 /* Last-test cache panel. Renders the persisted outcome from
    /v1/config/providers when present (M58). Empty string when
    the provider has never been tested so the card stays
@@ -5976,6 +6008,7 @@ function renderProviderCard(p) {
         : '')
       + '</div>'
       + renderProviderLastTestBlock(p)
+      + renderProviderRoutingTraceBlock(p)
     : '';
   const deleteBtn = p.configured
     ? '<button class="btn-danger" data-action="delete" data-name="' + escapeHtml(p.name) + '">Delete</button>'

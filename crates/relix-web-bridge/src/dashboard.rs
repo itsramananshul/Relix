@@ -395,6 +395,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_provider_routing_trace_landmarks_present() {
+        // M77 (Track 4): provider card renders lifetime
+        // routing trace — success/fail counts with
+        // reliability ratio + last-failure timestamp +
+        // status code. Empty when no traffic has flowed.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "renderProviderRoutingTraceBlock",
+            "p.failed_request_count",
+            "p.success_request_count",
+            "routing trace",
+            "p.last_failure_at",
+        ] {
+            assert!(body.contains(needle), "M77 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_provider_quarantine_controls_present() {
         // M69 (Track C): provider card ships quarantine +
         // cooldown badges and a toggle action that POSTs to
