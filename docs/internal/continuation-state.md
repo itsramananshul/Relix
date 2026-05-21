@@ -9,16 +9,16 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `a307138 feat(tool): PH-FS-AUDIT-FILTER op-filter on tool.fs.audit_recent`
+- **HEAD:** `f570a9b feat(capability): PH-CAP-RISK stage 2 — sweep every shipped descriptor with explicit risk`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1053 passing, 0 failures
-  - relix-core: 60
+- **Workspace tests:** 1064 passing, 0 failures
+  - relix-core: 66
   - relix-policy: 66
   - relix-runtime: 657
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
-  - relix-cli: 18
+  - relix-cli: 24
   - relix-web-bridge: 220
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
@@ -48,6 +48,8 @@ as the resume command.
 | 31c160e | PH-MCP-CLI | relix-cli mcp {servers,tools} — libp2p dial-and-call for MCP registry inspection |
 | f642e52 | PH-TERM-CLI | relix-cli terminal {sessions,audit,cancel} — terminal observability + cooperative cancel |
 | a307138 | PH-FS-AUDIT-FILTER | tool.fs.audit_recent JSON arg form with optional op filter |
+| a27e4a3 | PH-CAP-RISK stage 1 | RiskLevel enum + field on CapabilityDescriptor + validator + CLI render |
+| f570a9b | PH-CAP-RISK stage 2 | sweep every shipped descriptor with explicit risk tier |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
