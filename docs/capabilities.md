@@ -61,11 +61,12 @@ before the backend (visibility + stable contract + honesty).
 | `tool.read_file` | live | UTF-8 only; configurable byte cap |
 | `tool.write_file` | live | Atomic; modes overwrite / create_new |
 | `tool.append_file` (PH-FS-PARITY1) | live | Strictly additive; refuses to create |
-| `tool.search_files` | live | Name or substring-content; linear walker |
+| `tool.search_files` | live | Name / content substring or `glob` mode (PH-FS-PARITY3); linear walker |
 | `tool.list_dir` (CW2) | live | Tab-separated rows + paginated |
 | `tool.patch` | live | Unified diff apply |
 | `tool.patch_preview` (PH-FS-PARITY1) | live | Read-only dry-run |
 | `tool.binary_sniff` (PH-FS-PARITY2) | live | Classify text/binary by sniffing first 8 KiB |
+| `tool.fs.audit_recent` (PH-FS-PARITY4) | live | Bounded ring of recent write/append/patch mutations |
 | `tool.pdf` | live | base64-encoded PDF parse |
 
 ### Web

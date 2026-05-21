@@ -1022,6 +1022,11 @@ fn register_node_type_handlers(
             // PH-FS-PARITY2: tool.binary_sniff — classify a file
             // as text/binary by reading the first 8 KiB. Same jail.
             manifest.add_capability(crate::nodes::tool::fs::descriptor_binary_sniff());
+            // PH-FS-PARITY4: tool.fs.audit_recent — operator
+            // snapshot of the most recent successful mutations
+            // (write / append / patch) on the jail. Bounded
+            // in-memory ring.
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_audit_recent());
         }
         // B3: tool.pdf — only advertised when [tool.pdf] is configured.
         if tool_cfg.pdf.is_some() {

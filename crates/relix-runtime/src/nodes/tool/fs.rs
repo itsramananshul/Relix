@@ -51,8 +51,9 @@
 //!   level substring match. Adequate at alpha scale; an indexer is a
 //!   separate capability when one is needed.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 
@@ -100,10 +101,67 @@ pub enum FsError {
     RootNotDir(String),
 }
 
+/// PH-FS-PARITY4: one mutation observation. Pushed onto the
+/// jail's bounded audit ring after every successful write /
+/// append / patch. Surfaced via `tool.fs.audit_recent`. Pure
+/// in-memory observability; does NOT replace the
+/// dispatch-level audit log and does NOT mutate chronicle.
+#[derive(Clone, Debug)]
+pub struct FsAuditEntry {
+    /// Wall-clock unix seconds at the moment of mutation.
+    pub ts_secs: i64,
+    /// One of `"write"`, `"append"`, `"patch"`.
+    pub op: &'static str,
+    /// Jail-relative path (forward-slash normalized).
+    pub rel_path: String,
+    /// Byte count of the resulting / appended payload.
+    /// For `write` and `patch` this is the resulting file
+    /// size on disk; for `append` it is the number of bytes
+    /// appended (not the resulting size — that is captured in
+    /// the handler's response body).
+    pub bytes: usize,
+    /// Hex `subject_id` of the caller (full 32-byte fingerprint).
+    pub caller_subject_id: String,
+}
+
+/// PH-FS-PARITY4: bounded ring of [`FsAuditEntry`]. Oldest
+/// entries are evicted when the ring is full. Stored newest-last.
+pub struct FsAuditRing {
+    entries: Mutex<VecDeque<FsAuditEntry>>,
+    capacity: usize,
+}
+
+impl FsAuditRing {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub fn push(&self, entry: FsAuditEntry) {
+        let mut g = self.entries.lock().expect("fs audit ring poisoned");
+        if g.len() == self.capacity {
+            g.pop_front();
+        }
+        g.push_back(entry);
+    }
+
+    pub fn snapshot_newest_first(&self, max: usize) -> Vec<FsAuditEntry> {
+        let g = self.entries.lock().expect("fs audit ring poisoned");
+        g.iter().rev().take(max).cloned().collect()
+    }
+}
+
+/// Default ring capacity. Bounded so a busy jail can't hold an
+/// unbounded mutation log in process memory.
+const FS_AUDIT_RING_DEFAULT: usize = 256;
+
 /// Path-jailed FS handle shared across all four handlers.
 pub struct FsJail {
     canonical_root: PathBuf,
     cfg: FsJailConfig,
+    audit: FsAuditRing,
 }
 
 impl FsJail {
@@ -121,7 +179,38 @@ impl FsJail {
         Ok(Self {
             canonical_root,
             cfg,
+            audit: FsAuditRing::new(FS_AUDIT_RING_DEFAULT),
         })
+    }
+
+    /// Push a mutation observation onto the audit ring. Called
+    /// from `handle_write` / `handle_append` / `handle_patch` on
+    /// the success path. Failures (Err returns) intentionally do
+    /// NOT record — the operator inspects failures through the
+    /// dispatch-level audit log.
+    fn record_mutation(
+        &self,
+        op: &'static str,
+        rel_path: String,
+        bytes: usize,
+        ctx: &InvocationCtx,
+    ) {
+        let ts_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.audit.push(FsAuditEntry {
+            ts_secs,
+            op,
+            rel_path,
+            bytes,
+            caller_subject_id: ctx.caller.subject_id.to_string(),
+        });
+    }
+
+    /// Test/operator hook — snapshot the most recent N mutations.
+    pub fn audit_snapshot(&self, max: usize) -> Vec<FsAuditEntry> {
+        self.audit.snapshot_newest_first(max)
     }
 
     /// Resolve a caller-supplied jail-relative path to a canonical
@@ -353,6 +442,29 @@ pub fn descriptor_binary_sniff() -> CapabilityDescriptor {
     d
 }
 
+/// PH-FS-PARITY4: `tool.fs.audit_recent` — snapshot the most
+/// recent successful write / append / patch mutations on the
+/// jail. Pure in-memory observability; bounded ring of 256
+/// entries. Older entries are evicted in FIFO order. Does
+/// NOT replace the dispatch-level audit log.
+pub fn descriptor_audit_recent() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.fs.audit_recent");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["fs:audit".into()];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Return the most recent successful fs mutations on the jail. Arg \
+         is optional `<max>` (default 256). Tab-delim rows: \
+         ts_secs\\top\\trel_path\\tbytes\\tcaller_subject_id. Newest first."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "fs".into(), "audit".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
 /// CW2: `tool.list_dir` — list direct children of a
 /// jail-relative directory. Returns one line per entry:
 /// `<kind>\t<name>\t<size_bytes>\t<modified_unix_secs>`
@@ -452,12 +564,22 @@ pub fn register(bridge: &mut DispatchBridge, jail: Arc<FsJail>) {
         );
     }
     {
-        let j = jail;
+        let j = jail.clone();
         bridge.register(
             "tool.binary_sniff",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let j = j.clone();
                 async move { handle_binary_sniff(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail;
+        bridge.register(
+            "tool.fs.audit_recent",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_audit_recent(&j, &ctx) }
             })),
         );
     }
@@ -565,11 +687,9 @@ fn handle_write(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
         let _ = std::fs::remove_file(&tmp);
         return invalid(format!("tool.write_file rename: {e}"));
     }
-    let body = format!(
-        "ok bytes={} path={}\n",
-        content.len(),
-        jail.display_rel(&canonical)
-    );
+    let rel_display = jail.display_rel(&canonical);
+    jail.record_mutation("write", rel_display.clone(), content.len(), ctx);
+    let body = format!("ok bytes={} path={}\n", content.len(), rel_display);
     HandlerOutcome::Ok(body.into_bytes())
 }
 
@@ -734,6 +854,7 @@ fn handle_patch(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
         let _ = std::fs::remove_file(&tmp);
         return invalid(format!("tool.patch rename: {e}"));
     }
+    jail.record_mutation("patch", jail.display_rel(&canonical), patched.len(), ctx);
     let body = format!("ok bytes={}\n", patched.len());
     HandlerOutcome::Ok(body.into_bytes())
 }
@@ -799,6 +920,7 @@ fn handle_append(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
         return invalid(format!("tool.append_file write: {e}"));
     }
     let new_size = std::fs::metadata(&canonical).map(|m| m.len()).unwrap_or(0);
+    jail.record_mutation("append", jail.display_rel(&canonical), body.len(), ctx);
     HandlerOutcome::Ok(format!("ok appended={} new_size={new_size}\n", body.len()).into_bytes())
 }
 
@@ -1095,6 +1217,44 @@ fn tempfile_in_dir(dir: &Path) -> std::io::Result<PathBuf> {
     let tmp = dir.join(name);
     std::fs::File::create(&tmp)?;
     Ok(tmp)
+}
+
+/// PH-FS-PARITY4: handle `tool.fs.audit_recent`. Arg is an
+/// optional decimal `<max>` (default 256). Returns one row per
+/// entry, newest first, tab-delimited:
+/// `ts_secs\top\trel_path\tbytes\tcaller_subject_id`. Final
+/// row is `count=<N>`.
+fn handle_audit_recent(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("tool.fs.audit_recent arg utf8: {e}")),
+    };
+    let max = if s.is_empty() {
+        FS_AUDIT_RING_DEFAULT
+    } else {
+        match s.parse::<usize>() {
+            Ok(n) if n > 0 => n.min(FS_AUDIT_RING_DEFAULT),
+            _ => {
+                return invalid(format!(
+                    "tool.fs.audit_recent: arg must be a positive integer (got '{s}')"
+                ));
+            }
+        }
+    };
+    let entries = jail.audit_snapshot(max);
+    let count = entries.len();
+    let mut buf = String::new();
+    for e in entries {
+        let safe_path = e.rel_path.replace(['\t', '\n'], " ");
+        let _ = writeln!(
+            buf,
+            "{}\t{}\t{}\t{}\t{}",
+            e.ts_secs, e.op, safe_path, e.bytes, e.caller_subject_id
+        );
+    }
+    let _ = writeln!(buf, "count={count}");
+    HandlerOutcome::Ok(buf.into_bytes())
 }
 
 fn invalid(cause: String) -> HandlerOutcome {
@@ -2095,5 +2255,116 @@ mod tests {
             HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
         };
         assert_eq!(body.lines().count(), 3);
+    }
+
+    // ── PH-FS-PARITY4: tool.fs.audit_recent + mutation ring ────────
+
+    #[test]
+    fn audit_recent_descriptor_shape() {
+        let d = descriptor_audit_recent();
+        assert_eq!(d.method_name, "tool.fs.audit_recent");
+        assert_eq!(d.major_version, 1);
+        assert!(matches!(d.idempotency, Idempotency::Idempotent));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "fs:audit"));
+        assert!(d.requires_groups.iter().any(|g| g == "operators"));
+    }
+
+    #[test]
+    fn audit_ring_records_successful_write() {
+        let (_td, j) = mk_jail();
+        let r = handle_write(&j, &ctx(b"a.txt|overwrite|hello"));
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let snap = j.audit_snapshot(10);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].op, "write");
+        assert_eq!(snap[0].bytes, 5);
+        assert!(snap[0].rel_path.ends_with("a.txt"));
+        assert!(!snap[0].caller_subject_id.is_empty());
+    }
+
+    #[test]
+    fn audit_ring_records_append_and_patch() {
+        let (_td, j) = mk_jail();
+        handle_write(&j, &ctx(b"a.txt|overwrite|hi\n"));
+        handle_append(&j, &ctx(b"a.txt|world\n"));
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n hi\n-world\n+WORLD\n";
+        let arg = format!("a.txt|unified_diff|{diff}");
+        handle_patch(&j, &ctx(arg.as_bytes()));
+
+        let snap = j.audit_snapshot(10);
+        // Newest first: patch, append, write.
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].op, "patch");
+        assert_eq!(snap[1].op, "append");
+        assert_eq!(snap[2].op, "write");
+    }
+
+    #[test]
+    fn audit_ring_does_not_record_failed_write() {
+        let (_td, j) = mk_jail();
+        // Traversal — rejected before any I/O.
+        let r = handle_write(&j, &ctx(b"../escape|overwrite|x"));
+        assert!(matches!(r, HandlerOutcome::Err(_)));
+        let snap = j.audit_snapshot(10);
+        assert_eq!(snap.len(), 0);
+    }
+
+    #[test]
+    fn audit_ring_is_bounded_by_capacity_default() {
+        let (_td, j) = mk_jail();
+        // Push more than the default 256 to exercise eviction.
+        for i in 0..(FS_AUDIT_RING_DEFAULT + 10) {
+            handle_write(&j, &ctx(format!("f{i}.txt|overwrite|x").as_bytes()));
+        }
+        let snap = j.audit_snapshot(10_000);
+        assert_eq!(snap.len(), FS_AUDIT_RING_DEFAULT);
+    }
+
+    #[test]
+    fn audit_recent_handler_returns_newest_first_with_count() {
+        let (_td, j) = mk_jail();
+        handle_write(&j, &ctx(b"a.txt|overwrite|x"));
+        handle_write(&j, &ctx(b"b.txt|overwrite|yy"));
+        let r = handle_audit_recent(&j, &ctx(b""));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        // 2 entries + count= trailer.
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("b.txt"));
+        assert!(lines[1].contains("a.txt"));
+        assert_eq!(lines[2], "count=2");
+    }
+
+    #[test]
+    fn audit_recent_handler_respects_max_arg() {
+        let (_td, j) = mk_jail();
+        for i in 0..5 {
+            handle_write(&j, &ctx(format!("f{i}.txt|overwrite|x").as_bytes()));
+        }
+        let r = handle_audit_recent(&j, &ctx(b"2"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        // 2 entries + count=2 trailer.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "count=2");
+    }
+
+    #[test]
+    fn audit_recent_handler_rejects_non_numeric_arg() {
+        let (_td, j) = mk_jail();
+        let r = handle_audit_recent(&j, &ctx(b"abc"));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("positive integer"));
+            }
+            _ => panic!("expected Err"),
+        }
     }
 }
