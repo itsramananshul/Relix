@@ -450,12 +450,21 @@ all pushed to origin/main):
 | PH-DASH1 | f5449e5 | bridge +1 | click-to-expand firehose payload_json |
 | PH-WAVE2A | a31d81f | core +10 | jittered backoff helper |
 | PH-WAVE2C | cce96e2 | n/a | redaction count KPI tile |
-| PH-WAVE2D | (pending) | runtime +8 | task.todo_* coord capabilities |
-| PH-WAVE2E | (pending) | n/a | Anthropic prompt-caching cache_control |
+| PH-WAVE2D | 0a12bb0 | runtime +8 | task.todo_* coord capabilities (+ deadlock-fix during integration) |
+| PH-WAVE2E | 0a12bb0 | n/a | Anthropic prompt-caching cache_control |
+| PH-WAVE2F | 3d25355 | n/a | Anthropic extended-thinking budget knob |
+| PH-DASH2  | d69b6f1 | bridge +1 | bridge REST + dashboard widget for todos |
 
-Aggregate: ~7500+ LOC; runtime tests 291 → 419+, bridge tests
-192 → 208, relix-core 33 → 61. Every milestone clean fmt +
-clippy + tests. Total workspace ≈ 745+ passing tests.
+Aggregate: ~8500+ LOC; runtime tests 291 → 419, bridge tests
+192 → 209, relix-core 33 → 61. Every milestone clean fmt +
+clippy + tests. Total workspace = 754 passing tests.
+
+A deadlock was introduced and fixed during PH-WAVE2D: the
+initial `set_task_todos` impl called `self.list_task_todos`
+after `tx.commit()` while still holding the `std::sync::Mutex`
+guard (mutex is non-reentrant). Caught by a hang in the
+`todo_set_empty_clears_list` test; rewritten to re-prepare
+the SELECT inside the same guard scope.
 
 Plus an Explore-agent-generated `docs/internal/hermes-capability-map.md`
 inventorying all 76 Hermes tools / 35 skills / 11+ platforms with
