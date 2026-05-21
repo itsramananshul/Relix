@@ -187,6 +187,18 @@ pub struct ProviderEntry {
 /// recorded window" from the ring being full at this size.
 pub const RATE_LIMIT_RING_CAP: usize = 32;
 
+/// PH-WAVE2I: rate-limit hits within a 5-minute window that
+/// trigger the bridge to auto-set a cooldown. Higher than 1 so
+/// a single transient flap doesn't slam the cooldown door;
+/// low enough that a real rate-limit storm is caught quickly.
+pub const ANTI_RATELIMIT_THRESHOLD_5MIN: u64 = 5;
+
+/// PH-WAVE2I: length of the auto-set cooldown, in seconds.
+/// Operators can extend / clear via the existing M69
+/// quarantine surface; the bridge just refuses test calls
+/// until cooldown_until passes.
+pub const ANTI_RATELIMIT_COOLDOWN_SECS: i64 = 60;
+
 /// PH-WAVE2G: count rate-limit observations whose timestamp is
 /// within `window_secs` of `now`. Saturating arithmetic — a
 /// wildly future-stamped entry doesn't wrap. Empty ring returns
@@ -689,6 +701,21 @@ impl BridgeSecrets {
                             let drop = e.rate_limit_recent_hits.len() - RATE_LIMIT_RING_CAP;
                             e.rate_limit_recent_hits.drain(..drop);
                         }
+                        // PH-WAVE2I: auto-cooldown when the storm
+                        // threshold is reached. Don't override an
+                        // operator-set cooldown that's already
+                        // longer (manual quarantine wins). We
+                        // bump cooldown_until to the LATER of
+                        // (existing, now+ANTI_RATELIMIT_COOLDOWN_SECS).
+                        let recent = rate_limit_hits_in_window(&e.rate_limit_recent_hits, now, 300);
+                        if recent >= ANTI_RATELIMIT_THRESHOLD_5MIN {
+                            let proposed = now + ANTI_RATELIMIT_COOLDOWN_SECS;
+                            e.cooldown_until = Some(
+                                e.cooldown_until
+                                    .map(|c| c.max(proposed))
+                                    .unwrap_or(proposed),
+                            );
+                        }
                     }
                 }
                 true
@@ -971,6 +998,62 @@ mod tests {
         s.set_provider("openai", "sk-new".into(), Some("gpt-4o".into()));
         let p = s.provider_status("openai");
         assert_eq!(p.rate_limit_hits_1h, 1);
+    }
+
+    #[test]
+    fn auto_cooldown_triggers_on_storm_threshold() {
+        // PH-WAVE2I: 5 rate-limit hits in 5 minutes → auto
+        // cooldown is set. Test fires 5 hits in a row; each
+        // record_provider_test uses unix_secs() so they all
+        // land in the same 5-min window.
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        // First 4 hits: no cooldown yet.
+        for _ in 0..(ANTI_RATELIMIT_THRESHOLD_5MIN - 1) {
+            s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        }
+        let p_pre = s.provider_status("openai");
+        assert!(
+            p_pre.cooldown_until.is_none(),
+            "should not yet be in cooldown"
+        );
+        // 5th hit crosses the threshold.
+        s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        let p_post = s.provider_status("openai");
+        assert!(p_post.cooldown_until.is_some());
+        let now = unix_secs();
+        let cd = p_post.cooldown_until.unwrap();
+        assert!(
+            cd >= now,
+            "cooldown_until should be in the future (got {cd}, now {now})"
+        );
+        assert!(
+            cd <= now + ANTI_RATELIMIT_COOLDOWN_SECS + 1,
+            "cooldown shouldn't be wildly extended"
+        );
+    }
+
+    #[test]
+    fn auto_cooldown_preserves_longer_operator_cooldown() {
+        // Operator set a 1-hour cooldown manually. Auto-cooldown
+        // (60s) must not shorten it.
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        let now = unix_secs();
+        let manual_cd = now + 3600;
+        if let Some(e) = s.providers.get_mut("openai") {
+            e.cooldown_until = Some(manual_cd);
+        }
+        // Fire enough to trigger.
+        for _ in 0..ANTI_RATELIMIT_THRESHOLD_5MIN {
+            s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        }
+        let p = s.provider_status("openai");
+        assert_eq!(
+            p.cooldown_until,
+            Some(manual_cd),
+            "operator-set cooldown must win when longer than auto"
+        );
     }
 
     #[test]
