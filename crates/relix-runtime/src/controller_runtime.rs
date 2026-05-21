@@ -359,6 +359,18 @@ fn register_builtins(
             }
         })),
     );
+    // W2-007a: node.policy.simulate — answer "what would the
+    // policy say if caller X (groups=Y,Z) tried method M?"
+    // without actually invoking M. Pure read. Helps operators
+    // validate policy changes before deploying them.
+    let policy_handle = bridge.policy_handle();
+    bridge.register(
+        "node.policy.simulate",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let policy = policy_handle.clone();
+            async move { handle_policy_simulate(&policy, &ctx) }
+        })),
+    );
     // Built-in: every node serves its own NodeManifest.
     let manifest_for_handler = manifest.clone();
     bridge.register(
@@ -402,6 +414,107 @@ fn register_builtins(
             .with_categories(["observe".into(), "read".into()])
             .with_risk(relix_core::capability::RiskLevel::Safe),
     );
+    // W2-007a: policy simulate descriptor.
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.policy.simulate")
+            .with_description(
+                "Evaluate the local policy against a hypothetical caller (groups) + method tuple. \
+                 Arg shape: `<method>|<comma-separated-groups>`. Returns multi-line key=value: \
+                 `decision=allow|deny\\nmatched_rule=<rule_or_->\\nreason=<reason_or_->`. \
+                 Pure read; never invokes the method. Useful for validating policy changes \
+                 before deploying them.",
+            )
+            .with_categories(["observe".into(), "policy".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
+    );
+}
+
+/// W2-007a: handle `node.policy.simulate`. Parses `<method>|<groups_csv>`,
+/// builds a synthetic VerifiedIdentity with the supplied groups,
+/// runs PolicyEngine::evaluate, and returns the Decision as
+/// multi-line key=value. The synthetic identity carries the
+/// CALLER's identity for subject_id / name (so the simulation
+/// inherits the caller's identity but with a hypothetical
+/// groups list).
+fn handle_policy_simulate(policy: &PolicyEngine, ctx: &InvocationCtx) -> HandlerOutcome {
+    use relix_core::identity::VerifiedIdentity;
+    use relix_core::policy::Decision;
+    use relix_core::types::error_kinds;
+
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("node.policy.simulate arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let (method, groups_csv) = match s.split_once('|') {
+        Some(p) => p,
+        None => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: "node.policy.simulate: arg shape `<method>|<groups_csv>`".into(),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let method = method.trim();
+    if method.is_empty() {
+        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "node.policy.simulate: method required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let groups: Vec<String> = groups_csv
+        .split(',')
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    // Build a hypothetical identity that inherits the caller's
+    // subject_id / org_id (so audit-style admin tooling that
+    // distinguishes "who's asking" still works) but swaps the
+    // groups for the simulated set. Name is suffixed with
+    // `:simulate` so log lines + audit trails know the
+    // evaluation was hypothetical.
+    let hypothetical = VerifiedIdentity {
+        subject_id: ctx.caller.subject_id,
+        name: format!("{}:simulate", ctx.caller.name),
+        org_id: ctx.caller.org_id,
+        groups,
+        role: ctx.caller.role.clone(),
+        clearance: ctx.caller.clearance.clone(),
+        bundle_id: ctx.caller.bundle_id,
+    };
+    let decision = policy.evaluate(&hypothetical, method);
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    match &decision {
+        Decision::Allow { matched_rule } => {
+            let _ = writeln!(body, "decision=allow");
+            let _ = writeln!(body, "matched_rule={}", matched_rule);
+            let _ = writeln!(body, "reason=-");
+        }
+        Decision::Deny {
+            reason,
+            matched_rule,
+        } => {
+            let _ = writeln!(body, "decision=deny");
+            let _ = writeln!(
+                body,
+                "matched_rule={}",
+                matched_rule.as_deref().unwrap_or("-")
+            );
+            let _ = writeln!(body, "reason={}", reason);
+        }
+    }
+    HandlerOutcome::Ok(body.into_bytes())
 }
 
 /// W2-006b: format the dispatch-stats snapshot as tab-delim
@@ -422,7 +535,10 @@ fn dispatch_stats_body(
     snap.sort_by(|a, b| a.0.cmp(&b.0));
     let mut body = String::new();
     for (name, s) in &snap {
-        let mean = s.total_elapsed_ms.checked_div(s.latency_samples).unwrap_or(0);
+        let mean = s
+            .total_elapsed_ms
+            .checked_div(s.latency_samples)
+            .unwrap_or(0);
         let _ = writeln!(
             body,
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",

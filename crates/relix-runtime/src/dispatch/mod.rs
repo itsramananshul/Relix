@@ -183,6 +183,14 @@ impl DispatchBridge {
         self.capability_stats.clone()
     }
 
+    /// W2-007a: return a clone of the PolicyEngine. Used by the
+    /// `node.policy.simulate` built-in capability — handlers
+    /// can answer "what would the policy say?" questions
+    /// without owning the bridge.
+    pub fn policy_handle(&self) -> PolicyEngine {
+        self.policy.clone()
+    }
+
     /// PH-DISP1: snapshot of every capability's counters.
     /// Order is stable (by method name) so dashboards diff
     /// cleanly across calls. Returns an empty vec when no
