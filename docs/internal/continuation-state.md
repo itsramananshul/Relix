@@ -387,38 +387,70 @@ test failures.
 3. git status   (confirm clean)
 4. cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 5. cargo test --workspace
-   (Expected: 291 runtime + 192 bridge + others, 0 failures)
+   (Expected as of 2026-05-21: 54+33+380+23+2+203+3 = 698 tests, 0 failures)
 6. Read THIS file (docs/internal/continuation-state.md) for full context.
-7. Read TaskList; pick the next pending milestone. Recommended order:
-   a. M75 (lineage subtree metrics) — small, tightly bound to M66/M72,
-      good warmup that exercises the test suite after restart.
-   b. M77 (provider routing trace foundation) — Track 4 has been quiet
-      since M69; the user emphasized provider routing in the latest
-      directive.
-   c. CW2 (file_tools) — extends existing fs.rs pattern, low-risk
-      capability wave continuation.
-   d. M78 (production hardening docs) — code-conflict-free; can run
-      in parallel mentally.
-8. Maintain the HONESTY CONTRACT:
-   - No fabricated graph edges (real producers only).
-   - No fake hard-preemption (cooperative only; intent vs ack split).
-   - No fake provider failover (operator-visible state + restart-
-     required messaging).
-   - "(not recorded yet)" / "(not emitted yet)" labels stay honest
-     where data is missing.
-9. After each milestone:
-   - cargo fmt && cargo clippy --workspace --all-targets -- -D warnings
-   - cargo test --workspace
-   - git add <files> && git commit -m "..." && git push origin main
-10. DO NOT batch multiple milestones into one commit.
-11. DO NOT abandon current track work to start the Capability Wave;
-    rotate through tracks as the user has reaffirmed.
-12. Open issues to watch:
+7. Read docs/hermes-deep-dive.md — the Hermes analysis the user wants
+   continuously referenced for adaptation.
+8. Read docs/internal/decisions-pending.md — open D-001..D-006 questions
+   the runtime did NOT resolve on its own; user signs off in the morning.
+9. Read TaskList; pick the next pending milestone. As of this checkpoint:
+   - CW3, H1, H2, H4, H5, H6, H7 all shipped + pushed tonight (commits
+     98f1942 .. 404122e). 7 Hermes-grade adaptations + CW3.
+   - Pending: CW4 (browser_tool — big spec, defer), CW5 (mcp_tool —
+     decisions-pending D-002 blocks shape; defer until operator
+     answers).
+   - Highest-leverage next milestone the runtime can do without
+     decisions: H8 secret-redaction in chronicle + audit. Adapts
+     Hermes redact_sensitive_text. Pure additive; would land in
+     ~30min.
+10. Maintain the HONESTY CONTRACT:
+    - No fabricated graph edges (real producers only).
+    - No fake hard-preemption (cooperative only; intent vs ack split).
+    - No fake provider failover (operator-visible state + restart-
+      required messaging).
+    - "(not recorded yet)" / "(not emitted yet)" labels stay honest
+      where data is missing.
+11. After each milestone:
+    - cargo fmt && cargo clippy --workspace --all-targets -- -D warnings
+    - cargo test --workspace
+    - git add <files> && git commit -m "..." && git push origin main
+12. NO Claude attribution in commit messages.
+13. NO hardcoded provider tokens.
+14. If a decision is genuinely needed and you can't act safely → log
+    to docs/internal/decisions-pending.md and pivot to another track.
+    Never block the night on a question the user can answer tomorrow.
+15. Open issues / gaps still tracked honestly:
     - task.update enforcement vs M74 matrix (deferred audit)
     - CW1 has no process-interruption (Gate 2 scope)
     - AI controller doesn't live-read provider quarantine
-      (M77 should NOT silently fix this; it remains an honest gap)
+      (M77 ships state; live read requires runtime restart)
+    - H3 iteration-budget grace-call deferred per D-006 (needs an
+      executor consumer that doesn't exist yet)
 ```
+
+## Tonight's autonomous run summary (2026-05-20 → 2026-05-21)
+
+Resumed from CW1 checkpoint. Shipped (each as a separate commit,
+all pushed to origin/main):
+
+| Milestone | Commit | Tests added | Concept |
+|---|---|---|---|
+| CW3 | 98f1942 | runtime +16 | tool.web_get + tool.web_search (DDG scrape) |
+| H1  | 5e42d38 | runtime +19, bridge +1 | Structured FailoverReason classifier |
+| H2  | c810937 | runtime +28, bridge +1 | Chronicle one-line summarizer |
+| H4  | 946aa7c | runtime +7 | Anti-thrash auto-mark |
+| H5  | f343c8f | runtime +3 | Synthesized terminal_summary |
+| H6  | d71e2d8 | runtime +3, bridge +4 | Stuck-running detection |
+| H7  | 404122e | runtime +5 | Orphan-attempt cleanup |
+
+Aggregate: ~3700 LOC added; runtime tests 291 → 380, bridge tests
+192 → 203. Every milestone clean fmt + clippy + tests.
+
+### What the user paused on tonight
+- Asked the runtime to keep going all night and to log
+  decisions it can't safely make to a pending-decisions doc.
+- The pending-decisions doc is the source of truth for what
+  needs operator sign-off in the morning.
 
 ---
 
