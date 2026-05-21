@@ -1929,6 +1929,18 @@
         </div>
         <div class="card-body dense" id="stuck-host"></div>
       </div>
+      <!-- H13: event-type histogram. Top-5 event_types in the
+           firehose ring with counts + percentages. Helps operators
+           see what dominates ("retry storm" vs "healthy chat
+           traffic"). Click any row → set the H12 firehose filter
+           to that event_type. Hidden when ring is empty. -->
+      <div class="card" id="evhist-card" style="margin-top: 12px; display: none;">
+        <div class="card-header">
+          <h3>Event-type mix</h3>
+          <span class="meta" id="evhist-status"></span>
+        </div>
+        <div class="card-body dense" id="evhist-host"></div>
+      </div>
       <div class="card" style="margin-top: 12px;">
         <div class="card-header">
           <h3>Live event firehose (cross-task)</h3>
@@ -2810,6 +2822,74 @@ function renderOpsHealthBadges() {
   section.style.display = any ? '' : 'none';
 }
 
+/* H13: top-5 event_type histogram from the firehose ring.
+   Pure projection — sorts the ring by event_type frequency,
+   renders the top 5 with count + percentage of ring size.
+   Rendered as a compact bar list. Each row is click-to-filter
+   so an operator spotting "task.attempt_started dominates" can
+   click to see only those events. Auto-hides when the ring is
+   empty. */
+function renderEventTypeHistogram() {
+  const $card = document.getElementById('evhist-card');
+  const $host = document.getElementById('evhist-host');
+  const $status = document.getElementById('evhist-status');
+  if (!$card || !$host) return;
+  if (firehoseRing.length === 0) {
+    $card.style.display = 'none';
+    return;
+  }
+  const counts = new Map();
+  for (const e of firehoseRing) {
+    const k = e.event_type || '(unknown)';
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  // Sort desc by count, take top 5. Ties broken by name asc for
+  // deterministic ordering across re-renders.
+  const sorted = Array.from(counts.entries()).sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+  });
+  const top = sorted.slice(0, 5);
+  const totalShown = top.reduce((s, [, n]) => s + n, 0);
+  const ringSize = firehoseRing.length;
+  const maxCount = top[0][1];
+  $card.style.display = '';
+  const rows = top.map(([etype, n]) => {
+    const pct = ringSize > 0 ? Math.round((n * 100) / ringSize) : 0;
+    const barWidth = Math.max(6, Math.round((n * 100) / maxCount));
+    return '<tr data-evhist-type="' + escapeHtml(etype) + '" style="cursor: pointer;">'
+      + '<td><code>' + escapeHtml(etype) + '</code></td>'
+      + '<td class="meta" style="text-align: right; padding-right: 8px;">' + n + '</td>'
+      + '<td style="width: 50%;">'
+      + '<div style="background: var(--accent); height: 10px; width: ' + barWidth + '%; border-radius: 2px;"></div>'
+      + '</td>'
+      + '<td class="meta" style="text-align: right;">' + pct + '%</td>'
+      + '</tr>';
+  }).join('');
+  $host.innerHTML = '<table class="data"><thead><tr>'
+    + '<th>event_type</th><th style="text-align: right;">count</th>'
+    + '<th>share</th><th style="text-align: right;">%</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  if ($status) {
+    const more = sorted.length > 5 ? ' · +' + (sorted.length - 5) + ' more types' : '';
+    $status.textContent = 'top ' + top.length + ' of ' + sorted.length
+      + ' types · ' + totalShown + '/' + ringSize + ' events' + more;
+  }
+  // Click any row → set the H12 filter to that event_type.
+  $host.querySelectorAll('tr[data-evhist-type]').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const etype = tr.getAttribute('data-evhist-type') || '';
+      const $ff = document.getElementById('firehose-filter');
+      if ($ff) {
+        $ff.value = etype;
+        firehoseFilterText = etype;
+        renderGlobalFirehose(false);
+        $ff.focus();
+      }
+    });
+  });
+}
+
 /* H11: each tile is click-through to a filtered firehose URL.
    Wired once at DOMContentLoaded — the elements exist from the
    start (just hidden until a counter goes non-zero). */
@@ -3175,6 +3255,9 @@ function openGlobalFirehoseStream() {
       // landed in the ring. Cheap — walks at most
       // FIREHOSE_RING_CAP entries.
       renderOpsHealthBadges();
+      // H13: re-render the event-type histogram against the
+      // updated ring (same walk cost, distinct projection).
+      renderEventTypeHistogram();
     }
   });
   es.addEventListener('dropped', (m) => {
@@ -3272,6 +3355,9 @@ async function fetchGlobalFirehose() {
       firehoseRing = items.concat(firehoseRing).slice(0, FIREHOSE_RING_CAP);
     }
     renderGlobalFirehose(false);
+    // H13: histogram updates alongside the firehose table on
+    // each polled fetch.
+    renderEventTypeHistogram();
   } catch (_) {
     renderGlobalFirehose(true);
   }

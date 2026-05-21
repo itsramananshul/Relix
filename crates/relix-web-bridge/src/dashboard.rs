@@ -717,6 +717,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_event_type_histogram_card_present() {
+        // H13: a dedicated `Event-type mix` card on the overview
+        // hosts the top-5 event_type histogram. Hidden when the
+        // firehose ring is empty; landmark elements must exist
+        // in the static HTML so the JS can populate them.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"evhist-card\"",
+            "id=\"evhist-host\"",
+            "id=\"evhist-status\"",
+            "Event-type mix",
+            "function renderEventTypeHistogram",
+            "data-evhist-type",
+        ] {
+            assert!(body.contains(needle), "H13 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_firehose_filter_input_present() {
         // H12: the firehose card carries an inline filter input
         // + status meta + a renderRows path that respects it.
