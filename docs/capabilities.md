@@ -97,6 +97,36 @@ before the backend (visibility + stable contract + honesty).
 
 See `docs/browser-tool.md`.
 
+### Router node (PH-ROUTER-NODE)
+
+A new role for the controller binary — same `relix-controller`
+binary, different `[controller] role = "router"`. Acts as the
+mesh's observability + health control plane. Receives
+heartbeats from every controller and answers operator-facing
+`router.*` queries. Never makes LLM calls, never holds provider
+keys, runs every RPC through the existing identity → policy →
+handler → audit pipeline.
+
+| Method | Status | Notes |
+|---|---|---|
+| `router.heartbeat` | live | Controller-only push; registers/updates peer + caps + groups |
+| `router.network_summary` | live | Operator-facing mesh overview (peers, active sessions, uptime); `org_filter` substring |
+| `router.session_list` | live | Operator-facing session browser; `status_filter` + `limit` + `offset` pagination |
+| `router.log` | live | Controller-only push; bounded 10k-line in-memory ring |
+
+Background loops (router role only): stale-peer reaper every
+30s (flips `healthy=false` after 90s of no heartbeat); session
+reaper every 300s (drops `completed`/`failed` sessions past
+`session_ttl_secs`, default 1800).
+
+Controllers in `controller` role with a non-empty
+`router_peer_id` spawn a 60-second heartbeat sender (1.5s
+warmup, then every 60s). Bundle loaded from
+`<key_path>.bundle`; missing bundle disables heartbeats with
+a single WARN line (controller still boots).
+
+See `configs/router-node.toml` and `configs/policies/router.toml`.
+
 ### MCP (CW5 honest scaffold)
 
 | Method | Status | Notes |
@@ -150,6 +180,9 @@ operator-facing endpoints:
 | `relix-cli ops stuck` (PH-OPS-STUCK) | H6 stuck-running projection |
 | `relix-cli ops events` (PH-OPS-EVENTS) | H2 firehose snapshot for terminal operators |
 | `relix-cli ops route-test` (PH-ROUTER-PREVIEW-CLI) | Preview HealthAwareRouter pick over current cached health |
+| `relix-cli router status` (PH-ROUTER-NODE) | Router mesh overview via `router.network_summary` |
+| `relix-cli router peers` (PH-ROUTER-NODE) | Per-peer table from `router.network_summary` |
+| `relix-cli router sessions` (PH-ROUTER-NODE) | Session browser via `router.session_list` (--status/--limit/--offset) |
 | `relix-cli ping` | Direct libp2p ping to a peer |
 
 ## Per-feature docs

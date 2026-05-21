@@ -35,6 +35,7 @@ pub mod identity;
 pub mod policy;
 pub mod redact;
 pub mod retry;
+pub mod router;
 pub mod types;
 
 /// Crate-wide result type alias for caller convenience.

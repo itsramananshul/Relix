@@ -1,0 +1,30 @@
+# Router node — registers router.heartbeat / router.network_summary /
+# router.session_list / router.log. Acts as the mesh's observability +
+# health control plane. Receives heartbeats from every controller and
+# answers operator-facing /v1/router/* queries.
+
+[controller]
+name = "router"
+node_type = "router"
+listen_port = 9010
+# Role flag — "router" wires the four router.* capabilities + reaper
+# loops. The 60s heartbeat sender that controller-role nodes use is
+# NOT spawned in this role.
+role = "router"
+# Seconds to retain completed/failed sessions before reaping. Running
+# sessions never time out. Default 1800 (30 min) preserves enough
+# history for the operator dashboard's recent-session view.
+session_ttl_secs = 1800
+
+[identity]
+key_path = "dev-keys/router.key"
+
+[trust]
+org_root_key_path = "dev-keys/org-root.pub"
+
+[policy]
+file = "configs/policies/router.toml"
+
+[peers]
+# Routers themselves don't dial others; controllers dial the router
+# via their own [peers] table (alias = "router", port = 9010).

@@ -5,6 +5,7 @@ mod flow_run;
 mod identity;
 mod ops;
 mod ping;
+mod router;
 mod task;
 mod topology;
 
@@ -79,6 +80,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ops::Cmd,
     },
+    /// Operate the Router Node — mesh observability + health
+    /// control plane. Each subcommand dials the router peer
+    /// once, presents an identity bundle, and prints the
+    /// response. The router never makes LLM calls and never
+    /// holds provider keys.
+    Router {
+        #[command(subcommand)]
+        cmd: router::Cmd,
+    },
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -120,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Capability { cmd } => capability::run(cmd).await,
         Cmd::Topology { cmd } => topology::run(cmd).await,
         Cmd::Ops { cmd } => ops::run(cmd).await,
+        Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,

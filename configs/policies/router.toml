@@ -1,0 +1,37 @@
+# Router node policy. Default deny; allow only operators and
+# controllers, with each capability scoped to the group that
+# legitimately needs it.
+
+[admit]
+groups = ["operators", "controllers"]
+
+# Controllers push heartbeats; operators MUST NOT (heartbeat
+# spoofing would pollute the mesh inventory).
+[[rules]]
+name = "controllers_heartbeat"
+method = "router.heartbeat"
+allow_groups = ["controllers"]
+
+# network_summary and session_list are operator-facing reads.
+[[rules]]
+name = "operators_network_summary"
+method = "router.network_summary"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "operators_session_list"
+method = "router.session_list"
+allow_groups = ["operators"]
+
+# Controllers push log lines to the router for aggregation.
+[[rules]]
+name = "controllers_log"
+method = "router.log"
+allow_groups = ["controllers"]
+
+# node.health stays open so operators can probe the router as a
+# regular controller.
+[[rules]]
+name = "any_caller_health"
+method = "node.health"
+allow_groups = ["operators", "controllers", "guest"]

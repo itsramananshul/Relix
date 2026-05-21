@@ -63,6 +63,35 @@ pub struct ControllerSection {
     pub name: String,
     pub node_type: String,
     pub listen_port: u16,
+    /// Operator-facing role flag. `"controller"` (default) runs
+    /// the standard per-node-type capability surface plus a
+    /// 60-second heartbeat sender to the configured router.
+    /// `"router"` runs the four router.* capabilities and the
+    /// stale-peer + session reaper background loops; the
+    /// heartbeat sender is NOT spawned.
+    #[serde(default = "default_role")]
+    pub role: String,
+    /// Non-router nodes: the libp2p PeerId (base58) of the
+    /// designated router. Empty string / `None` disables the
+    /// heartbeat sender silently — the controller still boots.
+    #[serde(default)]
+    pub router_peer_id: Option<String>,
+    /// Router-only: seconds to retain completed/failed
+    /// sessions before reaping. Running sessions never time
+    /// out. Default 1800 (30 minutes).
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+}
+
+/// Default value for `ControllerSection::role`. Standalone fn
+/// because `#[serde(default = "...")]` requires a path.
+fn default_role() -> String {
+    "controller".to_string()
+}
+
+/// Default value for `ControllerSection::session_ttl_secs`.
+fn default_session_ttl() -> u64 {
+    1800
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -147,7 +176,29 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch bridge.
     let mut bridge = DispatchBridge::new(policy, trust_root, &audit_path, node_signer.clone())?;
     register_builtins(&mut bridge, &cfg, manifest.clone());
-    register_node_type_handlers(&mut bridge, &cfg, manifest.clone())?;
+    // Router role short-circuits: it doesn't run the per-node-type
+    // capability surface (memory/ai/tool/...) — it runs the four
+    // router.* capabilities and the reaper background loops.
+    let router_state = if cfg.controller.role == "router" {
+        tracing::info!(
+            role = "router",
+            session_ttl_secs = cfg.controller.session_ttl_secs,
+            "starting controller with role: router"
+        );
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::nodes::router::RouterState::new(
+                node_id.to_string(),
+                cfg.controller.name.clone(),
+                cfg.controller.session_ttl_secs,
+            ),
+        ));
+        crate::nodes::router::register(&mut bridge, state.clone());
+        register_router_descriptors(&manifest);
+        Some(state)
+    } else {
+        register_node_type_handlers(&mut bridge, &cfg, manifest.clone())?;
+        None
+    };
 
     let bridge = Arc::new(bridge);
 
@@ -167,6 +218,69 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     client.bootstrap_kademlia().await;
+
+    // Router-only background loops.
+    if let Some(state) = router_state.clone() {
+        let stale = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.tick().await; // skip first immediate tick
+            loop {
+                tick.tick().await;
+                if let Ok(mut g) = stale.lock() {
+                    g.reap_stale_peers();
+                }
+            }
+        });
+        let sessions = state;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.tick().await; // skip first immediate tick
+            loop {
+                tick.tick().await;
+                if let Ok(mut g) = sessions.lock() {
+                    g.reap_expired_sessions();
+                }
+            }
+        });
+        tracing::info!("router: spawned stale-peer reaper (30s) + session reaper (300s) loops");
+    } else {
+        // Controller role: optional heartbeat sender to the
+        // designated router peer. Non-fatal — the controller
+        // still boots when the router is down or unconfigured.
+        if let Some(router_peer_str) = cfg
+            .controller
+            .router_peer_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            match router_peer_str.parse::<rpc::PeerId>() {
+                Ok(router_peer) => {
+                    spawn_heartbeat_sender(
+                        client.clone(),
+                        router_peer,
+                        cfg.controller.name.clone(),
+                        client.peer_id().to_string(),
+                        manifest.clone(),
+                        cfg.identity.key_path.clone(),
+                    );
+                    tracing::info!(
+                        router = %router_peer_str,
+                        "controller: heartbeat sender scheduled (1.5s warmup, then every 60s)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        router_peer_id = %router_peer_str,
+                        error = %e,
+                        "controller: router_peer_id is not a valid libp2p PeerId; heartbeat sender disabled"
+                    );
+                }
+            }
+        } else {
+            tracing::info!("controller: no router_peer_id configured; heartbeat sender disabled");
+        }
+    }
 
     tracing::info!("controller online; awaiting inbound RPCs");
 
@@ -264,6 +378,145 @@ fn register_builtins(
 
 /// Register node-type-specific capabilities based on `[controller] node_type`.
 ///
+/// Advertise the four router.* capabilities in the manifest.
+/// Called from `run()` only when `[controller] role = "router"`.
+fn register_router_descriptors(manifest: &ManifestProvider) {
+    use relix_core::capability::CapabilityDescriptor;
+    manifest.add_capability(
+        CapabilityDescriptor::unary("router.heartbeat")
+            .with_description(
+                "Controller-only: register or refresh this peer's liveness + capability list.",
+            )
+            .with_categories(["router".into(), "health".into()]),
+    );
+    manifest.add_capability(
+        CapabilityDescriptor::unary("router.network_summary")
+            .with_description(
+                "Operator-facing mesh overview: known peers, active sessions, uptime.",
+            )
+            .with_categories(["router".into(), "observability".into()]),
+    );
+    manifest.add_capability(
+        CapabilityDescriptor::unary("router.session_list")
+            .with_description(
+                "Operator-facing session browser. Supports status filter + pagination.",
+            )
+            .with_categories(["router".into(), "observability".into()]),
+    );
+    manifest.add_capability(
+        CapabilityDescriptor::unary("router.log")
+            .with_description(
+                "Controller-only: push a structured log line to the router for aggregation.",
+            )
+            .with_categories(["router".into(), "observability".into()]),
+    );
+}
+
+/// Spawn the 60-second heartbeat sender background task.
+///
+/// Behaviour:
+/// - Wait 1.5 seconds after startup, then fire the initial heartbeat.
+/// - Then loop with a 60-second `tokio::time::interval`.
+/// - Each tick: build a [`relix_core::router::HeartbeatRequest`],
+///   CBOR-encode it, sign as an identity-bearing
+///   [`crate::dispatch::build_request`] envelope, send via the
+///   transport client to `router_peer`.
+/// - Identity bundle is loaded once at task start from
+///   `<key_path>.bundle`. If the file is missing the heartbeat
+///   sender logs a single WARN and exits cleanly — the
+///   controller is still alive on the mesh and operator can
+///   issue a bundle later.
+/// - Each send: success at DEBUG, failure at WARN. The router
+///   being down is non-fatal.
+fn spawn_heartbeat_sender(
+    client: rpc::Client,
+    router_peer: rpc::PeerId,
+    node_name: String,
+    local_peer_id: String,
+    manifest: ManifestProvider,
+    key_path: std::path::PathBuf,
+) {
+    let bundle_path = key_path.with_extension("bundle");
+    tokio::spawn(async move {
+        // Load + decode the identity bundle once.
+        let bundle_bytes = match std::fs::read(&bundle_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    bundle_path = %bundle_path.display(),
+                    error = %e,
+                    "heartbeat sender: identity bundle missing; heartbeats disabled (run `relix-cli identity issue` to create one)"
+                );
+                return;
+            }
+        };
+        let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    bundle_path = %bundle_path.display(),
+                    error = %e,
+                    "heartbeat sender: identity bundle decode failed; heartbeats disabled"
+                );
+                return;
+            }
+        };
+        // Extract groups from the bundle payload for the heartbeat body.
+        let groups: Vec<String> = match relix_core::codec::decode::<
+            relix_core::identity::IdentityBundle,
+        >(&bundle.payload)
+        {
+            Ok(id) => id.groups,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "heartbeat sender: identity payload decode failed; sending with empty groups"
+                );
+                Vec::new()
+            }
+        };
+        // Initial 1.5s warmup.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        // First tick fires immediately — that's our post-warmup heartbeat.
+        loop {
+            tick.tick().await;
+            let req = relix_core::router::HeartbeatRequest {
+                peer_id: local_peer_id.clone(),
+                name: node_name.clone(),
+                capabilities: manifest
+                    .snapshot()
+                    .capabilities
+                    .iter()
+                    .map(|c| c.method_name.clone())
+                    .collect(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                groups: groups.clone(),
+            };
+            let args = match relix_core::codec::encode(&req) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "heartbeat encode failed; skipping tick");
+                    continue;
+                }
+            };
+            let envelope =
+                crate::dispatch::build_request("router.heartbeat", args, bundle.clone(), 30);
+            match client.call(router_peer, envelope).await {
+                Ok(_) => tracing::debug!(router = %router_peer, "heartbeat sent"),
+                Err(e) => tracing::warn!(
+                    router = %router_peer,
+                    error = %e,
+                    "heartbeat send failed (router down? non-fatal)"
+                ),
+            }
+        }
+    });
+}
+
 /// - `memory` → SQLite + FTS5 memory store (M7).
 /// - Other types (`ai`, `tool`, `web_bridge`, `demo`, ...) are no-ops until
 ///   their handlers ship in later milestones; the controller still serves
