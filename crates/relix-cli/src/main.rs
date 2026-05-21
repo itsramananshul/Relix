@@ -1,5 +1,6 @@
 //! relix-cli — developer and operator CLI.
 
+mod browser;
 mod capability;
 mod flow_run;
 mod fs;
@@ -119,6 +120,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: web::Cmd,
     },
+    /// PH-CLI-BROWSER: browser-session operator surface.
+    /// `browser sessions` lists currently-open
+    /// `tool.browser.*` sessions via the bridge's
+    /// `GET /v1/browser/sessions` proxy (PH-DASH-BROWSER).
+    Browser {
+        #[command(subcommand)]
+        cmd: browser::Cmd,
+    },
     /// PH-TERM-CLI: inspect + control tool.terminal.* on a
     /// tool node. `terminal sessions` lists live runs;
     /// `terminal audit` snapshots the completion ring;
@@ -173,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,
         Cmd::Web { cmd } => web::run(cmd).await,
+        Cmd::Browser { cmd } => browser::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
