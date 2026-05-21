@@ -60,7 +60,11 @@ Adding `task.memory` without a context-engine consumer would ship
 write-side state with no read-side. Better to land the context
 engine first, then frozen snapshots fall out of it naturally.
 
-**Status.** open.
+**Decision.** (b) defer. Confirmed at Wave 1 close — out of
+scope. Revisit when the AI node grows context-injection
+machinery; frozen snapshots fall out naturally then.
+
+**Status.** answered: defer.
 
 ### D-002  Hermes "ClawHub community trust = never" — apply to MCP servers?
 
@@ -87,7 +91,12 @@ trust tiers on top duplicates that. Hermes needs tiers because it
 auto-installs from arbitrary URLs; Relix is operator-curated.
 Defer the marketplace question until there's a marketplace.
 
-**Status.** open.
+**Decision.** (b) single-tier "operator-explicit opt-in".
+Confirmed at Wave 1 close. The policy engine + sensitivity
+tags already do fine-grained admission; trust tiers stay
+out of the model until a real MCP marketplace exists.
+
+**Status.** answered: defer.
 
 ### D-003  Hermes "compression at 50% not 75%" — chronicle event compaction threshold?
 
@@ -115,7 +124,11 @@ chronicle rows (today's chronicle is append-only) and (ii) make
 replay UX less faithful. The summarizer-as-projection is the
 honest minimal version.
 
-**Status.** open.
+**Decision.** (c) on-demand only. Confirmed at Wave 1 close.
+H2's summarizer stays a pure function; no background
+compactor; append-only chronicle invariant preserved.
+
+**Status.** answered: defer.
 
 ### D-004  Hermes "skill provenance" — apply to coord-registered tasks?
 
@@ -140,7 +153,10 @@ authorized the task but not *which surface* dispatched it.
 existing dashboard list with a useful filter, no replay
 implications. ~1 hour of work.
 
-**Status.** open.
+**Decision.** (a) SHIP. Confirmed at Wave 1 close. See
+PH-ORIGIN-SURFACE for the implementation milestone.
+
+**Status.** answered: ship.
 
 ### D-007  computer_use_tool backend — Relix-owned vs proxy?
 
