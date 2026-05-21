@@ -2235,6 +2235,50 @@
         list. Used to validate policy changes before
         deploying.
       </p>
+      <!-- W2-007f: Recent denials ring viewer. Backed by
+           GET /v1/policy/denials (W2-007e) →
+           `node.policy.recent_denials` (W2-007d). Bounded ring,
+           newest first, capacity 256, peer-restart resets. -->
+      <div class="card" id="policy-denials-card">
+        <div class="card-header">
+          <h3>Recent denials</h3>
+          <span class="meta" id="policy-denials-summary"></span>
+        </div>
+        <div class="card-body">
+          <div class="row" style="margin-bottom: 8px; gap: 6px;">
+            <label class="meta" for="policy-denials-peer">peer alias:</label>
+            <input
+              type="text"
+              id="policy-denials-peer"
+              value="tool"
+              placeholder="tool"
+              autocomplete="off"
+              spellcheck="false"
+              style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 120px;"
+            />
+            <label class="meta" for="policy-denials-max">max:</label>
+            <input
+              type="number"
+              id="policy-denials-max"
+              value="100"
+              min="1"
+              max="500"
+              style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 80px;"
+            />
+            <button class="chip" id="policy-denials-refresh">refresh</button>
+            <span class="meta" id="policy-denials-status"></span>
+          </div>
+          <div id="policy-denials-host" class="dense">
+            <div class="loading">loading…</div>
+          </div>
+        </div>
+      </div>
+      <p class="meta">
+        Bounded ring (capacity 256, newest first); resets on
+        peer-process restart. The dispatch audit log remains the
+        canonical source — this card is the fast operator view.
+        Pure read.
+      </p>
     </section>
 
     <!-- ── #/mcp (PH-DASH-MCP) ──────────────────────────────────── -->
@@ -6824,6 +6868,92 @@ async function runPolicyWhatIf() {
 
 function enterCapabilities() {
   loadCapabilities();
+  // W2-007f: wire denials refresh once + load on entry.
+  initPolicyDenials();
+  loadPolicyDenials();
+}
+
+// W2-007f: idempotent — only wires listeners on first call.
+let policyDenialsWired = false;
+function initPolicyDenials() {
+  if (policyDenialsWired) return;
+  const $btn = document.getElementById('policy-denials-refresh');
+  if ($btn) $btn.addEventListener('click', () => loadPolicyDenials());
+  const $peer = document.getElementById('policy-denials-peer');
+  const $max = document.getElementById('policy-denials-max');
+  for (const $in of [$peer, $max].filter(Boolean)) {
+    $in.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadPolicyDenials();
+      }
+    });
+  }
+  policyDenialsWired = true;
+}
+
+async function loadPolicyDenials() {
+  const $host = document.getElementById('policy-denials-host');
+  const $status = document.getElementById('policy-denials-status');
+  const $summary = document.getElementById('policy-denials-summary');
+  if (!$host) return;
+  const peer = ((document.getElementById('policy-denials-peer') || {}).value || 'tool').trim();
+  const maxRaw = ((document.getElementById('policy-denials-max') || {}).value || '').trim();
+  const max = maxRaw ? Math.max(1, Math.min(500, parseInt(maxRaw, 10) || 100)) : 100;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  if ($status) $status.textContent = 'querying…';
+  try {
+    const url = '/v1/policy/denials?peer=' + encodeURIComponent(peer)
+      + '&max=' + encodeURIComponent(String(max));
+    const r = await fetch(url);
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    renderPolicyDenials(body);
+    if ($summary) $summary.textContent = (body.count || 0) + ' shown · peer=' + (body.peer || peer);
+    if ($status) $status.textContent = '';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: ' + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = 'failed';
+    if ($summary) $summary.textContent = '';
+  }
+}
+
+function renderPolicyDenials(body) {
+  const $host = document.getElementById('policy-denials-host');
+  if (!$host) return;
+  const rows = (body.denials || []);
+  if (rows.length === 0) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'no denials in ring — either no traffic, or every call passed policy'
+      + '</div>';
+    return;
+  }
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const trs = rows.map(d => {
+    const ago = fmtDuration(Math.max(0, nowSecs - (d.at || 0))) + ' ago';
+    const subjAbbr = (d.caller_subject_id || '').slice(0, 12);
+    return '<tr>'
+      + '<td class="meta">' + escapeHtml(ago) + '</td>'
+      + '<td><code>' + escapeHtml(d.method || '') + '</code></td>'
+      + '<td>' + escapeHtml(d.caller_name || '') + '</td>'
+      + '<td class="meta" title="' + escapeHtml(d.caller_subject_id || '') + '">'
+      +   '<code>' + escapeHtml(subjAbbr) + '</code>'
+      + '</td>'
+      + '<td><code>' + escapeHtml(d.rule || '') + '</code></td>'
+      + '<td>' + escapeHtml(d.reason || '') + '</td>'
+      + '</tr>';
+  }).join('');
+  $host.innerHTML = '<table class="data"><thead><tr>'
+    + '<th>when</th><th>method</th><th>caller</th><th>subject</th>'
+    + '<th>rule</th><th>reason</th>'
+    + '</tr></thead><tbody>' + trs + '</tbody></table>';
 }
 
 async function loadCapabilities() {
