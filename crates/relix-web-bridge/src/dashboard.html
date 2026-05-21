@@ -6901,8 +6901,19 @@ function renderProviderCard(p) {
     const nowSecs = Math.floor(Date.now() / 1000);
     const rem = Number(p.cooldown_until) - nowSecs;
     if (rem > 0) {
-      badge += '<span class="badge warn" title="bridge will refuse test-provider during cooldown">'
-        + 'cooldown ' + escapeHtml(fmtDuration(rem))
+      // PH-WAVE2J: distinguish operator-set quarantine from
+      // PH-WAVE2I auto-cooldown. If cooldown_until is in the
+      // future AND quarantined_at is None, the cooldown was
+      // auto-triggered by a rate-limit storm. Same color (warn)
+      // but a clearer tooltip so operators understand the
+      // bridge's behaviour without reading the source.
+      const isAuto = p.quarantined_at == null;
+      const tooltip = isAuto
+        ? 'auto cooldown — bridge auto-set this after a rate-limit storm (PH-WAVE2I). Clear by waiting it out or by toggling quarantine.'
+        : 'bridge will refuse test-provider during cooldown';
+      const label = isAuto ? 'auto cooldown ' : 'cooldown ';
+      badge += '<span class="badge warn" title="' + escapeHtml(tooltip) + '">'
+        + escapeHtml(label) + escapeHtml(fmtDuration(rem))
         + '</span> ';
     }
   }
