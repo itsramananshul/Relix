@@ -32,12 +32,15 @@ row's status field.
 
 | Hermes name | What it does | Leverage | Effort | Relix status | Relix counterpart | Notes |
 |---|---|---|---|---|---|---|
-| file_tools | read/write/list/mkdir/rm/append | high | medium | shipped | tool.read_file, tool.write_file, tool.list_dir + fs::FsJail | jailed path | 
-| file_operations | batch ops, encoding, validation | high | small | partial | tool.search_files + tool.patch | no batch wrapper yet |
-| file_state | session-scoped file state (diffs, undo) | medium | medium | pending | — | requires session-store |
+| file_tools | read/write/list/mkdir/rm/append | high | medium | shipped | tool.read_file, tool.write_file, tool.append_file, tool.list_dir + fs::FsJail | jailed path; PH-FS-PARITY1 added append + patch_preview |
+| file_operations | batch ops, encoding, validation | high | small | partial | tool.search_files (name/content/glob modes) + tool.patch + tool.patch_preview | PH-FS-PARITY3 added `glob` mode; no batch wrapper yet |
+| file_state | session-scoped file state (diffs, undo) | medium | medium | partial | tool.fs.audit_recent (PH-FS-PARITY4) | per-jail mutation ring; no per-session undo store |
 | patch_parser | parse + validate unified diffs | medium | small | shipped | tool.patch (diffy) | matches Hermes shape |
+| fuzzy_replace | fuzzy text edit (whitespace-tolerant) | high | small | pending | — | next: PH-FS-FUZZY |
+| file_metadata / stat | size, kind, mtime | low | trivial | pending | — | next: PH-FS-STAT |
+| file_tree | recursive dir tree (depth-capped) | medium | small | pending | — | next: PH-FS-TREE |
 | credential_files | read/write credential vaults | medium | medium | partial | bridge-secrets.toml | bridge owns, not a tool |
-| path_security | traversal guards + sandbox | high | trivial | shipped | fs::FsJail + tool.path_security | identical model |
+| path_security | traversal guards + sandbox | high | trivial | shipped | fs::FsJail | identical model |
 | binary_extensions | binary sniff | low | trivial | shipped | tool.binary_sniff (PH-FS-PARITY2) | classifies first 8 KiB; UTF-8 + null-byte + ASCII heuristic |
 
 ### Web + network
@@ -70,11 +73,19 @@ row's status field.
 
 | Hermes name | What it does | Leverage | Effort | Relix status | Relix counterpart | Notes |
 |---|---|---|---|---|---|---|
-| terminal_tool | shell exec w/ env isolation | high | large | shipped (CW1) | tool.terminal.run | sandboxed, allowlisted |
-| code_execution_tool | Python REPL | medium | large | pending | — | requires py runtime |
+| terminal_tool | shell exec w/ env isolation | high | large | shipped (CW1) | tool.terminal.run | sandboxed, allowlisted; 8-layer fail-closed model |
+| terminal_spawn (background) | fire-and-forget shell exec | high | medium | shipped (PH-TERM-SPAWN) | tool.terminal.spawn | returns session_id immediately; same allowlist as run |
+| terminal_tail | live stream stdout/stderr | high | medium | shipped (PH-TERM-STREAM1) | tool.terminal.tail | polling cursor, 64 KiB/call cap, JSON envelope |
+| terminal_cancel | cooperative kill | high | medium | shipped (PH-TERM-CANCEL) | tool.terminal.cancel | Arc<Notify> + manual drain refactor |
+| terminal_audit | completion ring | medium | small | shipped (PH-TERM-AUDIT) | tool.terminal.audit_recent | bounded ring; success + timed_out + cancelled disambiguated |
+| terminal_session_list | live registry of in-flight runs | medium | small | shipped (PH-TERM-SESSIONS) | tool.terminal.sessions | mirrors Hermes process_registry |
+| persistent_shell | open / input / close shell session | high | large | shipped (PH-TERM-SHELL) | tool.terminal.shell.{open,input,close} | separate `allowed_shells` allowlist; stdin piped; SpawnMode enum on validate_and_spawn |
+| shell_control_chars | named control sequences | medium | small | shipped (PH-TERM-CONTROL) | tool.terminal.shell.control | etx/eot/tab/enter/esc/backspace/sub/nak; platform-aware enter |
+| code_execution_tool | Python REPL | medium | large | partial | tool.terminal.shell.* with allowed_shells=["python"] | works without PTY for non-isatty REPL needs |
 | terminal_summary | compress long terminal output | high | trivial | shipped | H2 summarizer covers `[terminal]` shape | hand-extend if needed |
-| interrupt | SIGINT running agent | high | small | partial | task.pause / task.freeze (M70/M71) | cooperative not hard |
-| process_registry | spawned PID tracking | medium | small | pending | — | useful for shell exec |
+| interrupt | SIGINT running agent | high | small | shipped | tool.terminal.cancel + tool.terminal.shell.control (etx) | cancel uses `kill()`; shell.control sends 0x03 to stdin (no TTY-driver SIGINT delivery; D-010 logged) |
+| process_registry | spawned PID tracking | medium | small | shipped | tool.terminal.sessions (PH-TERM-SESSIONS) | PID captured in TerminalSessionRecord |
+| pty_backend (interactive isatty) | true PTY allocation | medium | very-large | deferred:D-010 | — | portable-pty integration; architectural mismatch with tokio::process::Child |
 
 ### Model + inference
 
@@ -122,7 +133,7 @@ row's status field.
 | skills_hub | browse/install from cloud hub | medium | large | pending | — | per D-002 trust-tier decision |
 | skills_tool | manage installed skills | medium | medium | pending | — | needs registry |
 | skills_sync | sync skills between devices | low | large | pending | — | depends on hub |
-| mcp_tool | MCP server discovery | medium | large | partial (CW5 scaffold shipped) | tool.mcp.list_servers/list_tools/invoke; live client pending (CW5-A/B). Trust tier still per D-002. |
+| mcp_tool | MCP server discovery | medium | large | partial (CW5 scaffold + PH-MCP-PROTO wire layer) | tool.mcp.list_servers / list_tools / invoke + JSON-RPC wire types in mcp::proto. Live stdio runtime gated on D-009 (no concrete server target identified). Trust tier still per D-002. |
 | mcp_oauth_manager | OAuth for MCP | medium | medium | pending | — | follow MCP |
 
 ### Utility + meta

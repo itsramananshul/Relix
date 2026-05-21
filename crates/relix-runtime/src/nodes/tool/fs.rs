@@ -490,6 +490,77 @@ pub fn descriptor_list() -> CapabilityDescriptor {
     d
 }
 
+/// PH-FS-FUZZY: `tool.fuzzy_replace` — Hermes-style fuzzy text
+/// edit that tolerates whitespace differences. Caller supplies
+/// `<rel_path>|<search>|<replace>`. The search block is matched
+/// against the file with leading/trailing whitespace per line
+/// normalized; on hit the matched span is replaced verbatim with
+/// the replacement. Atomic write via the tempfile-rename pattern.
+/// Refuses when the search block is found zero or multiple times
+/// — there's no automatic disambiguation.
+pub fn descriptor_fuzzy_replace() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.fuzzy_replace");
+    d.major_version = 1;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["fs:write".into()];
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Replace a block of text in a file, tolerating whitespace differences \
+         between caller-supplied search text and the file. Wire: \
+         `<rel_path>|<search>|<replace>`. Refuses on zero matches or multiple \
+         matches (no auto-disambiguation). Atomic write. Records mutation on \
+         tool.fs.audit_recent."
+            .into(),
+    );
+    d.categories = vec!["mutate".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
+/// PH-FS-TREE: `tool.fs.tree` — recursive directory walk with
+/// depth cap. Wire: `<rel_path>` or `<rel_path>|<max_depth>`
+/// (default depth 5). Returns tab-delim rows
+/// `<depth>\t<kind>\t<rel_path>\t<size>`. Cap at the jail's
+/// `max_search_results`.
+pub fn descriptor_tree() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.fs.tree");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Expensive;
+    d.sensitivity_tags = vec!["fs:read".into()];
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Recursive directory walk under the jail root, depth-bounded. Wire: \
+         `<rel_path>` or `<rel_path>|<max_depth>` (default 5). Tab-delim rows: \
+         depth\\tkind\\trel_path\\tsize. Capped at max_search_results entries."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
+/// PH-FS-STAT: `tool.fs.stat` — metadata for a single path.
+/// Wire: `<rel_path>`. Returns tab-delim key=value pairs.
+pub fn descriptor_stat() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.fs.stat");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["fs:read".into()];
+    d.requires_groups = vec!["chat-users".into()];
+    d.description = Some(
+        "Return file/directory metadata for a single jail-relative path. \
+         Tab-delim key=value pairs: path, kind (file/dir/symlink/other), \
+         size, mtime, is_symlink, exists."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "fs".into()];
+    d.environment_requirements = vec!["fs:jail".into()];
+    d
+}
+
 // ──────────────────────────── Registration ─────────────────────────────────
 
 pub fn register(bridge: &mut DispatchBridge, jail: Arc<FsJail>) {
@@ -574,12 +645,42 @@ pub fn register(bridge: &mut DispatchBridge, jail: Arc<FsJail>) {
         );
     }
     {
-        let j = jail;
+        let j = jail.clone();
         bridge.register(
             "tool.fs.audit_recent",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let j = j.clone();
                 async move { handle_audit_recent(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail.clone();
+        bridge.register(
+            "tool.fuzzy_replace",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_fuzzy_replace(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail.clone();
+        bridge.register(
+            "tool.fs.tree",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_tree(&j, &ctx) }
+            })),
+        );
+    }
+    {
+        let j = jail;
+        bridge.register(
+            "tool.fs.stat",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let j = j.clone();
+                async move { handle_stat(&j, &ctx) }
             })),
         );
     }
@@ -1254,6 +1355,285 @@ fn handle_audit_recent(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
         );
     }
     let _ = writeln!(buf, "count={count}");
+    HandlerOutcome::Ok(buf.into_bytes())
+}
+
+/// PH-FS-FUZZY: handle `tool.fuzzy_replace`. Wire:
+/// `<rel_path>|<search>|<replace>`. The search block is matched
+/// against the file with each line's leading + trailing
+/// whitespace normalized. Refuses on zero matches or multiple
+/// matches.
+fn handle_fuzzy_replace(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.fuzzy_replace arg utf8: {e}")),
+    };
+    let mut parts = s.splitn(3, '|');
+    let rel = parts.next().unwrap_or("").trim();
+    let search = parts.next().unwrap_or("");
+    let replace = parts.next().unwrap_or("");
+    if rel.is_empty() || search.is_empty() {
+        return invalid(
+            "tool.fuzzy_replace arg must be `<rel_path>|<search>|<replace>` \
+             (rel_path + search are required; replace may be empty)"
+                .into(),
+        );
+    }
+    let canonical = match jail.resolve(rel, true) {
+        Ok(p) => p,
+        Err(e) => return e.into(),
+    };
+    let body = match std::fs::read_to_string(&canonical) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.fuzzy_replace read: {e}")),
+    };
+    if body.len() > jail.cfg.max_read_bytes {
+        return invalid(format!(
+            "tool.fuzzy_replace: file {} bytes exceeds read cap {}",
+            body.len(),
+            jail.cfg.max_read_bytes
+        ));
+    }
+    let matches = fuzzy_find_matches(&body, search);
+    if matches.is_empty() {
+        return invalid("tool.fuzzy_replace: search block not found".into());
+    }
+    if matches.len() > 1 {
+        return invalid(format!(
+            "tool.fuzzy_replace: search block matches {} times; refusing to \
+             auto-disambiguate (rephrase with more context)",
+            matches.len()
+        ));
+    }
+    let (start, end) = matches[0];
+    let mut patched = String::with_capacity(body.len() + replace.len());
+    patched.push_str(&body[..start]);
+    patched.push_str(replace);
+    patched.push_str(&body[end..]);
+    if patched.len() > jail.cfg.max_write_bytes {
+        return invalid(format!(
+            "tool.fuzzy_replace: patched file {} bytes exceeds write cap {}",
+            patched.len(),
+            jail.cfg.max_write_bytes
+        ));
+    }
+    let parent = canonical.parent().expect("canonical has parent");
+    let tmp = match tempfile_in_dir(parent) {
+        Ok(t) => t,
+        Err(e) => return invalid(format!("tool.fuzzy_replace tempfile: {e}")),
+    };
+    if let Err(e) = std::fs::write(&tmp, patched.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return invalid(format!("tool.fuzzy_replace write tempfile: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &canonical) {
+        let _ = std::fs::remove_file(&tmp);
+        return invalid(format!("tool.fuzzy_replace rename: {e}"));
+    }
+    let rel_display = jail.display_rel(&canonical);
+    jail.record_mutation("fuzzy_replace", rel_display.clone(), patched.len(), ctx);
+    let body = format!("ok bytes={} path={}\n", patched.len(), rel_display);
+    HandlerOutcome::Ok(body.into_bytes())
+}
+
+/// PH-FS-FUZZY: normalize a string for whitespace-tolerant
+/// matching. Trims each line's leading + trailing whitespace
+/// and collapses internal runs of whitespace into a single
+/// space. Newlines preserved between lines.
+fn normalize_for_fuzzy(s: &str) -> String {
+    s.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<&str>>().join(" "))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// PH-FS-FUZZY: find all (start, end) byte ranges in `haystack`
+/// whose normalized form equals the normalized `needle`. Done
+/// by scanning every line-aligned window of `needle.lines()`
+/// length and comparing normalized forms.
+fn fuzzy_find_matches(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    let needle_norm = normalize_for_fuzzy(needle);
+    let needle_line_count = needle.lines().count().max(1);
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let line_offsets: Vec<usize> = std::iter::once(0)
+        .chain(
+            haystack
+                .char_indices()
+                .filter_map(|(i, c)| if c == '\n' { Some(i + 1) } else { None }),
+        )
+        .collect();
+    let total_lines = haystack.lines().count();
+    if total_lines == 0 {
+        return out;
+    }
+    for start_line in 0..=total_lines.saturating_sub(needle_line_count) {
+        let start = line_offsets[start_line];
+        let end_line = start_line + needle_line_count;
+        let end = if end_line < line_offsets.len() {
+            // Exclude the trailing newline; we want to replace
+            // exactly the needle's line range, not the
+            // following separator.
+            line_offsets[end_line].saturating_sub(1)
+        } else {
+            haystack.len()
+        };
+        let window = &haystack[start..end];
+        if normalize_for_fuzzy(window) == needle_norm {
+            out.push((start, end));
+        }
+    }
+    out
+}
+
+/// PH-FS-TREE: handle `tool.fs.tree`. Wire: `<rel_path>` or
+/// `<rel_path>|<max_depth>` (default depth 5).
+fn handle_tree(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    const DEFAULT_DEPTH: usize = 5;
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("tool.fs.tree arg utf8: {e}")),
+    };
+    let (rel, max_depth) = match s.rsplit_once('|') {
+        Some((p, n_str)) if n_str.trim().parse::<usize>().is_ok() => (
+            p.trim(),
+            n_str.trim().parse::<usize>().unwrap_or(DEFAULT_DEPTH),
+        ),
+        _ => (s.trim(), DEFAULT_DEPTH),
+    };
+    let rel = if rel.is_empty() { "." } else { rel };
+    let canonical = if rel == "." {
+        jail.canonical_root.clone()
+    } else {
+        match jail.resolve(rel, true) {
+            Ok(p) => p,
+            Err(e) => return e.into(),
+        }
+    };
+    let meta = match std::fs::metadata(&canonical) {
+        Ok(m) => m,
+        Err(e) => return invalid(format!("tool.fs.tree metadata: {e}")),
+    };
+    if !meta.is_dir() {
+        return invalid(format!(
+            "tool.fs.tree: '{}' is not a directory",
+            jail.display_rel(&canonical)
+        ));
+    }
+    let mut buf = String::new();
+    let cap = jail.cfg.max_search_results;
+    let mut emitted = 0usize;
+    // Pre-order DFS so directory parents print before their
+    // children — operator-readable.
+    let mut stack: Vec<(PathBuf, usize)> = vec![(canonical.clone(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if emitted >= cap {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        let mut collected: Vec<std::fs::DirEntry> = entries.flatten().collect();
+        // Stable sort for deterministic output.
+        collected.sort_by_key(|e| e.file_name());
+        // Push subdirs in reverse so the first one is processed first
+        // (we're using a stack, hence reverse).
+        for entry in collected.iter().rev() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() && depth < max_depth {
+                stack.push((path, depth + 1));
+            }
+        }
+        for entry in &collected {
+            if emitted >= cap {
+                break;
+            }
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let kind = if ft.is_dir() {
+                "dir"
+            } else if ft.is_file() {
+                "file"
+            } else if ft.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let rel = jail.display_rel(&path);
+            let safe_rel = rel.replace(['\t', '\n'], " ");
+            let _ = writeln!(buf, "{depth}\t{kind}\t{safe_rel}\t{size}");
+            emitted += 1;
+        }
+    }
+    let _ = writeln!(buf, "count={emitted}");
+    HandlerOutcome::Ok(buf.into_bytes())
+}
+
+/// PH-FS-STAT: handle `tool.fs.stat`. Wire: `<rel_path>`.
+/// Returns one line of `key=value` pairs, tab-separated.
+fn handle_stat(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("tool.fs.stat arg utf8: {e}")),
+    };
+    if s.is_empty() {
+        return invalid("tool.fs.stat: rel_path required".into());
+    }
+    // Resolve with must_exist=false so we can report exists=false
+    // honestly without surfacing a canonicalize error.
+    let canonical = match jail.resolve(s, false) {
+        Ok(p) => p,
+        Err(e) => return e.into(),
+    };
+    let rel_display = jail.display_rel(&canonical);
+    let mut buf = String::new();
+    match std::fs::symlink_metadata(&canonical) {
+        Ok(m) => {
+            let ft = m.file_type();
+            let kind = if ft.is_dir() {
+                "dir"
+            } else if ft.is_file() {
+                "file"
+            } else if ft.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            let size = m.len();
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let _ = writeln!(
+                buf,
+                "path={}\tkind={}\tsize={}\tmtime={}\tis_symlink={}\texists=true",
+                rel_display,
+                kind,
+                size,
+                mtime,
+                ft.is_symlink(),
+            );
+        }
+        Err(_) => {
+            let _ = writeln!(
+                buf,
+                "path={}\tkind=missing\tsize=0\tmtime=0\tis_symlink=false\texists=false",
+                rel_display,
+            );
+        }
+    }
     HandlerOutcome::Ok(buf.into_bytes())
 }
 
@@ -2365,6 +2745,232 @@ mod tests {
                 assert!(e.cause.contains("positive integer"));
             }
             _ => panic!("expected Err"),
+        }
+    }
+
+    // ── PH-FS-FUZZY: tool.fuzzy_replace ────────────────────────────
+
+    #[test]
+    fn fuzzy_replace_descriptor_shape() {
+        let d = descriptor_fuzzy_replace();
+        assert_eq!(d.method_name, "tool.fuzzy_replace");
+        assert!(matches!(d.idempotency, Idempotency::AtMostOnce));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "fs:write"));
+    }
+
+    #[test]
+    fn normalize_for_fuzzy_collapses_internal_whitespace() {
+        assert_eq!(
+            normalize_for_fuzzy("  fn  foo (  )  {\n   bar  ;\n}\n"),
+            "fn foo ( ) {\nbar ;\n}\n".trim_end().to_string()
+        );
+    }
+
+    #[test]
+    fn fuzzy_find_matches_exact_match() {
+        let body = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        let hits = fuzzy_find_matches(body, "fn b() {}");
+        assert_eq!(hits.len(), 1);
+        let (s, e) = hits[0];
+        assert_eq!(&body[s..e], "fn b() {}");
+    }
+
+    #[test]
+    fn fuzzy_find_matches_tolerates_whitespace_diff() {
+        let body = "    fn a() {\n        body();\n    }\n";
+        let hits = fuzzy_find_matches(body, "fn a() {\nbody();\n}");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn fuzzy_find_matches_multiple_hits() {
+        let body = "x = 1\nx = 1\nx = 1\n";
+        let hits = fuzzy_find_matches(body, "x = 1");
+        assert!(hits.len() >= 2);
+    }
+
+    #[test]
+    fn fuzzy_replace_succeeds_with_single_match() {
+        let (td, j) = mk_jail();
+        let p = td.path().join("code.txt");
+        std::fs::write(&p, "fn a() {}\n    fn b() {}\nfn c() {}\n").unwrap();
+        let arg = "code.txt|fn b() {}|fn B() { panic!(); }";
+        let r = handle_fuzzy_replace(&j, &ctx(arg.as_bytes()));
+        match r {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        }
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains("fn B() { panic!(); }"));
+        assert!(!after.contains("fn b() {}"));
+        // Audit ring should have recorded the mutation.
+        let snap = j.audit_snapshot(10);
+        assert!(snap.iter().any(|e| e.op == "fuzzy_replace"));
+    }
+
+    #[test]
+    fn fuzzy_replace_refuses_zero_matches() {
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("c.txt"), "hello\n").unwrap();
+        let r = handle_fuzzy_replace(&j, &ctx(b"c.txt|world|foo"));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("not found")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn fuzzy_replace_refuses_multiple_matches() {
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("c.txt"), "x = 1\nx = 1\nx = 1\n").unwrap();
+        let r = handle_fuzzy_replace(&j, &ctx(b"c.txt|x = 1|x = 2"));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("matches") && e.cause.contains("refusing"));
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn fuzzy_replace_rejects_traversal() {
+        let (_td, j) = mk_jail();
+        let r = handle_fuzzy_replace(&j, &ctx(b"../escape|foo|bar"));
+        match r {
+            HandlerOutcome::Err(_) => {}
+            _ => panic!("expected traversal rejection"),
+        }
+    }
+
+    // ── PH-FS-TREE: tool.fs.tree ───────────────────────────────────
+
+    #[test]
+    fn tree_descriptor_shape() {
+        let d = descriptor_tree();
+        assert_eq!(d.method_name, "tool.fs.tree");
+        assert!(matches!(d.cost_class, CostClass::Expensive));
+    }
+
+    #[test]
+    fn tree_returns_depth_prefixed_rows() {
+        let (td, j) = mk_jail();
+        std::fs::create_dir_all(td.path().join("a/b/c")).unwrap();
+        std::fs::write(td.path().join("a/x.txt"), "x").unwrap();
+        std::fs::write(td.path().join("a/b/y.txt"), "yy").unwrap();
+        std::fs::write(td.path().join("a/b/c/z.txt"), "zzz").unwrap();
+
+        let r = handle_tree(&j, &ctx(b"."));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<String> = body.lines().map(|l| l.replace('\\', "/")).collect();
+        // Every row except the trailer starts with a depth digit.
+        for l in &lines[..lines.len() - 1] {
+            assert!(l.chars().next().unwrap().is_ascii_digit(), "row: {l}");
+        }
+        // Includes the trailer.
+        assert!(lines.last().unwrap().starts_with("count="));
+        // Includes deeper files.
+        assert!(lines.iter().any(|l| l.contains("a/b/c/z.txt")));
+    }
+
+    #[test]
+    fn tree_respects_max_depth() {
+        let (td, j) = mk_jail();
+        std::fs::create_dir_all(td.path().join("a/b/c")).unwrap();
+        std::fs::write(td.path().join("a/x.txt"), "x").unwrap();
+        std::fs::write(td.path().join("a/b/y.txt"), "y").unwrap();
+        std::fs::write(td.path().join("a/b/c/z.txt"), "z").unwrap();
+        // Depth 1 should walk root + immediate children, NOT
+        // into b/c — z.txt sits at depth 3.
+        let r = handle_tree(&j, &ctx(b".|1"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let body = body.replace('\\', "/");
+        assert!(body.contains("a"));
+        assert!(!body.contains("z.txt"));
+    }
+
+    #[test]
+    fn tree_rejects_non_directory() {
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("f.txt"), "x").unwrap();
+        let r = handle_tree(&j, &ctx(b"f.txt"));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("not a directory")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    // ── PH-FS-STAT: tool.fs.stat ───────────────────────────────────
+
+    #[test]
+    fn stat_descriptor_shape() {
+        let d = descriptor_stat();
+        assert_eq!(d.method_name, "tool.fs.stat");
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+    }
+
+    #[test]
+    fn stat_existing_file_reports_size_and_kind() {
+        let (td, j) = mk_jail();
+        std::fs::write(td.path().join("f.txt"), b"hello").unwrap();
+        let r = handle_stat(&j, &ctx(b"f.txt"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(body.contains("kind=file"));
+        assert!(body.contains("size=5"));
+        assert!(body.contains("exists=true"));
+        assert!(body.contains("is_symlink=false"));
+    }
+
+    #[test]
+    fn stat_existing_dir_reports_dir_kind() {
+        let (td, j) = mk_jail();
+        std::fs::create_dir(td.path().join("d")).unwrap();
+        let r = handle_stat(&j, &ctx(b"d"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(body.contains("kind=dir"));
+        assert!(body.contains("exists=true"));
+    }
+
+    #[test]
+    fn stat_missing_path_reports_exists_false() {
+        let (_td, j) = mk_jail();
+        let r = handle_stat(&j, &ctx(b"missing.txt"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(body.contains("exists=false"));
+        assert!(body.contains("kind=missing"));
+    }
+
+    #[test]
+    fn stat_empty_arg_rejected() {
+        let (_td, j) = mk_jail();
+        let r = handle_stat(&j, &ctx(b""));
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("rel_path required")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn stat_rejects_traversal() {
+        let (_td, j) = mk_jail();
+        let r = handle_stat(&j, &ctx(b"../escape"));
+        match r {
+            HandlerOutcome::Err(_) => {}
+            _ => panic!("expected traversal rejection"),
         }
     }
 }

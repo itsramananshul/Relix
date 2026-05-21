@@ -1027,6 +1027,14 @@ fn register_node_type_handlers(
             // (write / append / patch) on the jail. Bounded
             // in-memory ring.
             manifest.add_capability(crate::nodes::tool::fs::descriptor_audit_recent());
+            // PH-FS-FUZZY: tool.fuzzy_replace — Hermes-style
+            // whitespace-tolerant text edit. Same jail.
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_fuzzy_replace());
+            // PH-FS-TREE: tool.fs.tree — depth-capped recursive
+            // directory walk.
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_tree());
+            // PH-FS-STAT: tool.fs.stat — single-path metadata.
+            manifest.add_capability(crate::nodes::tool::fs::descriptor_stat());
         }
         // B3: tool.pdf — only advertised when [tool.pdf] is configured.
         if tool_cfg.pdf.is_some() {

@@ -67,6 +67,9 @@ before the backend (visibility + stable contract + honesty).
 | `tool.patch_preview` (PH-FS-PARITY1) | live | Read-only dry-run |
 | `tool.binary_sniff` (PH-FS-PARITY2) | live | Classify text/binary by sniffing first 8 KiB |
 | `tool.fs.audit_recent` (PH-FS-PARITY4) | live | Bounded ring of recent write/append/patch mutations |
+| `tool.fuzzy_replace` (PH-FS-FUZZY) | live | Whitespace-tolerant text edit; refuses on 0 or >1 matches |
+| `tool.fs.tree` (PH-FS-TREE) | live | Depth-capped recursive directory walk |
+| `tool.fs.stat` (PH-FS-STAT) | live | Single-path metadata (kind/size/mtime/is_symlink/exists) |
 | `tool.pdf` | live | base64-encoded PDF parse |
 
 ### Web
