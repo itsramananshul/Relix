@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `e12ad4b feat(dash): W2-001d — Replay button on task detail action bar`
+- **HEAD:** `39114af feat(cli): W2-008a — relix-cli doctor environment health check`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -33,16 +33,25 @@ as the resume command.
     `node.policy.simulate` (W2-007a) + bridge proxy
     (W2-007b) + dashboard "What If" form (W2-007c). Decision
     viewer / dry-run mode pending.
-  - **W2-004 / W2-008:** not started.
-- **Workspace tests:** **1232 passing on default features**;
+  - **W2-004 (SOLFlow):** started — `relix-cli sol templates`
+    + `sol new --template ping --out path.sol` ship the
+    quick-add workflow. Visual-editor sub-items (slash
+    commands, drag-to-insert, variable picker, condition
+    builder) deferred per spec ("DO NOT overcomplicate").
+  - **W2-008 (Local-first):** started — `relix-cli doctor`
+    one-command bridge health check with opinionated
+    PASS/WARN/FAIL report. Remaining: one-command startup
+    script, demo scripts, Open WebUI integration, Docker
+    reliability.
+- **Workspace tests:** **1248 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
-  - relix-cli: 110
+  - relix-cli: 126 (+8 sol templates, +8 doctor)
   - relix-policy: 72
-  - relix-runtime: 727 (+5 task.replay)
+  - relix-runtime: 727
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 290 (+1 policy what-if landmark)
+  - relix-web-bridge: 290
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -121,6 +130,8 @@ as the resume command.
 | 134c2b1 | W2-001b | `task.replay` capability + `TaskStore::replay_from` clones a task (title `(replay)`, fresh retry_count) + writes `retried_from` edge + `task.replayed_from` chronicle event; 5 tests |
 | 6408ea4 | W2-001c | `POST /v1/tasks/:id/replay` bridge endpoint returns `{original_task_id, new_task_id}`; intervention_audit records the action |
 | e12ad4b | W2-001d | Dashboard "Replay" button on task detail action bar with confirm-guard + auto-navigate to new task on success — W2-001 substantively closed end-to-end |
+| cb430e9 | W2-004a | `relix-cli sol templates` + `sol new --template <name> --out <path>` — 6 baked-in workflow templates via include_str!; `--force` overwrite + parent-dir creation; 8 tests |
+| 39114af | W2-008a | `relix-cli doctor` — bridge health probe + PASS/WARN/FAIL report; non-zero exit on FAIL for CI; 8 tests on the pure `evaluate()` function (zero peers / expired / flapping / missing coordinator) |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
