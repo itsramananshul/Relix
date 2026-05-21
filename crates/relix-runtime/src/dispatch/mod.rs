@@ -48,6 +48,14 @@ pub enum HandlerOutcome {
     Err(ErrorEnvelope),
 }
 
+/// PH-DISP1: internal outcome bucket for [`DispatchBridge::bump_stats`].
+enum StatBucket {
+    Ok,
+    Err,
+    Denied,
+    Unknown,
+}
+
 /// A capability handler: native function invoked by the dispatch bridge.
 #[async_trait]
 pub trait Handler: Send + Sync {
@@ -78,6 +86,37 @@ pub struct DispatchBridge {
     trust_root: VerifyingKey,
     audit: tokio::sync::Mutex<AuditLog>,
     responder_node_id: NodeId,
+    /// PH-DISP1: per-capability invocation counters. One row
+    /// per method name the bridge has seen, populated as
+    /// requests pass through the admission pipeline. Exposed
+    /// via [`Self::capability_stats_snapshot`] for the bridge
+    /// / dashboard to project. Pure observability; doesn't
+    /// gate any decision.
+    capability_stats: std::sync::RwLock<HashMap<String, CapStats>>,
+}
+
+/// PH-DISP1: per-capability counters. Counts are lifetime —
+/// reset on bridge restart. The dashboard renders these via a
+/// future projection; today they're queryable in-process.
+#[derive(Debug, Default, Clone)]
+pub struct CapStats {
+    /// Total successful invocations (handler returned Ok).
+    pub invocations: u64,
+    /// Total handler-level errors (handler returned Err).
+    pub errors: u64,
+    /// Total policy-denied attempts. Never reaches the handler.
+    pub denied: u64,
+    /// Total unknown-method attempts. These don't have a
+    /// registered handler so the counter lives under the
+    /// caller-supplied method name; useful for spotting
+    /// mistyped capability names.
+    pub unknown_method: u64,
+    /// Wall-clock unix seconds of the most recent invocation
+    /// outcome (Ok or Err — set to `now` on every dispatch).
+    pub last_invoked_at: i64,
+    /// Wall-clock unix seconds of the most recent error
+    /// (handler Err OR policy-denied OR unknown_method).
+    pub last_error_at: Option<i64>,
 }
 
 impl DispatchBridge {
@@ -97,7 +136,51 @@ impl DispatchBridge {
             trust_root,
             audit: tokio::sync::Mutex::new(audit),
             responder_node_id,
+            capability_stats: std::sync::RwLock::new(HashMap::new()),
         })
+    }
+
+    /// PH-DISP1: snapshot of every capability's counters.
+    /// Order is stable (by method name) so dashboards diff
+    /// cleanly across calls. Returns an empty vec when no
+    /// requests have been dispatched yet.
+    pub fn capability_stats_snapshot(&self) -> Vec<(String, CapStats)> {
+        let g = self
+            .capability_stats
+            .read()
+            .expect("capability_stats read lock");
+        let mut out: Vec<(String, CapStats)> =
+            g.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// PH-DISP1: internal helper. Bumps the counter row for
+    /// `method` according to the outcome bucket.
+    fn bump_stats(&self, method: &str, bucket: StatBucket, now: i64) {
+        let mut g = self
+            .capability_stats
+            .write()
+            .expect("capability_stats write lock");
+        let row = g.entry(method.to_string()).or_default();
+        row.last_invoked_at = now;
+        match bucket {
+            StatBucket::Ok => {
+                row.invocations = row.invocations.saturating_add(1);
+            }
+            StatBucket::Err => {
+                row.errors = row.errors.saturating_add(1);
+                row.last_error_at = Some(now);
+            }
+            StatBucket::Denied => {
+                row.denied = row.denied.saturating_add(1);
+                row.last_error_at = Some(now);
+            }
+            StatBucket::Unknown => {
+                row.unknown_method = row.unknown_method.saturating_add(1);
+                row.last_error_at = Some(now);
+            }
+        }
     }
 
     /// Register a capability handler.
@@ -154,6 +237,11 @@ impl DispatchBridge {
 
         // === Admission step 7: capability lookup ===
         let Some(handler) = self.handlers.get(&req.method).cloned() else {
+            // PH-DISP1: count even unknown-method attempts so
+            // operators can spot mistyped capability names in
+            // the dashboard (e.g. "task.todo_set" vs the typo
+            // "task.todo_create").
+            self.bump_stats(&req.method, StatBucket::Unknown, now);
             return self
                 .audit_and_err_with_id(
                     &req,
@@ -183,6 +271,7 @@ impl DispatchBridge {
             ),
         };
         if denied {
+            self.bump_stats(&req.method, StatBucket::Denied, now);
             return self
                 .audit_and_err_with_id(
                     &req,
@@ -217,6 +306,13 @@ impl DispatchBridge {
                 Some(e.kind),
             ),
         };
+        // PH-DISP1: count the dispatched outcome.
+        let bucket = if matches!(status, AuditStatus::Ok) {
+            StatBucket::Ok
+        } else {
+            StatBucket::Err
+        };
+        self.bump_stats(&req.method, bucket, now);
         let aid = self
             .write_audit(
                 &req,
@@ -748,5 +844,147 @@ mod tests {
             ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::IDENTITY_INVALID),
             other => panic!("expected Err(identity_invalid), got {:?}", other),
         }
+    }
+
+    // ── PH-DISP1: capability invocation counters ────────────────────────
+
+    #[tokio::test]
+    async fn capability_stats_counts_ok_invocations() {
+        let dir = TempDir::new().unwrap();
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let policy = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "any"
+            method = "node.health"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let mut bridge = DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+
+        let caller_key = SigningKey::generate(&mut OsRng);
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&caller_key.verifying_key().to_bytes()),
+            name: "alice".into(),
+            org_id: NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let bundle = issue_identity(id, &org_root, 3600).unwrap();
+        for _ in 0..3 {
+            let envelope = build_request("node.health", b"x".to_vec(), bundle.clone(), 30);
+            let _ = bridge.handle_inbound(envelope).await;
+        }
+        let snap = bridge.capability_stats_snapshot();
+        let (name, stats) = snap
+            .iter()
+            .find(|(n, _)| n == "node.health")
+            .expect("node.health counter must exist");
+        assert_eq!(name, "node.health");
+        assert_eq!(stats.invocations, 3);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.denied, 0);
+        assert_eq!(stats.unknown_method, 0);
+        assert!(stats.last_invoked_at > 0);
+        assert!(stats.last_error_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn capability_stats_counts_unknown_method_attempts() {
+        let dir = TempDir::new().unwrap();
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let policy = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "any"
+            method = "anything.at.all"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let bridge = DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        // NO handlers registered. Every call should bump
+        // unknown_method.
+        let caller_key = SigningKey::generate(&mut OsRng);
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&caller_key.verifying_key().to_bytes()),
+            name: "alice".into(),
+            org_id: NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let bundle = issue_identity(id, &org_root, 3600).unwrap();
+        let envelope = build_request("task.todo_typooo", b"".to_vec(), bundle, 30);
+        let _ = bridge.handle_inbound(envelope).await;
+
+        let snap = bridge.capability_stats_snapshot();
+        let (_, stats) = snap
+            .iter()
+            .find(|(n, _)| n == "task.todo_typooo")
+            .expect("typo counter must exist");
+        assert_eq!(stats.unknown_method, 1);
+        assert!(stats.last_error_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn capability_stats_snapshot_returns_sorted() {
+        let dir = TempDir::new().unwrap();
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let policy = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "any"
+            method = "anything.at.all"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let bridge = DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        let caller_key = SigningKey::generate(&mut OsRng);
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&caller_key.verifying_key().to_bytes()),
+            name: "alice".into(),
+            org_id: NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let bundle = issue_identity(id, &org_root, 3600).unwrap();
+        // Send in reverse-alpha order; snapshot should sort.
+        for m in ["zzz.method", "aaa.method", "mmm.method"] {
+            let envelope = build_request(m, b"".to_vec(), bundle.clone(), 30);
+            let _ = bridge.handle_inbound(envelope).await;
+        }
+        let snap = bridge.capability_stats_snapshot();
+        let names: Vec<&str> = snap.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["aaa.method", "mmm.method", "zzz.method"]);
     }
 }
