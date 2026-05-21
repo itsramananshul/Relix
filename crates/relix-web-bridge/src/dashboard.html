@@ -1874,6 +1874,8 @@
               <button id="action-retry">Retry</button>
               <button id="action-pause">Pause</button>
               <button id="action-resume">Resume</button>
+              <button id="action-freeze">Freeze</button>
+              <button id="action-unfreeze">Unfreeze</button>
               <button id="action-note">Add note</button>
               <button id="action-investigate">Investigate</button>
               <button id="action-cancel" class="btn-danger">Cancel</button>
@@ -3302,6 +3304,14 @@ function initTasks() {
     if (!selectedTaskId) return;
     await requestResume(selectedTaskId);
   });
+  document.getElementById('action-freeze').addEventListener('click', async () => {
+    if (!selectedTaskId) return;
+    await requestFreeze(selectedTaskId);
+  });
+  document.getElementById('action-unfreeze').addEventListener('click', async () => {
+    if (!selectedTaskId) return;
+    await requestUnfreeze(selectedTaskId);
+  });
 
   tasksInited = true;
 }
@@ -3421,6 +3431,59 @@ async function requestInvestigation(taskId) {
   );
   if (reason === null) return;
   await requestInvestigationToggle(taskId, true, reason.trim());
+}
+
+async function requestFreeze(taskId) {
+  const reason = prompt(
+    'Freeze this task. Optional short reason (empty = none).\n\n'
+    + 'HONEST: no runtime freeze-gate primitive today — a\n'
+    + 'currently-executing flow continues to run. The status\n'
+    + 'transitions to `frozen` and `freeze_generation`\n'
+    + 'increments so future cooperative workers can observe\n'
+    + 'and propagate. Distinct from pause: freeze is\n'
+    + 'workflow-scoped (will propagate to spawned/delegated\n'
+    + 'children once those edge producers ship).',
+    ''
+  );
+  if (reason === null) return;
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/freeze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: reason.trim() || null }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    const flowMsg = body.flow_still_running
+      ? ' · WARN: in-flight flow may overwrite this status'
+      : '';
+    toast('frozen (was ' + (body.prior_status || '?') + ')' + flowMsg,
+      body.flow_still_running ? 'warn' : 'ok');
+    loadDetail(taskId);
+    loadTasks();
+  } catch (e) {
+    toast('freeze failed: ' + String(e.message || e), 'error');
+  }
+}
+
+async function requestUnfreeze(taskId) {
+  if (!confirm(
+    'Unfreeze this task? Status becomes `pending`. The runtime '
+    + 'does NOT automatically resume execution — operators '
+    + 'wanting a fresh attempt should use Retry after unfreeze.'
+  )) return;
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/unfreeze', {
+      method: 'POST',
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    toast('unfrozen → pending (was ' + (body.pre_freeze_status || '?') + ')', 'ok');
+    loadDetail(taskId);
+    loadTasks();
+  } catch (e) {
+    toast('unfreeze failed: ' + String(e.message || e), 'error');
+  }
 }
 
 async function requestPause(taskId) {

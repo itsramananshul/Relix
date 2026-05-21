@@ -301,6 +301,21 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.lineage utf8: {e}"))
     }
 
+    /// Operator-initiated workflow freeze (M71). Args: task_id
+    /// + optional reason. Returns `prior_status=<status>`.
+    pub async fn freeze(&self, task_id: &str, reason: Option<&str>) -> Result<String, String> {
+        let arg = format!("{task_id}|{}", reason.unwrap_or(""));
+        let bytes = self.call("task.freeze", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.freeze utf8: {e}"))
+    }
+
+    /// Operator-initiated unfreeze (M71). Returns
+    /// `pre_freeze_status=<status>`.
+    pub async fn unfreeze(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.unfreeze", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.unfreeze utf8: {e}"))
+    }
+
     /// Operator-initiated pause (M65). Args: task_id + optional
     /// reason. Returns the coordinator body verbatim
     /// (`prior_status=<status>`). Same fail-soft handling as

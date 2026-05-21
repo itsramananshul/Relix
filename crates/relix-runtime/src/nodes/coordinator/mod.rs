@@ -1503,6 +1503,192 @@ impl TaskStore {
         Ok(pre_pause_status)
     }
 
+    /// Operator-initiated freeze (M71). Workflow-level
+    /// equivalent of pause. Transitions to `frozen` status,
+    /// stamps `frozen_at`, bumps `freeze_generation`, emits
+    /// `task.freeze_requested` chronicle event.
+    ///
+    /// HONEST: like pause, this is metadata-only. The
+    /// runtime has no freeze-gate primitive yet — a flow
+    /// already executing continues underneath the `frozen`
+    /// status. Future cooperative workers (M70 protocol)
+    /// will observe the `freeze_generation` bump and emit
+    /// `task.freeze_propagated` as they refuse to start
+    /// new node execution.
+    ///
+    /// Returns the prior status so callers can report a
+    /// faithful transition.
+    pub fn set_frozen(
+        &self,
+        task_id: &str,
+        reason: Option<&str>,
+        author_subject_id: &str,
+    ) -> Result<String, CoordinatorError> {
+        let trimmed_reason = reason.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(r) = trimmed_reason
+            && r.len() > MAX_OPERATOR_NOTE_LEN
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.freeze: reason exceeds {MAX_OPERATOR_NOTE_LEN} bytes (got {})",
+                r.len()
+            )));
+        }
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let prior_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let prior_status = prior_status.ok_or(CoordinatorError::NotFound(task_id.to_string()))?;
+        if !FREEZABLE_STATUSES.contains(&prior_status.as_str()) {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.freeze: status '{prior_status}' is not freezable (allowed: {})",
+                FREEZABLE_STATUSES.join(", ")
+            )));
+        }
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        tx.execute(
+            "UPDATE tasks
+               SET status = 'frozen',
+                   frozen_at = ?2,
+                   frozen_reason = ?3,
+                   updated_at = ?2,
+                   freeze_generation = freeze_generation + 1
+             WHERE task_id = ?1",
+            params![task_id, now, trimmed_reason],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let new_freeze_generation: i64 = tx
+            .query_row(
+                "SELECT freeze_generation FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        let payload_json = serde_json::json!({
+            "prior_status": prior_status,
+            "reason": trimmed_reason,
+            "author": author_subject_id,
+            "freeze_generation": new_freeze_generation,
+            "intent": "request",
+        })
+        .to_string();
+        let legacy = match trimmed_reason {
+            Some(r) => format!("from {prior_status} · gen={new_freeze_generation} · {r}"),
+            None => format!("from {prior_status} · gen={new_freeze_generation}"),
+        };
+        insert_typed_event(
+            &tx,
+            task_id,
+            now,
+            "task.freeze_requested",
+            &legacy,
+            None,
+            None,
+            Some(&payload_json),
+        )?;
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(prior_status)
+    }
+
+    /// Operator-initiated unfreeze (M71). Refuses any status
+    /// other than `frozen`. Transitions to `pending`,
+    /// clears `frozen_at` + `frozen_reason`, bumps
+    /// `freeze_generation`, emits `task.unfreeze_requested`.
+    pub fn set_unfrozen(
+        &self,
+        task_id: &str,
+        author_subject_id: &str,
+    ) -> Result<String, CoordinatorError> {
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let prior_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?;
+        let prior_status = prior_status.ok_or(CoordinatorError::NotFound(task_id.to_string()))?;
+        if prior_status != "frozen" {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.unfreeze: status '{prior_status}' is not unfreezable (only 'frozen' is)"
+            )));
+        }
+        // Recover the pre-freeze status from the most recent
+        // freeze-request event so the unfreeze chronicle
+        // entry tells operators where the task was returning
+        // to.
+        let pre_freeze_status: String = conn
+            .query_row(
+                "SELECT payload_json FROM task_events
+                  WHERE task_id = ?1
+                    AND event_type = 'task.freeze_requested'
+                  ORDER BY event_id DESC LIMIT 1",
+                params![task_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(CoordinatorError::Db)?
+            .flatten()
+            .and_then(|pj| {
+                serde_json::from_str::<serde_json::Value>(&pj)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("prior_status")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string)
+                    })
+            })
+            .unwrap_or_else(|| "frozen".to_string());
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        tx.execute(
+            "UPDATE tasks
+               SET status = 'pending',
+                   frozen_at = NULL,
+                   frozen_reason = NULL,
+                   updated_at = ?2,
+                   freeze_generation = freeze_generation + 1
+             WHERE task_id = ?1",
+            params![task_id, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let new_freeze_generation: i64 = tx
+            .query_row(
+                "SELECT freeze_generation FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        let payload_json = serde_json::json!({
+            "pre_freeze_status": pre_freeze_status,
+            "new_status": "pending",
+            "author": author_subject_id,
+            "freeze_generation": new_freeze_generation,
+            "intent": "request",
+        })
+        .to_string();
+        let legacy =
+            format!("frozen→pending (was {pre_freeze_status}) · gen={new_freeze_generation}");
+        insert_typed_event(
+            &tx,
+            task_id,
+            now,
+            "task.unfreeze_requested",
+            &legacy,
+            None,
+            None,
+            Some(&payload_json),
+        )?;
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(pre_freeze_status)
+    }
+
     /// Cooperative-poller snapshot of interruption state
     /// (M70). Returns the current pause/freeze generations
     /// plus the live status — enough for a runtime worker
@@ -1808,7 +1994,8 @@ impl TaskStore {
                         last_failure_class, started_at,
                         attempt_count, current_attempt_id,
                         investigation_marked_at, investigation_reason,
-                        pause_generation, freeze_generation
+                        pause_generation, freeze_generation,
+                        frozen_at, frozen_reason
                  FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 |r| {
@@ -1839,6 +2026,8 @@ impl TaskStore {
                         investigation_reason: r.get(22)?,
                         pause_generation: r.get(23)?,
                         freeze_generation: r.get(24)?,
+                        frozen_at: r.get(25)?,
+                        frozen_reason: r.get(26)?,
                         events: Vec::new(),
                     })
                 },
@@ -2213,6 +2402,15 @@ pub struct TaskView {
     /// the freeze axis so a pause request doesn't invalidate a
     /// worker's freeze cache and vice versa.
     pub freeze_generation: i64,
+    /// M71: operator-set freeze stamp. `Some(ts)` when the
+    /// task is currently frozen (status = `frozen`); `None`
+    /// when not frozen. The chronicle preserves every
+    /// transition via `task.freeze_requested` /
+    /// `task.unfreeze_requested` events.
+    pub frozen_at: Option<i64>,
+    /// M71: optional operator-supplied reason captured at
+    /// freeze time. Cleared on unfreeze.
+    pub frozen_reason: Option<String>,
     pub events: Vec<TaskEvent>,
 }
 
@@ -2684,6 +2882,26 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.freeze",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_freeze(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.unfreeze",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_unfreeze(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
@@ -3057,6 +3275,8 @@ fn render_task_export(e: &TaskExport) -> String {
     push_opt_str_field!("investigation_reason", v.investigation_reason);
     push_int_field!("pause_generation", v.pause_generation);
     push_int_field!("freeze_generation", v.freeze_generation);
+    push_opt_int_field!("frozen_at", v.frozen_at);
+    push_opt_str_field!("frozen_reason", v.frozen_reason);
     s.push_str(r#","events":["#);
     for (i, ev) in v.events.iter().enumerate() {
         if i > 0 {
@@ -3492,6 +3712,20 @@ pub const MAX_OPERATOR_NOTE_LEN: usize = 2_000;
 /// rejects to keep the toggle idempotent.
 pub const PAUSABLE_STATUSES: &[&str] = &["pending", "running", "retrying"];
 
+/// Statuses from which an operator-initiated freeze is
+/// allowed (M71). Wider than pause — operators can freeze a
+/// paused task, a task awaiting input, etc. Refuses
+/// `frozen` (already), terminal statuses, and `cancelled`
+/// (terminal).
+pub const FREEZABLE_STATUSES: &[&str] = &[
+    "pending",
+    "running",
+    "retrying",
+    "paused",
+    "awaiting_input",
+    "interrupted",
+];
+
 /// `task.note` — operator-authored chronicle annotation. Args:
 /// `task_id|note_text`. The note text may contain `|` (splitn(2)
 /// keeps the remainder intact). The author is taken from
@@ -3674,6 +3908,51 @@ fn handle_resume(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// `task.freeze` — operator-initiated workflow freeze (M71).
+/// Args: `task_id|<reason>`. Reason optional. Returns
+/// `prior_status=<status>`. Distinct from pause — freeze is
+/// intended to propagate down the spawned/delegated subtree
+/// once those edge producers ship. Today single-task scope.
+fn handle_freeze(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.freeze utf8: {e}")),
+    };
+    let mut parts = s.splitn(2, '|');
+    let task_id = parts.next().unwrap_or("");
+    let reason = parts.next().filter(|v| !v.is_empty());
+    if task_id.is_empty() {
+        return invalid("task.freeze: task_id required".to_string());
+    }
+    let author = ctx.caller.subject_id.to_string();
+    match store.set_frozen(task_id, reason, &author) {
+        Ok(prior) => HandlerOutcome::Ok(format!("prior_status={prior}\n").into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.freeze: not found: {id}")),
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.freeze: {e}")),
+    }
+}
+
+/// `task.unfreeze` — operator-initiated unfreeze (M71).
+/// Args: `task_id`. Refuses any status other than `frozen`.
+/// Returns `pre_freeze_status=<status>`.
+fn handle_unfreeze(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.unfreeze utf8: {e}")),
+    };
+    if task_id.is_empty() {
+        return invalid("task.unfreeze: task_id required".to_string());
+    }
+    let author = ctx.caller.subject_id.to_string();
+    match store.set_unfrozen(task_id, &author) {
+        Ok(pre) => HandlerOutcome::Ok(format!("pre_freeze_status={pre}\n").into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.unfreeze: not found: {id}")),
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.unfreeze: {e}")),
+    }
+}
+
 /// `task.interruption_check` — cooperative-poller snapshot
 /// (M70). Args: `task_id`. Returns a multi-line k=v body:
 /// `status=...\npause_generation=N\nfreeze_generation=N\n`.
@@ -3841,6 +4120,12 @@ fn render_task_view(v: &TaskView) -> String {
     }
     let _ = writeln!(s, "pause_generation={}", v.pause_generation);
     let _ = writeln!(s, "freeze_generation={}", v.freeze_generation);
+    if let Some(x) = v.frozen_at {
+        let _ = writeln!(s, "frozen_at={}", x);
+    }
+    if let Some(x) = v.frozen_reason.as_ref() {
+        let _ = writeln!(s, "frozen_reason={}", x);
+    }
     let _ = writeln!(s, "event_count={}", v.events.len());
     // Events as a simple JSON array. We hand-build the JSON to avoid
     // pulling serde_json into this hot path; payloads are escaped
@@ -4078,6 +4363,17 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         // `task.observe_interruption` attestation capability.
         "ALTER TABLE tasks ADD COLUMN pause_generation INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE tasks ADD COLUMN freeze_generation INTEGER NOT NULL DEFAULT 0",
+        // M71: operator-set freeze (workflow-level pause).
+        // `frozen_at` stamps the freeze request; `frozen_reason`
+        // captures optional triage context. Freeze is intended
+        // to propagate down the spawned/delegated subtree once
+        // those edge producers ship (M72+). Today it sits on
+        // the single task. The matching `task.freeze_propagated`
+        // chronicle event (added in M70) lands when a
+        // cooperative worker attests via
+        // `task.observe_interruption`.
+        "ALTER TABLE tasks ADD COLUMN frozen_at INTEGER",
+        "ALTER TABLE tasks ADD COLUMN frozen_reason TEXT",
     ];
     for sql in alters {
         // Best-effort. The only error we expect is "duplicate column
@@ -6422,6 +6718,109 @@ mod tests {
         let tid = mk(&s, "t", "f", "{}", "o");
         let err = s.set_resumed(&tid, "op").unwrap_err();
         assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn freeze_from_running_transitions_to_frozen_with_chronicle() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        let prior = s.set_frozen(&tid, Some("upstream outage"), "op").unwrap();
+        assert_eq!(prior, "running");
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "frozen");
+        assert!(v.frozen_at.is_some());
+        assert_eq!(v.frozen_reason.as_deref(), Some("upstream outage"));
+        let ev = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "task.freeze_requested")
+            .expect("task.freeze_requested event");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["prior_status"], "running");
+        assert_eq!(pj["intent"], "request");
+        assert_eq!(pj["author"], "op");
+        assert_eq!(
+            v.freeze_generation,
+            pj["freeze_generation"].as_i64().unwrap()
+        );
+    }
+
+    #[test]
+    fn freeze_refuses_terminal_status() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(
+            &tid,
+            Some("completed"),
+            Some("result"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let err = s.set_frozen(&tid, None, "op").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn unfreeze_restores_to_pending_with_pre_freeze_status_in_event() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_frozen(&tid, Some("ops triage"), "op").unwrap();
+        let pre = s.set_unfrozen(&tid, "op").unwrap();
+        assert_eq!(pre, "running");
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.status, "pending");
+        assert!(v.frozen_at.is_none());
+        assert!(v.frozen_reason.is_none());
+        let ev = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "task.unfreeze_requested")
+            .expect("task.unfreeze_requested event");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["pre_freeze_status"], "running");
+        assert_eq!(pj["new_status"], "pending");
+        // Two freeze-axis bumps: one to freeze, one to unfreeze.
+        assert!(pj["freeze_generation"].as_i64().unwrap() >= 2);
+    }
+
+    #[test]
+    fn unfreeze_refuses_non_frozen_status() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let err = s.set_unfrozen(&tid, "op").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn freeze_generation_independent_of_pause_generation() {
+        // M70/M71: pause and freeze must use distinct
+        // counters so a worker caching one axis doesn't
+        // invalidate on the other.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_paused(&tid, None, "op").unwrap();
+        s.set_resumed(&tid, "op").unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v.pause_generation, 2);
+        assert_eq!(v.freeze_generation, 0);
+        s.set_frozen(&tid, None, "op").unwrap();
+        let v2 = s.get(&tid).unwrap().unwrap();
+        assert_eq!(v2.pause_generation, 2);
+        assert_eq!(v2.freeze_generation, 1);
     }
 
     #[test]

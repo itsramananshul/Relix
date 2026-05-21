@@ -266,6 +266,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // exists yet — same caveat as cancel.
         .route("/v1/tasks/:id/pause", post(tasks::pause))
         .route("/v1/tasks/:id/resume", post(tasks::resume))
+        // M71: operator freeze / unfreeze. Workflow-level
+        // counterpart to pause. Status → frozen. Future
+        // cooperative workers will observe + propagate the
+        // freeze via M70 protocol.
+        .route("/v1/tasks/:id/freeze", post(tasks::freeze))
+        .route("/v1/tasks/:id/unfreeze", post(tasks::unfreeze))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered
         // manifest cache (no extra mesh I/O).

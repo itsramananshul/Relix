@@ -539,6 +539,29 @@ fn register_node_type_handlers(
                 &["task", "write", "interrupt", "runtime"],
             ),
             (
+                "task.freeze",
+                "Operator-initiated workflow freeze. Distinct \
+                 from pause: freeze is intended to propagate \
+                 down the spawned/delegated subtree once those \
+                 edge producers ship. Status → `frozen`, bumps \
+                 `freeze_generation`, emits \
+                 `task.freeze_requested`. HONEST: today \
+                 single-task scope; cooperative workers will \
+                 observe + propagate via M70 protocol.",
+                &["task", "write", "intervene", "operator"],
+            ),
+            (
+                "task.unfreeze",
+                "Operator-initiated unfreeze. Refuses any \
+                 status other than `frozen`. Status → \
+                 `pending`, clears `frozen_at` + \
+                 `frozen_reason`, bumps `freeze_generation`, \
+                 emits `task.unfreeze_requested` with the \
+                 pre-freeze status recovered from the \
+                 chronicle.",
+                &["task", "write", "intervene", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -574,7 +597,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze"
         );
     }
     if cfg.controller.node_type == "tool" {

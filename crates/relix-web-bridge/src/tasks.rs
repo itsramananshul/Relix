@@ -769,6 +769,188 @@ pub async fn note(
     }))
 }
 
+// ── M71: freeze / unfreeze ─────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct FreezeReq {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FreezeResp {
+    pub task_id: String,
+    pub prior_status: String,
+    pub new_status: String,
+    /// HONEST: like pause, no runtime gate primitive yet.
+    /// True when prior_status was a live execution state.
+    pub flow_still_running: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnfreezeResp {
+    pub task_id: String,
+    pub pre_freeze_status: String,
+    pub new_status: String,
+}
+
+/// `POST /v1/tasks/:id/freeze` — operator-initiated workflow
+/// freeze (M71). Forwards to the Coordinator's `task.freeze`,
+/// records into the intervention audit ring with a M68
+/// correlation id.
+pub async fn freeze(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<FreezeReq>,
+) -> Result<Json<FreezeResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
+    let Some(rec) = state.task_recorder.as_ref() else {
+        state.intervention_audit.record_with_id(
+            "anon",
+            "freeze",
+            &id,
+            "error",
+            "no coordinator",
+            corr,
+        );
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let trimmed_reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(r) = trimmed_reason {
+        if r.len() > NOTE_BRIDGE_MAX_LEN {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiError {
+                    error: format!(
+                        "reason: too long (max {NOTE_BRIDGE_MAX_LEN} bytes, got {})",
+                        r.len()
+                    ),
+                }),
+            ));
+        }
+        if r.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "reason: must not contain control characters".into(),
+                }),
+            ));
+        }
+    }
+    let body = match rec.freeze(&id, trimmed_reason).await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record_with_id(
+                "anon",
+                "freeze",
+                &id,
+                "error",
+                format!("coord task.freeze failed: {e}"),
+                corr,
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let prior_status = body
+        .lines()
+        .find_map(|l| l.strip_prefix("prior_status="))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let flow_still_running = matches!(prior_status.as_str(), "running" | "retrying");
+    let detail = format!(
+        "{prior_status}→frozen{}{}",
+        trimmed_reason
+            .map(|r| format!(" · {r}"))
+            .unwrap_or_default(),
+        if flow_still_running {
+            " · flow still running"
+        } else {
+            ""
+        }
+    );
+    state
+        .intervention_audit
+        .record_with_id("anon", "freeze", &id, "ok", detail, corr);
+    Ok(Json(FreezeResp {
+        task_id: id,
+        prior_status,
+        new_status: "frozen".to_string(),
+        flow_still_running,
+    }))
+}
+
+/// `POST /v1/tasks/:id/unfreeze` — operator-initiated
+/// unfreeze (M71).
+pub async fn unfreeze(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<UnfreezeResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
+    let Some(rec) = state.task_recorder.as_ref() else {
+        state.intervention_audit.record_with_id(
+            "anon",
+            "unfreeze",
+            &id,
+            "error",
+            "no coordinator",
+            corr,
+        );
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = match rec.unfreeze(&id).await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record_with_id(
+                "anon",
+                "unfreeze",
+                &id,
+                "error",
+                format!("coord task.unfreeze failed: {e}"),
+                corr,
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let pre_freeze_status = body
+        .lines()
+        .find_map(|l| l.strip_prefix("pre_freeze_status="))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "frozen".to_string());
+    state.intervention_audit.record_with_id(
+        "anon",
+        "unfreeze",
+        &id,
+        "ok",
+        format!("frozen→pending (was {pre_freeze_status})"),
+        corr,
+    );
+    Ok(Json(UnfreezeResp {
+        task_id: id,
+        pre_freeze_status,
+        new_status: "pending".to_string(),
+    }))
+}
+
 // ── M65: pause / resume ────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]

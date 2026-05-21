@@ -563,6 +563,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_freeze_unfreeze_actions_present() {
+        // M71 (Track B): freeze + unfreeze. Workflow-level
+        // counterpart to pause. Honest about the runtime
+        // freeze-gate gap in the prompt copy.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"action-freeze\"",
+            "id=\"action-unfreeze\"",
+            "function requestFreeze",
+            "function requestUnfreeze",
+            "/freeze",
+            "/unfreeze",
+            "freeze-gate primitive",
+        ] {
+            assert!(body.contains(needle), "M71 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_pause_resume_actions_present() {
         // M65 (Track B): real coord pause/resume capabilities
         // backed by status transitions + chronicle events.
