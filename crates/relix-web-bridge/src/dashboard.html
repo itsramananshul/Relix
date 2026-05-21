@@ -1867,6 +1867,12 @@
               <div class="value" id="kpi-terminal">0</div>
               <div class="delta">post-mortems</div>
             </div>
+            <div class="kpi" id="kpi-redact-tile" style="cursor: pointer;"
+                 title="count of [REDACTED:...] markers in firehose payloads + audit details (paste-hygiene signal)">
+              <p class="label">redactions</p>
+              <div class="value" id="kpi-redact">0</div>
+              <div class="delta">secrets scrubbed</div>
+            </div>
           </div>
         </div>
         <div class="kpi-section">
@@ -2797,12 +2803,31 @@ function renderOpsHealthBadges() {
   // Walk the existing firehose ring (already populated by
   // openGlobalFirehoseStream + fetchGlobalFirehose). Counts cover
   // whatever window is in the ring (FIREHOSE_RING_CAP entries).
-  let thrash = 0, terminal = 0, orphan = 0;
+  let thrash = 0, terminal = 0, orphan = 0, redact = 0;
+  // PH-WAVE2C: count [REDACTED:...] markers across summary,
+  // payload, and payload_json string form. Multiple markers in
+  // the same row count once per row (a single op event with two
+  // secrets pasted in is one redaction event).
+  const REDACT_RE = /\[REDACTED:/;
   for (const e of firehoseRing) {
     const t = e.event_type || '';
     if (t === 'task.thrash_detected') thrash += 1;
     else if (t === 'task.terminal_summary') terminal += 1;
     else if (t === 'task.attempt_orphan_closed') orphan += 1;
+    const hay = (e.summary || '') + ' ' + (e.payload || '') + ' '
+              + (typeof e.payload_json === 'string'
+                  ? e.payload_json
+                  : (e.payload_json ? JSON.stringify(e.payload_json) : ''));
+    if (REDACT_RE.test(hay)) redact += 1;
+  }
+  // Walk the intervention-audit list too so audit-only redactions
+  // (e.g. provider_test details) light up the tile. We piggy-back
+  // on whatever the existing intervention ring most recently
+  // fetched.
+  if (Array.isArray(window.lastInterventionAudit)) {
+    for (const r of window.lastInterventionAudit) {
+      if (REDACT_RE.test(r.detail || '')) redact += 1;
+    }
   }
   const stuck = opsHealthStuckCount;
   // Update each tile's value.
@@ -2810,6 +2835,7 @@ function renderOpsHealthBadges() {
   document.getElementById('kpi-thrash').textContent = thrash;
   document.getElementById('kpi-orphan').textContent = orphan;
   document.getElementById('kpi-terminal').textContent = terminal;
+  document.getElementById('kpi-redact').textContent = redact;
   // Window label: how much firehose we're showing counts over.
   const ringSize = firehoseRing.length;
   document.getElementById('opshealth-window-label').textContent =
@@ -2818,7 +2844,7 @@ function renderOpsHealthBadges() {
       : '(last ' + ringSize + ' event' + (ringSize === 1 ? '' : 's') + ')';
   // Hide the section entirely when nothing's wrong — keeps the
   // overview tight on healthy systems.
-  const any = stuck > 0 || thrash > 0 || terminal > 0 || orphan > 0;
+  const any = stuck > 0 || thrash > 0 || terminal > 0 || orphan > 0 || redact > 0;
   section.style.display = any ? '' : 'none';
 }
 
@@ -3518,7 +3544,14 @@ async function fetchInterventionAudit() {
       return;
     }
     const j = await r.json();
+    // PH-WAVE2C: stash the latest audit snapshot on `window` so
+    // the ops-health renderer can count [REDACTED:...] markers
+    // in audit details without re-fetching.
+    window.lastInterventionAudit = j.items || [];
     renderInterventionAudit(j, false);
+    // Re-render badges immediately so the new redact count
+    // appears without waiting for the next firehose event.
+    renderOpsHealthBadges();
   } catch (_) {
     renderInterventionAudit({items: [], next_cursor: 0}, true);
   }

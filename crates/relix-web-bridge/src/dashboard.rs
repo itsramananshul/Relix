@@ -794,6 +794,7 @@ mod tests {
             "id=\"kpi-thrash-tile\"",
             "id=\"kpi-orphan-tile\"",
             "id=\"kpi-terminal-tile\"",
+            "id=\"kpi-redact-tile\"",
             "Operational health",
             "function renderOpsHealthBadges",
             "function wireOpsHealthTileClicks",
