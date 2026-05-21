@@ -201,7 +201,10 @@ last failure: TRANSPORT (DialFailure)" event written before the
 status flip. Pure additive change. The Hermes-grade synthesized
 summary (option a) lands later when an executor exists.
 
-**Status.** open.
+**Status.** answered:c — shipped via `recover_interrupted` synthesizing
+a `task.terminal_summary` event with `auto_emitted_by="recover_interrupted"`,
+attempts, retries, wall_clock_secs, last_failure_class, reason. Test:
+`recovery_scan_emits_terminal_summary_with_attempt_and_wallclock`.
 
 ### D-005  Hermes "ContextVar for write-origin scoping" — adopt for telemetry?
 
@@ -230,7 +233,8 @@ about and matches Relix's existing prefer-explicit-args posture.
 
 ## Answered
 
-(none yet)
+- D-006 — answered:c (in-place above). Recovery scan auto-emits a
+  synthesized `task.terminal_summary` event. Pure additive change.
 
 ---
 

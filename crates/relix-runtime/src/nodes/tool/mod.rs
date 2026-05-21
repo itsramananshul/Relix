@@ -54,6 +54,7 @@ pub mod sanitize;
 pub mod security;
 pub mod terminal;
 pub mod web_extract;
+pub mod web_robots;
 pub mod web_tools;
 
 use std::collections::HashMap;
@@ -706,6 +707,12 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
     // unchanged. No new credential surface, no new egress primitive.
     tracing::info!("tool node: registering tool.web_get + tool.web_search (CW3)");
     web_tools::register(bridge, backend.clone());
+
+    // PH-WEB-ROBOTS: tool.web.robots_check — robots.txt sniff over
+    // the same ToolBackend.fetch() pipeline so SSRF + pin + redirect
+    // re-validation all apply. Pure safety surface — does NOT enforce.
+    tracing::info!("tool node: registering tool.web.robots_check (PH-WEB-ROBOTS)");
+    web_robots::register(bridge, backend.clone());
 
     // B2: tool.read_file / write_file / search_files / patch.
     // Only registered when the operator opted in by setting

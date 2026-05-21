@@ -137,7 +137,7 @@ skills_guard, budget_config.
 | Hermes name | What it does | Leverage | Effort | Relix status | Notes |
 |---|---|---|---|---|---|
 | tirith_security | code security scanning | medium | large | pending | external service |
-| website_policy | robots.txt + ToS parsing | low | small | pending | small wrapper |
+| website_policy | robots.txt + ToS parsing | low | small | partial | tool.web.robots_check (PH-WEB-ROBOTS) — robots.txt sniff live; ToS detection pending |
 
 ---
 

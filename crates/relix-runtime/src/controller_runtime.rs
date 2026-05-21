@@ -747,6 +747,9 @@ fn register_node_type_handlers(
         // web_fetch since they share the SSRF/pin/redirect machinery.
         manifest.add_capability(crate::nodes::tool::web_tools::web_get_descriptor());
         manifest.add_capability(crate::nodes::tool::web_tools::web_search_descriptor());
+        // PH-WEB-ROBOTS: tool.web.robots_check — robots.txt sniff.
+        // Same SSRF + pin + redirect machinery as web_fetch.
+        manifest.add_capability(crate::nodes::tool::web_robots::robots_check_descriptor());
         // B2: jailed filesystem subsystem. Only advertised when
         // `[tool.fs]` is configured -- node-type tool with no
         // `[tool.fs]` keeps fs out of the manifest.
