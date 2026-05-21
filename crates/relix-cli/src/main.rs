@@ -9,6 +9,7 @@ mod mcp;
 mod ops;
 mod ping;
 mod router;
+mod sol;
 mod task;
 mod terminal;
 mod topology;
@@ -128,6 +129,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: browser::Cmd,
     },
+    /// W2-004a: SOL workflow authoring helpers.
+    /// `sol templates` lists baked-in workflow templates;
+    /// `sol new --template ping --out flows/my-ping.sol`
+    /// writes one to disk for quick-add.
+    Sol {
+        #[command(subcommand)]
+        cmd: sol::Cmd,
+    },
     /// PH-TERM-CLI: inspect + control tool.terminal.* on a
     /// tool node. `terminal sessions` lists live runs;
     /// `terminal audit` snapshots the completion ring;
@@ -183,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Fs { cmd } => fs::run(cmd).await,
         Cmd::Web { cmd } => web::run(cmd).await,
         Cmd::Browser { cmd } => browser::run(cmd).await,
+        Cmd::Sol { cmd } => sol::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,

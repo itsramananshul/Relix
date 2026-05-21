@@ -34,3 +34,6 @@ hex.workspace = true
 reqwest.workspace = true
 
 zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
