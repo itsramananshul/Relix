@@ -1,12 +1,9 @@
 # MCP tool (CW5)
 
 `tool.mcp.*` ships the **registry + discovery surface** for the
-Model Context Protocol. As of this milestone there is **no
-live MCP client**: `tool.mcp.invoke` returns a typed
-`RuntimeNotConnected` error. The registry, capability
-descriptors, validation, dispatch path, and dashboard surface
-are real. A future milestone wires the stdio + HTTP MCP
-clients behind the same registry.
+Model Context Protocol plus a **live stdio runtime**
+(PH-MCP-RUNTIME, D-009 closed). HTTP transport still returns
+`RuntimeNotConnected` until the HTTP client lands.
 
 ## Honesty contract
 
@@ -17,17 +14,29 @@ clients behind the same registry.
 The operator can:
 
 - Declare MCP servers in `[tool.mcp]` config (id, transport,
-  endpoint, optional `declared_tools`).
+  endpoint, optional `command`/`args`, optional
+  `declared_tools`).
 - Call `tool.mcp.list_servers` — each row's `status` reads
-  `configured` (never `connected`).
-- Call `tool.mcp.list_tools|<server_id>` — returns the
-  operator-supplied `declared_tools` (never fabricated).
+  `configured` (the dashboard projection grows richer states
+  when live health checks ship).
+- Call `tool.mcp.list_tools|<server_id>` — for `stdio`
+  transports the bridge runs a live `tools/list`; on transport
+  failure it falls back to the operator-declared list (never
+  fabricated). For other transports the declared list is
+  returned.
+- Call `tool.mcp.invoke|<server_id>|<tool_name>|<args>` — for
+  `stdio` transports the bridge spawns the configured
+  subprocess (lazy: on first call), runs the MCP `initialize`
+  handshake, dispatches `tools/call`, and returns the encoded
+  result content as JSON bytes. Spawn / I/O failures surface as
+  `RuntimeNotConnected` with the underlying cause prefixed
+  `mcp:`. Malformed responses surface as `RESPONDER_INTERNAL`
+  with `mcp: bad response: ...`. No fake success ever.
 
 The operator CANNOT today:
 
-- Call `tool.mcp.invoke|<server_id>|<tool_name>|<args>` — returns
-  `RuntimeNotConnected` with the reason "MCP client runtime is
-  not yet implemented in this Relix build."
+- Call `tool.mcp.invoke` against an `http` transport server —
+  returns `RuntimeNotConnected` until the HTTP client ships.
 
 ## Config
 
@@ -43,6 +52,17 @@ endpoint    = "mcp-fs-server"     # bare program name; no paths
 description = "Local filesystem MCP server (operator-supplied)"
 declared_tools = ["search", "read", "write"]
 
+# PH-MCP-RUNTIME: explicit `command` + `args` lets you run
+# servers shipped via package managers (npx, uvx, etc.).
+# `endpoint` stays as the stable id-surface; `command` wins
+# when set.
+[[tool.mcp.servers]]
+id          = "fs-everything"
+transport   = "stdio"
+endpoint    = "everything"
+command     = "npx"
+args        = ["-y", "@modelcontextprotocol/server-everything"]
+
 [[tool.mcp.servers]]
 id          = "remote-search"
 transport   = "http"
@@ -54,7 +74,8 @@ Validation enforced at startup:
 
 - `id` non-empty + unique.
 - `transport` ∈ `{"stdio", "http"}`.
-- `stdio` endpoints must be bare program names (no path separators).
+- `stdio` requires `command` OR `endpoint`; whichever resolves
+  must be a bare program name (no path separators).
 - `http` endpoints must start with `http://` or `https://`.
 
 When `[tool.mcp]` is absent the capability family is NOT

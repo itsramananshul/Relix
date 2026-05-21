@@ -49,6 +49,7 @@
 pub mod browser;
 pub mod fs;
 pub mod mcp;
+pub mod mcp_stdio;
 pub mod pdf;
 pub mod sanitize;
 pub mod security;
@@ -1048,16 +1049,17 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
         );
     }
 
-    // CW5: tool.mcp.* — MCP registry + runtime projection.
-    // Opt-in via [tool.mcp]. Today tool.mcp.invoke returns
-    // RuntimeNotConnected — the registry / discovery surface
-    // is real; live execution lands later. See mcp.rs.
+    // CW5: tool.mcp.* — MCP registry + live stdio runtime
+    // (PH-MCP-RUNTIME, D-009 closed). Opt-in via [tool.mcp].
+    // stdio servers spawn lazily on first invoke / list_tools;
+    // HTTP transport still returns RuntimeNotConnected. See
+    // mcp.rs and mcp_stdio.rs.
     if let Some(mcp_cfg) = backend.mcp_config() {
         match mcp::McpRegistry::new(mcp_cfg) {
             Ok(reg) => {
                 tracing::info!(
                     servers = reg.server_count(),
-                    "tool node: registering tool.mcp.* (CW5 registry + discovery scaffold)"
+                    "tool node: registering tool.mcp.* (registry + live stdio runtime)"
                 );
                 mcp::register(bridge, Arc::new(reg));
             }

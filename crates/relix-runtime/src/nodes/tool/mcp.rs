@@ -1,14 +1,15 @@
-//! CW5 — MCP (Model Context Protocol) registry + runtime projection.
+//! CW5 — MCP (Model Context Protocol) registry + runtime.
 //!
 //! Hermes ships `mcp_tool` which auto-discovers tools exposed
 //! by external MCP servers (stdio or HTTP transport) and
 //! projects them into the agent's capability catalog. Relix's
-//! CW5 foundation lands the **registry + discovery model**:
-//! operators declare MCP servers in their tool-node config,
-//! the bridge surfaces connection status + discovered
-//! capabilities — but the live execution path returns a
-//! typed `RuntimeNotConnected` error until the actual MCP
-//! client wiring ships.
+//! CW5 foundation lands the **registry + discovery model**;
+//! PH-MCP-RUNTIME (D-009 closed) layers a live stdio client on
+//! top — `tool.mcp.invoke` against an `stdio` server now
+//! spawns the operator-declared subprocess, runs the MCP
+//! `initialize` handshake, and dispatches `tools/call`. HTTP
+//! transport still returns `RuntimeNotConnected` until the
+//! HTTP client ships.
 //!
 //! ## Honesty contract
 //!
@@ -19,32 +20,43 @@
 //!
 //! Concrete posture:
 //!
-//! - `[[tool.mcp]]` config entries register servers. Each entry
-//!   has `id`, `transport` (`"stdio"` | `"http"`), `command`
-//!   or `url`, and an optional `auto_discover` flag.
+//! - `[[tool.mcp.servers]]` config entries register servers.
+//!   Each entry has `id`, `transport` (`"stdio"` | `"http"`),
+//!   `endpoint` (legacy program name OR base URL),
+//!   `command` + `args` (stdio-only, PH-MCP-RUNTIME),
+//!   `declared_tools`, and `description`.
 //! - `tool.mcp.list_servers` returns the operator-declared
-//!   server list with `status = "configured"` (never
-//!   `"connected"`) until the live client lands.
-//! - `tool.mcp.list_tools|<server_id>` returns the
-//!   declared / cached tool list (empty when no manual cache
-//!   was provided; never fabricated).
-//! - `tool.mcp.invoke|<server_id>|<tool_name>|<args>` returns
-//!   `RuntimeNotConnected` until the live client wires in.
+//!   server list with `status = "configured"`. The dashboard
+//!   can grow a richer `connected` projection when live
+//!   health checks ship.
+//! - `tool.mcp.list_tools|<server_id>` runs a live `tools/list`
+//!   when transport=stdio; on transport failure falls back to
+//!   the operator-declared list (never fabricated). Non-stdio
+//!   transports return the declared list.
+//! - `tool.mcp.invoke|<server_id>|<tool_name>|<args>` runs the
+//!   live stdio dispatch when transport=stdio. Spawn / I/O
+//!   failures surface as `RuntimeNotConnected` with the cause
+//!   prefixed `mcp:`. Malformed responses surface as
+//!   `RESPONDER_INTERNAL` with `mcp: bad response: ...`. HTTP
+//!   transport still returns `RuntimeNotConnected`.
 //!
 //! Operators reading the chronicle / audit will never see a
 //! fake MCP tool invocation. Per-D-002 the trust-tier
 //! decision is still operator-facing and won't be silently
 //! resolved.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use relix_core::capability::{
     CapabilityDescriptor, CapabilityKind, CostClass, Idempotency, RiskLevel,
 };
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
+use super::mcp_stdio::{McpStdioClient, StdioError, encode_tools_call_result};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 // ─────────────────────────── PH-MCP-PROTO: JSON-RPC wire layer ─────────────
@@ -269,6 +281,18 @@ pub struct McpServerConfig {
     /// no shell — bare program name like the CW1 terminal
     /// allowlist). For `http`: the base URL.
     pub endpoint: String,
+    /// PH-MCP-RUNTIME: explicit `command` override for the stdio
+    /// transport. When set the live client uses this instead of
+    /// `endpoint`. Lets operators write `command = "npx"` with
+    /// `args = ["@modelcontextprotocol/server-filesystem", "/tmp"]`
+    /// while keeping `endpoint` as a stable id-like surface.
+    /// Ignored for `http` transport.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// PH-MCP-RUNTIME: argv after the program. Only consulted
+    /// when `transport = "stdio"`. Empty by default.
+    #[serde(default)]
+    pub args: Vec<String>,
     /// Optional list of tools this server exposes. When set,
     /// `tool.mcp.list_tools` returns this. When None, returns
     /// an empty list (NEVER fabricated). Operators can hand-
@@ -278,6 +302,23 @@ pub struct McpServerConfig {
     /// Short human description for dashboard / logs.
     #[serde(default)]
     pub description: Option<String>,
+}
+
+impl McpServerConfig {
+    /// Resolve the program to spawn for `stdio` transport. Returns
+    /// `command` when set, otherwise falls back to `endpoint` (the
+    /// pre-PH-MCP-RUNTIME shape, kept for backwards compat).
+    pub fn stdio_program(&self) -> Option<String> {
+        if let Some(c) = &self.command
+            && !c.is_empty()
+        {
+            return Some(c.clone());
+        }
+        if !self.endpoint.is_empty() {
+            return Some(self.endpoint.clone());
+        }
+        None
+    }
 }
 
 /// Per-node MCP config. `servers` is empty by default — the
@@ -319,40 +360,58 @@ pub fn validate_config(cfg: &McpConfig) -> Result<(), McpError> {
                 ),
             });
         }
-        if s.endpoint.is_empty() {
-            return Err(McpError::InvalidConfig {
-                reason: format!("server '{}': endpoint required", s.id),
-            });
-        }
-        if s.transport == "stdio" && (s.endpoint.contains('/') || s.endpoint.contains('\\')) {
-            return Err(McpError::InvalidConfig {
+        if s.transport == "stdio" {
+            // PH-MCP-RUNTIME: stdio needs *something* to spawn —
+            // either the legacy `endpoint = "<program>"` form or
+            // the explicit `command = "..."` field. Both are
+            // forbidden from carrying path separators (matches
+            // the CW1 terminal allowlist posture).
+            let program = s.stdio_program().ok_or_else(|| McpError::InvalidConfig {
                 reason: format!(
-                    "server '{}': stdio transport requires a bare program name (no path separators); got '{}'",
-                    s.id, s.endpoint
+                    "server '{}': stdio transport requires either `endpoint` or `command`",
+                    s.id
                 ),
-            });
-        }
-        if s.transport == "http"
-            && !(s.endpoint.starts_with("http://") || s.endpoint.starts_with("https://"))
-        {
-            return Err(McpError::InvalidConfig {
-                reason: format!(
-                    "server '{}': http transport requires http(s):// URL; got '{}'",
-                    s.id, s.endpoint
-                ),
-            });
+            })?;
+            if program.contains('/') || program.contains('\\') {
+                return Err(McpError::InvalidConfig {
+                    reason: format!(
+                        "server '{}': stdio transport requires a bare program name (no path separators); got '{}'",
+                        s.id, program
+                    ),
+                });
+            }
+        } else if s.transport == "http" {
+            if s.endpoint.is_empty() {
+                return Err(McpError::InvalidConfig {
+                    reason: format!("server '{}': endpoint required for http transport", s.id),
+                });
+            }
+            if !(s.endpoint.starts_with("http://") || s.endpoint.starts_with("https://")) {
+                return Err(McpError::InvalidConfig {
+                    reason: format!(
+                        "server '{}': http transport requires http(s):// URL; got '{}'",
+                        s.id, s.endpoint
+                    ),
+                });
+            }
         }
     }
     Ok(())
 }
 
 /// MCP registry. Built once at controller startup, shared
-/// across handlers. The registry today is read-only over the
-/// config (no live connection state); when the live client
-/// lands it'll grow connection-status, last-discovered-at,
-/// reconnect counters, etc.
+/// across handlers. PH-MCP-RUNTIME: the registry now owns
+/// per-stdio-server live clients (lazy-spawned). HTTP transport
+/// is still RuntimeNotConnected until a separate HTTP client
+/// ships. The `clients` map is keyed by `server_id` and only
+/// populated for entries whose `transport = "stdio"`.
 pub struct McpRegistry {
     servers: Vec<McpServerConfig>,
+    /// Lazy-init pool of stdio clients. One entry per stdio
+    /// server. Wrapped in a Mutex because clients are added to
+    /// the map on first call_tool / list_tools (the clients
+    /// themselves serialise their own I/O internally).
+    stdio_clients: Mutex<HashMap<String, Arc<McpStdioClient>>>,
 }
 
 impl McpRegistry {
@@ -360,6 +419,7 @@ impl McpRegistry {
         validate_config(&cfg)?;
         Ok(Self {
             servers: cfg.servers,
+            stdio_clients: Mutex::new(HashMap::new()),
         })
     }
 
@@ -375,50 +435,126 @@ impl McpRegistry {
                 transport: s.transport.clone(),
                 endpoint: s.endpoint.clone(),
                 declared_tool_count: s.declared_tools.len(),
-                // Honest: "configured" not "connected" — the
-                // live client hasn't connected. When the live
-                // path lands this projection grows additional
-                // status values.
+                // Honest: stdio servers are "configured" until
+                // first call. HTTP servers stay "configured"
+                // until the HTTP client ships. The dashboard
+                // can grow a richer "connected" projection
+                // when it has a reason to.
                 status: "configured".to_string(),
                 description: s.description.clone(),
             })
             .collect()
     }
 
-    pub fn list_tools(&self, server_id: &str) -> Result<Vec<String>, McpError> {
-        let s = self
-            .servers
+    /// Look up the operator-declared config row by id. Internal
+    /// helper used by the async handlers.
+    fn find_server(&self, server_id: &str) -> Result<&McpServerConfig, McpError> {
+        self.servers
             .iter()
             .find(|s| s.id == server_id)
             .ok_or_else(|| McpError::ServerNotFound {
                 id: server_id.to_string(),
-            })?;
-        Ok(s.declared_tools.clone())
+            })
     }
 
-    pub fn invoke(
+    /// Get-or-spawn the stdio client for `server_id`. Returns
+    /// `None` when the server is not configured as stdio.
+    async fn stdio_client_for(
         &self,
         server_id: &str,
-        _tool_name: &str,
-        _args: &str,
-    ) -> Result<String, McpError> {
-        // Honesty contract: even if the operator pre-declared
-        // the tool, the live execution path hasn't been wired
-        // yet. ServerNotFound first (catches operator typos),
-        // then RuntimeNotConnected.
-        let _ = self
-            .servers
-            .iter()
-            .find(|s| s.id == server_id)
-            .ok_or_else(|| McpError::ServerNotFound {
-                id: server_id.to_string(),
-            })?;
-        Err(McpError::RuntimeNotConnected {
-            reason: "MCP client runtime is not yet implemented in this Relix build. \
-                     The registry + discovery model ships in CW5; live invocation \
-                     lands in a follow-up milestone. See docs/mcp-tool.md."
-                .to_string(),
-        })
+    ) -> Result<Option<Arc<McpStdioClient>>, McpError> {
+        let s = self.find_server(server_id)?;
+        if s.transport != "stdio" {
+            return Ok(None);
+        }
+        let program = s.stdio_program().ok_or_else(|| McpError::InvalidConfig {
+            reason: format!(
+                "server '{}': stdio transport requires `command` or `endpoint`",
+                s.id
+            ),
+        })?;
+        let mut guard = self.stdio_clients.lock().await;
+        if let Some(c) = guard.get(server_id) {
+            return Ok(Some(c.clone()));
+        }
+        let client = Arc::new(McpStdioClient::new(s.id.clone(), program, s.args.clone()));
+        guard.insert(server_id.to_string(), client.clone());
+        Ok(Some(client))
+    }
+
+    /// Async list_tools. For stdio servers, attempts a live
+    /// `tools/list`; on transport / decode failure falls back
+    /// to the operator-declared list (per the spec in the
+    /// PH-MCP-RUNTIME directive). For http or non-stdio servers
+    /// returns the declared list.
+    pub async fn list_tools(&self, server_id: &str) -> Result<Vec<String>, McpError> {
+        let declared = self.find_server(server_id)?.declared_tools.clone();
+        if let Some(client) = self.stdio_client_for(server_id).await? {
+            match client.list_tools().await {
+                Ok(res) => return Ok(res.tools.into_iter().map(|t| t.name).collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        server = %server_id,
+                        error = %e,
+                        "tool.mcp.list_tools live call failed; falling back to declared_tools"
+                    );
+                }
+            }
+        }
+        Ok(declared)
+    }
+
+    /// Async invoke. For stdio servers, runs the live
+    /// `tools/call` dispatch and returns the encoded
+    /// `tools/call` result JSON. For non-stdio transports,
+    /// returns RuntimeNotConnected (HTTP runtime is a separate
+    /// milestone).
+    pub async fn invoke(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        args: &str,
+    ) -> Result<Vec<u8>, McpError> {
+        // Parse arguments — empty string maps to `{}`. The args
+        // form is opaque JSON; the server schema-checks it.
+        let args_value: serde_json::Value = if args.trim().is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(args).map_err(|e| McpError::InvalidConfig {
+                reason: format!("tool.mcp.invoke: args must be JSON: {e}"),
+            })?
+        };
+
+        let client = self.stdio_client_for(server_id).await?.ok_or_else(|| {
+            McpError::RuntimeNotConnected {
+                reason: format!(
+                    "mcp: server '{server_id}' is not stdio transport; \
+                     live invocation only supports stdio in this Relix build"
+                ),
+            }
+        })?;
+
+        match client.call_tool(tool_name, args_value).await {
+            Ok(res) => Ok(encode_tools_call_result(&res)),
+            Err(e) => Err(map_stdio_err(&e)),
+        }
+    }
+}
+
+/// Translate a [`StdioError`] from the live client into the
+/// operator-facing [`McpError`] vocabulary. Spawn / EOF /
+/// ServerError → RuntimeNotConnected (the runtime *was* meant to
+/// be connected; honesty: surface the underlying cause).
+/// BadResponse / SerializeRequest → RuntimeNotConnected with
+/// a `mcp: bad response` prefix per the directive.
+fn map_stdio_err(e: &StdioError) -> McpError {
+    match e {
+        StdioError::BadResponse(_) | StdioError::LineTooLong { .. } => McpError::BadResponse {
+            reason: format!("mcp: bad response: {e}"),
+        },
+        _ => McpError::RuntimeNotConnected {
+            reason: format!("mcp: {e}"),
+        },
     }
 }
 
@@ -440,6 +576,12 @@ pub enum McpError {
     ServerNotFound { id: String },
     #[error("invalid config: {reason}")]
     InvalidConfig { reason: String },
+    /// PH-MCP-RUNTIME: server responded but the payload was
+    /// malformed or violated the protocol. Surfaced as
+    /// `RESPONDER_INTERNAL` on the wire (distinct from
+    /// `RuntimeNotConnected`, which covers I/O / spawn failures).
+    #[error("bad response: {reason}")]
+    BadResponse { reason: String },
 }
 
 // ─────────────────────────── Capability descriptors ───────────────────────
@@ -469,8 +611,10 @@ pub fn descriptor_list_tools() -> CapabilityDescriptor {
     d.policy_attachment_point = "tool.mcp.list_tools".to_string();
     d.requires_groups = vec!["operators".into()];
     d.description = Some(
-        "List the tool names a given MCP server exposes. Today reads the \
-         operator's `declared_tools` config field; live discovery lands later."
+        "List the tool names a given MCP server exposes. For stdio \
+         transports runs a live `tools/list` against the spawned \
+         subprocess; falls back to the operator-declared list on \
+         transport failure or for non-stdio transports."
             .into(),
     );
     d.categories = vec!["mcp".into(), "registry".into()];
@@ -491,10 +635,11 @@ pub fn descriptor_invoke() -> CapabilityDescriptor {
     d.policy_attachment_point = "tool.mcp.invoke".to_string();
     d.requires_groups = vec!["operators".into()];
     d.description = Some(
-        "Invoke a tool on a registered MCP server. Honesty: returns \
-         RuntimeNotConnected today; a follow-up milestone wires the \
-         live MCP client. Per D-002 the trust-tier decision is still \
-         operator-facing."
+        "Invoke a tool on a registered MCP server. For stdio \
+         transports the controller spawns the operator-declared \
+         subprocess (lazy on first call) and dispatches the call; \
+         HTTP transports still return RuntimeNotConnected. Per D-002 \
+         the trust-tier decision is still operator-facing."
             .into(),
     );
     d.categories = vec!["mcp".into(), "execute".into()];
@@ -517,7 +662,7 @@ pub fn register(bridge: &mut DispatchBridge, registry: Arc<McpRegistry>) {
         "tool.mcp.list_tools",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let r = r.clone();
-            async move { handle_list_tools(&r, &ctx) }
+            async move { handle_list_tools(&r, &ctx).await }
         })),
     );
     let r = registry;
@@ -525,7 +670,7 @@ pub fn register(bridge: &mut DispatchBridge, registry: Arc<McpRegistry>) {
         "tool.mcp.invoke",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let r = r.clone();
-            async move { handle_invoke(&r, &ctx) }
+            async move { handle_invoke(&r, &ctx).await }
         })),
     );
 }
@@ -547,15 +692,15 @@ fn handle_list_servers(reg: &Arc<McpRegistry>, _ctx: &InvocationCtx) -> HandlerO
     HandlerOutcome::Ok(body.into_bytes())
 }
 
-fn handle_list_tools(reg: &Arc<McpRegistry>, ctx: &InvocationCtx) -> HandlerOutcome {
+async fn handle_list_tools(reg: &Arc<McpRegistry>, ctx: &InvocationCtx) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
-        Ok(s) => s.trim(),
+        Ok(s) => s.trim().to_string(),
         Err(e) => return invalid(format!("tool.mcp.list_tools utf8: {e}")),
     };
     if s.is_empty() {
         return invalid("tool.mcp.list_tools: server_id required".into());
     }
-    match reg.list_tools(s) {
+    match reg.list_tools(&s).await {
         Ok(tools) => {
             use std::fmt::Write as _;
             let mut body = String::new();
@@ -569,9 +714,9 @@ fn handle_list_tools(reg: &Arc<McpRegistry>, ctx: &InvocationCtx) -> HandlerOutc
     }
 }
 
-fn handle_invoke(reg: &Arc<McpRegistry>, ctx: &InvocationCtx) -> HandlerOutcome {
+async fn handle_invoke(reg: &Arc<McpRegistry>, ctx: &InvocationCtx) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
-        Ok(s) => s,
+        Ok(s) => s.to_string(),
         Err(e) => return invalid(format!("tool.mcp.invoke utf8: {e}")),
     };
     let parts: Vec<&str> = s.splitn(3, '|').collect();
@@ -581,14 +726,14 @@ fn handle_invoke(reg: &Arc<McpRegistry>, ctx: &InvocationCtx) -> HandlerOutcome 
                 .into(),
         );
     }
-    let server_id = parts[0].trim();
-    let tool_name = parts[1].trim();
-    let args = parts[2];
+    let server_id = parts[0].trim().to_string();
+    let tool_name = parts[1].trim().to_string();
+    let args = parts[2].to_string();
     if server_id.is_empty() || tool_name.is_empty() {
         return invalid("tool.mcp.invoke: server_id + tool_name required".into());
     }
-    match reg.invoke(server_id, tool_name, args) {
-        Ok(body) => HandlerOutcome::Ok(body.into_bytes()),
+    match reg.invoke(&server_id, &tool_name, &args).await {
+        Ok(body) => HandlerOutcome::Ok(body),
         Err(e) => to_envelope(&e),
     }
 }
@@ -598,6 +743,7 @@ fn to_envelope(e: &McpError) -> HandlerOutcome {
         McpError::RuntimeNotConnected { .. } => error_kinds::RESPONDER_INTERNAL,
         McpError::ServerNotFound { .. } => error_kinds::INVALID_ARGS,
         McpError::InvalidConfig { .. } => error_kinds::INVALID_ARGS,
+        McpError::BadResponse { .. } => error_kinds::RESPONDER_INTERNAL,
     };
     HandlerOutcome::Err(ErrorEnvelope {
         kind,
@@ -631,6 +777,8 @@ mod tests {
             id: id.into(),
             transport: transport.into(),
             endpoint: endpoint.into(),
+            command: None,
+            args: vec![],
             declared_tools: vec![],
             description: None,
         }
@@ -698,34 +846,121 @@ mod tests {
         }
     }
 
-    #[test]
-    fn registry_list_tools_returns_declared() {
-        let mut s = srv("a", "stdio", "mcp-srv");
+    #[tokio::test]
+    async fn registry_list_tools_returns_declared_when_live_call_fails() {
+        let mut s = srv("a", "stdio", "relix-mcp-test-no-such-binary-xyzzy");
         s.declared_tools = vec!["search".into(), "fetch".into()];
         let reg = McpRegistry::new(make_cfg(vec![s])).unwrap();
-        let tools = reg.list_tools("a").unwrap();
+        // Live spawn fails (binary doesn't exist); per the
+        // PH-MCP-RUNTIME contract list_tools falls back to the
+        // operator-declared list.
+        let tools = reg.list_tools("a").await.unwrap();
         assert_eq!(tools, vec!["search".to_string(), "fetch".to_string()]);
     }
 
-    #[test]
-    fn registry_list_tools_unknown_server_errors() {
+    #[tokio::test]
+    async fn registry_list_tools_http_returns_declared() {
+        let mut s = srv("a", "http", "https://example.com");
+        s.declared_tools = vec!["only-declared".into()];
+        let reg = McpRegistry::new(make_cfg(vec![s])).unwrap();
+        let tools = reg.list_tools("a").await.unwrap();
+        assert_eq!(tools, vec!["only-declared".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn registry_list_tools_unknown_server_errors() {
         let reg = McpRegistry::new(make_cfg(vec![])).unwrap();
-        let err = reg.list_tools("nope").unwrap_err();
+        let err = reg.list_tools("nope").await.unwrap_err();
         assert!(matches!(err, McpError::ServerNotFound { .. }));
     }
 
-    #[test]
-    fn registry_invoke_returns_runtime_not_connected() {
-        let reg = McpRegistry::new(make_cfg(vec![srv("a", "stdio", "mcp-srv")])).unwrap();
-        let err = reg.invoke("a", "search", "{}").unwrap_err();
+    #[tokio::test]
+    async fn registry_invoke_stdio_spawn_failure_maps_to_runtime_not_connected() {
+        let reg = McpRegistry::new(make_cfg(vec![srv(
+            "a",
+            "stdio",
+            "relix-mcp-test-no-such-binary-xyzzy",
+        )]))
+        .unwrap();
+        let err = reg.invoke("a", "search", "{}").await.unwrap_err();
+        match err {
+            McpError::RuntimeNotConnected { reason } => {
+                assert!(reason.starts_with("mcp:"), "reason was: {reason}");
+            }
+            other => panic!("expected RuntimeNotConnected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_invoke_http_returns_runtime_not_connected() {
+        let reg =
+            McpRegistry::new(make_cfg(vec![srv("a", "http", "https://example.com")])).unwrap();
+        let err = reg.invoke("a", "search", "{}").await.unwrap_err();
         assert!(matches!(err, McpError::RuntimeNotConnected { .. }));
     }
 
-    #[test]
-    fn registry_invoke_unknown_server_first_errors_server_not_found() {
+    #[tokio::test]
+    async fn registry_invoke_unknown_server_first_errors_server_not_found() {
         let reg = McpRegistry::new(make_cfg(vec![])).unwrap();
-        let err = reg.invoke("missing", "x", "").unwrap_err();
+        let err = reg.invoke("missing", "x", "").await.unwrap_err();
         assert!(matches!(err, McpError::ServerNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn registry_invoke_rejects_non_json_args() {
+        let reg = McpRegistry::new(make_cfg(vec![srv("a", "stdio", "echo")])).unwrap();
+        let err = reg.invoke("a", "x", "not-json").await.unwrap_err();
+        match err {
+            McpError::InvalidConfig { reason } => assert!(reason.contains("JSON")),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_config_parses_command_and_args() {
+        let toml_src = r#"
+            id = "fs"
+            transport = "stdio"
+            endpoint = "fs"
+            command = "npx"
+            args = ["@modelcontextprotocol/server-filesystem", "/tmp"]
+        "#;
+        let s: McpServerConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(s.id, "fs");
+        assert_eq!(s.command.as_deref(), Some("npx"));
+        assert_eq!(
+            s.args,
+            vec![
+                "@modelcontextprotocol/server-filesystem".to_string(),
+                "/tmp".to_string(),
+            ]
+        );
+        assert_eq!(s.stdio_program().as_deref(), Some("npx"));
+    }
+
+    #[test]
+    fn server_config_stdio_program_falls_back_to_endpoint() {
+        let s = srv("a", "stdio", "mcp-srv");
+        assert_eq!(s.stdio_program().as_deref(), Some("mcp-srv"));
+    }
+
+    #[test]
+    fn validate_accepts_stdio_with_command_only() {
+        let mut s = McpServerConfig {
+            id: "fs".into(),
+            transport: "stdio".into(),
+            endpoint: "".into(),
+            command: Some("npx".into()),
+            args: vec!["@modelcontextprotocol/server-filesystem".into()],
+            declared_tools: vec![],
+            description: None,
+        };
+        // Empty endpoint is fine when command is set.
+        validate_config(&make_cfg(vec![s.clone()])).unwrap();
+        // Path separators rejected on either field.
+        s.command = Some("/usr/bin/npx".into());
+        let err = validate_config(&make_cfg(vec![s])).unwrap_err();
+        assert!(matches!(err, McpError::InvalidConfig { .. }));
     }
 
     #[test]

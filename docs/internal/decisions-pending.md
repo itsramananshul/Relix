@@ -342,7 +342,15 @@ specific server without operator-confirmed need risks the same
 avoid. The protocol layer alone is testable and gives the next
 session a head start the moment a target is named.
 
-**Status.** open — runtime continues with PH-MCP-PROTO only.
+**Status.** **shipped** as of PH-MCP-RUNTIME. The runtime now
+spawns operator-declared `stdio` MCP servers lazily on first
+`tool.mcp.invoke`, runs the `initialize` handshake, and
+dispatches `tools/call` + `tools/list` against the live process.
+The operator picks the server in their TOML (`command`,
+`args`); Relix doesn't bind to any specific reference server.
+Integration test gates against `@modelcontextprotocol/server-everything`
+(skipped when node/npx are absent — CI without node still
+passes). HTTP transport remains `RuntimeNotConnected`.
 
 ### D-010  Full PTY backend for `tool.terminal.shell.*` — adopt `portable-pty`?
 
