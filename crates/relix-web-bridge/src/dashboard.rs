@@ -673,6 +673,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_keyboard_shortcuts_present() {
+        // M79 (Track 6): keyboard navigation. j/k between
+        // task rows, / focuses search, ? opens the help
+        // overlay, 1..6 switch routes. Help overlay
+        // documents the bindings inline so operators
+        // discover them.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"kbd-help\"",
+            "id=\"kbd-help-close\"",
+            "id=\"kbd-help-open\"",
+            "function kbdMoveCursor",
+            "function toggleKbdHelp",
+            "isTextInputFocused",
+            "KBD_ROUTE_MAP",
+            "kbd-cursor",
+        ] {
+            assert!(body.contains(needle), "M79 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_firehose_sse_upgrade_landmarks_present() {
         // M73 (Track D): the firehose pane upgrades to SSE
         // when EventSource is available, surfaces drop frames
