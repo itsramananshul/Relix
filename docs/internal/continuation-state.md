@@ -9,17 +9,18 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `eb9c0d5 test(capability): PH-RISK-PIN-ALL pin risk tiers across every tool descriptor`
+- **HEAD:** `685aa1e feat(bridge): PH-BRIDGE-MCP-AUDIT bounded audit ring for /v1/mcp/invoke`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1102 passing, 0 failures
-  - relix-core: 66
+- **Workspace tests:** 1111 passing, 0 failures (delta this milestone: +9
+  — 8 in `mcp_audit::tests` + 1 `drop_kind` adapter test).
+  - relix-core: 91
   - relix-policy: 72
   - relix-runtime: 673
   - relix-runtime router_node integration: 6
-  - relix-telegram: 23
-  - relix-cli: 31 (lib) + 2 (bin)
-  - relix-web-bridge: 232
+  - relix-telegram: ≈23
+  - relix-cli: ≈33
+  - relix-web-bridge: 241 (was 232; +9 this milestone)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -57,6 +58,7 @@ as the resume command.
 | aa37f66 | PH-WEB-POST | tool.web.post — POST + body + raw cookie header + Set-Cookie response capture |
 | 8304d21 | PH-WEB-POST-RISK-CROSS | regression guards: web POST descriptors are Medium-tier + --risk medium+ surfaces tool.web.post |
 | eb9c0d5 | PH-RISK-PIN-ALL | pin risk tier of every shipped tool descriptor (9 modules, 9 tests, all non-Unknown + tier-exact) |
+| 685aa1e | PH-BRIDGE-MCP-AUDIT | bridge-side bounded ring for `POST /v1/mcp/invoke`; `GET /v1/mcp/audit`; dashboard card; classified `error_kind`; args content never recorded |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
