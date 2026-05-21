@@ -1343,29 +1343,50 @@ impl TaskStore {
             )));
         }
         let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        // M70: bump the pause generation as part of the same
+        // transaction. The new value is what the chronicle
+        // event carries and what cooperative pollers read.
         tx.execute(
             "UPDATE tasks
                SET status = 'paused',
-                   updated_at = ?2
+                   updated_at = ?2,
+                   pause_generation = pause_generation + 1
              WHERE task_id = ?1",
             params![task_id, now],
         )
         .map_err(CoordinatorError::Db)?;
+        let new_pause_generation: i64 = tx
+            .query_row(
+                "SELECT pause_generation FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
         let payload_json = serde_json::json!({
             "prior_status": prior_status,
             "reason": trimmed_reason,
             "author": author_subject_id,
+            // M70: intent vs ack. This is the REQUEST event;
+            // the matching `task.pause_observed` (M70) lands
+            // later when a cooperative worker calls
+            // `task.observe_interruption`.
+            "pause_generation": new_pause_generation,
+            "intent": "request",
         })
         .to_string();
         let legacy = match trimmed_reason {
-            Some(r) => format!("from {prior_status} · {r}"),
-            None => format!("from {prior_status}"),
+            Some(r) => format!("from {prior_status} · gen={new_pause_generation} · {r}"),
+            None => format!("from {prior_status} · gen={new_pause_generation}"),
         };
         insert_typed_event(
             &tx,
             task_id,
             now,
-            "task.paused",
+            // M70: renamed from `task.paused` to make the
+            // intent-vs-ack split explicit. The runtime
+            // emits `task.pause_observed` when a cooperative
+            // worker attests via `task.observe_interruption`.
+            "task.pause_requested",
             &legacy,
             None,
             None,
@@ -1406,15 +1427,18 @@ impl TaskStore {
                 "task.resume: status '{prior_status}' is not resumable (only 'paused' is)"
             )));
         }
-        // Find the last task.paused event to recover the
-        // pre-pause status. Best-effort: when missing, the
-        // resumed event still lands with prior_status=paused
-        // so the timeline is honest.
+        // Find the most recent pause-request event to recover
+        // the pre-pause status. Best-effort: when missing,
+        // the resumed event still lands with
+        // prior_status=paused so the timeline is honest.
+        // Accept both the new (M70) `task.pause_requested`
+        // event_type AND the pre-M70 `task.paused` for
+        // chronicle continuity.
         let pre_pause_status: String = conn
             .query_row(
                 "SELECT payload_json FROM task_events
                   WHERE task_id = ?1
-                    AND event_type = 'task.paused'
+                    AND event_type IN ('task.pause_requested', 'task.paused')
                   ORDER BY event_id DESC LIMIT 1",
                 params![task_id],
                 |r| r.get::<_, Option<String>>(0),
@@ -1433,26 +1457,43 @@ impl TaskStore {
             })
             .unwrap_or_else(|| "paused".to_string());
         let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        // M70: resume also bumps pause_generation so a
+        // cooperative worker that cached the paused
+        // generation knows to re-check before proceeding.
         tx.execute(
             "UPDATE tasks
                SET status = 'pending',
-                   updated_at = ?2
+                   updated_at = ?2,
+                   pause_generation = pause_generation + 1
              WHERE task_id = ?1",
             params![task_id, now],
         )
         .map_err(CoordinatorError::Db)?;
+        let new_pause_generation: i64 = tx
+            .query_row(
+                "SELECT pause_generation FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
         let payload_json = serde_json::json!({
             "pre_pause_status": pre_pause_status,
             "new_status": "pending",
             "author": author_subject_id,
+            "pause_generation": new_pause_generation,
+            "intent": "request",
         })
         .to_string();
-        let legacy = format!("paused→pending (was {pre_pause_status})");
+        let legacy =
+            format!("paused→pending (was {pre_pause_status}) · gen={new_pause_generation}");
         insert_typed_event(
             &tx,
             task_id,
             now,
-            "task.resumed",
+            // M70: renamed for intent-vs-ack clarity. The
+            // `task.resume_observed` event lands later via
+            // cooperative `task.observe_interruption`.
+            "task.resume_requested",
             &legacy,
             None,
             None,
@@ -1460,6 +1501,118 @@ impl TaskStore {
         )?;
         tx.commit().map_err(CoordinatorError::Db)?;
         Ok(pre_pause_status)
+    }
+
+    /// Cooperative-poller snapshot of interruption state
+    /// (M70). Returns the current pause/freeze generations
+    /// plus the live status — enough for a runtime worker
+    /// to detect "is there a newer pause request I haven't
+    /// observed yet?"
+    ///
+    /// Independent of any wall-clock; the bridge handler
+    /// surfaces the snapshot back to the caller verbatim.
+    /// NotFound when the task id is unknown.
+    pub fn interruption_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<InterruptionSnapshot, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        conn.query_row(
+            "SELECT status, pause_generation, freeze_generation
+             FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| {
+                Ok(InterruptionSnapshot {
+                    task_id: task_id.to_string(),
+                    status: r.get(0)?,
+                    pause_generation: r.get(1)?,
+                    freeze_generation: r.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(CoordinatorError::Db)?
+        .ok_or(CoordinatorError::NotFound(task_id.to_string()))
+    }
+
+    /// Runtime ack that a cooperative worker noticed an
+    /// interruption request (M70). Emits the matching
+    /// `task.pause_observed` / `task.resume_observed` /
+    /// `task.freeze_propagated` chronicle event with the
+    /// observer subject_id + the generation they noticed.
+    ///
+    /// Distinguishes operator INTENT (the original request
+    /// event) from runtime ACK (this event). Operators
+    /// inspecting the chronicle see exactly when the
+    /// runtime caught up — and when it didn't (a request
+    /// with no matching ack means the runtime never noticed
+    /// or wasn't running).
+    ///
+    /// `interruption_type` must be one of `pause` / `resume`
+    /// / `freeze`. `generation_observed` is the value the
+    /// worker saw when it observed — recorded for cross-
+    /// reference even if the live generation has since
+    /// advanced.
+    pub fn observe_interruption(
+        &self,
+        task_id: &str,
+        interruption_type: &str,
+        generation_observed: i64,
+        observer_subject_id: &str,
+    ) -> Result<i64, CoordinatorError> {
+        let event_type = match interruption_type {
+            "pause" => "task.pause_observed",
+            "resume" => "task.resume_observed",
+            "freeze" => "task.freeze_propagated",
+            other => {
+                return Err(CoordinatorError::Invalid(format!(
+                    "task.observe_interruption: unknown interruption_type \
+                     '{other}' (expected pause|resume|freeze)"
+                )));
+            }
+        };
+        if generation_observed < 0 {
+            return Err(CoordinatorError::Invalid(
+                "task.observe_interruption: generation_observed must be non-negative".to_string(),
+            ));
+        }
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        if exists == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        let payload_json = serde_json::json!({
+            "interruption_type": interruption_type,
+            "generation_observed": generation_observed,
+            "observer": observer_subject_id,
+            "observed_at": now,
+            "intent": "ack",
+        })
+        .to_string();
+        let legacy = format!(
+            "{interruption_type} observed at gen={generation_observed} by {observer_subject_id}"
+        );
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        insert_typed_event(
+            &tx,
+            task_id,
+            now,
+            event_type,
+            &legacy,
+            None,
+            None,
+            Some(&payload_json),
+        )?;
+        let event_id = tx.last_insert_rowid();
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(event_id)
     }
 
     /// Set or clear the operator-set investigation marker on
@@ -1654,7 +1807,8 @@ impl TaskStore {
                         max_runtime_secs, last_failure_reason,
                         last_failure_class, started_at,
                         attempt_count, current_attempt_id,
-                        investigation_marked_at, investigation_reason
+                        investigation_marked_at, investigation_reason,
+                        pause_generation, freeze_generation
                  FROM tasks WHERE task_id = ?1",
                 params![task_id],
                 |r| {
@@ -1683,6 +1837,8 @@ impl TaskStore {
                         current_attempt_id: r.get(20)?,
                         investigation_marked_at: r.get(21)?,
                         investigation_reason: r.get(22)?,
+                        pause_generation: r.get(23)?,
+                        freeze_generation: r.get(24)?,
                         events: Vec::new(),
                     })
                 },
@@ -2048,6 +2204,15 @@ pub struct TaskView {
     /// recent mark. Cleared to `None` when the marker is
     /// cleared.
     pub investigation_reason: Option<String>,
+    /// M70: monotonically-increasing counter bumped on every
+    /// pause/resume request. Cooperative workers (future)
+    /// poll `task.interruption_check`, cache this generation,
+    /// and re-read state whenever it advances.
+    pub pause_generation: i64,
+    /// M70/M71: same idea for freeze/unfreeze. Bumped only by
+    /// the freeze axis so a pause request doesn't invalidate a
+    /// worker's freeze cache and vice versa.
+    pub freeze_generation: i64,
     pub events: Vec<TaskEvent>,
 }
 
@@ -2213,6 +2378,20 @@ pub struct AttemptView {
     pub error_kind: Option<i64>,
     pub error_cause: Option<String>,
     pub failure_class: Option<String>,
+}
+
+/// Cooperative-poller snapshot returned by
+/// [`TaskStore::interruption_snapshot`] (M70). Carries the
+/// current live status + both generation counters; runtime
+/// workers compare against their cached values to detect a
+/// new pause/freeze request without re-loading the whole
+/// task row.
+#[derive(Debug, Clone)]
+pub struct InterruptionSnapshot {
+    pub task_id: String,
+    pub status: String,
+    pub pause_generation: i64,
+    pub freeze_generation: i64,
 }
 
 /// Aggregate output of [`TaskStore::task_lineage`] (M66).
@@ -2482,6 +2661,26 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_recent_events(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.interruption_check",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_interruption_check(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.observe_interruption",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_observe_interruption(&s, &ctx) }
             })),
         );
     }
@@ -2856,6 +3055,8 @@ fn render_task_export(e: &TaskExport) -> String {
     push_opt_int_field!("current_attempt_id", v.current_attempt_id);
     push_opt_int_field!("investigation_marked_at", v.investigation_marked_at);
     push_opt_str_field!("investigation_reason", v.investigation_reason);
+    push_int_field!("pause_generation", v.pause_generation);
+    push_int_field!("freeze_generation", v.freeze_generation);
     s.push_str(r#","events":["#);
     for (i, ev) in v.events.iter().enumerate() {
         if i > 0 {
@@ -3473,6 +3674,75 @@ fn handle_resume(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// `task.interruption_check` — cooperative-poller snapshot
+/// (M70). Args: `task_id`. Returns a multi-line k=v body:
+/// `status=...\npause_generation=N\nfreeze_generation=N\n`.
+/// Honest about scope: this is the read-side primitive for
+/// future cooperative runtime workers — the alpha runtime
+/// itself doesn't poll yet.
+fn handle_interruption_check(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let task_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.interruption_check utf8: {e}")),
+    };
+    if task_id.is_empty() {
+        return invalid("task.interruption_check: task_id required".to_string());
+    }
+    match store.interruption_snapshot(task_id) {
+        Ok(snap) => {
+            let body = format!(
+                "status={}\npause_generation={}\nfreeze_generation={}\n",
+                snap.status, snap.pause_generation, snap.freeze_generation,
+            );
+            HandlerOutcome::Ok(body.into_bytes())
+        }
+        Err(CoordinatorError::NotFound(id)) => {
+            invalid(format!("task.interruption_check: not found: {id}"))
+        }
+        Err(e) => internal(format!("task.interruption_check: {e}")),
+    }
+}
+
+/// `task.observe_interruption` — runtime ack that a
+/// cooperative worker noticed an interruption (M70). Args:
+/// `task_id|interruption_type|generation_observed`. Emits the
+/// matching `task.pause_observed` / `task.resume_observed` /
+/// `task.freeze_propagated` chronicle event. Returns the new
+/// event_id.
+fn handle_observe_interruption(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.observe_interruption utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let task_id = parts.first().copied().unwrap_or("").trim();
+    let interruption_type = parts.get(1).copied().unwrap_or("").trim();
+    let gen_str = parts.get(2).copied().unwrap_or("").trim();
+    if task_id.is_empty() || interruption_type.is_empty() || gen_str.is_empty() {
+        return invalid(
+            "task.observe_interruption: arg shape `task_id|interruption_type|generation`"
+                .to_string(),
+        );
+    }
+    let generation: i64 = match gen_str.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            return invalid(format!(
+                "task.observe_interruption: invalid generation '{gen_str}'"
+            ));
+        }
+    };
+    let observer = ctx.caller.subject_id.to_string();
+    match store.observe_interruption(task_id, interruption_type, generation, &observer) {
+        Ok(event_id) => HandlerOutcome::Ok(format!("event_id={event_id}\n").into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => {
+            invalid(format!("task.observe_interruption: not found: {id}"))
+        }
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.observe_interruption: {e}")),
+    }
+}
+
 /// `task.mark_investigation` — operator-set per-task
 /// investigation flag (M62). Args: `task_id|0|...` to clear,
 /// `task_id|1|<reason>` to mark. Reason is optional even on
@@ -3569,6 +3839,8 @@ fn render_task_view(v: &TaskView) -> String {
     if let Some(x) = v.investigation_reason.as_ref() {
         let _ = writeln!(s, "investigation_reason={}", x);
     }
+    let _ = writeln!(s, "pause_generation={}", v.pause_generation);
+    let _ = writeln!(s, "freeze_generation={}", v.freeze_generation);
     let _ = writeln!(s, "event_count={}", v.events.len());
     // Events as a simple JSON array. We hand-build the JSON to avoid
     // pulling serde_json into this hot path; payloads are escaped
@@ -3794,6 +4066,18 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         // mark time; surfaced in the dashboard banner so the
         // marker isn't just a flag in isolation.
         "ALTER TABLE tasks ADD COLUMN investigation_reason TEXT",
+        // M70: cooperative-interruption generation counters.
+        // Two distinct axes — pause / resume requests bump
+        // `pause_generation`; freeze / unfreeze (M71) bumps
+        // `freeze_generation`. Cooperative workers compare a
+        // cached value against the current row to decide
+        // whether they need to re-check interruption state
+        // before continuing work. HONEST: nothing in the
+        // runtime polls these today — they are scaffolding
+        // for future cooperative workers + the new
+        // `task.observe_interruption` attestation capability.
+        "ALTER TABLE tasks ADD COLUMN pause_generation INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN freeze_generation INTEGER NOT NULL DEFAULT 0",
     ];
     for sql in alters {
         // Best-effort. The only error we expect is "duplicate column
@@ -6056,18 +6340,26 @@ mod tests {
         assert_eq!(prior, "running");
         let v = s.get(&tid).unwrap().unwrap();
         assert_eq!(v.status, "paused");
-        // Chronicle event has the structured envelope.
+        // Chronicle event has the structured envelope. M70
+        // renamed `task.paused` → `task.pause_requested` to
+        // make the intent-vs-ack split explicit.
         let ev = s
             .list_events_after(&tid, 0, 100)
             .unwrap()
             .into_iter()
-            .find(|e| e.event_type == "task.paused")
-            .expect("task.paused event");
+            .find(|e| e.event_type == "task.pause_requested")
+            .expect("task.pause_requested event");
         let pj: serde_json::Value =
             serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
         assert_eq!(pj["prior_status"], "running");
         assert_eq!(pj["reason"], "debugging upstream");
         assert_eq!(pj["author"], "op");
+        assert_eq!(pj["intent"], "request");
+        // M70: pause_generation must be > 0 after the pause
+        // (the very first request bumps from 0 to 1).
+        assert!(pj["pause_generation"].as_i64().unwrap() >= 1);
+        // The task row's pause_generation matches.
+        assert_eq!(v.pause_generation, pj["pause_generation"].as_i64().unwrap());
     }
 
     #[test]
@@ -6111,12 +6403,17 @@ mod tests {
             .list_events_after(&tid, 0, 100)
             .unwrap()
             .into_iter()
-            .find(|e| e.event_type == "task.resumed")
-            .expect("task.resumed event");
+            .find(|e| e.event_type == "task.resume_requested")
+            .expect("task.resume_requested event");
         let pj: serde_json::Value =
             serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
         assert_eq!(pj["pre_pause_status"], "running");
         assert_eq!(pj["new_status"], "pending");
+        assert_eq!(pj["intent"], "request");
+        // M70: resume also bumps pause_generation so a
+        // cooperative worker that cached the paused
+        // generation knows to re-check before continuing.
+        assert!(pj["pause_generation"].as_i64().unwrap() >= 2);
     }
 
     #[test]
@@ -6125,6 +6422,109 @@ mod tests {
         let tid = mk(&s, "t", "f", "{}", "o");
         let err = s.set_resumed(&tid, "op").unwrap_err();
         assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn interruption_snapshot_starts_at_zero_then_advances_on_pause() {
+        // M70: every fresh task has both generation counters
+        // at 0. The first pause request bumps pause_gen to
+        // 1; resume bumps to 2. freeze_gen is untouched by
+        // pause/resume.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let snap0 = s.interruption_snapshot(&tid).unwrap();
+        assert_eq!(snap0.pause_generation, 0);
+        assert_eq!(snap0.freeze_generation, 0);
+        assert_eq!(snap0.status, "pending");
+
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_paused(&tid, None, "op").unwrap();
+        let snap1 = s.interruption_snapshot(&tid).unwrap();
+        assert_eq!(snap1.pause_generation, 1);
+        assert_eq!(snap1.freeze_generation, 0);
+        assert_eq!(snap1.status, "paused");
+
+        s.set_resumed(&tid, "op").unwrap();
+        let snap2 = s.interruption_snapshot(&tid).unwrap();
+        assert_eq!(snap2.pause_generation, 2);
+        assert_eq!(snap2.freeze_generation, 0);
+        assert_eq!(snap2.status, "pending");
+    }
+
+    #[test]
+    fn observe_interruption_emits_ack_event_with_generation() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_paused(&tid, None, "op").unwrap();
+        // A cooperative worker observes the pause at gen=1.
+        let event_id = s
+            .observe_interruption(&tid, "pause", 1, "worker-a")
+            .unwrap();
+        assert!(event_id > 0);
+        let ev = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "task.pause_observed")
+            .expect("task.pause_observed event");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["interruption_type"], "pause");
+        assert_eq!(pj["generation_observed"], 1);
+        assert_eq!(pj["observer"], "worker-a");
+        assert_eq!(pj["intent"], "ack");
+    }
+
+    #[test]
+    fn observe_interruption_resume_emits_resume_observed_event_type() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.observe_interruption(&tid, "resume", 5, "worker-b")
+            .unwrap();
+        let exists = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.event_type == "task.resume_observed");
+        assert!(exists, "resume observation must use task.resume_observed");
+    }
+
+    #[test]
+    fn observe_interruption_freeze_emits_freeze_propagated_event_type() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.observe_interruption(&tid, "freeze", 3, "worker-c")
+            .unwrap();
+        let exists = s
+            .list_events_after(&tid, 0, 100)
+            .unwrap()
+            .into_iter()
+            .any(|e| e.event_type == "task.freeze_propagated");
+        assert!(exists, "freeze observation must use task.freeze_propagated");
+    }
+
+    #[test]
+    fn observe_interruption_rejects_unknown_type_and_negative_generation() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let err = s
+            .observe_interruption(&tid, "halt", 1, "worker-x")
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+        let err2 = s
+            .observe_interruption(&tid, "pause", -1, "worker-x")
+            .unwrap_err();
+        assert!(matches!(err2, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn interruption_snapshot_not_found_returns_error() {
+        let s = store();
+        let err = s.interruption_snapshot("deadbeef").unwrap_err();
+        assert!(matches!(err, CoordinatorError::NotFound(id) if id == "deadbeef"));
     }
 
     #[test]

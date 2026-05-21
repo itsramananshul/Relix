@@ -512,6 +512,33 @@ fn register_node_type_handlers(
                 &["task", "read", "events", "operator"],
             ),
             (
+                "task.interruption_check",
+                "Cooperative-poller snapshot of interruption \
+                 state. Args: `task_id`. Returns the current \
+                 status + pause_generation + freeze_generation. \
+                 Runtime workers compare the returned \
+                 generations against their cached value to \
+                 detect a new operator pause/freeze request. \
+                 HONEST: the alpha runtime does not yet poll \
+                 this — it is the read side of the cooperative \
+                 interruption protocol introduced in M70.",
+                &["task", "read", "interrupt", "runtime"],
+            ),
+            (
+                "task.observe_interruption",
+                "Runtime ack that a cooperative worker noticed \
+                 an interruption. Args: \
+                 `task_id|pause|resume|freeze|generation`. \
+                 Emits the matching `task.pause_observed` / \
+                 `task.resume_observed` / `task.freeze_propagated` \
+                 chronicle event with the observer subject_id + \
+                 the generation observed. Distinguishes operator \
+                 INTENT (the original request event) from \
+                 runtime ACK — a request with no matching \
+                 observation means the runtime never noticed.",
+                &["task", "write", "interrupt", "runtime"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -547,7 +574,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption"
         );
     }
     if cfg.controller.node_type == "tool" {
