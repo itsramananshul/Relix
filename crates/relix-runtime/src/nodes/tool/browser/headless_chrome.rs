@@ -73,6 +73,10 @@ pub struct HeadlessChromeBackend {
     /// (e.g. after a launch failure).
     browser: Mutex<Option<Browser>>,
     sessions: Mutex<HashMap<String, Session>>,
+    /// W2-002c: where to drop a screenshot when navigate / click /
+    /// type_text fails on a live tab. `None` → feature disabled
+    /// (no capture attempted; no error-reason mutation).
+    screenshot_on_failure_dir: Option<std::path::PathBuf>,
 }
 
 impl HeadlessChromeBackend {
@@ -85,6 +89,57 @@ impl HeadlessChromeBackend {
             call_timeout: Duration::from_secs(cfg.call_timeout_secs),
             browser: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            screenshot_on_failure_dir: cfg.screenshot_on_failure_dir.clone(),
+        }
+    }
+
+    /// W2-002c: capture a PNG screenshot of `tab` and persist it
+    /// under `screenshot_on_failure_dir` (when set). Returns the
+    /// path on success, `None` on disabled-or-failed. Never
+    /// panics; never propagates I/O errors — this is a
+    /// best-effort post-mortem aid that must not mask the
+    /// original failure cause.
+    ///
+    /// Filename: `<session_id>-<unix_ms>.png`. Directory must
+    /// already exist; we do NOT mkdir to avoid surprising
+    /// operators with arbitrary directory creation.
+    fn snapshot_on_failure(
+        &self,
+        session_id: &str,
+        tab: &Arc<Tab>,
+    ) -> Option<std::path::PathBuf> {
+        let dir = self.screenshot_on_failure_dir.as_ref()?;
+        let bytes = tab
+            .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
+            .ok()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("{session_id}-{now_ms}.png"));
+        std::fs::write(&path, &bytes).ok()?;
+        Some(path)
+    }
+
+    /// W2-002c: helper to attach the screenshot path to an
+    /// existing BrowserError reason when one was captured.
+    /// Always returns the original error variant; the only
+    /// mutation is the appended `; screenshot=<path>` suffix
+    /// on the reason string when capture succeeded.
+    fn enrich_with_screenshot(
+        &self,
+        session_id: &str,
+        tab: &Arc<Tab>,
+        err: BrowserError,
+    ) -> BrowserError {
+        let Some(path) = self.snapshot_on_failure(session_id, tab) else {
+            return err;
+        };
+        match err {
+            BrowserError::BackendNotConnected { reason } => BrowserError::BackendNotConnected {
+                reason: format!("{reason}; screenshot={}", path.display()),
+            },
+            other => other,
         }
     }
 
@@ -232,14 +287,18 @@ impl BrowserBackend for HeadlessChromeBackend {
 
     fn navigate(&self, session_id: &str, url: &str) -> Result<(), BrowserError> {
         let tab = self.lookup_session(session_id)?;
-        tab.navigate_to(url)
-            .map_err(|e| BrowserError::BackendNotConnected {
+        if let Err(e) = tab.navigate_to(url) {
+            let base = BrowserError::BackendNotConnected {
                 reason: format!("headless_chrome: navigate_to({url}) failed: {e}"),
-            })?;
-        tab.wait_until_navigated()
-            .map_err(|e| BrowserError::BackendNotConnected {
+            };
+            return Err(self.enrich_with_screenshot(session_id, &tab, base));
+        }
+        if let Err(e) = tab.wait_until_navigated() {
+            let base = BrowserError::BackendNotConnected {
                 reason: format!("headless_chrome: wait_until_navigated failed: {e}"),
-            })?;
+            };
+            return Err(self.enrich_with_screenshot(session_id, &tab, base));
+        }
         Ok(())
     }
 
@@ -308,16 +367,23 @@ impl BrowserBackend for HeadlessChromeBackend {
 
     fn click(&self, session_id: &str, selector: &str) -> Result<(), BrowserError> {
         let tab = self.lookup_session(session_id)?;
-        let el = tab.find_element(selector).map_err(|e| {
-            BrowserError::BackendNotConnected {
-                reason: format!(
-                    "headless_chrome: click find_element({selector}) failed: {e}"
-                ),
+        let el = match tab.find_element(selector) {
+            Ok(el) => el,
+            Err(e) => {
+                let base = BrowserError::BackendNotConnected {
+                    reason: format!(
+                        "headless_chrome: click find_element({selector}) failed: {e}"
+                    ),
+                };
+                return Err(self.enrich_with_screenshot(session_id, &tab, base));
             }
-        })?;
-        el.click().map_err(|e| BrowserError::BackendNotConnected {
-            reason: format!("headless_chrome: click({selector}) failed: {e}"),
-        })?;
+        };
+        if let Err(e) = el.click() {
+            let base = BrowserError::BackendNotConnected {
+                reason: format!("headless_chrome: click({selector}) failed: {e}"),
+            };
+            return Err(self.enrich_with_screenshot(session_id, &tab, base));
+        }
         Ok(())
     }
 
@@ -328,30 +394,39 @@ impl BrowserBackend for HeadlessChromeBackend {
         text: &str,
     ) -> Result<(), BrowserError> {
         let tab = self.lookup_session(session_id)?;
-        let el = tab.find_element(selector).map_err(|e| {
-            BrowserError::BackendNotConnected {
-                reason: format!(
-                    "headless_chrome: type_text find_element({selector}) failed: {e}"
-                ),
+        let el = match tab.find_element(selector) {
+            Ok(el) => el,
+            Err(e) => {
+                let base = BrowserError::BackendNotConnected {
+                    reason: format!(
+                        "headless_chrome: type_text find_element({selector}) failed: {e}"
+                    ),
+                };
+                return Err(self.enrich_with_screenshot(session_id, &tab, base));
             }
-        })?;
+        };
         // Click first so the field is focused — `type_into`
         // dispatches synthetic key events, but without focus
         // the keys land on the wrong element. Honest: a click
         // on a disabled / readonly input still succeeds at the
         // CDP level; we don't pre-validate.
-        el.click().map_err(|e| BrowserError::BackendNotConnected {
-            reason: format!(
-                "headless_chrome: type_text focus-click({selector}) failed: {e}"
-            ),
-        })?;
-        el.type_into(text)
-            .map_err(|e| BrowserError::BackendNotConnected {
+        if let Err(e) = el.click() {
+            let base = BrowserError::BackendNotConnected {
+                reason: format!(
+                    "headless_chrome: type_text focus-click({selector}) failed: {e}"
+                ),
+            };
+            return Err(self.enrich_with_screenshot(session_id, &tab, base));
+        }
+        if let Err(e) = el.type_into(text) {
+            let base = BrowserError::BackendNotConnected {
                 reason: format!(
                     "headless_chrome: type_into({selector}, {} chars) failed: {e}",
                     text.chars().count()
                 ),
-            })?;
+            };
+            return Err(self.enrich_with_screenshot(session_id, &tab, base));
+        }
         Ok(())
     }
 
@@ -369,13 +444,17 @@ impl BrowserBackend for HeadlessChromeBackend {
         // default which doesn't match `[tool.browser]
         // call_timeout_secs`.
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        tab.wait_for_element_with_custom_timeout(selector, timeout)
-            .map(|_| ())
-            .map_err(|e| BrowserError::BackendNotConnected {
-                reason: format!(
-                    "headless_chrome: wait_for_selector({selector}, {timeout_ms}ms) failed: {e}"
-                ),
-            })
+        match tab.wait_for_element_with_custom_timeout(selector, timeout) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let base = BrowserError::BackendNotConnected {
+                    reason: format!(
+                        "headless_chrome: wait_for_selector({selector}, {timeout_ms}ms) failed: {e}"
+                    ),
+                };
+                Err(self.enrich_with_screenshot(session_id, &tab, base))
+            }
+        }
     }
 }
 

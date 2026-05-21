@@ -343,6 +343,7 @@ mod tests {
             max_sessions: 4,
             call_timeout_secs: 5,
             webdriver_url: "http://127.0.0.1:9515".to_string(),
+            ..BrowserConfig::default()
         }
     }
 

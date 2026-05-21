@@ -134,6 +134,17 @@ pub struct BrowserConfig {
     /// `http://127.0.0.1:9515` (chromedriver's default port).
     #[serde(default = "default_webdriver_url")]
     pub webdriver_url: String,
+    /// W2-002c: optional directory where the backend persists a
+    /// PNG screenshot every time a navigate / click / type_text
+    /// fails on a live tab. The failure error reason gets the
+    /// path appended so replay surfaces (W2-001) can render it.
+    /// `None` (default) → screenshot-on-failure is disabled.
+    /// The directory must already exist; the backend does not
+    /// create it. Honest scope: only HeadlessChromeBackend
+    /// implements this today; PW and WD ignore the field until
+    /// follow-ups.
+    #[serde(default)]
+    pub screenshot_on_failure_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for BrowserConfig {
@@ -143,6 +154,7 @@ impl Default for BrowserConfig {
             max_sessions: default_max_sessions(),
             call_timeout_secs: default_call_timeout_secs(),
             webdriver_url: default_webdriver_url(),
+            screenshot_on_failure_dir: None,
         }
     }
 }
@@ -876,7 +888,7 @@ mod tests {
             backend: "none".to_string(),
             max_sessions: 4,
             call_timeout_secs: 30,
-            webdriver_url: default_webdriver_url(),
+            ..BrowserConfig::default()
         }
     }
 
