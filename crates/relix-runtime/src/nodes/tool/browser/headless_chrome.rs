@@ -297,6 +297,86 @@ impl BrowserBackend for HeadlessChromeBackend {
         out.sort_by_key(|r| r.opened_at);
         Ok(out)
     }
+
+    // W2-002b: click / type_text / wait_for_selector overrides
+    // of the default trait impls. Each maps the headless_chrome
+    // crate's failure into BackendNotConnected with a reason
+    // string that names the specific failure — operators
+    // debugging form workflows want to see "selector not found"
+    // distinct from "tab dropped" distinct from "type failed
+    // mid-key".
+
+    fn click(&self, session_id: &str, selector: &str) -> Result<(), BrowserError> {
+        let tab = self.lookup_session(session_id)?;
+        let el = tab.find_element(selector).map_err(|e| {
+            BrowserError::BackendNotConnected {
+                reason: format!(
+                    "headless_chrome: click find_element({selector}) failed: {e}"
+                ),
+            }
+        })?;
+        el.click().map_err(|e| BrowserError::BackendNotConnected {
+            reason: format!("headless_chrome: click({selector}) failed: {e}"),
+        })?;
+        Ok(())
+    }
+
+    fn type_text(
+        &self,
+        session_id: &str,
+        selector: &str,
+        text: &str,
+    ) -> Result<(), BrowserError> {
+        let tab = self.lookup_session(session_id)?;
+        let el = tab.find_element(selector).map_err(|e| {
+            BrowserError::BackendNotConnected {
+                reason: format!(
+                    "headless_chrome: type_text find_element({selector}) failed: {e}"
+                ),
+            }
+        })?;
+        // Click first so the field is focused — `type_into`
+        // dispatches synthetic key events, but without focus
+        // the keys land on the wrong element. Honest: a click
+        // on a disabled / readonly input still succeeds at the
+        // CDP level; we don't pre-validate.
+        el.click().map_err(|e| BrowserError::BackendNotConnected {
+            reason: format!(
+                "headless_chrome: type_text focus-click({selector}) failed: {e}"
+            ),
+        })?;
+        el.type_into(text)
+            .map_err(|e| BrowserError::BackendNotConnected {
+                reason: format!(
+                    "headless_chrome: type_into({selector}, {} chars) failed: {e}",
+                    text.chars().count()
+                ),
+            })?;
+        Ok(())
+    }
+
+    fn wait_for_selector(
+        &self,
+        session_id: &str,
+        selector: &str,
+        timeout_ms: u64,
+    ) -> Result<(), BrowserError> {
+        let tab = self.lookup_session(session_id)?;
+        // Bound the wait with the operator-supplied timeout.
+        // `wait_for_element_with_custom_timeout` is the
+        // headless_chrome API that respects a per-call cap;
+        // without it the crate falls back to its own internal
+        // default which doesn't match `[tool.browser]
+        // call_timeout_secs`.
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        tab.wait_for_element_with_custom_timeout(selector, timeout)
+            .map(|_| ())
+            .map_err(|e| BrowserError::BackendNotConnected {
+                reason: format!(
+                    "headless_chrome: wait_for_selector({selector}, {timeout_ms}ms) failed: {e}"
+                ),
+            })
+    }
 }
 
 /// PH-BROWSER-HC: live build. Constructs the
