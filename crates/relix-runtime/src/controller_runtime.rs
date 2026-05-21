@@ -562,6 +562,34 @@ fn register_node_type_handlers(
                 &["task", "write", "intervene", "operator"],
             ),
             (
+                "task.record_spawned",
+                "Attest a `spawned` cross-task edge. The \
+                 caller (runtime worker, CLI, external \
+                 orchestrator) declares it observed parent \
+                 spawning child. Emits `task.spawned_child` \
+                 chronicle event on the parent + inserts \
+                 the edge with full producer/branch/context \
+                 metadata. HONEST: no runtime path \
+                 auto-emits today — the attestation API is \
+                 ready for future producers.",
+                &["task", "write", "graph", "lineage", "runtime"],
+            ),
+            (
+                "task.record_delegated",
+                "Attest a `delegated_to` cross-task edge. \
+                 Parent passed completion responsibility to \
+                 child rather than fanning out. Optional \
+                 reason captured verbatim in payload_json.",
+                &["task", "write", "graph", "lineage", "runtime"],
+            ),
+            (
+                "task.record_awaited",
+                "Attest an `awaited` cross-task edge. Parent \
+                 is blocked waiting on the awaited task. \
+                 Optional reason captured verbatim.",
+                &["task", "write", "graph", "lineage", "runtime"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -597,7 +625,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze / record_spawned / record_delegated / record_awaited"
         );
     }
     if cfg.controller.node_type == "tool" {

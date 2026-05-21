@@ -1689,6 +1689,195 @@ impl TaskStore {
         Ok(pre_freeze_status)
     }
 
+    /// Record a `spawned_task` edge attesting that the
+    /// caller (a runtime worker or operator-driven tool)
+    /// observed `parent_task_id` spawning `child_task_id`
+    /// (M72).
+    ///
+    /// Both tasks must exist. The caller's subject_id is
+    /// recorded as the "producer" so operators inspecting
+    /// the graph can trace which runtime node attested the
+    /// relationship. Emits a `task.spawned_child` chronicle
+    /// event on the PARENT so the per-task timeline shows
+    /// the spawn, and inserts the edge with
+    /// spawned_by_event_id pointing at that event for
+    /// round-trip clickability.
+    ///
+    /// `branch_id` and `context_id` are optional opaque
+    /// labels the producer can use to group related spawns
+    /// (e.g. a parallel-branch identifier or a flow
+    /// execution context). When `None`, the corresponding
+    /// payload field is omitted — operators see the absence
+    /// rather than a fabricated default.
+    ///
+    /// HONEST: today no runtime path automatically calls
+    /// this. The capability is ready; producers will land
+    /// as we add runtime hooks. The schema rejects synth.
+    pub fn record_spawned(
+        &self,
+        parent_task_id: &str,
+        child_task_id: &str,
+        branch_id: Option<&str>,
+        context_id: Option<&str>,
+        producer_subject_id: &str,
+    ) -> Result<EdgeProducerOutcome, CoordinatorError> {
+        self.record_cross_task_edge(
+            parent_task_id,
+            child_task_id,
+            "spawned",
+            "task.spawned_child",
+            branch_id,
+            context_id,
+            None,
+            producer_subject_id,
+        )
+    }
+
+    /// Record a `delegated_to` edge — same shape as
+    /// `record_spawned` but with delegation semantics
+    /// (parent passed responsibility for completion to
+    /// the child instead of fan-out). `delegation_reason`
+    /// is optional, surfaced verbatim in payload_json.
+    pub fn record_delegated(
+        &self,
+        parent_task_id: &str,
+        child_task_id: &str,
+        delegation_reason: Option<&str>,
+        producer_subject_id: &str,
+    ) -> Result<EdgeProducerOutcome, CoordinatorError> {
+        self.record_cross_task_edge(
+            parent_task_id,
+            child_task_id,
+            "delegated_to",
+            "task.delegated_to",
+            None,
+            None,
+            delegation_reason,
+            producer_subject_id,
+        )
+    }
+
+    /// Record an `awaited` edge — parent is blocked waiting
+    /// for `awaited_task_id` to complete. `await_reason` is
+    /// optional, surfaced verbatim in payload_json.
+    pub fn record_awaited(
+        &self,
+        parent_task_id: &str,
+        awaited_task_id: &str,
+        await_reason: Option<&str>,
+        producer_subject_id: &str,
+    ) -> Result<EdgeProducerOutcome, CoordinatorError> {
+        self.record_cross_task_edge(
+            parent_task_id,
+            awaited_task_id,
+            "awaited",
+            "task.awaiting",
+            None,
+            None,
+            await_reason,
+            producer_subject_id,
+        )
+    }
+
+    /// Shared insert helper for the M72 edge producers.
+    /// Wraps the chronicle-event emit + edge insert in one
+    /// transaction so callers can never see one without the
+    /// other.
+    #[allow(clippy::too_many_arguments)]
+    fn record_cross_task_edge(
+        &self,
+        parent_task_id: &str,
+        related_task_id: &str,
+        edge_type: &str,
+        event_type: &str,
+        branch_id: Option<&str>,
+        context_id: Option<&str>,
+        reason: Option<&str>,
+        producer_subject_id: &str,
+    ) -> Result<EdgeProducerOutcome, CoordinatorError> {
+        if parent_task_id == related_task_id {
+            return Err(CoordinatorError::Invalid(format!(
+                "{edge_type}: parent and related task_id must differ \
+                 (intra-task edges have dedicated types)"
+            )));
+        }
+        let trimmed_branch = branch_id.map(str::trim).filter(|s| !s.is_empty());
+        let trimmed_context = context_id.map(str::trim).filter(|s| !s.is_empty());
+        let trimmed_reason = reason.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(r) = trimmed_reason
+            && r.len() > MAX_OPERATOR_NOTE_LEN
+        {
+            return Err(CoordinatorError::Invalid(format!(
+                "{edge_type}: reason exceeds {MAX_OPERATOR_NOTE_LEN} bytes (got {})",
+                r.len()
+            )));
+        }
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        for tid in [parent_task_id, related_task_id] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                    params![tid],
+                    |r| r.get(0),
+                )
+                .map_err(CoordinatorError::Db)?;
+            if exists == 0 {
+                return Err(CoordinatorError::NotFound(tid.to_string()));
+            }
+        }
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        let mut payload = serde_json::json!({
+            "edge_type": edge_type,
+            "related_task_id": related_task_id,
+            "producer": producer_subject_id,
+            "produced_at": now,
+        });
+        if let Some(b) = trimmed_branch {
+            payload["branch_id"] = serde_json::Value::String(b.to_string());
+        }
+        if let Some(c) = trimmed_context {
+            payload["context_id"] = serde_json::Value::String(c.to_string());
+        }
+        if let Some(r) = trimmed_reason {
+            payload["reason"] = serde_json::Value::String(r.to_string());
+        }
+        let payload_json = payload.to_string();
+        let legacy = match (trimmed_branch, trimmed_reason) {
+            (Some(b), Some(r)) => format!("→{related_task_id} · branch={b} · {r}"),
+            (Some(b), None) => format!("→{related_task_id} · branch={b}"),
+            (None, Some(r)) => format!("→{related_task_id} · {r}"),
+            (None, None) => format!("→{related_task_id}"),
+        };
+        insert_typed_event(
+            &tx,
+            parent_task_id,
+            now,
+            event_type,
+            &legacy,
+            None,
+            None,
+            Some(&payload_json),
+        )?;
+        let event_id = tx.last_insert_rowid();
+        // Insert the edge with spawned_by_event_id pointing
+        // at the chronicle event we just wrote. attempt_id
+        // left NULL — these edges are task-scoped, not
+        // attempt-scoped (until the runtime is attest-rich
+        // enough to know).
+        tx.execute(
+            "INSERT INTO task_edges
+                (task_id, attempt_id, edge_type, related_task_id,
+                 related_attempt_id, spawned_by_event_id, created_at)
+             VALUES (?1, NULL, ?2, ?3, NULL, ?4, ?5)",
+            params![parent_task_id, edge_type, related_task_id, event_id, now],
+        )
+        .map_err(CoordinatorError::Db)?;
+        let edge_id = tx.last_insert_rowid();
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(EdgeProducerOutcome { edge_id, event_id })
+    }
+
     /// Cooperative-poller snapshot of interruption state
     /// (M70). Returns the current pause/freeze generations
     /// plus the live status — enough for a runtime worker
@@ -2578,6 +2767,15 @@ pub struct AttemptView {
     pub failure_class: Option<String>,
 }
 
+/// Outcome of an M72 edge-producer call. Carries both the
+/// new edge_id AND the chronicle event_id so callers can
+/// surface either side to operators.
+#[derive(Debug, Clone)]
+pub struct EdgeProducerOutcome {
+    pub edge_id: i64,
+    pub event_id: i64,
+}
+
 /// Cooperative-poller snapshot returned by
 /// [`TaskStore::interruption_snapshot`] (M70). Carries the
 /// current live status + both generation counters; runtime
@@ -2899,6 +3097,36 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_unfreeze(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.record_spawned",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_record_spawned(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.record_delegated",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_record_delegated(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.record_awaited",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_record_awaited(&s, &ctx) }
             })),
         );
     }
@@ -3905,6 +4133,100 @@ fn handle_resume(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.resume: not found: {id}")),
         Err(CoordinatorError::Invalid(msg)) => invalid(msg),
         Err(e) => internal(format!("task.resume: {e}")),
+    }
+}
+
+/// `task.record_spawned` — attest a `spawned` edge (M72).
+/// Args: `parent_task_id|child_task_id|branch_id|context_id`
+/// (branch + context optional). The caller's subject_id is
+/// recorded as the producer. Returns
+/// `edge_id=N\nevent_id=N\n`.
+fn handle_record_spawned(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.record_spawned utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(4, '|').collect();
+    let parent = parts.first().copied().unwrap_or("").trim();
+    let child = parts.get(1).copied().unwrap_or("").trim();
+    let branch = parts.get(2).copied().filter(|v| !v.is_empty());
+    let context = parts.get(3).copied().filter(|v| !v.is_empty());
+    if parent.is_empty() || child.is_empty() {
+        return invalid(
+            "task.record_spawned: arg shape `parent_task_id|child_task_id|branch_id|context_id`"
+                .to_string(),
+        );
+    }
+    let producer = ctx.caller.subject_id.to_string();
+    match store.record_spawned(parent, child, branch, context, &producer) {
+        Ok(o) => HandlerOutcome::Ok(
+            format!("edge_id={}\nevent_id={}\n", o.edge_id, o.event_id).into_bytes(),
+        ),
+        Err(CoordinatorError::NotFound(id)) => {
+            invalid(format!("task.record_spawned: not found: {id}"))
+        }
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.record_spawned: {e}")),
+    }
+}
+
+/// `task.record_delegated` — attest a `delegated_to` edge.
+/// Args: `parent_task_id|child_task_id|reason` (reason
+/// optional). Returns `edge_id=N\nevent_id=N\n`.
+fn handle_record_delegated(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.record_delegated utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let parent = parts.first().copied().unwrap_or("").trim();
+    let child = parts.get(1).copied().unwrap_or("").trim();
+    let reason = parts.get(2).copied().filter(|v| !v.is_empty());
+    if parent.is_empty() || child.is_empty() {
+        return invalid(
+            "task.record_delegated: arg shape `parent_task_id|child_task_id|reason`".to_string(),
+        );
+    }
+    let producer = ctx.caller.subject_id.to_string();
+    match store.record_delegated(parent, child, reason, &producer) {
+        Ok(o) => HandlerOutcome::Ok(
+            format!("edge_id={}\nevent_id={}\n", o.edge_id, o.event_id).into_bytes(),
+        ),
+        Err(CoordinatorError::NotFound(id)) => {
+            invalid(format!("task.record_delegated: not found: {id}"))
+        }
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.record_delegated: {e}")),
+    }
+}
+
+/// `task.record_awaited` — attest an `awaited` edge.
+/// Args: `task_id|awaited_task_id|reason` (reason
+/// optional). Returns `edge_id=N\nevent_id=N\n`.
+fn handle_record_awaited(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.record_awaited utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(3, '|').collect();
+    let waiter = parts.first().copied().unwrap_or("").trim();
+    let awaited = parts.get(1).copied().unwrap_or("").trim();
+    let reason = parts.get(2).copied().filter(|v| !v.is_empty());
+    if waiter.is_empty() || awaited.is_empty() {
+        return invalid(
+            "task.record_awaited: arg shape `task_id|awaited_task_id|reason`".to_string(),
+        );
+    }
+    let producer = ctx.caller.subject_id.to_string();
+    match store.record_awaited(waiter, awaited, reason, &producer) {
+        Ok(o) => HandlerOutcome::Ok(
+            format!("edge_id={}\nevent_id={}\n", o.edge_id, o.event_id).into_bytes(),
+        ),
+        Err(CoordinatorError::NotFound(id)) => {
+            invalid(format!("task.record_awaited: not found: {id}"))
+        }
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.record_awaited: {e}")),
     }
 }
 
@@ -6718,6 +7040,124 @@ mod tests {
         let tid = mk(&s, "t", "f", "{}", "o");
         let err = s.set_resumed(&tid, "op").unwrap_err();
         assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn record_spawned_inserts_edge_with_chronicle_anchor() {
+        let s = store();
+        let parent = mk(&s, "parent", "f", "{}", "o");
+        let child = mk(&s, "child", "f", "{}", "o");
+        let outcome = s
+            .record_spawned(
+                &parent,
+                &child,
+                Some("branch-A"),
+                Some("ctx-42"),
+                "worker-x",
+            )
+            .unwrap();
+        assert!(outcome.edge_id > 0);
+        assert!(outcome.event_id > 0);
+        // Edge inserted with correct shape.
+        let edges = s.list_edges_for_task(&parent).unwrap();
+        let spawned: Vec<&TaskEdge> = edges.iter().filter(|e| e.edge_type == "spawned").collect();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].task_id, parent);
+        assert_eq!(spawned[0].related_task_id.as_deref(), Some(child.as_str()));
+        assert_eq!(spawned[0].spawned_by_event_id, Some(outcome.event_id));
+        // Chronicle event lands on parent with full producer
+        // metadata.
+        let ev = s
+            .list_events_after(&parent, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_id == outcome.event_id)
+            .expect("chronicle event present");
+        assert_eq!(ev.event_type, "task.spawned_child");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["edge_type"], "spawned");
+        assert_eq!(pj["related_task_id"], child);
+        assert_eq!(pj["producer"], "worker-x");
+        assert_eq!(pj["branch_id"], "branch-A");
+        assert_eq!(pj["context_id"], "ctx-42");
+    }
+
+    #[test]
+    fn record_spawned_refuses_self_edge() {
+        let s = store();
+        let tid = mk(&s, "self", "f", "{}", "o");
+        let err = s
+            .record_spawned(&tid, &tid, None, None, "worker")
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn record_delegated_omits_unset_metadata_fields() {
+        let s = store();
+        let parent = mk(&s, "p", "f", "{}", "o");
+        let child = mk(&s, "c", "f", "{}", "o");
+        let outcome = s.record_delegated(&parent, &child, None, "worker").unwrap();
+        let ev = s
+            .list_events_after(&parent, 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_id == outcome.event_id)
+            .expect("chronicle event present");
+        assert_eq!(ev.event_type, "task.delegated_to");
+        let pj: serde_json::Value =
+            serde_json::from_str(ev.payload_json.as_deref().unwrap()).unwrap();
+        // Honest: optional fields don't materialize as
+        // empty strings or null — they're absent from the
+        // payload entirely.
+        assert!(pj.get("branch_id").is_none());
+        assert!(pj.get("context_id").is_none());
+        assert!(pj.get("reason").is_none());
+    }
+
+    #[test]
+    fn record_awaited_emits_awaited_edge() {
+        let s = store();
+        let waiter = mk(&s, "w", "f", "{}", "o");
+        let awaited = mk(&s, "a", "f", "{}", "o");
+        s.record_awaited(&waiter, &awaited, Some("upstream call"), "worker")
+            .unwrap();
+        let edges = s.list_edges_for_task(&waiter).unwrap();
+        assert!(
+            edges.iter().any(|e| e.edge_type == "awaited"
+                && e.related_task_id.as_deref() == Some(awaited.as_str()))
+        );
+    }
+
+    #[test]
+    fn record_spawned_rejects_unknown_task_ids() {
+        let s = store();
+        let parent = mk(&s, "p", "f", "{}", "o");
+        let err = s
+            .record_spawned(&parent, "deadbeef", None, None, "worker")
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::NotFound(id) if id == "deadbeef"));
+        let err2 = s
+            .record_spawned("deadbeef", &parent, None, None, "worker")
+            .unwrap_err();
+        assert!(matches!(err2, CoordinatorError::NotFound(id) if id == "deadbeef"));
+    }
+
+    #[test]
+    fn lineage_finds_spawned_edges_as_cross_task() {
+        // M66 + M72 integration: the lineage walker now sees
+        // genuine cross-task edges when producers attest them.
+        // `cross_task_edge_count` reflects the real count.
+        let s = store();
+        let parent = mk(&s, "p", "f", "{}", "o");
+        let child = mk(&s, "c", "f", "{}", "o");
+        s.record_spawned(&parent, &child, None, None, "worker")
+            .unwrap();
+        let g = s.task_lineage(&parent, 4).unwrap();
+        assert!(g.tasks.contains(&parent));
+        assert!(g.tasks.contains(&child));
+        assert_eq!(g.cross_task_edge_count, 1);
     }
 
     #[test]
