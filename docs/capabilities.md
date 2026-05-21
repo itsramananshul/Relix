@@ -97,6 +97,7 @@ before the backend (visibility + stable contract + honesty).
 | `tool.web_get` (CW3) | live | Fetch + extract in one call |
 | `tool.web_search` (CW3) | live | DuckDuckGo HTML scrape |
 | `tool.web.robots_check` (PH-WEB-ROBOTS) | live | robots.txt sniff + RFC 9309 longest-prefix-match-wins; defaults to allow on missing |
+| `tool.web.blocklist_summary` (PH-DASH-BLOCKLIST) | live | Read-only snapshot of `[tool] blocked_hosts` (PH-WEB-BLOCKLIST); used by `#/fsaudit` dashboard card + `relix-cli web blocklist` |
 
 ### Terminal
 

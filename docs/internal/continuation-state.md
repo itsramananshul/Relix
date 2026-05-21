@@ -9,15 +9,14 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `6d09544 feat(tool): PH-BROWSER-FEATURES — browser backend trait + feature-gated module scaffolding`
+- **HEAD:** `b0dcaee feat(cli): PH-CLI-WEB-BLOCKLIST — relix-cli web blocklist mirror`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1170 passing, 0 failures (delta this milestone:
-  +7 default-feature; +3 more compiled under
-  `--features relix-runtime/browser-all`).
-  - relix-cli: 104
+- **Workspace tests:** 1173 passing, 0 failures (delta this milestone: +3
+  CLI; 1176 under `--features relix-runtime/browser-all`).
+  - relix-cli: 107 (was 104; +3 this milestone)
   - relix-policy: 72
-  - relix-runtime: 693 (was 686; +7 default; 696 under browser-all)
+  - relix-runtime: 693 (696 under browser-all)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
@@ -67,6 +66,7 @@ as the resume command.
 | 5cb3ab4 | PH-WEB-BLOCKLIST | `[tool] blocked_hosts` operator-curated hostname blocklist; new `HostBlocklist` type + `SsrfError::HostBlocked`; runs before scheme/DNS + on every redirect; exact-match-only (no subdomain widening) honesty contract; URLhaus refresh recipe in module doc; 9 tests + 14 existing call sites threaded |
 | 5120dce | PH-DASH-BLOCKLIST | new `tool.web.blocklist_summary` Safe capability + `GET /v1/tool/blocklist` bridge proxy + dashboard card on `#/fsaudit` page (first-200 cap, sorted, honest "not live feed" note); 4 runtime + 8 bridge tests |
 | 6d09544 | PH-BROWSER-FEATURES | refactored `browser.rs` → `browser/` directory with frozen `BrowserBackend` trait + three feature-gated backend modules (`browser-headless-chrome` / `-playwright` / `-webdriver` + `browser-all`); new `BrowserError::FeatureNotCompiled` variant; `ToolBackend::new` validate-on-construct prevents silent NoneBackend fallback; scaffold `with_label` surfaces operator-chosen backend name; D-008 flipped to "multi-backend plan accepted" pending PH-BROWSER-HC/PW/WD; 7 default + 3 feature-gated tests |
+| b0dcaee | PH-CLI-WEB-BLOCKLIST | `relix-cli web blocklist` — HTTP mirror of `GET /v1/tool/blocklist`; sorted host list + `--max` cap + `--raw`; new `web` sibling under main.rs; 3 wire-shape tests; docs/capabilities.md updated |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
