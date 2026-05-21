@@ -46,6 +46,20 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// H6 stuck-running task projection from /v1/tasks/stuck.
+    /// Shows tasks that have been `running` longer than
+    /// `--threshold-secs` (default 300) without a deadline.
+    Stuck {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Stuck threshold in seconds (passed to the bridge).
+        #[arg(long, default_value_t = 300i64)]
+        threshold_secs: i64,
+        /// Raw JSON instead of the table view.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -56,6 +70,11 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             filter,
             json,
         } => capabilities(&bridge, &filter, json).await,
+        Cmd::Stuck {
+            bridge,
+            threshold_secs,
+            json,
+        } => stuck(&bridge, threshold_secs, json).await,
     }
 }
 
@@ -203,6 +222,70 @@ async fn capabilities(
     Ok(())
 }
 
+async fn stuck(
+    bridge: &str,
+    threshold_secs: i64,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/v1/tasks/stuck?threshold_secs={}",
+        bridge.trim_end_matches('/'),
+        threshold_secs.max(0),
+    );
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let s: StuckResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("bridge returned non-JSON body: {e}\nraw:\n{body}"))?;
+    println!(
+        "stuck={count}  threshold_secs={threshold}",
+        count = s.count,
+        threshold = s.threshold_secs.unwrap_or(threshold_secs),
+    );
+    if s.items.is_empty() {
+        println!("(no stuck tasks)");
+        return Ok(());
+    }
+    println!();
+    let id_h = "task_id";
+    let title_h = "title";
+    let age_h = "age";
+    println!("{id_h:<36}  {title_h:<32}  {age_h}");
+    for it in &s.items {
+        println!(
+            "{id:<36}  {title:<32}  {age}s",
+            id = it.task_id,
+            title = it.title,
+            age = it.age_secs,
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct StuckResponse {
+    #[serde(default)]
+    items: Vec<StuckItem>,
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    threshold_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StuckItem {
+    task_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    age_secs: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct TopologyResponse {
     #[serde(default)]
@@ -318,6 +401,24 @@ mod tests {
         let h: HealthResponse = serde_json::from_str(body).unwrap();
         assert!(h.providers.is_empty());
         assert_eq!(h.aggregate.cooldowns_active, 0);
+    }
+
+    #[test]
+    fn parse_stuck_response() {
+        let body = r#"{
+            "items": [
+                {"task_id": "abcd1234abcd1234abcd1234abcd1234",
+                 "title": "long-running task",
+                 "started_at": 1700000000,
+                 "age_secs": 1234}
+            ],
+            "count": 1,
+            "threshold_secs": 300
+        }"#;
+        let s: StuckResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(s.count, 1);
+        assert_eq!(s.items.len(), 1);
+        assert_eq!(s.items[0].age_secs, 1234);
     }
 
     #[test]
