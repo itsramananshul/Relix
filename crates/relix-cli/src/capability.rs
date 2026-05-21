@@ -38,6 +38,15 @@ pub enum Cmd {
         /// Filter by sensitivity tag (e.g. `external:network`).
         #[arg(long, default_value = "")]
         tag: String,
+        /// PH-CAP-RISK3: filter by risk_level. Bare tier names
+        /// (`safe`, `low`, `medium`, `high`, `critical`,
+        /// `unknown`) match exactly. At-or-above form (`safe+`,
+        /// `low+`, `medium+`, `high+`) matches that tier and
+        /// every higher tier — useful for risk audits.
+        /// `unknown` has no `+` variant (it's a deployment gap
+        /// flag, not part of the tier ordering).
+        #[arg(long, default_value = "")]
+        risk: String,
     },
     /// Show one capability descriptor in detail.
     Get {
@@ -84,7 +93,19 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             client_key,
             category,
             tag,
+            risk,
         } => {
+            let risk_filter = if risk.is_empty() {
+                None
+            } else {
+                match parse_risk_filter(&risk) {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        eprintln!("invalid --risk value: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            };
             let manifest = fetch_manifest(&peer, &identity, &client_key).await?;
             println!(
                 "{}  {}  ({} caps)",
@@ -100,16 +121,30 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
                 if !tag.is_empty() && !cap.sensitivity_tags.iter().any(|t| t == &tag) {
                     continue;
                 }
+                if let Some(ref filter) = risk_filter
+                    && !risk_filter_matches(filter, cap.risk_level)
+                {
+                    continue;
+                }
                 let summary = render_oneline(cap);
                 println!("  {summary}");
                 shown += 1;
             }
             if shown == 0 {
-                let filter_note = match (category.is_empty(), tag.is_empty()) {
-                    (true, true) => "(none)".to_string(),
-                    (false, true) => format!("category={category}"),
-                    (true, false) => format!("tag={tag}"),
-                    (false, false) => format!("category={category} tag={tag}"),
+                let mut parts: Vec<String> = Vec::new();
+                if !category.is_empty() {
+                    parts.push(format!("category={category}"));
+                }
+                if !tag.is_empty() {
+                    parts.push(format!("tag={tag}"));
+                }
+                if !risk.is_empty() {
+                    parts.push(format!("risk={risk}"));
+                }
+                let filter_note = if parts.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    parts.join(" ")
                 };
                 println!("  (no capabilities match {filter_note})");
             }
@@ -339,6 +374,86 @@ fn risk_level_label(r: RiskLevel) -> &'static str {
         RiskLevel::Medium => "medium",
         RiskLevel::High => "high",
         RiskLevel::Critical => "critical",
+    }
+}
+
+/// PH-CAP-RISK3: parsed --risk filter. `Exact(tier)` matches
+/// only that tier; `AtLeast(tier)` matches that tier and every
+/// higher tier (Unknown is excluded from the chain — see
+/// `risk_rank`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RiskFilter {
+    Exact(RiskLevel),
+    AtLeast(RiskLevel),
+}
+
+/// PH-CAP-RISK3: parse the --risk argument. Accepts bare tier
+/// names (`safe`, `low`, `medium`, `high`, `critical`,
+/// `unknown`) and the at-or-above syntax `<tier>+` for the
+/// five ordered tiers. Case-insensitive. Returns an error
+/// string when the value is not recognized.
+fn parse_risk_filter(arg: &str) -> Result<RiskFilter, String> {
+    let trimmed = arg.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err("empty --risk value".into());
+    }
+    let (name, at_least) = if let Some(stripped) = trimmed.strip_suffix('+') {
+        (stripped.to_string(), true)
+    } else {
+        (trimmed, false)
+    };
+    let tier = match name.as_str() {
+        "unknown" => RiskLevel::Unknown,
+        "safe" => RiskLevel::Safe,
+        "low" => RiskLevel::Low,
+        "medium" => RiskLevel::Medium,
+        "high" => RiskLevel::High,
+        "critical" => RiskLevel::Critical,
+        other => {
+            return Err(format!(
+                "unknown tier '{other}' (expected: safe, low, medium, high, critical, unknown, \
+                 with optional + for at-or-above)"
+            ));
+        }
+    };
+    if at_least && matches!(tier, RiskLevel::Unknown) {
+        return Err(
+            "unknown+ is not a valid filter (Unknown is a deployment-gap signal, not part of \
+             the tier ordering)"
+                .into(),
+        );
+    }
+    Ok(if at_least {
+        RiskFilter::AtLeast(tier)
+    } else {
+        RiskFilter::Exact(tier)
+    })
+}
+
+/// PH-CAP-RISK3: ordering rank for the five real tiers.
+/// Unknown is treated as -1 (outside the ordering) so
+/// `AtLeast(Safe)` does NOT include Unknown. Operators
+/// auditing for risk use `--risk unknown` explicitly.
+fn risk_rank(r: RiskLevel) -> i32 {
+    match r {
+        RiskLevel::Unknown => -1,
+        RiskLevel::Safe => 0,
+        RiskLevel::Low => 1,
+        RiskLevel::Medium => 2,
+        RiskLevel::High => 3,
+        RiskLevel::Critical => 4,
+    }
+}
+
+/// PH-CAP-RISK3: does `cap_risk` satisfy the filter?
+fn risk_filter_matches(filter: &RiskFilter, cap_risk: RiskLevel) -> bool {
+    match filter {
+        RiskFilter::Exact(t) => cap_risk == *t,
+        RiskFilter::AtLeast(t) => {
+            // Unknown never satisfies an AtLeast filter (see
+            // risk_rank — Unknown is -1, outside the chain).
+            risk_rank(cap_risk) >= risk_rank(*t) && cap_risk != RiskLevel::Unknown
+        }
     }
 }
 
@@ -718,5 +833,123 @@ mod tests {
         manifest.capabilities.push(c.clone());
         let s = render_detail(&manifest, &c);
         assert!(s.contains("risk_level:      medium"), "rendered: {s}");
+    }
+
+    // ── PH-CAP-RISK3: --risk filter parsing + matching ─────────────
+
+    #[test]
+    fn parse_risk_filter_exact_bare_names() {
+        assert_eq!(
+            parse_risk_filter("safe").unwrap(),
+            RiskFilter::Exact(RiskLevel::Safe)
+        );
+        assert_eq!(
+            parse_risk_filter("low").unwrap(),
+            RiskFilter::Exact(RiskLevel::Low)
+        );
+        assert_eq!(
+            parse_risk_filter("medium").unwrap(),
+            RiskFilter::Exact(RiskLevel::Medium)
+        );
+        assert_eq!(
+            parse_risk_filter("high").unwrap(),
+            RiskFilter::Exact(RiskLevel::High)
+        );
+        assert_eq!(
+            parse_risk_filter("critical").unwrap(),
+            RiskFilter::Exact(RiskLevel::Critical)
+        );
+        assert_eq!(
+            parse_risk_filter("unknown").unwrap(),
+            RiskFilter::Exact(RiskLevel::Unknown)
+        );
+    }
+
+    #[test]
+    fn parse_risk_filter_at_least_form() {
+        assert_eq!(
+            parse_risk_filter("safe+").unwrap(),
+            RiskFilter::AtLeast(RiskLevel::Safe)
+        );
+        assert_eq!(
+            parse_risk_filter("medium+").unwrap(),
+            RiskFilter::AtLeast(RiskLevel::Medium)
+        );
+        assert_eq!(
+            parse_risk_filter("high+").unwrap(),
+            RiskFilter::AtLeast(RiskLevel::High)
+        );
+    }
+
+    #[test]
+    fn parse_risk_filter_is_case_insensitive_and_trims() {
+        assert_eq!(
+            parse_risk_filter("  MEDIUM ").unwrap(),
+            RiskFilter::Exact(RiskLevel::Medium)
+        );
+        assert_eq!(
+            parse_risk_filter("HIGH+").unwrap(),
+            RiskFilter::AtLeast(RiskLevel::High)
+        );
+    }
+
+    #[test]
+    fn parse_risk_filter_rejects_unknown_plus() {
+        let err = parse_risk_filter("unknown+").unwrap_err();
+        assert!(err.contains("not a valid filter"));
+    }
+
+    #[test]
+    fn parse_risk_filter_rejects_garbage() {
+        let err = parse_risk_filter("yolo").unwrap_err();
+        assert!(err.contains("unknown tier"));
+        let err = parse_risk_filter("").unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn risk_filter_exact_matches_only_named_tier() {
+        let f = RiskFilter::Exact(RiskLevel::Medium);
+        assert!(!risk_filter_matches(&f, RiskLevel::Safe));
+        assert!(!risk_filter_matches(&f, RiskLevel::Low));
+        assert!(risk_filter_matches(&f, RiskLevel::Medium));
+        assert!(!risk_filter_matches(&f, RiskLevel::High));
+        assert!(!risk_filter_matches(&f, RiskLevel::Critical));
+        assert!(!risk_filter_matches(&f, RiskLevel::Unknown));
+    }
+
+    #[test]
+    fn risk_filter_at_least_matches_named_and_higher() {
+        let f = RiskFilter::AtLeast(RiskLevel::Medium);
+        assert!(!risk_filter_matches(&f, RiskLevel::Safe));
+        assert!(!risk_filter_matches(&f, RiskLevel::Low));
+        assert!(risk_filter_matches(&f, RiskLevel::Medium));
+        assert!(risk_filter_matches(&f, RiskLevel::High));
+        assert!(risk_filter_matches(&f, RiskLevel::Critical));
+        // Unknown is OUTSIDE the chain — explicitly not matched
+        // by AtLeast(...) for any tier. Operators use `unknown`
+        // exactly to find unaudited descriptors.
+        assert!(!risk_filter_matches(&f, RiskLevel::Unknown));
+    }
+
+    #[test]
+    fn risk_filter_at_least_safe_matches_everything_but_unknown() {
+        let f = RiskFilter::AtLeast(RiskLevel::Safe);
+        assert!(risk_filter_matches(&f, RiskLevel::Safe));
+        assert!(risk_filter_matches(&f, RiskLevel::Low));
+        assert!(risk_filter_matches(&f, RiskLevel::Medium));
+        assert!(risk_filter_matches(&f, RiskLevel::High));
+        assert!(risk_filter_matches(&f, RiskLevel::Critical));
+        assert!(!risk_filter_matches(&f, RiskLevel::Unknown));
+    }
+
+    #[test]
+    fn risk_filter_exact_unknown_finds_unaudited_descriptors() {
+        // `--risk unknown` is the explicit way to surface
+        // descriptors the validator would flag.
+        let f = RiskFilter::Exact(RiskLevel::Unknown);
+        assert!(risk_filter_matches(&f, RiskLevel::Unknown));
+        assert!(!risk_filter_matches(&f, RiskLevel::Safe));
+        assert!(!risk_filter_matches(&f, RiskLevel::Critical));
     }
 }
