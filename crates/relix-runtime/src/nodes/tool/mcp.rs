@@ -888,4 +888,36 @@ mod tests {
         let r: proto::ToolsCallResult = serde_json::from_value(raw).unwrap();
         assert!(!r.is_error);
     }
+
+    /// PH-RISK-PIN-ALL: pin the risk tier of every MCP
+    /// descriptor. Reads of the registry are Safe; invoke
+    /// (which spawns / drives an external process when the
+    /// stdio runtime is wired) is High. None should be Unknown.
+    #[test]
+    fn mcp_descriptors_have_explicit_non_unknown_risk() {
+        let pinned: &[(&str, CapabilityDescriptor, RiskLevel)] = &[
+            (
+                "tool.mcp.list_servers",
+                descriptor_list_servers(),
+                RiskLevel::Safe,
+            ),
+            (
+                "tool.mcp.list_tools",
+                descriptor_list_tools(),
+                RiskLevel::Safe,
+            ),
+            ("tool.mcp.invoke", descriptor_invoke(), RiskLevel::High),
+        ];
+        for (name, d, expected) in pinned {
+            assert_ne!(
+                d.risk_level,
+                RiskLevel::Unknown,
+                "{name} defaulted to Unknown risk"
+            );
+            assert_eq!(
+                d.risk_level, *expected,
+                "{name} risk tier drifted (expected {expected:?})"
+            );
+        }
+    }
 }

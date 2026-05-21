@@ -1616,4 +1616,28 @@ mod tests {
         assert!(!is_textual_content_type("image/png"));
         assert!(!is_textual_content_type("application/pdf"));
     }
+
+    /// PH-RISK-PIN-ALL: pin the risk tier of the two
+    /// tool-node-level descriptors that live in mod.rs.
+    /// terminal_descriptor (tool.terminal.run) is High —
+    /// allowlisted shell execution. capability_descriptor
+    /// (tool.web_fetch) is Medium — SSRF-gated network egress.
+    #[test]
+    fn mod_level_descriptors_have_explicit_non_unknown_risk() {
+        let pinned: &[(&str, CapabilityDescriptor, RiskLevel)] = &[
+            ("tool.terminal.run", terminal_descriptor(), RiskLevel::High),
+            ("tool.web_fetch", capability_descriptor(), RiskLevel::Medium),
+        ];
+        for (name, d, expected) in pinned {
+            assert_ne!(
+                d.risk_level,
+                RiskLevel::Unknown,
+                "{name} defaulted to Unknown risk"
+            );
+            assert_eq!(
+                d.risk_level, *expected,
+                "{name} risk tier drifted (expected {expected:?})"
+            );
+        }
+    }
 }

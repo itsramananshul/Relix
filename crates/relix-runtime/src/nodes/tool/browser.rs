@@ -727,4 +727,60 @@ mod tests {
         assert!(d.sensitivity_tags.iter().any(|t| t == "external:network"));
         assert!(d.sensitivity_tags.iter().any(|t| t == "egress:http"));
     }
+
+    /// PH-RISK-PIN-ALL: pin the risk tier of every browser
+    /// descriptor. Pure reads (get_text / screenshot / list)
+    /// are Safe; session lifecycle (open / close — internal
+    /// allocation only) is Low; navigate (network egress) is
+    /// Medium. Tiers reflect the EVENTUAL backend behavior;
+    /// today the NoneBackend returns BackendNotConnected, but
+    /// when the live backend lands (D-008) the tiers already
+    /// describe what each capability does — no scaffold→live
+    /// transition surprise.
+    #[test]
+    fn browser_descriptors_have_explicit_non_unknown_risk() {
+        let pinned: &[(&str, CapabilityDescriptor, RiskLevel)] = &[
+            (
+                "tool.browser.open_session",
+                descriptor_open_session(),
+                RiskLevel::Low,
+            ),
+            (
+                "tool.browser.close_session",
+                descriptor_close_session(),
+                RiskLevel::Low,
+            ),
+            (
+                "tool.browser.navigate",
+                descriptor_navigate(),
+                RiskLevel::Medium,
+            ),
+            (
+                "tool.browser.get_text",
+                descriptor_get_text(),
+                RiskLevel::Safe,
+            ),
+            (
+                "tool.browser.screenshot",
+                descriptor_screenshot(),
+                RiskLevel::Safe,
+            ),
+            (
+                "tool.browser.list_sessions",
+                descriptor_list_sessions(),
+                RiskLevel::Safe,
+            ),
+        ];
+        for (name, d, expected) in pinned {
+            assert_ne!(
+                d.risk_level,
+                RiskLevel::Unknown,
+                "{name} defaulted to Unknown risk"
+            );
+            assert_eq!(
+                d.risk_level, *expected,
+                "{name} risk tier drifted (expected {expected:?})"
+            );
+        }
+    }
 }

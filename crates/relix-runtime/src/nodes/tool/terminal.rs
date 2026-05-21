@@ -3083,4 +3083,62 @@ mod tests {
         assert!(!b.shell_stdins.lock().unwrap().contains_key(session_id));
         assert!(b.sessions.lock().unwrap().contains_key(session_id));
     }
+
+    /// PH-RISK-PIN-ALL: pin the risk tier of every shipped
+    /// terminal descriptor. Observation surfaces (sessions /
+    /// audit_recent / tail) are Safe. Cooperative control
+    /// (cancel / shell.close — internal-only state changes)
+    /// is Low. Execution surfaces (spawn + the four shell.*
+    /// caps that drive a subprocess) are High. terminal.run
+    /// itself lives in tool/mod.rs and is pinned by the test
+    /// in that module.
+    #[test]
+    fn terminal_descriptors_have_explicit_non_unknown_risk() {
+        let pinned: &[(&str, CapabilityDescriptor, RiskLevel)] = &[
+            (
+                "tool.terminal.sessions",
+                descriptor_sessions(),
+                RiskLevel::Safe,
+            ),
+            (
+                "tool.terminal.audit_recent",
+                descriptor_audit_recent(),
+                RiskLevel::Safe,
+            ),
+            ("tool.terminal.tail", descriptor_tail(), RiskLevel::Safe),
+            ("tool.terminal.cancel", descriptor_cancel(), RiskLevel::Low),
+            (
+                "tool.terminal.shell.close",
+                descriptor_shell_close(),
+                RiskLevel::Low,
+            ),
+            ("tool.terminal.spawn", descriptor_spawn(), RiskLevel::High),
+            (
+                "tool.terminal.shell.open",
+                descriptor_shell_open(),
+                RiskLevel::High,
+            ),
+            (
+                "tool.terminal.shell.input",
+                descriptor_shell_input(),
+                RiskLevel::High,
+            ),
+            (
+                "tool.terminal.shell.control",
+                descriptor_shell_control(),
+                RiskLevel::High,
+            ),
+        ];
+        for (name, d, expected) in pinned {
+            assert_ne!(
+                d.risk_level,
+                RiskLevel::Unknown,
+                "{name} defaulted to Unknown risk"
+            );
+            assert_eq!(
+                d.risk_level, *expected,
+                "{name} risk tier drifted (expected {expected:?})"
+            );
+        }
+    }
 }

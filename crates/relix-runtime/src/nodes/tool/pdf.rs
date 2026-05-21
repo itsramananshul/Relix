@@ -590,4 +590,14 @@ mod tests {
             HandlerOutcome::Ok(_) => panic!("expected rejection on malformed arg"),
         }
     }
+
+    /// PH-RISK-PIN-ALL: tool.pdf is a pure parser over
+    /// caller-supplied base64 bytes — no network, no host I/O,
+    /// no shell. Safe tier.
+    #[test]
+    fn pdf_descriptor_has_safe_risk() {
+        let d = capability_descriptor();
+        assert_ne!(d.risk_level, RiskLevel::Unknown);
+        assert_eq!(d.risk_level, RiskLevel::Safe);
+    }
 }

@@ -624,4 +624,14 @@ mod tests {
         assert!(s.contains("crawl_delay=2\n"));
         assert!(s.contains("source=fetched\n"));
     }
+
+    /// PH-RISK-PIN-ALL: tool.web.robots_check makes an outbound
+    /// HTTP request (SSRF-gated) — Medium tier, same as the
+    /// rest of the network-touching web tools.
+    #[test]
+    fn web_robots_descriptor_has_medium_risk() {
+        let d = robots_check_descriptor();
+        assert_ne!(d.risk_level, RiskLevel::Unknown);
+        assert_eq!(d.risk_level, RiskLevel::Medium);
+    }
 }

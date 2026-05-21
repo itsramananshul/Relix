@@ -539,4 +539,14 @@ mod tests {
             "recovered {recovered_pct} from chunks: {chunks:?}"
         );
     }
+
+    /// PH-RISK-PIN-ALL: tool.text.chunk is pure CPU over
+    /// caller-supplied text — no network, no host I/O. Safe.
+    #[test]
+    fn text_chunk_descriptor_has_safe_risk() {
+        use relix_core::capability::RiskLevel;
+        let d = capability_descriptor();
+        assert_ne!(d.risk_level, RiskLevel::Unknown);
+        assert_eq!(d.risk_level, RiskLevel::Safe);
+    }
 }

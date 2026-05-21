@@ -1553,4 +1553,14 @@ mod tests {
             _ => panic!("expected Err"),
         }
     }
+
+    /// PH-RISK-PIN-ALL: tool.web_extract is a pure parser
+    /// over caller-supplied bytes — no network surface, no
+    /// host I/O. Safe tier.
+    #[test]
+    fn web_extract_descriptor_has_safe_risk() {
+        let d = capability_descriptor();
+        assert_ne!(d.risk_level, RiskLevel::Unknown);
+        assert_eq!(d.risk_level, RiskLevel::Safe);
+    }
 }

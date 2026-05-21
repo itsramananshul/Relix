@@ -3188,4 +3188,55 @@ mod tests {
             _ => panic!("expected traversal rejection"),
         }
     }
+
+    /// PH-RISK-PIN-ALL: pin the risk tier of every shipped fs
+    /// descriptor. None should default to Unknown (would trip
+    /// the validator) and each carries the deliberate tier
+    /// chosen in PH-CAP-RISK stage 2. Reads are Safe, writes /
+    /// patches / fuzzy_replace are Medium. Future fs descriptor
+    /// additions trip this test and force an audit.
+    #[test]
+    fn fs_descriptors_have_explicit_non_unknown_risk() {
+        let pinned: &[(&str, CapabilityDescriptor, RiskLevel)] = &[
+            ("tool.read_file", descriptor_read(), RiskLevel::Safe),
+            ("tool.write_file", descriptor_write(), RiskLevel::Medium),
+            ("tool.search_files", descriptor_search(), RiskLevel::Safe),
+            ("tool.patch", descriptor_patch(), RiskLevel::Medium),
+            ("tool.append_file", descriptor_append(), RiskLevel::Medium),
+            (
+                "tool.patch_preview",
+                descriptor_patch_preview(),
+                RiskLevel::Safe,
+            ),
+            (
+                "tool.binary_sniff",
+                descriptor_binary_sniff(),
+                RiskLevel::Safe,
+            ),
+            (
+                "tool.fs.audit_recent",
+                descriptor_audit_recent(),
+                RiskLevel::Safe,
+            ),
+            ("tool.list_dir", descriptor_list(), RiskLevel::Safe),
+            (
+                "tool.fuzzy_replace",
+                descriptor_fuzzy_replace(),
+                RiskLevel::Medium,
+            ),
+            ("tool.fs.tree", descriptor_tree(), RiskLevel::Safe),
+            ("tool.fs.stat", descriptor_stat(), RiskLevel::Safe),
+        ];
+        for (name, d, expected) in pinned {
+            assert_ne!(
+                d.risk_level,
+                RiskLevel::Unknown,
+                "{name} defaulted to Unknown risk"
+            );
+            assert_eq!(
+                d.risk_level, *expected,
+                "{name} risk tier drifted (expected {expected:?})"
+            );
+        }
+    }
 }
