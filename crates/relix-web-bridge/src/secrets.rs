@@ -168,6 +168,33 @@ pub struct ProviderEntry {
     /// across reasons" without parsing free-form bodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_reason: Option<String>,
+    /// PH-WAVE2G: bounded ring of recent rate-limit
+    /// observations. Each entry is the unix-seconds timestamp
+    /// of a test call that classified as `rate-limit`. Newest
+    /// at the back. Capped at [`RATE_LIMIT_RING_CAP`] so a
+    /// long-lived bridge can't grow the entry unboundedly.
+    /// Distinct from `last_failure_*` (snapshot of newest
+    /// failure regardless of class) — this ring is a
+    /// time-decay signal for the specific rate-limit
+    /// failure mode. Empty / absent means no rate-limit hits
+    /// have been observed since the entry was created.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limit_recent_hits: Vec<i64>,
+}
+
+/// PH-WAVE2G: hard cap on per-provider rate-limit ring size.
+/// Operators can tell "we got rate-limited 32+ times in our
+/// recorded window" from the ring being full at this size.
+pub const RATE_LIMIT_RING_CAP: usize = 32;
+
+/// PH-WAVE2G: count rate-limit observations whose timestamp is
+/// within `window_secs` of `now`. Saturating arithmetic — a
+/// wildly future-stamped entry doesn't wrap. Empty ring returns
+/// 0. Public so callers (provider_status, future telemetry)
+/// share one definition.
+pub fn rate_limit_hits_in_window(hits: &[i64], now: i64, window_secs: i64) -> u64 {
+    let lower = now.saturating_sub(window_secs);
+    hits.iter().filter(|&&t| t >= lower && t <= now).count() as u64
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -273,6 +300,19 @@ pub struct ProviderStatus {
     /// `None` when the provider has never failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure_reason: Option<String>,
+    /// PH-WAVE2G: count of rate-limit observations in the last
+    /// 5 minutes (computed from `rate_limit_recent_hits` at
+    /// projection time). 0 → no recent hits → field suppressed
+    /// from JSON output.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub rate_limit_hits_5min: u64,
+    /// PH-WAVE2G: same for the last hour.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub rate_limit_hits_1h: u64,
+    /// PH-WAVE2G: timestamp of the most recent rate-limit
+    /// observation, if any. None when the ring is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_rate_limit_at: Option<i64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -369,6 +409,7 @@ impl BridgeSecrets {
     /// validates that before calling.
     pub fn provider_status(&self, name: &str) -> ProviderStatus {
         let is_default = self.default_provider.as_deref() == Some(name);
+        let now = unix_secs();
         match self.providers.get(name) {
             Some(e) => ProviderStatus {
                 name: name.to_string(),
@@ -391,6 +432,13 @@ impl BridgeSecrets {
                 last_failure_at: e.last_failure_at,
                 last_failure_status_code: e.last_failure_status_code,
                 last_failure_reason: e.last_failure_reason.clone(),
+                rate_limit_hits_5min: rate_limit_hits_in_window(
+                    &e.rate_limit_recent_hits,
+                    now,
+                    300,
+                ),
+                rate_limit_hits_1h: rate_limit_hits_in_window(&e.rate_limit_recent_hits, now, 3600),
+                last_rate_limit_at: e.rate_limit_recent_hits.last().copied(),
             },
             None => ProviderStatus {
                 name: name.to_string(),
@@ -413,6 +461,9 @@ impl BridgeSecrets {
                 last_failure_at: None,
                 last_failure_status_code: None,
                 last_failure_reason: None,
+                rate_limit_hits_5min: 0,
+                rate_limit_hits_1h: 0,
+                last_rate_limit_at: None,
             },
         }
     }
@@ -557,6 +608,9 @@ impl BridgeSecrets {
         let prior_last_failure_at = prior.and_then(|e| e.last_failure_at);
         let prior_last_failure_status_code = prior.and_then(|e| e.last_failure_status_code);
         let prior_last_failure_reason = prior.and_then(|e| e.last_failure_reason.clone());
+        let prior_rate_limit_ring = prior
+            .map(|e| e.rate_limit_recent_hits.clone())
+            .unwrap_or_default();
         self.providers.insert(
             name.to_string(),
             ProviderEntry {
@@ -577,6 +631,7 @@ impl BridgeSecrets {
                 last_failure_at: prior_last_failure_at,
                 last_failure_status_code: prior_last_failure_status_code,
                 last_failure_reason: prior_last_failure_reason,
+                rate_limit_recent_hits: prior_rate_limit_ring,
             },
         );
     }
@@ -624,6 +679,17 @@ impl BridgeSecrets {
                     e.last_failure_at = Some(now);
                     e.last_failure_status_code = status_code;
                     e.last_failure_reason = failure_reason.map(str::to_string);
+                    // PH-WAVE2G: append to the rolling rate-limit ring
+                    // ONLY for the rate-limit specific failure mode.
+                    // Trim from the front when the cap is exceeded —
+                    // we want the most recent observations.
+                    if matches!(failure_reason, Some("rate-limit")) {
+                        e.rate_limit_recent_hits.push(now);
+                        if e.rate_limit_recent_hits.len() > RATE_LIMIT_RING_CAP {
+                            let drop = e.rate_limit_recent_hits.len() - RATE_LIMIT_RING_CAP;
+                            e.rate_limit_recent_hits.drain(..drop);
+                        }
+                    }
                 }
                 true
             }
@@ -832,6 +898,89 @@ mod tests {
         assert!(p.quarantined_at.is_some());
         assert!(p.cooldown_until.is_some());
         assert_eq!(p.quarantine_reason.as_deref(), Some("flap"));
+    }
+
+    // ── PH-WAVE2G: rolling rate-limit observation ring ───────────────
+
+    #[test]
+    fn rate_limit_ring_records_only_rate_limit_failures() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        s.record_provider_test("openai", false, Some(500), 80, "boom", Some("server-5xx"));
+        s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        let p = s.provider_status("openai");
+        // 2 rate-limit hits in the last hour; the server-5xx
+        // doesn't count.
+        assert_eq!(p.rate_limit_hits_1h, 2);
+        assert!(p.last_rate_limit_at.is_some());
+    }
+
+    #[test]
+    fn rate_limit_window_5min_vs_1h() {
+        // Synthesise a provider entry directly so we control
+        // the timestamps.
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        // Drop two old hits and one recent one into the ring
+        // by hand. Provider entry exists from set_provider.
+        let now = unix_secs();
+        if let Some(e) = s.providers.get_mut("openai") {
+            e.rate_limit_recent_hits = vec![now - 7200, now - 3500, now - 60];
+        }
+        let p = s.provider_status("openai");
+        // last 5min: only the now-60 hit.
+        assert_eq!(p.rate_limit_hits_5min, 1);
+        // last 1h: now-60 + now-3500 (just under 1h).
+        assert_eq!(p.rate_limit_hits_1h, 2);
+    }
+
+    #[test]
+    fn rate_limit_ring_caps_at_max() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        for _ in 0..(RATE_LIMIT_RING_CAP + 10) {
+            s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        }
+        let entry = s.providers.get("openai").unwrap();
+        assert_eq!(
+            entry.rate_limit_recent_hits.len(),
+            RATE_LIMIT_RING_CAP,
+            "ring should cap at RATE_LIMIT_RING_CAP"
+        );
+    }
+
+    #[test]
+    fn rate_limit_ring_round_trips_through_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bridge-secrets.toml");
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        s.save(&path).expect("save");
+        let s2 = BridgeSecrets::load_or_empty(&path);
+        let p = s2.provider_status("openai");
+        assert_eq!(p.rate_limit_hits_1h, 1);
+    }
+
+    #[test]
+    fn rate_limit_ring_preserved_across_key_overwrite() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-old".into(), None);
+        s.record_provider_test("openai", false, Some(429), 50, "rate", Some("rate-limit"));
+        s.set_provider("openai", "sk-new".into(), Some("gpt-4o".into()));
+        let p = s.provider_status("openai");
+        assert_eq!(p.rate_limit_hits_1h, 1);
+    }
+
+    #[test]
+    fn rate_limit_hits_in_window_basic() {
+        let now = 1_000_000;
+        let hits = vec![now - 7200, now - 600, now - 60];
+        assert_eq!(rate_limit_hits_in_window(&hits, now, 300), 1);
+        assert_eq!(rate_limit_hits_in_window(&hits, now, 3600), 2);
+        assert_eq!(rate_limit_hits_in_window(&hits, now, 0), 0);
+        assert_eq!(rate_limit_hits_in_window(&[], now, 3600), 0);
     }
 
     #[test]

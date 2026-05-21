@@ -6750,6 +6750,22 @@ function renderProviderRoutingTraceBlock(p) {
         + escapeHtml(String(p.last_failure_reason))
         + '</span>'
     : '';
+  // PH-WAVE2G: time-decay rate-limit badge. Different from the
+  // generic failover-reason badge: this one specifically counts
+  // how often the rate-limit specific failure mode has fired
+  // in the last 5 minutes / hour. Lets operators distinguish
+  // "rate-limited 5 times in 5 minutes" (active problem) from
+  // "rate-limited once a week ago" (history).
+  const rl5 = Number(p.rate_limit_hits_5min || 0);
+  const rl1h = Number(p.rate_limit_hits_1h || 0);
+  const rlBadge = rl1h > 0
+    ? ' <span class="badge ' + (rl5 > 0 ? 'danger' : 'warn')
+        + '" title="rate-limit observations: '
+        + rl5 + ' in 5min, ' + rl1h + ' in 1h">'
+        + 'rate ×' + rl1h + '/h'
+        + (rl5 > 0 ? ' (' + rl5 + '/5m)' : '')
+        + '</span>'
+    : '';
   return '<div class="provider-meta">routing trace '
     + '<span class="badge ' + relCls + '">'
     + (reliability != null ? reliability + '% ok' : '—')
@@ -6757,6 +6773,7 @@ function renderProviderRoutingTraceBlock(p) {
     + oks + ' ok / ' + fails + ' fail'
     + lastFailPart
     + reasonBadge
+    + rlBadge
     + '</div>';
 }
 
