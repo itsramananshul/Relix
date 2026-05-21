@@ -73,6 +73,13 @@ before the backend (visibility + stable contract + honesty).
 | `tool.pdf` | live | base64-encoded PDF parse |
 | `tool.text.chunk` (PH-PDF-CHUNK) | live | Split text into bounded chunks (paragraph > sentence > word > char) for retrieval / context-window prep |
 
+### CLI surfaces
+
+| Subcommand | Status | Notes |
+|---|---|---|
+| `relix-cli mcp servers --peer ...` (PH-MCP-CLI) | live | Lists MCP servers registered on a tool node (libp2p dial-and-call) |
+| `relix-cli mcp tools --peer ... --server-id ...` (PH-MCP-CLI) | live | Lists declared tools for a specific MCP server |
+
 ### Web
 
 | Method | Status | Notes |

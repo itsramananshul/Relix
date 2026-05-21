@@ -3,6 +3,7 @@
 mod capability;
 mod flow_run;
 mod identity;
+mod mcp;
 mod ops;
 mod ping;
 mod router;
@@ -89,6 +90,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: router::Cmd,
     },
+    /// PH-MCP-CLI: inspect the MCP registry on a tool node.
+    /// `mcp servers` lists registered MCP servers + their
+    /// declared status; `mcp tools <id>` lists tools a server
+    /// has declared. Read-only; uses libp2p dial-and-call (no
+    /// bridge proxy required).
+    Mcp {
+        #[command(subcommand)]
+        cmd: mcp::Cmd,
+    },
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -131,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Topology { cmd } => topology::run(cmd).await,
         Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
+        Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,
