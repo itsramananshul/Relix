@@ -442,11 +442,12 @@ pub fn descriptor_binary_sniff() -> CapabilityDescriptor {
     d
 }
 
-/// PH-FS-PARITY4: `tool.fs.audit_recent` — snapshot the most
-/// recent successful write / append / patch mutations on the
-/// jail. Pure in-memory observability; bounded ring of 256
-/// entries. Older entries are evicted in FIFO order. Does
-/// NOT replace the dispatch-level audit log.
+/// PH-FS-PARITY4 + PH-FS-AUDIT-FILTER: `tool.fs.audit_recent` —
+/// snapshot the most recent successful write / append / patch /
+/// fuzzy_replace mutations on the jail. Pure in-memory
+/// observability; bounded ring of 256 entries. Older entries
+/// are evicted in FIFO order. Does NOT replace the
+/// dispatch-level audit log.
 pub fn descriptor_audit_recent() -> CapabilityDescriptor {
     let mut d = CapabilityDescriptor::unary("tool.fs.audit_recent");
     d.major_version = 1;
@@ -455,9 +456,11 @@ pub fn descriptor_audit_recent() -> CapabilityDescriptor {
     d.sensitivity_tags = vec!["fs:audit".into()];
     d.requires_groups = vec!["operators".into()];
     d.description = Some(
-        "Return the most recent successful fs mutations on the jail. Arg \
-         is optional `<max>` (default 256). Tab-delim rows: \
-         ts_secs\\top\\trel_path\\tbytes\\tcaller_subject_id. Newest first."
+        "Return the most recent successful fs mutations on the jail. Arg shapes: \
+         empty (default max), `<positive_integer>` (legacy max-only form), or \
+         JSON `{max?, op?}` where op filters to write|append|patch|fuzzy_replace. \
+         Tab-delim rows: ts_secs\\top\\trel_path\\tbytes\\tcaller_subject_id. \
+         Newest first."
             .into(),
     );
     d.categories = vec!["read".into(), "fs".into(), "audit".into()];
@@ -1320,33 +1323,93 @@ fn tempfile_in_dir(dir: &Path) -> std::io::Result<PathBuf> {
     Ok(tmp)
 }
 
-/// PH-FS-PARITY4: handle `tool.fs.audit_recent`. Arg is an
-/// optional decimal `<max>` (default 256). Returns one row per
-/// entry, newest first, tab-delimited:
+/// PH-FS-PARITY4 + PH-FS-AUDIT-FILTER: handle
+/// `tool.fs.audit_recent`. Arg shapes:
+///
+///   (empty)                — default max (256), no op filter
+///   `<positive_integer>`   — that max, no op filter (legacy)
+///   `{"max":50,"op":"write"}` — JSON form (both fields optional)
+///
+/// Op filter values: `write` | `append` | `patch` |
+/// `fuzzy_replace`. Returns rows newest-first, tab-delim:
 /// `ts_secs\top\trel_path\tbytes\tcaller_subject_id`. Final
-/// row is `count=<N>`.
+/// row is `count=<N>` (after filtering).
 fn handle_audit_recent(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
     use std::fmt::Write as _;
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s.trim(),
         Err(e) => return invalid(format!("tool.fs.audit_recent arg utf8: {e}")),
     };
-    let max = if s.is_empty() {
-        FS_AUDIT_RING_DEFAULT
+
+    #[derive(Debug, Deserialize)]
+    struct AuditRequest {
+        #[serde(default)]
+        max: Option<usize>,
+        #[serde(default)]
+        op: Option<String>,
+    }
+
+    let (max, op_filter): (usize, Option<String>) = if s.is_empty() {
+        (FS_AUDIT_RING_DEFAULT, None)
+    } else if s.starts_with('{') {
+        // JSON form — both fields optional.
+        let req: AuditRequest = match serde_json::from_str(s) {
+            Ok(r) => r,
+            Err(e) => {
+                return invalid(format!("tool.fs.audit_recent: bad JSON: {e}"));
+            }
+        };
+        let max = match req.max {
+            None => FS_AUDIT_RING_DEFAULT,
+            Some(0) => {
+                return invalid("tool.fs.audit_recent: max must be > 0".into());
+            }
+            Some(n) => n.min(FS_AUDIT_RING_DEFAULT),
+        };
+        let op = req.op.as_deref().map(|o| o.to_string());
+        if let Some(ref o) = op
+            && !matches!(o.as_str(), "write" | "append" | "patch" | "fuzzy_replace")
+        {
+            return invalid(format!(
+                "tool.fs.audit_recent: unknown op '{o}' (supported: write, append, patch, fuzzy_replace)"
+            ));
+        }
+        (max, op)
     } else {
+        // Legacy integer form — backward-compatible with the
+        // original PH-FS-PARITY4 wire.
         match s.parse::<usize>() {
-            Ok(n) if n > 0 => n.min(FS_AUDIT_RING_DEFAULT),
+            Ok(n) if n > 0 => (n.min(FS_AUDIT_RING_DEFAULT), None),
             _ => {
                 return invalid(format!(
-                    "tool.fs.audit_recent: arg must be a positive integer (got '{s}')"
+                    "tool.fs.audit_recent: arg must be a positive integer or JSON \
+                     (got '{s}')"
                 ));
             }
         }
     };
-    let entries = jail.audit_snapshot(max);
-    let count = entries.len();
+
+    // PH-FS-AUDIT-FILTER: pull a generous snapshot when filter
+    // is on, so we can still return up to `max` matching entries
+    // (the ring is bounded; pulling everything is cheap and the
+    // filter is applied client-side here).
+    let snapshot_cap = if op_filter.is_some() {
+        FS_AUDIT_RING_DEFAULT
+    } else {
+        max
+    };
+    let entries = jail.audit_snapshot(snapshot_cap);
+    let filtered: Vec<FsAuditEntry> = match op_filter.as_deref() {
+        Some(op) => entries
+            .into_iter()
+            .filter(|e| e.op == op)
+            .take(max)
+            .collect(),
+        None => entries.into_iter().take(max).collect(),
+    };
+    let count = filtered.len();
     let mut buf = String::new();
-    for e in entries {
+    for e in filtered {
         let safe_path = e.rel_path.replace(['\t', '\n'], " ");
         let _ = writeln!(
             buf,
@@ -2742,10 +2805,150 @@ mod tests {
         let r = handle_audit_recent(&j, &ctx(b"abc"));
         match r {
             HandlerOutcome::Err(e) => {
-                assert!(e.cause.contains("positive integer"));
+                assert!(e.cause.contains("positive integer") || e.cause.contains("JSON"));
             }
             _ => panic!("expected Err"),
         }
+    }
+
+    // ── PH-FS-AUDIT-FILTER: op-filter on tool.fs.audit_recent ─────
+
+    #[test]
+    fn audit_filter_json_op_write_only_returns_writes() {
+        let (_td, j) = mk_jail();
+        // Mix of ops via the high-level handlers.
+        handle_write(&j, &ctx(b"a.txt|overwrite|hi"));
+        handle_append(&j, &ctx(b"a.txt|world"));
+        handle_write(&j, &ctx(b"b.txt|overwrite|x"));
+        // Filter to write only.
+        let r = handle_audit_recent(&j, &ctx(br#"{"op":"write"}"#));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        // 2 write rows + count=2 trailer.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "count=2");
+        for row in &lines[..lines.len() - 1] {
+            assert!(row.contains("\twrite\t"), "non-write row leaked: {row}");
+        }
+    }
+
+    #[test]
+    fn audit_filter_json_op_append_excludes_writes() {
+        let (_td, j) = mk_jail();
+        handle_write(&j, &ctx(b"a.txt|overwrite|hi"));
+        handle_append(&j, &ctx(b"a.txt|world\n"));
+        let r = handle_audit_recent(&j, &ctx(br#"{"op":"append"}"#));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.last().unwrap(), &"count=1");
+        assert!(lines[0].contains("\tappend\t"));
+    }
+
+    #[test]
+    fn audit_filter_json_with_max_caps_post_filter() {
+        let (_td, j) = mk_jail();
+        for i in 0..5 {
+            handle_write(&j, &ctx(format!("f{i}.txt|overwrite|x").as_bytes()));
+        }
+        let r = handle_audit_recent(&j, &ctx(br#"{"max":3,"op":"write"}"#));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.last().unwrap(), &"count=3");
+    }
+
+    #[test]
+    fn audit_filter_json_unknown_op_rejected() {
+        let (_td, j) = mk_jail();
+        let r = handle_audit_recent(&j, &ctx(br#"{"op":"frobnicate"}"#));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("unknown op"));
+                assert!(e.cause.contains("frobnicate"));
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn audit_filter_legacy_integer_form_still_works() {
+        let (_td, j) = mk_jail();
+        handle_write(&j, &ctx(b"a.txt|overwrite|x"));
+        handle_write(&j, &ctx(b"b.txt|overwrite|y"));
+        // Pure integer arg — backward-compatible path.
+        let r = handle_audit_recent(&j, &ctx(b"5"));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert_eq!(body.lines().last().unwrap(), "count=2");
+    }
+
+    #[test]
+    fn audit_filter_json_bad_shape_rejected() {
+        let (_td, j) = mk_jail();
+        // Starts with `{` so JSON path; payload is invalid JSON.
+        let r = handle_audit_recent(&j, &ctx(b"{not json"));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("bad JSON"));
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn audit_filter_json_zero_max_rejected() {
+        let (_td, j) = mk_jail();
+        let r = handle_audit_recent(&j, &ctx(br#"{"max":0}"#));
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("max must be > 0"));
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn audit_filter_json_op_only_no_max_uses_default() {
+        let (_td, j) = mk_jail();
+        // Push 10 writes; default max should cover them all.
+        for i in 0..10 {
+            handle_write(&j, &ctx(format!("f{i}.txt|overwrite|x").as_bytes()));
+        }
+        let r = handle_audit_recent(&j, &ctx(br#"{"op":"write"}"#));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert_eq!(body.lines().last().unwrap(), "count=10");
+    }
+
+    #[test]
+    fn audit_filter_json_fuzzy_replace_op_matches() {
+        let (td, j) = mk_jail();
+        let p = td.path().join("code.txt");
+        std::fs::write(&p, "fn a() {}\nfn b() {}\n").unwrap();
+        let arg = "code.txt|fn b() {}|fn B() {}";
+        handle_fuzzy_replace(&j, &ctx(arg.as_bytes()));
+        // Mix in a plain write so the filter has to work.
+        handle_write(&j, &ctx(b"other.txt|overwrite|hi"));
+        let r = handle_audit_recent(&j, &ctx(br#"{"op":"fuzzy_replace"}"#));
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.last().unwrap(), &"count=1");
+        assert!(lines[0].contains("\tfuzzy_replace\t"));
     }
 
     // ── PH-FS-FUZZY: tool.fuzzy_replace ────────────────────────────
