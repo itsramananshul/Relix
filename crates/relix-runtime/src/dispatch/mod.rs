@@ -98,6 +98,15 @@ pub struct DispatchBridge {
 /// PH-DISP1: per-capability counters. Counts are lifetime —
 /// reset on bridge restart. The dashboard renders these via a
 /// future projection; today they're queryable in-process.
+///
+/// W2-006a extends the counters with latency fields:
+/// `last_elapsed_ms`, `total_elapsed_ms`, `max_elapsed_ms`, and
+/// `latency_samples`. Mean latency is `total_elapsed_ms /
+/// latency_samples` (callers compute it; this struct stays a
+/// dumb counter bag). Latency captures only successful or
+/// handler-errored invocations — policy-denied / unknown-method
+/// attempts don't reach the handler so they have no elapsed
+/// time to record.
 #[derive(Debug, Default, Clone)]
 pub struct CapStats {
     /// Total successful invocations (handler returned Ok).
@@ -117,6 +126,27 @@ pub struct CapStats {
     /// Wall-clock unix seconds of the most recent error
     /// (handler Err OR policy-denied OR unknown_method).
     pub last_error_at: Option<i64>,
+    /// W2-006a: elapsed_ms of the most recent dispatched
+    /// invocation (Ok or Err). 0 when no invocation has
+    /// completed yet — distinguishable from a real 0ms call by
+    /// `latency_samples == 0`.
+    pub last_elapsed_ms: u64,
+    /// W2-006a: rolling max of the per-call elapsed_ms across
+    /// every Ok or Err invocation. Useful for "is anything
+    /// hanging?" at-a-glance.
+    pub max_elapsed_ms: u64,
+    /// W2-006a: sum of elapsed_ms across every Ok or Err
+    /// invocation. Divide by `latency_samples` for mean.
+    /// Saturates on overflow (u64 is more than enough for
+    /// realistic operator workloads, but the saturating
+    /// arithmetic stays defensive).
+    pub total_elapsed_ms: u64,
+    /// W2-006a: number of Ok+Err invocations recorded — the
+    /// denominator for mean latency. Distinct from
+    /// `invocations + errors` only because policy-denied /
+    /// unknown_method don't contribute (no handler call → no
+    /// elapsed time).
+    pub latency_samples: u64,
 }
 
 impl DispatchBridge {
@@ -158,6 +188,21 @@ impl DispatchBridge {
     /// PH-DISP1: internal helper. Bumps the counter row for
     /// `method` according to the outcome bucket.
     fn bump_stats(&self, method: &str, bucket: StatBucket, now: i64) {
+        self.bump_stats_with_latency(method, bucket, now, None);
+    }
+
+    /// W2-006a: variant that also records per-call elapsed_ms
+    /// for Ok / Err invocations. Denied / Unknown buckets don't
+    /// have a handler call so the elapsed argument is ignored
+    /// (callers may still pass `Some` for ergonomics; we skip
+    /// the update).
+    fn bump_stats_with_latency(
+        &self,
+        method: &str,
+        bucket: StatBucket,
+        now: i64,
+        elapsed_ms: Option<u64>,
+    ) {
         let mut g = self
             .capability_stats
             .write()
@@ -180,6 +225,15 @@ impl DispatchBridge {
                 row.unknown_method = row.unknown_method.saturating_add(1);
                 row.last_error_at = Some(now);
             }
+        }
+        // Latency only meaningful for Ok / Err (handler ran).
+        if matches!(bucket, StatBucket::Ok | StatBucket::Err)
+            && let Some(ms) = elapsed_ms
+        {
+            row.last_elapsed_ms = ms;
+            row.max_elapsed_ms = row.max_elapsed_ms.max(ms);
+            row.total_elapsed_ms = row.total_elapsed_ms.saturating_add(ms);
+            row.latency_samples = row.latency_samples.saturating_add(1);
         }
     }
 
@@ -291,7 +345,14 @@ impl DispatchBridge {
             request_id: req.rid,
             args: req.args.to_vec(),
         };
+        // W2-006a: capture per-call elapsed_ms. Instant::now
+        // straddles only the handler invocation — admission /
+        // policy / audit are explicitly NOT included so the
+        // operator-visible latency reflects user code, not the
+        // bridge's overhead.
+        let dispatch_started = std::time::Instant::now();
         let outcome = handler.invoke(ctx).await;
+        let elapsed_ms = dispatch_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
         // === Admission step 11: audit ===
         let (result, status, error_kind) = match outcome {
@@ -307,12 +368,13 @@ impl DispatchBridge {
             ),
         };
         // PH-DISP1: count the dispatched outcome.
+        // W2-006a: also record latency for Ok / Err.
         let bucket = if matches!(status, AuditStatus::Ok) {
             StatBucket::Ok
         } else {
             StatBucket::Err
         };
-        self.bump_stats(&req.method, bucket, now);
+        self.bump_stats_with_latency(&req.method, bucket, now, Some(elapsed_ms));
         let aid = self
             .write_audit(
                 &req,
@@ -898,6 +960,10 @@ mod tests {
         assert_eq!(stats.unknown_method, 0);
         assert!(stats.last_invoked_at > 0);
         assert!(stats.last_error_at.is_none());
+        // W2-006a: latency fields populated by every Ok dispatch.
+        assert_eq!(stats.latency_samples, 3);
+        assert!(stats.total_elapsed_ms >= stats.last_elapsed_ms);
+        assert!(stats.max_elapsed_ms >= stats.last_elapsed_ms);
     }
 
     #[tokio::test]
