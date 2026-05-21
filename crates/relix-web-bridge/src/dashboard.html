@@ -5139,11 +5139,27 @@ function renderDetail(l) {
     { id: 'pause',      label: 'pause' },
     { id: 'lifecycle',  label: 'lifecycle' },
   ];
+  // W2-003d: per-category counts over the attempt-scoped
+  // events (so the chip counts respect the attempt filter
+  // but ignore the category filter itself — otherwise
+  // every non-active chip would always read "(0)").
+  const catCounts = { '': attemptScoped.length };
+  for (const e of attemptScoped) {
+    const c = chronicleCategory(e);
+    catCounts[c] = (catCounts[c] || 0) + 1;
+  }
   const chipsHtml = chronCats.map(c => {
     const active = c.id === chronicleCategoryFilter ? ' active' : '';
+    const n = catCounts[c.id] || 0;
+    // Dim zero-count non-active chips so the eye lands
+    // on categories that actually have events. The chip
+    // is still clickable (toggles the filter to that
+    // category, which simply shows "no events match").
+    const dim = (n === 0 && !active) ? ' style="opacity: 0.45;"' : '';
+    const label = escapeHtml(c.label) + ' (' + n + ')';
     return '<button class="chip' + active
-      + '" data-chronicle-cat="' + escapeHtml(c.id) + '">'
-      + escapeHtml(c.label) + '</button>';
+      + '" data-chronicle-cat="' + escapeHtml(c.id) + '"'
+      + dim + '>' + label + '</button>';
   }).join('');
   const clearTextChip = chronicleTextFilter
     ? '<button class="chip" data-action="clear-chronicle-text" title="clear text filter">clear text ×</button>'
