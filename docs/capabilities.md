@@ -50,6 +50,7 @@ before the backend (visibility + stable contract + honesty).
 | Anthropic extended thinking (PH-WAVE2F) | live | Opt-in `thinking_budget_tokens` on ChatInput |
 | `FailoverReason` classifier (H1) | live | 12 categories + retry hint |
 | `NoopRouter` / `ProviderRouter` trait (PH-ROUTER1) | live | Foundation for future smart router; preserves single-provider behavior |
+| `HealthAwareRouter` + `ProviderHealth` (PH-ROUTER2) | live | Health-aware router that filters cooldown/quarantined providers and ranks by success_ratio; falls back to best ratio when all unhealthy |
 
 ## Tool node (`crates/relix-runtime/src/nodes/tool/`)
 

@@ -59,7 +59,9 @@ pub mod router;
 pub use failover::{
     FailoverCategory, FailoverReason, classify_http_failure, classify_transport_failure,
 };
-pub use router::{NoopRouter, ProviderRouter, RouteCandidate, RouteDecision};
+pub use router::{
+    HealthAwareRouter, NoopRouter, ProviderHealth, ProviderRouter, RouteCandidate, RouteDecision,
+};
 
 use std::sync::Arc;
 
