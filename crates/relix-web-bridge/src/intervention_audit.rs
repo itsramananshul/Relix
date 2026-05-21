@@ -161,7 +161,13 @@ impl InterventionAudit {
         correlation_id: impl Into<String>,
     ) {
         let ts = unix_secs();
-        let detail = clamp_detail(detail.into());
+        // H9: redact known-shape secrets before persisting. Same
+        // boundary discipline as chronicle writes (H8) — the
+        // audit log is operator-readable forever, so a leak here
+        // is just as bad as one in the chronicle. Clamp AFTER
+        // redaction so the redaction marker is never truncated
+        // mid-token.
+        let detail = clamp_detail(relix_core::redact::redact_secrets(&detail.into()));
         let actor = clamp_detail(actor.into());
         let entry = {
             let mut g = self.inner.write().expect("intervention write lock");
@@ -372,6 +378,39 @@ mod tests {
         let line = body.lines().next().expect("at least one line");
         let parsed: InterventionEntry = serde_json::from_str(line).expect("parse");
         assert_eq!(parsed.correlation_id, corr);
+    }
+
+    #[test]
+    fn record_redacts_secrets_in_detail_before_persist() {
+        // H9: a pasted API key in the detail field must NOT land
+        // in the in-memory ring OR the on-disk JSONL. Same posture
+        // as the chronicle write boundary (H8). Operators who
+        // grep their audit log a year later shouldn't see live
+        // secrets.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("intervention.jsonl");
+        let a = InterventionAudit::new(Some(path.clone()));
+        a.record(
+            "anon",
+            "provider_test",
+            "openai",
+            "ok",
+            "tried FAKE_TEST_FIXTURE_REDACTED",
+        );
+        let snap = a.snapshot();
+        assert!(
+            !snap[0].detail.contains("sk-abcdef"),
+            "raw key leaked into ring: {}",
+            snap[0].detail
+        );
+        assert!(snap[0].detail.contains("[REDACTED:OPENAI_KEY]"));
+        // Disk file must be redacted too.
+        let body = std::fs::read_to_string(&path).expect("read jsonl");
+        assert!(
+            !body.contains("sk-abcdef"),
+            "raw key leaked to disk: {body}"
+        );
+        assert!(body.contains("[REDACTED:OPENAI_KEY]"));
     }
 
     #[test]
