@@ -517,10 +517,16 @@ impl TaskStore {
             args.push(v.into());
         }
         if let Some(v) = error_cause {
+            // H10: redact known-shape secrets in error_cause /
+            // last_failure_reason before persisting. Provider
+            // error messages often quote `Authorization: Bearer ...`
+            // headers or bare keys; without redaction those land
+            // in the tasks row + chronicle forever.
+            let safe = relix_core::redact::redact_secrets(v);
             sets.push("error_cause = ?");
-            args.push(v.to_string().into());
+            args.push(safe.clone().into());
             sets.push("last_failure_reason = ?");
-            args.push(v.to_string().into());
+            args.push(safe.into());
         }
         // H4: anti-thrash counter. When a new failure_class arrives,
         // compare it against the prior value on the row. Bumping vs
@@ -1570,6 +1576,12 @@ impl TaskStore {
                 r.len()
             )));
         }
+        // H10: scrub secrets from operator-supplied reason text
+        // (same boundary discipline as H8 operator_note +
+        // investigation_marker reasons).
+        let redacted_reason: Option<String> =
+            trimmed_reason.map(relix_core::redact::redact_secrets);
+        let safe_reason: Option<&str> = redacted_reason.as_deref();
         let now = unix_secs();
         let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let prior_status: Option<String> = conn
@@ -1609,7 +1621,7 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         let payload_json = serde_json::json!({
             "prior_status": prior_status,
-            "reason": trimmed_reason,
+            "reason": safe_reason,
             "author": author_subject_id,
             // M70: intent vs ack. This is the REQUEST event;
             // the matching `task.pause_observed` (M70) lands
@@ -1619,7 +1631,7 @@ impl TaskStore {
             "intent": "request",
         })
         .to_string();
-        let legacy = match trimmed_reason {
+        let legacy = match safe_reason {
             Some(r) => format!("from {prior_status} · gen={new_pause_generation} · {r}"),
             None => format!("from {prior_status} · gen={new_pause_generation}"),
         };
@@ -1778,6 +1790,11 @@ impl TaskStore {
                 r.len()
             )));
         }
+        // H10: same redaction posture as set_paused (H10) / H8
+        // operator_note / H8 investigation_marker.
+        let redacted_reason: Option<String> =
+            trimmed_reason.map(relix_core::redact::redact_secrets);
+        let safe_reason: Option<&str> = redacted_reason.as_deref();
         let now = unix_secs();
         let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
         let prior_status: Option<String> = conn
@@ -1804,7 +1821,7 @@ impl TaskStore {
                    updated_at = ?2,
                    freeze_generation = freeze_generation + 1
              WHERE task_id = ?1",
-            params![task_id, now, trimmed_reason],
+            params![task_id, now, safe_reason],
         )
         .map_err(CoordinatorError::Db)?;
         let new_freeze_generation: i64 = tx
@@ -1816,13 +1833,13 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         let payload_json = serde_json::json!({
             "prior_status": prior_status,
-            "reason": trimmed_reason,
+            "reason": safe_reason,
             "author": author_subject_id,
             "freeze_generation": new_freeze_generation,
             "intent": "request",
         })
         .to_string();
-        let legacy = match trimmed_reason {
+        let legacy = match safe_reason {
             Some(r) => format!("from {prior_status} · gen={new_freeze_generation} · {r}"),
             None => format!("from {prior_status} · gen={new_freeze_generation}"),
         };
@@ -6153,6 +6170,80 @@ mod tests {
         assert!(!ev.payload.contains("ghp_abcdef"));
         let pj = ev.payload_json.as_deref().unwrap();
         assert!(!pj.contains("ghp_abcdef"));
+    }
+
+    // ── H10: redaction sweep across pause/freeze/error_cause ──────────
+
+    #[test]
+    fn set_paused_reason_redacted_before_persist() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(&tid, Some("running"), None, None, None, None, None, None)
+            .unwrap();
+        s.set_paused(
+            &tid,
+            Some("pausing — pasted FAKE_TEST_FIXTURE_REDACTED by mistake"),
+            "op",
+        )
+        .unwrap();
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let ev = events
+            .iter()
+            .rfind(|e| e.event_type == "task.pause_requested")
+            .expect("pause_requested event missing");
+        assert!(
+            !ev.payload.contains("sk-abcdef"),
+            "raw key in legacy payload: {}",
+            ev.payload
+        );
+        let pj = ev.payload_json.as_deref().unwrap();
+        assert!(!pj.contains("sk-abcdef"), "raw key in payload_json: {pj}");
+        assert!(pj.contains("[REDACTED:OPENAI_KEY]"));
+    }
+
+    #[test]
+    fn set_frozen_reason_redacted_before_persist() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.set_frozen(&tid, Some("freeze: env had ghp_abcdefghij1234567890"), "op")
+            .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        // tasks.frozen_reason must be redacted too.
+        let fr = v.frozen_reason.unwrap_or_default();
+        assert!(!fr.contains("ghp_abcdef"), "raw PAT in task row: {fr}");
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let ev = events
+            .iter()
+            .rfind(|e| e.event_type == "task.freeze_requested")
+            .expect("freeze_requested event missing");
+        assert!(!ev.payload.contains("ghp_abcdef"));
+    }
+
+    #[test]
+    fn update_error_cause_redacted_before_persist() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("provider responded HTTP 401: invalid Authorization: Bearer eyJhbGciOiJIUzI1NiJ9zzzzzzz"),
+            Some("auth"),
+        )
+        .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        let cause = v.error_cause.unwrap_or_default();
+        assert!(
+            !cause.contains("eyJhbGc"),
+            "raw token in error_cause: {cause}"
+        );
+        assert!(cause.contains("[REDACTED:BEARER_TOKEN]"));
+        let last = v.last_failure_reason.unwrap_or_default();
+        assert!(!last.contains("eyJhbGc"));
+        assert!(last.contains("[REDACTED:BEARER_TOKEN]"));
     }
 
     // ── H7: orphan attempt cleanup ────────────────────────────────────
