@@ -266,6 +266,18 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.retry utf8: {e}"))
     }
 
+    /// Operator-authored chronicle annotation (M60). Appends a
+    /// `task.operator_note` event with the supplied text. The
+    /// coordinator surfaces the bridge's verified caller
+    /// identity as the note's `author` field — the bridge
+    /// doesn't need to pass an explicit author. Returns the
+    /// coordinator body verbatim (`event_id=N`).
+    pub async fn note(&self, task_id: &str, note: &str) -> Result<String, String> {
+        let arg = format!("{task_id}|{note}");
+        let bytes = self.call("task.note", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.note utf8: {e}"))
+    }
+
     /// Operator-triggered cancellation. Two steps:
     ///
     /// 1. Append a `task.cancelled` event with the operator-

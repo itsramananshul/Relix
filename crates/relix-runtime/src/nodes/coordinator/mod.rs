@@ -1113,6 +1113,80 @@ impl TaskStore {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Append an operator-authored note as a structured
+    /// `task.operator_note` chronicle event (M60). The note
+    /// becomes part of the immutable task history and is
+    /// surfaced alongside runtime events in any
+    /// `task.events` / `task.export` consumer.
+    ///
+    /// `note` must be non-empty after trimming and is capped
+    /// at `MAX_OPERATOR_NOTE_LEN` bytes; longer text is
+    /// rejected with `Invalid` rather than silently truncated
+    /// (operators should know).
+    ///
+    /// `author_subject_id` is the verified caller's
+    /// subject_id — the bridge passes through `ctx.caller`,
+    /// so the recorded author matches the admission-audit
+    /// caller for the same RPC.
+    ///
+    /// Returns the new event_id so callers can deep-link
+    /// into the chronicle.
+    pub fn append_operator_note(
+        &self,
+        task_id: &str,
+        note: &str,
+        author_subject_id: &str,
+    ) -> Result<i64, CoordinatorError> {
+        let trimmed = note.trim();
+        if trimmed.is_empty() {
+            return Err(CoordinatorError::Invalid(
+                "task.note: note text required (non-empty after trim)".to_string(),
+            ));
+        }
+        if trimmed.len() > MAX_OPERATOR_NOTE_LEN {
+            return Err(CoordinatorError::Invalid(format!(
+                "task.note: note exceeds {MAX_OPERATOR_NOTE_LEN} bytes (got {})",
+                trimmed.len()
+            )));
+        }
+        let now = unix_secs();
+        let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .map_err(CoordinatorError::Db)?;
+        if exists == 0 {
+            return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+        // Structured envelope. Author + ts let the dashboard
+        // render notes consistently with retry/cancel events.
+        // The legacy `payload` string carries the trimmed note
+        // verbatim so older grep-driven CLIs see the text;
+        // payload_json carries the typed envelope.
+        let payload_json = serde_json::json!({
+            "note": trimmed,
+            "author": author_subject_id,
+        })
+        .to_string();
+        let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+        insert_typed_event(
+            &tx,
+            task_id,
+            now,
+            "task.operator_note",
+            trimmed,
+            None,
+            None,
+            Some(&payload_json),
+        )?;
+        let event_id = tx.last_insert_rowid();
+        tx.commit().map_err(CoordinatorError::Db)?;
+        Ok(event_id)
+    }
+
     /// Read one Task plus its event chronicle. Returns `None` when the
     /// task id is unknown.
     pub fn get(&self, task_id: &str) -> Result<Option<TaskView>, CoordinatorError> {
@@ -1846,6 +1920,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_recent_edges(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.note",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_note(&s, &ctx) }
             })),
         );
     }
@@ -2632,6 +2716,47 @@ fn handle_recover(store: &TaskStore, _ctx: &InvocationCtx) -> HandlerOutcome {
     }
 }
 
+/// Hard cap on a single operator note's length. Picked to
+/// fit a paragraph of triage context (a few sentences) without
+/// inviting people to dump multi-KB logs into the chronicle —
+/// that's what `task.export` + on-disk grep are for.
+pub const MAX_OPERATOR_NOTE_LEN: usize = 2_000;
+
+/// `task.note` — operator-authored chronicle annotation. Args:
+/// `task_id|note_text`. The note text may contain `|` (splitn(2)
+/// keeps the remainder intact). The author is taken from
+/// `ctx.caller.subject_id` so the recorded note matches the
+/// admission-audit caller for the same RPC.
+///
+/// Returns `event_id=N\n` on success so callers can deep-link
+/// into the chronicle. INVALID_ARGS when:
+/// - args malformed (missing `|` separator)
+/// - task_id empty
+/// - note text empty after trim
+/// - note text exceeds [`MAX_OPERATOR_NOTE_LEN`]
+fn handle_note(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.note utf8: {e}")),
+    };
+    let mut parts = s.splitn(2, '|');
+    let task_id = parts.next().unwrap_or("");
+    let note = parts.next().unwrap_or("");
+    if task_id.is_empty() {
+        return invalid("task.note: task_id required (arg shape: task_id|note)".to_string());
+    }
+    if note.is_empty() {
+        return invalid("task.note: note text required (arg shape: task_id|note)".to_string());
+    }
+    let author = ctx.caller.subject_id.to_string();
+    match store.append_operator_note(task_id, note, &author) {
+        Ok(event_id) => HandlerOutcome::Ok(format!("event_id={event_id}\n").into_bytes()),
+        Err(CoordinatorError::NotFound(id)) => invalid(format!("task.note: not found: {id}")),
+        Err(CoordinatorError::Invalid(msg)) => invalid(msg),
+        Err(e) => internal(format!("task.note: {e}")),
+    }
+}
+
 /// Render a TaskView as a multi-line `key=value` block followed by an
 /// `events:` JSON array. Stable + grep-friendly for `relix-cli task get`.
 fn render_task_view(v: &TaskView) -> String {
@@ -3189,6 +3314,13 @@ pub enum CoordinatorError {
     /// Task id has no matching row.
     #[error("task not found: {0}")]
     NotFound(String),
+    /// Caller-supplied input failed a TaskStore-level validation
+    /// (empty required field, oversize input, etc.). Mapped to
+    /// `INVALID_ARGS` at the handler boundary so the caller
+    /// sees a user-friendly message rather than a generic
+    /// internal error.
+    #[error("invalid: {0}")]
+    Invalid(String),
 }
 
 #[cfg(test)]
@@ -5024,6 +5156,74 @@ mod tests {
             elapsed.as_secs() < 5,
             "incremental 5000-event walk took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn append_operator_note_writes_typed_event() {
+        // M60: the note lands as a typed `task.operator_note`
+        // event with payload_json carrying author + note. The
+        // legacy `payload` string carries the trimmed note so
+        // older grep-driven CLIs see it directly.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let event_id = s
+            .append_operator_note(&tid, "  investigate after lunch  ", "subj-anshul")
+            .unwrap();
+        assert!(event_id > 0);
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let note_ev = events
+            .iter()
+            .find(|e| e.event_type == "task.operator_note")
+            .expect("note event missing");
+        assert_eq!(note_ev.payload, "investigate after lunch");
+        let pj = note_ev
+            .payload_json
+            .as_deref()
+            .expect("payload_json should be populated");
+        let parsed: serde_json::Value = serde_json::from_str(pj).unwrap();
+        assert_eq!(parsed["note"], "investigate after lunch");
+        assert_eq!(parsed["author"], "subj-anshul");
+    }
+
+    #[test]
+    fn append_operator_note_rejects_empty_and_oversize_input() {
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Empty after trim.
+        let err = s.append_operator_note(&tid, "   ", "sub").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+        // Oversize.
+        let big = "a".repeat(MAX_OPERATOR_NOTE_LEN + 1);
+        let err = s.append_operator_note(&tid, &big, "sub").unwrap_err();
+        assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn append_operator_note_rejects_unknown_task_id() {
+        let s = store();
+        let err = s
+            .append_operator_note("deadbeef", "valid note", "sub")
+            .unwrap_err();
+        assert!(matches!(err, CoordinatorError::NotFound(id) if id == "deadbeef"));
+    }
+
+    #[test]
+    fn append_operator_note_preserves_pipe_chars_in_text() {
+        // The wire format is `task_id|note`, but the bridge
+        // splits with splitn(2), so the note may contain `|`.
+        // The append helper takes a plain &str — verify the
+        // store doesn't sanitise pipes out of the recorded
+        // value.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        let note = "key=value | other=thing";
+        s.append_operator_note(&tid, note, "sub").unwrap();
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let note_ev = events
+            .iter()
+            .find(|e| e.event_type == "task.operator_note")
+            .expect("note event missing");
+        assert_eq!(note_ev.payload, note);
     }
 
     #[test]

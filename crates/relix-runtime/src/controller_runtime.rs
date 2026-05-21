@@ -450,6 +450,14 @@ fn register_node_type_handlers(
                 &["task", "read", "graph", "lineage", "operator"],
             ),
             (
+                "task.note",
+                "Append an operator-authored annotation to a Task's \
+                 chronicle as a `task.operator_note` event. The note \
+                 becomes part of the immutable history; the author \
+                 is taken from the verified caller's subject_id.",
+                &["task", "write", "annotate", "operator"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -485,7 +493,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note"
         );
     }
     if cfg.controller.node_type == "tool" {

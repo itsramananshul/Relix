@@ -619,6 +619,130 @@ pub async fn retry(
     Ok(Json(parsed))
 }
 
+// ── M60: operator notes ────────────────────────────────────
+
+/// Hard cap on bridge-side note body length. Tighter than the
+/// coordinator's `MAX_OPERATOR_NOTE_LEN` so a misbehaving
+/// dashboard client doesn't waste a coord round-trip just to
+/// be rejected. Mirror the coord constant if it shrinks.
+const NOTE_BRIDGE_MAX_LEN: usize = 2_000;
+
+#[derive(Debug, Deserialize)]
+pub struct NoteReq {
+    /// The annotation text. Non-empty after trimming; capped
+    /// at NOTE_BRIDGE_MAX_LEN bytes. Control chars (NUL, etc.)
+    /// rejected so a pathological dashboard input can't break
+    /// downstream chronicle renderers.
+    pub note: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoteResp {
+    pub task_id: String,
+    /// Coordinator-assigned event_id so the dashboard can
+    /// scroll the chronicle to the new note immediately.
+    pub event_id: i64,
+}
+
+/// `POST /v1/tasks/:id/note` — append an operator annotation
+/// to a task's chronicle. Validates the note body bridge-side
+/// (length, control chars), forwards to the Coordinator's
+/// `task.note` capability, and records the action into the
+/// intervention audit ring.
+pub async fn note(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<NoteReq>,
+) -> Result<Json<NoteResp>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        state
+            .intervention_audit
+            .record("anon", "task_note", &id, "error", "no coordinator");
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let trimmed = req.note.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "note: required (non-empty after trim)".into(),
+            }),
+        ));
+    }
+    if trimmed.len() > NOTE_BRIDGE_MAX_LEN {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiError {
+                error: format!(
+                    "note: too long (max {NOTE_BRIDGE_MAX_LEN} bytes, got {})",
+                    trimmed.len()
+                ),
+            }),
+        ));
+    }
+    // Reject control chars (except common whitespace) so a
+    // pathological client can't ship NULs into the chronicle.
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "note: must not contain control characters".into(),
+            }),
+        ));
+    }
+    let body = match rec.note(&id, trimmed).await {
+        Ok(b) => b,
+        Err(e) => {
+            state.intervention_audit.record(
+                "anon",
+                "task_note",
+                &id,
+                "error",
+                format!("coord task.note failed: {e}"),
+            );
+            return Err((gateway_status_for(&e), Json(ApiError { error: e })));
+        }
+    };
+    let event_id: i64 = body
+        .lines()
+        .find_map(|l| l.strip_prefix("event_id="))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    // Short preview in the audit detail — full text lives in
+    // the chronicle event itself.
+    let preview = if trimmed.len() <= 80 {
+        trimmed.to_string()
+    } else {
+        let mut end = 80;
+        while !trimmed.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}…", &trimmed[..end])
+    };
+    state.intervention_audit.record(
+        "anon",
+        "task_note",
+        &id,
+        "ok",
+        format!("event_id={event_id} · {preview}"),
+    );
+    Ok(Json(NoteResp {
+        task_id: id,
+        event_id,
+    }))
+}
+
 fn parse_failure_class_from_body(body: &str) -> Option<String> {
     body.lines()
         .find_map(|line| line.strip_prefix("last_failure_class="))

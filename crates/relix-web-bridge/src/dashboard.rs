@@ -502,6 +502,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_action_note_button_present() {
+        // M60 (Track B): task detail panel ships an "Add note"
+        // button that posts to /v1/tasks/:id/note. The
+        // coordinator records the note as a structured
+        // `task.operator_note` chronicle event with the
+        // verified caller as the author.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="action-note""#),
+            "action-note button missing"
+        );
+        assert!(
+            body.contains("function requestNote"),
+            "requestNote handler missing"
+        );
+        // Dashboard should hit the POST /v1/tasks/:id/note
+        // endpoint shape registered in main.rs.
+        assert!(
+            body.contains("encodeURIComponent(taskId) + '/note'"),
+            "note endpoint URL missing from requestNote"
+        );
+    }
+
+    #[tokio::test]
     async fn page_intervention_audit_panel_present() {
         // M57 (Track B): overview ships a real operator
         // intervention audit panel. Pulls from

@@ -241,6 +241,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tasks/recover", post(tasks::recover))
         .route("/v1/tasks/:id/retry", post(tasks::retry))
         .route("/v1/tasks/:id/cancel", post(tasks::cancel))
+        // Operator-authored annotation as a chronicle event
+        // (M60). Body: {note: string}. The Coordinator records
+        // the verified caller's subject_id as the note's
+        // author; the bridge records the call in the
+        // intervention audit ring too.
+        .route("/v1/tasks/:id/note", post(tasks::note))
         // T4 P2: capability discovery as JSON. Translation-only —
         // pure projection of the bridge's already-discovered
         // manifest cache (no extra mesh I/O).

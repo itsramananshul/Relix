@@ -1789,6 +1789,7 @@
             <div class="card-actions" id="detail-actions" style="display:none;">
               <button id="action-export">Export</button>
               <button id="action-retry">Retry</button>
+              <button id="action-note">Add note</button>
               <button id="action-cancel" class="btn-danger">Cancel</button>
               <button id="action-recover">Recover</button>
             </div>
@@ -3092,8 +3093,43 @@ function initTasks() {
     if (!selectedTaskId) return;
     await requestCancel(selectedTaskId);
   });
+  document.getElementById('action-note').addEventListener('click', async () => {
+    if (!selectedTaskId) return;
+    await requestNote(selectedTaskId);
+  });
 
   tasksInited = true;
+}
+
+async function requestNote(taskId) {
+  const note = prompt(
+    'Operator note — appended to the task chronicle as a '
+    + '`task.operator_note` event. The author is recorded as '
+    + 'the verified caller (the bridge identity) on the '
+    + 'coordinator side. Max ~2000 chars.',
+    ''
+  );
+  if (note === null) return;
+  const trimmed = note.trim();
+  if (!trimmed) {
+    toast('note: empty input, nothing recorded', 'warn');
+    return;
+  }
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/note', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: trimmed }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    toast('note appended · event_id ' + (body.event_id || '?'), 'ok');
+    // Re-fetch the task detail so the new chronicle event
+    // appears immediately. Best-effort.
+    loadDetail(taskId);
+  } catch (e) {
+    toast('note failed: ' + String(e.message || e), 'error');
+  }
 }
 
 async function requestCancel(taskId) {
