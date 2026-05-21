@@ -3416,6 +3416,24 @@ function renderGlobalFirehose(errored) {
       ? filtered.length + ' of ' + firehoseRing.length + ' shown'
       : '';
   }
+  // PH-DASH1: pre-format a clean JSON pretty-print for the
+  // inline drill-in. Falls back to the raw payload string when
+  // payload_json is absent. Computed once per render pass so the
+  // click-to-expand handler doesn't have to re-parse on every
+  // toggle.
+  function eventDetailBody(e) {
+    if (e.payload_json && typeof e.payload_json === 'object') {
+      try { return JSON.stringify(e.payload_json, null, 2); }
+      catch (_) { /* fall through */ }
+    }
+    if (typeof e.payload_json === 'string' && e.payload_json.length) {
+      try {
+        const obj = JSON.parse(e.payload_json);
+        return JSON.stringify(obj, null, 2);
+      } catch (_) { return e.payload_json; }
+    }
+    return e.payload || '(no payload)';
+  }
   const rows = filtered.map(e => {
     const ago = fmtDuration(Math.max(0, nowSecs - (e.ts || 0))) + ' ago';
     const taskCell = '<a href="#/tasks/' + encodeURIComponent(e.task_id || '')
@@ -3427,18 +3445,48 @@ function renderGlobalFirehose(errored) {
     const summary = e.summary && e.summary.length
       ? e.summary
       : (e.payload || '').slice(0, 80);
-    return '<tr>'
+    // PH-DASH1: stable row-id so click-to-expand can find the
+    // matching detail row. Composite of task_id + event_id so
+    // it's globally unique within the ring.
+    const rowId = (e.task_id || 'nt') + '-' + (e.event_id || 0);
+    const detail = escapeHtml(eventDetailBody(e));
+    return '<tr class="evrow" data-evrow-id="' + escapeHtml(rowId) + '" style="cursor: pointer;">'
       + '<td class="meta">' + escapeHtml(ago) + '</td>'
       + '<td>' + taskCell + '</td>'
       + '<td><code>' + escapeHtml(e.event_type || '') + '</code></td>'
       + '<td class="meta">' + escapeHtml(String(e.event_id || '')) + '</td>'
       + '<td class="summary">' + escapeHtml(summary) + '</td>'
+      + '</tr>'
+      + '<tr class="evrow-detail" data-evrow-detail-id="' + escapeHtml(rowId) + '" style="display: none;">'
+      + '<td colspan="5" style="padding: 8px 14px; background: var(--bg-1); border-top: 1px solid var(--border);">'
+      + '<pre style="margin: 0; font-size: 11px; white-space: pre-wrap; word-break: break-word; color: var(--dim);">'
+      + detail
+      + '</pre>'
+      + '</td>'
       + '</tr>';
   }).join('');
   $host.innerHTML = '<table class="data"><thead><tr>'
     + '<th>when</th><th>task</th><th>event_type</th>'
     + '<th>event_id</th><th>summary</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  // PH-DASH1: wire click-to-expand. One delegated listener on
+  // the tbody so the rows themselves can be re-rendered freely
+  // without re-binding. Toggles the matching detail row.
+  const tbody = $host.querySelector('tbody');
+  if (tbody) {
+    tbody.addEventListener('click', (ev) => {
+      const tr = ev.target.closest('tr.evrow');
+      if (!tr) return;
+      // Ignore clicks that land on the task-id link.
+      if (ev.target.closest('a')) return;
+      const id = tr.getAttribute('data-evrow-id');
+      const detailRow = tbody.querySelector(
+        'tr.evrow-detail[data-evrow-detail-id="' + (id || '').replace(/"/g, '\\"') + '"]'
+      );
+      if (!detailRow) return;
+      detailRow.style.display = detailRow.style.display === 'none' ? '' : 'none';
+    });
+  }
   if ($status) {
     const sseOn = firehoseEventSource
       && firehoseEventSource.readyState === EventSource.OPEN;

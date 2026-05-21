@@ -738,6 +738,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_firehose_row_expansion_present() {
+        // PH-DASH1: every firehose row is clickable + has a
+        // sibling detail row hidden by default. JS wires the
+        // tbody click delegation.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "data-evrow-id",
+            "data-evrow-detail-id",
+            "function eventDetailBody",
+            "evrow-detail",
+        ] {
+            assert!(
+                body.contains(needle),
+                "PH-DASH1 landmark `{needle}` missing"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn page_firehose_filter_input_present() {
         // H12: the firehose card carries an inline filter input
         // + status meta + a renderRows path that respects it.
