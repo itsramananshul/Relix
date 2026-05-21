@@ -9,16 +9,16 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `f570a9b feat(capability): PH-CAP-RISK stage 2 — sweep every shipped descriptor with explicit risk`
+- **HEAD:** `4de4a53 feat(cli): PH-CAP-RISK3 relix-cli capability ls --risk filter`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1064 passing, 0 failures
+- **Workspace tests:** 1074 passing, 0 failures
   - relix-core: 66
   - relix-policy: 66
   - relix-runtime: 657
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
-  - relix-cli: 24
+  - relix-cli: 34
   - relix-web-bridge: 220
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
@@ -50,6 +50,7 @@ as the resume command.
 | a307138 | PH-FS-AUDIT-FILTER | tool.fs.audit_recent JSON arg form with optional op filter |
 | a27e4a3 | PH-CAP-RISK stage 1 | RiskLevel enum + field on CapabilityDescriptor + validator + CLI render |
 | f570a9b | PH-CAP-RISK stage 2 | sweep every shipped descriptor with explicit risk tier |
+| 4de4a53 | PH-CAP-RISK3 | relix-cli capability ls --risk filter (exact + at-or-above) |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
