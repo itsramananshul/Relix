@@ -276,6 +276,107 @@ impl BrowserBackend for WebDriverBackend {
         })
     }
 
+    // W2-002e: live click / type_text / wait_for_selector via
+    // fantoccini. Each method bridges sync→async through the
+    // existing `with_client` helper which already wraps the call
+    // in tokio::time::timeout against `call_timeout`. Errors
+    // map to BackendNotConnected with a webdriver: prefix.
+
+    fn click(&self, session_id: &str, selector: &str) -> Result<(), BrowserError> {
+        let selector = selector.to_string();
+        self.with_client(session_id, move |client| async move {
+            let el = client
+                .find(Locator::Css(&selector))
+                .await
+                .map_err(|e| BrowserError::BackendNotConnected {
+                    reason: format!("webdriver: click find({selector}): {e}"),
+                })?;
+            el.click().await.map_err(|e| BrowserError::BackendNotConnected {
+                reason: format!("webdriver: click({selector}): {e}"),
+            })?;
+            Ok(())
+        })
+    }
+
+    fn type_text(
+        &self,
+        session_id: &str,
+        selector: &str,
+        text: &str,
+    ) -> Result<(), BrowserError> {
+        let selector = selector.to_string();
+        let text = text.to_string();
+        self.with_client(session_id, move |client| async move {
+            let el = client
+                .find(Locator::Css(&selector))
+                .await
+                .map_err(|e| BrowserError::BackendNotConnected {
+                    reason: format!("webdriver: type_text find({selector}): {e}"),
+                })?;
+            // fantoccini's `send_keys` is the WebDriver equivalent
+            // of "type into focused element"; the element click
+                // ahead of it focuses the input (mirrors the HC
+            // backend's focus-click semantics).
+            el.click().await.map_err(|e| BrowserError::BackendNotConnected {
+                reason: format!("webdriver: type_text focus-click({selector}): {e}"),
+            })?;
+            el.send_keys(&text)
+                .await
+                .map_err(|e| BrowserError::BackendNotConnected {
+                    reason: format!(
+                        "webdriver: send_keys({selector}, {} chars): {e}",
+                        text.chars().count()
+                    ),
+                })?;
+            Ok(())
+        })
+    }
+
+    fn wait_for_selector(
+        &self,
+        session_id: &str,
+        selector: &str,
+        timeout_ms: u64,
+    ) -> Result<(), BrowserError> {
+        // Override the with_client wrap so the operator-supplied
+        // timeout governs the wait (NOT the backend-level
+        // call_timeout). This matters: a 60_000ms wait is a
+        // legitimate request that the backend-level 30s budget
+        // would clip.
+        let client = {
+            let guard = self.sessions.lock().expect("wd backend lock");
+            match guard.get(session_id) {
+                Some(s) => s.client.clone(),
+                None => {
+                    return Err(BrowserError::SessionNotFound {
+                        session_id: session_id.to_string(),
+                    });
+                }
+            }
+        };
+        let selector = selector.to_string();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        self.block_on(async move {
+            tokio::time::timeout(
+                timeout,
+                client
+                    .wait()
+                    .at_most(timeout)
+                    .for_element(Locator::Css(&selector)),
+            )
+            .await
+            .map_err(|_| BrowserError::BackendNotConnected {
+                reason: format!(
+                    "webdriver: wait_for_selector({selector}, {timeout_ms}ms) outer timeout"
+                ),
+            })?
+            .map(|_| ())
+            .map_err(|e| BrowserError::BackendNotConnected {
+                reason: format!("webdriver: wait_for_selector({selector}, {timeout_ms}ms): {e}"),
+            })
+        })
+    }
+
     fn list_sessions(&self) -> Result<Vec<BrowserSessionView>, BrowserError> {
         // Snapshot the (id, client clone, opened_at) tuples
         // under the lock; release before we issue WebDriver
