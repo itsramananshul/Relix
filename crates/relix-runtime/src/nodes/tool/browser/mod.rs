@@ -934,16 +934,26 @@ mod tests {
         assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
     }
 
+    /// PH-BROWSER-PW: replaces the prior
+    /// `feature_playwright_compiled_builds_scaffold` test. With
+    /// the live driver, `try_build` returns the real
+    /// `PlaywrightBackend` (still no Node spawn — that happens
+    /// lazily on the first `open_session`) and the canonical
+    /// name surfaces unchanged. We deliberately do NOT call
+    /// `navigate` here: navigate would try to spawn Node, and
+    /// CI hosts without Node would falsely fail this unit test.
+    /// The live integration coverage lives in
+    /// `playwright::tests::live_playwright_navigates_about_blank`.
     #[cfg(feature = "browser-playwright")]
     #[test]
-    fn feature_playwright_compiled_builds_scaffold() {
+    fn feature_playwright_compiled_builds_real_backend() {
         let mut c = cfg();
         c.backend = "playwright".into();
-        let b = build_backend(&c).expect("scaffold should build");
+        let b = build_backend(&c).expect("real backend should build");
         assert_eq!(b.name(), "playwright");
-        let id = b.open_session().expect("session");
-        let err = b.navigate(&id, "https://example.com/").unwrap_err();
-        assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
+        // list_sessions is the only path that doesn't touch the
+        // sidecar — verify it returns the empty in-memory map.
+        assert_eq!(b.list_sessions().expect("list_sessions").len(), 0);
     }
 
     #[cfg(feature = "browser-webdriver")]
