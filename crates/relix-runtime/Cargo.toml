@@ -49,6 +49,14 @@ hyper.workspace = true
 # Logging
 tracing.workspace = true
 
+# PH-BROWSER-HC — optional Chrome DevTools Protocol driver.
+# Pulled in only when `--features browser-headless-chrome` is
+# set; default builds do NOT carry this dependency. The crate
+# is blocking (its websocket loop is synchronous) — the
+# backend wraps tab handles in a Mutex and uses
+# `tab.set_default_timeout` for per-call deadlines.
+headless_chrome = { version = "1.0", optional = true }
+
 [features]
 # PH-BROWSER-FEATURES — per-backend opt-in flags. Default
 # build ships the NoneBackend honest scaffold only.
@@ -56,7 +64,7 @@ tracing.workspace = true
 # the corresponding feature; otherwise the tool node fails
 # loudly at startup (no silent fallback to NoneBackend).
 default = []
-browser-headless-chrome = []
+browser-headless-chrome = ["dep:headless_chrome"]
 browser-playwright = []
 browser-webdriver = []
 # Convenience: turn on all three backend features at once.

@@ -922,27 +922,21 @@ mod tests {
     /// compiled. With no features the runtime tests still
     /// cover the "none" path + the feature-not-compiled error
     /// shape above.
-    #[cfg(feature = "browser-headless-chrome")]
-    #[test]
-    fn feature_headless_chrome_compiled_builds_scaffold() {
-        let mut c = cfg();
-        c.backend = "headless_chrome".into();
-        let b = build_backend(&c).expect("scaffold should build");
-        assert_eq!(b.name(), "headless_chrome");
-        let id = b.open_session().expect("session");
-        let err = b.navigate(&id, "https://example.com/").unwrap_err();
-        assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
-    }
-
-    /// PH-BROWSER-PW: replaces the prior
-    /// `feature_playwright_compiled_builds_scaffold` test. With
-    /// the live driver, `try_build` returns the real
-    /// `PlaywrightBackend` (still no Node spawn — that happens
-    /// lazily on the first `open_session`) and the canonical
-    /// name surfaces unchanged. We deliberately do NOT call
-    /// `navigate` here: navigate would try to spawn Node, and
-    /// CI hosts without Node would falsely fail this unit test.
-    /// The live integration coverage lives in
+    ///
+    /// PH-BROWSER-HC NOTE: the `headless_chrome` scaffold has
+    /// been replaced by a live driver. The
+    /// `feature_headless_chrome_compiled_builds_real_backend`
+    /// test in `headless_chrome::tests` covers the live-build
+    /// shape (Ok with `name()=="headless_chrome"` OR
+    /// BackendNotConnected when Chrome isn't installed).
+    ///
+    /// PH-BROWSER-PW: with the live driver, `try_build` returns
+    /// the real `PlaywrightBackend` (still no Node spawn — that
+    /// happens lazily on the first `open_session`) and the
+    /// canonical name surfaces unchanged. We deliberately do NOT
+    /// call `navigate` here: navigate would try to spawn Node,
+    /// and CI hosts without Node would falsely fail this unit
+    /// test. The live integration coverage lives in
     /// `playwright::tests::live_playwright_navigates_about_blank`.
     #[cfg(feature = "browser-playwright")]
     #[test]
