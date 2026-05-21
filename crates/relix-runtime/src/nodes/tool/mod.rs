@@ -51,6 +51,7 @@ pub mod pdf;
 pub mod security;
 pub mod terminal;
 pub mod web_extract;
+pub mod web_tools;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -662,6 +663,13 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
         max_input_bytes: backend.extract_max_input_bytes(),
     });
     web_extract::register(bridge, extract_cfg);
+
+    // CW3: tool.web_get + tool.web_search — composed over the same
+    // ToolBackend.fetch() pipeline so SSRF / DNS pin / per-hop
+    // redirect re-validation / content-type filter all apply
+    // unchanged. No new credential surface, no new egress primitive.
+    tracing::info!("tool node: registering tool.web_get + tool.web_search (CW3)");
+    web_tools::register(bridge, backend.clone());
 
     // B2: tool.read_file / write_file / search_files / patch.
     // Only registered when the operator opted in by setting

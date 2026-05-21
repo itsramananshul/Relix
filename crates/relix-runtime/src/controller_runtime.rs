@@ -670,6 +670,11 @@ fn register_node_type_handlers(
         // tool node so it shares identity / admission / audit / pool
         // setup. Distinct from tool.web_fetch (no network surface).
         manifest.add_capability(crate::nodes::tool::web_extract::capability_descriptor());
+        // CW3: tool.web_get + tool.web_search — composed over the
+        // same web_fetch pipeline. Both always advertise alongside
+        // web_fetch since they share the SSRF/pin/redirect machinery.
+        manifest.add_capability(crate::nodes::tool::web_tools::web_get_descriptor());
+        manifest.add_capability(crate::nodes::tool::web_tools::web_search_descriptor());
         // B2: jailed filesystem subsystem. Only advertised when
         // `[tool.fs]` is configured -- node-type tool with no
         // `[tool.fs]` keeps fs out of the manifest.
@@ -704,7 +709,8 @@ fn register_node_type_handlers(
             allow_http = tool_cfg.allow_http,
             method = %desc.method_name,
             sensitivity = ?desc.sensitivity_tags,
-            "tool node: registered tool.web_fetch"
+            cw3 = "tool.web_get, tool.web_search",
+            "tool node: registered tool.web_fetch + CW3 web_tools"
         );
     }
     // web_bridge / demo node types are no-ops today; their handlers ship in
