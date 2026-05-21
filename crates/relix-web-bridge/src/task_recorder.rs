@@ -286,6 +286,29 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.stuck utf8: {e}"))
     }
 
+    /// PH-WAVE2D / PH-DASH2: per-task todo passthroughs.
+    pub async fn todo_list(&self, task_id: &str) -> Result<String, String> {
+        let bytes = self.call("task.todo_list", task_id.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.todo_list utf8: {e}"))
+    }
+
+    pub async fn todo_set(&self, task_id: &str, items: &[String]) -> Result<String, String> {
+        let arg = format!("{task_id}|{}", items.join("\n"));
+        let bytes = self.call("task.todo_set", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.todo_set utf8: {e}"))
+    }
+
+    pub async fn todo_update(
+        &self,
+        task_id: &str,
+        todo_id: i64,
+        status: &str,
+    ) -> Result<String, String> {
+        let arg = format!("{task_id}|{todo_id}|{status}");
+        let bytes = self.call("task.todo_update", arg.as_bytes()).await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.todo_update utf8: {e}"))
+    }
+
     /// Cross-task event firehose passthrough (M67). Args:
     /// since_event_id + limit + optional event_type filter.
     pub async fn recent_events(

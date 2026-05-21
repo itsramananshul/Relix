@@ -738,6 +738,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_todo_panel_present() {
+        // PH-DASH2: per-task drill-in carries a todo widget slot
+        // + the supporting JS hooks. The widget itself renders
+        // async after fetchTodoPanel runs; only the slot/landmark
+        // strings are static.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"todo-slot\"",
+            "function fetchTodoPanel",
+            "function renderTodoPanel",
+            "/todos",
+        ] {
+            assert!(
+                body.contains(needle),
+                "PH-DASH2 landmark `{needle}` missing"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn page_firehose_row_expansion_present() {
         // PH-DASH1: every firehose row is clickable + has a
         // sibling detail row hidden by default. JS wires the

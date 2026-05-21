@@ -33,7 +33,7 @@ use axum::{
     extract::Request,
     middleware::Next,
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post, put},
 };
 use clap::Parser;
 
@@ -307,6 +307,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Register before /v1/tasks/:id paths so axum's static
         // matcher prefers it.
         .route("/v1/tasks/stuck", get(tasks::stuck))
+        // PH-DASH2: per-task todo surface — read / replace /
+        // update single item. Routes registered before the
+        // catch-all /v1/tasks/:id paths so axum prefers them.
+        .route("/v1/tasks/:id/todos", get(tasks::todo_list))
+        .route("/v1/tasks/:id/todos", put(tasks::todo_put))
+        .route("/v1/tasks/:id/todos/:todo_id", patch(tasks::todo_patch))
         .route("/v1/tasks/:id/summary", get(tasks::summary))
         .route("/v1/tasks/:id/events", get(tasks::events))
         // Experimental SSE wrapper around task.events polling.

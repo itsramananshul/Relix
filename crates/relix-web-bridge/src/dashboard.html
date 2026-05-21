@@ -3884,6 +3884,140 @@ function initTasks() {
   tasksInited = true;
 }
 
+/* PH-DASH2: per-task todo widget. Fetches /v1/tasks/:id/todos
+   and renders an inline card. Operators can toggle each item's
+   status with a click on the status badge, or paste a fresh
+   ordered list into the textarea and submit to replace the
+   whole list (server-side: H8 redactor scrubs each text). */
+let todoCurrentTaskId = null;
+async function fetchTodoPanel(taskId) {
+  todoCurrentTaskId = taskId;
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/todos');
+    if (!r.ok) {
+      renderTodoPanel(null);
+      return;
+    }
+    const j = await r.json();
+    renderTodoPanel(j);
+  } catch (_) {
+    renderTodoPanel(null);
+  }
+}
+
+function renderTodoPanel(payload) {
+  const $slot = document.getElementById('todo-slot');
+  if (!$slot) return;
+  const items = (payload && payload.items) || [];
+  const taskId = todoCurrentTaskId;
+  const rows = items.map(it => {
+    const cls = it.status === 'done' ? 'ok' : 'warn';
+    const next = it.status === 'done' ? 'open' : 'done';
+    return '<tr data-todo-id="' + escapeHtml(String(it.todo_id))
+      + '" data-next-status="' + escapeHtml(next) + '">'
+      + '<td class="meta">' + escapeHtml(String(it.position)) + '</td>'
+      + '<td><span class="badge ' + cls + '" style="cursor: pointer;" title="click to mark ' + next + '">'
+      + escapeHtml(it.status)
+      + '</span></td>'
+      + '<td>' + escapeHtml(it.text) + '</td>'
+      + '</tr>';
+  }).join('');
+  const tableBlock = items.length
+    ? '<table class="data" id="todo-table"><thead><tr>'
+      + '<th>#</th><th>status</th><th>text</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>'
+    : '<div class="empty" style="padding: 8px 14px;">no todos for this task yet</div>';
+  // Editor: textarea with current list as initial value. On submit
+  // we PUT the whole list (replace semantics).
+  const initial = items.map(it => it.text).join('\n');
+  $slot.innerHTML = '<div class="card" style="margin-top: 12px;">'
+    + '<div class="card-header">'
+    + '<h3>Todos</h3>'
+    + '<span class="meta">' + items.length + ' item' + (items.length === 1 ? '' : 's') + '</span>'
+    + '</div>'
+    + '<div class="card-body dense">' + tableBlock + '</div>'
+    + '<div class="card-body" style="padding-top: 0;">'
+    + '<details>'
+    + '<summary class="meta" style="cursor: pointer;">Edit list (replaces all items)</summary>'
+    + '<textarea id="todo-editor" rows="5" placeholder="one item per line" '
+    + 'style="width: 100%; margin-top: 6px; background: var(--bg-1); color: var(--text); '
+    + 'border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; '
+    + 'font-family: inherit; font-size: 12px;">'
+    + escapeHtml(initial)
+    + '</textarea>'
+    + '<div style="margin-top: 6px;">'
+    + '<button id="todo-save" class="chip">Save</button>'
+    + '<span class="meta" id="todo-save-status" style="margin-left: 8px;"></span>'
+    + '</div>'
+    + '</details>'
+    + '</div>'
+    + '</div>';
+  // Wire status badge clicks → PATCH.
+  const tbody = document.querySelector('#todo-table tbody');
+  if (tbody) {
+    tbody.addEventListener('click', async (ev) => {
+      const badge = ev.target.closest('.badge');
+      if (!badge) return;
+      const tr = ev.target.closest('tr[data-todo-id]');
+      if (!tr || !taskId) return;
+      const todoId = tr.getAttribute('data-todo-id');
+      const next = tr.getAttribute('data-next-status');
+      try {
+        const r = await fetch(
+          '/v1/tasks/' + encodeURIComponent(taskId) + '/todos/' + encodeURIComponent(todoId),
+          {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ status: next }),
+          }
+        );
+        if (r.ok) {
+          fetchTodoPanel(taskId); // re-render
+        } else {
+          toast('todo update failed: HTTP ' + r.status, 'error');
+        }
+      } catch (e) {
+        toast('todo update failed: ' + String(e), 'error');
+      }
+    });
+  }
+  // Wire save button → PUT replace.
+  const $save = document.getElementById('todo-save');
+  if ($save) {
+    $save.addEventListener('click', async () => {
+      const $ed = document.getElementById('todo-editor');
+      const $status = document.getElementById('todo-save-status');
+      if (!$ed || !taskId) return;
+      const items = $ed.value
+        .split('\n')
+        .map(s => s.trim())
+        .filter(Boolean);
+      if ($status) $status.textContent = 'saving…';
+      try {
+        const r = await fetch(
+          '/v1/tasks/' + encodeURIComponent(taskId) + '/todos',
+          {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ items }),
+          }
+        );
+        if (r.ok) {
+          if ($status) $status.textContent = 'saved · ' + items.length + ' item(s)';
+          fetchTodoPanel(taskId);
+        } else {
+          const body = await r.text();
+          if ($status) $status.textContent = 'save failed: ' + r.status;
+          toast('todo save failed: ' + body, 'error');
+        }
+      } catch (e) {
+        if ($status) $status.textContent = 'save failed';
+        toast('todo save failed: ' + String(e), 'error');
+      }
+    });
+  }
+}
+
 /* M66: execution-lineage panel. Fetches /v1/tasks/:id/lineage
    and renders the related-tasks list + edge count + honest
    note about which edge types have producers. Empty / fail
@@ -4506,10 +4640,18 @@ function renderDetail(l) {
     + corrSlot
     + lineageSlot
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
+    // PH-DASH2: per-task todo panel slot — populated async by
+    // fetchTodoPanel after the detail renders. Empty slot
+    // when the task has no todos so a stale list doesn't
+    // flash before the fetch lands.
+    + '<div id="todo-slot"></div>'
     + eventsBlock
     + xrefBlock;
   if (l.task && l.task.task_id) {
     fetchLineageGraph(l.task.task_id);
+    // PH-DASH2: hydrate the todo widget after the rest of
+    // the detail renders.
+    fetchTodoPanel(l.task.task_id);
   }
   // Fire-and-forget correlation lookup. Status guards
   // mean we only fetch when the operator would actually

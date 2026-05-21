@@ -1560,6 +1560,161 @@ fn parse_recent_edges(body: &str) -> Vec<RecentEdge> {
     out
 }
 
+// ── PH-DASH2: per-task todo list (Hermes todo_tool surface) ──
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TodoItem {
+    pub todo_id: i64,
+    pub position: i64,
+    pub status: String,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TodoListResponse {
+    pub items: Vec<TodoItem>,
+    pub count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TodoSetRequest {
+    /// Full ordered replacement list. Empty array clears.
+    pub items: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TodoUpdateRequest {
+    /// New status — `open` or `done`.
+    pub status: String,
+}
+
+/// `GET /v1/tasks/:id/todos` — read the per-task todo list.
+pub async fn todo_list(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TodoListResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = rec
+        .todo_list(&id)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    Ok(Json(parse_todo_body(&body)))
+}
+
+/// `PUT /v1/tasks/:id/todos` — replace the full todo list.
+pub async fn todo_put(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TodoSetRequest>,
+) -> Result<Json<TodoListResponse>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = rec
+        .todo_set(&id, &req.items)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    state.intervention_audit.record(
+        "anon",
+        "todo_set",
+        &id,
+        "ok",
+        format!("{} item(s)", req.items.len()),
+    );
+    Ok(Json(parse_todo_body(&body)))
+}
+
+/// `PATCH /v1/tasks/:id/todos/:todo_id` — toggle one todo's status.
+pub async fn todo_patch(
+    State(state): State<AppState>,
+    Path((id, todo_id)): Path<(String, i64)>,
+    Json(req): Json<TodoUpdateRequest>,
+) -> Result<Json<TodoItem>, (StatusCode, Json<ApiError>)> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        return Err(no_coordinator());
+    };
+    if !is_valid_task_id(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "task_id must be 32 hex chars".into(),
+            }),
+        ));
+    }
+    let body = rec
+        .todo_update(&id, todo_id, &req.status)
+        .await
+        .map_err(|e| (gateway_status_for(&e), Json(ApiError { error: e })))?;
+    // Single-row response shape: `<position>\t<todo_id>\t<status>\t<text>`.
+    let mut parts = body.trim_end().split('\t');
+    let position = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let returned_id = parts.next().and_then(|s| s.parse().ok()).unwrap_or(todo_id);
+    let status = parts.next().unwrap_or("").to_string();
+    let text = parts.next().unwrap_or("").to_string();
+    state.intervention_audit.record(
+        "anon",
+        "todo_update",
+        format!("{id}/{todo_id}"),
+        "ok",
+        format!("status→{}", req.status),
+    );
+    Ok(Json(TodoItem {
+        todo_id: returned_id,
+        position,
+        status,
+        text,
+    }))
+}
+
+fn parse_todo_body(body: &str) -> TodoListResponse {
+    let mut items = Vec::new();
+    let mut explicit_count: Option<usize> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("count=") {
+            explicit_count = rest.parse().ok();
+            continue;
+        }
+        let mut parts = trimmed.splitn(4, '\t');
+        let position = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let todo_id = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let status = parts.next().unwrap_or("").to_string();
+        let text = parts.next().unwrap_or("").to_string();
+        if todo_id == 0 && text.is_empty() {
+            continue;
+        }
+        items.push(TodoItem {
+            todo_id,
+            position,
+            status,
+            text,
+        });
+    }
+    let count = explicit_count.unwrap_or(items.len());
+    TodoListResponse { items, count }
+}
+
 // ── H6: stuck-running projection ─────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
