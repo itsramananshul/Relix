@@ -9,19 +9,19 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `5120dce feat(tool+bridge+dash): PH-DASH-BLOCKLIST surface tool.web.blocklist_summary`
+- **HEAD:** `6d09544 feat(tool): PH-BROWSER-FEATURES — browser backend trait + feature-gated module scaffolding`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1163 passing, 0 failures (delta this milestone: +12
-  — 4 in `web_tools::tests` for the new capability + 8 in
-  `blocklist::tests` for the bridge parser).
+- **Workspace tests:** 1170 passing, 0 failures (delta this milestone:
+  +7 default-feature; +3 more compiled under
+  `--features relix-runtime/browser-all`).
   - relix-cli: 104
   - relix-policy: 72
-  - relix-runtime: 686 (was 682; +4 this milestone)
+  - relix-runtime: 693 (was 686; +7 default; 696 under browser-all)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 267 (was 259; +8 this milestone)
+  - relix-web-bridge: 267
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -66,6 +66,7 @@ as the resume command.
 | 6c091fb | PH-CLI-AUDIT-MIRRORS | `relix-cli fs audit` (new fs module) + `relix-cli terminal audit-http` (HTTP sibling of libp2p audit); padded tables; status-badge derived from exit/flags; urlencode_token for op-filter safety; 10 wire-shape tests |
 | 5cb3ab4 | PH-WEB-BLOCKLIST | `[tool] blocked_hosts` operator-curated hostname blocklist; new `HostBlocklist` type + `SsrfError::HostBlocked`; runs before scheme/DNS + on every redirect; exact-match-only (no subdomain widening) honesty contract; URLhaus refresh recipe in module doc; 9 tests + 14 existing call sites threaded |
 | 5120dce | PH-DASH-BLOCKLIST | new `tool.web.blocklist_summary` Safe capability + `GET /v1/tool/blocklist` bridge proxy + dashboard card on `#/fsaudit` page (first-200 cap, sorted, honest "not live feed" note); 4 runtime + 8 bridge tests |
+| 6d09544 | PH-BROWSER-FEATURES | refactored `browser.rs` → `browser/` directory with frozen `BrowserBackend` trait + three feature-gated backend modules (`browser-headless-chrome` / `-playwright` / `-webdriver` + `browser-all`); new `BrowserError::FeatureNotCompiled` variant; `ToolBackend::new` validate-on-construct prevents silent NoneBackend fallback; scaffold `with_label` surfaces operator-chosen backend name; D-008 flipped to "multi-backend plan accepted" pending PH-BROWSER-HC/PW/WD; 7 default + 3 feature-gated tests |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
