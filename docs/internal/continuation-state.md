@@ -9,34 +9,42 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `4ea1311 feat(tool): W2-002d — structured event-trace logging on browser handlers`
+- **HEAD:** `a643f99 feat(cli): W2-006e — relix-cli ops dispatch-stats mirrors GET /v1/dispatch/stats`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Wave 1 status: CLOSED.** All decision-blocked tracks shipped.
-  All five open Wave 1 decisions (D-001/2/3/4/7) resolved at
-  Wave 1 close: D-004 shipped (PH-ORIGIN-SURFACE);
-  D-001/2/3/7 answered:defer.
-- **Wave 2 status: IN PROGRESS.** Track W2-002 (Browser
-  automation) substantively shipped — trait extended with
-  click / type_text / wait_for_selector + HC live impl +
-  screenshot-on-failure + structured event-trace logging.
-  Remaining: PW/WD click/type live impls + dashboard
-  screenshot viewer. Other Wave 2 tracks (W2-001 replay UX,
-  W2-003 dashboard UX, W2-005 failure system, W2-006
-  observability, W2-007 policy hardening, W2-008 local-first
-  polish) not yet started.
-- **Workspace tests:** **1213 passing on default features**;
-  **+5 under `--features browser-headless-chrome`** (HC live
-  W2-002a/b paths exercised). Per-feature totals (default →
-  with all features) preserved across Wave 2:
+- **Wave 1 status: CLOSED.** All decisions resolved.
+- **Wave 2 status: IN PROGRESS.**
+  - **W2-002 (Browser):** substantively shipped — trait
+    extension (click/type/wait), HC live impl, WD live impl,
+    screenshot-on-failure, event-trace logging. PW live
+    click/type/wait still pending; dashboard screenshot
+    viewer pending.
+  - **W2-006 (Observability):** CLOSED end-to-end —
+    latency on CapStats → `node.dispatch.stats` runtime
+    capability → `GET /v1/dispatch/stats` bridge proxy →
+    `#/metrics` dashboard page → `relix-cli ops
+    dispatch-stats` CLI mirror.
+  - **W2-001 (Replay UX):** started — per-step duration in
+    chronicle timeline. Replay button / diff mode / failure
+    screenshot rendering pending.
+  - **W2-005 (Failure system):** substantively shipped via
+    Wave 1 (RetryPolicy, FailureClass, structured reasons,
+    cancellation). Visualization is W2-003 overlap.
+  - **W2-003 (Dashboard UX):** partial — Metrics page
+    shipped; live feed / status pills / filtering pending.
+  - **W2-004 / W2-007 / W2-008:** not started.
+- **Workspace tests:** **1220 passing on default features**;
+  feature-gated additions preserved (+5 HC live, +8 WD live).
   - relix-cli: 110
   - relix-policy: 72
-  - relix-runtime: 721 (was 709 at Wave 1 close — D-004 +5,
-    W2-002a trait-extension defaults +7)
+  - relix-runtime: 722 (+6 dispatch latency / D-004 / browser
+    trait defaults)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 276
+  - relix-web-bridge: 283 (+9 dispatch_stats parser + 1
+    metrics landmark + 1 browser_sessions landmark + earlier
+    additions)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -100,6 +108,14 @@ as the resume command.
 | 5a0e5ec | (D-004 follow-up) | `task.get` body emits `origin_surface=...` line so bridge `TaskDetail.header` map carries it to the dashboard |
 | 27b33a0 | W2-002c | screenshot-on-failure: opt-in `[tool.browser] screenshot_on_failure_dir` persists a PNG of the failure state and appends `; screenshot=<path>` to the error reason — replay-friendly post-mortem aid |
 | 4ea1311 | W2-002d | structured `tracing::info!` event traces on navigate / click / type_text / wait_for_selector handlers (`method`, `backend`, `session_id`, `elapsed_ms`, `outcome`, `reason`, ...) — text payload deliberately NOT logged (form-credential safety) |
+| 7b213ba | docs | Wave 2 tally through W2-002d |
+| 627329d | W2-002e | WebDriverBackend live click / type_text / wait_for_selector via fantoccini; wait_for_selector bypasses backend call_timeout so operator-supplied timeout_ms governs |
+| f59d720 | W2-006a | CapStats extended with last/max/total/samples elapsed_ms; only handler.invoke timed (excludes admission overhead) |
+| 6fc43b3 | W2-006b | `node.dispatch.stats` capability surfaces the snapshot over the dispatch wire; tab-delim row format; DispatchBridge.capability_stats now Arc<RwLock> so handlers can capture a cheap clone |
+| 1c25965 | W2-006c | `GET /v1/dispatch/stats` bridge proxy + 6 parser tests; serde skip-if-none on last_error_at |
+| 48a073a | W2-006d | `#/metrics` dashboard page renders the snapshot sorted by mean elapsed desc; visual cues for tail-ratio (max÷mean > 5x) + err count tier |
+| ee71e3d | W2-001a | per-step duration ("+1.2s since prev") in chronicle timeline rows — operators spot which step took 8s |
+| a643f99 | W2-006e | `relix-cli ops dispatch-stats` mirrors GET /v1/dispatch/stats — terminal twin of the Metrics dashboard panel |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
