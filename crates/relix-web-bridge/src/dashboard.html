@@ -1934,6 +1934,21 @@
           <h3>Live event firehose (cross-task)</h3>
           <span class="meta" id="firehose-status"></span>
         </div>
+        <!-- H12: inline search filter. Substring match against
+             task_id, event_type, and the H2 one-line summary.
+             Filtering is pure client-side over the existing
+             ring so it's instant. Empty input renders everything. -->
+        <div class="card-toolbar" style="padding: 6px 14px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center;">
+          <input
+            type="text"
+            id="firehose-filter"
+            placeholder="filter: task id / event_type / summary text"
+            autocomplete="off"
+            spellcheck="false"
+            style="flex: 1; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px;"
+          />
+          <span class="meta" id="firehose-filter-status" style="font-size: 11px;"></span>
+        </div>
         <div class="card-body dense" id="firehose-host">
           <div class="empty">no events yet</div>
         </div>
@@ -3262,9 +3277,25 @@ async function fetchGlobalFirehose() {
   }
 }
 
+/* H12: firehose filter state. Empty = match everything. */
+let firehoseFilterText = '';
+
+/* Apply the H12 filter to a firehose ring entry. Substring match
+   (case-insensitive) against task_id, event_type, and the H2
+   summary projection. Empty filter passes everything. */
+function firehoseRowMatches(e, needle) {
+  if (!needle) return true;
+  const hay = ((e.task_id || '') + ' '
+             + (e.event_type || '') + ' '
+             + (e.summary || '') + ' '
+             + (e.payload || '')).toLowerCase();
+  return hay.includes(needle);
+}
+
 function renderGlobalFirehose(errored) {
   const $host = document.getElementById('firehose-host');
   const $status = document.getElementById('firehose-status');
+  const $filterStatus = document.getElementById('firehose-filter-status');
   if (!$host) return;
   if (errored) {
     $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
@@ -3278,10 +3309,28 @@ function renderGlobalFirehose(errored) {
       + 'no events yet — once tasks run, this tail will populate'
       + '</div>';
     if ($status) $status.textContent = '';
+    if ($filterStatus) $filterStatus.textContent = '';
     return;
   }
   const nowSecs = Math.floor(Date.now() / 1000);
-  const rows = firehoseRing.map(e => {
+  const needle = (firehoseFilterText || '').trim().toLowerCase();
+  const filtered = needle ? firehoseRing.filter(e => firehoseRowMatches(e, needle)) : firehoseRing;
+  if (needle && filtered.length === 0) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'no events match "' + escapeHtml(needle) + '" in the current ring ('
+      + firehoseRing.length + ' event' + (firehoseRing.length === 1 ? '' : 's') + ')'
+      + '</div>';
+    if ($filterStatus) {
+      $filterStatus.textContent = '0 of ' + firehoseRing.length + ' shown';
+    }
+    return;
+  }
+  if ($filterStatus) {
+    $filterStatus.textContent = needle
+      ? filtered.length + ' of ' + firehoseRing.length + ' shown'
+      : '';
+  }
+  const rows = filtered.map(e => {
     const ago = fmtDuration(Math.max(0, nowSecs - (e.ts || 0))) + ' ago';
     const taskCell = '<a href="#/tasks/' + encodeURIComponent(e.task_id || '')
       + '" class="id" title="' + escapeHtml(e.task_id || '') + '">'
@@ -5005,6 +5054,28 @@ document.addEventListener('DOMContentLoaded', () => {
   // H11: wire ops-health KPI tile clicks. The tiles themselves
   // exist from initial render (just hidden when counts=0).
   wireOpsHealthTileClicks();
+  // H12: live filter for the firehose. Listens on `input` so
+  // typing immediately narrows the visible rows; the filter
+  // state is global so renders triggered by SSE arrivals
+  // respect it without re-reading the DOM.
+  const $ff = document.getElementById('firehose-filter');
+  if ($ff) {
+    $ff.addEventListener('input', () => {
+      firehoseFilterText = $ff.value || '';
+      // Re-render only when overview is visible; otherwise
+      // the next tick will pick up the new filter naturally.
+      if (currentRoute === 'overview') renderGlobalFirehose(false);
+    });
+    // Escape clears the filter — operator-friendly muscle memory.
+    $ff.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && $ff.value) {
+        ev.stopPropagation();
+        $ff.value = '';
+        firehoseFilterText = '';
+        if (currentRoute === 'overview') renderGlobalFirehose(false);
+      }
+    });
+  }
 });
 
 document.addEventListener('click', (ev) => {

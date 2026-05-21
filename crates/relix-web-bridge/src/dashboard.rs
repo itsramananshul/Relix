@@ -717,6 +717,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_firehose_filter_input_present() {
+        // H12: the firehose card carries an inline filter input
+        // + status meta + a renderRows path that respects it.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "id=\"firehose-filter\"",
+            "id=\"firehose-filter-status\"",
+            "function firehoseRowMatches",
+            "firehoseFilterText",
+            // Escape clears the filter
+            "ev.key === 'Escape'",
+        ] {
+            assert!(body.contains(needle), "H12 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_operational_health_kpis_present() {
         // H11: overview ships an "Operational health" KPI section
         // with tiles for stuck (H6), thrash (H4), orphan (H7),
