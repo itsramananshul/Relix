@@ -118,11 +118,12 @@ mod tests {
         );
         assert!(body.contains("Operator Console"), "missing brand subtitle");
 
-        // All six routes register a nav item AND a corresponding page section.
+        // All seven routes register a nav item AND a corresponding page section.
         for route in [
             "overview",
             "tasks",
             "topology",
+            "capabilities",
             "providers",
             "telegram",
             "config",
@@ -734,6 +735,33 @@ mod tests {
             "data-evhist-type",
         ] {
             assert!(body.contains(needle), "H13 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
+    async fn page_capabilities_explorer_present() {
+        // PH-DASH3: new #/capabilities route with filter chips,
+        // text input, and a table host. Sources data from
+        // /v1/topology (already exposed). No new bridge endpoint
+        // required.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "data-page=\"capabilities\"",
+            "id=\"cap-filter-chips\"",
+            "id=\"cap-filter-text\"",
+            "id=\"cap-host\"",
+            "function initCapabilities",
+            "function loadCapabilities",
+            "function renderCapabilityTable",
+            "data-cap-category=\"tool.browser\"",
+            "data-cap-category=\"tool.mcp\"",
+        ] {
+            assert!(
+                body.contains(needle),
+                "PH-DASH3 landmark `{needle}` missing"
+            );
         }
     }
 

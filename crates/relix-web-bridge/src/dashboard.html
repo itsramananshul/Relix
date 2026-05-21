@@ -1809,6 +1809,7 @@
     <a href="#/overview" class="nav-item" data-route="overview">Overview</a>
     <a href="#/tasks"    class="nav-item" data-route="tasks">Tasks</a>
     <a href="#/topology" class="nav-item" data-route="topology">Topology</a>
+    <a href="#/capabilities" class="nav-item" data-route="capabilities">Capabilities</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2139,6 +2140,56 @@
       </p>
     </section>
 
+    <!-- ── #/capabilities (PH-DASH3) ────────────────────────────── -->
+    <section class="page" data-page="capabilities">
+      <h2>Capabilities</h2>
+      <p class="page-subtitle">
+        Every capability advertised by every peer in the cached topology.
+        Click any row to see the owning peer + freshness. Filter by category
+        (top chips) or by name (text input).
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px; flex-wrap: wrap;" id="cap-filter-chips">
+        <button class="chip active" data-cap-category="">all</button>
+        <button class="chip" data-cap-category="task">task.*</button>
+        <button class="chip" data-cap-category="tool">tool.*</button>
+        <button class="chip" data-cap-category="tool.browser">browser</button>
+        <button class="chip" data-cap-category="tool.mcp">mcp</button>
+        <button class="chip" data-cap-category="memory">memory</button>
+        <button class="chip" data-cap-category="ai">ai</button>
+        <button class="chip" data-cap-category="node">node</button>
+      </div>
+      <div class="row" style="margin-bottom: 8px; gap: 6px;">
+        <input
+          type="text"
+          id="cap-filter-text"
+          placeholder="filter: capability name substring (e.g. task.todo)"
+          autocomplete="off"
+          spellcheck="false"
+          style="flex: 1; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px;"
+        />
+        <span class="meta" id="cap-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>All advertised capabilities</h3>
+          <span class="meta" id="cap-summary"></span>
+        </div>
+        <div class="card-body dense" id="cap-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Sourced from <code>/v1/topology</code> — every peer's
+        manifest <code>methods[]</code> aggregated. Honest:
+        capabilities that haven't been called yet still appear here
+        (this is the catalog, not the live invocation history).
+        A capability returning <code>BackendNotConnected</code> at
+        invocation time (browser, MCP) still ships its descriptor;
+        operators see what's wired vs gated by looking at the source
+        peer's <code>node_type</code> + the capability's name.
+      </p>
+    </section>
+
     <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
@@ -2349,12 +2400,13 @@
 
 /* ── Router ────────────────────────────────────────────────── */
 const PAGES = {
-  overview:  { label: 'Overview',     init: initOverview,  enter: enterOverview },
-  tasks:     { label: 'Tasks',        init: initTasks,     enter: enterTasks },
-  topology:  { label: 'Topology',     init: initTopology,  enter: enterTopology },
-  providers: { label: 'AI Providers', init: null,          enter: enterProviders },
-  telegram:  { label: 'Telegram',     init: initTelegram,  enter: enterTelegram },
-  config:    { label: 'Bridge Config', init: initConfig,    enter: enterConfig },
+  overview:     { label: 'Overview',     init: initOverview,     enter: enterOverview },
+  tasks:        { label: 'Tasks',        init: initTasks,        enter: enterTasks },
+  topology:     { label: 'Topology',     init: initTopology,     enter: enterTopology },
+  capabilities: { label: 'Capabilities', init: initCapabilities, enter: enterCapabilities },
+  providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
+  telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
+  config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
 };
 
 const PROVIDER_LABELS = {
@@ -5316,9 +5368,10 @@ const KBD_ROUTE_MAP = {
   '1': 'overview',
   '2': 'tasks',
   '3': 'topology',
-  '4': 'providers',
-  '5': 'telegram',
-  '6': 'config',
+  '4': 'capabilities',
+  '5': 'providers',
+  '6': 'telegram',
+  '7': 'config',
 };
 
 document.addEventListener('keydown', (ev) => {
@@ -6273,6 +6326,143 @@ function initTopology() {
 
 function enterTopology() {
   loadTopology();
+}
+
+/* PH-DASH3: Capability explorer. Walks /v1/topology to build
+   a flat capability-per-row table, then filters client-side
+   by category-chip + name-substring. No new bridge endpoint —
+   topology already exposes per-peer methods[]. */
+let capabilityRows = [];      // flat list of {method, peer, ...}
+let capCategoryFilter = '';   // active chip filter
+let capTextFilter = '';       // active text input
+
+function initCapabilities() {
+  // Wire chip clicks (delegated). Active chip switches state +
+  // re-renders the table from the cached rows.
+  const $chips = document.getElementById('cap-filter-chips');
+  if ($chips) {
+    $chips.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-cap-category]');
+      if (!btn) return;
+      capCategoryFilter = btn.getAttribute('data-cap-category') || '';
+      $chips.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('active', b === btn);
+      });
+      renderCapabilityTable();
+    });
+  }
+  // Wire text filter.
+  const $text = document.getElementById('cap-filter-text');
+  if ($text) {
+    $text.addEventListener('input', () => {
+      capTextFilter = ($text.value || '').toLowerCase().trim();
+      renderCapabilityTable();
+    });
+    // Escape clears the text filter without leaving the input.
+    $text.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && $text.value) {
+        ev.stopPropagation();
+        $text.value = '';
+        capTextFilter = '';
+        renderCapabilityTable();
+      }
+    });
+  }
+}
+
+function enterCapabilities() {
+  loadCapabilities();
+}
+
+async function loadCapabilities() {
+  const $host = document.getElementById('cap-host');
+  if ($host) $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/topology');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const t = await r.json();
+    capabilityRows = [];
+    for (const p of (t.peers || [])) {
+      for (const m of (p.methods || [])) {
+        capabilityRows.push({
+          method: m,
+          alias: p.alias || '(none)',
+          node_id: p.node_id,
+          node_type: p.node_type,
+          node_name: p.node_name,
+          freshness: p.freshness,
+          last_refreshed_secs_ago: p.last_refreshed_secs_ago,
+        });
+      }
+    }
+    // Sort alpha by method for stable diffs.
+    capabilityRows.sort((a, b) => a.method.localeCompare(b.method));
+    renderCapabilityTable();
+  } catch (e) {
+    if ($host) {
+      $host.innerHTML = '<div class="error">load failed: '
+        + escapeHtml(String(e)) + '</div>';
+    }
+  }
+}
+
+function renderCapabilityTable() {
+  const $host = document.getElementById('cap-host');
+  const $summary = document.getElementById('cap-summary');
+  const $status = document.getElementById('cap-status');
+  if (!$host) return;
+  // Apply filters.
+  const cat = capCategoryFilter;
+  const needle = capTextFilter;
+  const filtered = capabilityRows.filter(r => {
+    if (cat && !r.method.startsWith(cat + '.') && r.method !== cat) {
+      // Allow partial prefixes like "tool" to also match "tool.web_*"
+      // The startsWith above already covers it; this branch keeps
+      // exact-cat matches like "memory" working.
+      return false;
+    }
+    if (needle && !r.method.toLowerCase().includes(needle)) return false;
+    return true;
+  });
+  if (filtered.length === 0) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + (capabilityRows.length === 0
+          ? 'no capabilities discovered yet — wait for the first manifest refresh'
+          : 'no capabilities match the current filters')
+      + '</div>';
+    if ($summary) $summary.textContent = '';
+    if ($status) {
+      $status.textContent = capabilityRows.length === 0
+        ? ''
+        : '0 of ' + capabilityRows.length + ' shown';
+    }
+    return;
+  }
+  const rows = filtered.map(r => {
+    const ageCls = r.freshness === 'fresh'
+      ? 'ok'
+      : r.freshness === 'stale' ? 'warn' : 'danger';
+    return '<tr>'
+      + '<td><code>' + escapeHtml(r.method) + '</code></td>'
+      + '<td>' + escapeHtml(r.alias) + '</td>'
+      + '<td class="meta">' + escapeHtml(r.node_type) + '</td>'
+      + '<td><span class="badge ' + ageCls + '">' + escapeHtml(r.freshness) + '</span></td>'
+      + '<td class="meta">' + escapeHtml(String(r.last_refreshed_secs_ago)) + 's ago</td>'
+      + '</tr>';
+  }).join('');
+  $host.innerHTML = '<table class="data"><thead><tr>'
+    + '<th>capability</th><th>alias</th><th>node_type</th>'
+    + '<th>freshness</th><th>last_refr</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  if ($summary) {
+    $summary.textContent = filtered.length + ' of ' + capabilityRows.length
+      + ' across ' + (new Set(filtered.map(r => r.alias)).size) + ' peer(s)';
+  }
+  if ($status) {
+    $status.textContent = (cat || needle)
+      ? filtered.length + ' of ' + capabilityRows.length + ' shown'
+      : '';
+  }
 }
 
 async function loadTopology() {
