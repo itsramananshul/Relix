@@ -9,18 +9,19 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `5cb3ab4 feat(tool): PH-WEB-BLOCKLIST operator-curated host blocklist on every web entry point`
+- **HEAD:** `5120dce feat(tool+bridge+dash): PH-DASH-BLOCKLIST surface tool.web.blocklist_summary`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1151 passing, 0 failures (delta this milestone: +9
-  — 9 in `security::tests` for `HostBlocklist` + integration).
+- **Workspace tests:** 1163 passing, 0 failures (delta this milestone: +12
+  — 4 in `web_tools::tests` for the new capability + 8 in
+  `blocklist::tests` for the bridge parser).
   - relix-cli: 104
   - relix-policy: 72
-  - relix-runtime: 682 (was 673; +9 this milestone)
+  - relix-runtime: 686 (was 682; +4 this milestone)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 259
+  - relix-web-bridge: 267 (was 259; +8 this milestone)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -64,6 +65,7 @@ as the resume command.
 | 3e8dc5e | PH-BRIDGE-TERM-AUDIT | `GET /v1/terminal/audit` proxy for `tool.terminal.audit_recent`; new `#/termaudit` dashboard page with status badge derived from exit/timed_out/cancelled; kbd 7 → termaudit (Configure → 8/9/0); 8 parser tests + landmark |
 | 6c091fb | PH-CLI-AUDIT-MIRRORS | `relix-cli fs audit` (new fs module) + `relix-cli terminal audit-http` (HTTP sibling of libp2p audit); padded tables; status-badge derived from exit/flags; urlencode_token for op-filter safety; 10 wire-shape tests |
 | 5cb3ab4 | PH-WEB-BLOCKLIST | `[tool] blocked_hosts` operator-curated hostname blocklist; new `HostBlocklist` type + `SsrfError::HostBlocked`; runs before scheme/DNS + on every redirect; exact-match-only (no subdomain widening) honesty contract; URLhaus refresh recipe in module doc; 9 tests + 14 existing call sites threaded |
+| 5120dce | PH-DASH-BLOCKLIST | new `tool.web.blocklist_summary` Safe capability + `GET /v1/tool/blocklist` bridge proxy + dashboard card on `#/fsaudit` page (first-200 cap, sorted, honest "not live feed" note); 4 runtime + 8 bridge tests |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
