@@ -146,6 +146,17 @@ use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 pub mod event_summary;
 pub use event_summary::{summarize_event, summarize_event_parts};
 
+/// H4: number of consecutive failures sharing the same
+/// `last_failure_class` that triggers automatic investigation
+/// marking + a `task.thrash_detected` chronicle event. Higher
+/// than 1 so a single transient flap doesn't false-positive;
+/// low enough that a stuck retry loop is caught within a
+/// handful of attempts. Operators can pre-mark a task ahead
+/// of this threshold via `task.mark_investigation` — the
+/// auto-marker skips already-marked tasks to avoid clobbering
+/// an existing operator reason.
+pub const ANTI_THRASH_THRESHOLD: i64 = 3;
+
 /// Lightweight classification of why a flow failed. Written to
 /// `tasks.last_failure_class` by the bridge so operators (and any
 /// future auto-retry policy) can decide whether the failure is worth
@@ -511,9 +522,38 @@ impl TaskStore {
             sets.push("last_failure_reason = ?");
             args.push(v.to_string().into());
         }
-        if let Some(v) = failure_class {
+        // H4: anti-thrash counter. When a new failure_class arrives,
+        // compare it against the prior value on the row. Bumping vs
+        // resetting matches Hermes's "_ineffective_compression_count":
+        //   same class as last time → bump (the runtime is going in
+        //     circles)
+        //   different class → reset to 1 (a different failure mode
+        //     suggests the runtime is making progress)
+        //   None → leave counter alone (no failure to track).
+        // The counter is read post-commit to decide whether to emit
+        // the thrash-detected event + auto-mark investigation; the
+        // *write* of the counter happens inside this transaction so
+        // it's consistent with the failure update.
+        let mut thrash_check: Option<(String, i64)> = None;
+        if let Some(new_class) = failure_class {
+            let (prior_class, prior_count) = tx
+                .query_row(
+                    "SELECT last_failure_class, consecutive_same_class_count
+                     FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .map_err(CoordinatorError::Db)?;
+            let new_count = if prior_class.as_deref() == Some(new_class) {
+                prior_count.saturating_add(1)
+            } else {
+                1
+            };
             sets.push("last_failure_class = ?");
-            args.push(v.to_string().into());
+            args.push(new_class.to_string().into());
+            sets.push("consecutive_same_class_count = ?");
+            args.push(new_count.into());
+            thrash_check = Some((new_class.to_string(), new_count));
         }
         args.push(task_id.to_string().into());
         let sql = format!("UPDATE tasks SET {} WHERE task_id = ?", sets.join(", "));
@@ -522,6 +562,71 @@ impl TaskStore {
             .map_err(CoordinatorError::Db)?;
         if n == 0 {
             return Err(CoordinatorError::NotFound(task_id.to_string()));
+        }
+
+        // H4: when the counter crosses the threshold AND the task
+        // isn't already investigation-marked, auto-mark it +
+        // emit `task.thrash_detected`. Operators see a "thrashing"
+        // banner on the task without having to grep audit logs.
+        if let Some((cls, count)) = thrash_check
+            && count >= ANTI_THRASH_THRESHOLD
+        {
+            let already_marked: Option<i64> = tx
+                .query_row(
+                    "SELECT investigation_marked_at FROM tasks WHERE task_id = ?1",
+                    params![task_id],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .map_err(CoordinatorError::Db)?;
+            if already_marked.is_none() {
+                let auto_reason =
+                    format!("auto-marked: {count} consecutive failures with class={cls}",);
+                tx.execute(
+                    "UPDATE tasks
+                     SET investigation_marked_at = ?1,
+                         investigation_reason = ?2,
+                         updated_at = ?1
+                     WHERE task_id = ?3",
+                    params![now, auto_reason, task_id],
+                )
+                .map_err(CoordinatorError::Db)?;
+                let thrash_legacy = format!(
+                    "consecutive failures class={cls} count={count} threshold={ANTI_THRASH_THRESHOLD}",
+                );
+                let thrash_json = format!(
+                    r#"{{"class":"{}","count":{count},"threshold":{ANTI_THRASH_THRESHOLD}}}"#,
+                    json_escape(&cls),
+                );
+                insert_typed_event(
+                    &tx,
+                    task_id,
+                    now,
+                    "task.thrash_detected",
+                    &thrash_legacy,
+                    None,
+                    None,
+                    Some(&thrash_json),
+                )?;
+                // Mirror task.investigation_marked so the existing
+                // dashboard treatment for that event surfaces this
+                // auto-mark identically to operator-set marks.
+                let marked_legacy = format!("auto-marked (thrash): count={count} class={cls}");
+                let marked_json = format!(
+                    r#"{{"reason":"{}","auto":true,"thrash_class":"{}","thrash_count":{count}}}"#,
+                    json_escape(&auto_reason),
+                    json_escape(&cls),
+                );
+                insert_typed_event(
+                    &tx,
+                    task_id,
+                    now,
+                    "task.investigation_marked",
+                    &marked_legacy,
+                    None,
+                    None,
+                    Some(&marked_json),
+                )?;
+            }
         }
 
         // C2a: drive the per-attempt timeline as a side effect of
@@ -5145,6 +5250,18 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         // `task.observe_interruption`.
         "ALTER TABLE tasks ADD COLUMN frozen_at INTEGER",
         "ALTER TABLE tasks ADD COLUMN frozen_reason TEXT",
+        // H4: anti-thrash counter (Hermes-inspired). Tracks how
+        // many *consecutive* failures shared the same
+        // `last_failure_class`. Incremented when a failed update
+        // has the same class as the previous one; reset to 1
+        // when the class differs; left at 0 until the first
+        // failure. When the counter crosses ANTI_THRASH_THRESHOLD
+        // (3) the coordinator auto-marks the task for investigation
+        // and emits a `task.thrash_detected` chronicle event so
+        // operators see stuck retry loops without grepping audit
+        // logs. NULL/0 means no failures yet — the field is
+        // additive and a fresh DB starts at 0.
+        "ALTER TABLE tasks ADD COLUMN consecutive_same_class_count INTEGER NOT NULL DEFAULT 0",
     ];
     for sql in alters {
         // Best-effort. The only error we expect is "duplicate column
@@ -8171,6 +8288,252 @@ mod tests {
             .append_operator_note("deadbeef", "valid note", "sub")
             .unwrap_err();
         assert!(matches!(err, CoordinatorError::NotFound(id) if id == "deadbeef"));
+    }
+
+    // ─────────────────── H4: anti-thrash auto-mark ──────────────────────────
+
+    #[test]
+    fn anti_thrash_auto_marks_after_threshold_same_class_failures() {
+        // Three failures in a row with the same failure_class trigger
+        // the auto-mark + emit task.thrash_detected and
+        // task.investigation_marked. Matches Hermes's
+        // _ineffective_compression_count pattern: when the runtime
+        // keeps failing the same way, escalate to the operator
+        // without waiting for them to grep the audit log.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Three different attempts all fail with the SAME class.
+        for _ in 0..ANTI_THRASH_THRESHOLD {
+            s.update(
+                &tid,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("transport"),
+            )
+            .expect("update");
+        }
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v.investigation_marked_at.is_some(),
+            "task should be auto-marked after {ANTI_THRASH_THRESHOLD} same-class failures"
+        );
+        let events = s.list_events_after(&tid, 0, 50).unwrap();
+        let thrash = events
+            .iter()
+            .find(|e| e.event_type == "task.thrash_detected")
+            .expect("task.thrash_detected missing");
+        let pj: serde_json::Value =
+            serde_json::from_str(thrash.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(pj["class"], "transport");
+        assert_eq!(pj["count"], ANTI_THRASH_THRESHOLD);
+        assert_eq!(pj["threshold"], ANTI_THRASH_THRESHOLD);
+        // Mirror event for dashboard treatment.
+        let auto_marked = events
+            .iter()
+            .rfind(|e| e.event_type == "task.investigation_marked")
+            .expect("auto-marked investigation event missing");
+        let mpj: serde_json::Value =
+            serde_json::from_str(auto_marked.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(mpj["auto"], true);
+        assert_eq!(mpj["thrash_class"], "transport");
+    }
+
+    #[test]
+    fn anti_thrash_resets_when_class_changes() {
+        // Two `transport` failures + one `timeout` failure → counter
+        // resets to 1 on the class change, no auto-mark.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("timeout"),
+        )
+        .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v.investigation_marked_at.is_none(),
+            "different failure classes should NOT auto-mark"
+        );
+        // Three transport failures after the timeout would re-trigger.
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        let v2 = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v2.investigation_marked_at.is_some(),
+            "three consecutive transport failures after the timeout reset must auto-mark"
+        );
+    }
+
+    #[test]
+    fn anti_thrash_does_not_clobber_existing_operator_mark() {
+        // If the operator pre-marked the task with their own reason,
+        // the auto-marker must not overwrite. The reason field
+        // remains the operator's. Operators care about their
+        // triage notes more than the auto-marker.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        s.set_investigation_marker(&tid, true, Some("manual triage"), "op")
+            .unwrap();
+        for _ in 0..(ANTI_THRASH_THRESHOLD + 1) {
+            s.update(
+                &tid,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("transport"),
+            )
+            .unwrap();
+        }
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(v.investigation_marked_at.is_some());
+        assert_eq!(v.investigation_reason.as_deref(), Some("manual triage"));
+    }
+
+    #[test]
+    fn anti_thrash_does_not_fire_below_threshold() {
+        // Threshold - 1 consecutive same-class failures must not
+        // auto-mark. The counter exists but the escalation only
+        // happens when the threshold is crossed.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        for _ in 0..(ANTI_THRASH_THRESHOLD - 1) {
+            s.update(
+                &tid,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("transport"),
+            )
+            .unwrap();
+        }
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v.investigation_marked_at.is_none(),
+            "below-threshold consecutive failures must not auto-mark"
+        );
+    }
+
+    #[test]
+    fn anti_thrash_ignores_updates_without_failure_class() {
+        // A status update with no failure_class must not bump or
+        // reset the counter. The counter only moves on actual
+        // failure events.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // Set a failure baseline.
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        // A bunch of non-failure-class updates.
+        for _ in 0..10 {
+            s.update(&tid, None, Some("ok"), None, None, None, None, None)
+                .unwrap();
+        }
+        // Two more failures of the same class — total = 3 consecutive.
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        s.update(
+            &tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("transport"),
+        )
+        .unwrap();
+        let v = s.get(&tid).unwrap().unwrap();
+        assert!(
+            v.investigation_marked_at.is_some(),
+            "consecutive same-class failures with intervening no-class updates must still auto-mark"
+        );
     }
 
     #[test]

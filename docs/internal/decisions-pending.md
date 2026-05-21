@@ -142,6 +142,44 @@ implications. ~1 hour of work.
 
 **Status.** open.
 
+### D-006  Hermes "iteration budget + grace-call" — defer or adapt?
+
+**Context.** Hermes tracks `iteration_budget` per conversation
+and allows one `_budget_grace_call` after exhaustion so the model
+can write a final summary of what got done. Relix already tracks
+`retry_count` + `max_retries` per task (the analogous concept), and
+the recovery scan already flips overdue rows. The piece that's
+missing is the *grace-call summary*: when a task is about to be
+flipped to a terminal failure, one final write that captures the
+post-mortem (what was accomplished, what's blocked, what remains).
+Hermes does this by giving the LLM one more API call without
+tools, asking for a summary. That requires an executor that knows
+its budget — Relix's coordinator is a record-keeper today and
+does NOT drive execution.
+
+**Options.**
+- (a) Add a `task.terminal_summary` capability the bridge / flow
+  runner can call before the recovery scan flips a task. Operator-
+  visible field on the task row. Doesn't *force* anyone to use it
+  but ships the surface.
+- (b) Defer until an executor-side context loop exists (Relix today
+  doesn't loop — it dispatches one capability and returns). Without
+  that consumer the grace-call has no caller.
+- (c) Embed the post-mortem into the recovery scan itself: when it
+  flips a task to `interrupted`, automatically emit a synthesized
+  `task.terminal_summary` event listing last error class, retry
+  count, and total wall-clock.
+
+**Recommendation.** (c) — ships the post-mortem with zero new
+consumer dependency. The recovery scan already has all the
+information it needs (status, retry_count, last_failure_class,
+started_at, finished_at). One-line "interrupted after 4 attempts,
+last failure: TRANSPORT (DialFailure)" event written before the
+status flip. Pure additive change. The Hermes-grade synthesized
+summary (option a) lands later when an executor exists.
+
+**Status.** open.
+
 ### D-005  Hermes "ContextVar for write-origin scoping" — adopt for telemetry?
 
 **Context.** Hermes uses `contextvars.ContextVar` to thread the

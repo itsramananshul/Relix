@@ -117,6 +117,7 @@ pub fn summarize_event(ev: &TaskEvent) -> String {
         "task.investigation_cleared" => "[investigation] cleared".to_string(),
         "task.operator_note" => summarize_operator_note(payload.as_ref(), &ev.payload),
         "task.interrupted" => summarize_interrupted(payload.as_ref()),
+        "task.thrash_detected" => summarize_thrash(payload.as_ref()),
         other => format!("[event] {other}"),
     }
 }
@@ -339,6 +340,25 @@ fn summarize_interrupted(payload: Option<&Value>) -> String {
     }
 }
 
+fn summarize_thrash(payload: Option<&Value>) -> String {
+    let class = payload
+        .and_then(|p| p.get("class").and_then(Value::as_str))
+        .unwrap_or("");
+    let count = payload
+        .and_then(|p| p.get("count").and_then(Value::as_i64))
+        .unwrap_or(0);
+    let threshold = payload
+        .and_then(|p| p.get("threshold").and_then(Value::as_i64))
+        .unwrap_or(0);
+    match (class.is_empty(), count, threshold) {
+        (false, c, t) if c > 0 && t > 0 => format!("[thrash] {class} ×{c}/{t}"),
+        (false, c, _) if c > 0 => format!("[thrash] {class} ×{c}"),
+        (false, _, _) => format!("[thrash] {class}"),
+        (true, c, _) if c > 0 => format!("[thrash] ×{c}"),
+        (true, _, _) => "[thrash] detected".to_string(),
+    }
+}
+
 // ─────────────────────────── Helpers ───────────────────────────
 
 /// Replace whitespace/control chars with single spaces, collapse runs,
@@ -558,6 +578,21 @@ mod tests {
     }
 
     #[test]
+    fn thrash_detected_full_payload() {
+        let s = summarize_event(&ev(
+            "task.thrash_detected",
+            Some(r#"{"class":"transport","count":3,"threshold":3}"#),
+        ));
+        assert_eq!(s, "[thrash] transport ×3/3");
+    }
+
+    #[test]
+    fn thrash_detected_no_payload() {
+        let s = summarize_event(&ev("task.thrash_detected", None));
+        assert_eq!(s, "[thrash] detected");
+    }
+
+    #[test]
     fn unknown_event_falls_through() {
         let s = summarize_event(&ev("task.fancy_new_event_type", None));
         assert_eq!(s, "[event] task.fancy_new_event_type");
@@ -611,6 +646,7 @@ mod tests {
             "task.investigation_cleared",
             "task.operator_note",
             "task.interrupted",
+            "task.thrash_detected",
             "task.someday_unknown",
         ] {
             let s = summarize_event(&ev(event_type, None));
