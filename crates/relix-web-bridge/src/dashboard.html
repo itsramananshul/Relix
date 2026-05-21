@@ -3024,6 +3024,13 @@ function renderInterventionAudit(payload, errored) {
     } else {
       targetCell = '<code>' + escapeHtml(e.target || '—') + '</code>';
     }
+    // M68: correlation id surfaces as a copy-friendly short
+    // monospace id. Empty when the entry pre-dates M68
+    // wiring or came from a path that doesn't mint one.
+    const corrCell = e.correlation_id
+      ? '<code class="id" title="correlation id (copy to grep across audit + logs)">'
+        + escapeHtml(e.correlation_id) + '</code>'
+      : '<span class="meta">—</span>';
     return '<tr>'
       + '<td class="meta">' + escapeHtml(ago) + '</td>'
       + '<td><code>' + escapeHtml(e.action || '') + '</code></td>'
@@ -3031,11 +3038,12 @@ function renderInterventionAudit(payload, errored) {
       + '<td><span class="badge ' + badgeCls + '">'
         + escapeHtml(e.outcome || '') + '</span></td>'
       + '<td class="meta">' + escapeHtml(e.detail || '') + '</td>'
+      + '<td>' + corrCell + '</td>'
       + '</tr>';
   }).join('');
   $host.innerHTML = '<table class="data"><thead><tr>'
     + '<th>when</th><th>action</th><th>target</th>'
-    + '<th>outcome</th><th>detail</th>'
+    + '<th>outcome</th><th>detail</th><th>corr_id</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>';
   if ($status) {
     $status.textContent = items.length + ' shown · newest seq '

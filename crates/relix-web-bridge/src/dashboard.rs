@@ -593,6 +593,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_intervention_audit_renders_correlation_id_column() {
+        // M68 (Track B): every intervention now carries a
+        // 16-hex correlation id minted bridge-side; the
+        // dashboard surfaces it as a copy-friendly column
+        // in the operator-audit panel.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            ">corr_id<",
+            "e.correlation_id",
+            "correlation id (copy to grep",
+        ] {
+            assert!(body.contains(needle), "M68 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_global_firehose_pane_present() {
         // M67 (Track D): overview ships a global event
         // firehose pane fed by /v1/tasks/events/recent.

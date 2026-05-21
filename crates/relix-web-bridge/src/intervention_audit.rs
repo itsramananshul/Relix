@@ -72,6 +72,16 @@ pub struct InterventionEntry {
     /// echoed user input or upstream body — see redact rules
     /// at each call site. Capped at DETAIL_CAP bytes.
     pub detail: String,
+    /// M68: bridge-generated correlation id for this
+    /// intervention. Surfaces in chronicle events (when the
+    /// underlying coord capability accepts a correlation_id
+    /// arg) so operators can join the audit entry to the
+    /// resulting `task.paused` / `task.operator_note` / etc.
+    /// event. 16 hex chars (64 bits of entropy from OsRng) —
+    /// short enough to scan in a log but wide enough to
+    /// avoid collisions during normal operator activity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub correlation_id: String,
 }
 
 /// Hard cap on detail length to keep ring memory + JSONL
@@ -114,9 +124,17 @@ impl InterventionAudit {
         })
     }
 
-    /// Append a new intervention entry. Always lands in the
-    /// in-memory ring; best-effort writes to disk when a
-    /// `file_path` is set.
+    /// Append a new intervention entry without a correlation
+    /// id. Lands in the in-memory ring; best-effort writes to
+    /// disk when a `file_path` is set. Production HTTP
+    /// handlers prefer [`Self::record_with_id`] so the audit
+    /// row and any resulting chronicle event share an id.
+    ///
+    /// Kept exported because future internal background
+    /// tasks (recovery scans, etc.) may want a
+    /// no-correlation path. Currently only exercised by
+    /// unit tests; `#[allow(dead_code)]` keeps clippy quiet.
+    #[allow(dead_code)]
     pub fn record(
         &self,
         actor: impl Into<String>,
@@ -124,6 +142,23 @@ impl InterventionAudit {
         target: impl Into<String>,
         outcome: impl Into<String>,
         detail: impl Into<String>,
+    ) {
+        self.record_with_id(actor, action, target, outcome, detail, String::new());
+    }
+
+    /// Append with a pre-minted correlation id (M68). The id
+    /// becomes part of the audit entry + is expected to also
+    /// land in any chronicle event the underlying coord
+    /// capability emits, so the two surfaces can be joined
+    /// post-hoc.
+    pub fn record_with_id(
+        &self,
+        actor: impl Into<String>,
+        action: impl Into<String>,
+        target: impl Into<String>,
+        outcome: impl Into<String>,
+        detail: impl Into<String>,
+        correlation_id: impl Into<String>,
     ) {
         let ts = unix_secs();
         let detail = clamp_detail(detail.into());
@@ -139,6 +174,7 @@ impl InterventionAudit {
                 target: target.into(),
                 outcome: outcome.into(),
                 detail,
+                correlation_id: correlation_id.into(),
             };
             g.events.push_front(entry.clone());
             while g.events.len() > self.cap {
@@ -148,7 +184,24 @@ impl InterventionAudit {
         };
         self.append_to_file(&entry);
     }
+}
 
+/// Mint a 16-hex correlation id from OsRng (M68). Short
+/// enough to scan in a log; 64 bits of entropy avoid
+/// collisions during normal operator activity.
+pub fn new_correlation_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(16);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+impl InterventionAudit {
     /// Snapshot the recent entries newest-first, optionally
     /// limited to those after a sequence cursor. `since=0`
     /// returns up to `limit` of the newest entries.
@@ -290,6 +343,36 @@ pub async fn recent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_with_id_round_trips_correlation_id_through_disk() {
+        // M68: the correlation_id field persists through the
+        // in-memory ring AND through the JSONL file so a
+        // post-mortem grep can join an audit entry to its
+        // chronicle counterpart.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("intervention.jsonl");
+        let a = InterventionAudit::new(Some(path.clone()));
+        let corr = new_correlation_id();
+        assert_eq!(corr.len(), 16);
+        assert!(corr.chars().all(|c| c.is_ascii_hexdigit()));
+        a.record_with_id(
+            "anon",
+            "pause",
+            "task-1",
+            "ok",
+            "running→paused",
+            corr.clone(),
+        );
+        // In-memory check.
+        let snap = a.snapshot();
+        assert_eq!(snap[0].correlation_id, corr);
+        // Disk check — same id round-trips.
+        let body = std::fs::read_to_string(&path).expect("read jsonl");
+        let line = body.lines().next().expect("at least one line");
+        let parsed: InterventionEntry = serde_json::from_str(line).expect("parse");
+        assert_eq!(parsed.correlation_id, corr);
+    }
 
     #[test]
     fn record_appends_in_newest_first_order() {

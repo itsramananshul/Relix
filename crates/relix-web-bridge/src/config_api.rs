@@ -24,6 +24,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppState;
+use crate::intervention_audit::new_correlation_id;
 use crate::secrets::{ALLOWED_PROVIDERS, ALLOWED_TELEGRAM_MODES, ProviderStatus, TelegramStatus};
 
 /// Standard error envelope.
@@ -121,6 +122,7 @@ pub async fn put_provider(
     Path(name): Path<String>,
     Json(req): Json<PutProviderReq>,
 ) -> Result<Json<PutProviderResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
         return Err(unprocessable(format!(
             "unknown provider '{name}'. allowed: {}",
@@ -142,7 +144,7 @@ pub async fn put_provider(
                 default_model = %status.default_model.as_deref().unwrap_or(""),
                 "config: providers.{name} updated"
             );
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "provider_save",
                 &name,
@@ -152,6 +154,7 @@ pub async fn put_provider(
                     status.key_preview.as_deref().unwrap_or("none"),
                     status.default_model.as_deref().unwrap_or("(none)")
                 ),
+                corr,
             );
             Ok(Json(PutProviderResp {
                 status,
@@ -159,12 +162,13 @@ pub async fn put_provider(
             }))
         }
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "provider_save",
                 &name,
                 "error",
                 format!("persist failed: {e}"),
+                corr,
             );
             Err(internal(format!("persist failed: {e}")))
         }
@@ -198,6 +202,7 @@ pub async fn test_provider(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<ProviderTestResult>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -271,7 +276,7 @@ pub async fn test_provider(
             "config: providers.{name} test cache persist failed"
         );
     }
-    state.intervention_audit.record(
+    state.intervention_audit.record_with_id(
         "anon",
         "provider_test",
         &name,
@@ -289,6 +294,7 @@ pub async fn test_provider(
                 format!(" · {}", result.detail)
             }
         ),
+        corr,
     );
     Ok(Json(result))
 }
@@ -481,6 +487,7 @@ pub async fn set_provider_enabled(
     Path(name): Path<String>,
     Json(req): Json<PutEnabledReq>,
 ) -> Result<Json<PutProviderResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
         return Err(unprocessable(format!(
             "unknown provider '{name}'. allowed: {}",
@@ -494,12 +501,13 @@ pub async fn set_provider_enabled(
     match result {
         Ok((applied, status)) => {
             if !applied {
-                state.intervention_audit.record(
+                state.intervention_audit.record_with_id(
                     "anon",
                     "provider_enabled_set",
                     &name,
                     "refused",
                     "no entry yet — set api_key first",
+                    corr,
                 );
                 return Err(unprocessable(format!(
                     "provider '{name}' has no entry; set an api_key first via PUT /v1/config/providers/{name}"
@@ -510,12 +518,13 @@ pub async fn set_provider_enabled(
                 enabled = req.enabled,
                 "config: providers.{name} enabled flag updated"
             );
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "provider_enabled_set",
                 &name,
                 "ok",
                 if req.enabled { "enabled" } else { "disabled" },
+                corr,
             );
             Ok(Json(PutProviderResp {
                 status,
@@ -523,12 +532,13 @@ pub async fn set_provider_enabled(
             }))
         }
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "provider_enabled_set",
                 &name,
                 "error",
                 format!("persist failed: {e}"),
+                corr,
             );
             Err(internal(format!("persist failed: {e}")))
         }
@@ -541,6 +551,7 @@ pub async fn delete_provider(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<ProviderStatus>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
         return Err(unprocessable(format!(
             "unknown provider '{name}'. allowed: {}",
@@ -554,18 +565,24 @@ pub async fn delete_provider(
     match status {
         Ok(s) => {
             tracing::info!(provider = %name, "config: providers.{name} deleted");
-            state
-                .intervention_audit
-                .record("anon", "provider_delete", &name, "ok", "");
+            state.intervention_audit.record_with_id(
+                "anon",
+                "provider_delete",
+                &name,
+                "ok",
+                "",
+                corr,
+            );
             Ok(Json(s))
         }
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "provider_delete",
                 &name,
                 "error",
                 format!("persist failed: {e}"),
+                corr,
             );
             Err(internal(format!("persist failed: {e}")))
         }
@@ -603,6 +620,7 @@ pub async fn put_default_provider(
     State(state): State<AppState>,
     Json(req): Json<PutDefaultProviderReq>,
 ) -> Result<Json<DefaultProviderResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     if let Some(name) = req.name.as_ref()
         && !ALLOWED_PROVIDERS.contains(&name.as_str())
     {
@@ -622,16 +640,21 @@ pub async fn put_default_provider(
                 "config: default provider updated"
             );
             let target = current.clone().unwrap_or_else(|| "(cleared)".to_string());
-            state
-                .intervention_audit
-                .record("anon", "provider_make_default", target, "ok", "");
+            state.intervention_audit.record_with_id(
+                "anon",
+                "provider_make_default",
+                target,
+                "ok",
+                "",
+                corr,
+            );
             Ok(Json(DefaultProviderResp {
                 default_provider: current,
                 restart_required: true,
             }))
         }
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "provider_make_default",
                 req.name
@@ -639,6 +662,7 @@ pub async fn put_default_provider(
                     .unwrap_or_else(|| "(unspecified)".to_string()),
                 "error",
                 format!("persist failed: {e}"),
+                corr,
             );
             Err(internal(format!("persist failed: {e}")))
         }
@@ -716,6 +740,7 @@ pub struct TelegramTestResult {
 pub async fn test_telegram(
     State(state): State<AppState>,
 ) -> Result<Json<TelegramTestResult>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let token = state.secrets.read(|s| {
         s.telegram
             .as_ref()
@@ -752,7 +777,7 @@ pub async fn test_telegram(
         elapsed_ms = result.elapsed_ms,
         "config: telegram test"
     );
-    state.intervention_audit.record(
+    state.intervention_audit.record_with_id(
         "anon",
         "telegram_test",
         "telegram",
@@ -775,6 +800,7 @@ pub async fn test_telegram(
                 format!(" · {}", result.detail)
             }
         ),
+        corr,
     );
     Ok(Json(result))
 }
@@ -868,6 +894,7 @@ pub async fn put_telegram(
     State(state): State<AppState>,
     Json(req): Json<PutTelegramReq>,
 ) -> Result<Json<PutTelegramResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     if req.bot_token.trim().is_empty() {
         return Err(bad_request("bot_token required (non-empty)"));
     }
@@ -923,7 +950,7 @@ pub async fn put_telegram(
             } else {
                 None
             };
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "telegram_save",
                 "telegram",
@@ -936,6 +963,7 @@ pub async fn put_telegram(
                         ""
                     }
                 ),
+                corr,
             );
             Ok(Json(PutTelegramResp {
                 status,
@@ -944,12 +972,13 @@ pub async fn put_telegram(
             }))
         }
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "telegram_save",
                 "telegram",
                 "error",
                 format!("persist failed: {e}"),
+                corr,
             );
             Err(internal(format!("persist failed: {e}")))
         }

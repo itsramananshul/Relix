@@ -45,6 +45,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppState;
+use crate::intervention_audit::new_correlation_id;
 
 /// Compact task line returned by `GET /v1/tasks`.
 #[derive(Debug, Serialize)]
@@ -354,25 +355,28 @@ pub struct RecoverResponse {
 pub async fn recover(
     State(state): State<AppState>,
 ) -> Result<Json<RecoverResponse>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let Some(rec) = state.task_recorder.as_ref() else {
-        state.intervention_audit.record(
+        state.intervention_audit.record_with_id(
             "anon",
             "recover",
             "all",
             "error",
             "no coordinator configured",
+            corr,
         );
         return Err(no_coordinator());
     };
     let body = match rec.recover().await {
         Ok(b) => b,
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "recover",
                 "all",
                 "error",
                 format!("coord call failed: {e}"),
+                corr,
             );
             return Err((StatusCode::BAD_GATEWAY, Json(ApiError { error: e })));
         }
@@ -393,7 +397,7 @@ pub async fn recover(
     };
     state
         .intervention_audit
-        .record("anon", "recover", "all", "ok", detail);
+        .record_with_id("anon", "recover", "all", "ok", detail, corr);
     Ok(Json(RecoverResponse {
         recovered: ids,
         count,
@@ -476,6 +480,7 @@ pub async fn cancel(
     Path(id): Path<String>,
     Json(req): Json<CancelReq>,
 ) -> Result<Json<CancelResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let Some(rec) = state.task_recorder.as_ref() else {
         return Err(no_coordinator());
     };
@@ -511,12 +516,13 @@ pub async fn cancel(
     }
     let reason = req.reason.unwrap_or_default();
     if let Err(e) = rec.cancel(&id, &reason).await {
-        state.intervention_audit.record(
+        state.intervention_audit.record_with_id(
             "anon",
             "cancel",
             &id,
             "error",
             format!("coord cancel failed: {e}"),
+            corr,
         );
         return Err((gateway_status_for(&e), Json(ApiError { error: e })));
     }
@@ -536,7 +542,7 @@ pub async fn cancel(
     );
     state
         .intervention_audit
-        .record("anon", "cancel", &id, "ok", detail);
+        .record_with_id("anon", "cancel", &id, "ok", detail, corr);
     Ok(Json(CancelResp {
         task_id: id,
         prior_status,
@@ -556,6 +562,7 @@ pub async fn retry(
     Path(id): Path<String>,
     Query(q): Query<RetryQuery>,
 ) -> Result<Json<RetryResponse>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let Some(rec) = state.task_recorder.as_ref() else {
         return Err(no_coordinator());
     };
@@ -578,12 +585,13 @@ pub async fn retry(
         if let Some(c) = class.as_deref()
             && NON_RETRYABLE_CLASSES.contains(&c)
         {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "retry",
                 &id,
                 "refused",
                 format!("non-retryable failure_class={c}"),
+                corr,
             );
             return Ok(Json(RetryResponse {
                 outcome: "refused".to_string(),
@@ -600,12 +608,13 @@ pub async fn retry(
     let body = match rec.retry(&id).await {
         Ok(b) => b,
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "retry",
                 &id,
                 "error",
                 format!("coord retry failed: {e}"),
+                corr,
             );
             return Err((gateway_status_for(&e), Json(ApiError { error: e })));
         }
@@ -617,12 +626,13 @@ pub async fn retry(
         "exhausted" | "refused" => "refused",
         _ => "ok",
     };
-    state.intervention_audit.record(
+    state.intervention_audit.record_with_id(
         "anon",
         "retry",
         &id,
         outcome_label,
         format!("{}{}", parsed.detail, force_suffix),
+        corr,
     );
     Ok(Json(parsed))
 }
@@ -662,10 +672,16 @@ pub async fn note(
     Path(id): Path<String>,
     Json(req): Json<NoteReq>,
 ) -> Result<Json<NoteResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let Some(rec) = state.task_recorder.as_ref() else {
-        state
-            .intervention_audit
-            .record("anon", "task_note", &id, "error", "no coordinator");
+        state.intervention_audit.record_with_id(
+            "anon",
+            "task_note",
+            &id,
+            "error",
+            "no coordinator",
+            corr,
+        );
         return Err(no_coordinator());
     };
     if !is_valid_task_id(&id) {
@@ -712,12 +728,13 @@ pub async fn note(
     let body = match rec.note(&id, trimmed).await {
         Ok(b) => b,
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "task_note",
                 &id,
                 "error",
                 format!("coord task.note failed: {e}"),
+                corr,
             );
             return Err((gateway_status_for(&e), Json(ApiError { error: e })));
         }
@@ -738,12 +755,13 @@ pub async fn note(
         }
         format!("{}…", &trimmed[..end])
     };
-    state.intervention_audit.record(
+    state.intervention_audit.record_with_id(
         "anon",
         "task_note",
         &id,
         "ok",
         format!("event_id={event_id} · {preview}"),
+        corr,
     );
     Ok(Json(NoteResp {
         task_id: id,
@@ -792,10 +810,16 @@ pub async fn pause(
     Path(id): Path<String>,
     Json(req): Json<PauseReq>,
 ) -> Result<Json<PauseResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let Some(rec) = state.task_recorder.as_ref() else {
-        state
-            .intervention_audit
-            .record("anon", "pause", &id, "error", "no coordinator");
+        state.intervention_audit.record_with_id(
+            "anon",
+            "pause",
+            &id,
+            "error",
+            "no coordinator",
+            corr,
+        );
         return Err(no_coordinator());
     };
     if !is_valid_task_id(&id) {
@@ -835,12 +859,13 @@ pub async fn pause(
     let body = match rec.pause(&id, trimmed_reason).await {
         Ok(b) => b,
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "pause",
                 &id,
                 "error",
                 format!("coord task.pause failed: {e}"),
+                corr,
             );
             return Err((gateway_status_for(&e), Json(ApiError { error: e })));
         }
@@ -864,7 +889,7 @@ pub async fn pause(
     );
     state
         .intervention_audit
-        .record("anon", "pause", &id, "ok", detail);
+        .record_with_id("anon", "pause", &id, "ok", detail, corr);
     Ok(Json(PauseResp {
         task_id: id,
         prior_status,
@@ -880,10 +905,16 @@ pub async fn resume(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ResumeResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let Some(rec) = state.task_recorder.as_ref() else {
-        state
-            .intervention_audit
-            .record("anon", "resume", &id, "error", "no coordinator");
+        state.intervention_audit.record_with_id(
+            "anon",
+            "resume",
+            &id,
+            "error",
+            "no coordinator",
+            corr,
+        );
         return Err(no_coordinator());
     };
     if !is_valid_task_id(&id) {
@@ -897,12 +928,13 @@ pub async fn resume(
     let body = match rec.resume(&id).await {
         Ok(b) => b,
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "resume",
                 &id,
                 "error",
                 format!("coord task.resume failed: {e}"),
+                corr,
             );
             return Err((gateway_status_for(&e), Json(ApiError { error: e })));
         }
@@ -912,12 +944,13 @@ pub async fn resume(
         .find_map(|l| l.strip_prefix("pre_pause_status="))
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|| "paused".to_string());
-    state.intervention_audit.record(
+    state.intervention_audit.record_with_id(
         "anon",
         "resume",
         &id,
         "ok",
         format!("paused→pending (was {pre_pause_status})"),
+        corr,
     );
     Ok(Json(ResumeResp {
         task_id: id,
@@ -955,13 +988,15 @@ pub async fn investigation(
     Path(id): Path<String>,
     Json(req): Json<InvestigationReq>,
 ) -> Result<Json<InvestigationResp>, (StatusCode, Json<ApiError>)> {
+    let corr = new_correlation_id();
     let Some(rec) = state.task_recorder.as_ref() else {
-        state.intervention_audit.record(
+        state.intervention_audit.record_with_id(
             "anon",
             "task_investigation_set",
             &id,
             "error",
             "no coordinator",
+            corr,
         );
         return Err(no_coordinator());
     };
@@ -1006,12 +1041,13 @@ pub async fn investigation(
     {
         Ok(b) => b,
         Err(e) => {
-            state.intervention_audit.record(
+            state.intervention_audit.record_with_id(
                 "anon",
                 "task_investigation_set",
                 &id,
                 "error",
                 format!("coord task.mark_investigation failed: {e}"),
+                corr,
             );
             return Err((gateway_status_for(&e), Json(ApiError { error: e })));
         }
@@ -1030,9 +1066,14 @@ pub async fn investigation(
     } else {
         "cleared".to_string()
     };
-    state
-        .intervention_audit
-        .record("anon", "task_investigation_set", &id, "ok", detail);
+    state.intervention_audit.record_with_id(
+        "anon",
+        "task_investigation_set",
+        &id,
+        "ok",
+        detail,
+        corr,
+    );
     Ok(Json(InvestigationResp {
         task_id: id,
         marked_at,
