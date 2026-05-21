@@ -1055,6 +1055,9 @@ fn register_node_type_handlers(
             // PH-TERM-STREAM1: tool.terminal.tail — polling-cursor
             // stream tail of a live run's stdout / stderr buffer.
             manifest.add_capability(crate::nodes::tool::terminal::descriptor_tail());
+            // PH-TERM-SPAWN: tool.terminal.spawn — fire-and-forget
+            // background variant of tool.terminal.run.
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_spawn());
         }
         // CW4: tool.browser.* — only advertised when
         // [tool.browser] is configured. Honest: the descriptors

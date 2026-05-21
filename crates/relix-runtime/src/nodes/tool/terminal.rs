@@ -64,12 +64,22 @@
 //! backpressure relief; a future ring-with-consumer-cursor
 //! would relax this.
 //!
+//! ## Background execution (PH-TERM-SPAWN)
+//!
+//! `tool.terminal.spawn` is the fire-and-forget sibling of
+//! `tool.terminal.run`. Same validation + spawn posture; the
+//! response carries `{session_id, pid, command, timeout_secs,
+//! started_at}` and returns immediately while the run continues
+//! asynchronously on the tokio runtime. The completion path is
+//! identical to `run` — same audit ring push, same session
+//! cleanup, same `tail` visibility — so consuming a backgrounded
+//! run uses the same surfaces as the synchronous one.
+//!
 //! ## Still out of scope (alpha)
 //!
 //! - No streaming-with-consumer-drain (tail is read-only; it
 //!   does NOT advance the drainer's write head, so a long-
 //!   running run producing > 1 MiB still stalls).
-//! - No background / detached execution.
 //! - No persistent shell sessions.
 //! - No interactive stdin.
 //!
@@ -387,7 +397,7 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
         );
     }
     {
-        let b = backend;
+        let b = backend.clone();
         bridge.register(
             "tool.terminal.tail",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -396,6 +406,56 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
             })),
         );
     }
+    {
+        let b = backend;
+        bridge.register(
+            "tool.terminal.spawn",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_spawn(b, ctx).await }
+            })),
+        );
+    }
+}
+
+/// PH-TERM-SPAWN: `tool.terminal.spawn` capability — fire-and-
+/// forget variant of `tool.terminal.run`. Validates + spawns +
+/// registers the session, then returns immediately with the
+/// session_id so the caller can poll `tool.terminal.sessions`,
+/// `tool.terminal.tail`, and `tool.terminal.audit_recent`. Same
+/// allowlist + path-traversal + env / cwd posture as run.
+pub fn descriptor_spawn() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.spawn");
+    d.major_version = 1;
+    // Spawn is at most once — running the same request twice
+    // produces two children.
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec![
+        "shell:execute".into(),
+        "shell:background".into(),
+        "host:local".into(),
+        "destructive:potential".into(),
+    ];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Background variant of tool.terminal.run. Request JSON: \
+         {command, args, timeout_secs?}. Returns IMMEDIATELY with JSON \
+         {session_id, pid, command, timeout_secs, started_at}. The run \
+         continues asynchronously; consume it via tool.terminal.tail, \
+         tool.terminal.sessions, tool.terminal.audit_recent, or terminate \
+         early via tool.terminal.cancel. Same allowlist + cwd + env posture \
+         as tool.terminal.run."
+            .into(),
+    );
+    d.categories = vec![
+        "mutate".into(),
+        "terminal".into(),
+        "execute".into(),
+        "background".into(),
+    ];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
 }
 
 /// PH-TERM-STREAM1: per-call cap on bytes returned by
@@ -507,32 +567,55 @@ pub fn descriptor_sessions() -> CapabilityDescriptor {
     d
 }
 
-async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
-    let req: RunRequest = match serde_json::from_slice(&ctx.args) {
-        Ok(r) => r,
-        Err(e) => {
-            return HandlerOutcome::Err(ErrorEnvelope {
-                kind: error_kinds::INVALID_ARGS,
-                cause: format!("tool.terminal.run: bad request shape: {e}"),
-                retry_hint: 2,
-                retry_after: None,
-            });
-        }
-    };
-    // Allowlist + path-traversal guards.
+/// PH-TERM-SPAWN: validated + spawned run state. Produced by
+/// [`validate_and_spawn`]; consumed by [`drive_to_completion`].
+/// Carries everything needed to drive the child to termination
+/// AND surface a useful response to the caller, whether the
+/// caller is the synchronous `tool.terminal.run` handler or the
+/// background `tool.terminal.spawn` handler.
+struct SpawnedRun {
+    child: tokio::process::Child,
+    started: Instant,
+    session_id: String,
+    cancel_notify: Arc<tokio::sync::Notify>,
+    stdout_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    stdout_drain: tokio::task::JoinHandle<()>,
+    stderr_drain: tokio::task::JoinHandle<()>,
+    command: String,
+    args: Vec<String>,
+    timeout_secs: u64,
+    caller_subject_id: String,
+    pid: Option<u32>,
+}
+
+/// PH-TERM-SPAWN: validate a [`RunRequest`] against the
+/// backend's allowlist + posture, configure the tokio
+/// [`Command`](tokio::process::Command), spawn the child, take
+/// the stdio pipes, register the session, and kick off the
+/// stdout/stderr drainer tasks. Pure setup — no wait, no
+/// cleanup. Both `tool.terminal.run` and `tool.terminal.spawn`
+/// route through this so they share validation + spawn
+/// behavior.
+async fn validate_and_spawn(
+    backend: &Arc<TerminalBackend>,
+    ctx: &InvocationCtx,
+    req: &RunRequest,
+    capability: &'static str,
+) -> Result<SpawnedRun, ErrorEnvelope> {
     if req.command.is_empty() {
-        return HandlerOutcome::Err(ErrorEnvelope {
+        return Err(ErrorEnvelope {
             kind: error_kinds::INVALID_ARGS,
-            cause: "tool.terminal.run: command required".to_string(),
+            cause: format!("{capability}: command required"),
             retry_hint: 2,
             retry_after: None,
         });
     }
     if req.command.contains('/') || req.command.contains('\\') {
-        return HandlerOutcome::Err(ErrorEnvelope {
+        return Err(ErrorEnvelope {
             kind: error_kinds::INVALID_ARGS,
             cause: format!(
-                "tool.terminal.run: command `{}` contains a path separator; \
+                "{capability}: command `{}` contains a path separator; \
                  only bare program names are accepted (operator allowlist \
                  enforces this)",
                 req.command
@@ -542,10 +625,10 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
         });
     }
     if !backend.allowed.contains(&req.command) {
-        return HandlerOutcome::Err(ErrorEnvelope {
+        return Err(ErrorEnvelope {
             kind: error_kinds::POLICY_DENIED,
             cause: format!(
-                "tool.terminal.run: command `{}` is not in the operator's \
+                "{capability}: command `{}` is not in the operator's \
                  allowlist (allowed: {})",
                 req.command,
                 backend.cfg.allowed_commands.join(", ")
@@ -554,7 +637,6 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
             retry_after: None,
         });
     }
-    // Effective timeout = min(per-call, cfg max). Always cap.
     let timeout_secs = req
         .timeout_secs
         .unwrap_or(backend.cfg.max_timeout_secs)
@@ -565,9 +647,6 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
     command.args(&req.args);
     if !backend.cfg.inherit_env {
         command.env_clear();
-        // Preserve a minimal PATH so the OS can find the
-        // binary. Without this, env_clear breaks resolution
-        // on Windows + many Unix setups.
         if let Ok(path) = std::env::var("PATH") {
             command.env("PATH", path);
         }
@@ -586,40 +665,29 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
-    // Kill the child if its Child handle is dropped — defence
-    // against runaway processes if the runtime panics mid-await.
     command.kill_on_drop(true);
 
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return HandlerOutcome::Err(ErrorEnvelope {
-                kind: error_kinds::RESPONDER_INTERNAL,
-                cause: format!("tool.terminal.run: spawn `{}` failed: {e}", req.command),
-                retry_hint: 2,
-                retry_after: None,
-            });
-        }
-    };
+    let mut child = command.spawn().map_err(|e| ErrorEnvelope {
+        kind: error_kinds::RESPONDER_INTERNAL,
+        cause: format!("{capability}: spawn `{}` failed: {e}", req.command),
+        retry_hint: 2,
+        retry_after: None,
+    })?;
     let stdout_pipe = child
         .stdout
         .take()
-        .expect("tool.terminal.run: stdout pipe present (was piped at spawn)");
+        .expect("tool.terminal: stdout pipe present (was piped at spawn)");
     let stderr_pipe = child
         .stderr
         .take()
-        .expect("tool.terminal.run: stderr pipe present (was piped at spawn)");
+        .expect("tool.terminal: stderr pipe present (was piped at spawn)");
 
-    // PH-TERM-SESSIONS / PH-TERM-CANCEL / PH-TERM-STREAM1:
-    // register the live session BEFORE wiring up the race so a
-    // cancel arriving anytime after spawn finds its target. The
-    // stdout/stderr buffers live on the record so the
-    // `tool.terminal.tail` poller can read them mid-run.
     let session_id = new_session_id();
     let pid = child.id();
     let cancel_notify = Arc::new(tokio::sync::Notify::new());
     let stdout_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let caller_subject_id = ctx.caller.subject_id.to_string();
     {
         let mut g = backend
             .sessions
@@ -633,7 +701,7 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
                 command: req.command.clone(),
                 args: req.args.clone(),
                 started_at: unix_secs(),
-                caller_subject_id: ctx.caller.subject_id.to_string(),
+                caller_subject_id: caller_subject_id.clone(),
                 timeout_secs,
                 cancel_notify: cancel_notify.clone(),
                 stdout_buf: stdout_buf.clone(),
@@ -642,10 +710,6 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
         );
     }
 
-    // Drain stdout/stderr concurrently with the wait so the OS
-    // pipe buffer never fills (which would block the child). The
-    // drainers write through the shared Arc<Mutex<Vec<u8>>>;
-    // `tool.terminal.tail` reads the same arcs.
     let stdout_drain = tokio::spawn(drain_pipe_into(
         stdout_pipe,
         stdout_buf.clone(),
@@ -657,49 +721,75 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
         MAX_OUTPUT_BYTES,
     ));
 
-    // Race wait against cancel + timeout. `biased` keeps the
-    // ordering deterministic: a child that already exited wins
-    // over a cancel that arrives at the same tick.
-    let cancel_fut = cancel_notify.notified();
+    Ok(SpawnedRun {
+        child,
+        started,
+        session_id,
+        cancel_notify,
+        stdout_buf,
+        stderr_buf,
+        stdout_drain,
+        stderr_drain,
+        command: req.command.clone(),
+        args: req.args.clone(),
+        timeout_secs,
+        caller_subject_id,
+        pid,
+    })
+}
+
+/// PH-TERM-SPAWN: drive a [`SpawnedRun`] to termination. Races
+/// `child.wait()` against the cancel notify and the hard
+/// timeout; joins the drainer tasks; removes the session from
+/// the registry; pushes an audit entry; returns the response.
+/// Used by both the synchronous run handler (which serializes
+/// and returns) and the background spawn handler (which fires
+/// this off via `tokio::spawn` and ignores the result).
+///
+/// Wait-error from `child.wait()` returns `Err(ErrorEnvelope)`
+/// WITHOUT pushing audit — wait-error is a harness failure, not
+/// a run outcome.
+async fn drive_to_completion(
+    backend: Arc<TerminalBackend>,
+    mut s: SpawnedRun,
+) -> Result<RunResponse, ErrorEnvelope> {
+    let cancel_fut = s.cancel_notify.notified();
     tokio::pin!(cancel_fut);
-    let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout_secs));
+    let timeout_fut = tokio::time::sleep(Duration::from_secs(s.timeout_secs));
     tokio::pin!(timeout_fut);
     let outcome = tokio::select! {
         biased;
-        res = child.wait() => Termination::Exited(res),
+        res = s.child.wait() => Termination::Exited(res),
         _ = &mut cancel_fut => {
-            let _ = child.kill().await;
+            let _ = s.child.kill().await;
             Termination::Cancelled
         }
         _ = &mut timeout_fut => {
-            let _ = child.kill().await;
+            let _ = s.child.kill().await;
             Termination::TimedOut
         }
     };
-    let duration_ms = started.elapsed().as_millis() as u64;
-    // Drainers see EOF once the pipes close (child exit / kill);
-    // join them so we have the final byte buffers in hand.
-    let _ = stdout_drain.await;
-    let _ = stderr_drain.await;
-    // Drop the session record now that the child has terminated.
+    let duration_ms = s.started.elapsed().as_millis() as u64;
+    let _ = s.stdout_drain.await;
+    let _ = s.stderr_drain.await;
     {
         let mut g = backend
             .sessions
             .lock()
             .expect("tool.terminal sessions poisoned");
-        g.remove(&session_id);
+        g.remove(&s.session_id);
     }
-    let stdout_bytes = std::mem::take(&mut *stdout_buf.lock().expect("stdout buf poisoned"));
-    let stderr_bytes = std::mem::take(&mut *stderr_buf.lock().expect("stderr buf poisoned"));
+    let stdout_bytes = std::mem::take(&mut *s.stdout_buf.lock().expect("stdout buf poisoned"));
+    let stderr_bytes = std::mem::take(&mut *s.stderr_buf.lock().expect("stderr buf poisoned"));
     let (stdout, truncated_stdout) = truncate_output(stdout_bytes);
     let (stderr, truncated_stderr) = truncate_output(stderr_bytes);
 
     let (exit_code, timed_out, cancelled) = match outcome {
         Termination::Exited(Ok(status)) => (status.code(), false, false),
         Termination::Exited(Err(e)) => {
-            return HandlerOutcome::Err(ErrorEnvelope {
+            return Err(ErrorEnvelope {
                 kind: error_kinds::RESPONDER_INTERNAL,
-                cause: format!("tool.terminal.run: wait failed: {e}"),
+                cause: format!("tool.terminal: wait failed: {e}"),
                 retry_hint: 2,
                 retry_after: None,
             });
@@ -717,49 +807,126 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
         cancelled,
         truncated_stdout,
         truncated_stderr,
-        command: req.command.clone(),
-        timeout_secs,
+        command: s.command.clone(),
+        timeout_secs: s.timeout_secs,
     };
     if timed_out {
         tracing::warn!(
-            caller = %ctx.caller.subject_id,
+            caller = %s.caller_subject_id,
             command = %resp.command,
-            timeout_secs,
+            timeout_secs = s.timeout_secs,
             duration_ms,
-            "tool.terminal.run timed out — child killed"
+            session_id = %s.session_id,
+            "tool.terminal run timed out — child killed"
         );
     } else if cancelled {
         tracing::warn!(
-            caller = %ctx.caller.subject_id,
+            caller = %s.caller_subject_id,
             command = %resp.command,
             duration_ms,
-            session_id = %session_id,
-            "tool.terminal.run cancelled — child killed"
+            session_id = %s.session_id,
+            "tool.terminal run cancelled — child killed"
         );
     } else {
         tracing::info!(
-            caller = %ctx.caller.subject_id,
+            caller = %s.caller_subject_id,
             command = %resp.command,
             exit_code = ?resp.exit_code,
             duration_ms = resp.duration_ms,
             timeout_secs = resp.timeout_secs,
             truncated_stdout = resp.truncated_stdout,
             truncated_stderr = resp.truncated_stderr,
-            "tool.terminal.run completed"
+            session_id = %s.session_id,
+            "tool.terminal run completed"
         );
     }
-    // PH-TERM-AUDIT: record the terminated run on the ring. One
-    // entry per run regardless of outcome; the response fields
-    // disambiguate normal exit / timeout / cancel.
     backend.audit.push(TerminalAuditEntry {
         ts_secs: unix_secs(),
         command: resp.command.clone(),
-        args: req.args.clone(),
+        args: s.args.clone(),
         exit_code: resp.exit_code,
         duration_ms: resp.duration_ms,
         timed_out: resp.timed_out,
         cancelled: resp.cancelled,
-        caller_subject_id: ctx.caller.subject_id.to_string(),
+        caller_subject_id: s.caller_subject_id.clone(),
+    });
+    Ok(resp)
+}
+
+async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
+    let req: RunRequest = match serde_json::from_slice(&ctx.args) {
+        Ok(r) => r,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.run: bad request shape: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let spawned = match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.run").await {
+        Ok(s) => s,
+        Err(e) => return HandlerOutcome::Err(e),
+    };
+    match drive_to_completion(backend, spawned).await {
+        Ok(resp) => HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default()),
+        Err(e) => HandlerOutcome::Err(e),
+    }
+}
+
+/// PH-TERM-SPAWN: wire-shape body for the spawn-only response.
+/// Returned immediately by `tool.terminal.spawn` so the caller
+/// can start polling tail / sessions / audit with the
+/// session_id.
+#[derive(Debug, Serialize)]
+struct SpawnResponse {
+    session_id: String,
+    pid: Option<u32>,
+    command: String,
+    timeout_secs: u64,
+    started_at: i64,
+}
+
+async fn handle_spawn(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
+    let req: RunRequest = match serde_json::from_slice(&ctx.args) {
+        Ok(r) => r,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.spawn: bad request shape: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let spawned = match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.spawn").await {
+        Ok(s) => s,
+        Err(e) => return HandlerOutcome::Err(e),
+    };
+    let resp = SpawnResponse {
+        session_id: spawned.session_id.clone(),
+        pid: spawned.pid,
+        command: spawned.command.clone(),
+        timeout_secs: spawned.timeout_secs,
+        started_at: unix_secs(),
+    };
+    // Kick the run task onto the background runtime and return
+    // immediately. The completion path drives audit + cleanup
+    // exactly like the synchronous handler; the only difference
+    // is that no one is awaiting the RunResponse here. A
+    // wait-error from the harness is logged but does not
+    // surface to the caller (they already got their session_id).
+    let backend_for_task = backend.clone();
+    let session_id_for_task = spawned.session_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = drive_to_completion(backend_for_task, spawned).await {
+            tracing::warn!(
+                session_id = %session_id_for_task,
+                cause = %e.cause,
+                "tool.terminal.spawn: background run completed with wait error"
+            );
+        }
     });
     HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
 }
@@ -1702,5 +1869,149 @@ mod tests {
         let v = parse_tail(&body);
         assert_eq!(v["chunk"], "hi");
         assert_eq!(v["next_offset"], 2);
+    }
+
+    // ── PH-TERM-SPAWN: tool.terminal.spawn ─────────────────────────
+
+    /// Cross-platform always-present binary for the live-spawn
+    /// integration test below. On Windows `cmd.exe` is in
+    /// System32; on Unix `sh` is in /bin via the OS PATH.
+    #[cfg(windows)]
+    const REAL_SPAWN_BIN: &str = "cmd";
+    #[cfg(unix)]
+    const REAL_SPAWN_BIN: &str = "sh";
+
+    #[cfg(windows)]
+    fn real_spawn_quick_exit_args() -> &'static [&'static str] {
+        &["/c", "exit"]
+    }
+    #[cfg(unix)]
+    fn real_spawn_quick_exit_args() -> &'static [&'static str] {
+        &["-c", "exit 0"]
+    }
+
+    #[test]
+    fn spawn_descriptor_shape() {
+        let d = descriptor_spawn();
+        assert_eq!(d.method_name, "tool.terminal.spawn");
+        assert_eq!(d.major_version, 1);
+        assert!(matches!(d.idempotency, Idempotency::AtMostOnce));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "shell:execute"));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "shell:background"));
+        assert!(
+            d.sensitivity_tags
+                .iter()
+                .any(|t| t == "destructive:potential")
+        );
+        assert!(d.requires_groups.iter().any(|g| g == "operators"));
+        assert!(d.categories.iter().any(|c| c == "background"));
+    }
+
+    #[tokio::test]
+    async fn spawn_bad_json_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"not-json");
+        match handle_spawn(b, ctx).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("bad request shape"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_empty_command_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"command":"","args":[]}"#;
+        match handle_spawn(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("command required"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_path_separator_in_command_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"command":"bin/echo","args":[]}"#;
+        match handle_spawn(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("path separator"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_disallowed_command_rejected_policy_denied() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"command":"rm","args":["-rf","/"]}"#;
+        match handle_spawn(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("not in the operator's allowlist"));
+                assert_eq!(e.kind, error_kinds::POLICY_DENIED);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_real_subprocess_returns_session_immediately() {
+        // Real-spawn integration test. Uses cmd.exe on Windows
+        // / sh on Unix, both of which are always present.
+        let b = Arc::new(TerminalBackend::new(cfg(&[REAL_SPAWN_BIN])).unwrap());
+        let args_json = serde_json::to_string(real_spawn_quick_exit_args()).unwrap();
+        let body =
+            format!(r#"{{"command":"{REAL_SPAWN_BIN}","args":{args_json},"timeout_secs":5}}"#);
+        let ctx = ctx_with_args(body.as_bytes());
+
+        let started = Instant::now();
+        let result = handle_spawn(b.clone(), ctx).await;
+        // Spawn must return well under the timeout (which is
+        // 5 seconds) — typically tens of milliseconds.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "spawn should return immediately, took {:?}",
+            started.elapsed()
+        );
+
+        let body = match result {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["session_id"].as_str().is_some());
+        assert!(v["pid"].as_u64().is_some());
+        assert_eq!(v["command"], REAL_SPAWN_BIN);
+        assert_eq!(v["timeout_secs"], 5);
+
+        // Give the background task time to complete the
+        // quick-exit and push the audit entry.
+        for _ in 0..50 {
+            if !b.audit_snapshot(10).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let snap = b.audit_snapshot(10);
+        assert_eq!(
+            snap.len(),
+            1,
+            "audit entry should land after background completion"
+        );
+        assert_eq!(snap[0].command, REAL_SPAWN_BIN);
+        assert!(!snap[0].timed_out);
+        assert!(!snap[0].cancelled);
+        // exit 0 → exit_code Some(0) on both platforms.
+        assert_eq!(snap[0].exit_code, Some(0));
+
+        // Session should have been removed from the live registry
+        // by the completion path.
+        assert!(b.snapshot_sessions().is_empty());
     }
 }
