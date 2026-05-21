@@ -9,13 +9,13 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `f642e52 feat(cli): PH-TERM-CLI relix-cli terminal subcommand`
+- **HEAD:** `a307138 feat(tool): PH-FS-AUDIT-FILTER op-filter on tool.fs.audit_recent`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1044 passing, 0 failures
+- **Workspace tests:** 1053 passing, 0 failures
   - relix-core: 60
   - relix-policy: 66
-  - relix-runtime: 648
+  - relix-runtime: 657
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli: 18
@@ -47,6 +47,7 @@ as the resume command.
 | 8632314 | PH-PDF-CHUNK | tool.text.chunk — general text chunker (paragraph > sentence > word > char) |
 | 31c160e | PH-MCP-CLI | relix-cli mcp {servers,tools} — libp2p dial-and-call for MCP registry inspection |
 | f642e52 | PH-TERM-CLI | relix-cli terminal {sessions,audit,cancel} — terminal observability + cooperative cancel |
+| a307138 | PH-FS-AUDIT-FILTER | tool.fs.audit_recent JSON arg form with optional op filter |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
