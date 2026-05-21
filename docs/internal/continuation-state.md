@@ -9,13 +9,13 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `155ca06 feat(bridge): PH-BRIDGE-MCP-INVOKE POST /v1/mcp/invoke proxy`
+- **HEAD:** `aa37f66 feat(tool): PH-WEB-POST tool.web.post with body + cookie support`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1086 passing, 0 failures
+- **Workspace tests:** 1092 passing, 0 failures
   - relix-core: 66
   - relix-policy: 66
-  - relix-runtime: 657
+  - relix-runtime: 663
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli: 34
@@ -54,6 +54,7 @@ as the resume command.
 | 8ae5ff1 | PH-BRIDGE-MCP | GET /v1/mcp/{servers,tools} bridge HTTP proxy for MCP registry |
 | 10bb4d9 | PH-DASH-MCP | dashboard #/mcp page with server table + expandable tools per row |
 | 155ca06 | PH-BRIDGE-MCP-INVOKE | POST /v1/mcp/invoke bridge proxy (502 until D-009 unblocks runtime) |
+| aa37f66 | PH-WEB-POST | tool.web.post — POST + body + raw cookie header + Set-Cookie response capture |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
