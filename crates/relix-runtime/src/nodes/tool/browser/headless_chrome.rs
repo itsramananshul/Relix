@@ -321,6 +321,7 @@ mod tests {
             backend: "headless_chrome".to_string(),
             max_sessions: 4,
             call_timeout_secs: 10,
+            ..BrowserConfig::default()
         }
     }
 
@@ -401,6 +402,7 @@ mod tests {
             backend: "headless_chrome".to_string(),
             max_sessions: 4,
             call_timeout_secs: 10,
+            ..super::super::BrowserConfig::default()
         };
         c.backend = "headless_chrome".into();
         let b = super::super::build_backend(&c).expect("build_backend should succeed");

@@ -505,6 +505,7 @@ mod tests {
             backend: "playwright".to_string(),
             max_sessions: 4,
             call_timeout_secs: 30,
+            ..BrowserConfig::default()
         }
     }
 
