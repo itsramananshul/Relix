@@ -59,6 +59,12 @@ pub struct TaskListEntry {
     /// truncated rows) may not carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
+    /// M63: operator-set investigation marker timestamp.
+    /// `None` when unset (or when an older Coordinator emits
+    /// a 4-column row). Dashboard renders an "under
+    /// investigation" badge when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_marked_at: Option<i64>,
 }
 
 /// Detailed task body returned by `GET /v1/tasks/:id`.
@@ -194,10 +200,12 @@ pub async fn list(
             task_id: parts[0].to_string(),
             status: parts[1].to_string(),
             title: parts[2].to_string(),
-            // The older list_paginated payload omits updated_at;
-            // the dashboard renders "—" when None, so this is
-            // honest rather than fabricated.
+            // The older list_paginated payload omits updated_at
+            // and investigation_marked_at; the dashboard renders
+            // "—" when None, so this is honest rather than
+            // fabricated.
             updated_at: None,
+            investigation_marked_at: None,
         });
     }
     Ok(Json(out))
@@ -1614,9 +1622,13 @@ fn parse_events_lines(body: &str) -> Vec<TaskEvent> {
 }
 
 /// Parse a `task.list_cursor` body: tab-delimited
-/// `task_id\tstatus\ttitle\tupdated_at` rows followed by a
-/// trailing `next_cursor=<value>\n`. Returns the rows + the
-/// optional cursor (None on empty value).
+/// `task_id\tstatus\ttitle\tupdated_at\tinvestigation_marked_at`
+/// rows followed by a trailing `next_cursor=<value>\n`.
+/// Returns the rows + the optional cursor (None on empty
+/// value). 4-column and 3-column legacy shapes are still
+/// accepted (the trailing columns default to None) so the
+/// dashboard keeps working against an older Coordinator that
+/// hasn't picked up the M63 schema.
 fn parse_cursor_body(body: &str) -> (Vec<TaskListEntry>, Option<String>) {
     let mut items = Vec::new();
     let mut next: Option<String> = None;
@@ -1632,16 +1644,22 @@ fn parse_cursor_body(body: &str) -> (Vec<TaskListEntry>, Option<String>) {
             }
             continue;
         }
-        let parts: Vec<&str> = line.splitn(4, '\t').collect();
+        let parts: Vec<&str> = line.splitn(5, '\t').collect();
         if parts.len() < 3 {
             continue;
         }
         let updated_at = parts.get(3).and_then(|v| v.trim().parse::<i64>().ok());
+        let investigation_marked_at = parts
+            .get(4)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<i64>().ok());
         items.push(TaskListEntry {
             task_id: parts[0].to_string(),
             status: parts[1].to_string(),
             title: parts[2].to_string(),
             updated_at,
+            investigation_marked_at,
         });
     }
     (items, next)
@@ -1938,6 +1956,20 @@ mod tests {
         let (items, _next) = parse_cursor_body(body);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].updated_at, None);
+        assert_eq!(items[0].investigation_marked_at, None);
+    }
+
+    #[test]
+    fn parse_cursor_body_reads_investigation_marker_when_present() {
+        // M63 wire format: 5th tab-delimited column is
+        // investigation_marked_at, empty when unset.
+        let body = "abc\trunning\tt0\t100\t1700000000\n\
+                    def\tcompleted\tt1\t99\t\n\
+                    next_cursor=\n";
+        let (items, _next) = parse_cursor_body(body);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].investigation_marked_at, Some(1700000000));
+        assert_eq!(items[1].investigation_marked_at, None);
     }
 
     #[test]

@@ -1416,6 +1416,11 @@ impl TaskStore {
                 title: r.get(1)?,
                 status: r.get(2)?,
                 updated_at: r.get(3)?,
+                // The list_paginated SQL doesn't SELECT the
+                // investigation column (the older list shape
+                // never carried it). Set to None — clients
+                // wanting the marker use list_cursor instead.
+                investigation_marked_at: None,
             })
         };
         let mut out = Vec::with_capacity(cap);
@@ -1471,14 +1476,14 @@ impl TaskStore {
         let (sql, args): (&str, Vec<rusqlite::types::Value>) =
             match (cursor.as_ref(), status_filter) {
                 (None, None) => (
-                    "SELECT task_id, title, status, updated_at
+                    "SELECT task_id, title, status, updated_at, investigation_marked_at
                      FROM tasks
                      ORDER BY updated_at DESC, task_id DESC
                      LIMIT ?1",
                     vec![(cap as i64).into()],
                 ),
                 (None, Some(s)) => (
-                    "SELECT task_id, title, status, updated_at
+                    "SELECT task_id, title, status, updated_at, investigation_marked_at
                      FROM tasks
                      WHERE status = ?2
                      ORDER BY updated_at DESC, task_id DESC
@@ -1486,7 +1491,7 @@ impl TaskStore {
                     vec![(cap as i64).into(), s.to_string().into()],
                 ),
                 (Some(c), None) => (
-                    "SELECT task_id, title, status, updated_at
+                    "SELECT task_id, title, status, updated_at, investigation_marked_at
                      FROM tasks
                      WHERE (updated_at < ?2)
                         OR (updated_at = ?2 AND task_id < ?3)
@@ -1499,7 +1504,7 @@ impl TaskStore {
                     ],
                 ),
                 (Some(c), Some(s)) => (
-                    "SELECT task_id, title, status, updated_at
+                    "SELECT task_id, title, status, updated_at, investigation_marked_at
                      FROM tasks
                      WHERE status = ?4
                        AND ((updated_at < ?2)
@@ -1522,6 +1527,7 @@ impl TaskStore {
                     title: r.get(1)?,
                     status: r.get(2)?,
                     updated_at: r.get(3)?,
+                    investigation_marked_at: r.get(4)?,
                 })
             })
             .map_err(CoordinatorError::Db)?;
@@ -1737,6 +1743,10 @@ pub struct TaskSummary {
     pub title: String,
     pub status: String,
     pub updated_at: i64,
+    /// M63: surfaced on list output so the dashboard can render
+    /// a badge per row without a per-task drill-in. `None`
+    /// when the marker is unset.
+    pub investigation_marked_at: Option<i64>,
 }
 
 /// Cursor for [`TaskStore::list_cursor`]. Encodes the
@@ -2610,6 +2620,14 @@ fn handle_list_cursor(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome 
                 buf.push_str(&title);
                 buf.push('\t');
                 buf.push_str(&r.updated_at.to_string());
+                buf.push('\t');
+                // M63: 5th column = investigation_marked_at,
+                // empty when not marked. Older bridge parsers
+                // splitn(4, '\t') and ignore extra fields, so
+                // this is forward-compatible.
+                if let Some(ts) = r.investigation_marked_at {
+                    buf.push_str(&ts.to_string());
+                }
                 buf.push('\n');
             }
             let next = page

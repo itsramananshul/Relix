@@ -502,6 +502,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_investigation_list_filter_present() {
+        // M63 (Track B): task list ships the investigation
+        // marker badge per row + a quick-filter chip that
+        // narrows to flagged tasks across all statuses.
+        // Surfaced via the new 5th column on task.list_cursor.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            "data-quick-filter=\"__investigating\"",
+            "let investigatingOnly",
+            "t.investigation_marked_at",
+            "query.investigating",
+        ] {
+            assert!(body.contains(needle), "M63 landmark `{needle}` missing");
+        }
+    }
+
+    #[tokio::test]
     async fn page_investigation_marker_landmarks_present() {
         // M62 (Track B): the investigation marker is real
         // per-task state on the coordinator. The dashboard
