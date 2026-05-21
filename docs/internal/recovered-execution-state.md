@@ -303,3 +303,44 @@ no co-author trailers — and push to `origin/main`.
 - No tests modified.
 - No git operations beyond `status` / `log` reads.
 - The recovery doc itself is the only new artifact.
+
+---
+
+## 11. Recovery-Session Wave 1 Progress
+
+After writing this doc, the session shipped six commits on `main`:
+
+| Commit | Milestone | Tests | Concept |
+|---|---|---|---|
+| ca08428 | docs(internal) | n/a | recovered-execution-state + D-008 |
+| 8ed8e05 | PH-FS-PARITY3 | runtime +10 | tool.search_files `glob` mode (hand-rolled `*`/`**`/`?`) |
+| 47b5db9 | PH-FS-PARITY4 | runtime +8 | tool.fs.audit_recent + per-jail mutation ring |
+| 1feb8ce | PH-TERM-SESSIONS | runtime +6 | tool.terminal.sessions — live in-flight run registry |
+| acac673 | PH-MCP-PROTO | runtime +12 | MCP JSON-RPC wire layer (no I/O) + D-009 logged |
+| 512e727 | PH-TERM-AUDIT | runtime +8 | tool.terminal.audit_recent + per-backend completion ring |
+
+Aggregate: ~1100 LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
+controller_runtime.rs, docs/capabilities.md. Runtime tests
+507 → 551 (+44). Workspace 887 → 931 passing. fmt + clippy clean
+on every commit.
+
+**Decisions logged but unanswered:** D-008 (browser backend),
+D-009 (MCP server target). Both block real backend wiring until
+operator picks; the surfaces themselves keep the honesty contract
+(NoneBackend / RuntimeNotConnected).
+
+**Wave 1 tracks still pending after this session:**
+- Terminal cancel + streaming + background — requires refactor of
+  `wait_with_output` path; high-regression risk vs the value of
+  the observability rings already shipped.
+- Browser real backend — D-008 blocked.
+- MCP stdio runtime wiring — D-009 blocked.
+- Filesystem fuzzy_replace — explicitly out-of-scope per fs.rs
+  module docstring (alpha decision).
+
+**Cross-cutting parity work that's now well-positioned:**
+- The per-capability observability ring pattern is now established
+  (fs.audit_recent + terminal.sessions + terminal.audit_recent).
+  Future capabilities should ship a matching ring when they have
+  state worth observing — and the MCP proto module is ready for
+  the moment D-009 unblocks.
