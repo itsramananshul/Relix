@@ -30,9 +30,59 @@ use std::path::PathBuf;
 
 use axum::{
     Router,
+    extract::Request,
+    middleware::Next,
+    response::Response,
     routing::{get, post},
 };
 use clap::Parser;
+
+/// H15: per-request latency-tracking middleware. Wraps every
+/// route registered on the bridge router and emits one
+/// `bridge: route` info line per request with method, path,
+/// status, and wall-clock elapsed_ms. No in-process state —
+/// operators wire this into their tracing collector (Grafana,
+/// Loki, etc.) to derive per-route p50/p95 over arbitrary
+/// windows. Streaming responses log the time to first response
+/// header, NOT the total stream duration — the inner handler
+/// closes its span when it returns the `Response`, which for
+/// SSE is when the response head is flushed.
+async fn route_latency_log(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let status = resp.status();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    // INFO for 2xx/3xx, WARN for 4xx, ERROR for 5xx — gives
+    // operators a quick log-level filter on outliers.
+    if status.is_success() || status.is_redirection() {
+        tracing::info!(
+            http.method = %method,
+            http.path = %path,
+            http.status = status.as_u16(),
+            http.elapsed_ms = elapsed_ms,
+            "bridge: route"
+        );
+    } else if status.is_client_error() {
+        tracing::warn!(
+            http.method = %method,
+            http.path = %path,
+            http.status = status.as_u16(),
+            http.elapsed_ms = elapsed_ms,
+            "bridge: route (client error)"
+        );
+    } else {
+        tracing::error!(
+            http.method = %method,
+            http.path = %path,
+            http.status = status.as_u16(),
+            http.elapsed_ms = elapsed_ms,
+            "bridge: route (server error)"
+        );
+    }
+    resp
+}
 
 mod capabilities;
 mod chat;
@@ -378,7 +428,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.
         .route("/dashboard", get(dashboard::page))
-        .with_state(state);
+        .with_state(state)
+        // H15: per-request latency tracing. Emits one structured
+        // `bridge: route` info line per request with method, path,
+        // status, and elapsed_ms. No in-process state — operators
+        // get p50/p95 via log scrape. Layered last so it wraps
+        // every route registered above.
+        .layer(axum::middleware::from_fn(route_latency_log));
 
     tracing::info!(
         listen = %addr,
