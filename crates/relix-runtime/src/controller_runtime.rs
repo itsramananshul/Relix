@@ -674,6 +674,20 @@ fn register_node_type_handlers(
                 &["browser", "read"],
             ),
             (
+                "tool.mcp.list_servers",
+                "CW5: list operator-declared MCP servers and \
+                 their wire metadata. Honest: status=configured \
+                 (not connected) until the live client lands.",
+                &["mcp", "registry", "read"],
+            ),
+            (
+                "tool.mcp.invoke",
+                "CW5: invoke a tool on an MCP server. \
+                 RuntimeNotConnected today; live client lands \
+                 in a follow-up.",
+                &["mcp", "execute", "write"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -774,6 +788,18 @@ fn register_node_type_handlers(
             manifest.add_capability(crate::nodes::tool::browser::descriptor_get_text());
             manifest.add_capability(crate::nodes::tool::browser::descriptor_screenshot());
             manifest.add_capability(crate::nodes::tool::browser::descriptor_list_sessions());
+        }
+        // CW5: tool.mcp.* — registry + discovery surface
+        // advertised when [tool.mcp] is configured AND the
+        // registry validates (duplicate ids, bad transport,
+        // etc. fail-closed). Invoke still returns
+        // RuntimeNotConnected until the live client lands.
+        if let Some(mcp_cfg) = tool_cfg.mcp.as_ref()
+            && crate::nodes::tool::mcp::validate_config(mcp_cfg).is_ok()
+        {
+            manifest.add_capability(crate::nodes::tool::mcp::descriptor_list_servers());
+            manifest.add_capability(crate::nodes::tool::mcp::descriptor_list_tools());
+            manifest.add_capability(crate::nodes::tool::mcp::descriptor_invoke());
         }
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,

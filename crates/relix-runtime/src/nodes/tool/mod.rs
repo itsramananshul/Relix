@@ -48,6 +48,7 @@
 
 pub mod browser;
 pub mod fs;
+pub mod mcp;
 pub mod pdf;
 pub mod sanitize;
 pub mod security;
@@ -124,6 +125,14 @@ pub struct ToolConfig {
     /// `crates/relix-runtime/src/nodes/tool/browser.rs`.
     #[serde(default)]
     pub browser: Option<browser::BrowserConfig>,
+    /// CW5: optional MCP (Model Context Protocol) registry +
+    /// runtime projection. When `None` the `tool.mcp.*`
+    /// capability family is NOT registered. When present the
+    /// registry + discovery surface is wired; `tool.mcp.invoke`
+    /// returns RuntimeNotConnected until the live client lands.
+    /// See `crates/relix-runtime/src/nodes/tool/mcp.rs`.
+    #[serde(default)]
+    pub mcp: Option<mcp::McpConfig>,
 }
 
 impl Default for ToolConfig {
@@ -139,6 +148,7 @@ impl Default for ToolConfig {
             pdf: None,
             terminal: None,
             browser: None,
+            mcp: None,
         }
     }
 }
@@ -431,6 +441,13 @@ impl ToolBackend {
     /// `tool.browser.*` capability surface.
     pub fn browser_config(&self) -> Option<browser::BrowserConfig> {
         self.cfg.browser.clone()
+    }
+
+    /// Accessor for the optional `[tool.mcp]` subsystem config
+    /// (CW5). When `None`, [`register`] does not register the
+    /// `tool.mcp.*` capability surface.
+    pub fn mcp_config(&self) -> Option<mcp::McpConfig> {
+        self.cfg.mcp.clone()
     }
 
     /// Run the configured capability against a single URL.
@@ -781,6 +798,32 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
     } else {
         tracing::info!(
             "tool node: [tool.browser] not configured; browser subsystem disabled (tool.browser.* unavailable)"
+        );
+    }
+
+    // CW5: tool.mcp.* — MCP registry + runtime projection.
+    // Opt-in via [tool.mcp]. Today tool.mcp.invoke returns
+    // RuntimeNotConnected — the registry / discovery surface
+    // is real; live execution lands later. See mcp.rs.
+    if let Some(mcp_cfg) = backend.mcp_config() {
+        match mcp::McpRegistry::new(mcp_cfg) {
+            Ok(reg) => {
+                tracing::info!(
+                    servers = reg.server_count(),
+                    "tool node: registering tool.mcp.* (CW5 registry + discovery scaffold)"
+                );
+                mcp::register(bridge, Arc::new(reg));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "tool node: [tool.mcp] present but invalid; mcp surface NOT registered"
+                );
+            }
+        }
+    } else {
+        tracing::info!(
+            "tool node: [tool.mcp] not configured; mcp subsystem disabled (tool.mcp.* unavailable)"
         );
     }
 }
