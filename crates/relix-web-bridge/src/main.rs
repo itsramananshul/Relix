@@ -100,6 +100,7 @@ mod mcp;
 mod mcp_audit;
 mod metrics;
 mod openai;
+mod policy_denials;
 mod policy_simulate;
 mod secrets;
 mod sse;
@@ -437,6 +438,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ask "what would the policy decide if a caller with
         // groups Y called method M?" without invoking M.
         .route("/v1/policy/simulate", get(policy_simulate::simulate))
+        // W2-007e: proxy for `node.policy.recent_denials`.
+        // Returns the bounded ring of recent policy-denied
+        // attempts (capacity 256 per peer). Pure read.
+        .route("/v1/policy/denials", get(policy_denials::denials))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
