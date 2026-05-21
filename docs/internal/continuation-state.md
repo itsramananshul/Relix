@@ -9,18 +9,18 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `3e8dc5e feat(bridge): PH-BRIDGE-TERM-AUDIT proxy + dashboard panel for tool.terminal.audit_recent`
+- **HEAD:** `6c091fb feat(cli): PH-CLI-AUDIT-MIRRORS — relix-cli fs audit + terminal audit-http`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1132 passing, 0 failures (delta this milestone: +9
-  — 8 in `term_audit::tests` + 1 dashboard landmark).
-  - relix-cli: 94
+- **Workspace tests:** 1142 passing, 0 failures (delta this milestone: +10
+  — 7 in `fs::tests` + 3 in `terminal::tests` HTTP wire-shape guards).
+  - relix-cli: 104 (was 94; +10 this milestone)
   - relix-policy: 72
   - relix-runtime: 673
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 259 (was 250; +9 this milestone)
+  - relix-web-bridge: 259
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
@@ -62,6 +62,7 @@ as the resume command.
 | 5fd8af4 | PH-CLI-MCP-AUDIT | `relix-cli mcp audit` — HTTP mirror of the bridge ring; `--bridge`, `--max`, `--raw`; padded table render; 3 forward-compat tests |
 | 8cbaa2a | PH-BRIDGE-FS-AUDIT | `GET /v1/fs/audit` proxy for `tool.fs.audit_recent`; new `#/fsaudit` dashboard page with peer/op/max controls + table; kbd 6 reassigned; 400 on INVALID_ARGS; 8 parser tests + landmark |
 | 3e8dc5e | PH-BRIDGE-TERM-AUDIT | `GET /v1/terminal/audit` proxy for `tool.terminal.audit_recent`; new `#/termaudit` dashboard page with status badge derived from exit/timed_out/cancelled; kbd 7 → termaudit (Configure → 8/9/0); 8 parser tests + landmark |
+| 6c091fb | PH-CLI-AUDIT-MIRRORS | `relix-cli fs audit` (new fs module) + `relix-cli terminal audit-http` (HTTP sibling of libp2p audit); padded tables; status-badge derived from exit/flags; urlencode_token for op-filter safety; 10 wire-shape tests |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
