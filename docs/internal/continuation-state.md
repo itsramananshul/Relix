@@ -9,16 +9,16 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `8632314 feat(tool): PH-PDF-CHUNK tool.text.chunk text chunking for retrieval`
+- **HEAD:** `31c160e feat(cli): PH-MCP-CLI relix-cli mcp subcommand for MCP registry inspection`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1028 passing, 0 failures
+- **Workspace tests:** 1036 passing, 0 failures
   - relix-core: 60
   - relix-policy: 66
   - relix-runtime: 648
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
-  - relix-cli: 2
+  - relix-cli: 10
   - relix-web-bridge: 220
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
@@ -45,6 +45,7 @@ as the resume command.
 | e825be6 | PH-FS-FUZZY + PH-FS-TREE + PH-FS-STAT | filesystem Hermes parity |
 | 4199b9b | PH-WEB-MARKDOWN | tool.web_extract `markdown` mode — HTML → Markdown structural conversion |
 | 8632314 | PH-PDF-CHUNK | tool.text.chunk — general text chunker (paragraph > sentence > word > char) |
+| 31c160e | PH-MCP-CLI | relix-cli mcp {servers,tools} — libp2p dial-and-call for MCP registry inspection |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
