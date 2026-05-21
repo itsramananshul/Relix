@@ -243,29 +243,48 @@ be found / launched, the backend continues to return
 `BackendNotConnected` with the specific reason — never fakes
 success.
 
-**Status.** PH-BROWSER-FEATURES — multi-backend feature plan
-accepted. Operator picks at runtime via `[tool.browser] backend
-= "..."` from `{none | headless_chrome | playwright | webdriver}`;
+**Status. SHIPPED.** PH-BROWSER-D008-RESOLVE: all three live
+drivers landed alongside PH-BROWSER-FEATURES (multi-backend
+feature plan).
+
+Operator picks at runtime via `[tool.browser] backend = "..."`
+from `{none | headless_chrome | playwright | webdriver}`;
 each non-`none` backend is gated on its own Cargo feature
-(`browser-headless-chrome` / `-playwright` / `-webdriver`).
-Selecting a backend whose feature isn't compiled in fails
+(`browser-headless-chrome` / `-playwright` / `-webdriver`,
+plus the convenience `browser-all`).
+
+Selecting a backend whose feature isn't compiled fails
 LOUDLY at startup (`ToolError::Build`) — no silent
-`NoneBackend` fallback. The three live drivers land in
-follow-up milestones (PH-BROWSER-HC, PH-BROWSER-PW,
-PH-BROWSER-WD); today each feature compiles a labeled
-scaffold that surfaces the operator's choice in the
-dashboard but refuses navigate / get_text / screenshot
-with a `BackendNotConnected` reason naming the upcoming
-milestone tag.
+`NoneBackend` fallback. The three live drivers:
 
-Recommendation note for operators who don't want to install
-extra runtimes: pick `headless_chrome` — no Node, no sidecar,
-just the operator's existing `chrome` / `chromium` binary.
-This is now reflected in `docs/browser-tool.md` ("Recommended
-default" section).
+- **PH-BROWSER-HC** (`headless_chrome` crate) — Chrome
+  DevTools Protocol against the operator's existing
+  `chrome` / `chromium` binary. Recommended default per the
+  original D-008 analysis.
+- **PH-BROWSER-PW** (Node + `playwright-core` sidecar over
+  stdio JSON-RPC) — best multi-engine coverage; heaviest
+  install.
+- **PH-BROWSER-WD** (`fantoccini` crate against
+  operator-supplied `chromedriver` / `geckodriver`) — most
+  W3C-standards-aligned; requires a separate driver
+  binary.
 
-PH-BROWSER-D008-RESOLVE will flip this entry to "shipped" once
-the three live drivers land.
+Each backend is lazy on the browser/driver launch so the
+tool node starts cleanly even when the runtime isn't
+present — the first call returns
+`BackendNotConnected { reason: "<backend>: <specific
+cause>" }`. Honest contract preserved: no fake success, no
+silent NoneBackend downgrade.
+
+Per-runtime integration tests are gated on the runtime
+being present (Chrome in PATH for HC, `node` +
+`playwright-core` for PW, a live driver responding at
+`/status` for WD); CI without those skips with `eprintln!`
+and the unit tests still pass.
+
+Reference: `docs/browser-tool.md` for the build matrix
+(`--features browser-headless-chrome` etc.) and the
+"Recommended default" section.
 
 **Context.** Hermes uses `contextvars.ContextVar` to thread the
 write-origin label through nested async tool calls without

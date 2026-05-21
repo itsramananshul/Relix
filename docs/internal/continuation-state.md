@@ -9,14 +9,17 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `b0dcaee feat(cli): PH-CLI-WEB-BLOCKLIST — relix-cli web blocklist mirror`
+- **HEAD:** `6dcc670 fix(tool): browser BrowserConfig struct-literal sites use ..default() after WD field`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 1173 passing, 0 failures (delta this milestone: +3
-  CLI; 1176 under `--features relix-runtime/browser-all`).
-  - relix-cli: 107 (was 104; +3 this milestone)
+- **Workspace tests:** 1174 passing on default features
+  (delta this milestone: +1 from PW's always-on
+  `list_sessions_empty_before_any_open`); **1192 under
+  `--features relix-runtime/browser-all`** (HC +5, PW +5, WD +8
+  feature-gated live driver tests).
+  - relix-cli: 107
   - relix-policy: 72
-  - relix-runtime: 693 (696 under browser-all)
+  - relix-runtime: 694 (712 under browser-all)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
@@ -67,6 +70,10 @@ as the resume command.
 | 5120dce | PH-DASH-BLOCKLIST | new `tool.web.blocklist_summary` Safe capability + `GET /v1/tool/blocklist` bridge proxy + dashboard card on `#/fsaudit` page (first-200 cap, sorted, honest "not live feed" note); 4 runtime + 8 bridge tests |
 | 6d09544 | PH-BROWSER-FEATURES | refactored `browser.rs` → `browser/` directory with frozen `BrowserBackend` trait + three feature-gated backend modules (`browser-headless-chrome` / `-playwright` / `-webdriver` + `browser-all`); new `BrowserError::FeatureNotCompiled` variant; `ToolBackend::new` validate-on-construct prevents silent NoneBackend fallback; scaffold `with_label` surfaces operator-chosen backend name; D-008 flipped to "multi-backend plan accepted" pending PH-BROWSER-HC/PW/WD; 7 default + 3 feature-gated tests |
 | b0dcaee | PH-CLI-WEB-BLOCKLIST | `relix-cli web blocklist` — HTTP mirror of `GET /v1/tool/blocklist`; sorted host list + `--max` cap + `--raw`; new `web` sibling under main.rs; 3 wire-shape tests; docs/capabilities.md updated |
+| 39ca0b8 | PH-BROWSER-PW | live Playwright sidecar backend behind `browser-playwright` — Node + playwright-core over stdio JSON-RPC; embedded sidecar.js via include_str!; sync trait → async bridge via block_in_place + Handle::current().block_on; 5 tests incl. runtime-gated live navigate; subagent-authored, orchestrator-verified |
+| b7f30c9 | PH-BROWSER-HC | live `headless_chrome` crate backend behind `browser-headless-chrome` — Chrome DevTools Protocol; lazy Browser launch; per-session Tab cached in Mutex<HashMap>; 5 tests incl. runtime-gated chromium-in-PATH probe; subagent-authored, orchestrator-verified |
+| 1d24c46 | PH-BROWSER-WD | live `fantoccini` WebDriver backend behind `browser-webdriver` — sync→async bridge via block_in_place; new `webdriver_url` BrowserConfig field (default `http://127.0.0.1:9515`); lazy driver connect; 8 tests incl. runtime-gated `/status` probe; subagent-authored, orchestrator-verified |
+| 6dcc670 | (fix) | HC + PW struct-literal `cfg()` test helpers updated with `..BrowserConfig::default()` so `--features browser-all` clippy + tests compile after the WD field addition |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
@@ -83,14 +90,21 @@ Runtime tests: 507 → 615 (+108). Workspace: 887 → 995 (+108).
 
 ## Wave 1 status by track
 
-### A. Browser backend — BLOCKED on D-008
+### A. Browser backend — SHIPPED (D-008 closed)
 
-CW4 (`tool.browser.*`) still ships as honest scaffold:
-`NoneBackend` returns `BackendNotConnected` on every non-noop.
-D-008 (Playwright sidecar vs headless_chrome vs WebDriver,
-recommendation **b: headless_chrome**) is open and gates the live
-backend. Pure additive once decided; the existing trait + scaffold
-slot in via the existing `build_backend()` path.
+PH-BROWSER-FEATURES froze a clean `BrowserBackend` trait +
+`browser/` directory layout; PH-BROWSER-HC / -PW / -WD then
+landed three live drivers behind Cargo features
+(`browser-headless-chrome` / `-playwright` / `-webdriver`,
+plus `browser-all`). PH-BROWSER-D008-RESOLVE flipped D-008
+from "open" to "shipped." Operator picks one at runtime via
+`[tool.browser] backend = "..."`; selecting a backend whose
+feature isn't compiled fails loudly at startup (no silent
+NoneBackend fallback). Each driver is lazy on browser /
+sidecar / driver launch — the tool node starts cleanly
+when the runtime isn't present and surfaces the missing
+runtime via a `BackendNotConnected { reason: "<backend>:
+<cause>" }` envelope on the first call.
 
 ### B. MCP runtime — protocol layer shipped, runtime BLOCKED on D-009
 
@@ -207,7 +221,7 @@ From `docs/internal/decisions-pending.md`:
 | D-004 | `origin_surface` column | (a) ship — additive | None |
 | D-006 | iteration-budget grace-call | (c) — **shipped** | — |
 | D-007 | computer_use_tool backend | (c) defer | computer_use_tool |
-| D-008 | Browser backend (PW vs HC vs WD) | (b) headless_chrome | **CW4 real backend** |
+| D-008 | Browser backend (PW vs HC vs WD) | multi-backend — **shipped all three behind features** | — |
 | D-009 | MCP server target | (c) defer | **MCP stdio runtime** |
 | D-010 | PTY backend (`portable-pty`) | (b) defer | TUI / isatty-true |
 
