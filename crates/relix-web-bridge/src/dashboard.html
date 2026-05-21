@@ -2193,6 +2193,47 @@
         operators see what's wired vs gated by looking at the source
         peer's <code>node_type</code> + the capability's name.
       </p>
+      <!-- W2-007c: Policy What-If card. Operators ask "would
+           the policy allow caller-with-groups-Y calling X?"
+           without invoking X. Backed by GET /v1/policy/simulate
+           (W2-007b) → `node.policy.simulate` (W2-007a). -->
+      <div class="card" id="policy-whatif-card">
+        <div class="card-header">
+          <h3>Policy "What If?"</h3>
+          <span class="meta" id="policy-whatif-status"></span>
+        </div>
+        <div class="card-body">
+          <div class="row" style="gap: 8px; flex-wrap: wrap;">
+            <label class="meta">peer alias
+              <input type="text" id="policy-whatif-peer"
+                value="tool" placeholder="tool"
+                autocomplete="off" spellcheck="false"
+                style="margin-left: 4px; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 100px;" />
+            </label>
+            <label class="meta" style="flex: 2; min-width: 220px;">method
+              <input type="text" id="policy-whatif-method"
+                placeholder="tool.web_fetch"
+                autocomplete="off" spellcheck="false"
+                style="margin-left: 4px; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: calc(100% - 80px);" />
+            </label>
+            <label class="meta" style="flex: 2; min-width: 220px;">groups
+              <input type="text" id="policy-whatif-groups"
+                placeholder="chat-users,operators"
+                autocomplete="off" spellcheck="false"
+                style="margin-left: 4px; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: calc(100% - 80px);" />
+            </label>
+            <button class="chip" id="policy-whatif-submit">simulate</button>
+          </div>
+          <div id="policy-whatif-result" style="margin-top: 10px;"></div>
+        </div>
+      </div>
+      <p class="meta">
+        Pure read — no method is invoked. The simulation
+        inherits the caller's identity (subject_id, org_id,
+        role, clearance) but swaps groups for the supplied
+        list. Used to validate policy changes before
+        deploying.
+      </p>
     </section>
 
     <!-- ── #/mcp (PH-DASH-MCP) ──────────────────────────────────── -->
@@ -6677,6 +6718,79 @@ function initCapabilities() {
         renderCapabilityTable();
       }
     });
+  }
+  // W2-007c: Policy What-If form. Click "simulate" (or hit
+  // Enter inside any input) → GET /v1/policy/simulate →
+  // render the decision badge + matched rule + reason.
+  const $submit = document.getElementById('policy-whatif-submit');
+  if ($submit) {
+    $submit.addEventListener('click', () => runPolicyWhatIf());
+  }
+  const $whatifInputs = [
+    document.getElementById('policy-whatif-peer'),
+    document.getElementById('policy-whatif-method'),
+    document.getElementById('policy-whatif-groups'),
+  ].filter(Boolean);
+  for (const $in of $whatifInputs) {
+    $in.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        runPolicyWhatIf();
+      }
+    });
+  }
+}
+
+async function runPolicyWhatIf() {
+  const $result = document.getElementById('policy-whatif-result');
+  const $status = document.getElementById('policy-whatif-status');
+  if (!$result) return;
+  const peer = ((document.getElementById('policy-whatif-peer') || {}).value || 'tool').trim();
+  const method = ((document.getElementById('policy-whatif-method') || {}).value || '').trim();
+  const groups = ((document.getElementById('policy-whatif-groups') || {}).value || '').trim();
+  if (!method) {
+    $result.innerHTML = '<div class="error">method required</div>';
+    if ($status) $status.textContent = '';
+    return;
+  }
+  $result.innerHTML = '<div class="loading">simulating…</div>';
+  if ($status) $status.textContent = 'querying…';
+  try {
+    const url = '/v1/policy/simulate?peer=' + encodeURIComponent(peer)
+      + '&method=' + encodeURIComponent(method)
+      + (groups ? '&groups=' + encodeURIComponent(groups) : '');
+    const r = await fetch(url);
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const decision = body.decision || '?';
+    const cls = decision === 'allow' ? 'ok'
+      : decision === 'deny' ? 'danger'
+      : 'warn';
+    const ruleRow = body.matched_rule
+      ? '<div>matched rule: <code>' + escapeHtml(body.matched_rule) + '</code></div>'
+      : '<div class="meta">(no rule matched)</div>';
+    const reasonRow = body.reason
+      ? '<div>reason: ' + escapeHtml(body.reason) + '</div>'
+      : '';
+    const groupsLabel = (body.groups && body.groups.length)
+      ? body.groups.map(g => '<code>' + escapeHtml(g) + '</code>').join(', ')
+      : '<span class="meta">(no groups)</span>';
+    $result.innerHTML =
+      '<div><span class="badge ' + cls + '">' + escapeHtml(decision) + '</span>'
+      + ' &nbsp; method=<code>' + escapeHtml(method) + '</code>'
+      + ' groups=' + groupsLabel + '</div>'
+      + ruleRow + reasonRow;
+    if ($status) $status.textContent = 'peer=' + (body.peer || peer);
+  } catch (e) {
+    $result.innerHTML = '<div class="error">simulate failed: ' + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = 'failed';
   }
 }
 

@@ -487,6 +487,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_policy_whatif_landmarks_present() {
+        // W2-007c: Policy What-If form on the Capabilities
+        // page. Hits /v1/policy/simulate (W2-007b → W2-007a).
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"id="policy-whatif-card""#),
+            "policy what-if card missing"
+        );
+        assert!(
+            body.contains(r#"id="policy-whatif-peer""#),
+            "policy what-if peer input missing"
+        );
+        assert!(
+            body.contains(r#"id="policy-whatif-method""#),
+            "policy what-if method input missing"
+        );
+        assert!(
+            body.contains(r#"id="policy-whatif-groups""#),
+            "policy what-if groups input missing"
+        );
+        assert!(
+            body.contains(r#"id="policy-whatif-submit""#),
+            "policy what-if submit button missing"
+        );
+        assert!(
+            body.contains("/v1/policy/simulate"),
+            "policy what-if should consume /v1/policy/simulate"
+        );
+        assert!(
+            body.contains("runPolicyWhatIf"),
+            "runPolicyWhatIf handler missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_metrics_landmarks_present() {
         // W2-006d: dispatch-stats dashboard panel. Reads
         // /v1/dispatch/stats (bridge proxy → node.dispatch.stats)
