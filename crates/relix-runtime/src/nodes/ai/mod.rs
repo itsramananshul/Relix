@@ -68,9 +68,10 @@ use std::sync::Arc;
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
+pub use provider::ChatInput;
 use provider::{
-    AnthropicProvider, ChatInput, ChatProvider, GeminiProvider, MockProvider,
-    OpenAICompatibleProvider, ProviderEntries, ProviderEntry, ProviderError,
+    AnthropicProvider, ChatProvider, GeminiProvider, MockProvider, OpenAICompatibleProvider,
+    ProviderEntries, ProviderEntry, ProviderError,
 };
 
 /// Per-node AI configuration parsed from controller TOML `[ai]`.

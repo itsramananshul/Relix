@@ -119,6 +119,7 @@ operator-facing endpoints:
 | `GET /v1/tasks/stuck` (H6) | Stuck-running projection |
 | `GET /v1/tasks/events/recent` / `/stream` (M67/M73) | Cross-task firehose + SSE |
 | `GET /v1/providers/health` (PH-WAVE2K) | Consolidated AI-stack snapshot |
+| `POST /v1/providers/route_test` (PH-ROUTER-PREVIEW) | Preview HealthAwareRouter's pick for a candidate list against current cached health |
 | `GET /v1/config/providers` | Per-provider redacted status |
 | Route-latency tracing middleware (H15) | Structured log field per request |
 | Operator intervention audit (M57 + H9) | All mutating routes recorded; H9 redacts |

@@ -395,6 +395,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // PH-WAVE2K: consolidated ops endpoint — all provider
         // statuses + aggregate counters in one fetch.
         .route("/v1/providers/health", get(config_api::providers_health))
+        // PH-ROUTER-PREVIEW: preview the HealthAwareRouter's
+        // decision for a candidate list against the bridge's
+        // current cached health snapshot. Pure observability —
+        // does NOT send any chat call.
+        .route("/v1/providers/route_test", post(config_api::route_test))
         .route(
             "/v1/config/providers/:name",
             get(config_api::get_provider)

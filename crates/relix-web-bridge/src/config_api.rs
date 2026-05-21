@@ -139,6 +139,94 @@ pub async fn providers_health(State(state): State<AppState>) -> Json<ProvidersHe
     })
 }
 
+/// PH-ROUTER-PREVIEW: request body for the route_test endpoint.
+#[derive(Debug, Deserialize)]
+pub struct RouteTestReq {
+    /// Caller-supplied candidate provider list, in priority
+    /// order. Names match `secrets::ALLOWED_PROVIDERS`. Empty
+    /// → 400.
+    pub candidates: Vec<String>,
+}
+
+/// PH-ROUTER-PREVIEW: response body — direct serialization of
+/// the runtime's `RouteDecision` envelope so operators get the
+/// same shape the future AI-node consumer would see.
+#[derive(Debug, Serialize)]
+pub struct RouteTestResp {
+    pub router: String,
+    pub chosen: String,
+    pub reasoning: String,
+    pub chosen_at: i64,
+    pub candidates: Vec<RouteTestCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RouteTestCandidate {
+    pub name: String,
+    pub score: f32,
+    pub eligibility: String,
+    pub why: String,
+}
+
+/// `POST /v1/providers/route_test` — preview which provider the
+/// HealthAwareRouter would pick given the bridge's current
+/// cached provider-health snapshot. Pure observability — does
+/// NOT send any actual chat call.
+pub async fn route_test(
+    State(state): State<AppState>,
+    Json(req): Json<RouteTestReq>,
+) -> Result<Json<RouteTestResp>, (StatusCode, Json<ApiError>)> {
+    use relix_runtime::nodes::ai::{ChatInput, HealthAwareRouter, ProviderHealth, ProviderRouter};
+    if req.candidates.is_empty() {
+        return Err(bad_request("candidates required (non-empty list)"));
+    }
+    for c in &req.candidates {
+        if !ALLOWED_PROVIDERS.contains(&c.as_str()) {
+            return Err(bad_request(format!(
+                "unknown provider '{c}'. allowed: {}",
+                ALLOWED_PROVIDERS.join(", ")
+            )));
+        }
+    }
+    let providers = state.secrets.read(|s| s.all_provider_statuses());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let snapshot: Vec<ProviderHealth> = providers
+        .iter()
+        .map(|p| {
+            let in_cooldown = p.cooldown_until.is_some_and(|cd| cd > now);
+            ProviderHealth {
+                name: p.name.clone(),
+                in_cooldown,
+                operator_quarantined: p.quarantined_at.is_some(),
+                rate_limit_hits_5min: p.rate_limit_hits_5min,
+                success_count: p.success_request_count,
+                failure_count: p.failed_request_count,
+            }
+        })
+        .collect();
+    let router = HealthAwareRouter::new(snapshot);
+    let decision = router.pick(&ChatInput::default(), &req.candidates);
+    Ok(Json(RouteTestResp {
+        router: router.name().to_string(),
+        chosen: decision.chosen,
+        reasoning: decision.reasoning,
+        chosen_at: decision.chosen_at,
+        candidates: decision
+            .candidates
+            .into_iter()
+            .map(|c| RouteTestCandidate {
+                name: c.name,
+                score: c.score,
+                eligibility: c.eligibility,
+                why: c.why,
+            })
+            .collect(),
+    }))
+}
+
 /// `GET /v1/config/providers/:name` — redacted status for one
 /// provider. 404 when the name is not in the allowlist.
 pub async fn get_provider(
@@ -1504,6 +1592,36 @@ mod tests {
         // Doesn't false-positive on "/bot" without a digit after it.
         let s2 = scrub_telegram_url("see /botanical for help");
         assert_eq!(s2, "see /botanical for help");
+    }
+
+    #[test]
+    fn route_test_req_round_trips() {
+        let body = r#"{"candidates":["openai","anthropic"]}"#;
+        let r: RouteTestReq = serde_json::from_str(body).unwrap();
+        assert_eq!(r.candidates, vec!["openai", "anthropic"]);
+    }
+
+    #[test]
+    fn route_test_resp_is_stable_shape() {
+        // The dashboard / CLI consumes this shape; pin it.
+        let r = RouteTestResp {
+            router: "health-aware".into(),
+            chosen: "openai".into(),
+            reasoning: "test".into(),
+            chosen_at: 1700000000,
+            candidates: vec![RouteTestCandidate {
+                name: "openai".into(),
+                score: 1.0,
+                eligibility: "eligible".into(),
+                why: "chosen".into(),
+            }],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"router\":\"health-aware\""));
+        assert!(json.contains("\"chosen\":\"openai\""));
+        assert!(json.contains("\"chosen_at\":1700000000"));
+        assert!(json.contains("\"candidates\":["));
+        assert!(json.contains("\"eligibility\":\"eligible\""));
     }
 
     #[test]
