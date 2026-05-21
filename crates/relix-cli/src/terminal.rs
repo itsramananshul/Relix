@@ -1,23 +1,32 @@
-//! `relix-cli terminal ...` — PH-TERM-CLI operator surface for
+//! `relix-cli terminal ...` — operator surface for
 //! `tool.terminal.*` observability + control on a tool node.
 //!
-//! Read-only by default; `cancel` is the only mutation. Each
-//! subcommand dials one tool-node peer over libp2p, presents
-//! the caller's identity bundle, calls the relevant
-//! `tool.terminal.*` capability through the full admission
-//! pipeline (identity → policy → handler → audit), parses the
-//! tab-delim response, and pretty-prints.
+//! Two transports under one parent:
+//!
+//! - PH-TERM-CLI libp2p path: `sessions` / `audit` / `cancel`
+//!   dial one tool-node peer directly over libp2p, present the
+//!   caller's identity bundle, call the capability through the
+//!   admission pipeline, parse the tab-delim response, and
+//!   pretty-print. Read-only by default; `cancel` is the only
+//!   mutation.
+//!
+//! - PH-CLI-AUDIT-MIRRORS HTTP path: `audit-http` hits the
+//!   bridge's `GET /v1/terminal/audit` (PH-BRIDGE-TERM-AUDIT),
+//!   parses the structured JSON, and renders the same shape as
+//!   the libp2p audit. Lives here rather than as a separate
+//!   subcommand so operators can `terminal audit-http` without
+//!   needing the identity bundle on disk.
 //!
 //! Sibling of `relix-cli mcp` for the same reasons (PH-MCP-CLI
-//! module doc): the bridge doesn't proxy these endpoints, and
-//! direct libp2p dial is the same shape as `relix-cli ping` /
-//! `capability`. Avoids adding a bridge route for tool-node-
-//! local registries.
+//! module doc): libp2p dial is the same shape as `relix-cli ping`,
+//! and the HTTP variant lets the dashboard-running operator
+//! skip identity setup entirely.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Subcommand;
+use serde::Deserialize;
 
 use relix_core::bundle::Bundle;
 use relix_core::codec;
@@ -77,6 +86,26 @@ pub enum Cmd {
         /// Session id from `terminal sessions`.
         #[arg(long)]
         session_id: String,
+    },
+    /// PH-CLI-AUDIT-MIRRORS: same content as `audit` but
+    /// fetched via the bridge's HTTP proxy
+    /// (`GET /v1/terminal/audit`, PH-BRIDGE-TERM-AUDIT). Useful
+    /// when an identity bundle isn't already on disk — the
+    /// bridge does the dial-and-call on the operator's behalf.
+    AuditHttp {
+        /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Target peer alias (default `tool`).
+        #[arg(long, default_value = "tool")]
+        peer: String,
+        /// Maximum rows to fetch. Server clamps to ring capacity.
+        #[arg(long, default_value_t = 50usize)]
+        max: usize,
+        /// Print raw JSON from the bridge instead of the
+        /// formatted table.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
     },
 }
 
@@ -188,8 +217,126 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             // on hit. Print whatever the responder said.
             print_raw(&body);
         }
+        Cmd::AuditHttp {
+            bridge,
+            peer,
+            max,
+            raw,
+        } => {
+            let url = format!(
+                "{}/v1/terminal/audit?peer={peer}&max={max}",
+                bridge.trim_end_matches('/'),
+            );
+            let body = http_get(&url).await?;
+            if raw {
+                print_raw(&body);
+                return Ok(());
+            }
+            let parsed: HttpAuditResp = serde_json::from_str(&body)
+                .map_err(|e| format!("decode /v1/terminal/audit body: {e} (body={body})"))?;
+            render_http_audit(&parsed);
+        }
     }
     Ok(())
+}
+
+/// PH-CLI-AUDIT-MIRRORS: bridge wire-shape mirror of
+/// `term_audit::TermAuditRow`. `exit_code` is `Option<i32>` —
+/// the bridge emits `None` for killed children (responder sent
+/// `"?"`) and the JSON omits the field via
+/// `skip_serializing_if`. Both shapes deserialize cleanly.
+#[derive(Debug, Deserialize)]
+struct HttpAuditRow {
+    #[serde(default)]
+    ts_secs: i64,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    caller_subject_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpAuditResp {
+    #[serde(default)]
+    peer: String,
+    #[serde(default)]
+    entries: Vec<HttpAuditRow>,
+    #[serde(default)]
+    count: usize,
+}
+
+fn render_http_audit(resp: &HttpAuditResp) {
+    if resp.entries.is_empty() {
+        println!(
+            "(no terminal runs recorded yet on peer '{p}' — ring count={c})",
+            p = resp.peer,
+            c = resp.count
+        );
+        return;
+    }
+    let ts_h = "ts";
+    let cmd_h = "command";
+    let exit_h = "exit";
+    let dur_h = "ms";
+    let status_h = "status";
+    let caller_h = "caller";
+    println!(
+        "{ts_h:<10}  {cmd_h:<28}  {exit_h:>5}  {dur_h:>8}  \
+         {status_h:<10}  {caller_h}",
+    );
+    for e in &resp.entries {
+        let exit_str = match e.exit_code {
+            Some(c) => c.to_string(),
+            None => "—".to_string(),
+        };
+        let status = if e.timed_out {
+            "timed_out"
+        } else if e.cancelled {
+            "cancelled"
+        } else if e.exit_code.is_none() {
+            "killed"
+        } else if e.exit_code == Some(0) {
+            "ok"
+        } else {
+            "nonzero"
+        };
+        let cmd = truncate(&e.command, 28);
+        let caller = truncate(&e.caller_subject_id, 16);
+        println!(
+            "{ts:<10}  {cmd:<28}  {exit:>5}  {dur:>8}  {status:<10}  {caller}",
+            ts = e.ts_secs,
+            cmd = cmd,
+            exit = exit_str,
+            dur = e.duration_ms,
+            status = status,
+            caller = caller,
+        );
+    }
+    println!("count={}", resp.count);
+}
+
+/// PH-CLI-AUDIT-MIRRORS: small GET helper. Duplicated from
+/// `mcp::http_get` / `fs::http_get` — see PH-CLI-DIAL-REFACTOR
+/// for the future hoist.
+async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let resp = client.get(url).send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("bridge returned HTTP {status}: {body}").into());
+    }
+    Ok(body)
 }
 
 fn print_raw(body: &str) {
@@ -417,5 +564,61 @@ mod tests {
         let s = truncate("abcdefghijklmnop", 8);
         assert!(s.ends_with('…'));
         assert_eq!(s.chars().count(), 8);
+    }
+
+    // ── PH-CLI-AUDIT-MIRRORS: bridge HTTP wire-shape ─────────────────
+
+    #[test]
+    fn http_audit_resp_round_trips_with_both_exit_shapes() {
+        // Bridge omits exit_code on killed children via
+        // skip_serializing_if=Option::is_none. The CLI must
+        // accept both forms cleanly.
+        let json = r#"{
+            "peer": "tool",
+            "entries": [
+                {"ts_secs": 100, "command": "ls", "exit_code": 0,
+                 "duration_ms": 12, "timed_out": false,
+                 "cancelled": false, "caller_subject_id": "aaa"},
+                {"ts_secs": 200, "command": "sleep",
+                 "duration_ms": 5000, "timed_out": true,
+                 "cancelled": false, "caller_subject_id": "bbb"}
+            ],
+            "count": 2
+        }"#;
+        let parsed: HttpAuditResp = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.peer, "tool");
+        assert_eq!(parsed.count, 2);
+        assert_eq!(parsed.entries[0].exit_code, Some(0));
+        assert_eq!(parsed.entries[1].exit_code, None);
+        assert!(parsed.entries[1].timed_out);
+    }
+
+    #[test]
+    fn http_audit_resp_tolerates_missing_fields() {
+        // Defensive: a partial body shouldn't crash the CLI.
+        let parsed: HttpAuditResp = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.peer, "");
+        assert_eq!(parsed.count, 0);
+        assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn http_audit_resp_ignores_unknown_fields() {
+        // Forward-compat: a new bridge field (e.g. exit_signal)
+        // shouldn't break an older CLI build.
+        let json = r#"{
+            "peer": "tool",
+            "count": 1,
+            "future_field": 99,
+            "entries": [{
+                "ts_secs": 1, "command": "x", "exit_code": 0,
+                "duration_ms": 0, "timed_out": false,
+                "cancelled": false, "caller_subject_id": "c",
+                "exit_signal": "SIGTERM"
+            }]
+        }"#;
+        let parsed: HttpAuditResp = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.count, 1);
+        assert_eq!(parsed.entries[0].command, "x");
     }
 }

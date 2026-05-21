@@ -2,6 +2,7 @@
 
 mod capability;
 mod flow_run;
+mod fs;
 mod identity;
 mod mcp;
 mod ops;
@@ -100,6 +101,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: mcp::Cmd,
     },
+    /// PH-CLI-AUDIT-MIRRORS: filesystem operator surface.
+    /// `fs audit` snapshots the per-jail mutation ring via the
+    /// bridge's `GET /v1/fs/audit` proxy (PH-BRIDGE-FS-AUDIT).
+    /// HTTP-against-bridge — no identity bundle required.
+    Fs {
+        #[command(subcommand)]
+        cmd: fs::Cmd,
+    },
     /// PH-TERM-CLI: inspect + control tool.terminal.* on a
     /// tool node. `terminal sessions` lists live runs;
     /// `terminal audit` snapshots the completion ring;
@@ -152,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
+        Cmd::Fs { cmd } => fs::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
