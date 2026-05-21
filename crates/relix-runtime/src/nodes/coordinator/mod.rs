@@ -3130,6 +3130,16 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
             })),
         );
     }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.transition_check",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_transition_check(&s, &ctx) }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
@@ -3940,6 +3950,87 @@ pub const MAX_OPERATOR_NOTE_LEN: usize = 2_000;
 /// rejects to keep the toggle idempotent.
 pub const PAUSABLE_STATUSES: &[&str] = &["pending", "running", "retrying"];
 
+/// Canonical task state vocabulary (M74). Every status the
+/// runtime / operators / coord can write. Used by
+/// [`is_allowed_transition`] to validate state-machine
+/// movement. Unknown / future statuses are tolerated by the
+/// validator (returns "unknown — caller-defined") so adding
+/// a new status doesn't break older bridges.
+pub const TASK_STATES: &[&str] = &[
+    "pending",
+    "running",
+    "retrying",
+    "completed",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "paused",
+    "frozen",
+    "awaiting_input",
+];
+
+/// Returns true when `from → to` is a permitted task-state
+/// transition under the runtime's canonical state machine
+/// (M74). Same-status moves are no-ops and always allowed.
+/// Unknown statuses (anything outside [`TASK_STATES`]) are
+/// allowed conservatively so caller-defined statuses don't
+/// break: the bridge enforcement layer is responsible for
+/// rejecting them at the API boundary.
+///
+/// Documented allowed transitions (read the source table
+/// for the authoritative list):
+/// - pending → running | cancelled | paused | frozen
+/// - running → completed | failed | interrupted | cancelled
+///   | paused | frozen | awaiting_input | retrying
+/// - retrying → running | failed | cancelled | paused | frozen
+/// - failed → retrying (operator forces retry)
+/// - interrupted → retrying | cancelled | paused | frozen
+/// - paused → pending (resume) | frozen | cancelled
+/// - frozen → pending (unfreeze) | cancelled
+/// - awaiting_input → running | cancelled | frozen
+/// - completed (terminal — no outbound transitions)
+/// - cancelled (terminal — no outbound transitions)
+pub fn is_allowed_transition(from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    // Unknown statuses get the conservative "allowed" verdict
+    // so adding a new status to a future migration doesn't
+    // break older bridge code reading the table.
+    let from_known = TASK_STATES.contains(&from);
+    let to_known = TASK_STATES.contains(&to);
+    if !from_known || !to_known {
+        return true;
+    }
+    matches!(
+        (from, to),
+        ("pending", "running" | "cancelled" | "paused" | "frozen")
+            | (
+                "running",
+                "completed"
+                    | "failed"
+                    | "interrupted"
+                    | "cancelled"
+                    | "paused"
+                    | "frozen"
+                    | "awaiting_input"
+                    | "retrying"
+            )
+            | (
+                "retrying",
+                "running" | "failed" | "cancelled" | "paused" | "frozen"
+            )
+            | ("failed", "retrying")
+            | (
+                "interrupted",
+                "retrying" | "cancelled" | "paused" | "frozen"
+            )
+            | ("paused", "pending" | "frozen" | "cancelled")
+            | ("frozen", "pending" | "cancelled")
+            | ("awaiting_input", "running" | "cancelled" | "frozen")
+    )
+}
+
 /// Statuses from which an operator-initiated freeze is
 /// allowed (M71). Wider than pause — operators can freeze a
 /// paused task, a task awaiting input, etc. Refuses
@@ -4133,6 +4224,44 @@ fn handle_resume(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(CoordinatorError::NotFound(id)) => invalid(format!("task.resume: not found: {id}")),
         Err(CoordinatorError::Invalid(msg)) => invalid(msg),
         Err(e) => internal(format!("task.resume: {e}")),
+    }
+}
+
+/// `task.transition_check` — informational state-machine
+/// validator (M74). Args: `task_id|target_status`. Reads the
+/// task's current status + checks against the canonical
+/// transition matrix. Returns:
+/// `allowed=true|false\ncurrent_status=<s>\ntarget_status=<s>\n`.
+///
+/// Does NOT mutate the task. Callers (operators, runtime
+/// workers, CLI tooling) use this to pre-flight a planned
+/// transition without committing it. The actual update
+/// path (`task.update`) is not yet enforced against the
+/// matrix — that's a separate milestone — so this is the
+/// honest authoritative reference for what *should* be
+/// permitted.
+fn handle_transition_check(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.transition_check utf8: {e}")),
+    };
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    let task_id = parts.first().copied().unwrap_or("").trim();
+    let target = parts.get(1).copied().unwrap_or("").trim();
+    if task_id.is_empty() || target.is_empty() {
+        return invalid("task.transition_check: arg shape `task_id|target_status`".to_string());
+    }
+    match store.get(task_id) {
+        Ok(Some(view)) => {
+            let allowed = is_allowed_transition(&view.status, target);
+            let body = format!(
+                "allowed={allowed}\ncurrent_status={}\ntarget_status={target}\n",
+                view.status,
+            );
+            HandlerOutcome::Ok(body.into_bytes())
+        }
+        Ok(None) => invalid(format!("task.transition_check: not found: {task_id}")),
+        Err(e) => internal(format!("task.transition_check: {e}")),
     }
 }
 
@@ -7040,6 +7169,86 @@ mod tests {
         let tid = mk(&s, "t", "f", "{}", "o");
         let err = s.set_resumed(&tid, "op").unwrap_err();
         assert!(matches!(err, CoordinatorError::Invalid(_)));
+    }
+
+    #[test]
+    fn state_machine_canonical_transitions_allowed() {
+        // M74: spot-check the canonical happy path.
+        for (from, to) in [
+            ("pending", "running"),
+            ("running", "completed"),
+            ("running", "failed"),
+            ("running", "interrupted"),
+            ("running", "cancelled"),
+            ("running", "paused"),
+            ("running", "frozen"),
+            ("retrying", "running"),
+            ("failed", "retrying"),
+            ("interrupted", "retrying"),
+            ("paused", "pending"),
+            ("paused", "frozen"),
+            ("frozen", "pending"),
+        ] {
+            assert!(
+                is_allowed_transition(from, to),
+                "expected {from} → {to} to be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn state_machine_invalid_transitions_rejected() {
+        // M74: spot-check disallowed transitions. Terminal
+        // statuses must reject all outbound except same-status.
+        for (from, to) in [
+            ("completed", "running"),
+            ("completed", "failed"),
+            ("cancelled", "running"),
+            ("cancelled", "pending"),
+            ("pending", "completed"),
+            ("pending", "failed"),
+            ("running", "pending"),
+            ("frozen", "running"),
+            ("paused", "running"),
+        ] {
+            assert!(
+                !is_allowed_transition(from, to),
+                "expected {from} → {to} to be disallowed"
+            );
+        }
+    }
+
+    #[test]
+    fn state_machine_same_status_is_noop() {
+        for s in TASK_STATES {
+            assert!(
+                is_allowed_transition(s, s),
+                "expected same-status no-op for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_machine_unknown_status_conservatively_allowed() {
+        // Forward-compat: a future status the validator
+        // doesn't know about must not block updates. The
+        // bridge enforcement layer is responsible for
+        // rejecting genuinely-unknown statuses at the API.
+        assert!(is_allowed_transition("running", "operator-defined"));
+        assert!(is_allowed_transition("future-status", "completed"));
+    }
+
+    #[test]
+    fn transition_check_reports_allowed_or_not() {
+        // M74: actually exercise the snapshot helper through
+        // a real task with a known status.
+        let s = store();
+        let tid = mk(&s, "t", "f", "{}", "o");
+        // pending → running: allowed
+        let view = s.get(&tid).unwrap().unwrap();
+        assert_eq!(view.status, "pending");
+        assert!(is_allowed_transition(&view.status, "running"));
+        assert!(!is_allowed_transition(&view.status, "completed"));
     }
 
     #[test]

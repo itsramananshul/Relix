@@ -590,6 +590,19 @@ fn register_node_type_handlers(
                 &["task", "write", "graph", "lineage", "runtime"],
             ),
             (
+                "task.transition_check",
+                "Informational state-machine validator. Args: \
+                 `task_id|target_status`. Reads current \
+                 status + returns `allowed=true|false` against \
+                 the canonical transition matrix. Does NOT \
+                 mutate. Operators + runtime workers use this \
+                 to pre-flight a planned transition. The \
+                 `task.update` path is not yet enforced \
+                 against the matrix (separate milestone) — \
+                 this is the honest authoritative reference.",
+                &["task", "read", "state-machine"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -625,7 +638,7 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
-            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze / record_spawned / record_delegated / record_awaited"
+            "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze / record_spawned / record_delegated / record_awaited / transition_check"
         );
     }
     if cfg.controller.node_type == "tool" {
