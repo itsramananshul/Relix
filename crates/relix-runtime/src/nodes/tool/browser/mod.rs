@@ -101,7 +101,7 @@ pub mod webdriver;
 /// Per-node config for the browser subsystem. Lives under
 /// `[tool.browser]`. When the whole section is absent the
 /// capability is NOT registered (see `register()`).
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct BrowserConfig {
     /// Backend selector. One of:
     /// - `"none"` — scaffold; every non-noop returns
@@ -110,6 +110,9 @@ pub struct BrowserConfig {
     ///   feature.
     /// - `"playwright"` — requires `browser-playwright` feature.
     /// - `"webdriver"` — requires `browser-webdriver` feature.
+    ///   When this backend is selected, [`Self::webdriver_url`]
+    ///   must point at the operator-supplied WebDriver daemon
+    ///   (chromedriver / geckodriver).
     ///
     /// Selecting a backend whose feature isn't compiled fails
     /// LOUDLY at startup (no silent NoneBackend fallback).
@@ -125,6 +128,23 @@ pub struct BrowserConfig {
     /// when the scaffold has nothing to time out yet.
     #[serde(default = "default_call_timeout_secs")]
     pub call_timeout_secs: u64,
+    /// PH-BROWSER-WD: URL of the operator-supplied WebDriver
+    /// daemon (chromedriver / geckodriver). Required when
+    /// `backend = "webdriver"`. Defaults to
+    /// `http://127.0.0.1:9515` (chromedriver's default port).
+    #[serde(default = "default_webdriver_url")]
+    pub webdriver_url: String,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+            max_sessions: default_max_sessions(),
+            call_timeout_secs: default_call_timeout_secs(),
+            webdriver_url: default_webdriver_url(),
+        }
+    }
 }
 
 fn default_backend() -> String {
@@ -135,6 +155,9 @@ fn default_max_sessions() -> usize {
 }
 fn default_call_timeout_secs() -> u64 {
     30
+}
+fn default_webdriver_url() -> String {
+    "http://127.0.0.1:9515".to_string()
 }
 
 /// Recognised backend names. The set is closed — anything else
@@ -615,6 +638,7 @@ mod tests {
             backend: "none".to_string(),
             max_sessions: 4,
             call_timeout_secs: 30,
+            webdriver_url: default_webdriver_url(),
         }
     }
 
@@ -950,15 +974,27 @@ mod tests {
         assert_eq!(b.list_sessions().expect("list_sessions").len(), 0);
     }
 
+    /// PH-BROWSER-WD: with the `browser-webdriver` feature on,
+    /// `build_backend` returns the live fantoccini-backed
+    /// `WebDriverBackend`. `try_build` must NOT touch the
+    /// network — it does not probe the driver URL. We assert
+    /// the name only; live-driver behaviour is exercised in
+    /// `webdriver::tests` and gated on a running daemon.
     #[cfg(feature = "browser-webdriver")]
     #[test]
-    fn feature_webdriver_compiled_builds_scaffold() {
+    fn feature_webdriver_compiled_builds_real_backend() {
         let mut c = cfg();
         c.backend = "webdriver".into();
-        let b = build_backend(&c).expect("scaffold should build");
+        let b = build_backend(&c).expect("real backend should build");
         assert_eq!(b.name(), "webdriver");
-        let id = b.open_session().expect("session");
-        let err = b.navigate(&id, "https://example.com/").unwrap_err();
-        assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
+    }
+
+    #[test]
+    fn default_browser_config_webdriver_url_is_chromedriver_default() {
+        let cfg = BrowserConfig::default();
+        assert_eq!(cfg.webdriver_url, "http://127.0.0.1:9515");
+        assert_eq!(cfg.backend, "none");
+        assert_eq!(cfg.max_sessions, 16);
+        assert_eq!(cfg.call_timeout_secs, 30);
     }
 }

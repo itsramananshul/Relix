@@ -57,6 +57,13 @@ tracing.workspace = true
 # `tab.set_default_timeout` for per-call deadlines.
 headless_chrome = { version = "1.0", optional = true }
 
+# PH-BROWSER-WD: WebDriver client (chromedriver / geckodriver).
+# Only compiled in when `browser-webdriver` is enabled. Pinned
+# to fantoccini 0.21.x. Use rustls-tls (not default
+# native-tls) to avoid pulling openssl in — matches reqwest's
+# workspace-level rustls posture.
+fantoccini = { version = "0.21", default-features = false, features = ["rustls-tls"], optional = true }
+
 [features]
 # PH-BROWSER-FEATURES — per-backend opt-in flags. Default
 # build ships the NoneBackend honest scaffold only.
@@ -66,7 +73,8 @@ headless_chrome = { version = "1.0", optional = true }
 default = []
 browser-headless-chrome = ["dep:headless_chrome"]
 browser-playwright = []
-browser-webdriver = []
+# PH-BROWSER-WD: pulls in the fantoccini WebDriver client.
+browser-webdriver = ["dep:fantoccini"]
 # Convenience: turn on all three backend features at once.
 browser-all = [
     "browser-headless-chrome",
