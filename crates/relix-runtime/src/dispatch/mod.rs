@@ -92,7 +92,12 @@ pub struct DispatchBridge {
     /// via [`Self::capability_stats_snapshot`] for the bridge
     /// / dashboard to project. Pure observability; doesn't
     /// gate any decision.
-    capability_stats: std::sync::RwLock<HashMap<String, CapStats>>,
+    ///
+    /// W2-006b: wrapped in `Arc` so handlers (e.g. the
+    /// `node.dispatch.stats` capability the bridge exposes)
+    /// can capture a cheap clone of the shared lock without
+    /// needing access to the whole DispatchBridge.
+    capability_stats: Arc<std::sync::RwLock<HashMap<String, CapStats>>>,
 }
 
 /// PH-DISP1: per-capability counters. Counts are lifetime —
@@ -166,8 +171,16 @@ impl DispatchBridge {
             trust_root,
             audit: tokio::sync::Mutex::new(audit),
             responder_node_id,
-            capability_stats: std::sync::RwLock::new(HashMap::new()),
+            capability_stats: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
+    }
+
+    /// W2-006b: return a cheap clone of the capability-stats
+    /// RwLock handle. Handlers registered against this bridge
+    /// (e.g. the built-in `node.dispatch.stats`) capture this
+    /// to read the snapshot without owning the bridge.
+    pub fn capability_stats_handle(&self) -> Arc<std::sync::RwLock<HashMap<String, CapStats>>> {
+        self.capability_stats.clone()
     }
 
     /// PH-DISP1: snapshot of every capability's counters.

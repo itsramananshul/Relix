@@ -343,6 +343,22 @@ fn register_builtins(
             async move { HandlerOutcome::Ok(body.into_bytes()) }
         })),
     );
+    // W2-006b: node.dispatch.stats — per-capability latency +
+    // outcome counters from the local DispatchBridge. Pure
+    // read; never gates a decision. The handler captures an
+    // Arc clone of the stats lock so it doesn't need the
+    // bridge.
+    let stats_handle = bridge.capability_stats_handle();
+    bridge.register(
+        "node.dispatch.stats",
+        Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+            let stats = stats_handle.clone();
+            async move {
+                let body = dispatch_stats_body(&stats);
+                HandlerOutcome::Ok(body.into_bytes())
+            }
+        })),
+    );
     // Built-in: every node serves its own NodeManifest.
     let manifest_for_handler = manifest.clone();
     bridge.register(
@@ -376,6 +392,57 @@ fn register_builtins(
             .with_categories(["discover".into()])
             .with_risk(relix_core::capability::RiskLevel::Safe),
     );
+    // W2-006b: dispatch stats descriptor.
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.dispatch.stats")
+            .with_description(
+                "Per-capability invocation counters + latency stats from the local DispatchBridge. \
+                 Tab-delim rows: method\\tinvocations\\terrors\\tdenied\\tunknown_method\\tlast_invoked_at\\tlast_error_at\\tlatency_samples\\tlast_elapsed_ms\\tmax_elapsed_ms\\tmean_elapsed_ms — followed by `count=N`.",
+            )
+            .with_categories(["observe".into(), "read".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
+    );
+}
+
+/// W2-006b: format the dispatch-stats snapshot as tab-delim
+/// rows. The output mirrors the row schema described in the
+/// `node.dispatch.stats` capability descriptor. Mean elapsed
+/// is `total / samples` when samples > 0; otherwise 0.
+fn dispatch_stats_body(
+    stats: &std::sync::RwLock<std::collections::HashMap<String, crate::dispatch::CapStats>>,
+) -> String {
+    use std::fmt::Write as _;
+    let snap: Vec<(String, crate::dispatch::CapStats)> = {
+        let g = stats.read().expect("capability_stats read");
+        g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    // Stable ordering — lexicographic by method name — so
+    // operators diff cleanly across calls.
+    let mut snap = snap;
+    snap.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut body = String::new();
+    for (name, s) in &snap {
+        let mean = s.total_elapsed_ms.checked_div(s.latency_samples).unwrap_or(0);
+        let _ = writeln!(
+            body,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            name,
+            s.invocations,
+            s.errors,
+            s.denied,
+            s.unknown_method,
+            s.last_invoked_at,
+            s.last_error_at
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "-".into()),
+            s.latency_samples,
+            s.last_elapsed_ms,
+            s.max_elapsed_ms,
+            mean,
+        );
+    }
+    let _ = writeln!(body, "count={}", snap.len());
+    body
 }
 
 /// Register node-type-specific capabilities based on `[controller] node_type`.
