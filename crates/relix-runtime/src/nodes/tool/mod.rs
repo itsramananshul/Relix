@@ -72,7 +72,7 @@ use relix_core::capability::{
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
-use security::{SsrfError, resolve_safe_url, resolve_safe_url_blocking};
+use security::{HostBlocklist, SsrfError, resolve_safe_url, resolve_safe_url_blocking};
 
 /// Per-node tool configuration parsed from `[tool]` in the controller TOML.
 #[derive(Clone, Debug, Deserialize)]
@@ -137,6 +137,20 @@ pub struct ToolConfig {
     /// See `crates/relix-runtime/src/nodes/tool/mcp.rs`.
     #[serde(default)]
     pub mcp: Option<mcp::McpConfig>,
+    /// PH-WEB-BLOCKLIST: operator-curated hostname blocklist.
+    /// Every URL passed to `tool.web_fetch` / `tool.web_get` /
+    /// `tool.web_extract` / `tool.web.post` / `tool.web.robots_check`
+    /// is checked against this list (case-insensitive exact match)
+    /// before scheme/DNS validation. Same check runs on every
+    /// redirect target via the existing redirect policy.
+    ///
+    /// Honest scope: this is **operator-curated**, not a live
+    /// threat feed. Refresh from URLhaus (or any other source) on
+    /// whatever schedule fits — see
+    /// `crates/relix-runtime/src/nodes/tool/security.rs` module
+    /// doc for the curl recipe.
+    #[serde(default)]
+    pub blocked_hosts: Vec<String>,
 }
 
 impl Default for ToolConfig {
@@ -153,6 +167,7 @@ impl Default for ToolConfig {
             terminal: None,
             browser: None,
             mcp: None,
+            blocked_hosts: Vec::new(),
         }
     }
 }
@@ -216,6 +231,10 @@ fn build_client(
 fn ssrf_redirect_policy(cfg: &ToolConfig) -> reqwest::redirect::Policy {
     let max_redirects = cfg.max_redirects;
     let allow_http = cfg.allow_http;
+    // PH-WEB-BLOCKLIST: re-check every redirect target against the
+    // operator blocklist. Clone is cheap (Arc<HashSet>) so each
+    // redirect doesn't re-build the lookup structure.
+    let blocklist = HostBlocklist::new(cfg.blocked_hosts.iter().cloned());
     reqwest::redirect::Policy::custom(move |attempt| {
         let target_str = attempt.url().to_string();
         let previous_count = attempt.previous().len();
@@ -237,7 +256,7 @@ fn ssrf_redirect_policy(cfg: &ToolConfig) -> reqwest::redirect::Policy {
                 "tool.web_fetch: redirect cap ({max_redirects}) reached"
             )));
         }
-        match resolve_safe_url_blocking(&target_str, allow_http) {
+        match resolve_safe_url_blocking(&target_str, allow_http, &blocklist) {
             Ok(_) => {
                 tracing::debug!(
                     target_url = %target_str,
@@ -397,6 +416,10 @@ impl PinnedClientPool {
 pub struct ToolBackend {
     cfg: ToolConfig,
     pool: PinnedClientPool,
+    /// PH-WEB-BLOCKLIST: operator-curated host blocklist. Built
+    /// once at `new()` from `cfg.blocked_hosts`. Cheap-clone for
+    /// the redirect closure.
+    blocklist: HostBlocklist,
 }
 
 impl ToolBackend {
@@ -407,10 +430,19 @@ impl ToolBackend {
     pub fn new(cfg: ToolConfig) -> Result<Self, ToolError> {
         let probe =
             build_client(&cfg, None).map_err(|e| ToolError::Build(format!("client probe: {e}")))?;
+        let blocklist = HostBlocklist::new(cfg.blocked_hosts.iter().cloned());
         Ok(Self {
             cfg: cfg.clone(),
             pool: PinnedClientPool::new(cfg, Arc::new(probe)),
+            blocklist,
         })
+    }
+
+    /// PH-WEB-BLOCKLIST: read-only accessor for the operator
+    /// blocklist. Used by tests + future dashboard surfaces. The
+    /// returned clone shares the underlying `Arc<HashSet>`.
+    pub fn blocklist(&self) -> HostBlocklist {
+        self.blocklist.clone()
     }
 
     /// Accessor used by [`register`] to forward the operator's
@@ -488,7 +520,7 @@ impl ToolBackend {
     pub async fn fetch(&self, raw_url: &str, max_bytes_request: usize) -> WebFetchOutcome {
         let cap = max_bytes_request.min(self.cfg.max_bytes).max(1);
 
-        let target = match resolve_safe_url(raw_url, self.cfg.allow_http).await {
+        let target = match resolve_safe_url(raw_url, self.cfg.allow_http, &self.blocklist).await {
             Ok(t) => t,
             Err(e) => return WebFetchOutcome::Rejected(e),
         };
@@ -614,7 +646,7 @@ impl ToolBackend {
     ) -> WebPostOutcome {
         let cap = max_bytes_request.min(self.cfg.max_bytes).max(1);
 
-        let target = match resolve_safe_url(raw_url, self.cfg.allow_http).await {
+        let target = match resolve_safe_url(raw_url, self.cfg.allow_http, &self.blocklist).await {
             Ok(t) => t,
             Err(e) => return WebPostOutcome::Rejected(e),
         };

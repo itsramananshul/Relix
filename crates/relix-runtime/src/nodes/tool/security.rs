@@ -42,7 +42,44 @@
 //! - **Network egress filtering** at the host OS level is not configured
 //!   by the tool node; operators on shared hosts should add an iptables /
 //!   Windows-Firewall outbound deny for RFC 1918 to the tool node's UID.
+//!
+//! ## PH-WEB-BLOCKLIST — operator-curated host blocklist
+//!
+//! Beyond the hard-coded SSRF rejections above, every web entry point
+//! accepts an operator-supplied [`HostBlocklist`] of hostnames the node
+//! should refuse outright. The check runs:
+//!
+//! - **Before scheme/DNS** validation, so a blocked host never even
+//!   gets to the resolver.
+//! - **On every redirect target**, via the same closure that re-runs
+//!   the SSRF guard.
+//!
+//! Matching is case-insensitive **exact** on the hostname. If an
+//! operator lists `evil.example.com`, only that hostname is blocked —
+//! NOT subdomains or the parent domain. To block a whole subtree the
+//! operator lists each hostname explicitly. This matches the
+//! per-hostname granularity of feeds like URLhaus and avoids the
+//! "block example.com, accidentally lose google.example.com" footgun.
+//!
+//! ### Refreshing from URLhaus
+//!
+//! URLhaus publishes a hostnames-only feed at
+//! `https://urlhaus.abuse.ch/downloads/hostfile/`. To convert into
+//! the `[tool] blocked_hosts = [...]` form:
+//!
+//! ```text
+//! curl -sSL https://urlhaus.abuse.ch/downloads/hostfile/ \
+//!   | awk '/^127\.0\.0\.1[ \t]/{print $2}' \
+//!   | sed 's/^/  "/;s/$/",/' > blocked_hosts.toml.fragment
+//! ```
+//!
+//! Then paste under `[tool]`. Restart the tool node. This is
+//! **operator-curated** by design — the bridge does not call URLhaus
+//! live (no implicit external dependency, no leak of fetched URLs to
+//! a third party, no surprise rate-limit failures). The honesty
+//! posture: "we block what you told us to."
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 use reqwest::Url;
@@ -92,6 +129,61 @@ pub enum SsrfError {
         ip: IpAddr,
         reason: &'static str,
     },
+    /// PH-WEB-BLOCKLIST: hostname matched the operator's blocklist.
+    /// Caller is the same `policy_denied` envelope shape as the
+    /// hardcoded SSRF rejections — the dashboard / CLI can't
+    /// distinguish, by design (we don't tell potential adversaries
+    /// "you hit our blocklist").
+    #[error("hostname '{host}' is on the operator blocklist")]
+    HostBlocked { host: String },
+}
+
+/// PH-WEB-BLOCKLIST: operator-curated host blocklist. Cheap-clone
+/// `Arc`-backed `HashSet` so the redirect closure can hold its own
+/// view without paying per-redirect copy cost. All entries
+/// lowercased on construction; lookup is case-insensitive against
+/// the URL's normalized host.
+#[derive(Debug, Clone, Default)]
+pub struct HostBlocklist {
+    entries: std::sync::Arc<HashSet<String>>,
+}
+
+impl HostBlocklist {
+    /// Build a blocklist from an operator-supplied slice. Empty
+    /// entries are dropped; remaining entries are trimmed and
+    /// lowercased. Duplicates collapse into one HashSet entry.
+    pub fn new<I, S>(hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let entries = hosts
+            .into_iter()
+            .filter_map(|h| {
+                let t = h.as_ref().trim().to_ascii_lowercase();
+                if t.is_empty() { None } else { Some(t) }
+            })
+            .collect::<HashSet<String>>();
+        Self {
+            entries: std::sync::Arc::new(entries),
+        }
+    }
+
+    /// True iff `host` is on the blocklist. Caller is expected to
+    /// pass a hostname already normalized to lowercase (callers
+    /// inside this module do this via `validate_url_pre_dns`).
+    pub fn contains(&self, host: &str) -> bool {
+        self.entries.contains(host)
+    }
+
+    /// Number of entries — useful for dashboards / log lines.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Validate a URL string and (if it has a hostname) resolve it. Returns
@@ -103,8 +195,12 @@ pub enum SsrfError {
 /// system resolver decides to be slow. The synchronous twin
 /// [`resolve_safe_url_blocking`] is used by reqwest's redirect policy
 /// closure (which cannot await).
-pub async fn resolve_safe_url(raw: &str, allow_http: bool) -> Result<SafeUrl, SsrfError> {
-    let (url, lower_host) = match validate_url_pre_dns(raw, allow_http)? {
+pub async fn resolve_safe_url(
+    raw: &str,
+    allow_http: bool,
+    blocklist: &HostBlocklist,
+) -> Result<SafeUrl, SsrfError> {
+    let (url, lower_host) = match validate_url_pre_dns(raw, allow_http, blocklist)? {
         ValidatedHost::LiteralIp { url, ip } => {
             return Ok(SafeUrl {
                 normalized_url: url,
@@ -128,8 +224,12 @@ pub async fn resolve_safe_url(raw: &str, allow_http: bool) -> Result<SafeUrl, Ss
 /// `redirect::Policy::custom` closure (which is sync). Blocks the calling
 /// thread on the system resolver; acceptable for redirects because they
 /// are rare and short-lived. Returns the same [`SafeUrl`] on success.
-pub fn resolve_safe_url_blocking(raw: &str, allow_http: bool) -> Result<SafeUrl, SsrfError> {
-    let (url, lower_host) = match validate_url_pre_dns(raw, allow_http)? {
+pub fn resolve_safe_url_blocking(
+    raw: &str,
+    allow_http: bool,
+    blocklist: &HostBlocklist,
+) -> Result<SafeUrl, SsrfError> {
+    let (url, lower_host) = match validate_url_pre_dns(raw, allow_http, blocklist)? {
         ValidatedHost::LiteralIp { url, ip } => {
             return Ok(SafeUrl {
                 normalized_url: url,
@@ -151,8 +251,12 @@ enum ValidatedHost {
 }
 
 /// Cheap, sync, pre-DNS checks: parse URL, scheme allowlist, literal-IP
-/// range check, hostname denylist. No I/O.
-fn validate_url_pre_dns(raw: &str, allow_http: bool) -> Result<ValidatedHost, SsrfError> {
+/// range check, hostname denylist, **operator blocklist**. No I/O.
+fn validate_url_pre_dns(
+    raw: &str,
+    allow_http: bool,
+    blocklist: &HostBlocklist,
+) -> Result<ValidatedHost, SsrfError> {
     let url = Url::parse(raw.trim()).map_err(|e| SsrfError::BadUrl(e.to_string()))?;
 
     let scheme = url.scheme().to_ascii_lowercase();
@@ -166,6 +270,16 @@ fn validate_url_pre_dns(raw: &str, allow_http: bool) -> Result<ValidatedHost, Ss
         .host_str()
         .ok_or_else(|| SsrfError::NoHost(raw.to_string()))?
         .to_string();
+    let lower_host = host.to_ascii_lowercase();
+
+    // PH-WEB-BLOCKLIST: operator-curated host blocklist check runs
+    // BEFORE the IP / hostname rules — so even loopback / metadata
+    // hostnames that aren't on the hardcoded list but ARE on the
+    // operator list reject with HostBlocked (clearer error
+    // attribution than HostnameDenied).
+    if blocklist.contains(&lower_host) {
+        return Err(SsrfError::HostBlocked { host: lower_host });
+    }
 
     if let Some(parsed) = parse_literal_ip(&host) {
         if let Some(reason) = forbidden_ip_reason(parsed) {
@@ -173,7 +287,6 @@ fn validate_url_pre_dns(raw: &str, allow_http: bool) -> Result<ValidatedHost, Ss
         }
         return Ok(ValidatedHost::LiteralIp { url, ip: parsed });
     }
-    let lower_host = host.to_ascii_lowercase();
     if let Some(reason) = forbidden_hostname_reason(&lower_host) {
         return Err(SsrfError::HostnameDenied {
             host: lower_host,
@@ -429,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_loopback_literal() {
-        let e = resolve_safe_url("https://127.0.0.1/", false)
+        let e = resolve_safe_url("https://127.0.0.1/", false, &HostBlocklist::default())
             .await
             .expect_err("should be rejected");
         assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
@@ -437,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_file_scheme() {
-        let e = resolve_safe_url("file:///etc/passwd", false)
+        let e = resolve_safe_url("file:///etc/passwd", false, &HostBlocklist::default())
             .await
             .expect_err("should be rejected");
         assert!(matches!(e, SsrfError::SchemeDenied { .. }), "got {e:?}");
@@ -445,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_http_when_not_opted_in() {
-        let e = resolve_safe_url("http://example.com/", false)
+        let e = resolve_safe_url("http://example.com/", false, &HostBlocklist::default())
             .await
             .expect_err("should be rejected");
         assert!(matches!(e, SsrfError::SchemeDenied { .. }), "got {e:?}");
@@ -453,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_invalid_url() {
-        let e = resolve_safe_url("not a url", false)
+        let e = resolve_safe_url("not a url", false, &HostBlocklist::default())
             .await
             .expect_err("should be rejected");
         assert!(matches!(e, SsrfError::BadUrl(_)), "got {e:?}");
@@ -461,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_localhost_hostname() {
-        let e = resolve_safe_url("https://localhost/", false)
+        let e = resolve_safe_url("https://localhost/", false, &HostBlocklist::default())
             .await
             .expect_err("should be rejected");
         assert!(matches!(e, SsrfError::HostnameDenied { .. }), "got {e:?}");
@@ -490,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_bracketed_ipv6_loopback() {
-        let e = resolve_safe_url("https://[::1]/", false)
+        let e = resolve_safe_url("https://[::1]/", false, &HostBlocklist::default())
             .await
             .expect_err("bracketed v6 loopback must be rejected");
         assert_v6_rejected(&e);
@@ -498,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_bracketed_ipv6_link_local() {
-        let e = resolve_safe_url("https://[fe80::1]/", false)
+        let e = resolve_safe_url("https://[fe80::1]/", false, &HostBlocklist::default())
             .await
             .expect_err("bracketed v6 link-local must be rejected");
         assert_v6_rejected(&e);
@@ -509,9 +622,13 @@ mod tests {
         // `[::ffff:127.0.0.1]` should unwrap to 127.0.0.1 either at
         // parse time or after DNS resolution — both paths must
         // refuse before any I/O.
-        let e = resolve_safe_url("https://[::ffff:127.0.0.1]/", false)
-            .await
-            .expect_err("mapped v4 loopback must be rejected");
+        let e = resolve_safe_url(
+            "https://[::ffff:127.0.0.1]/",
+            false,
+            &HostBlocklist::default(),
+        )
+        .await
+        .expect_err("mapped v4 loopback must be rejected");
         assert_v6_rejected(&e);
     }
 
@@ -522,7 +639,7 @@ mod tests {
         // etc.
         for variant in ["LOCALHOST", "LocalHost", "lOcAlHoSt"] {
             let url = format!("https://{variant}/");
-            let e = resolve_safe_url(&url, false)
+            let e = resolve_safe_url(&url, false, &HostBlocklist::default())
                 .await
                 .expect_err(&format!("variant {variant} must be denied"));
             assert!(
@@ -534,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_safe_url_rejects_internal_suffix_case_variants() {
-        let e = resolve_safe_url("https://API.INTERNAL/", false)
+        let e = resolve_safe_url("https://API.INTERNAL/", false, &HostBlocklist::default())
             .await
             .expect_err("INTERNAL suffix variant must be denied");
         assert!(matches!(e, SsrfError::HostnameDenied { .. }), "got {e:?}");
@@ -546,17 +663,25 @@ mod tests {
         // see `safe.example` as the host. URL spec says userinfo
         // is before the `@`, host is after. The literal-IP check
         // must operate on the actual host (`127.0.0.1`).
-        let e = resolve_safe_url("https://user:pass@127.0.0.1/", false)
-            .await
-            .expect_err("userinfo must not mask the real host");
+        let e = resolve_safe_url(
+            "https://user:pass@127.0.0.1/",
+            false,
+            &HostBlocklist::default(),
+        )
+        .await
+        .expect_err("userinfo must not mask the real host");
         assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
     }
 
     #[tokio::test]
     async fn resolve_safe_url_with_explicit_port_still_checks_host() {
-        let e = resolve_safe_url("https://127.0.0.1:8443/path", false)
-            .await
-            .expect_err("port must not bypass IP check");
+        let e = resolve_safe_url(
+            "https://127.0.0.1:8443/path",
+            false,
+            &HostBlocklist::default(),
+        )
+        .await
+        .expect_err("port must not bypass IP check");
         assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
     }
 
@@ -565,7 +690,7 @@ mod tests {
         // `data:` URLs and similar exotic schemes parse but have no
         // host. Should produce a clean SchemeDenied (or NoHost) —
         // never a panic on .host_str().unwrap().
-        let e = resolve_safe_url("data:text/plain,hello", false)
+        let e = resolve_safe_url("data:text/plain,hello", false, &HostBlocklist::default())
             .await
             .expect_err("data: URL must be refused");
         assert!(
@@ -581,5 +706,124 @@ mod tests {
         // to fail loudly than silently dial nothing.
         assert!(forbidden_ip_reason("192.0.2.1".parse().unwrap()).is_some());
         assert!(forbidden_ip_reason("203.0.113.1".parse().unwrap()).is_some());
+    }
+
+    // ── PH-WEB-BLOCKLIST: operator-curated host blocklist ──────────
+
+    #[test]
+    fn host_blocklist_lowercases_and_dedupes_on_construction() {
+        let bl = HostBlocklist::new([
+            "Evil.example.com",
+            "  evil.example.com  ",
+            "EVIL.EXAMPLE.COM",
+            "other.bad",
+        ]);
+        assert_eq!(bl.len(), 2);
+        assert!(bl.contains("evil.example.com"));
+        assert!(bl.contains("other.bad"));
+        assert!(!bl.contains("safe.example.com"));
+    }
+
+    #[test]
+    fn host_blocklist_drops_empty_entries() {
+        let bl = HostBlocklist::new(["evil.example.com", "", "   ", "other.bad"]);
+        assert_eq!(bl.len(), 2);
+        assert!(!bl.contains(""));
+    }
+
+    #[test]
+    fn host_blocklist_empty_default_contains_nothing() {
+        let bl = HostBlocklist::default();
+        assert!(bl.is_empty());
+        assert!(!bl.contains("anything"));
+    }
+
+    #[test]
+    fn host_blocklist_does_not_match_subdomains() {
+        // Honesty guard: an entry for `evil.example.com` does NOT
+        // block `sub.evil.example.com`. Operators must list
+        // subdomains explicitly (matches URLhaus's per-hostname
+        // feed granularity). Documenting this with a test so a
+        // future "make it match subdomains" diff has to consciously
+        // override the contract.
+        let bl = HostBlocklist::new(["evil.example.com"]);
+        assert!(bl.contains("evil.example.com"));
+        assert!(!bl.contains("sub.evil.example.com"));
+        assert!(!bl.contains("example.com"));
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_rejects_blocked_host_before_dns() {
+        // The blocklist check must fire BEFORE the DNS lookup —
+        // otherwise a typo-host on the blocklist would burn a
+        // DNS round-trip. We verify by using a hostname that
+        // would not resolve at all (`.invalid` TLD is reserved by
+        // RFC 2606) but is on the blocklist.
+        let bl = HostBlocklist::new(["does-not-resolve.invalid"]);
+        let e = resolve_safe_url("https://does-not-resolve.invalid/", false, &bl)
+            .await
+            .expect_err("blocked host must reject before DNS");
+        match e {
+            SsrfError::HostBlocked { host } => {
+                assert_eq!(host, "does-not-resolve.invalid");
+            }
+            other => panic!("expected HostBlocked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_blocklist_is_case_insensitive() {
+        let bl = HostBlocklist::new(["evil.example.com"]);
+        // URL parser normalizes the host to lowercase already, but
+        // the blocklist itself must also be case-insensitive on
+        // the input side (we lowercase entries on construction).
+        let e = resolve_safe_url("https://EVIL.example.com/", false, &bl)
+            .await
+            .expect_err("uppercase variant must still match");
+        assert!(matches!(e, SsrfError::HostBlocked { .. }), "got {e:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_blocklist_does_not_widen_to_subdomain() {
+        // The runtime-policy contract: exact match only. A request
+        // for `safe.example.com` does NOT get blocked even if
+        // `example.com` is on the list. We use a real hostname
+        // that resolves so the test exercises the full path (not
+        // the pre-DNS short-circuit).
+        let bl = HostBlocklist::new(["example.com"]);
+        // We don't actually need DNS to confirm — we just need to
+        // confirm the blocklist check did not match. If the call
+        // fails on DnsFailed / DnsForbidden / network unreachable
+        // that's fine — what we want is "NOT HostBlocked."
+        let res = resolve_safe_url("https://safe.example.com/", false, &bl).await;
+        if let Err(SsrfError::HostBlocked { host }) = &res {
+            panic!("subdomain should not be blocked, but got HostBlocked('{host}')");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_safe_url_blocklist_fires_before_hardcoded_denylist() {
+        // Edge case: `localhost` is both on the hardcoded denylist
+        // AND (now) the operator blocklist. The blocklist check
+        // runs first, so the operator sees HostBlocked (clearer
+        // attribution: "you told us to block this").
+        let bl = HostBlocklist::new(["localhost"]);
+        let e = resolve_safe_url("https://localhost/", false, &bl)
+            .await
+            .expect_err("blocked");
+        assert!(
+            matches!(e, SsrfError::HostBlocked { .. }),
+            "blocklist must take precedence, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_safe_url_blocking_respects_blocklist() {
+        // Sync twin (used by redirect closure) must enforce the
+        // same blocklist as the async path.
+        let bl = HostBlocklist::new(["evil.example.com"]);
+        let e = resolve_safe_url_blocking("https://evil.example.com/", false, &bl)
+            .expect_err("blocking path must reject");
+        assert!(matches!(e, SsrfError::HostBlocked { .. }), "got {e:?}");
     }
 }
