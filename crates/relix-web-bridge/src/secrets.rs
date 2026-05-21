@@ -73,6 +73,38 @@ pub struct ProviderEntry {
     /// with entries created before this field landed.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    // ── M58: persistent last-test cache ────────────────────
+    //
+    // Every successful or failed call to
+    // `POST /v1/config/providers/:name/test` writes these
+    // fields. Operators glancing at the provider card see
+    // "last tested ok 200 · 245ms · 3 min ago" without
+    // re-running the test, and the value persists across
+    // bridge restarts because it lives in the same
+    // bridge-secrets.toml the keys do.
+    /// Unix seconds of the most recent test call. `None`
+    /// when the provider has never been tested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_test_at: Option<i64>,
+    /// `Some(true)` for success, `Some(false)` for failure,
+    /// `None` when never tested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_test_ok: Option<bool>,
+    /// Upstream HTTP status code for the most recent test, when
+    /// the request reached the provider's server. `None` for
+    /// transport failures (DNS, TCP, TLS) — the failure mode
+    /// surfaces in `last_test_detail`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_test_status_code: Option<u16>,
+    /// Elapsed milliseconds of the most recent test call.
+    /// `None` when never tested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_test_elapsed_ms: Option<u64>,
+    /// Redaction-safe human summary from the most recent test.
+    /// Same source as the live test response's `detail` field —
+    /// NEVER includes the raw key or arbitrary upstream body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_test_detail: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -127,6 +159,26 @@ pub struct ProviderStatus {
     /// when the provider is unconfigured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_set_at: Option<i64>,
+    // ── M58: persistent last-test cache projection ─────────
+    /// Unix seconds of the most recent operator-triggered
+    /// test against this provider's saved key. `None` when
+    /// the provider has never been tested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_at: Option<i64>,
+    /// Outcome of the most recent test. `None` when never
+    /// tested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_ok: Option<bool>,
+    /// Upstream HTTP status code from the most recent test,
+    /// when the request reached the provider's server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_status_code: Option<u16>,
+    /// Elapsed milliseconds of the most recent test.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_elapsed_ms: Option<u64>,
+    /// Redaction-safe summary from the most recent test.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_test_detail: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -232,6 +284,11 @@ impl BridgeSecrets {
                 default_model: e.default_model.clone(),
                 key_preview: redact(&e.api_key),
                 key_set_at: Some(e.set_at),
+                last_test_at: e.last_test_at,
+                last_test_ok: e.last_test_ok,
+                last_test_status_code: e.last_test_status_code,
+                last_test_elapsed_ms: e.last_test_elapsed_ms,
+                last_test_detail: e.last_test_detail.clone(),
             },
             None => ProviderStatus {
                 name: name.to_string(),
@@ -241,6 +298,11 @@ impl BridgeSecrets {
                 default_model: None,
                 key_preview: None,
                 key_set_at: None,
+                last_test_at: None,
+                last_test_ok: None,
+                last_test_status_code: None,
+                last_test_elapsed_ms: None,
+                last_test_detail: None,
             },
         }
     }
@@ -307,6 +369,23 @@ impl BridgeSecrets {
     /// [`ALLOWED_PROVIDERS`] + rejecting empty `api_key`.
     pub fn set_provider(&mut self, name: &str, api_key: String, default_model: Option<String>) {
         let prior_enabled = self.providers.get(name).map(|e| e.enabled).unwrap_or(true);
+        // Preserve the last-test cache across key overwrites.
+        // The key may have changed underneath, but the cache
+        // accurately describes "the most recent test" — which
+        // until the next test rerun reflects the OLD key.
+        // The dashboard renders both `last_test_at` and
+        // `key_set_at` so operators can tell they need to
+        // re-test after a key swap (if last_test_at <
+        // key_set_at the cache is stale).
+        let prior_cache = self.providers.get(name).map(|e| {
+            (
+                e.last_test_at,
+                e.last_test_ok,
+                e.last_test_status_code,
+                e.last_test_elapsed_ms,
+                e.last_test_detail.clone(),
+            )
+        });
         self.providers.insert(
             name.to_string(),
             ProviderEntry {
@@ -314,6 +393,11 @@ impl BridgeSecrets {
                 default_model,
                 set_at: unix_secs(),
                 enabled: prior_enabled,
+                last_test_at: prior_cache.as_ref().and_then(|c| c.0),
+                last_test_ok: prior_cache.as_ref().and_then(|c| c.1),
+                last_test_status_code: prior_cache.as_ref().and_then(|c| c.2),
+                last_test_elapsed_ms: prior_cache.as_ref().and_then(|c| c.3),
+                last_test_detail: prior_cache.and_then(|c| c.4),
             },
         );
     }
@@ -321,6 +405,32 @@ impl BridgeSecrets {
     /// Remove a provider entry, if present. Idempotent.
     pub fn delete_provider(&mut self, name: &str) {
         self.providers.remove(name);
+    }
+
+    /// Record the outcome of a test-provider call against this
+    /// provider's saved key. Stamps `last_test_at` to the
+    /// current time. Returns `false` when there's no entry to
+    /// stamp (defensive — the test handler validates this
+    /// itself before calling).
+    pub fn record_provider_test(
+        &mut self,
+        name: &str,
+        ok: bool,
+        status_code: Option<u16>,
+        elapsed_ms: u64,
+        detail: impl Into<String>,
+    ) -> bool {
+        match self.providers.get_mut(name) {
+            Some(e) => {
+                e.last_test_at = Some(unix_secs());
+                e.last_test_ok = Some(ok);
+                e.last_test_status_code = status_code;
+                e.last_test_elapsed_ms = Some(elapsed_ms);
+                e.last_test_detail = Some(detail.into());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Insert or replace the Telegram entry. Caller is
@@ -477,6 +587,73 @@ mod tests {
             !json.contains("1234567890"),
             "key body leaked into ProviderStatus JSON: {json}"
         );
+    }
+
+    #[test]
+    fn record_provider_test_writes_cache_fields() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        let p0 = s.provider_status("openai");
+        assert!(p0.last_test_at.is_none());
+
+        let applied = s.record_provider_test("openai", true, Some(200), 123, "ok");
+        assert!(applied);
+        let p1 = s.provider_status("openai");
+        assert_eq!(p1.last_test_ok, Some(true));
+        assert_eq!(p1.last_test_status_code, Some(200));
+        assert_eq!(p1.last_test_elapsed_ms, Some(123));
+        assert_eq!(p1.last_test_detail.as_deref(), Some("ok"));
+        assert!(p1.last_test_at.is_some());
+    }
+
+    #[test]
+    fn record_provider_test_refuses_when_no_entry() {
+        let mut s = BridgeSecrets::default();
+        // No prior set_provider — the entry doesn't exist, so
+        // recording a test against it must noop.
+        let applied = s.record_provider_test("openai", true, None, 0, "noop");
+        assert!(!applied);
+        let p = s.provider_status("openai");
+        assert!(p.last_test_at.is_none());
+    }
+
+    #[test]
+    fn set_provider_preserves_last_test_cache_across_key_overwrite() {
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-old".into(), Some("gpt-4o".into()));
+        s.record_provider_test("openai", true, Some(200), 42, "ok ({200})");
+        // Overwrite the key. The cache must survive — operators
+        // can tell the cache is stale by comparing
+        // `last_test_at` with `key_set_at`.
+        s.set_provider("openai", "sk-new".into(), Some("gpt-4o".into()));
+        let p = s.provider_status("openai");
+        assert_eq!(p.last_test_ok, Some(true));
+        assert_eq!(p.last_test_status_code, Some(200));
+        assert_eq!(p.last_test_elapsed_ms, Some(42));
+        // `key_set_at` was bumped by the second set_provider;
+        // both timestamps are still present so the dashboard
+        // can compare them.
+        assert!(p.key_set_at.is_some());
+        assert!(p.last_test_at.is_some());
+    }
+
+    #[test]
+    fn provider_test_cache_round_trips_through_disk() {
+        // Persisted cache survives a save + reload cycle. That's
+        // the whole point of M58 — operators see the badge
+        // after a bridge restart.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bridge-secrets.toml");
+        let mut s = BridgeSecrets::default();
+        s.set_provider("openai", "sk-x".into(), None);
+        s.record_provider_test("openai", false, Some(401), 88, "upstream returned 401");
+        s.save(&path).expect("save");
+        let s2 = BridgeSecrets::load_or_empty(&path);
+        let p = s2.provider_status("openai");
+        assert_eq!(p.last_test_ok, Some(false));
+        assert_eq!(p.last_test_status_code, Some(401));
+        assert_eq!(p.last_test_elapsed_ms, Some(88));
+        assert_eq!(p.last_test_detail.as_deref(), Some("upstream returned 401"));
     }
 
     #[test]

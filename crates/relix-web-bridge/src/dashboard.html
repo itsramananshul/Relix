@@ -4977,6 +4977,43 @@ function renderProviders(providers) {
    given provider. Empty string when the provider isn't in
    PROVIDER_MODEL_PRESETS (operators still get a plain text
    input — datalist is purely an autocomplete affordance). */
+/* Last-test cache panel. Renders the persisted outcome from
+   /v1/config/providers when present (M58). Empty string when
+   the provider has never been tested so the card stays
+   compact. Surfaces a "stale (key changed since)" warn when
+   the cache predates the most recent key_set_at — operators
+   need to re-test after a key swap. */
+function renderProviderLastTestBlock(p) {
+  if (!p.last_test_at) return '';
+  const ts = Number(p.last_test_at);
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const age = Math.max(0, nowSecs - ts);
+  const okBadge = (p.last_test_ok === true)
+    ? '<span class="badge ok">ok</span>'
+    : (p.last_test_ok === false
+        ? '<span class="badge danger">fail</span>'
+        : '<span class="badge muted">—</span>');
+  const statusPart = (p.last_test_status_code != null)
+    ? ' · HTTP ' + p.last_test_status_code
+    : '';
+  const elapsedPart = (p.last_test_elapsed_ms != null)
+    ? ' · ' + p.last_test_elapsed_ms + 'ms'
+    : '';
+  const stale = (p.key_set_at != null && ts < Number(p.key_set_at));
+  const staleTag = stale
+    ? ' <span class="badge warn" title="key was overwritten after this test; re-test recommended">stale</span>'
+    : '';
+  const detail = p.last_test_detail
+    ? ' · ' + escapeHtml(p.last_test_detail)
+    : '';
+  return '<div class="provider-meta">last test '
+    + okBadge + staleTag
+    + statusPart + elapsedPart
+    + ' · ' + escapeHtml(fmtDuration(age)) + ' ago'
+    + detail
+    + '</div>';
+}
+
 function renderProviderModelPresetDatalist(name) {
   const presets = PROVIDER_MODEL_PRESETS[name];
   if (!presets || !presets.length) return '';
@@ -5004,6 +5041,7 @@ function renderProviderCard(p) {
         ? ' &middot; default <span>' + escapeHtml(p.default_model) + '</span>'
         : '')
       + '</div>'
+      + renderProviderLastTestBlock(p)
     : '';
   const deleteBtn = p.configured
     ? '<button class="btn-danger" data-action="delete" data-name="' + escapeHtml(p.name) + '">Delete</button>'

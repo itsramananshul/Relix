@@ -395,6 +395,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_provider_last_test_badge_present() {
+        // M58 (Track C): provider card renders a persistent
+        // last-test badge with ok/fail, HTTP status, elapsed,
+        // and an ago timestamp. The cache survives bridge
+        // restarts because it lives in bridge-secrets.toml.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("renderProviderLastTestBlock"),
+            "last-test block renderer missing"
+        );
+        assert!(
+            body.contains("p.last_test_at"),
+            "last-test renderer should consume last_test_at from /v1/config/providers"
+        );
+        // Stale-badge surfaces when last_test_at < key_set_at;
+        // the literal substring proves the logic is wired.
+        assert!(
+            body.contains("ts < Number(p.key_set_at)"),
+            "stale-test detection (last_test_at < key_set_at) missing"
+        );
+    }
+
+    #[tokio::test]
     async fn page_provider_model_presets_present() {
         // M54 (Track C): provider card default_model input is
         // wired to a datalist of curated presets per provider

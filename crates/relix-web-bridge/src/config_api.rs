@@ -251,6 +251,26 @@ pub async fn test_provider(
         elapsed_ms = result.elapsed_ms,
         "config: providers.{name} test"
     );
+    // M58: persist the test outcome so operators see a
+    // last-tested badge on the provider card without re-running.
+    // Best-effort — a persist failure logs at warn but the
+    // live response still ships, so the operator isn't blocked.
+    let cache_persist = state.secrets.mutate(|s| {
+        s.record_provider_test(
+            &name,
+            result.ok,
+            result.status_code,
+            result.elapsed_ms,
+            result.detail.clone(),
+        )
+    });
+    if let Err(e) = cache_persist {
+        tracing::warn!(
+            provider = %name,
+            error = %e,
+            "config: providers.{name} test cache persist failed"
+        );
+    }
     state.intervention_audit.record(
         "anon",
         "provider_test",
