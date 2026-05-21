@@ -467,10 +467,14 @@ all pushed to origin/main):
 | PH-ROUTER1 | 40eaa28 | runtime +6 | provider router scaffold (NoopRouter trait) |
 | PH-FS-PARITY1 | 7d39590 | runtime +6 | tool.append_file + tool.patch_preview (Hermes file_operations parity) |
 | docs(capability) | d240309 | n/a | canonical docs/capabilities.md index of every shipped capability |
+| PH-OPS-EVENTS | a738a12 | cli +1 | relix-cli ops events — H2 firehose snapshot |
+| PH-WEB-ROBOTS | 45ea5b3 | runtime +14 | tool.web.robots_check (RFC 9309 robots.txt sniff) |
+| PH-FS-PARITY2 | d134ce5 | runtime +10 | tool.binary_sniff (Hermes binary_extensions parity) |
+| D-006 closure | 45ea5b3 | n/a | answered:c — recovery_scan terminal_summary already shipped |
 
-Aggregate: ~9600+ LOC; runtime tests 291 → 419, bridge tests
-192 → 217, relix-core 33 → 61, relix-cli 54 → 56. Every
-milestone clean fmt + clippy + tests. Total workspace = 764
+Aggregate: ~9900+ LOC; runtime tests 419 → 491, bridge tests
+192 → 218, relix-core 33 → 61, relix-cli 54 → 60. Every
+milestone clean fmt + clippy + tests. Total workspace = ~790
 passing tests.
 
 The PH-WAVE2 cluster (G..L) ships a complete bridge-side
