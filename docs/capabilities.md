@@ -84,6 +84,7 @@ before the backend (visibility + stable contract + honesty).
 | Method | Status | Notes |
 |---|---|---|
 | `tool.terminal.run` (CW1) | live | Sandboxed shell; operator allowlist required |
+| `tool.terminal.sessions` (PH-TERM-SESSIONS) | live | Live in-flight run registry snapshot |
 
 ### Browser (CW4 honest scaffold)
 

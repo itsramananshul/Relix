@@ -52,12 +52,13 @@
 //! post-hoc debugging; streaming + interruption land at Gate 2
 //! alongside the resumable VM.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use relix_core::capability::{CapabilityDescriptor, CostClass, Idempotency};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
@@ -97,12 +98,40 @@ fn default_timeout_secs() -> u64 {
 /// truncated + flagged in the response.
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MiB
 
+/// PH-TERM-SESSIONS: one live `tool.terminal.run` invocation
+/// in flight. Inserted on spawn, removed on completion (success,
+/// timeout, or spawn failure). Pure observability — does NOT
+/// give an outside caller a kill handle yet; that lands in a
+/// follow-up milestone alongside `tool.terminal.cancel`.
+#[derive(Clone, Debug)]
+pub struct TerminalSessionRecord {
+    pub session_id: String,
+    /// OS process id captured immediately after spawn. `None`
+    /// when the platform doesn't expose the pid (very rare).
+    pub pid: Option<u32>,
+    pub command: String,
+    /// Args as supplied by the caller. Copied so the registry
+    /// survives request scope.
+    pub args: Vec<String>,
+    /// Unix seconds at spawn time.
+    pub started_at: i64,
+    /// Hex `subject_id` of the caller.
+    pub caller_subject_id: String,
+    /// Effective per-call timeout (after clamping against
+    /// `max_timeout_secs`).
+    pub timeout_secs: u64,
+}
+
 /// Validated terminal config + the allowlist as a hash set
 /// for O(1) lookup.
 #[derive(Debug)]
 pub struct TerminalBackend {
     cfg: TerminalConfig,
     allowed: BTreeSet<String>,
+    /// PH-TERM-SESSIONS: live in-flight runs. Keyed by the
+    /// session id allocated at spawn. Mutex-bounded; held only
+    /// for short insert/remove/snapshot transactions.
+    sessions: Mutex<HashMap<String, TerminalSessionRecord>>,
 }
 
 impl TerminalBackend {
@@ -133,7 +162,23 @@ impl TerminalBackend {
             );
         }
         let allowed: BTreeSet<String> = cfg.allowed_commands.iter().cloned().collect();
-        Ok(Self { cfg, allowed })
+        Ok(Self {
+            cfg,
+            allowed,
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// PH-TERM-SESSIONS: snapshot the live session table. Held
+    /// in a short mutex critical section; returned records are
+    /// cloned so the caller is free to format them outside the
+    /// lock.
+    pub fn snapshot_sessions(&self) -> Vec<TerminalSessionRecord> {
+        let g = self
+            .sessions
+            .lock()
+            .expect("tool.terminal sessions poisoned");
+        g.values().cloned().collect()
     }
 }
 
@@ -176,17 +221,53 @@ struct RunResponse {
     timeout_secs: u64,
 }
 
-/// Register the `tool.terminal.run` capability on the
-/// dispatch bridge. Called from `tool::register` when the
-/// `[tool.terminal]` config section is present.
+/// Register the `tool.terminal.*` capabilities on the dispatch
+/// bridge. Called from `tool::register` when the `[tool.terminal]`
+/// config section is present.
 pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
-    bridge.register(
-        "tool.terminal.run",
-        Arc::new(FnHandler(move |ctx: InvocationCtx| {
-            let b = backend.clone();
-            async move { handle_run(b, ctx).await }
-        })),
+    {
+        let b = backend.clone();
+        bridge.register(
+            "tool.terminal.run",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_run(b, ctx).await }
+            })),
+        );
+    }
+    {
+        let b = backend;
+        bridge.register(
+            "tool.terminal.sessions",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_sessions(b, &ctx) }
+            })),
+        );
+    }
+}
+
+/// PH-TERM-SESSIONS: `tool.terminal.sessions` capability —
+/// snapshot of currently-running terminal invocations. Pure
+/// in-memory observability surface. Useful for operators who
+/// need to see whether a long-running spawn is still pending
+/// before tearing the tool node down.
+pub fn descriptor_sessions() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.sessions");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["shell:audit".into()];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "List currently-running tool.terminal.run sessions. Tab-delim rows: \
+         session_id\\tpid\\tcommand\\tstarted_at\\ttimeout_secs\\tcaller_subject_id. \
+         Final row is `count=<N>`."
+            .into(),
     );
+    d.categories = vec!["read".into(), "terminal".into(), "audit".into()];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
 }
 
 async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
@@ -283,9 +364,41 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
             });
         }
     };
+    // PH-TERM-SESSIONS: register the live session BEFORE awaiting
+    // wait_with_output (which consumes the Child). The session
+    // record is removed unconditionally on completion.
+    let session_id = new_session_id();
+    let pid = child.id();
+    {
+        let mut g = backend
+            .sessions
+            .lock()
+            .expect("tool.terminal sessions poisoned");
+        g.insert(
+            session_id.clone(),
+            TerminalSessionRecord {
+                session_id: session_id.clone(),
+                pid,
+                command: req.command.clone(),
+                args: req.args.clone(),
+                started_at: unix_secs(),
+                caller_subject_id: ctx.caller.subject_id.to_string(),
+                timeout_secs,
+            },
+        );
+    }
     let wait_fut = child.wait_with_output();
     let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await;
     let duration_ms = started.elapsed().as_millis() as u64;
+    // Drop the session record now that the child has exited (or
+    // timed out and been killed via kill_on_drop).
+    {
+        let mut g = backend
+            .sessions
+            .lock()
+            .expect("tool.terminal sessions poisoned");
+        g.remove(&session_id);
+    }
 
     match outcome {
         Ok(Ok(out)) => {
@@ -347,6 +460,52 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
             HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
         }
     }
+}
+
+/// PH-TERM-SESSIONS: handle `tool.terminal.sessions`. Returns
+/// the live registry snapshot as tab-delim rows. Args are
+/// ignored (operators may pass anything; the registration
+/// validates nothing). Final row is `count=<N>`.
+fn handle_sessions(backend: Arc<TerminalBackend>, _ctx: &InvocationCtx) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    let mut sessions = backend.snapshot_sessions();
+    // Stable order — newest first so paginated UIs render the
+    // most-recent runs at the top.
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+    let count = sessions.len();
+    let mut buf = String::new();
+    for s in sessions {
+        let safe_cmd = s.command.replace(['\t', '\n'], " ");
+        let _ = writeln!(
+            buf,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            s.session_id,
+            s.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+            safe_cmd,
+            s.started_at,
+            s.timeout_secs,
+            s.caller_subject_id,
+        );
+    }
+    let _ = writeln!(buf, "count={count}");
+    HandlerOutcome::Ok(buf.into_bytes())
+}
+
+/// PH-TERM-SESSIONS: 16 hex chars of randomness — matches the
+/// existing CW4 browser session id shape so the operator UX
+/// is consistent across session-bearing capabilities.
+fn new_session_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Truncate a byte buffer to `MAX_OUTPUT_BYTES`, returning
@@ -427,5 +586,136 @@ mod tests {
         let (s, truncated) = truncate_output(small);
         assert_eq!(s, "hello");
         assert!(!truncated);
+    }
+
+    // ── PH-TERM-SESSIONS: live run registry + tool.terminal.sessions ──
+
+    #[test]
+    fn sessions_descriptor_shape() {
+        let d = descriptor_sessions();
+        assert_eq!(d.method_name, "tool.terminal.sessions");
+        assert_eq!(d.major_version, 1);
+        assert!(matches!(d.idempotency, Idempotency::Idempotent));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "shell:audit"));
+        assert!(d.requires_groups.iter().any(|g| g == "operators"));
+    }
+
+    #[test]
+    fn fresh_backend_has_no_sessions() {
+        let b = TerminalBackend::new(cfg(&["echo"])).unwrap();
+        assert_eq!(b.snapshot_sessions().len(), 0);
+    }
+
+    #[test]
+    fn new_session_id_is_16_hex_chars() {
+        let id = new_session_id();
+        assert_eq!(id.len(), 16);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        // Different draw, different id (collision probability
+        // is 2^-64, so a different value is overwhelmingly likely).
+        assert_ne!(new_session_id(), id);
+    }
+
+    #[test]
+    fn handle_sessions_returns_count_zero_when_empty() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = test_ctx();
+        let r = handle_sessions(b, &ctx);
+        let body = match r {
+            HandlerOutcome::Ok(bytes) => String::from_utf8(bytes).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert_eq!(body.trim(), "count=0");
+    }
+
+    #[test]
+    fn snapshot_reflects_manual_insert_and_remove() {
+        let b = TerminalBackend::new(cfg(&["echo"])).unwrap();
+        // Manually insert to exercise the snapshot path
+        // without spawning a real process (the spawn path is
+        // covered by handle_run's existing behavior + the
+        // controller integration).
+        let rec = TerminalSessionRecord {
+            session_id: "abc123".into(),
+            pid: Some(42),
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            started_at: 1_700_000_000,
+            caller_subject_id: "deadbeef".into(),
+            timeout_secs: 30,
+        };
+        b.sessions.lock().unwrap().insert("abc123".into(), rec);
+        let snap = b.snapshot_sessions();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].session_id, "abc123");
+        assert_eq!(snap[0].pid, Some(42));
+
+        b.sessions.lock().unwrap().remove("abc123");
+        assert_eq!(b.snapshot_sessions().len(), 0);
+    }
+
+    #[test]
+    fn handle_sessions_formats_rows_newest_first_with_count() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        // Insert two sessions with different started_at so the
+        // ordering assertion is meaningful.
+        {
+            let mut g = b.sessions.lock().unwrap();
+            g.insert(
+                "old".into(),
+                TerminalSessionRecord {
+                    session_id: "old".into(),
+                    pid: Some(10),
+                    command: "echo".into(),
+                    args: vec![],
+                    started_at: 100,
+                    caller_subject_id: "aa".into(),
+                    timeout_secs: 30,
+                },
+            );
+            g.insert(
+                "new".into(),
+                TerminalSessionRecord {
+                    session_id: "new".into(),
+                    pid: Some(11),
+                    command: "ls".into(),
+                    args: vec![],
+                    started_at: 200,
+                    caller_subject_id: "bb".into(),
+                    timeout_secs: 30,
+                },
+            );
+        }
+        let ctx = test_ctx();
+        let r = handle_sessions(b, &ctx);
+        let body = match r {
+            HandlerOutcome::Ok(bytes) => String::from_utf8(bytes).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("new\t"), "first row: {}", lines[0]);
+        assert!(lines[1].starts_with("old\t"), "second row: {}", lines[1]);
+        assert_eq!(lines[2], "count=2");
+    }
+
+    fn test_ctx() -> InvocationCtx {
+        use relix_core::identity::VerifiedIdentity;
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "".into(),
+                clearance: "".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args: Vec::new(),
+        }
     }
 }

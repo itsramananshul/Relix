@@ -1042,6 +1042,10 @@ fn register_node_type_handlers(
             && crate::nodes::tool::terminal::TerminalBackend::new(term_cfg.clone()).is_ok()
         {
             manifest.add_capability(crate::nodes::tool::terminal_descriptor());
+            // PH-TERM-SESSIONS: tool.terminal.sessions — live
+            // run registry snapshot. Always co-advertised when
+            // the terminal config validates.
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_sessions());
         }
         // CW4: tool.browser.* — only advertised when
         // [tool.browser] is configured. Honest: the descriptors
