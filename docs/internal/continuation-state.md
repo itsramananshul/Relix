@@ -473,6 +473,7 @@ all pushed to origin/main):
 | PH-ROUTER2 | 41ee3bb | runtime +11 | HealthAwareRouter — health-aware provider picker |
 | PH-ROUTER-PREVIEW | 16d44c0 | bridge +2 | POST /v1/providers/route_test endpoint |
 | PH-ROUTER-PREVIEW-CLI | b228cf2 | cli +1 | relix-cli ops route-test subcommand |
+| PH-ROUTER-NODE | 689f819 | core +5, runtime +16 (10 unit, 6 acceptance), cli +0 | Router Node — new controller role (role="router"); 4 router.* caps; heartbeat + reaper loops; CLI router status/peers/sessions; configs/router-node.toml; configs/policies/router.toml |
 | D-006 closure | 45ea5b3 | n/a | answered:c — recovery_scan terminal_summary already shipped |
 
 Aggregate: ~10300+ LOC; runtime tests 419 → 497, bridge tests
