@@ -1046,6 +1046,9 @@ fn register_node_type_handlers(
             // run registry snapshot. Always co-advertised when
             // the terminal config validates.
             manifest.add_capability(crate::nodes::tool::terminal::descriptor_sessions());
+            // PH-TERM-AUDIT: tool.terminal.audit_recent — bounded
+            // ring of completed runs (success + timed-out).
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_audit_recent());
         }
         // CW4: tool.browser.* — only advertised when
         // [tool.browser] is configured. Honest: the descriptors

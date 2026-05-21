@@ -52,7 +52,7 @@
 //! post-hoc debugging; streaming + interruption land at Gate 2
 //! alongside the resumable VM.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -122,6 +122,68 @@ pub struct TerminalSessionRecord {
     pub timeout_secs: u64,
 }
 
+/// PH-TERM-AUDIT: one completed `tool.terminal.run` invocation
+/// observation. Pushed onto the bounded audit ring after every
+/// terminated run regardless of outcome (normal exit, timeout,
+/// or wait-error). Pure in-memory observability — does NOT
+/// replace the dispatch-level audit log, does NOT duplicate
+/// chronicle.
+#[derive(Clone, Debug)]
+pub struct TerminalAuditEntry {
+    /// Wall-clock unix seconds at the moment of completion.
+    pub ts_secs: i64,
+    pub command: String,
+    pub args: Vec<String>,
+    /// Exit code as reported by the OS. `None` when the child
+    /// was killed (timeout) or wait failed.
+    pub exit_code: Option<i32>,
+    /// Wall-clock elapsed from spawn to termination, in
+    /// milliseconds.
+    pub duration_ms: u64,
+    pub timed_out: bool,
+    /// Hex `subject_id` of the caller.
+    pub caller_subject_id: String,
+}
+
+/// PH-TERM-AUDIT: bounded ring of [`TerminalAuditEntry`].
+#[derive(Debug)]
+pub struct TerminalAuditRing {
+    entries: Mutex<VecDeque<TerminalAuditEntry>>,
+    capacity: usize,
+}
+
+impl TerminalAuditRing {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub fn push(&self, e: TerminalAuditEntry) {
+        let mut g = self
+            .entries
+            .lock()
+            .expect("tool.terminal audit ring poisoned");
+        if g.len() == self.capacity {
+            g.pop_front();
+        }
+        g.push_back(e);
+    }
+
+    pub fn snapshot_newest_first(&self, max: usize) -> Vec<TerminalAuditEntry> {
+        let g = self
+            .entries
+            .lock()
+            .expect("tool.terminal audit ring poisoned");
+        g.iter().rev().take(max).cloned().collect()
+    }
+}
+
+/// Default ring capacity. Bounded so a busy operator can't
+/// hold an unbounded history in process memory.
+const TERMINAL_AUDIT_RING_DEFAULT: usize = 256;
+
 /// Validated terminal config + the allowlist as a hash set
 /// for O(1) lookup.
 #[derive(Debug)]
@@ -132,6 +194,8 @@ pub struct TerminalBackend {
     /// session id allocated at spawn. Mutex-bounded; held only
     /// for short insert/remove/snapshot transactions.
     sessions: Mutex<HashMap<String, TerminalSessionRecord>>,
+    /// PH-TERM-AUDIT: bounded ring of completed runs.
+    audit: TerminalAuditRing,
 }
 
 impl TerminalBackend {
@@ -166,6 +230,7 @@ impl TerminalBackend {
             cfg,
             allowed,
             sessions: Mutex::new(HashMap::new()),
+            audit: TerminalAuditRing::new(TERMINAL_AUDIT_RING_DEFAULT),
         })
     }
 
@@ -179,6 +244,11 @@ impl TerminalBackend {
             .lock()
             .expect("tool.terminal sessions poisoned");
         g.values().cloned().collect()
+    }
+
+    /// PH-TERM-AUDIT: snapshot the most recent N completed runs.
+    pub fn audit_snapshot(&self, max: usize) -> Vec<TerminalAuditEntry> {
+        self.audit.snapshot_newest_first(max)
     }
 }
 
@@ -236,7 +306,7 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
         );
     }
     {
-        let b = backend;
+        let b = backend.clone();
         bridge.register(
             "tool.terminal.sessions",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -245,6 +315,39 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
             })),
         );
     }
+    {
+        let b = backend;
+        bridge.register(
+            "tool.terminal.audit_recent",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_audit_recent(b, &ctx) }
+            })),
+        );
+    }
+}
+
+/// PH-TERM-AUDIT: `tool.terminal.audit_recent` capability —
+/// bounded ring snapshot of completed runs. Pure in-memory
+/// observability surface; defers to the dispatch-level audit
+/// log for the cross-capability record.
+pub fn descriptor_audit_recent() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.audit_recent");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["shell:audit".into()];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Return the most recent completed tool.terminal.run invocations. \
+         Arg is optional `<max>` (default 256). Tab-delim rows: \
+         ts_secs\\tcommand\\texit_code\\tduration_ms\\ttimed_out\\tcaller_subject_id. \
+         Newest first."
+            .into(),
+    );
+    d.categories = vec!["read".into(), "terminal".into(), "audit".into()];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
 }
 
 /// PH-TERM-SESSIONS: `tool.terminal.sessions` capability —
@@ -426,6 +529,18 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
                 truncated_stderr = resp.truncated_stderr,
                 "tool.terminal.run completed"
             );
+            // PH-TERM-AUDIT: record the completed run on the
+            // ring. Pure observability; happens regardless of
+            // exit code (an exit-1 is still a completed run).
+            backend.audit.push(TerminalAuditEntry {
+                ts_secs: unix_secs(),
+                command: resp.command.clone(),
+                args: req.args.clone(),
+                exit_code: resp.exit_code,
+                duration_ms: resp.duration_ms,
+                timed_out: false,
+                caller_subject_id: ctx.caller.subject_id.to_string(),
+            });
             HandlerOutcome::Ok(body)
         }
         Ok(Err(e)) => HandlerOutcome::Err(ErrorEnvelope {
@@ -457,6 +572,16 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
                 command: req.command,
                 timeout_secs,
             };
+            // PH-TERM-AUDIT: record the timed-out run too.
+            backend.audit.push(TerminalAuditEntry {
+                ts_secs: unix_secs(),
+                command: resp.command.clone(),
+                args: req.args.clone(),
+                exit_code: None,
+                duration_ms: resp.duration_ms,
+                timed_out: true,
+                caller_subject_id: ctx.caller.subject_id.to_string(),
+            });
             HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
         }
     }
@@ -485,6 +610,64 @@ fn handle_sessions(backend: Arc<TerminalBackend>, _ctx: &InvocationCtx) -> Handl
             s.started_at,
             s.timeout_secs,
             s.caller_subject_id,
+        );
+    }
+    let _ = writeln!(buf, "count={count}");
+    HandlerOutcome::Ok(buf.into_bytes())
+}
+
+/// PH-TERM-AUDIT: handle `tool.terminal.audit_recent`. Arg is
+/// an optional decimal `<max>` (default 256, capped at ring
+/// capacity). Returns one row per entry, newest first,
+/// tab-delimited:
+/// `ts_secs\tcommand\texit_code\tduration_ms\ttimed_out\tcaller_subject_id`.
+/// Final row is `count=<N>`.
+fn handle_audit_recent(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.audit_recent arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let max = if s.is_empty() {
+        TERMINAL_AUDIT_RING_DEFAULT
+    } else {
+        match s.parse::<usize>() {
+            Ok(n) if n > 0 => n.min(TERMINAL_AUDIT_RING_DEFAULT),
+            _ => {
+                return HandlerOutcome::Err(ErrorEnvelope {
+                    kind: error_kinds::INVALID_ARGS,
+                    cause: format!(
+                        "tool.terminal.audit_recent: arg must be a positive integer (got '{s}')"
+                    ),
+                    retry_hint: 2,
+                    retry_after: None,
+                });
+            }
+        }
+    };
+    let entries = backend.audit_snapshot(max);
+    let count = entries.len();
+    let mut buf = String::new();
+    for e in entries {
+        let safe_cmd = e.command.replace(['\t', '\n'], " ");
+        let _ = writeln!(
+            buf,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            e.ts_secs,
+            safe_cmd,
+            e.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into()),
+            e.duration_ms,
+            e.timed_out,
+            e.caller_subject_id,
         );
     }
     let _ = writeln!(buf, "count={count}");
@@ -716,6 +899,150 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: Vec::new(),
+        }
+    }
+
+    // ── PH-TERM-AUDIT: completed-run audit ring ────────────────────
+
+    fn ctx_with_args(args: &[u8]) -> InvocationCtx {
+        let mut c = test_ctx();
+        c.args = args.to_vec();
+        c
+    }
+
+    #[test]
+    fn audit_recent_descriptor_shape() {
+        let d = descriptor_audit_recent();
+        assert_eq!(d.method_name, "tool.terminal.audit_recent");
+        assert!(matches!(d.idempotency, Idempotency::Idempotent));
+        assert!(matches!(d.cost_class, CostClass::Cheap));
+        assert!(d.sensitivity_tags.iter().any(|t| t == "shell:audit"));
+        assert!(d.requires_groups.iter().any(|g| g == "operators"));
+    }
+
+    #[test]
+    fn fresh_backend_audit_ring_is_empty() {
+        let b = TerminalBackend::new(cfg(&["echo"])).unwrap();
+        assert_eq!(b.audit_snapshot(10).len(), 0);
+    }
+
+    #[test]
+    fn audit_ring_bounded_by_capacity() {
+        let b = TerminalBackend::new(cfg(&["echo"])).unwrap();
+        for i in 0..(TERMINAL_AUDIT_RING_DEFAULT + 10) {
+            b.audit.push(TerminalAuditEntry {
+                ts_secs: i as i64,
+                command: format!("e{i}"),
+                args: vec![],
+                exit_code: Some(0),
+                duration_ms: 1,
+                timed_out: false,
+                caller_subject_id: "x".into(),
+            });
+        }
+        assert_eq!(b.audit_snapshot(10_000).len(), TERMINAL_AUDIT_RING_DEFAULT);
+    }
+
+    #[test]
+    fn audit_ring_snapshot_is_newest_first() {
+        let b = TerminalBackend::new(cfg(&["echo"])).unwrap();
+        for i in 0..3 {
+            b.audit.push(TerminalAuditEntry {
+                ts_secs: i as i64,
+                command: format!("e{i}"),
+                args: vec![],
+                exit_code: Some(0),
+                duration_ms: 1,
+                timed_out: false,
+                caller_subject_id: "x".into(),
+            });
+        }
+        let snap = b.audit_snapshot(10);
+        assert_eq!(snap[0].command, "e2");
+        assert_eq!(snap[1].command, "e1");
+        assert_eq!(snap[2].command, "e0");
+    }
+
+    #[test]
+    fn handle_audit_recent_empty_returns_count_zero() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = test_ctx();
+        let r = handle_audit_recent(b, &ctx);
+        let body = match r {
+            HandlerOutcome::Ok(bytes) => String::from_utf8(bytes).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert_eq!(body.trim(), "count=0");
+    }
+
+    #[test]
+    fn handle_audit_recent_formats_rows_with_count() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        b.audit.push(TerminalAuditEntry {
+            ts_secs: 100,
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            exit_code: Some(0),
+            duration_ms: 5,
+            timed_out: false,
+            caller_subject_id: "aa".into(),
+        });
+        b.audit.push(TerminalAuditEntry {
+            ts_secs: 200,
+            command: "ls".into(),
+            args: vec![],
+            exit_code: None,
+            duration_ms: 30000,
+            timed_out: true,
+            caller_subject_id: "bb".into(),
+        });
+        let ctx = test_ctx();
+        let r = handle_audit_recent(b, &ctx);
+        let body = match r {
+            HandlerOutcome::Ok(bytes) => String::from_utf8(bytes).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Newest first — ts 200 row before ts 100 row.
+        assert!(lines[0].starts_with("200\tls\t?\t30000\ttrue\tbb"));
+        assert!(lines[1].starts_with("100\techo\t0\t5\tfalse\taa"));
+        assert_eq!(lines[2], "count=2");
+    }
+
+    #[test]
+    fn handle_audit_recent_respects_max_arg() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        for i in 0..5 {
+            b.audit.push(TerminalAuditEntry {
+                ts_secs: i,
+                command: format!("e{i}"),
+                args: vec![],
+                exit_code: Some(0),
+                duration_ms: 1,
+                timed_out: false,
+                caller_subject_id: "x".into(),
+            });
+        }
+        let ctx = ctx_with_args(b"2");
+        let r = handle_audit_recent(b, &ctx);
+        let body = match r {
+            HandlerOutcome::Ok(bytes) => String::from_utf8(bytes).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "count=2");
+    }
+
+    #[test]
+    fn handle_audit_recent_rejects_non_numeric_arg() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"abc");
+        let r = handle_audit_recent(b, &ctx);
+        match r {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("positive integer")),
+            _ => panic!("expected Err"),
         }
     }
 }
