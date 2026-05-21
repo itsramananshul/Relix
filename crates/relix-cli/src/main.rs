@@ -8,6 +8,7 @@ mod ops;
 mod ping;
 mod router;
 mod task;
+mod terminal;
 mod topology;
 
 use clap::{Parser, Subcommand};
@@ -99,6 +100,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: mcp::Cmd,
     },
+    /// PH-TERM-CLI: inspect + control tool.terminal.* on a
+    /// tool node. `terminal sessions` lists live runs;
+    /// `terminal audit` snapshots the completion ring;
+    /// `terminal cancel --session-id X` triggers cooperative
+    /// cancel. Libp2p dial-and-call.
+    Terminal {
+        #[command(subcommand)]
+        cmd: terminal::Cmd,
+    },
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -142,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
+        Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,

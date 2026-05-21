@@ -79,6 +79,9 @@ before the backend (visibility + stable contract + honesty).
 |---|---|---|
 | `relix-cli mcp servers --peer ...` (PH-MCP-CLI) | live | Lists MCP servers registered on a tool node (libp2p dial-and-call) |
 | `relix-cli mcp tools --peer ... --server-id ...` (PH-MCP-CLI) | live | Lists declared tools for a specific MCP server |
+| `relix-cli terminal sessions --peer ...` (PH-TERM-CLI) | live | Lists live in-flight terminal sessions |
+| `relix-cli terminal audit --peer ... [--max N]` (PH-TERM-CLI) | live | Snapshots the completion ring; renders status (ok/timed_out/cancelled) |
+| `relix-cli terminal cancel --peer ... --session-id ...` (PH-TERM-CLI) | live | Triggers cooperative cancel for a live session |
 
 ### Web
 
