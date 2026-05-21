@@ -318,10 +318,11 @@ After writing this doc, the session shipped six commits on `main`:
 | 1feb8ce | PH-TERM-SESSIONS | runtime +6 | tool.terminal.sessions — live in-flight run registry |
 | acac673 | PH-MCP-PROTO | runtime +12 | MCP JSON-RPC wire layer (no I/O) + D-009 logged |
 | 512e727 | PH-TERM-AUDIT | runtime +8 | tool.terminal.audit_recent + per-backend completion ring |
+| 9d4381d | PH-TERM-CANCEL | runtime +7 | tool.terminal.cancel + manual stdout/stderr drain refactor |
 
-Aggregate: ~1100 LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
+Aggregate: ~1500+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
 controller_runtime.rs, docs/capabilities.md. Runtime tests
-507 → 551 (+44). Workspace 887 → 931 passing. fmt + clippy clean
+507 → 558 (+51). Workspace 887 → 938 passing. fmt + clippy clean
 on every commit.
 
 **Decisions logged but unanswered:** D-008 (browser backend),
@@ -330,13 +331,25 @@ operator picks; the surfaces themselves keep the honesty contract
 (NoneBackend / RuntimeNotConnected).
 
 **Wave 1 tracks still pending after this session:**
-- Terminal cancel + streaming + background — requires refactor of
-  `wait_with_output` path; high-regression risk vs the value of
-  the observability rings already shipped.
+- Terminal streaming + background + interactive stdin — each is a
+  different shape from the existing run path and needs a consumer
+  on the other side.
 - Browser real backend — D-008 blocked.
 - MCP stdio runtime wiring — D-009 blocked.
 - Filesystem fuzzy_replace — explicitly out-of-scope per fs.rs
   module docstring (alpha decision).
+
+**Wave 1 tracks now complete:**
+- Terminal cancel — `tool.terminal.cancel` cooperative termination
+  (PH-TERM-CANCEL).
+- Terminal process registry — `tool.terminal.sessions` (PH-TERM-SESSIONS).
+- Terminal completion observability — `tool.terminal.audit_recent`
+  (PH-TERM-AUDIT).
+- Filesystem glob search — `tool.search_files` `glob` mode
+  (PH-FS-PARITY3).
+- Filesystem mutation audit — `tool.fs.audit_recent` (PH-FS-PARITY4).
+- MCP wire layer — JSON-RPC types ready for the next session
+  (PH-MCP-PROTO).
 
 **Cross-cutting parity work that's now well-positioned:**
 - The per-capability observability ring pattern is now established
