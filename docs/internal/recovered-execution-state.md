@@ -319,10 +319,11 @@ After writing this doc, the session shipped six commits on `main`:
 | acac673 | PH-MCP-PROTO | runtime +12 | MCP JSON-RPC wire layer (no I/O) + D-009 logged |
 | 512e727 | PH-TERM-AUDIT | runtime +8 | tool.terminal.audit_recent + per-backend completion ring |
 | 9d4381d | PH-TERM-CANCEL | runtime +7 | tool.terminal.cancel + manual stdout/stderr drain refactor |
+| c8d7fcb | PH-TERM-STREAM1 | runtime +11 | tool.terminal.tail — polling-cursor live stdout/stderr stream |
 
-Aggregate: ~1500+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
+Aggregate: ~1800+ LOC across tool/fs.rs, tool/terminal.rs, tool/mcp.rs,
 controller_runtime.rs, docs/capabilities.md. Runtime tests
-507 → 558 (+51). Workspace 887 → 938 passing. fmt + clippy clean
+507 → 569 (+62). Workspace 887 → 949 passing. fmt + clippy clean
 on every commit.
 
 **Decisions logged but unanswered:** D-008 (browser backend),
@@ -331,9 +332,12 @@ operator picks; the surfaces themselves keep the honesty contract
 (NoneBackend / RuntimeNotConnected).
 
 **Wave 1 tracks still pending after this session:**
-- Terminal streaming + background + interactive stdin — each is a
-  different shape from the existing run path and needs a consumer
-  on the other side.
+- Terminal background / detached / persistent shell / interactive
+  stdin — each is a different shape from the existing run path
+  and needs a consumer on the other side.
+- Terminal streaming-with-consumer-drain (the current tail is
+  read-only; a > 1 MiB producer still stalls when the buffer
+  fills).
 - Browser real backend — D-008 blocked.
 - MCP stdio runtime wiring — D-009 blocked.
 - Filesystem fuzzy_replace — explicitly out-of-scope per fs.rs
@@ -342,6 +346,8 @@ operator picks; the surfaces themselves keep the honesty contract
 **Wave 1 tracks now complete:**
 - Terminal cancel — `tool.terminal.cancel` cooperative termination
   (PH-TERM-CANCEL).
+- Terminal streaming (read-only tail) — `tool.terminal.tail`
+  polling cursor (PH-TERM-STREAM1).
 - Terminal process registry — `tool.terminal.sessions` (PH-TERM-SESSIONS).
 - Terminal completion observability — `tool.terminal.audit_recent`
   (PH-TERM-AUDIT).
