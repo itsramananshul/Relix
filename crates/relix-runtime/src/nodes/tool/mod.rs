@@ -46,6 +46,7 @@
 //!
 //! These ship in later milestones if and when a flow needs them.
 
+pub mod browser;
 pub mod fs;
 pub mod pdf;
 pub mod sanitize;
@@ -114,6 +115,15 @@ pub struct ToolConfig {
     /// the full security model.
     #[serde(default)]
     pub terminal: Option<terminal::TerminalConfig>,
+    /// CW4: optional browser-automation subsystem. When `None`
+    /// the `tool.browser.*` capability surface is NOT registered.
+    /// When present `backend = "none"` (default) advertises the
+    /// surface but every navigate / screenshot returns
+    /// BackendNotConnected — honest scaffold for a future
+    /// Playwright integration. See
+    /// `crates/relix-runtime/src/nodes/tool/browser.rs`.
+    #[serde(default)]
+    pub browser: Option<browser::BrowserConfig>,
 }
 
 impl Default for ToolConfig {
@@ -128,6 +138,7 @@ impl Default for ToolConfig {
             fs: None,
             pdf: None,
             terminal: None,
+            browser: None,
         }
     }
 }
@@ -413,6 +424,13 @@ impl ToolBackend {
     /// must opt in deliberately AND supply an allowlist.
     pub fn terminal_config(&self) -> Option<terminal::TerminalConfig> {
         self.cfg.terminal.clone()
+    }
+
+    /// Accessor for the optional `[tool.browser]` subsystem config
+    /// (CW4). When `None`, [`register`] does not register the
+    /// `tool.browser.*` capability surface.
+    pub fn browser_config(&self) -> Option<browser::BrowserConfig> {
+        self.cfg.browser.clone()
     }
 
     /// Run the configured capability against a single URL.
@@ -733,6 +751,36 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
     } else {
         tracing::info!(
             "tool node: [tool.terminal] not configured; terminal subsystem disabled (tool.terminal.run unavailable)"
+        );
+    }
+
+    // CW4: tool.browser.* — browser-automation surface. Opt-in
+    // via [tool.browser]. Today the only working backend is
+    // "none" (returns BackendNotConnected on every non-noop
+    // call) — see browser.rs honesty contract. The capability
+    // surface is registered so operators see the wired methods
+    // in the manifest + dashboard, and so a future Playwright
+    // backend slots in without touching this register path.
+    if let Some(br_cfg) = backend.browser_config() {
+        match browser::build_backend(&br_cfg) {
+            Ok(bb) => {
+                tracing::info!(
+                    backend = bb.name(),
+                    max_sessions = br_cfg.max_sessions,
+                    "tool node: registering tool.browser.* (CW4 honest scaffold)"
+                );
+                browser::register(bridge, bb);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "tool node: [tool.browser] present but invalid; browser surface NOT registered"
+                );
+            }
+        }
+    } else {
+        tracing::info!(
+            "tool node: [tool.browser] not configured; browser subsystem disabled (tool.browser.* unavailable)"
         );
     }
 }

@@ -654,6 +654,26 @@ fn register_node_type_handlers(
                 &["task", "todo", "write"],
             ),
             (
+                "tool.browser.open_session",
+                "CW4: open a browser session. Returns the \
+                 session id. Today the \"none\" backend allocates \
+                 ids without driving a real browser; navigate / \
+                 screenshot return BackendNotConnected until a \
+                 real backend lands. See docs/browser-tool.md.",
+                &["browser", "session", "write"],
+            ),
+            (
+                "tool.browser.navigate",
+                "CW4: navigate a browser session. \
+                 BackendNotConnected today.",
+                &["browser", "navigation", "write"],
+            ),
+            (
+                "tool.browser.list_sessions",
+                "CW4: list open browser sessions.",
+                &["browser", "read"],
+            ),
+            (
                 "task.events",
                 "Incremental chronicle fetch (task_id|after_id|limit). \
                  Returns one JSON event per line; empty when nothing is \
@@ -739,6 +759,21 @@ fn register_node_type_handlers(
             && crate::nodes::tool::terminal::TerminalBackend::new(term_cfg.clone()).is_ok()
         {
             manifest.add_capability(crate::nodes::tool::terminal_descriptor());
+        }
+        // CW4: tool.browser.* — only advertised when
+        // [tool.browser] is configured. Honest: the descriptors
+        // ship even with backend="none" so operators see the
+        // surface; the runtime returns BackendNotConnected
+        // until a real backend lands.
+        if let Some(br_cfg) = tool_cfg.browser.as_ref()
+            && crate::nodes::tool::browser::build_backend(br_cfg).is_ok()
+        {
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_open_session());
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_close_session());
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_navigate());
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_get_text());
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_screenshot());
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_list_sessions());
         }
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,
