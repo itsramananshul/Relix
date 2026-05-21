@@ -118,13 +118,16 @@ mod tests {
         );
         assert!(body.contains("Operator Console"), "missing brand subtitle");
 
-        // All eight routes register a nav item AND a corresponding page section.
+        // All nine routes register a nav item AND a corresponding
+        // page section (eight Operate + Configure tabs plus the
+        // PH-BRIDGE-FS-AUDIT fsaudit page).
         for route in [
             "overview",
             "tasks",
             "topology",
             "capabilities",
             "mcp",
+            "fsaudit",
             "providers",
             "telegram",
             "config",
@@ -348,6 +351,61 @@ mod tests {
         assert!(
             body.contains("loadMcpAudit"),
             "loadMcpAudit handler missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_fsaudit_landmarks_present() {
+        // PH-BRIDGE-FS-AUDIT: dashboard panel for the per-jail
+        // mutation ring. The page reads /v1/fs/audit (bridge
+        // proxy) and renders the runtime-side ring as a table.
+        // Route name is `fsaudit` (single token) since parseHash
+        // captures `[\w]+`; the nav label is "FS Audit" for
+        // humans.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"data-page="fsaudit""#),
+            "fsaudit page section missing"
+        );
+        assert!(
+            body.contains(r#"data-route="fsaudit""#),
+            "fsaudit nav item missing"
+        );
+        assert!(
+            body.contains("/v1/fs/audit"),
+            "fsaudit page should consume /v1/fs/audit"
+        );
+        // Operator-facing controls.
+        assert!(
+            body.contains(r#"id="fsaudit-peer-input""#),
+            "fsaudit peer alias input missing"
+        );
+        assert!(
+            body.contains(r#"id="fsaudit-op-input""#),
+            "fsaudit op filter dropdown missing"
+        );
+        assert!(
+            body.contains(r#"id="fsaudit-max-input""#),
+            "fsaudit max input missing"
+        );
+        assert!(
+            body.contains(r#"id="fsaudit-refresh-btn""#),
+            "fsaudit refresh button missing"
+        );
+        // PAGES registry entry + handler functions.
+        assert!(body.contains("initFsAudit"), "initFsAudit handler missing");
+        assert!(
+            body.contains("enterFsAudit"),
+            "enterFsAudit handler missing"
+        );
+        assert!(body.contains("loadFsAudit"), "loadFsAudit handler missing");
+        // kbd shortcut shifted 6 → fsaudit (Configure group moved
+        // to 7/8/9). Assert the new mapping is in place.
+        assert!(
+            body.contains("'6': 'fsaudit'"),
+            "kbd shortcut 6 should switch to fsaudit"
         );
     }
 

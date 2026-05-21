@@ -90,6 +90,7 @@ mod config;
 mod config_api;
 mod dashboard;
 mod flow;
+mod fs_audit;
 mod intervention_audit;
 mod lifecycle;
 mod mcp;
@@ -397,6 +398,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // rejects (400) are not recorded; only invocations that
         // reached the mesh (success or responder failure) are.
         .route("/v1/mcp/audit", get(mcp::audit))
+        // PH-BRIDGE-FS-AUDIT: proxy for `tool.fs.audit_recent`
+        // on the tool peer. Returns the runtime-side mutation
+        // ring as JSON. Query: `?peer=&max=&op=`.
+        .route("/v1/fs/audit", get(fs_audit::audit))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).

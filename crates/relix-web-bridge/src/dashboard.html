@@ -1811,6 +1811,7 @@
     <a href="#/topology" class="nav-item" data-route="topology">Topology</a>
     <a href="#/capabilities" class="nav-item" data-route="capabilities">Capabilities</a>
     <a href="#/mcp"          class="nav-item" data-route="mcp">MCP</a>
+    <a href="#/fsaudit"      class="nav-item" data-route="fsaudit">FS Audit</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2255,6 +2256,68 @@
       </p>
     </section>
 
+    <!-- ── #/fsaudit (PH-BRIDGE-FS-AUDIT) ───────────────────────── -->
+    <section class="page" data-page="fsaudit">
+      <h2>Filesystem Audit</h2>
+      <p class="page-subtitle">
+        Per-jail mutation ring on the tool node — every successful
+        <code>write</code> / <code>append</code> / <code>patch</code> /
+        <code>fuzzy_replace</code> pushes one row. Sourced from
+        <code>/v1/fs/audit</code> which proxies
+        <code>tool.fs.audit_recent</code> via the existing mesh client.
+        Bounded (256, newest first); resets on tool-node restart.
+        Independent of the dispatch-level audit log.
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px;">
+        <label for="fsaudit-peer-input" class="meta">peer alias:</label>
+        <input
+          type="text"
+          id="fsaudit-peer-input"
+          value="tool"
+          placeholder="tool"
+          autocomplete="off"
+          spellcheck="false"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 140px;"
+        />
+        <label for="fsaudit-op-input" class="meta">op:</label>
+        <select
+          id="fsaudit-op-input"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px;"
+        >
+          <option value="">(any)</option>
+          <option value="write">write</option>
+          <option value="append">append</option>
+          <option value="patch">patch</option>
+          <option value="fuzzy_replace">fuzzy_replace</option>
+        </select>
+        <label for="fsaudit-max-input" class="meta">max:</label>
+        <input
+          type="number"
+          id="fsaudit-max-input"
+          value="100"
+          min="1"
+          max="500"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 80px;"
+        />
+        <button class="chip" id="fsaudit-refresh-btn">refresh</button>
+        <span class="meta" id="fsaudit-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Recent mutations</h3>
+          <span class="meta" id="fsaudit-summary"></span>
+        </div>
+        <div class="card-body dense" id="fsaudit-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <p class="meta">
+        Caller ids are abbreviated; hover for the full 32-byte
+        fingerprint. The op filter is enforced by the responder —
+        passing an unknown op yields HTTP 400.
+      </p>
+    </section>
+
     <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
@@ -2409,7 +2472,7 @@
         <tr><td><kbd>/</kbd></td><td>focus the search input</td></tr>
         <tr><td><kbd>Esc</kbd></td><td>clear search focus or close this overlay</td></tr>
         <tr><th colspan="2">Routes</th></tr>
-        <tr><td><kbd>1</kbd>…<kbd>6</kbd></td><td>switch to overview/tasks/topology/providers/telegram/config</td></tr>
+        <tr><td><kbd>1</kbd>…<kbd>9</kbd></td><td>switch to overview/tasks/topology/capabilities/mcp/fs&#x2011;audit/providers/telegram/config</td></tr>
         <tr><th colspan="2">Help</th></tr>
         <tr><td><kbd>?</kbd> / <kbd>h</kbd></td><td>toggle this overlay</td></tr>
       </tbody>
@@ -2470,6 +2533,7 @@ const PAGES = {
   topology:     { label: 'Topology',     init: initTopology,     enter: enterTopology },
   capabilities: { label: 'Capabilities', init: initCapabilities, enter: enterCapabilities },
   mcp:          { label: 'MCP',          init: initMcp,          enter: enterMcp },
+  fsaudit:      { label: 'FS Audit',     init: initFsAudit,      enter: enterFsAudit },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -5436,9 +5500,10 @@ const KBD_ROUTE_MAP = {
   '3': 'topology',
   '4': 'capabilities',
   '5': 'mcp',
-  '6': 'providers',
-  '7': 'telegram',
-  '8': 'config',
+  '6': 'fsaudit',
+  '7': 'providers',
+  '8': 'telegram',
+  '9': 'config',
 };
 
 document.addEventListener('keydown', (ev) => {
@@ -6784,6 +6849,128 @@ async function loadMcpAudit() {
   } catch (e) {
     $host.innerHTML = '<div class="error">load failed: '
       + escapeHtml(String(e)) + '</div>';
+    if ($summary) $summary.textContent = '';
+  }
+}
+
+/* PH-BRIDGE-FS-AUDIT: dashboard panel for the per-jail
+   mutation ring on the tool node. Reads /v1/fs/audit which
+   proxies tool.fs.audit_recent over libp2p. The op dropdown
+   passes through verbatim — the responder rejects unknown ops
+   with a 400. */
+function initFsAudit() {
+  const $refresh = document.getElementById('fsaudit-refresh-btn');
+  if ($refresh) {
+    $refresh.addEventListener('click', () => loadFsAudit());
+  }
+  const $peer = document.getElementById('fsaudit-peer-input');
+  if ($peer) {
+    $peer.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadFsAudit();
+      }
+    });
+  }
+  const $op = document.getElementById('fsaudit-op-input');
+  if ($op) $op.addEventListener('change', () => loadFsAudit());
+  const $max = document.getElementById('fsaudit-max-input');
+  if ($max) {
+    $max.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadFsAudit();
+      }
+    });
+  }
+}
+
+function enterFsAudit() {
+  loadFsAudit();
+}
+
+function currentFsAuditPeer() {
+  const $peer = document.getElementById('fsaudit-peer-input');
+  const v = $peer ? ($peer.value || '').trim() : '';
+  return v || 'tool';
+}
+
+async function loadFsAudit() {
+  const $host = document.getElementById('fsaudit-host');
+  const $status = document.getElementById('fsaudit-status');
+  const $summary = document.getElementById('fsaudit-summary');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  if ($status) $status.textContent = 'querying…';
+  const peer = currentFsAuditPeer();
+  const op = (document.getElementById('fsaudit-op-input') || {}).value || '';
+  const max = parseInt(
+    (document.getElementById('fsaudit-max-input') || {}).value || '100',
+    10
+  );
+  let url = '/v1/fs/audit?peer=' + encodeURIComponent(peer)
+    + '&max=' + (isFinite(max) && max > 0 ? max : 100);
+  if (op) url += '&op=' + encodeURIComponent(op);
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const entries = body.entries || [];
+    const count = body.count || 0;
+    if ($status) {
+      $status.textContent = 'peer=' + (body.peer || peer)
+        + ' rows=' + entries.length + (op ? ' op=' + op : '');
+    }
+    if ($summary) {
+      $summary.textContent = count === 0
+        ? 'ring empty'
+        : count + ' row(s)';
+    }
+    if (entries.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no fs mutations recorded yet on peer <code>'
+        + escapeHtml(peer) + '</code>'
+        + (op ? ' for op <code>' + escapeHtml(op) + '</code>' : '')
+        + ' — write / append / patch something and refresh'
+        + '</div>';
+      return;
+    }
+    const rows = entries.map(e => {
+      const when = new Date((e.ts_secs || 0) * 1000);
+      const opCls = e.op === 'write' ? 'warn'
+        : e.op === 'append' ? 'task'
+        : e.op === 'patch' ? 'danger'
+        : 'task';
+      const callerShort = (e.caller_subject_id || '').slice(0, 10);
+      return '<tr>'
+        + '<td class="meta">' + escapeHtml(when.toLocaleTimeString()) + '</td>'
+        + '<td><span class="badge ' + opCls + '">'
+        + escapeHtml(e.op || '') + '</span></td>'
+        + '<td><code>' + escapeHtml(e.rel_path || '') + '</code></td>'
+        + '<td>' + escapeHtml(String(e.bytes || 0)) + ' B</td>'
+        + '<td class="meta" title="' + escapeHtml(e.caller_subject_id || '') + '">'
+        + '<code>' + escapeHtml(callerShort) + '…</code>'
+        + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>time</th>'
+      + '<th>op</th>'
+      + '<th>path</th>'
+      + '<th>bytes</th>'
+      + '<th>caller</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = 'failed';
     if ($summary) $summary.textContent = '';
   }
 }
