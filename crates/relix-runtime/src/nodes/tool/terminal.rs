@@ -75,13 +75,34 @@
 //! cleanup, same `tail` visibility — so consuming a backgrounded
 //! run uses the same surfaces as the synchronous one.
 //!
+//! ## Persistent shell sessions (PH-TERM-SHELL)
+//!
+//! `tool.terminal.shell.open` spawns a shell from a separate
+//! operator-managed allowlist (`allowed_shells`) with stdin
+//! piped, stdout/stderr drained into the same per-session
+//! buffers that `tool.terminal.tail` reads. Operators send
+//! bytes to stdin via `tool.terminal.shell.input` and close the
+//! stdin pipe (signalling EOF) via `tool.terminal.shell.close`.
+//! The shell process is otherwise tracked exactly like a
+//! background run — `tool.terminal.sessions` lists it,
+//! `tool.terminal.cancel` kills it, `tool.terminal.audit_recent`
+//! records the eventual exit.
+//!
+//! Honest limitation: there is NO command-boundary tracking
+//! inside the shell. Output from one `input` call is
+//! interleaved with output from prior calls in the same stdout
+//! buffer; operators who need per-command exit codes inject
+//! their own sentinel (e.g., `echo "__RELIX_DONE_$?__"`).
+//!
 //! ## Still out of scope (alpha)
 //!
 //! - No streaming-with-consumer-drain (tail is read-only; it
 //!   does NOT advance the drainer's write head, so a long-
 //!   running run producing > 1 MiB still stalls).
-//! - No persistent shell sessions.
-//! - No interactive stdin.
+//! - No command-boundary tracking inside a persistent shell
+//!   (the shell session is a single bytes-in / bytes-out
+//!   stream — operators don't get per-command exit codes
+//!   without their own sentinel).
 //!
 //! These are explicit future-work items, not silent omissions.
 //! The chronicle entry the bridge would write against a calling
@@ -108,6 +129,15 @@ pub struct TerminalConfig {
     /// paths, no globs). A spawn request for any other
     /// command returns `INVALID_ARGS`.
     pub allowed_commands: Vec<String>,
+    /// PH-TERM-SHELL: bare program names the operator has
+    /// allowed for persistent shell sessions via
+    /// `tool.terminal.shell.open`. Separate from
+    /// `allowed_commands` so operators can opt into bash /
+    /// powershell without opening every command name to spawn.
+    /// Default `[]` — shell sessions are gated until the
+    /// operator explicitly lists at least one shell binary.
+    #[serde(default)]
+    pub allowed_shells: Vec<String>,
     /// Hard ceiling on per-run wall clock, seconds. Default
     /// `DEFAULT_TIMEOUT_SECS`. Requests may set a smaller
     /// per-call timeout but never larger; the smaller of the
@@ -247,22 +277,36 @@ const TERMINAL_AUDIT_RING_DEFAULT: usize = 256;
 pub struct TerminalBackend {
     cfg: TerminalConfig,
     allowed: BTreeSet<String>,
+    /// PH-TERM-SHELL: shell allowlist (separate from
+    /// `allowed`). Empty when no shells are allowed — the open
+    /// handler refuses fail-closed in that case.
+    allowed_shells: BTreeSet<String>,
     /// PH-TERM-SESSIONS: live in-flight runs. Keyed by the
     /// session id allocated at spawn. Mutex-bounded; held only
     /// for short insert/remove/snapshot transactions.
     sessions: Mutex<HashMap<String, TerminalSessionRecord>>,
     /// PH-TERM-AUDIT: bounded ring of completed runs.
     audit: TerminalAuditRing,
+    /// PH-TERM-SHELL: per-session stdin writers for persistent
+    /// shell sessions. Parallel to `sessions` (same keying);
+    /// insert on `tool.terminal.shell.open`, remove on
+    /// `tool.terminal.shell.close` or when
+    /// [`drive_to_completion`] cleans up the session. Wrapped in
+    /// `tokio::sync::Mutex` so the input handler can hold the
+    /// guard across the `write_all` / `flush` awaits.
+    shell_stdins:
+        Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>>>,
 }
 
 impl TerminalBackend {
     pub fn new(cfg: TerminalConfig) -> Result<Self, String> {
-        if cfg.allowed_commands.is_empty() {
-            return Err(
-                "tool.terminal: allowed_commands must list at least one binary; \
-                 the capability fails closed when no allowlist is provided"
-                    .to_string(),
-            );
+        // PH-TERM-SHELL: either allowlist may be empty, but not
+        // both — at least one mode of execution must be enabled.
+        if cfg.allowed_commands.is_empty() && cfg.allowed_shells.is_empty() {
+            return Err("tool.terminal: at least one of `allowed_commands` or \
+                 `allowed_shells` must list a binary; the capability fails \
+                 closed when no allowlist is provided"
+                .to_string());
         }
         for cmd in &cfg.allowed_commands {
             if cmd.is_empty() {
@@ -282,12 +326,30 @@ impl TerminalBackend {
                     .to_string(),
             );
         }
+        // PH-TERM-SHELL: shell allowlist validation. Empty is
+        // acceptable (shell sessions disabled); a populated list
+        // must follow the same bare-program-name rules as
+        // allowed_commands.
+        for shell in &cfg.allowed_shells {
+            if shell.is_empty() {
+                return Err("tool.terminal: allowed_shells contains empty entry".to_string());
+            }
+            if shell.contains('/') || shell.contains('\\') {
+                return Err(format!(
+                    "tool.terminal: allowed_shells entry `{shell}` contains a path \
+                     separator; only bare program names are accepted"
+                ));
+            }
+        }
         let allowed: BTreeSet<String> = cfg.allowed_commands.iter().cloned().collect();
+        let allowed_shells: BTreeSet<String> = cfg.allowed_shells.iter().cloned().collect();
         Ok(Self {
             cfg,
             allowed,
+            allowed_shells,
             sessions: Mutex::new(HashMap::new()),
             audit: TerminalAuditRing::new(TERMINAL_AUDIT_RING_DEFAULT),
+            shell_stdins: Mutex::new(HashMap::new()),
         })
     }
 
@@ -407,7 +469,7 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
         );
     }
     {
-        let b = backend;
+        let b = backend.clone();
         bridge.register(
             "tool.terminal.spawn",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -416,6 +478,142 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<TerminalBackend>) {
             })),
         );
     }
+    {
+        let b = backend.clone();
+        bridge.register(
+            "tool.terminal.shell.open",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_shell_open(b, ctx).await }
+            })),
+        );
+    }
+    {
+        let b = backend.clone();
+        bridge.register(
+            "tool.terminal.shell.input",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_shell_input(b, ctx).await }
+            })),
+        );
+    }
+    {
+        let b = backend;
+        bridge.register(
+            "tool.terminal.shell.close",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let b = b.clone();
+                async move { handle_shell_close(b, &ctx) }
+            })),
+        );
+    }
+}
+
+/// PH-TERM-SHELL: `tool.terminal.shell.open` capability —
+/// spawns a persistent shell from the operator's
+/// `allowed_shells` allowlist with stdin piped. Returns
+/// IMMEDIATELY with the session_id; the run continues
+/// asynchronously. Operators send bytes via
+/// `tool.terminal.shell.input`, read output via
+/// `tool.terminal.tail`, and signal EOF via
+/// `tool.terminal.shell.close`.
+pub fn descriptor_shell_open() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.shell.open");
+    d.major_version = 1;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec![
+        "shell:execute".into(),
+        "shell:persistent".into(),
+        "host:local".into(),
+        "destructive:potential".into(),
+    ];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Open a persistent shell session. Request JSON: \
+         {command, args, timeout_secs?} where `command` is a bare program \
+         name from the operator's `allowed_shells` allowlist. Returns \
+         IMMEDIATELY with JSON {session_id, pid, command, timeout_secs, \
+         started_at}. Consume via tool.terminal.shell.input + \
+         tool.terminal.tail; close stdin with tool.terminal.shell.close; \
+         kill outright with tool.terminal.cancel."
+            .into(),
+    );
+    d.categories = vec![
+        "mutate".into(),
+        "terminal".into(),
+        "execute".into(),
+        "shell".into(),
+        "persistent".into(),
+    ];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
+}
+
+/// PH-TERM-SHELL: `tool.terminal.shell.input` capability —
+/// writes bytes to a live shell session's stdin. The bytes are
+/// taken verbatim (no shell escaping), so callers are
+/// responsible for trailing newlines.
+pub fn descriptor_shell_input() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.shell.input");
+    d.major_version = 1;
+    // Sending the same input twice does send the input twice
+    // (shells are stateful) — explicitly not idempotent.
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec![
+        "shell:execute".into(),
+        "shell:input".into(),
+        "destructive:potential".into(),
+    ];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Write bytes to a persistent shell session's stdin. Request JSON: \
+         {session_id, bytes?, bytes_base64?}. `bytes` is the UTF-8 happy \
+         path (callers are responsible for trailing newlines); \
+         `bytes_base64` carries arbitrary binary input. Returns JSON \
+         {session_id, written}. INVALID_ARGS when the session is unknown \
+         or has been closed."
+            .into(),
+    );
+    d.categories = vec![
+        "mutate".into(),
+        "terminal".into(),
+        "execute".into(),
+        "shell".into(),
+    ];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
+}
+
+/// PH-TERM-SHELL: `tool.terminal.shell.close` capability —
+/// drops the stdin writer for a session, sending EOF to the
+/// shell process. Most shells exit on EOF; the session
+/// continues to be tracked until the child exits (or until
+/// timeout / cancel). To kill outright use `tool.terminal.cancel`.
+pub fn descriptor_shell_close() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.terminal.shell.close");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["shell:control".into()];
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Close the stdin pipe of a persistent shell session, signalling EOF. \
+         Arg is the session id. Returns `ok session=<id>` on hit. The shell \
+         process is NOT killed (most shells exit naturally on EOF); to \
+         terminate immediately use tool.terminal.cancel."
+            .into(),
+    );
+    d.categories = vec![
+        "mutate".into(),
+        "terminal".into(),
+        "control".into(),
+        "shell".into(),
+    ];
+    d.environment_requirements = vec!["shell:allowlist".into()];
+    d
 }
 
 /// PH-TERM-SPAWN: `tool.terminal.spawn` capability — fire-and-
@@ -571,8 +769,9 @@ pub fn descriptor_sessions() -> CapabilityDescriptor {
 /// [`validate_and_spawn`]; consumed by [`drive_to_completion`].
 /// Carries everything needed to drive the child to termination
 /// AND surface a useful response to the caller, whether the
-/// caller is the synchronous `tool.terminal.run` handler or the
-/// background `tool.terminal.spawn` handler.
+/// caller is the synchronous `tool.terminal.run` handler, the
+/// background `tool.terminal.spawn` handler, or the
+/// `tool.terminal.shell.open` handler.
 struct SpawnedRun {
     child: tokio::process::Child,
     started: Instant,
@@ -589,6 +788,18 @@ struct SpawnedRun {
     pid: Option<u32>,
 }
 
+/// PH-TERM-SHELL: dispatch mode for [`validate_and_spawn`]. `Run`
+/// keeps stdin nulled and validates against `allowed_commands`;
+/// `Shell` pipes stdin and validates against `allowed_shells`.
+/// The shell stdin pipe is taken out of the child and stashed in
+/// `backend.shell_stdins` so `tool.terminal.shell.input` can
+/// write to it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnMode {
+    Run,
+    Shell,
+}
+
 /// PH-TERM-SPAWN: validate a [`RunRequest`] against the
 /// backend's allowlist + posture, configure the tokio
 /// [`Command`](tokio::process::Command), spawn the child, take
@@ -602,6 +813,7 @@ async fn validate_and_spawn(
     ctx: &InvocationCtx,
     req: &RunRequest,
     capability: &'static str,
+    mode: SpawnMode,
 ) -> Result<SpawnedRun, ErrorEnvelope> {
     if req.command.is_empty() {
         return Err(ErrorEnvelope {
@@ -624,14 +836,32 @@ async fn validate_and_spawn(
             retry_after: None,
         });
     }
-    if !backend.allowed.contains(&req.command) {
+    let (allowlist, allowlist_label) = match mode {
+        SpawnMode::Run => (&backend.allowed, "allowed_commands"),
+        SpawnMode::Shell => (&backend.allowed_shells, "allowed_shells"),
+    };
+    if allowlist.is_empty() {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::POLICY_DENIED,
+            cause: format!(
+                "{capability}: operator has not configured any entries in \
+                 `{allowlist_label}`; the capability fails closed"
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    if !allowlist.contains(&req.command) {
+        let entries = match mode {
+            SpawnMode::Run => backend.cfg.allowed_commands.join(", "),
+            SpawnMode::Shell => backend.cfg.allowed_shells.join(", "),
+        };
         return Err(ErrorEnvelope {
             kind: error_kinds::POLICY_DENIED,
             cause: format!(
                 "{capability}: command `{}` is not in the operator's \
-                 allowlist (allowed: {})",
+                 `{allowlist_label}` ({entries})",
                 req.command,
-                backend.cfg.allowed_commands.join(", ")
             ),
             retry_hint: 0,
             retry_after: None,
@@ -662,7 +892,17 @@ async fn validate_and_spawn(
     if let Some(wd) = backend.cfg.working_dir.as_ref() {
         command.current_dir(wd);
     }
-    command.stdin(std::process::Stdio::null());
+    // PH-TERM-SHELL: Run keeps stdin null (the established
+    // safety posture); Shell pipes stdin so the input handler
+    // can write to it.
+    match mode {
+        SpawnMode::Run => {
+            command.stdin(std::process::Stdio::null());
+        }
+        SpawnMode::Shell => {
+            command.stdin(std::process::Stdio::piped());
+        }
+    }
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     command.kill_on_drop(true);
@@ -681,6 +921,19 @@ async fn validate_and_spawn(
         .stderr
         .take()
         .expect("tool.terminal: stderr pipe present (was piped at spawn)");
+    // PH-TERM-SHELL: take the stdin pipe out of the Child in
+    // shell mode so the input handler can write to it later.
+    // Run mode leaves stdin as None (it was Stdio::null at
+    // spawn).
+    let stdin_pipe = match mode {
+        SpawnMode::Shell => Some(
+            child
+                .stdin
+                .take()
+                .expect("tool.terminal: stdin pipe present (was piped at spawn)"),
+        ),
+        SpawnMode::Run => None,
+    };
 
     let session_id = new_session_id();
     let pid = child.id();
@@ -707,6 +960,21 @@ async fn validate_and_spawn(
                 stdout_buf: stdout_buf.clone(),
                 stderr_buf: stderr_buf.clone(),
             },
+        );
+    }
+    // PH-TERM-SHELL: stash the stdin pipe in the parallel
+    // shell_stdins map keyed by the same session_id. The input
+    // handler looks it up here; close drops the entry; the
+    // session-cleanup branch of drive_to_completion also
+    // removes it so a forgotten close doesn't leak the pipe.
+    if let Some(stdin) = stdin_pipe {
+        let mut g = backend
+            .shell_stdins
+            .lock()
+            .expect("tool.terminal shell_stdins poisoned");
+        g.insert(
+            session_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(Some(stdin))),
         );
     }
 
@@ -777,6 +1045,18 @@ async fn drive_to_completion(
             .sessions
             .lock()
             .expect("tool.terminal sessions poisoned");
+        g.remove(&s.session_id);
+    }
+    // PH-TERM-SHELL: also clear the stdin entry. No-op for
+    // non-shell sessions (the map never had an entry for them);
+    // for shell sessions that completed without an explicit
+    // `tool.terminal.shell.close`, this prevents the writer
+    // Arc from leaking past the lifetime of the child.
+    {
+        let mut g = backend
+            .shell_stdins
+            .lock()
+            .expect("tool.terminal shell_stdins poisoned");
         g.remove(&s.session_id);
     }
     let stdout_bytes = std::mem::take(&mut *s.stdout_buf.lock().expect("stdout buf poisoned"));
@@ -865,10 +1145,11 @@ async fn handle_run(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Handle
             });
         }
     };
-    let spawned = match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.run").await {
-        Ok(s) => s,
-        Err(e) => return HandlerOutcome::Err(e),
-    };
+    let spawned =
+        match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.run", SpawnMode::Run).await {
+            Ok(s) => s,
+            Err(e) => return HandlerOutcome::Err(e),
+        };
     match drive_to_completion(backend, spawned).await {
         Ok(resp) => HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default()),
         Err(e) => HandlerOutcome::Err(e),
@@ -900,10 +1181,12 @@ async fn handle_spawn(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Hand
             });
         }
     };
-    let spawned = match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.spawn").await {
-        Ok(s) => s,
-        Err(e) => return HandlerOutcome::Err(e),
-    };
+    let spawned =
+        match validate_and_spawn(&backend, &ctx, &req, "tool.terminal.spawn", SpawnMode::Run).await
+        {
+            Ok(s) => s,
+            Err(e) => return HandlerOutcome::Err(e),
+        };
     let resp = SpawnResponse {
         session_id: spawned.session_id.clone(),
         pid: spawned.pid,
@@ -929,6 +1212,219 @@ async fn handle_spawn(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> Hand
         }
     });
     HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
+}
+
+/// PH-TERM-SHELL: handle `tool.terminal.shell.open`. Validates
+/// against `allowed_shells`, spawns with stdin piped, stashes
+/// the stdin writer in `backend.shell_stdins`, and returns
+/// immediately with the session id. The run continues
+/// asynchronously via `tokio::spawn(drive_to_completion(...))`,
+/// matching the spawn handler's posture.
+async fn handle_shell_open(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
+    let req: RunRequest = match serde_json::from_slice(&ctx.args) {
+        Ok(r) => r,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.shell.open: bad request shape: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let spawned = match validate_and_spawn(
+        &backend,
+        &ctx,
+        &req,
+        "tool.terminal.shell.open",
+        SpawnMode::Shell,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return HandlerOutcome::Err(e),
+    };
+    let resp = SpawnResponse {
+        session_id: spawned.session_id.clone(),
+        pid: spawned.pid,
+        command: spawned.command.clone(),
+        timeout_secs: spawned.timeout_secs,
+        started_at: unix_secs(),
+    };
+    let backend_for_task = backend.clone();
+    let session_id_for_task = spawned.session_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = drive_to_completion(backend_for_task, spawned).await {
+            tracing::warn!(
+                session_id = %session_id_for_task,
+                cause = %e.cause,
+                "tool.terminal.shell.open: background shell completed with wait error"
+            );
+        }
+    });
+    HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
+}
+
+/// PH-TERM-SHELL: handle `tool.terminal.shell.input`. Looks up
+/// the session's stdin writer in `backend.shell_stdins`,
+/// decodes input bytes (UTF-8 `bytes` or base64 `bytes_base64`),
+/// writes + flushes. Returns `{session_id, written}` on
+/// success.
+async fn handle_shell_input(backend: Arc<TerminalBackend>, ctx: InvocationCtx) -> HandlerOutcome {
+    use base64::Engine as _;
+    use tokio::io::AsyncWriteExt as _;
+    #[derive(Debug, Deserialize)]
+    struct ShellInputRequest {
+        session_id: String,
+        #[serde(default)]
+        bytes: String,
+        #[serde(default)]
+        bytes_base64: String,
+    }
+    #[derive(Debug, Serialize)]
+    struct ShellInputResponse {
+        session_id: String,
+        written: usize,
+    }
+
+    let req: ShellInputRequest = match serde_json::from_slice(&ctx.args) {
+        Ok(r) => r,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.shell.input: bad request shape: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if req.session_id.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "tool.terminal.shell.input: session_id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let payload: Vec<u8> = if !req.bytes_base64.is_empty() {
+        match base64::engine::general_purpose::STANDARD.decode(req.bytes_base64.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                return HandlerOutcome::Err(ErrorEnvelope {
+                    kind: error_kinds::INVALID_ARGS,
+                    cause: format!("tool.terminal.shell.input: bad base64: {e}"),
+                    retry_hint: 2,
+                    retry_after: None,
+                });
+            }
+        }
+    } else {
+        req.bytes.into_bytes()
+    };
+    // bytes can legitimately be empty (operator wanted to test
+    // the path or send a no-op write). Accept it.
+    let stdin_arc = {
+        let g = backend
+            .shell_stdins
+            .lock()
+            .expect("tool.terminal shell_stdins poisoned");
+        match g.get(&req.session_id) {
+            Some(arc) => arc.clone(),
+            None => {
+                return HandlerOutcome::Err(ErrorEnvelope {
+                    kind: error_kinds::INVALID_ARGS,
+                    cause: format!(
+                        "tool.terminal.shell.input: session not found or already closed (id='{}')",
+                        req.session_id
+                    ),
+                    retry_hint: 0,
+                    retry_after: None,
+                });
+            }
+        }
+    };
+    let mut guard = stdin_arc.lock().await;
+    let stdin = match guard.as_mut() {
+        Some(s) => s,
+        None => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!(
+                    "tool.terminal.shell.input: session stdin has been closed (id='{}')",
+                    req.session_id
+                ),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    if let Err(e) = stdin.write_all(&payload).await {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("tool.terminal.shell.input: write failed: {e}"),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    if let Err(e) = stdin.flush().await {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("tool.terminal.shell.input: flush failed: {e}"),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let resp = ShellInputResponse {
+        session_id: req.session_id,
+        written: payload.len(),
+    };
+    HandlerOutcome::Ok(serde_json::to_vec(&resp).unwrap_or_default())
+}
+
+/// PH-TERM-SHELL: handle `tool.terminal.shell.close`. Drops the
+/// stdin pipe from `backend.shell_stdins`, which closes the OS
+/// pipe and signals EOF to the shell. The child is NOT killed
+/// — most shells exit naturally on EOF; operators wanting an
+/// immediate kill use `tool.terminal.cancel`.
+fn handle_shell_close(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("tool.terminal.shell.close arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if s.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "tool.terminal.shell.close: session_id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let removed = {
+        let mut g = backend
+            .shell_stdins
+            .lock()
+            .expect("tool.terminal shell_stdins poisoned");
+        g.remove(s).is_some()
+    };
+    if removed {
+        HandlerOutcome::Ok(format!("ok session={s}\n").into_bytes())
+    } else {
+        HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!(
+                "tool.terminal.shell.close: session not found or stdin already closed (id='{s}')"
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        })
+    }
 }
 
 /// PH-TERM-SESSIONS: handle `tool.terminal.sessions`. Returns
@@ -1249,6 +1745,17 @@ mod tests {
     fn cfg(allowed: &[&str]) -> TerminalConfig {
         TerminalConfig {
             allowed_commands: allowed.iter().map(|s| s.to_string()).collect(),
+            allowed_shells: vec![],
+            max_timeout_secs: 30,
+            inherit_env: false,
+            working_dir: None,
+        }
+    }
+
+    fn cfg_with_shells(allowed: &[&str], shells: &[&str]) -> TerminalConfig {
+        TerminalConfig {
+            allowed_commands: allowed.iter().map(|s| s.to_string()).collect(),
+            allowed_shells: shells.iter().map(|s| s.to_string()).collect(),
             max_timeout_secs: 30,
             inherit_env: false,
             working_dir: None,
@@ -1953,7 +2460,7 @@ mod tests {
         let arg = br#"{"command":"rm","args":["-rf","/"]}"#;
         match handle_spawn(b, ctx_with_args(arg)).await {
             HandlerOutcome::Err(e) => {
-                assert!(e.cause.contains("not in the operator's allowlist"));
+                assert!(e.cause.contains("allowed_commands"));
                 assert_eq!(e.kind, error_kinds::POLICY_DENIED);
             }
             _ => panic!("expected Err"),
@@ -2013,5 +2520,220 @@ mod tests {
         // Session should have been removed from the live registry
         // by the completion path.
         assert!(b.snapshot_sessions().is_empty());
+    }
+
+    // ── PH-TERM-SHELL: tool.terminal.shell.{open,input,close} ─────
+
+    #[test]
+    fn shell_descriptors_shape() {
+        let open = descriptor_shell_open();
+        assert_eq!(open.method_name, "tool.terminal.shell.open");
+        assert!(
+            open.sensitivity_tags
+                .iter()
+                .any(|t| t == "shell:persistent")
+        );
+        assert!(open.categories.iter().any(|c| c == "persistent"));
+
+        let input = descriptor_shell_input();
+        assert_eq!(input.method_name, "tool.terminal.shell.input");
+        assert!(input.sensitivity_tags.iter().any(|t| t == "shell:input"));
+
+        let close = descriptor_shell_close();
+        assert_eq!(close.method_name, "tool.terminal.shell.close");
+        assert!(matches!(close.idempotency, Idempotency::Idempotent));
+    }
+
+    #[test]
+    fn backend_rejects_shell_allowlist_path_separator() {
+        let err = TerminalBackend::new(cfg_with_shells(&["echo"], &["bin/sh"])).unwrap_err();
+        assert!(err.contains("path separator"));
+    }
+
+    #[test]
+    fn backend_rejects_empty_shell_allowlist_entry() {
+        let err = TerminalBackend::new(cfg_with_shells(&["echo"], &[""])).unwrap_err();
+        assert!(err.contains("empty entry"));
+    }
+
+    #[tokio::test]
+    async fn shell_open_fails_closed_when_allowlist_empty() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"command":"sh","args":[]}"#;
+        match handle_shell_open(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, error_kinds::POLICY_DENIED);
+                assert!(e.cause.contains("`allowed_shells`"));
+            }
+            _ => panic!("expected POLICY_DENIED"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_open_disallowed_command_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg_with_shells(&["echo"], &["sh"])).unwrap());
+        let arg = br#"{"command":"bash","args":[]}"#;
+        match handle_shell_open(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, error_kinds::POLICY_DENIED);
+                assert!(e.cause.contains("allowed_shells"));
+            }
+            _ => panic!("expected POLICY_DENIED"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_input_unknown_session_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"session_id":"abc123","bytes":"ls\n"}"#;
+        match handle_shell_input(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("session not found or already closed"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_input_bad_base64_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let arg = br#"{"session_id":"abc123","bytes_base64":"!!!not-base64!!!"}"#;
+        match handle_shell_input(b, ctx_with_args(arg)).await {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("bad base64"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn shell_close_unknown_session_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"abc123");
+        match handle_shell_close(b, &ctx) {
+            HandlerOutcome::Err(e) => {
+                assert!(e.cause.contains("session not found"));
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn shell_close_empty_arg_rejected() {
+        let b = Arc::new(TerminalBackend::new(cfg(&["echo"])).unwrap());
+        let ctx = ctx_with_args(b"");
+        match handle_shell_close(b, &ctx) {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("session_id required")),
+            _ => panic!("expected Err"),
+        }
+    }
+
+    /// Cross-platform shell binary for the live-spawn shell test.
+    #[cfg(windows)]
+    const REAL_SHELL_BIN: &str = "cmd";
+    #[cfg(unix)]
+    const REAL_SHELL_BIN: &str = "sh";
+
+    #[tokio::test]
+    async fn shell_open_real_subprocess_full_lifecycle() {
+        // End-to-end: open a real shell, send input that
+        // produces stdout, close stdin, observe the audit
+        // entry.
+        let b = Arc::new(TerminalBackend::new(cfg_with_shells(&[], &[REAL_SHELL_BIN])).unwrap());
+        let req = format!(r#"{{"command":"{REAL_SHELL_BIN}","args":[],"timeout_secs":10}}"#);
+        let open_body = match handle_shell_open(b.clone(), ctx_with_args(req.as_bytes())).await {
+            HandlerOutcome::Ok(body) => body,
+            HandlerOutcome::Err(e) => panic!("open failed: {}", e.cause),
+        };
+        let open_v: serde_json::Value = serde_json::from_slice(&open_body).unwrap();
+        let session_id = open_v["session_id"].as_str().unwrap().to_string();
+        assert!(!session_id.is_empty());
+        assert!(open_v["pid"].as_u64().is_some());
+
+        // Send a command that produces deterministic output and
+        // then exits. On Windows `cmd` exits on `exit\r\n`; on
+        // Unix `sh` exits on EOF or `exit\n`.
+        let echo_cmd = if cfg!(windows) {
+            "echo relix-shell-marker\r\nexit\r\n"
+        } else {
+            "echo relix-shell-marker\nexit\n"
+        };
+        let input_req = serde_json::to_string(&serde_json::json!({
+            "session_id": session_id,
+            "bytes": echo_cmd,
+        }))
+        .unwrap();
+        let input_body =
+            match handle_shell_input(b.clone(), ctx_with_args(input_req.as_bytes())).await {
+                HandlerOutcome::Ok(b) => b,
+                HandlerOutcome::Err(e) => panic!("input failed: {}", e.cause),
+            };
+        let input_v: serde_json::Value = serde_json::from_slice(&input_body).unwrap();
+        assert_eq!(input_v["session_id"], session_id);
+        assert_eq!(input_v["written"], echo_cmd.len());
+
+        // Give the shell time to consume input, produce output,
+        // and exit. The audit ring is the most reliable signal
+        // that the background task has finished cleanup.
+        for _ in 0..100 {
+            if !b.audit_snapshot(10).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let snap = b.audit_snapshot(10);
+        assert_eq!(snap.len(), 1, "audit entry should land after shell exit");
+        assert_eq!(snap[0].command, REAL_SHELL_BIN);
+        assert!(!snap[0].timed_out);
+        assert!(!snap[0].cancelled);
+
+        // Live registry should be empty + stdin map should be
+        // empty (cleanup branch in drive_to_completion removes
+        // both).
+        assert!(b.snapshot_sessions().is_empty());
+        assert!(b.shell_stdins.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_close_drops_stdin_entry_without_killing_session() {
+        // Manually wire up a session record + a stdin entry so
+        // we can test close in isolation (without spawning a
+        // real shell).
+        let b = Arc::new(TerminalBackend::new(cfg_with_shells(&["echo"], &["sh"])).unwrap());
+        let session_id = "manual-shell-session";
+
+        // Insert a session record.
+        {
+            let mut g = b.sessions.lock().unwrap();
+            g.insert(
+                session_id.into(),
+                mk_session_record(session_id, unix_secs(), "sh"),
+            );
+        }
+        // Insert a stdin entry containing None (the actual
+        // ChildStdin requires a real spawn — we just need the
+        // map slot to exercise the close path's remove logic).
+        {
+            let mut g = b.shell_stdins.lock().unwrap();
+            g.insert(session_id.into(), Arc::new(tokio::sync::Mutex::new(None)));
+        }
+        assert!(b.shell_stdins.lock().unwrap().contains_key(session_id));
+
+        let ctx = ctx_with_args(session_id.as_bytes());
+        match handle_shell_close(b.clone(), &ctx) {
+            HandlerOutcome::Ok(body) => {
+                let s = String::from_utf8(body).unwrap();
+                assert!(s.contains(&format!("ok session={session_id}")));
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        }
+
+        // stdin entry gone; session record still present (close
+        // does NOT kill the process, only signals EOF).
+        assert!(!b.shell_stdins.lock().unwrap().contains_key(session_id));
+        assert!(b.sessions.lock().unwrap().contains_key(session_id));
     }
 }

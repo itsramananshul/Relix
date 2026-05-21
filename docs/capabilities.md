@@ -85,6 +85,9 @@ before the backend (visibility + stable contract + honesty).
 |---|---|---|
 | `tool.terminal.run` (CW1) | live | Sandboxed shell; operator allowlist required |
 | `tool.terminal.spawn` (PH-TERM-SPAWN) | live | Fire-and-forget variant of run; returns session_id immediately |
+| `tool.terminal.shell.open` (PH-TERM-SHELL) | live | Open a persistent shell session (separate `allowed_shells` allowlist) |
+| `tool.terminal.shell.input` (PH-TERM-SHELL) | live | Write bytes (UTF-8 or base64) to a shell session's stdin |
+| `tool.terminal.shell.close` (PH-TERM-SHELL) | live | Close shell stdin (signal EOF); does not kill the child |
 | `tool.terminal.sessions` (PH-TERM-SESSIONS) | live | Live in-flight run registry snapshot |
 | `tool.terminal.audit_recent` (PH-TERM-AUDIT) | live | Bounded ring of completed runs (success + timed-out + cancelled) |
 | `tool.terminal.cancel` (PH-TERM-CANCEL) | live | Cooperatively terminate a live `tool.terminal.run` session by id |

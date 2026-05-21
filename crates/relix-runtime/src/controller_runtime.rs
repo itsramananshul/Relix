@@ -1058,6 +1058,15 @@ fn register_node_type_handlers(
             // PH-TERM-SPAWN: tool.terminal.spawn — fire-and-forget
             // background variant of tool.terminal.run.
             manifest.add_capability(crate::nodes::tool::terminal::descriptor_spawn());
+            // PH-TERM-SHELL: tool.terminal.shell.{open,input,close}
+            // — persistent shell sessions. open/input/close are
+            // always advertised when terminal is configured; the
+            // open handler refuses fail-closed when `allowed_shells`
+            // is empty, so the surface is honest about whether
+            // shells are actually usable.
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_open());
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_input());
+            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_close());
         }
         // CW4: tool.browser.* — only advertised when
         // [tool.browser] is configured. Honest: the descriptors
