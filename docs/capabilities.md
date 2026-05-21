@@ -77,7 +77,7 @@ before the backend (visibility + stable contract + honesty).
 | Method | Status | Notes |
 |---|---|---|
 | `tool.web_fetch` | live | SSRF + DNS pin + per-hop redirect re-check |
-| `tool.web_extract` | live | Hand-rolled HTML state machine |
+| `tool.web_extract` | live | Hand-rolled HTML state machine — modes: text/title/links/meta/markdown (PH-WEB-MARKDOWN)/all |
 | `tool.web_get` (CW3) | live | Fetch + extract in one call |
 | `tool.web_search` (CW3) | live | DuckDuckGo HTML scrape |
 | `tool.web.robots_check` (PH-WEB-ROBOTS) | live | robots.txt sniff + RFC 9309 longest-prefix-match-wins; defaults to allow on missing |

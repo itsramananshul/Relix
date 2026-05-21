@@ -49,7 +49,8 @@ row's status field.
 |---|---|---|---|---|---|---|
 | web_tools | HTTP GET/POST + headers + cookies | high | medium | partial | tool.web_fetch + tool.web_get | GET only today |
 | url_safety | URLhaus / phishing checks | medium | medium | pending | — | requires external service |
-| web_extract | DOM parse + CSS selectors | medium | medium | shipped | tool.web_extract | hand-rolled parser |
+| web_extract | DOM parse + CSS selectors | medium | medium | shipped | tool.web_extract | hand-rolled parser; modes text/title/links/meta/markdown/all |
+| html_to_markdown | HTML structure → Markdown | medium | medium | shipped (PH-WEB-MARKDOWN) | tool.web_extract `markdown` mode | headings, paragraphs, links, lists, code, blockquotes, hr, emphasis; no tables / definition lists / footnotes |
 | x_search_tool | X search + trending | low | medium | deferred:DXXX | — | requires API key — operator decision |
 | osv_check | Open Source Vulnerabilities | medium | medium | pending | — | net-bound; small wrapper |
 | vision_tools | image OCR + landmark | medium | medium | pending | — | needs provider |

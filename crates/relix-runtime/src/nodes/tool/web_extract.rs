@@ -22,6 +22,7 @@
 //! | `title` | Single line: contents of `<title>`. Empty if absent. |
 //! | `links` | One absolute-or-relative URL per line, deduplicated, in document order. |
 //! | `meta`  | One `name\tcontent` per line. Both `name=` and `property=` (OpenGraph) attributes are recognised. |
+//! | `markdown` (PH-WEB-MARKDOWN) | HTML → Markdown structural conversion (headings, paragraphs, links, lists, code, blockquotes, hr, emphasis). Scripts / styles dropped, entities decoded. |
 //! | `all`   | Multi-line `key=value` block: `title=`, `link_count=`, `meta_count=`, then `text=` followed by the text body. Suitable for one-shot inspection from a CLI or another flow. |
 //!
 //! ## Limits
@@ -118,13 +119,15 @@ fn handle(cfg: &WebExtractConfig, ctx: &InvocationCtx) -> HandlerOutcome {
     let mode_str = parts.next().unwrap_or("").trim();
     let html = parts.next().unwrap_or("");
     if mode_str.is_empty() {
-        return invalid("tool.web_extract: mode required (text/title/links/meta/all)".into());
+        return invalid(
+            "tool.web_extract: mode required (text/title/links/meta/markdown/all)".into(),
+        );
     }
     let mode = match Mode::parse(mode_str) {
         Some(m) => m,
         None => {
             return invalid(format!(
-                "tool.web_extract: unknown mode '{mode_str}' (text/title/links/meta/all)"
+                "tool.web_extract: unknown mode '{mode_str}' (text/title/links/meta/markdown/all)"
             ));
         }
     };
@@ -135,18 +138,26 @@ fn handle(cfg: &WebExtractConfig, ctx: &InvocationCtx) -> HandlerOutcome {
             cfg.max_input_bytes
         ));
     }
-    let extracted = extract(html);
+    // PH-WEB-MARKDOWN: markdown mode uses a different state
+    // machine; skip the general extractor for that case.
     let body = match mode {
-        Mode::Text => extracted.text,
-        Mode::Title => extracted.title.unwrap_or_default(),
-        Mode::Links => extracted.links.join("\n"),
-        Mode::Meta => extracted
-            .meta
-            .into_iter()
-            .map(|(k, v)| format!("{k}\t{v}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Mode::All => render_all(&extracted),
+        Mode::Markdown => extract_markdown(html),
+        _ => {
+            let extracted = extract(html);
+            match mode {
+                Mode::Text => extracted.text,
+                Mode::Title => extracted.title.unwrap_or_default(),
+                Mode::Links => extracted.links.join("\n"),
+                Mode::Meta => extracted
+                    .meta
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}\t{v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Mode::All => render_all(&extracted),
+                Mode::Markdown => unreachable!("handled above"),
+            }
+        }
     };
     HandlerOutcome::Ok(body.into_bytes())
 }
@@ -158,6 +169,7 @@ enum Mode {
     Links,
     Meta,
     All,
+    Markdown,
 }
 
 impl Mode {
@@ -168,6 +180,7 @@ impl Mode {
             "links" => Some(Self::Links),
             "meta" => Some(Self::Meta),
             "all" => Some(Self::All),
+            "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -374,6 +387,480 @@ pub fn extract(html: &str) -> Extracted {
         links,
         meta,
     }
+}
+
+/// PH-WEB-MARKDOWN: convert an HTML fragment to Markdown.
+///
+/// Hand-rolled single-pass walker. Maintains an inline buffer
+/// per block; flushes the buffer with the appropriate Markdown
+/// prefix when a block boundary is encountered. Block elements:
+/// `<h1>`..`<h6>`, `<p>`, `<pre>`, `<blockquote>`, `<ul>`/`<ol>`,
+/// `<li>`, `<hr>`. Inline elements: `<a>`, `<strong>`/`<b>`,
+/// `<em>`/`<i>`, `<code>`, `<br>`, `<img>`.
+///
+/// **Limitations:**
+/// - Not an HTML5 parser. Malformed input may produce odd
+///   Markdown; will not panic.
+/// - Tables, definition lists, footnotes are NOT rendered (the
+///   text content survives, but without table structure).
+/// - Nested lists are emitted as flat lists with two-space
+///   indent per level — works in most Markdown renderers.
+/// - Code blocks use triple-backtick fences with no language
+///   tag (would need `<code class="language-X">` extraction).
+#[allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::too_many_lines
+)]
+pub fn extract_markdown(html: &str) -> String {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    let n = bytes.len();
+    let mut out = String::with_capacity(html.len());
+
+    // Inline buffer accumulates text content for the current
+    // block; flushed by `flush_block` when a block boundary
+    // arrives. Tracks its own whitespace state.
+    let mut inline_buf = String::new();
+    let mut inline_last_space = true;
+
+    // The kind of block we're currently building. Switched at
+    // each opening block-level tag.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Block {
+        Paragraph,
+        Heading(u8),
+        Pre,
+    }
+    let mut block = Block::Paragraph;
+
+    // Nesting stacks.
+    #[derive(Debug, Clone, Copy)]
+    enum ListKind {
+        Ul,
+        Ol(u32),
+    }
+    let mut list_stack: Vec<ListKind> = Vec::new();
+    let mut blockquote_depth: usize = 0;
+
+    // Pending link href — when an <a> opens, store the href;
+    // when it closes, wrap inline_buf's last span with [..](href).
+    let mut pending_href: Option<(String, usize)> = None; // (href, inline_buf len at open)
+
+    // Format / strip state for inline markers we have to emit
+    // verbatim into inline_buf.
+    let mut emphasis_open = 0u8; // <em>/<i>
+    let mut strong_open = 0u8; // <strong>/<b>
+    let mut code_inline_open = 0u8;
+
+    let mut in_script = false;
+    let mut in_style = false;
+
+    // Helper closure-shaped flush: emit the current inline buffer
+    // as a block according to `block`, applying blockquote /
+    // list / heading prefixes. Resets the inline buffer.
+    let flush_block = |out: &mut String,
+                       inline_buf: &mut String,
+                       inline_last_space: &mut bool,
+                       block: &Block,
+                       list_stack: &[ListKind],
+                       blockquote_depth: usize| {
+        let s = inline_buf.trim().to_string();
+        if s.is_empty() && !matches!(block, Block::Pre) {
+            return;
+        }
+        let bq: String = std::iter::repeat_n("> ", blockquote_depth).collect();
+        let list_indent: String = std::iter::repeat_n("  ", list_stack.len()).collect();
+        match block {
+            Block::Heading(level) => {
+                let hashes: String = std::iter::repeat_n('#', *level as usize).collect();
+                out.push_str(&bq);
+                out.push_str(&list_indent);
+                out.push_str(&hashes);
+                out.push(' ');
+                out.push_str(&s);
+                out.push_str("\n\n");
+            }
+            Block::Pre => {
+                out.push_str("```\n");
+                out.push_str(&s);
+                if !s.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("```\n\n");
+            }
+            Block::Paragraph => {
+                if !s.is_empty() {
+                    out.push_str(&bq);
+                    out.push_str(&list_indent);
+                    out.push_str(&s);
+                    out.push_str("\n\n");
+                }
+            }
+        }
+        inline_buf.clear();
+        *inline_last_space = true;
+    };
+
+    while i < n {
+        let b = bytes[i];
+
+        if b == b'<' && i + 4 <= n && &bytes[i..i + 4] == b"<!--" {
+            if let Some(end) = find_subslice(&bytes[i + 4..], b"-->") {
+                i = i + 4 + end + 3;
+            } else {
+                i = n;
+            }
+            continue;
+        }
+
+        if b == b'<' && i + 1 < n {
+            let is_close = bytes[i + 1] == b'/';
+            let name_start = if is_close { i + 2 } else { i + 1 };
+            let name_end = name_start
+                + bytes[name_start..]
+                    .iter()
+                    .take_while(|&&c| c.is_ascii_alphanumeric() || c == b':')
+                    .count();
+            let tag_name_lower = ascii_lower_str(&bytes[name_start..name_end]);
+            let tag_end = match memchr_byte(&bytes[i..], b'>') {
+                Some(off) => i + off,
+                None => break,
+            };
+            let tag_inner = &bytes[name_end..tag_end];
+
+            match tag_name_lower.as_str() {
+                "script" => in_script = !is_close,
+                "style" => in_style = !is_close,
+                _ => {}
+            }
+
+            if in_script || in_style {
+                i = tag_end + 1;
+                continue;
+            }
+
+            if !is_close {
+                match tag_name_lower.as_str() {
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        let level = tag_name_lower.as_bytes()[1] - b'0';
+                        block = Block::Heading(level);
+                    }
+                    "p" | "div" | "section" | "article" | "header" | "footer" | "nav" | "main"
+                    | "aside" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        block = Block::Paragraph;
+                    }
+                    "pre" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        block = Block::Pre;
+                    }
+                    "blockquote" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        blockquote_depth += 1;
+                        block = Block::Paragraph;
+                    }
+                    "ul" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        list_stack.push(ListKind::Ul);
+                        block = Block::Paragraph;
+                    }
+                    "ol" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        list_stack.push(ListKind::Ol(1));
+                        block = Block::Paragraph;
+                    }
+                    "li" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        // Emit the bullet/number for this list
+                        // item directly into the output, then
+                        // build the rest of the line in the
+                        // inline buffer. Flush at </li>.
+                        let depth = list_stack.len().saturating_sub(1);
+                        let list_indent: String = std::iter::repeat_n("  ", depth).collect();
+                        let bq: String = std::iter::repeat_n("> ", blockquote_depth).collect();
+                        out.push_str(&bq);
+                        out.push_str(&list_indent);
+                        match list_stack.last_mut() {
+                            Some(ListKind::Ul) | None => out.push_str("- "),
+                            Some(ListKind::Ol(n_ref)) => {
+                                out.push_str(&format!("{}. ", *n_ref));
+                                *n_ref += 1;
+                            }
+                        }
+                        block = Block::Paragraph;
+                    }
+                    "br" => {
+                        // Soft break — two spaces + newline.
+                        inline_buf.push_str("  \n");
+                        inline_last_space = true;
+                    }
+                    "hr" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        let bq: String = std::iter::repeat_n("> ", blockquote_depth).collect();
+                        out.push_str(&bq);
+                        out.push_str("---\n\n");
+                    }
+                    "title" => {
+                        // Skip <title>...</title> entirely — it's
+                        // metadata, not body text.
+                        let body_start = tag_end + 1;
+                        if let Some(close_rel) = find_subslice_ci(&bytes[body_start..], b"</title>")
+                        {
+                            i = body_start + close_rel + b"</title>".len();
+                            continue;
+                        }
+                    }
+                    "a" => {
+                        if let Some(href) = read_attr(tag_inner, b"href") {
+                            let href = decode_entities(href.trim());
+                            if !href.is_empty() {
+                                inline_buf.push('[');
+                                pending_href = Some((href, inline_buf.len()));
+                            }
+                        }
+                    }
+                    "img" => {
+                        if let Some(src) = read_attr(tag_inner, b"src") {
+                            let alt = read_attr(tag_inner, b"alt").unwrap_or("");
+                            let src = decode_entities(src.trim());
+                            let alt = decode_entities(alt.trim());
+                            inline_buf.push_str(&format!("![{alt}]({src})"));
+                            inline_last_space = false;
+                        }
+                    }
+                    "strong" | "b" => {
+                        inline_buf.push_str("**");
+                        strong_open = strong_open.saturating_add(1);
+                        inline_last_space = false;
+                    }
+                    "em" | "i" => {
+                        inline_buf.push('*');
+                        emphasis_open = emphasis_open.saturating_add(1);
+                        inline_last_space = false;
+                    }
+                    "code" if !matches!(block, Block::Pre) => {
+                        inline_buf.push('`');
+                        code_inline_open = code_inline_open.saturating_add(1);
+                        inline_last_space = false;
+                    }
+                    _ => {}
+                }
+            } else {
+                match tag_name_lower.as_str() {
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "div" | "section"
+                    | "article" | "header" | "footer" | "nav" | "main" | "aside" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        block = Block::Paragraph;
+                    }
+                    "pre" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        block = Block::Paragraph;
+                    }
+                    "blockquote" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        blockquote_depth = blockquote_depth.saturating_sub(1);
+                    }
+                    "ul" | "ol" => {
+                        flush_block(
+                            &mut out,
+                            &mut inline_buf,
+                            &mut inline_last_space,
+                            &block,
+                            &list_stack,
+                            blockquote_depth,
+                        );
+                        list_stack.pop();
+                    }
+                    "li" => {
+                        // Flush the line, but NOT with the
+                        // list-item prefix this time — that was
+                        // already emitted at <li>. Emit the inline
+                        // buffer trimmed + newline.
+                        let s = inline_buf.trim().to_string();
+                        out.push_str(&s);
+                        out.push('\n');
+                        inline_buf.clear();
+                        inline_last_space = true;
+                        block = Block::Paragraph;
+                    }
+                    "a" => {
+                        if let Some((href, _start)) = pending_href.take() {
+                            inline_buf.push_str(&format!("]({href})"));
+                            inline_last_space = false;
+                        }
+                    }
+                    "strong" | "b" => {
+                        if strong_open > 0 {
+                            inline_buf.push_str("**");
+                            strong_open -= 1;
+                            inline_last_space = false;
+                        }
+                    }
+                    "em" | "i" => {
+                        if emphasis_open > 0 {
+                            inline_buf.push('*');
+                            emphasis_open -= 1;
+                            inline_last_space = false;
+                        }
+                    }
+                    "code" if !matches!(block, Block::Pre) => {
+                        if code_inline_open > 0 {
+                            inline_buf.push('`');
+                            code_inline_open -= 1;
+                            inline_last_space = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            i = tag_end + 1;
+            continue;
+        }
+
+        // Plain text.
+        if !in_script && !in_style {
+            if b.is_ascii_whitespace() {
+                if matches!(block, Block::Pre) {
+                    // Inside <pre>, preserve whitespace verbatim.
+                    let ch_len = utf8_char_len(b);
+                    let end = (i + ch_len).min(n);
+                    inline_buf.push_str(std::str::from_utf8(&bytes[i..end]).unwrap_or(""));
+                    i = end;
+                    inline_last_space = b == b' ' || b == b'\t';
+                    continue;
+                }
+                if !inline_last_space {
+                    inline_buf.push(' ');
+                    inline_last_space = true;
+                }
+                i += 1;
+            } else {
+                if b == b'&' {
+                    if let Some((decoded, consumed)) = decode_one_entity(&bytes[i..]) {
+                        inline_buf.push_str(&decoded);
+                        inline_last_space =
+                            decoded.chars().last().is_some_and(|c| c.is_whitespace());
+                        i += consumed;
+                        continue;
+                    }
+                }
+                let ch_len = utf8_char_len(b);
+                let end = (i + ch_len).min(n);
+                inline_buf.push_str(std::str::from_utf8(&bytes[i..end]).unwrap_or(""));
+                inline_last_space = false;
+                i = end;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // Final flush.
+    flush_block(
+        &mut out,
+        &mut inline_buf,
+        &mut inline_last_space,
+        &block,
+        &list_stack,
+        blockquote_depth,
+    );
+
+    // Collapse runs of more than two blank lines.
+    let mut tidied = String::with_capacity(out.len());
+    let mut blank_run = 0usize;
+    for line in out.lines() {
+        if line.is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                tidied.push('\n');
+            }
+        } else {
+            blank_run = 0;
+            tidied.push_str(line);
+            tidied.push('\n');
+        }
+    }
+    tidied.trim_end().to_string()
 }
 
 fn render_all(e: &Extracted) -> String {
@@ -903,5 +1390,164 @@ mod tests {
             "double-decode regression: {:?}",
             e.text
         );
+    }
+
+    // ── PH-WEB-MARKDOWN: markdown mode ─────────────────────────────
+
+    #[test]
+    fn markdown_heading_emits_hash_prefix() {
+        let md = extract_markdown("<h1>Title</h1>");
+        assert_eq!(md, "# Title");
+    }
+
+    #[test]
+    fn markdown_multiple_headings_keep_level() {
+        let md = extract_markdown("<h2>A</h2><h3>B</h3>");
+        assert!(md.contains("## A"));
+        assert!(md.contains("### B"));
+    }
+
+    #[test]
+    fn markdown_paragraph_emits_blank_line_separator() {
+        let md = extract_markdown("<p>first</p><p>second</p>");
+        assert!(md.contains("first\n\nsecond"), "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_link_uses_bracket_paren_syntax() {
+        let md = extract_markdown(r#"<p>see <a href="https://example.com">here</a></p>"#);
+        assert!(md.contains("[here](https://example.com)"), "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_strong_em_inline() {
+        let md = extract_markdown("<p>this is <strong>bold</strong> and <em>italic</em></p>");
+        assert!(md.contains("**bold**"));
+        assert!(md.contains("*italic*"));
+    }
+
+    #[test]
+    fn markdown_inline_code_uses_backticks() {
+        let md = extract_markdown("<p>call <code>foo()</code> here</p>");
+        assert!(md.contains("`foo()`"), "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_pre_emits_fenced_code_block() {
+        let md = extract_markdown("<pre>let x = 1;\nlet y = 2;</pre>");
+        assert!(md.contains("```\nlet x = 1;\nlet y = 2;"), "got: {md:?}");
+        assert!(md.contains("```"));
+    }
+
+    #[test]
+    fn markdown_unordered_list_dashes() {
+        let md = extract_markdown("<ul><li>one</li><li>two</li></ul>");
+        assert!(md.contains("- one"), "got: {md:?}");
+        assert!(md.contains("- two"), "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_ordered_list_numbers() {
+        let md = extract_markdown("<ol><li>one</li><li>two</li><li>three</li></ol>");
+        assert!(md.contains("1. one"));
+        assert!(md.contains("2. two"));
+        assert!(md.contains("3. three"));
+    }
+
+    #[test]
+    fn markdown_blockquote_prefix() {
+        let md = extract_markdown("<blockquote><p>quoted</p></blockquote>");
+        assert!(md.contains("> quoted"), "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_hr_emits_three_dashes() {
+        let md = extract_markdown("<p>a</p><hr><p>b</p>");
+        assert!(md.contains("---"), "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_img_emits_image_syntax() {
+        let md = extract_markdown(r#"<p><img src="https://example.com/x.png" alt="x" /></p>"#);
+        assert!(
+            md.contains("![x](https://example.com/x.png)"),
+            "got: {md:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_strips_script_and_style() {
+        let md = extract_markdown(
+            "<script>alert('x')</script><style>p{color:red}</style><p>visible</p>",
+        );
+        assert!(!md.contains("alert"));
+        assert!(!md.contains("color:red"));
+        assert!(md.contains("visible"));
+    }
+
+    #[test]
+    fn markdown_decodes_entities() {
+        let md = extract_markdown("<p>5 &amp; 10 &lt; 100</p>");
+        assert!(md.contains("5 & 10 < 100"), "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_skips_title_metadata() {
+        let md = extract_markdown("<title>page-title</title><h1>Body</h1><p>content</p>");
+        assert!(!md.contains("page-title"));
+        assert!(md.contains("Body"));
+    }
+
+    #[test]
+    fn markdown_mode_through_handler() {
+        let cfg = WebExtractConfig::default();
+        // Build a minimal InvocationCtx.
+        use relix_core::identity::VerifiedIdentity;
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        let ctx = InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "".into(),
+                clearance: "".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args: b"markdown|<h1>Hello</h1><p>world</p>".to_vec(),
+        };
+        let out = match handle(&cfg, &ctx) {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        };
+        assert!(out.contains("# Hello"));
+        assert!(out.contains("world"));
+    }
+
+    #[test]
+    fn markdown_mode_listed_in_error_when_unknown() {
+        let cfg = WebExtractConfig::default();
+        use relix_core::identity::VerifiedIdentity;
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        let ctx = InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "".into(),
+                clearance: "".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args: b"bogus|<p>x</p>".to_vec(),
+        };
+        match handle(&cfg, &ctx) {
+            HandlerOutcome::Err(e) => assert!(e.cause.contains("markdown")),
+            _ => panic!("expected Err"),
+        }
     }
 }
