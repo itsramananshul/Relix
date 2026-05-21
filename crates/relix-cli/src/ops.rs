@@ -60,6 +60,23 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Preview the HealthAwareRouter's pick for a candidate
+    /// list (PH-ROUTER-PREVIEW). Hits POST
+    /// /v1/providers/route_test against current cached health.
+    /// Does NOT send any chat call.
+    RouteTest {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Comma-separated candidate list (e.g.
+        /// `openai,anthropic`). Order matters — the router uses
+        /// it for stable tie-breaking.
+        #[arg(long)]
+        candidates: String,
+        /// Raw JSON instead of the pretty summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Recent cross-task events from /v1/tasks/events/recent.
     /// Mirrors the dashboard firehose for terminal operators
     /// — shows the H2 one-line summary projection per row.
@@ -99,6 +116,11 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             filter,
             json,
         } => events(&bridge, limit, &filter, json).await,
+        Cmd::RouteTest {
+            bridge,
+            candidates,
+            json,
+        } => route_test(&bridge, &candidates, json).await,
     }
 }
 
@@ -361,6 +383,93 @@ async fn events(
     Ok(())
 }
 
+async fn route_test(
+    bridge: &str,
+    candidates_csv: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let candidates: Vec<String> = candidates_csv
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if candidates.is_empty() {
+        return Err("--candidates required (comma-separated, non-empty)".into());
+    }
+    let url = format!("{}/v1/providers/route_test", bridge.trim_end_matches('/'));
+    let body_in = serde_json::json!({ "candidates": candidates }).to_string();
+    let body = http_post_json(&url, &body_in).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let resp: RouteTestResp = serde_json::from_str(&body)
+        .map_err(|e| format!("bridge returned non-JSON body: {e}\nraw:\n{body}"))?;
+    println!("router={r}  chosen={c}", r = resp.router, c = resp.chosen,);
+    println!("reasoning: {}", resp.reasoning);
+    println!();
+    let name_h = "candidate";
+    let score_h = "score";
+    let elig_h = "eligibility";
+    let why_h = "why";
+    println!("{name_h:<14}  {score_h:>5}  {elig_h:<12}  {why_h}");
+    for c in &resp.candidates {
+        println!(
+            "{n:<14}  {s:>5.2}  {e:<12}  {w}",
+            n = c.name,
+            s = c.score,
+            e = c.eligibility,
+            w = c.why,
+        );
+    }
+    Ok(())
+}
+
+async fn http_post_json(url: &str, body: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("bridge returned HTTP {status}: {body}").into());
+    }
+    Ok(body)
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteTestResp {
+    #[serde(default)]
+    router: String,
+    #[serde(default)]
+    chosen: String,
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    candidates: Vec<RouteTestCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteTestCandidate {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    score: f32,
+    #[serde(default)]
+    eligibility: String,
+    #[serde(default)]
+    why: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct EventsResponse {
     #[serde(default)]
@@ -535,6 +644,26 @@ mod tests {
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.next_cursor, 5);
         assert_eq!(r.items[0].summary, "[retry] requested (#2/5)");
+    }
+
+    #[test]
+    fn parse_route_test_response() {
+        let body = r#"{
+            "router": "health-aware",
+            "chosen": "openai",
+            "reasoning": "health-aware: chose openai (success_ratio=0.95) from 2 eligible of 2 total",
+            "chosen_at": 1700000000,
+            "candidates": [
+                {"name": "openai", "score": 0.95, "eligibility": "eligible", "why": "chosen (healthy success_ratio=0.95)"},
+                {"name": "anthropic", "score": 0.42, "eligibility": "eligible", "why": "considered (healthy success_ratio=0.84)"}
+            ]
+        }"#;
+        let r: RouteTestResp = serde_json::from_str(body).unwrap();
+        assert_eq!(r.router, "health-aware");
+        assert_eq!(r.chosen, "openai");
+        assert_eq!(r.candidates.len(), 2);
+        assert!((r.candidates[0].score - 0.95).abs() < 1e-3);
+        assert_eq!(r.candidates[1].eligibility, "eligible");
     }
 
     #[test]

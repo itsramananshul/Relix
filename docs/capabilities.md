@@ -149,6 +149,7 @@ operator-facing endpoints:
 | `relix-cli ops capabilities` (PH-DASH3-CLI) | Mesh-wide capability list |
 | `relix-cli ops stuck` (PH-OPS-STUCK) | H6 stuck-running projection |
 | `relix-cli ops events` (PH-OPS-EVENTS) | H2 firehose snapshot for terminal operators |
+| `relix-cli ops route-test` (PH-ROUTER-PREVIEW-CLI) | Preview HealthAwareRouter pick over current cached health |
 | `relix-cli ping` | Direct libp2p ping to a peer |
 
 ## Per-feature docs
