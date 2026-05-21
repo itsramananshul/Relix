@@ -206,7 +206,48 @@ a `task.terminal_summary` event with `auto_emitted_by="recover_interrupted"`,
 attempts, retries, wall_clock_secs, last_failure_class, reason. Test:
 `recovery_scan_emits_terminal_summary_with_attempt_and_wallclock`.
 
-### D-005  Hermes "ContextVar for write-origin scoping" — adopt for telemetry?
+### D-008  Browser backend — Playwright subprocess vs direct CDP vs headless_chrome crate?
+
+**Context.** CW4 ships `tool.browser.*` as an honest scaffold
+(NoneBackend returns `BackendNotConnected` on every non-noop
+call). Wave 1 demands a real backend. Three concrete paths:
+
+**Options.**
+- (a) **Playwright via Node.js subprocess** — spawn `playwright-core`
+  in a sidecar process, JSON-RPC bridge over stdio.
+  Pros: maximum compatibility (Hermes uses this exact pattern;
+  every site that works in Hermes will work in Relix);
+  Playwright's auto-wait + selector engine is best-in-class.
+  Cons: a Node runtime becomes a hard runtime dependency of
+  the tool node; cross-process IPC adds latency and a
+  failure surface; operator must `npm i playwright-core` once.
+- (b) **Direct Chrome DevTools Protocol via `headless_chrome`
+  crate** — pure-Rust CDP client; spawns a headless Chromium
+  the crate downloads itself. Pros: single binary, no Node
+  dep, fast. Cons: less battle-tested than Playwright; some
+  modern auto-wait patterns must be hand-rolled; crate
+  maintainership is moderate (active but not heavy).
+- (c) **`fantoccini` (WebDriver) + Selenium / geckodriver** —
+  W3C-standard protocol. Pros: portable across browsers
+  (Firefox + Chrome). Cons: WebDriver is slower + chattier
+  than CDP; selector ergonomics worse; another long-running
+  daemon to manage.
+
+**Recommendation.** (b) `headless_chrome` for first cut.
+Rust-native, single binary, no Node runtime dependency, fast
+enough for the operator workflows that matter today (navigate
++ extract + screenshot + click). Wave-2 can add a Playwright
+subprocess backend behind a feature flag for sites that need
+its richer auto-wait. Honest fallback: when no Chromium can
+be found / launched, the backend continues to return
+`BackendNotConnected` with the specific reason — never fakes
+success.
+
+**Status.** open — answer needed before CW4 ships a live
+backend. Pure additive change once decided; the existing
+`BrowserBackend` trait + `NoneBackend` impl + descriptors
+stay in place and a `HeadlessChromeBackend` / `PlaywrightBackend`
+slot in via the existing build_backend() path.
 
 **Context.** Hermes uses `contextvars.ContextVar` to thread the
 write-origin label through nested async tool calls without
