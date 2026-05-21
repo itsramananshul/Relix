@@ -195,7 +195,7 @@ Highest-leverage parity:
 |---|---|---|---|---|---|
 | Rate-limit ladder (429 + body detection) | nous_rate_guard.py + account_usage.py + classify_api_error | high | medium | partial | H1 classifier covers detection; no ladder/cooldown yet |
 | Prompt caching (cache_control) | anthropic_adapter.py prompt caching | high | small | shipped | system block sent as structured array with cache_control ephemeral (PH-WAVE2E) |
-| Extended thinking (o1/o3) | lmstudio_reasoning.py | high | small | pending | transport-level hook |
+| Extended thinking (o1/o3) | lmstudio_reasoning.py | high | small | shipped | ChatInput.thinking_budget_tokens → Anthropic `thinking:{type:enabled,budget_tokens:N}` (PH-WAVE2F). Reasoning trace surface deferred. |
 | Vision (multi-image, resize, cost est) | vision_tools.py | medium | medium | pending | needs ChatInput.images |
 | Streaming SSE chunks | chat_completions transports | high | medium | partial | OpenAI shim streams; not all adapters |
 | Structured output (JSON schema) | per-adapter | medium | medium | pending | adapter knob |
@@ -233,7 +233,7 @@ would gain the most operator value from next:
    classifier covers detection; ladder/cooldown pending)
 6. **Delegation / Subagent Spawning** — partial (M72), needs
    executor
-7. **Extended Thinking (o1/o3)** — pending, small
+7. **Extended Thinking (o1/o3)** — shipped (PH-WAVE2F) ✓
 8. **Browser Automation (Playwright)** — pending (CW4)
 9. **Multi-Platform Channel Routing** — pending (Discord/Slack/Email)
 10. **Skill Ecosystem + MCP** — pending (CW5), per D-002

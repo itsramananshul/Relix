@@ -65,6 +65,23 @@ pub struct ChatInput {
     pub temperature: Option<f32>,
     /// Optional max tokens to generate.
     pub max_tokens: Option<u32>,
+    /// PH-WAVE2F: opt-in budget for Anthropic-style extended
+    /// thinking (o1/o3-style structured reasoning). When
+    /// `Some(N)` AND the active provider is Anthropic, the
+    /// request body adds `thinking: { type: "enabled",
+    /// budget_tokens: N }`. Providers that don't support
+    /// extended thinking (OpenAI-compat, Gemini placeholder,
+    /// mock) ignore the field. Honest scope: extended-thinking
+    /// output is emitted by Anthropic as separate `thinking`
+    /// content blocks alongside the regular `text` block;
+    /// today's AnthropicProvider returns only the `text`
+    /// block, so callers get the *benefit* of extended
+    /// reasoning without seeing the reasoning trace. A future
+    /// milestone can surface the thinking text via a new
+    /// ChatOutput field; the request-side knob ships now
+    /// because it's pure additive and operators don't need
+    /// the trace to want the better answer quality.
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 /// Structured response from a provider.

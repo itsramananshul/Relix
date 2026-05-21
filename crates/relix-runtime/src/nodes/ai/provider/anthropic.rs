@@ -98,6 +98,18 @@ impl ChatProvider for AnthropicProvider {
         if let Some(t) = input.temperature {
             body["temperature"] = json!(t);
         }
+        // PH-WAVE2F: extended thinking. Opt-in budget for
+        // o1/o3-style structured reasoning. Anthropic accepts
+        // `thinking: { type: "enabled", budget_tokens: N }`
+        // and silently ignores it on models that don't
+        // support extended thinking — same fail-soft posture
+        // as the PH-WAVE2E cache_control hint.
+        if let Some(budget) = input.thinking_budget_tokens {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
 
         let url = format!("{}/v1/messages", self.base_url);
         let resp = self
