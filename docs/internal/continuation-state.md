@@ -444,13 +444,20 @@ all pushed to origin/main):
 | H7  | 404122e | runtime +5 | Orphan-attempt cleanup |
 | H8  | 971308c | core +18, runtime +2 | Secret redaction (relix-core, chronicle) |
 | H9  | 56f906c | bridge +1 | Secret redaction (intervention audit) |
+| H10 | a0451ec | runtime +3 | Redaction sweep: pause/freeze/error_cause |
 
-Aggregate: ~5500 LOC added; runtime tests 291 → 382, bridge tests
-192 → 204, relix-core 33 → 51. Every milestone clean fmt + clippy
-+ tests. Total workspace ≈ 700 passing tests, 0 failures.
+Aggregate: ~5800 LOC added; runtime tests 291 → 385 (+94),
+bridge tests 192 → 204 (+12), relix-core 33 → 51 (+18). Every
+milestone clean fmt + clippy + tests. Total workspace ≈ 705
+passing tests, 0 failures.
 
 H3 (iteration budget grace-call) was deferred per D-006 — needs
 an executor consumer that doesn't exist yet. Decision logged.
+
+After H8 + H9 + H10 every operator/provider-supplied free-text
+boundary in the coordinator and bridge is covered by the
+redaction scrubber. Chronicle, audit log, dashboard timeline:
+all secret-safe by default.
 
 ### What the user paused on tonight
 - Asked the runtime to keep going all night and to log
