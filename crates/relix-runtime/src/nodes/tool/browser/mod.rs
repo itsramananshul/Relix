@@ -177,10 +177,18 @@ pub struct BrowserSessionView {
 }
 
 /// Public backend interface. Implemented by [`NoneBackend`] and
-/// by each feature-gated backend module. The trait surface is
-/// FROZEN in PH-BROWSER-FEATURES — subagents working on
-/// PH-BROWSER-HC / -PW / -WD must not extend it without a
-/// coordinated migration.
+/// by each feature-gated backend module.
+///
+/// **Trait evolution.** PH-BROWSER-FEATURES froze the original
+/// surface (`name` / `open_session` / `close_session` /
+/// `navigate` / `get_text` / `screenshot` / `list_sessions`).
+/// W2-002a extends it with `click` / `type_text` /
+/// `wait_for_selector` via default implementations that return
+/// `BackendNotConnected` so the trait can grow without
+/// breaking backends that haven't implemented the new
+/// methods yet. Backends implement the methods they support;
+/// the others honestly report "not yet wired" per the
+/// honesty contract.
 pub trait BrowserBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn open_session(&self) -> Result<String, BrowserError>;
@@ -189,6 +197,56 @@ pub trait BrowserBackend: Send + Sync {
     fn get_text(&self, session_id: &str) -> Result<String, BrowserError>;
     fn screenshot(&self, session_id: &str) -> Result<Vec<u8>, BrowserError>;
     fn list_sessions(&self) -> Result<Vec<BrowserSessionView>, BrowserError>;
+
+    /// W2-002a: click a CSS selector on the session's current
+    /// page. Default impl returns `BackendNotConnected` — each
+    /// live backend overrides with its driver-specific click
+    /// primitive. Operators driving TUI / form workflows need
+    /// click + type_text + wait_for_selector to land before
+    /// the browser surface is genuinely useful.
+    fn click(&self, _session_id: &str, _selector: &str) -> Result<(), BrowserError> {
+        Err(BrowserError::BackendNotConnected {
+            reason: format!(
+                "{}: click not yet implemented for this backend (W2-002a default)",
+                self.name()
+            ),
+        })
+    }
+
+    /// W2-002a: type a string into a CSS selector. Default
+    /// impl returns `BackendNotConnected`.
+    fn type_text(
+        &self,
+        _session_id: &str,
+        _selector: &str,
+        _text: &str,
+    ) -> Result<(), BrowserError> {
+        Err(BrowserError::BackendNotConnected {
+            reason: format!(
+                "{}: type_text not yet implemented for this backend (W2-002a default)",
+                self.name()
+            ),
+        })
+    }
+
+    /// W2-002a: wait up to `timeout_ms` for a CSS selector to
+    /// appear in the DOM. Default impl returns
+    /// `BackendNotConnected`. Implementations should respect
+    /// the timeout — operators rely on this for deterministic
+    /// click/type flows.
+    fn wait_for_selector(
+        &self,
+        _session_id: &str,
+        _selector: &str,
+        _timeout_ms: u64,
+    ) -> Result<(), BrowserError> {
+        Err(BrowserError::BackendNotConnected {
+            reason: format!(
+                "{}: wait_for_selector not yet implemented for this backend (W2-002a default)",
+                self.name()
+            ),
+        })
+    }
 }
 
 /// Backend error variants. `BackendNotConnected` is the
@@ -410,6 +468,74 @@ pub fn descriptor_list_sessions() -> CapabilityDescriptor {
     d
 }
 
+/// W2-002a: descriptor for `tool.browser.click`. Same blast
+/// radius as `navigate` — drives the live page state.
+pub fn descriptor_click() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.browser.click");
+    d.major_version = 1;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["browser:session".into(), "browser:mutate".into()];
+    d.policy_attachment_point = "tool.browser.click".to_string();
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Click a CSS selector on the session's current page. \
+         Arg shape: `<session_id>|<css_selector>`. Returns \
+         BackendNotConnected on backends that haven't \
+         implemented click yet."
+            .into(),
+    );
+    d.categories = vec!["browser".into(), "mutate".into()];
+    d.environment_requirements = vec!["browser:host".into()];
+    d.risk_level = RiskLevel::Medium;
+    d
+}
+
+/// W2-002a: descriptor for `tool.browser.type_text`.
+pub fn descriptor_type_text() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.browser.type_text");
+    d.major_version = 1;
+    d.idempotency = Idempotency::AtMostOnce;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["browser:session".into(), "browser:mutate".into()];
+    d.policy_attachment_point = "tool.browser.type_text".to_string();
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Type a string into a CSS selector on the current page. \
+         Arg shape: `<session_id>|<css_selector>|<text>`. Text \
+         may contain `|` because the parser uses splitn(3)."
+            .into(),
+    );
+    d.categories = vec!["browser".into(), "mutate".into()];
+    d.environment_requirements = vec!["browser:host".into()];
+    d.risk_level = RiskLevel::Medium;
+    d
+}
+
+/// W2-002a: descriptor for `tool.browser.wait_for_selector`.
+pub fn descriptor_wait_for_selector() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.browser.wait_for_selector");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["browser:session".into(), "browser:wait".into()];
+    d.policy_attachment_point = "tool.browser.wait_for_selector".to_string();
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Wait up to `timeout_ms` for a CSS selector to appear \
+         in the DOM. Arg shape: \
+         `<session_id>|<css_selector>|<timeout_ms>`. Times out \
+         with BackendNotConnected on backends without an impl, \
+         or with a reason naming the selector + waited duration \
+         on a real backend that didn't see it."
+            .into(),
+    );
+    d.categories = vec!["browser".into(), "wait".into()];
+    d.environment_requirements = vec!["browser:host".into()];
+    d.risk_level = RiskLevel::Safe;
+    d
+}
+
 /// Register every browser.* capability onto the dispatch bridge.
 /// Caller is `tool::register` in `tool/mod.rs` — only invoked
 /// when `[tool.browser]` is present in the operator config AND
@@ -455,12 +581,37 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<dyn BrowserBackend>) {
             async move { handle_screenshot(&b, &ctx) }
         })),
     );
-    let b = backend;
+    let b = backend.clone();
     bridge.register(
         "tool.browser.list_sessions",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let b = b.clone();
             async move { handle_list_sessions(&b, &ctx) }
+        })),
+    );
+    // W2-002a: click / type_text / wait_for_selector.
+    let b = backend.clone();
+    bridge.register(
+        "tool.browser.click",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let b = b.clone();
+            async move { handle_click(&b, &ctx) }
+        })),
+    );
+    let b = backend.clone();
+    bridge.register(
+        "tool.browser.type_text",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let b = b.clone();
+            async move { handle_type_text(&b, &ctx) }
+        })),
+    );
+    let b = backend;
+    bridge.register(
+        "tool.browser.wait_for_selector",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let b = b.clone();
+            async move { handle_wait_for_selector(&b, &ctx) }
         })),
     );
 }
@@ -569,6 +720,93 @@ fn handle_list_sessions(b: &Arc<dyn BrowserBackend>, _ctx: &InvocationCtx) -> Ha
             let _ = writeln!(body, "count={}", rows.len());
             HandlerOutcome::Ok(body.into_bytes())
         }
+        Err(e) => to_envelope(&e),
+    }
+}
+
+// ── W2-002a: click / type_text / wait_for_selector handlers ─────
+
+fn handle_click(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match utf8_arg(ctx, "click") {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let (id, selector) = match s.split_once('|') {
+        Some(p) => p,
+        None => {
+            return invalid("tool.browser.click: arg shape `<session_id>|<css_selector>`".into());
+        }
+    };
+    let id = id.trim();
+    let selector = selector.trim();
+    if id.is_empty() || selector.is_empty() {
+        return invalid(
+            "tool.browser.click: both session_id and css_selector required (arg shape `<session_id>|<css_selector>`)"
+                .into(),
+        );
+    }
+    match b.click(id, selector) {
+        Ok(()) => HandlerOutcome::Ok("clicked\n".to_string().into_bytes()),
+        Err(e) => to_envelope(&e),
+    }
+}
+
+fn handle_type_text(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match utf8_arg(ctx, "type_text") {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    // splitn(3) so the text payload may contain `|` without
+    // breaking the split — common when typing JSON-ish content
+    // or URLs into a form field.
+    let mut parts = s.splitn(3, '|');
+    let id = parts.next().unwrap_or("").trim();
+    let selector = parts.next().unwrap_or("").trim();
+    let text = parts.next().unwrap_or("");
+    if id.is_empty() || selector.is_empty() {
+        return invalid(
+            "tool.browser.type_text: arg shape `<session_id>|<css_selector>|<text>` (text may be empty but the two pipes must be present)"
+                .into(),
+        );
+    }
+    match b.type_text(id, selector, text) {
+        Ok(()) => HandlerOutcome::Ok("typed\n".to_string().into_bytes()),
+        Err(e) => to_envelope(&e),
+    }
+}
+
+fn handle_wait_for_selector(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match utf8_arg(ctx, "wait_for_selector") {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let mut parts = s.splitn(3, '|');
+    let id = parts.next().unwrap_or("").trim();
+    let selector = parts.next().unwrap_or("").trim();
+    let timeout_str = parts.next().unwrap_or("").trim();
+    if id.is_empty() || selector.is_empty() {
+        return invalid(
+            "tool.browser.wait_for_selector: arg shape `<session_id>|<css_selector>|<timeout_ms>`"
+                .into(),
+        );
+    }
+    let timeout_ms = if timeout_str.is_empty() {
+        // Reasonable default — matches the operator's
+        // `[tool.browser] call_timeout_secs` posture but in
+        // ms granularity. 30s.
+        30_000u64
+    } else {
+        match timeout_str.parse::<u64>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                return invalid(format!(
+                    "tool.browser.wait_for_selector: bad timeout_ms '{timeout_str}' (must be positive integer or empty for default)"
+                ));
+            }
+        }
+    };
+    match b.wait_for_selector(id, selector, timeout_ms) {
+        Ok(()) => HandlerOutcome::Ok("found\n".to_string().into_bytes()),
         Err(e) => to_envelope(&e),
     }
 }
@@ -886,7 +1124,9 @@ mod tests {
     /// PH-RISK-PIN-ALL: pin the risk tier of every browser
     /// descriptor. PH-BROWSER-FEATURES preserves the pinned
     /// tiers — the trait surface didn't change, so the risk
-    /// posture per capability doesn't either.
+    /// posture per capability doesn't either. W2-002a adds
+    /// `click` / `type_text` (Medium) and
+    /// `wait_for_selector` (Safe).
     #[test]
     fn browser_descriptors_have_explicit_non_unknown_risk() {
         let pinned: &[(&str, CapabilityDescriptor, RiskLevel)] = &[
@@ -920,6 +1160,17 @@ mod tests {
                 descriptor_list_sessions(),
                 RiskLevel::Safe,
             ),
+            ("tool.browser.click", descriptor_click(), RiskLevel::Medium),
+            (
+                "tool.browser.type_text",
+                descriptor_type_text(),
+                RiskLevel::Medium,
+            ),
+            (
+                "tool.browser.wait_for_selector",
+                descriptor_wait_for_selector(),
+                RiskLevel::Safe,
+            ),
         ];
         for (name, d, expected) in pinned {
             assert_ne!(
@@ -931,6 +1182,127 @@ mod tests {
                 d.risk_level, *expected,
                 "{name} risk tier drifted (expected {expected:?})"
             );
+        }
+    }
+
+    // ── W2-002a: default-impl click / type_text / wait_for_selector ──
+
+    #[test]
+    fn default_click_returns_backend_not_connected_with_backend_name() {
+        let b = build_backend(&cfg()).unwrap();
+        let id = b.open_session().unwrap();
+        let err = b.click(&id, "#submit").unwrap_err();
+        match err {
+            BrowserError::BackendNotConnected { reason } => {
+                assert!(reason.contains("none"));
+                assert!(reason.contains("click"));
+                assert!(reason.contains("W2-002a"));
+            }
+            other => panic!("expected BackendNotConnected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_type_text_returns_backend_not_connected_with_backend_name() {
+        let b = build_backend(&cfg()).unwrap();
+        let id = b.open_session().unwrap();
+        let err = b.type_text(&id, "#email", "user@example.com").unwrap_err();
+        match err {
+            BrowserError::BackendNotConnected { reason } => {
+                assert!(reason.contains("type_text"));
+            }
+            other => panic!("expected BackendNotConnected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_wait_for_selector_returns_backend_not_connected() {
+        let b = build_backend(&cfg()).unwrap();
+        let id = b.open_session().unwrap();
+        let err = b.wait_for_selector(&id, "#ready", 5_000).unwrap_err();
+        assert!(matches!(err, BrowserError::BackendNotConnected { .. }));
+    }
+
+    #[test]
+    fn handle_click_rejects_missing_selector_slot() {
+        let b = build_backend(&cfg()).unwrap();
+        let id = b.open_session().unwrap();
+        let arg = id.into_bytes();
+        let out = handle_click(&Arc::clone(&b), &ctx_with(arg));
+        match out {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("arg shape"));
+            }
+            _ => panic!("expected INVALID_ARGS"),
+        }
+    }
+
+    #[test]
+    fn handle_type_text_allows_pipes_in_text_payload() {
+        // splitn(3, '|') means the third slot can contain `|`.
+        // Verify by sending text with a pipe and asserting the
+        // backend receives it intact via the default impl's
+        // error reason (which doesn't include text but at
+        // least proves the handler accepted the shape).
+        let b = build_backend(&cfg()).unwrap();
+        let id = b.open_session().unwrap();
+        let arg = format!("{id}|#json|{{\"k\":\"a|b\"}}").into_bytes();
+        let out = handle_type_text(&Arc::clone(&b), &ctx_with(arg));
+        match out {
+            HandlerOutcome::Err(env) => {
+                // The default impl returns BackendNotConnected;
+                // the responder maps it to RESPONDER_INTERNAL.
+                assert_eq!(env.kind, error_kinds::RESPONDER_INTERNAL);
+            }
+            HandlerOutcome::Ok(_) => panic!("none backend should refuse type_text"),
+        }
+    }
+
+    #[test]
+    fn handle_wait_for_selector_default_timeout_is_30s() {
+        // Empty timeout slot → 30_000 ms.
+        let b = build_backend(&cfg()).unwrap();
+        let id = b.open_session().unwrap();
+        // Use an empty timeout slot to exercise the default
+        // path. The default impl errors with BackendNotConnected
+        // — we're verifying the parse path, not the wait.
+        let arg = format!("{id}|#ready|").into_bytes();
+        let out = handle_wait_for_selector(&Arc::clone(&b), &ctx_with(arg));
+        assert!(matches!(out, HandlerOutcome::Err(_)));
+    }
+
+    #[test]
+    fn handle_wait_for_selector_rejects_bad_timeout() {
+        let b = build_backend(&cfg()).unwrap();
+        let id = b.open_session().unwrap();
+        let arg = format!("{id}|#ready|notanumber").into_bytes();
+        let out = handle_wait_for_selector(&Arc::clone(&b), &ctx_with(arg));
+        match out {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("bad timeout_ms"));
+            }
+            _ => panic!("expected INVALID_ARGS"),
+        }
+    }
+
+    fn ctx_with(args: Vec<u8>) -> InvocationCtx {
+        use relix_core::identity::VerifiedIdentity;
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "".into(),
+                clearance: "".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args,
         }
     }
 

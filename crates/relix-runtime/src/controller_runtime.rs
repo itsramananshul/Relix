@@ -1130,6 +1130,10 @@ fn register_node_type_handlers(
             manifest.add_capability(crate::nodes::tool::browser::descriptor_get_text());
             manifest.add_capability(crate::nodes::tool::browser::descriptor_screenshot());
             manifest.add_capability(crate::nodes::tool::browser::descriptor_list_sessions());
+            // W2-002a: click / type_text / wait_for_selector.
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_click());
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_type_text());
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_wait_for_selector());
         }
         // CW5: tool.mcp.* — registry + discovery surface
         // advertised when [tool.mcp] is configured AND the
