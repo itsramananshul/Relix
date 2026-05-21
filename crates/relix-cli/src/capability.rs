@@ -952,4 +952,57 @@ mod tests {
         assert!(!risk_filter_matches(&f, RiskLevel::Safe));
         assert!(!risk_filter_matches(&f, RiskLevel::Critical));
     }
+
+    /// PH-WEB-POST-RISK-CROSS: pin the cross-cutting behavior
+    /// that the Medium-tier `tool.web.post` capability:
+    /// - matches `--risk medium`,
+    /// - matches `--risk safe+`, `--risk low+`, `--risk medium+`,
+    /// - does NOT match `--risk safe`, `--risk low`, `--risk high`,
+    /// - does NOT match `--risk high+`, `--risk critical+`,
+    /// - does NOT match `--risk unknown`.
+    ///
+    /// Operators auditing for audit-worthy capabilities use
+    /// `--risk medium+`; this test catches accidental regrades
+    /// or filter-comparison flips before they break the audit
+    /// path.
+    #[test]
+    fn web_post_medium_tier_satisfies_audit_filters() {
+        // Build a descriptor that mirrors web_post_descriptor()
+        // — only the risk_level matters for the filter under
+        // test, so we don't need to import the runtime crate.
+        let mut cap = CapabilityDescriptor::unary("tool.web.post");
+        cap.risk_level = RiskLevel::Medium;
+
+        // Bare-tier filters.
+        assert!(
+            risk_filter_matches(&RiskFilter::Exact(RiskLevel::Medium), cap.risk_level),
+            "--risk medium must include tool.web.post"
+        );
+        assert!(
+            !risk_filter_matches(&RiskFilter::Exact(RiskLevel::Safe), cap.risk_level),
+            "--risk safe must NOT include tool.web.post"
+        );
+        assert!(
+            !risk_filter_matches(&RiskFilter::Exact(RiskLevel::High), cap.risk_level),
+            "--risk high must NOT include tool.web.post"
+        );
+        assert!(
+            !risk_filter_matches(&RiskFilter::Exact(RiskLevel::Unknown), cap.risk_level),
+            "--risk unknown must NOT include tool.web.post (it's audited)"
+        );
+
+        // At-or-above filters.
+        for at_least in [RiskLevel::Safe, RiskLevel::Low, RiskLevel::Medium] {
+            assert!(
+                risk_filter_matches(&RiskFilter::AtLeast(at_least), cap.risk_level),
+                "--risk {at_least:?}+ must include tool.web.post"
+            );
+        }
+        for at_least in [RiskLevel::High, RiskLevel::Critical] {
+            assert!(
+                !risk_filter_matches(&RiskFilter::AtLeast(at_least), cap.risk_level),
+                "--risk {at_least:?}+ must NOT include tool.web.post"
+            );
+        }
+    }
 }

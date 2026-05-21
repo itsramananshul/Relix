@@ -1162,6 +1162,38 @@ mod tests {
         assert!(matches!(d.risk_level, RiskLevel::Medium));
     }
 
+    /// PH-WEB-POST-RISK-CROSS: pin the risk tier of every shipped
+    /// web-tools descriptor as a sharp equality assertion (not
+    /// `matches!`). Catches drift if a future commit accidentally
+    /// regrades any of them — the descriptors are operator-facing
+    /// and the tier affects `--risk` filter behavior + the
+    /// validator's audit posture. None of them should ever be
+    /// Unknown (that would surface as a deployment warning).
+    #[test]
+    fn web_tools_descriptors_have_explicit_non_unknown_risk() {
+        for d in [
+            web_get_descriptor(),
+            web_search_descriptor(),
+            web_post_descriptor(),
+        ] {
+            assert_ne!(
+                d.risk_level,
+                RiskLevel::Unknown,
+                "{} unexpectedly defaulted to Unknown risk",
+                d.method_name
+            );
+            // Every web-tools capability touches the network →
+            // every one is Medium tier (controlled side effect
+            // outside the responder, gated by SSRF + DNS pin).
+            assert_eq!(
+                d.risk_level,
+                RiskLevel::Medium,
+                "{} should be Medium tier (network side-effect under SSRF gate)",
+                d.method_name
+            );
+        }
+    }
+
     #[test]
     fn web_post_request_minimal_decodes() {
         // Only `url` is required; every other field has a default.
