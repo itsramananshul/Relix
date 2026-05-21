@@ -91,6 +91,7 @@ mod chat;
 mod config;
 mod config_api;
 mod dashboard;
+mod dispatch_stats;
 mod flow;
 mod fs_audit;
 mod intervention_audit;
@@ -422,6 +423,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // status). Read-only — open/close go through the
         // existing libp2p dispatch.
         .route("/v1/browser/sessions", get(browser_sessions::sessions))
+        // W2-006c: proxy for `node.dispatch.stats` on any peer.
+        // Returns per-capability invocation + latency counters
+        // (lifetime, reset on peer restart). Read-only.
+        .route("/v1/dispatch/stats", get(dispatch_stats::stats))
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
