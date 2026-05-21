@@ -9,13 +9,13 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `e825be6 feat(tool): PH-FS-FUZZY + PH-FS-TREE + PH-FS-STAT filesystem parity`
+- **HEAD:** `4199b9b feat(web): PH-WEB-MARKDOWN tool.web_extract markdown mode`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
-- **Workspace tests:** 995 passing, 0 failures
+- **Workspace tests:** 1012 passing, 0 failures
   - relix-core: 60
   - relix-policy: 66
-  - relix-runtime: 615
+  - relix-runtime: 632
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli: 2
@@ -43,6 +43,7 @@ as the resume command.
 | 57c575d | PH-TERM-SHELL | tool.terminal.shell.{open,input,close} |
 | cf2ea48 | PH-TERM-CONTROL | tool.terminal.shell.control + D-010 logged |
 | e825be6 | PH-FS-FUZZY + PH-FS-TREE + PH-FS-STAT | filesystem Hermes parity |
+| 4199b9b | PH-WEB-MARKDOWN | tool.web_extract `markdown` mode — HTML → Markdown structural conversion |
 
 Plus 6 docs-only commits tallying each milestone into
 `docs/internal/recovered-execution-state.md`.
@@ -121,12 +122,16 @@ Gaps:
 - Command-boundary tracking inside a shell session (operators
   use their own sentinels today).
 
-### E. Web — no movement this session
+### E. Web — markdown extraction shipped
 
-`tool.web_fetch / web_get / web_search / web_extract /
-web.robots_check` already shipped. Hermes gaps: POST, cookies,
-URL safety (URLhaus), OSV check, crawl_limited, markdown
-extraction. All decision-free; pick at next session.
+`tool.web_fetch / web_get / web_search / web.robots_check`
+already shipped. `tool.web_extract` now also supports
+`markdown` mode (PH-WEB-MARKDOWN) — full HTML-to-Markdown
+conversion (headings, paragraphs, links, lists, code blocks,
+blockquotes, hr, emphasis, images). Hermes gaps remaining:
+POST, cookies, URL safety (URLhaus), OSV check, crawl_limited,
+explicit OpenGraph extraction (current meta mode handles it
+indirectly). All decision-free.
 
 ### F. PDF / document — no movement this session
 
