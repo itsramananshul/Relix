@@ -371,6 +371,18 @@ fn register_builtins(
             async move { handle_policy_simulate(&policy, &ctx) }
         })),
     );
+    // W2-007d: node.policy.recent_denials — bounded ring of
+    // recent policy-denied attempts on the local dispatch
+    // bridge. Pure read. Lets operators see who tried what
+    // that we refused without trawling the audit log.
+    let denial_ring = bridge.policy_denials_handle();
+    bridge.register(
+        "node.policy.recent_denials",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let ring = denial_ring.clone();
+            async move { handle_policy_recent_denials(&ring, &ctx) }
+        })),
+    );
     // Built-in: every node serves its own NodeManifest.
     let manifest_for_handler = manifest.clone();
     bridge.register(
@@ -427,6 +439,75 @@ fn register_builtins(
             .with_categories(["observe".into(), "policy".into()])
             .with_risk(relix_core::capability::RiskLevel::Safe),
     );
+    // W2-007d: recent denials descriptor.
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.policy.recent_denials")
+            .with_description(
+                "Bounded ring of recent policy-denied attempts (capacity 256, newest first). \
+                 Optional arg: max row count as a positive integer. \
+                 Returns tab-delim rows: at\\tmethod\\tcaller_subject_id\\tcaller_name\\trule\\treason, \
+                 followed by `count=N`. Resets on bridge restart.",
+            )
+            .with_categories(["observe".into(), "policy".into(), "read".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
+    );
+}
+
+/// W2-007d: handle `node.policy.recent_denials`. Optional arg
+/// is a positive integer max row count (default 100,
+/// server-capped at 500). Emits one tab-delim line per entry
+/// newest-first, plus trailing `count=N`.
+fn handle_policy_recent_denials(
+    ring: &std::sync::Arc<crate::dispatch::PolicyDenialRing>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    use relix_core::types::error_kinds;
+    use std::fmt::Write as _;
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("node.policy.recent_denials arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let max = if s.is_empty() {
+        100
+    } else {
+        match s.parse::<usize>() {
+            Ok(v) if v > 0 => v.min(500),
+            _ => {
+                return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                    kind: error_kinds::INVALID_ARGS,
+                    cause: format!(
+                        "node.policy.recent_denials: arg must be a positive integer (got '{s}')"
+                    ),
+                    retry_hint: 2,
+                    retry_after: None,
+                });
+            }
+        }
+    };
+    let rows = ring.snapshot_newest_first(max);
+    let count = rows.len();
+    let mut body = String::new();
+    for r in &rows {
+        // Strip tabs from free-form fields so the row format
+        // stays grep-friendly. The audit log keeps the
+        // canonical values.
+        let safe_reason = r.reason.replace(['\t', '\n'], " ");
+        let safe_name = r.caller_name.replace(['\t', '\n'], " ");
+        let _ = writeln!(
+            body,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            r.at, r.method, r.caller_subject_id, safe_name, r.rule, safe_reason
+        );
+    }
+    let _ = writeln!(body, "count={count}");
+    HandlerOutcome::Ok(body.into_bytes())
 }
 
 /// W2-007a: handle `node.policy.simulate`. Parses `<method>|<groups_csv>`,

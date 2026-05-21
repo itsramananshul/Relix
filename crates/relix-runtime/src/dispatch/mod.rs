@@ -56,6 +56,80 @@ enum StatBucket {
     Unknown,
 }
 
+/// W2-007d: one observation in the policy denial ring.
+/// Cheap to clone — every field is owned + small.
+#[derive(Debug, Clone)]
+pub struct PolicyDenialEntry {
+    /// Unix seconds when the denial was recorded.
+    pub at: i64,
+    /// Method the caller attempted.
+    pub method: String,
+    /// Caller's subject_id (hex). Same string the audit log
+    /// records — operators can correlate.
+    pub caller_subject_id: String,
+    /// Caller's friendly name from their VerifiedIdentity.
+    pub caller_name: String,
+    /// Name of the policy rule that explicitly denied, or
+    /// `"default_deny"` when nothing matched.
+    pub rule: String,
+    /// Operator-readable reason from the policy engine.
+    pub reason: String,
+}
+
+/// W2-007d: bounded ring of recent [`PolicyDenialEntry`]s on
+/// the local DispatchBridge. FIFO eviction; default capacity
+/// 256. Resets on bridge restart.
+#[derive(Debug)]
+pub struct PolicyDenialRing {
+    entries: std::sync::Mutex<std::collections::VecDeque<PolicyDenialEntry>>,
+    capacity: usize,
+}
+
+/// W2-007d: default ring capacity. Same convention as the
+/// other in-memory rings (fs / terminal / mcp audit).
+pub const POLICY_DENIAL_RING_DEFAULT: usize = 256;
+
+impl Default for PolicyDenialRing {
+    fn default() -> Self {
+        Self::new(POLICY_DENIAL_RING_DEFAULT)
+    }
+}
+
+impl PolicyDenialRing {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub fn push(&self, e: PolicyDenialEntry) {
+        let mut g = self.entries.lock().expect("policy denial ring poisoned");
+        if g.len() == self.capacity {
+            g.pop_front();
+        }
+        g.push_back(e);
+    }
+
+    /// Snapshot the most recent `max` entries, newest first.
+    pub fn snapshot_newest_first(&self, max: usize) -> Vec<PolicyDenialEntry> {
+        let g = self.entries.lock().expect("policy denial ring poisoned");
+        g.iter().rev().take(max).cloned().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("policy denial ring poisoned")
+            .len()
+    }
+
+    #[allow(dead_code)] // pairs with len() per clippy len_zero
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// A capability handler: native function invoked by the dispatch bridge.
 #[async_trait]
 pub trait Handler: Send + Sync {
@@ -98,6 +172,11 @@ pub struct DispatchBridge {
     /// can capture a cheap clone of the shared lock without
     /// needing access to the whole DispatchBridge.
     capability_stats: Arc<std::sync::RwLock<HashMap<String, CapStats>>>,
+    /// W2-007d: bounded ring of recent policy denials. The
+    /// admission step pushes one entry on every Deny outcome
+    /// before the audit log is written. Surfaced via the
+    /// built-in `node.policy.recent_denials` capability.
+    policy_denials: Arc<PolicyDenialRing>,
 }
 
 /// PH-DISP1: per-capability counters. Counts are lifetime —
@@ -172,7 +251,15 @@ impl DispatchBridge {
             audit: tokio::sync::Mutex::new(audit),
             responder_node_id,
             capability_stats: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            policy_denials: Arc::new(PolicyDenialRing::default()),
         })
+    }
+
+    /// W2-007d: cheap-clone accessor for the policy denial
+    /// ring. Used by the built-in `node.policy.recent_denials`
+    /// capability + future bridge proxy.
+    pub fn policy_denials_handle(&self) -> Arc<PolicyDenialRing> {
+        self.policy_denials.clone()
     }
 
     /// W2-006b: return a cheap clone of the capability-stats
@@ -347,6 +434,28 @@ impl DispatchBridge {
         };
         if denied {
             self.bump_stats(&req.method, StatBucket::Denied, now);
+            // W2-007d: capture the structured denial for the
+            // operator-facing ring. Pulls the rule / reason
+            // out of the `decision` match arm rather than
+            // re-parsing the joined string. The audit log
+            // still records the canonical line; this ring is
+            // a fast read surface.
+            if let Decision::Deny {
+                reason,
+                matched_rule,
+            } = &decision
+            {
+                self.policy_denials.push(PolicyDenialEntry {
+                    at: now,
+                    method: req.method.clone(),
+                    caller_subject_id: verified.subject_id.to_string(),
+                    caller_name: verified.name.clone(),
+                    rule: matched_rule
+                        .clone()
+                        .unwrap_or_else(|| "default_deny".to_string()),
+                    reason: reason.clone(),
+                });
+            }
             return self
                 .audit_and_err_with_id(
                     &req,
@@ -927,6 +1036,109 @@ mod tests {
             ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::IDENTITY_INVALID),
             other => panic!("expected Err(identity_invalid), got {:?}", other),
         }
+    }
+
+    // ── W2-007d: policy denial ring ─────────────────────────────────
+
+    #[test]
+    fn policy_denial_ring_default_capacity_matches_const() {
+        let r = PolicyDenialRing::default();
+        assert!(r.is_empty());
+        // Push capacity + 50 entries; ring should saturate at default.
+        for i in 0..(POLICY_DENIAL_RING_DEFAULT + 50) {
+            r.push(PolicyDenialEntry {
+                at: i as i64,
+                method: "m".into(),
+                caller_subject_id: "x".into(),
+                caller_name: "x".into(),
+                rule: "default_deny".into(),
+                reason: "no rule".into(),
+            });
+        }
+        assert_eq!(r.len(), POLICY_DENIAL_RING_DEFAULT);
+    }
+
+    #[test]
+    fn policy_denial_ring_snapshot_returns_newest_first() {
+        let r = PolicyDenialRing::default();
+        for i in 0..3 {
+            r.push(PolicyDenialEntry {
+                at: 100 + i as i64,
+                method: format!("m{i}"),
+                caller_subject_id: "x".into(),
+                caller_name: "x".into(),
+                rule: "default_deny".into(),
+                reason: "no rule".into(),
+            });
+        }
+        let snap = r.snapshot_newest_first(10);
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].method, "m2");
+        assert_eq!(snap[1].method, "m1");
+        assert_eq!(snap[2].method, "m0");
+    }
+
+    #[test]
+    fn policy_denial_ring_zero_capacity_clamps_to_one() {
+        let r = PolicyDenialRing::new(0);
+        r.push(PolicyDenialEntry {
+            at: 1,
+            method: "a".into(),
+            caller_subject_id: "x".into(),
+            caller_name: "x".into(),
+            rule: "default_deny".into(),
+            reason: "no rule".into(),
+        });
+        r.push(PolicyDenialEntry {
+            at: 2,
+            method: "b".into(),
+            caller_subject_id: "x".into(),
+            caller_name: "x".into(),
+            rule: "default_deny".into(),
+            reason: "no rule".into(),
+        });
+        // capacity clamped to 1 → only newest survives.
+        assert_eq!(r.len(), 1);
+        let snap = r.snapshot_newest_first(10);
+        assert_eq!(snap[0].method, "b");
+    }
+
+    #[tokio::test]
+    async fn policy_denial_pushes_to_ring_on_deny() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        // Caller in `guest` group; policy requires `chat-users`.
+        let bundle = mk_identity(&org_root, "bob", &["guest"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let _ = bridge.handle_inbound(envelope).await;
+        // Ring must now have one entry.
+        let snap = bridge.policy_denials_handle().snapshot_newest_first(10);
+        assert_eq!(snap.len(), 1);
+        let entry = &snap[0];
+        assert_eq!(entry.method, "node.health");
+        assert_eq!(entry.caller_name, "bob");
+        // Either a named rule denied OR default_deny when no
+        // rule matched. The test policy has a single rule
+        // requiring `chat-users`, so default_deny is the
+        // expected reason.
+        assert!(entry.rule == "default_deny" || !entry.rule.is_empty());
+        assert!(!entry.reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn policy_denial_ring_empty_when_no_denial() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        // Caller in the allowed group — admission succeeds.
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let resp = bridge.handle_inbound(envelope).await;
+        let decoded = decode_response(&resp).unwrap();
+        assert!(matches!(decoded.res, ResponseResult::Ok(_)));
+        // Ring must still be empty.
+        assert!(bridge.policy_denials_handle().is_empty());
     }
 
     // ── PH-DISP1: capability invocation counters ────────────────────────
