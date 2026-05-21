@@ -457,10 +457,23 @@ all pushed to origin/main):
 | PH-WAVE2G | 2c77e38 | bridge +6 | rolling rate-limit observation ring + dashboard badge |
 | PH-WAVE2H | c015cf3 | n/a | firehose row category CSS accents (H-event family) |
 | PH-WAVE2I | 9c02c8e | bridge +2 | auto-cooldown on rate-limit storm (closes ladder loop) |
+| PH-WAVE2J | 0a99235 | n/a | auto-cooldown vs operator-quarantine distinction on dashboard |
+| PH-WAVE2K | 5032f80 | n/a | consolidated /v1/providers/health ops endpoint |
+| PH-WAVE2L | 5190ab5 | cli +2 | relix-cli ops providers-health subcommand |
 
-Aggregate: ~9100+ LOC; runtime tests 291 → 419, bridge tests
-192 → 217, relix-core 33 → 61. Every milestone clean fmt +
-clippy + tests. Total workspace = 762 passing tests.
+Aggregate: ~9600+ LOC; runtime tests 291 → 419, bridge tests
+192 → 217, relix-core 33 → 61, relix-cli 54 → 56. Every
+milestone clean fmt + clippy + tests. Total workspace = 764
+passing tests.
+
+The PH-WAVE2 cluster (G..L) ships a complete bridge-side
+rate-limit ladder + ops surface: per-provider observation ring →
+auto-cooldown trigger → distinct dashboard banner → consolidated
+endpoint → CLI snapshot. Operators can see what's rate-limited,
+why the bridge stopped trying, and how the AI stack is overall —
+all without grep-driving logs. The remaining work is
+AI-controller-side cross-provider failover (which needs the
+router/executor work that PHASE H9 calls for).
 
 A deadlock was introduced and fixed during PH-WAVE2D: the
 initial `set_task_todos` impl called `self.list_task_todos`
