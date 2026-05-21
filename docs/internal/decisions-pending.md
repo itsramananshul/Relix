@@ -142,6 +142,29 @@ implications. ~1 hour of work.
 
 **Status.** open.
 
+### D-007  computer_use_tool backend — Relix-owned vs proxy?
+
+**Context.** Hermes ships `computer_use_tool` (mouse/keyboard
+/screenshot via VNC or HCB). Real ops value for "the agent
+should drive a desktop app." Requires a backend host that runs
+a real desktop session the tool can drive. Hermes integrates
+with Modal / Vercel Sandbox / Daytona / local X11.
+
+**Options.**
+- (a) Ship our own backend (Linux container w/ Xvfb + xdotool).
+  Operator self-hosts. Large work but Relix-shaped.
+- (b) Proxy through an external service. Small wrapper. Operator
+  pays the external service. Less Relix-shaped.
+- (c) Defer entirely. Browser automation (CW4) already covers
+  most "drive a webapp" cases. Desktop is a different shape.
+
+**Recommendation.** (c) defer. Computer_use is the niche-iest
+Hermes tool — most agent workflows are web/CLI. Revisit when
+an operator has a concrete desktop-driving workflow blocked
+without it.
+
+**Status.** open.
+
 ### D-006  Hermes "iteration budget + grace-call" — defer or adapt?
 
 **Context.** Hermes tracks `iteration_budget` per conversation
