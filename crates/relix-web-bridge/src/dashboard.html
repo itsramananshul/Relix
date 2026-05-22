@@ -2551,6 +2551,17 @@
           style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 140px;"
         />
         <button class="chip" id="metrics-refresh-btn">refresh</button>
+        <label for="metrics-auto-refresh" class="meta" style="margin-left: 8px;">auto:</label>
+        <select
+          id="metrics-auto-refresh"
+          title="auto-refresh interval — stops when you leave the Metrics page"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px;"
+        >
+          <option value="0">off</option>
+          <option value="5">5s</option>
+          <option value="15">15s</option>
+          <option value="60">60s</option>
+        </select>
         <span class="meta" id="metrics-status"></span>
       </div>
       <div class="card">
@@ -2871,6 +2882,14 @@ function setQueryParams(updates) {
 
 function showRoute(name) {
   const isSameRoute = currentRoute === name;
+  // W2-008e: tear down the metrics auto-refresh timer when
+  // navigating away from the Metrics page so polling stops
+  // while invisible. The applyMetricsAutoRefresh in
+  // enterMetrics re-installs it on return.
+  if (currentRoute === 'metrics' && name !== 'metrics' && metricsAutoRefreshTimer) {
+    clearInterval(metricsAutoRefreshTimer);
+    metricsAutoRefreshTimer = null;
+  }
   currentRoute = name;
   // Toggle sections
   document.querySelectorAll('section.page').forEach(s => {
@@ -8120,7 +8139,17 @@ function renderLatencySparkline(samples) {
 /* W2-006d: dashboard panel for the dispatch-stats snapshot.
    Reads /v1/dispatch/stats which proxies node.dispatch.stats
    over libp2p. Sorted by mean elapsed desc — operators see the
-   slowest capability first. */
+   slowest capability first.
+
+   W2-008e: auto-refresh — a single setInterval handle tracks
+   the currently-active polling cadence. The interval is
+   torn down when:
+     - operator picks "off" from the dropdown
+     - operator leaves the Metrics page (showRoute call
+       below clears the handle)
+   so the dashboard doesn't keep polling in the background
+   while invisible. */
+let metricsAutoRefreshTimer = null;
 function initMetrics() {
   const $refresh = document.getElementById('metrics-refresh-btn');
   if ($refresh) {
@@ -8135,10 +8164,43 @@ function initMetrics() {
       }
     });
   }
+  const $auto = document.getElementById('metrics-auto-refresh');
+  if ($auto) {
+    $auto.addEventListener('change', () => {
+      applyMetricsAutoRefresh(parseInt($auto.value, 10) || 0);
+    });
+  }
+}
+
+function applyMetricsAutoRefresh(seconds) {
+  // Tear down any existing timer before installing a new one.
+  if (metricsAutoRefreshTimer) {
+    clearInterval(metricsAutoRefreshTimer);
+    metricsAutoRefreshTimer = null;
+  }
+  if (!seconds || seconds <= 0) return;
+  metricsAutoRefreshTimer = setInterval(() => {
+    // Belt-and-braces: if we somehow drift off the page
+    // without the showRoute teardown firing, self-cancel.
+    if (currentRoute !== 'metrics') {
+      clearInterval(metricsAutoRefreshTimer);
+      metricsAutoRefreshTimer = null;
+      return;
+    }
+    loadMetrics();
+  }, seconds * 1000);
 }
 
 function enterMetrics() {
   loadMetrics();
+  // Re-apply the operator's last selected interval on
+  // page re-entry. The <select> value persists across
+  // hashchanges (it's just DOM state), so a refresh / nav
+  // back to Metrics resumes the same cadence.
+  const $auto = document.getElementById('metrics-auto-refresh');
+  if ($auto) {
+    applyMetricsAutoRefresh(parseInt($auto.value, 10) || 0);
+  }
 }
 
 function currentMetricsPeer() {
