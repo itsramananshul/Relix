@@ -4624,6 +4624,79 @@ function initTasks() {
    ordered list into the textarea and submit to replace the
    whole list (server-side: H8 redactor scrubs each text). */
 let todoCurrentTaskId = null;
+// PH-DELEGATE-DASH: delegations panel on the task detail
+// view. Shows two pieces:
+//   - For a parent task: list of children with goal preview,
+//     status badge, and a link to each child's task detail.
+//   - For a child task: a back-link to the parent. We detect
+//     "is a child" by checking origin_surface = 'delegation'
+//     and finding a delegated_to edge where this task is the
+//     related_task_id.
+async function fetchDelegationsPanel(taskId, task) {
+  const $slot = document.getElementById('delegations-slot');
+  if (!$slot) return;
+  $slot.innerHTML = '';
+  let html = '';
+  try {
+    const r = await fetch('/v1/delegate/list/' + encodeURIComponent(taskId));
+    if (r.ok) {
+      const j = await r.json();
+      const children = j.delegations || [];
+      if (children.length > 0) {
+        html += '<div class="delegations-block" style="padding: 8px 14px;">'
+          + '<h3>Delegations</h3>'
+          + '<table class="data"><thead><tr>'
+          + '<th>child</th><th>goal</th><th>status</th><th>created</th>'
+          + '</tr></thead><tbody>';
+        for (const d of children) {
+          const childHref = '#/tasks/' + encodeURIComponent(d.child_task_id);
+          const created = d.created_at
+            ? new Date(d.created_at * 1000).toLocaleString()
+            : '—';
+          html += '<tr>'
+            + '<td><a class="id" href="' + childHref + '">'
+            + escapeHtml(shortenId(d.child_task_id)) + '</a></td>'
+            + '<td>' + escapeHtml(d.goal_preview || '') + '</td>'
+            + '<td><span class="badge ' + escapeHtml(d.status) + '">'
+            + escapeHtml(d.status) + '</span></td>'
+            + '<td>' + created + '</td>'
+            + '</tr>';
+        }
+        html += '</tbody></table></div>';
+      }
+    }
+  } catch (e) {
+    // Silent — the panel is non-critical; an empty slot is
+    // fine when the bridge can't reach the coordinator.
+  }
+  // Back-link for child tasks. The task summary carries
+  // origin_surface; we use the existing edges list to find
+  // the parent.
+  if (task && task.origin_surface === 'delegation') {
+    try {
+      const er = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/edges');
+      if (er.ok) {
+        const ej = await er.json();
+        const edges = ej.edges || [];
+        const inbound = edges.find(e =>
+          e.edge_type === 'delegated_to'
+          && e.related_task_id === taskId);
+        if (inbound && inbound.task_id) {
+          const parentHref = '#/tasks/' + encodeURIComponent(inbound.task_id);
+          html += '<div class="delegations-block" style="padding: 8px 14px;">'
+            + '<h3>Delegated from</h3>'
+            + '<a class="id" href="' + parentHref + '">'
+            + escapeHtml(shortenId(inbound.task_id)) + '</a>'
+            + '</div>';
+        }
+      }
+    } catch (e) {
+      // silent — same rationale as above.
+    }
+  }
+  $slot.innerHTML = html;
+}
+
 async function fetchTodoPanel(taskId) {
   todoCurrentTaskId = taskId;
   try {
@@ -5596,6 +5669,11 @@ function renderDetail(l) {
     // when the task has no todos so a stale list doesn't
     // flash before the fetch lands.
     + '<div id="todo-slot"></div>'
+    // PH-DELEGATE-DASH: delegations panel — fetched async by
+    // fetchDelegationsPanel after the detail renders. Shows
+    // children for parent tasks and a back-link for child
+    // tasks; empty slot otherwise.
+    + '<div id="delegations-slot"></div>'
     + eventsBlock
     + xrefBlock;
   if (l.task && l.task.task_id) {
@@ -5603,6 +5681,8 @@ function renderDetail(l) {
     // PH-DASH2: hydrate the todo widget after the rest of
     // the detail renders.
     fetchTodoPanel(l.task.task_id);
+    // PH-DELEGATE-DASH: hydrate the delegations panel.
+    fetchDelegationsPanel(l.task.task_id, l.task);
   }
   // Fire-and-forget correlation lookup. Status guards
   // mean we only fetch when the operator would actually
