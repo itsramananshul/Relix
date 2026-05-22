@@ -93,6 +93,45 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// W2-007b mirror: ask a peer's PolicyEngine "would this
+    /// caller (with these groups) calling this method be
+    /// allowed?" without invoking the method. Hits
+    /// `GET /v1/policy/simulate`.
+    PolicySimulate {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Target peer alias.
+        #[arg(long, default_value = "tool")]
+        peer: String,
+        /// Method to simulate (e.g. `tool.web_fetch`).
+        #[arg(long)]
+        method: String,
+        /// Comma-separated groups list (e.g.
+        /// `chat-users,operators`). Empty = inherit caller.
+        #[arg(long, default_value = "")]
+        groups: String,
+        /// Raw JSON instead of the pretty summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// W2-007e mirror: recent policy-denied attempts ring
+    /// (capacity 256, peer-restart resets). Hits
+    /// `GET /v1/policy/denials`.
+    PolicyDenials {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Target peer alias.
+        #[arg(long, default_value = "tool")]
+        peer: String,
+        /// Maximum entries (default 100, server caps at 500).
+        #[arg(long, default_value_t = 100usize)]
+        max: usize,
+        /// Raw JSON instead of the table view.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Recent cross-task events from /v1/tasks/events/recent.
     /// Mirrors the dashboard firehose for terminal operators
     /// — shows the H2 one-line summary projection per row.
@@ -138,6 +177,19 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => route_test(&bridge, &candidates, json).await,
         Cmd::DispatchStats { bridge, peer, json } => dispatch_stats(&bridge, &peer, json).await,
+        Cmd::PolicySimulate {
+            bridge,
+            peer,
+            method,
+            groups,
+            json,
+        } => policy_simulate(&bridge, &peer, &method, &groups, json).await,
+        Cmd::PolicyDenials {
+            bridge,
+            peer,
+            max,
+            json,
+        } => policy_denials(&bridge, &peer, max, json).await,
     }
 }
 
@@ -689,6 +741,198 @@ async fn dispatch_stats(
     Ok(())
 }
 
+// W2-007b CLI mirror: GET /v1/policy/simulate
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct PolicySimulateResp {
+    #[serde(default)]
+    peer: String,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    decision: String,
+    #[serde(default)]
+    matched_rule: Option<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn policy_simulate(
+    bridge: &str,
+    peer: &str,
+    method: &str,
+    groups: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let method_trim = method.trim();
+    if method_trim.is_empty() {
+        return Err("--method required (e.g. `--method tool.web_fetch`)".into());
+    }
+    let mut url = format!(
+        "{}/v1/policy/simulate?peer={}&method={}",
+        bridge.trim_end_matches('/'),
+        urlencoding(peer),
+        urlencoding(method_trim),
+    );
+    let groups_trim = groups.trim();
+    if !groups_trim.is_empty() {
+        url.push_str("&groups=");
+        url.push_str(&urlencoding(groups_trim));
+    }
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let r: PolicySimulateResp = serde_json::from_str(&body)
+        .map_err(|e| format!("decode /v1/policy/simulate body: {e} (body={body})"))?;
+    let groups_label = if r.groups.is_empty() {
+        "(no groups)".to_string()
+    } else {
+        r.groups.join(",")
+    };
+    println!("peer={p}  method={m}", p = r.peer, m = r.method);
+    println!("groups={g}", g = groups_label);
+    println!("decision={d}", d = r.decision);
+    println!(
+        "matched_rule={r}",
+        r = r.matched_rule.as_deref().unwrap_or("-")
+    );
+    if !r.reason.is_empty() {
+        println!("reason={r}", r = r.reason);
+    }
+    Ok(())
+}
+
+// W2-007e CLI mirror: GET /v1/policy/denials
+
+#[derive(Debug, Deserialize)]
+struct PolicyDenialsResp {
+    #[serde(default)]
+    peer: String,
+    #[serde(default)]
+    denials: Vec<PolicyDenialRow>,
+    #[serde(default)]
+    count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+// caller_subject_id is preserved for forensic identity and
+// future "--show-subject" mode; the default table is too
+// narrow to display the full 32-byte fingerprint.
+#[allow(dead_code)]
+struct PolicyDenialRow {
+    #[serde(default)]
+    at: i64,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    caller_subject_id: String,
+    #[serde(default)]
+    caller_name: String,
+    #[serde(default)]
+    rule: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn policy_denials(
+    bridge: &str,
+    peer: &str,
+    max: usize,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/v1/policy/denials?peer={}&max={}",
+        bridge.trim_end_matches('/'),
+        urlencoding(peer),
+        max,
+    );
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let r: PolicyDenialsResp = serde_json::from_str(&body)
+        .map_err(|e| format!("decode /v1/policy/denials body: {e} (body={body})"))?;
+    if r.denials.is_empty() {
+        println!(
+            "(no denials in ring on peer '{p}' — count={c})",
+            p = r.peer,
+            c = r.count
+        );
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let when_h = "when";
+    let method_h = "method";
+    let caller_h = "caller";
+    let rule_h = "rule";
+    let reason_h = "reason";
+    println!("{when_h:<10}  {method_h:<28}  {caller_h:<16}  {rule_h:<24}  {reason_h}");
+    for d in &r.denials {
+        let age = (now - d.at).max(0);
+        let when = format_age(age);
+        let method = truncate(&d.method, 28);
+        let caller = truncate(&d.caller_name, 16);
+        let rule = truncate(&d.rule, 24);
+        println!(
+            "{when:<10}  {method:<28}  {caller:<16}  {rule:<24}  {reason}",
+            when = when,
+            method = method,
+            caller = caller,
+            rule = rule,
+            reason = d.reason,
+        );
+    }
+    println!("count={}", r.count);
+    Ok(())
+}
+
+/// W2-007e: minimal "Xs ago" / "Xm ago" / "Xh ago" formatter.
+fn format_age(secs: i64) -> String {
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    format!("{}h ago", secs / 3600)
+}
+
+/// Tiny URL-encoding helper. `urlencoding` crate isn't in
+/// the workspace and the operator-facing values here are
+/// short identifiers — manual escaping is fine.
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let is_safe = matches!(
+            b,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+                | b'-' | b'_' | b'.' | b'~'
+                | b',' | b'/'
+        );
+        if is_safe {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -890,6 +1134,79 @@ mod tests {
         assert_eq!(s.chars().count(), 5);
         // The peak (20) should map to the tallest bar.
         assert!(s.contains('█'));
+    }
+
+    #[test]
+    fn format_age_renders_buckets() {
+        assert_eq!(format_age(0), "0s ago");
+        assert_eq!(format_age(59), "59s ago");
+        assert_eq!(format_age(60), "1m ago");
+        assert_eq!(format_age(3599), "59m ago");
+        assert_eq!(format_age(3600), "1h ago");
+        assert_eq!(format_age(36000), "10h ago");
+    }
+
+    #[test]
+    fn urlencoding_passes_safe_chars() {
+        assert_eq!(urlencoding("tool.web_fetch"), "tool.web_fetch");
+        assert_eq!(urlencoding("a,b/c-d.e_f~g"), "a,b/c-d.e_f~g");
+    }
+
+    #[test]
+    fn urlencoding_escapes_specials() {
+        assert_eq!(urlencoding(" "), "%20");
+        assert_eq!(urlencoding("?"), "%3F");
+        assert_eq!(urlencoding("="), "%3D");
+        assert_eq!(urlencoding("&"), "%26");
+    }
+
+    #[test]
+    fn policy_simulate_resp_parses() {
+        let body = r#"{
+            "peer": "tool",
+            "method": "tool.web_fetch",
+            "groups": ["chat-users", "operators"],
+            "decision": "allow",
+            "matched_rule": "web_fetch_chat",
+            "reason": "explicit allow"
+        }"#;
+        let r: PolicySimulateResp = serde_json::from_str(body).unwrap();
+        assert_eq!(r.decision, "allow");
+        assert_eq!(r.matched_rule.as_deref(), Some("web_fetch_chat"));
+        assert_eq!(r.groups.len(), 2);
+    }
+
+    #[test]
+    fn policy_simulate_resp_handles_missing_rule() {
+        let body = r#"{
+            "peer": "tool",
+            "method": "tool.unknown",
+            "groups": [],
+            "decision": "deny",
+            "matched_rule": null,
+            "reason": "default deny"
+        }"#;
+        let r: PolicySimulateResp = serde_json::from_str(body).unwrap();
+        assert_eq!(r.decision, "deny");
+        assert!(r.matched_rule.is_none());
+    }
+
+    #[test]
+    fn policy_denials_resp_parses() {
+        let body = r#"{
+            "peer": "tool",
+            "denials": [
+                {"at": 1716, "method": "tool.web_fetch",
+                 "caller_subject_id": "abcd", "caller_name": "bob",
+                 "rule": "default_deny", "reason": "no rule matched"}
+            ],
+            "count": 1
+        }"#;
+        let r: PolicyDenialsResp = serde_json::from_str(body).unwrap();
+        assert_eq!(r.count, 1);
+        assert_eq!(r.denials.len(), 1);
+        assert_eq!(r.denials[0].method, "tool.web_fetch");
+        assert_eq!(r.denials[0].caller_name, "bob");
     }
 
     #[test]
