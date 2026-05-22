@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `1d61339 feat(cli): W2-008f — --csv flag on relix-cli ops events`
+- **HEAD:** `06666d7 feat(cli): W2-008h — relix-cli ops openwebui-setup`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -52,19 +52,20 @@ as the resume command.
     quick-add workflow. Visual-editor sub-items (slash
     commands, drag-to-insert, variable picker, condition
     builder) deferred per spec ("DO NOT overcomplicate").
-  - **W2-008 (Local-first):** CLOSED for the operator
-    surface — `relix-cli doctor` env health (W2-008a) +
+  - **W2-008 (Local-first):** CLOSED end-to-end —
+    `relix-cli doctor` env health (W2-008a) +
     `scripts/demo-smoke.sh` bash smoke (W2-008b) +
     `relix-cli ops smoke` Rust smoke (W2-008c) +
     `relix-cli ops tail` live firehose tail (W2-008d) +
     Metrics page auto-refresh (W2-008e) +
-    `relix-cli ops events --csv` spreadsheet dump (W2-008f).
-    One-command startup (`scripts/relix-mesh-up.sh`)
-    predates this wave. Remaining: Open WebUI auto-
-    config, Docker reliability.
-- **Workspace tests:** **1294 passing on default features**;
+    `relix-cli ops events --csv` spreadsheet dump (W2-008f) +
+    multi-stage Dockerfile + ops walkthrough (W2-008g) +
+    `relix-cli ops openwebui-setup` connection block
+    (W2-008h). One-command startup
+    (`scripts/relix-mesh-up.sh`) predates this wave.
+- **Workspace tests:** **1299 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
-  - relix-cli: 140 (+4 W2-008f csv_field)
+  - relix-cli: 145 (+5 W2-008h port_from_bridge + models)
   - relix-policy: 72
   - relix-runtime: 742
   - relix-runtime router_node integration: 6
