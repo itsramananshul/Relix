@@ -1370,7 +1370,10 @@ mod tests {
             "function fetchLineageGraph",
             "function renderLineagePanel",
             "id=\"lineage-slot\"",
-            "/lineage?depth=",
+            // Path moved to `/lineage_graph?depth=` so it no
+            // longer collides with the single-task lineage
+            // envelope at `/v1/tasks/:id/lineage`.
+            "/lineage_graph?depth=",
             "Execution lineage",
         ] {
             assert!(body.contains(needle), "M66 landmark `{needle}` missing");

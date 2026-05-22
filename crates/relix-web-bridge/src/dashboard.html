@@ -4568,13 +4568,15 @@ function renderTodoPanel(payload) {
   }
 }
 
-/* M66: execution-lineage panel. Fetches /v1/tasks/:id/lineage
-   and renders the related-tasks list + edge count + honest
-   note about which edge types have producers. Empty / fail
-   states stay quiet so the panel never invents structure. */
+/* M66: execution-lineage panel. Fetches /v1/tasks/:id/lineage_graph
+   (BFS over task_edges) and renders the related-tasks list + edge
+   count + honest note about which edge types have producers. The
+   single-task lineage envelope lives at /v1/tasks/:id/lineage —
+   distinct path so the two don't collide on the axum router. Empty
+   / fail states stay quiet so the panel never invents structure. */
 async function fetchLineageGraph(taskId) {
   try {
-    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/lineage?depth=4');
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/lineage_graph?depth=4');
     if (!r.ok) {
       renderLineagePanel(null);
       return;

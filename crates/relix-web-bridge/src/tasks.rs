@@ -2229,10 +2229,13 @@ pub struct LineageResponse {
     pub note: String,
 }
 
-/// `GET /v1/tasks/:id/lineage?depth=N` — BFS execution
+/// `GET /v1/tasks/:id/lineage_graph?depth=N` — BFS execution
 /// lineage. Returns the set of related tasks + the edges
 /// connecting them. Today only `retried_from` populates the
-/// graph (intra-task only).
+/// graph (intra-task only). Distinct path from
+/// `/v1/tasks/:id/lineage` so the routes don't collide —
+/// the single-task lineage envelope owns `/lineage` and this
+/// graph view owns `/lineage_graph`.
 pub async fn lineage_graph(
     State(state): State<AppState>,
     Path(id): Path<String>,
