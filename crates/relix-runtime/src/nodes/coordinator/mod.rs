@@ -143,6 +143,7 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
+pub mod cron;
 pub mod event_summary;
 pub use event_summary::{summarize_event, summarize_event_parts};
 
