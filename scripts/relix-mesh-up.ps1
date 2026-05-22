@@ -39,9 +39,20 @@ param(
     [int]$AiPort            = 19712,
     [int]$ToolPort          = 19713,
     [int]$CoordinatorPort   = 19714,
+    [int]$TelegramPort      = 19715,
     [switch]$ToolAllowHttp,
     [switch]$NoTool,
-    [switch]$NoCoordinator
+    [switch]$NoCoordinator,
+    # Telegram channel is opt-in. Enable by setting
+    #   $env:RELIX_TELEGRAM = "1"
+    #   $env:RELIX_TELEGRAM_BOT_TOKEN = "<botfather-token>"
+    # before invoking this script. Optional:
+    #   $env:RELIX_TELEGRAM_OPERATOR_CHAT_ID = "<chat_id>"
+    #   $env:RELIX_TELEGRAM_ALLOWED_USERS    = "42,1234"  # comma-separated
+    # If RELIX_TELEGRAM=1 but RELIX_TELEGRAM_BOT_TOKEN is unset, the
+    # telegram controller will boot but its long-poll loop will idle
+    # (the bot stays offline; the dashboard reports `online=false`).
+    [switch]$NoTelegram
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,7 +77,12 @@ $MemKey         = "dev-keys/$Run-memory.key"
 $AiKey          = "dev-keys/$Run-ai.key"
 $ToolKey        = "dev-keys/$Run-tool.key"
 $CoordinatorKey = "dev-keys/$Run-coordinator.key"
+$TelegramKey    = "dev-keys/$Run-telegram.key"
 $BridgeKey      = "dev-keys/$Run-bridge.key"
+# Telegram is opt-in. Default off so existing operator
+# workflows are unaffected; explicitly set $env:RELIX_TELEGRAM=1
+# to enable.
+$TelegramEnabled = ($env:RELIX_TELEGRAM -eq '1') -and (-not $NoTelegram.IsPresent)
 $Policy     = "configs/policies/$Run.toml"
 $BridgeHttp = "127.0.0.1:$BridgePort"
 
@@ -88,6 +104,7 @@ $MemConfig         = "$DataBase/memory.toml"
 $AiConfig          = "$DataBase/ai.toml"
 $ToolConfig        = "$DataBase/tool.toml"
 $CoordinatorConfig = "$DataBase/coordinator.toml"
+$TelegramConfig    = "$DataBase/telegram.toml"
 $BridgeConfig      = "$DataBase/bridge.toml"
 $Peers             = "$DataBase/peers.toml"
 
@@ -237,6 +254,62 @@ max_output_chars = 200000
     New-Item -ItemType Directory -Force -Path "$DataBase/fs-jail" | Out-Null
 }
 
+# 4.6) Telegram controller config. Opt-in via $env:RELIX_TELEGRAM=1.
+#      The telegram node dials the memory/ai/coordinator peers
+#      directly so it needs its own [peers] entries — its
+#      outbound client only needs to know the addresses below.
+if ($TelegramEnabled) {
+    $tgAllowed = $env:RELIX_TELEGRAM_ALLOWED_USERS
+    if (-not $tgAllowed) { $tgAllowed = '' }
+    $allowedToml = if ($tgAllowed -eq '') {
+        '[]'
+    } else {
+        '[' + $tgAllowed + ']'
+    }
+    $opChat = if ($env:RELIX_TELEGRAM_OPERATOR_CHAT_ID) {
+        $env:RELIX_TELEGRAM_OPERATOR_CHAT_ID
+    } else {
+        '0'
+    }
+@"
+[controller]
+name = "$Run-telegram"
+node_type = "telegram"
+listen_port = $TelegramPort
+
+[identity]
+key_path = "$TelegramKey"
+
+[trust]
+org_root_key_path = "$OrgPub"
+
+[policy]
+file = "$Policy"
+
+[telegram]
+token_env = "RELIX_TELEGRAM_BOT_TOKEN"
+allowed_users = $allowedToml
+operator_chat_id = $opChat
+messages_ring_capacity = 200
+flow_template = "flows/chat_template.sol"
+session_db_path = "$DataBase/telegram_sessions.db"
+poll_interval_secs = 1
+approval_poll_interval_secs = 15
+
+[telegram.memory_peer]
+addr = "/ip4/127.0.0.1/tcp/$MemPort"
+
+[telegram.ai_peer]
+addr = "/ip4/127.0.0.1/tcp/$AiPort"
+deadline_secs = 60
+
+[telegram.coord_peer]
+addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
+
+[peers]
+"@ | Set-Content -Encoding utf8 $TelegramConfig
+}
+
 # 4.5) Coordinator controller config. Owns the durable Task ledger
 #      (SQLite). Optional -- pass -NoCoordinator to skip.
 if (-not $NoCoordinator) {
@@ -382,6 +455,16 @@ allow_groups = ["chat-users"]
 name = "task_list"
 method = "task.list"
 allow_groups = ["chat-users"]
+
+[[rules]]
+name = "telegram_status"
+method = "telegram.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "telegram_messages_recent"
+method = "telegram.messages_recent"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
 # 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.
@@ -406,6 +489,14 @@ if (-not $NoCoordinator) {
 
 [peers.coordinator]
 addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
+"@
+}
+if ($TelegramEnabled) {
+    $peersToml += @"
+
+
+[peers.telegram]
+addr = "/ip4/127.0.0.1/tcp/$TelegramPort"
 "@
 }
 $peersToml | Set-Content -Encoding utf8 $Peers
@@ -457,11 +548,13 @@ $MemLog         = "$DataBase/memory.log"
 $AiLog          = "$DataBase/ai.log"
 $ToolLog        = "$DataBase/tool.log"
 $CoordinatorLog = "$DataBase/coordinator.log"
+$TelegramLog    = "$DataBase/telegram.log"
 $BridgeLog      = "$DataBase/bridge.log"
 $MemErr         = "$DataBase/memory.err.log"
 $AiErr          = "$DataBase/ai.err.log"
 $ToolErr        = "$DataBase/tool.err.log"
 $CoordinatorErr = "$DataBase/coordinator.err.log"
+$TelegramErr    = "$DataBase/telegram.err.log"
 $BridgeErr      = "$DataBase/bridge.err.log"
 
 $env:RELIX_DATA_DIR = 'dev-data'
@@ -521,6 +614,12 @@ if (-not $NoCoordinator) {
 } else {
     Write-Host "  coord port:    (disabled - -NoCoordinator)"
 }
+if ($TelegramEnabled) {
+    $hasToken = if ($env:RELIX_TELEGRAM_BOT_TOKEN) { 'token=set' } else { 'token=MISSING' }
+    Write-Host ("  telegram port: tcp/{0}  ({1})" -f $TelegramPort, $hasToken)
+} else {
+    Write-Host "  telegram port: (disabled - set RELIX_TELEGRAM=1 to enable)"
+}
 Write-Host "  bridge HTTP:   http://$BridgeHttp"
 Write-Host "  data dir:      $DataBase"
 Write-Host ""
@@ -546,6 +645,22 @@ try {
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $CoordinatorConfig -OutLog $CoordinatorLog -ErrLog $CoordinatorErr -RustLog 'relix_runtime=info') )
     }
 
+    if ($TelegramEnabled) {
+        # Mint the telegram bundle on demand so this node has its
+        # own delegated identity (same pattern as the bridge).
+        if (-not (Test-Path $TelegramKey)) {
+            & $Cli identity new-client --client-key $TelegramKey
+            if ($LASTEXITCODE -ne 0) { throw "telegram identity new-client failed" }
+        }
+        $TelegramBundlePath = "dev-keys/$Run-telegram.bundle"
+        if (-not (Test-Path $TelegramBundlePath)) {
+            & $Cli identity mint --root-key $OrgKey --name telegram --groups chat-users --out $TelegramBundlePath
+            if ($LASTEXITCODE -ne 0) { throw "telegram identity mint failed" }
+        }
+        Write-Host "starting telegram controller ..."
+        [void]$started.Add( (Start-Node -Exe $Controller -Cfg $TelegramConfig -OutLog $TelegramLog -ErrLog $TelegramErr -RustLog 'relix_runtime=info,relix_telegram=info') )
+    }
+
     if (-not (Wait-Log -Path $MemLog -Needle 'transport listening' -Desc 'memory controller')) { throw 'memory controller never came up' }
     if (-not (Wait-Log -Path $AiLog  -Needle 'transport listening' -Desc 'ai controller'))     { throw 'ai controller never came up' }
     if (-not $NoTool) {
@@ -553,6 +668,9 @@ try {
     }
     if (-not $NoCoordinator) {
         if (-not (Wait-Log -Path $CoordinatorLog -Needle 'transport listening' -Desc 'coordinator controller')) { throw 'coordinator controller never came up' }
+    }
+    if ($TelegramEnabled) {
+        if (-not (Wait-Log -Path $TelegramLog -Needle 'transport listening' -Desc 'telegram controller')) { throw 'telegram controller never came up' }
     }
     Start-Sleep -Milliseconds 400
 
@@ -608,6 +726,7 @@ try {
     Write-Host "  $AiLog"
     if (-not $NoTool)        { Write-Host "  $ToolLog" }
     if (-not $NoCoordinator) { Write-Host "  $CoordinatorLog" }
+    if ($TelegramEnabled)    { Write-Host "  $TelegramLog" }
     Write-Host "  $BridgeLog"
     Write-Host ""
     Write-Host "PIDs (this script will only stop these on Ctrl-C):"

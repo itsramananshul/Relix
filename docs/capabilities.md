@@ -51,6 +51,21 @@ before the backend (visibility + stable contract + honesty).
 | `memory.agent_read` (W2-MEMORY-1) | live | Read persistent agent + user memory for a subject_id. Returns `agent_bytes=N\|user_bytes=M\n<bytes>`. See [agent-memory.md](agent-memory.md). |
 | `memory.agent_write` (W2-MEMORY-1) | live | add/replace/remove/read one memory target. Arg: `subject_id\|target\|action\|data`. Targets: `agent` (cap 2200 chars) / `user` (cap 1375). Entries separated by `§`. |
 | `memory.agent_curate` (W2-MEMORY-CURATOR) | live | Asks the AI peer to consolidate / drop stale entries for one subject's agent + user memory. Arg: `subject_id\|ai_peer_alias`. Returns pipe-delim summary with before/after counts. Existing memory is preserved on any AI failure. See [agent-memory.md](agent-memory.md#memory-curator). |
+| `memory.curator_status` (W2-MEMORY-CURATOR) | live | Read-only view of the scheduler's live state: enabled flag, interval, last/next run timestamps, last run summary (agents_reviewed / agents_curated / total_chars_saved). Wire body is pipe-delim `key=value`, with `-1` sentinel for "no run yet". Bridge proxies as `GET /v1/memory/curator/status`. |
+
+## Telegram channel node (`crates/relix-runtime/src/nodes/telegram/`)
+
+| Method | Status | Notes |
+|---|---|---|
+| `telegram.status` | live | Read-only bot online state + identity. Arg: `""`. Returns `online=<bool>\|username=<str>\|first_name=<str>\|user_id=<i64>\|messages_seen=<u64>\|last_message_at=<i64>\n` (`-1` sentinel == "no message yet"). Bridge proxies as `GET /v1/telegram/status`. |
+| `telegram.messages_recent` | live | Last N inbound messages from a bounded in-memory ring (capacity 200), newest-first. Arg: `<limit>` (defaults to 20). Returns tab-separated `ts\tfrom_user_id\tfrom_username\tchat_id\ttext_preview\n` rows. Preview is truncated to 100 chars; tabs / newlines replaced with spaces. Bridge proxies as `GET /v1/telegram/messages/recent?limit=N`. |
+
+Outbound: the telegram node also dials `memory.write_turn`,
+`memory.recent_for_session`, `memory.agent_read`,
+`memory.agent_write`, `ai.chat`, `task.create`, `task.update`,
+`task.event`, and `task.list` against its configured peers — these
+aren't telegram-specific capabilities; they're the existing methods
+the channel consumes as a normal mesh participant.
 
 ## AI node (`crates/relix-runtime/src/nodes/ai/`)
 

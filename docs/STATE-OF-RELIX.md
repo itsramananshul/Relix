@@ -477,14 +477,24 @@ Source: `crates/relix-cli/src/main.rs`.
 Things that exist in the source tree but are not complete. Cited
 honestly — these are real code that runs, but ships with a known gap.
 
-### 6.1 Telegram channel — scaffold only
+### 6.1 Telegram channel — shipped
 
-`relix-telegram` ships config validation, identity-derivation (per-Telegram-user
-subject ids via blake3), a `BotApi` trait, a `MockBotApi` test double,
-and a session-store stub. **There is no live HTTPS client and no
-controller binary wiring.** Dashboard `#/telegram` page exists but
-talks to bridge config endpoints, not a live bot. Operators cannot
-send a Telegram message through Relix today.
+`relix-telegram` now ships a live `BotApi` HTTPS client
+(reqwest + rustls, no openssl) covering getMe / getUpdates /
+sendMessage / answerCallbackQuery / editMessageText / sendChatAction
+with 429 + 5xx retry semantics. `node_type = "telegram"` is wired
+into the controller binary; it long-polls for inbound messages,
+enforces `allowed_users`, handles `/start /help /status /memory
+/forget /approve /reject`, runs the equivalent of `flows/chat_template.sol`
+(`memory.recent_for_session` → `ai.chat` → `memory.write_turn`), creates
+a coordinator task per turn with `origin_surface = "telegram"`, and
+optionally posts approval-required notifications to a configured
+operator chat. Bridge endpoints `GET /v1/telegram/status` and
+`GET /v1/telegram/messages/recent` proxy the channel's read
+capabilities; the dashboard `#/telegram` page renders both as live
+cards. Setup is documented in `docs/telegram.md`. Boot via
+`scripts/relix-mesh-up.ps1` with `$env:RELIX_TELEGRAM = "1"` and
+`$env:RELIX_TELEGRAM_BOT_TOKEN = "<token>"`.
 
 ### 6.2 Playwright browser backend — scaffold
 

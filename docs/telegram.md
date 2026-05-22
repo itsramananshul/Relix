@@ -1,0 +1,217 @@
+# Telegram channel
+
+The Telegram channel turns every inbound Telegram message into a
+chat-flow run on the Relix mesh and posts the agent's reply back to
+the originating chat. It runs as its own controller process
+(`node_type = "telegram"`) and dials the memory, AI, and coordinator
+peers like any other mesh participant.
+
+This document covers what the channel does, how to set it up, and the
+operator-facing knobs (allowed users, approval notifications, slash
+commands).
+
+## What it does
+
+For every inbound text message:
+
+1. Derives a stable `subject_id` for the sender by hashing
+   `telegram:<user_id>:<chat_id>` with blake3. Same user in the same
+   chat is always the same subject across restarts.
+2. Records the message in a bounded in-memory ring (capacity 200) so
+   the dashboard can render the recent-messages widget without
+   touching the AI / memory peers.
+3. Enforces the `allowed_users` permit list (empty list = allow
+   everyone). Unauthorised callers get a static reply and no further
+   dispatch happens.
+4. Parses the leading slash command (see [Slash commands](#slash-commands)).
+   Unrecognised commands are treated as plain chat.
+5. For chat: emits a `typing` chat-action, reads the last 10 turns
+   from `memory.recent_for_session`, dispatches `ai.chat` with the
+   rendered history, persists both halves of the turn via
+   `memory.write_turn`, posts the AI's reply, and flips the
+   coordinator task to `completed`. If the AI peer is unreachable
+   or returns empty the user gets the spec-mandated fallback:
+   *"I'm having trouble reaching my brain right now. Please try
+   again in a moment."*
+6. When an `operator_chat_id` is configured a background notifier
+   polls the coordinator every 15 s for tasks in `awaiting_input`
+   and posts a one-line "⏳ Approval required" message (deduped
+   across polls).
+
+## Setup
+
+### 1. Mint a bot token with @BotFather
+
+Open Telegram, message [@BotFather](https://t.me/BotFather), run
+`/newbot`, and follow the prompts. Copy the token it gives you. It
+looks like `1234567:ABCDEFghijklmnop`.
+
+### 2. Decide where the token lives
+
+The controller reads the token from an env var named in `[telegram]
+token_env`. The default mesh script reads `RELIX_TELEGRAM_BOT_TOKEN`.
+You have two options:
+
+- **One-shot**: `export RELIX_TELEGRAM_BOT_TOKEN=…` before invoking
+  the mesh script. Token lives only in the controller process; nothing
+  is written to disk.
+- **Durable**: store it in `bridge-secrets.toml` via the dashboard's
+  Telegram settings page. The dashboard writes the token to disk at
+  mode 0600 (gitignored). When you boot the mesh from a wrapper
+  script that exports the saved token from `bridge-secrets.toml` into
+  `RELIX_TELEGRAM_BOT_TOKEN`, the controller picks it up the same
+  way.
+
+Either way, the token never appears in a checked-in config.
+
+### 3. Enable the telegram controller
+
+Windows / PowerShell:
+
+```powershell
+$env:RELIX_TELEGRAM = "1"
+$env:RELIX_TELEGRAM_BOT_TOKEN = "<your-bot-token>"
+.\scripts\relix-mesh-up.ps1
+```
+
+When `RELIX_TELEGRAM = 1` the script:
+- mints a `dev-keys/<run>-telegram.{key,bundle}` identity for the
+  channel controller,
+- writes `dev-data/<run>/telegram.toml` with default peer addresses
+  pointing at memory / ai / coordinator,
+- appends `[peers.telegram]` to the bridge's `peers.toml`,
+- adds `telegram.status` + `telegram.messages_recent` to the shared
+  policy file,
+- starts the telegram controller alongside the other nodes.
+
+The mesh banner reports the telegram port and whether the token env
+var is set. If the token is missing the controller boots but its
+long-poll loop idles — the dashboard shows `online=false`.
+
+### 4. Verify
+
+After boot:
+
+```
+GET http://127.0.0.1:19791/v1/telegram/status
+```
+
+Returns JSON like:
+
+```json
+{
+  "peer": "telegram",
+  "online": true,
+  "username": "yourbot",
+  "first_name": "Your Bot",
+  "user_id": 1234567,
+  "messages_seen": 0,
+  "last_message_at": null
+}
+```
+
+Open Telegram and send `/start` to your bot. You should see the
+welcome message reply, and `GET /v1/telegram/messages/recent`
+should return one row.
+
+## Configuring allowed users
+
+By default the channel accepts messages from everyone. Lock it down
+by listing Telegram numeric user_ids in `RELIX_TELEGRAM_ALLOWED_USERS`
+(comma-separated). The script writes them into
+`[telegram] allowed_users` for you:
+
+```powershell
+$env:RELIX_TELEGRAM_ALLOWED_USERS = "42,1234567"
+```
+
+Or edit `dev-data/<run>/telegram.toml` directly:
+
+```toml
+[telegram]
+allowed_users = [42, 1234567]
+```
+
+When the list is non-empty, any caller not on the list gets the
+static reply:
+
+> You are not authorized to use this bot.
+
+The reply still records the inbound in the ring so the operator can
+see who attempted to talk to the bot.
+
+## Approval notifications
+
+Set `RELIX_TELEGRAM_OPERATOR_CHAT_ID` to a numeric chat_id (your
+own DM or a group) to receive an approval-required notification any
+time a task enters `awaiting_input`. The notifier polls every 15 s
+by default; tweak via `[telegram] approval_poll_interval_secs`.
+
+The notification body:
+
+```
+⏳ Approval required
+Task: <task_id>
+Agent: (see dashboard)
+Action: (awaiting_input)
+Reason: <task title>
+Reply /approve <task_id> or /reject <task_id>
+```
+
+`/approve` and `/reject` are operator-only — they are rejected with
+"Approval commands are operator-only." when the caller's chat_id
+doesn't match the configured `operator_chat_id`.
+
+## Slash commands
+
+| Command | What it does |
+|---|---|
+| `/start` | Welcome message explaining what the bot does. |
+| `/help` | List the supported commands. |
+| `/status` | Mesh-side summary: bot online state, messages seen, allow-list mode. |
+| `/memory` | Show the caller's persistent agent + user memory blobs. |
+| `/forget` | Clear the caller's agent + user memory. |
+| `/approve <task_id>` | Mark a `awaiting_input` task as `running` and append a `task.approval_granted` chronicle event. Operator-only. |
+| `/reject <task_id>` | Flip a `awaiting_input` task to `failed` and append `task.approval_rejected`. Operator-only. |
+
+Telegram appends `@<bot_username>` to slash commands sent in group
+chats; the parser strips it transparently. Command heads are
+case-insensitive (`/Help`, `/HELP` → `Help`). Unknown slash commands
+fall through to the chat-flow path so they're not silently
+swallowed.
+
+## Security notes
+
+- The bot token is the channel's single point of authentication. It
+  is never logged, never echoed back via HTTP, and never serialised
+  into the controller config. It only lives in `RELIX_TELEGRAM_BOT_TOKEN`
+  (controller process env) and optionally `bridge-secrets.toml`
+  (mode 0600, gitignored).
+- `subject_id` derivation is **deterministic** but not authenticated:
+  a Telegram account ID is the only thing the channel sees. Apply
+  permit lists in adversarial settings; Telegram's accounts are not
+  anti-Sybil.
+- The channel writes `task.create` for every chat turn with
+  `origin_surface = "telegram"` so the audit trail in the
+  coordinator and dashboard knows which surface drove each task.
+- Telegram updates older than the last processed `update_id` are
+  not replayed across restarts (Telegram's offset semantics handle
+  this). Updates that arrive during a restart are buffered by
+  Telegram (24h) and picked up on next poll.
+
+## Reading the wire
+
+The two read capabilities the bridge proxies:
+
+- `telegram.status` arg `""`; returns
+  `online=<bool>|username=<str>|first_name=<str>|user_id=<i64>|messages_seen=<u64>|last_message_at=<i64>\n`
+  (`-1` for "no message yet").
+- `telegram.messages_recent` arg `<limit>`; returns one tab-separated
+  row per message newest-first:
+  `<ts>\t<from_user_id>\t<from_username>\t<chat_id>\t<text_preview>\n`
+  (preview truncated to 100 chars, tabs/newlines replaced with
+  spaces).
+
+Both bodies are stable across releases; the bridge JSON layer is the
+recommended consumer (the wire format is documented here for SOL
+flows that want to call the capabilities directly).

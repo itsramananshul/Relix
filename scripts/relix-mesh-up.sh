@@ -21,6 +21,14 @@
 #   ./scripts/relix-mesh-up.sh --provider anthropic    # requires $ANTHROPIC_API_KEY
 #   ./scripts/relix-mesh-up.sh --provider local --base-url http://localhost:11434/v1
 #   ./scripts/relix-mesh-up.sh --run myrun --bridge-port 19800
+#
+# Telegram channel: this 3-node bringup script does not spawn
+# the telegram controller. Use scripts/relix-mesh-up.ps1 with
+# `$env:RELIX_TELEGRAM = "1"` (Windows) for the full mesh
+# including telegram, or stand up a telegram controller
+# manually with `relix-controller --config configs/telegram.toml`
+# after setting RELIX_TELEGRAM_BOT_TOKEN. See docs/telegram.md
+# for the full setup walk-through.
 
 set -euo pipefail
 
