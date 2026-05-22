@@ -84,6 +84,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
     resp
 }
 
+mod agent_memory;
 mod blocklist;
 mod browser_captures;
 mod browser_sessions;
@@ -444,6 +445,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Returns the bounded ring of recent policy-denied
         // attempts (capacity 256 per peer). Pure read.
         .route("/v1/policy/denials", get(policy_denials::denials))
+        // W2-MEMORY-3: proxy for `memory.agent_read`. Returns
+        // the persistent agent + user memory for a subject_id.
+        // Read-only — writes happen via the agent's own
+        // `memory` tool inside ai.chat sessions, never via the
+        // dashboard.
+        .route("/v1/memory/agent", get(agent_memory::agent_memory))
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with

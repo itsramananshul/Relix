@@ -1815,6 +1815,7 @@
     <a href="#/termaudit"    class="nav-item" data-route="termaudit">Terminal Audit</a>
     <a href="#/browser"      class="nav-item" data-route="browser">Browser</a>
     <a href="#/metrics"      class="nav-item" data-route="metrics">Metrics</a>
+    <a href="#/memory"       class="nav-item" data-route="memory">Agent Memory</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2590,6 +2591,67 @@
       </p>
     </section>
 
+    <!-- ── #/memory (W2-MEMORY-3) ─────────────────────────────── -->
+    <section class="page" data-page="memory">
+      <h2>Agent Memory</h2>
+      <p class="page-subtitle">
+        Persistent per-agent memory (frozen-snapshot pattern). Read-only
+        inspector — agents write their own memory through the
+        <code>memory.agent_write</code> tool during ai.chat sessions.
+        Memory reads happen ONCE at chat-session start; mid-session
+        writes land on disk immediately but the running session's
+        prompt does not refresh until the next session.
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px; flex-wrap: wrap;">
+        <label for="memory-peer-input" class="meta">peer alias:</label>
+        <input
+          type="text"
+          id="memory-peer-input"
+          value="memory"
+          placeholder="memory"
+          autocomplete="off"
+          spellcheck="false"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 140px;"
+        />
+        <label for="memory-subject-input" class="meta">subject_id:</label>
+        <input
+          type="text"
+          id="memory-subject-input"
+          placeholder="paste an agent's 64-char hex subject_id"
+          autocomplete="off"
+          spellcheck="false"
+          style="flex: 1; min-width: 300px; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: var(--font-mono); font-size: 12px;"
+        />
+        <button class="chip" id="memory-read-btn">read</button>
+        <span class="meta" id="memory-status"></span>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Agent memory</h3>
+          <span class="meta" id="memory-agent-summary"></span>
+        </div>
+        <div class="card-body">
+          <pre id="memory-agent-host" class="dense" style="margin: 0; padding: 10px 14px; white-space: pre-wrap; word-break: break-word; color: var(--dim); font-family: var(--font-mono); font-size: 12px; min-height: 80px;"></pre>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>User memory</h3>
+          <span class="meta" id="memory-user-summary"></span>
+        </div>
+        <div class="card-body">
+          <pre id="memory-user-host" class="dense" style="margin: 0; padding: 10px 14px; white-space: pre-wrap; word-break: break-word; color: var(--dim); font-family: var(--font-mono); font-size: 12px; min-height: 80px;"></pre>
+        </div>
+      </div>
+      <p class="meta">
+        Entries are separated by <code>§</code> (U+00A7).
+        Agent target caps at <strong>2200</strong> characters;
+        User target caps at <strong>1375</strong>. Writes exceeding
+        the cap are rejected with INVALID_ARGS — agents must remove
+        old entries before adding new ones.
+      </p>
+    </section>
+
     <!-- ── #/providers ─────────────────────────────────────────── -->
     <section class="page" data-page="providers">
       <h2>AI Providers</h2>
@@ -2809,6 +2871,7 @@ const PAGES = {
   termaudit:    { label: 'Terminal Audit', init: initTermAudit,  enter: enterTermAudit },
   browser:      { label: 'Browser',      init: initBrowser,      enter: enterBrowser },
   metrics:      { label: 'Metrics',      init: initMetrics,      enter: enterMetrics },
+  memory:       { label: 'Agent Memory', init: initMemory,       enter: enterMemory },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -8343,6 +8406,89 @@ async function loadMetrics() {
       + escapeHtml(String(e)) + '</div>';
     if ($status) $status.textContent = 'failed';
     if ($summary) $summary.textContent = '';
+  }
+}
+
+/* W2-MEMORY-3: agent-memory inspector. Hits /v1/memory/agent
+   on demand (operator clicks read or hits Enter). Read-only
+   surface — writes happen via the agent's `memory` tool inside
+   ai.chat sessions, never via the dashboard. */
+let memoryInspectorWired = false;
+function initMemory() {
+  if (memoryInspectorWired) return;
+  const $btn = document.getElementById('memory-read-btn');
+  if ($btn) $btn.addEventListener('click', () => loadAgentMemory());
+  const $peer = document.getElementById('memory-peer-input');
+  const $subj = document.getElementById('memory-subject-input');
+  for (const $in of [$peer, $subj].filter(Boolean)) {
+    $in.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadAgentMemory();
+      }
+    });
+  }
+  memoryInspectorWired = true;
+}
+
+function enterMemory() {
+  // No auto-load — wait for the operator to paste a subject_id.
+  // Persistent memory is per-agent; we don't know which one to
+  // show until the operator asks.
+}
+
+async function loadAgentMemory() {
+  const $agent = document.getElementById('memory-agent-host');
+  const $user  = document.getElementById('memory-user-host');
+  const $status = document.getElementById('memory-status');
+  const $agentSum = document.getElementById('memory-agent-summary');
+  const $userSum  = document.getElementById('memory-user-summary');
+  if (!$agent || !$user) return;
+  const peer = ((document.getElementById('memory-peer-input') || {}).value || 'memory').trim();
+  const subject = ((document.getElementById('memory-subject-input') || {}).value || '').trim();
+  if (!subject) {
+    if ($status) $status.textContent = 'subject_id required';
+    $agent.textContent = '';
+    $user.textContent = '';
+    if ($agentSum) $agentSum.textContent = '';
+    if ($userSum) $userSum.textContent = '';
+    return;
+  }
+  $agent.textContent = 'loading…';
+  $user.textContent = 'loading…';
+  if ($status) $status.textContent = 'querying…';
+  try {
+    const url = '/v1/memory/agent?peer=' + encodeURIComponent(peer)
+      + '&subject_id=' + encodeURIComponent(subject);
+    const r = await fetch(url);
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const agentTxt = body.agent_memory || '';
+    const userTxt  = body.user_memory  || '';
+    $agent.textContent = agentTxt || '(empty)';
+    $user.textContent  = userTxt  || '(empty)';
+    if ($agentSum) {
+      const n = body.agent_chars || 0;
+      $agentSum.textContent = n + ' chars · cap 2200';
+    }
+    if ($userSum) {
+      const n = body.user_chars || 0;
+      $userSum.textContent  = n + ' chars · cap 1375';
+    }
+    if ($status) $status.textContent = 'peer=' + (body.peer || peer);
+  } catch (e) {
+    $agent.textContent = '';
+    $user.textContent = '';
+    if ($agentSum) $agentSum.textContent = '';
+    if ($userSum) $userSum.textContent = '';
+    if ($status) $status.textContent = 'failed: ' + String(e);
   }
 }
 
