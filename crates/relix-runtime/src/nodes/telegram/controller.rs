@@ -164,7 +164,7 @@ pub async fn handle_one_update(
             }
             let _ = send_text(api, msg.chat_id, msg.message_id, "🧹 Memory cleared.").await;
         }
-        Command::Approve(task_id) => {
+        Command::Approve(approval_id) => {
             // Operator-only. Reject when the caller's
             // chat isn't the configured operator chat.
             if cfg.operator_chat_id == 0 || msg.chat_id != cfg.operator_chat_id {
@@ -177,26 +177,39 @@ pub async fn handle_one_update(
                 .await;
                 return;
             }
-            let task_id = task_id.trim();
-            if task_id.is_empty() {
+            let approval_id = approval_id.trim();
+            if approval_id.is_empty() {
                 let _ = send_text(
                     api,
                     msg.chat_id,
                     msg.message_id,
-                    "Usage: /approve <task_id>",
+                    "Usage: /approve <approval_id>",
                 )
                 .await;
                 return;
             }
-            if let Some(o) = out {
-                o.task_event(task_id, "task.approval_granted", "via=telegram")
-                    .await;
-                o.task_update_status(task_id, "running", "").await;
-            }
-            let body = format!("✅ Approved {task_id}.");
+            let decided_by = format!("telegram:{}", msg.user_id);
+            let body = if let Some(o) = out {
+                match o
+                    .approval_decide(approval_id, "approved", &decided_by, "")
+                    .await
+                {
+                    Some(b) => {
+                        let trimmed = b.trim();
+                        if let Some(token) = trimmed.strip_prefix("ok|") {
+                            format!("✅ Approved {approval_id}.\nToken: {token}")
+                        } else {
+                            format!("✅ Approved {approval_id}.")
+                        }
+                    }
+                    None => format!("⚠️ Failed to decide approval {approval_id}."),
+                }
+            } else {
+                "⚠️ Coordinator unreachable.".to_string()
+            };
             let _ = send_text(api, msg.chat_id, msg.message_id, &body).await;
         }
-        Command::Reject(task_id) => {
+        Command::Reject(approval_id) => {
             if cfg.operator_chat_id == 0 || msg.chat_id != cfg.operator_chat_id {
                 let _ = send_text(
                     api,
@@ -207,19 +220,29 @@ pub async fn handle_one_update(
                 .await;
                 return;
             }
-            let task_id = task_id.trim();
-            if task_id.is_empty() {
-                let _ =
-                    send_text(api, msg.chat_id, msg.message_id, "Usage: /reject <task_id>").await;
+            let approval_id = approval_id.trim();
+            if approval_id.is_empty() {
+                let _ = send_text(
+                    api,
+                    msg.chat_id,
+                    msg.message_id,
+                    "Usage: /reject <approval_id>",
+                )
+                .await;
                 return;
             }
-            if let Some(o) = out {
-                o.task_event(task_id, "task.approval_rejected", "via=telegram")
-                    .await;
-                o.task_update_status(task_id, "failed", "rejected via telegram")
-                    .await;
-            }
-            let body = format!("❌ Rejected {task_id}.");
+            let decided_by = format!("telegram:{}", msg.user_id);
+            let body = if let Some(o) = out {
+                match o
+                    .approval_decide(approval_id, "rejected", &decided_by, "via=telegram")
+                    .await
+                {
+                    Some(_) => format!("❌ Rejected {approval_id}."),
+                    None => format!("⚠️ Failed to decide approval {approval_id}."),
+                }
+            } else {
+                "⚠️ Coordinator unreachable.".to_string()
+            };
             let _ = send_text(api, msg.chat_id, msg.message_id, &body).await;
         }
         Command::Chat(text) => {
@@ -530,6 +553,19 @@ mod tests {
         ) -> Vec<(String, String, String)> {
             self.task_list_reply.lock().unwrap().clone()
         }
+        async fn approval_decide(
+            &self,
+            _approval_id: &str,
+            decision: &str,
+            _decided_by: &str,
+            _note: &str,
+        ) -> Option<String> {
+            if decision == "approved" {
+                Some("ok|deadbeefdeadbeefdeadbeefdeadbeef\n".to_string())
+            } else {
+                Some("ok\n".to_string())
+            }
+        }
     }
 
     fn state_online() -> ChannelState {
@@ -685,67 +721,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_command_from_operator_chat_emits_event_and_status_update() {
+    async fn approve_command_from_operator_chat_calls_coord_approval_decide() {
         let api = MockBotApi::new();
         let out = StubOutbound::default();
         let state = state_online();
         let ring = MessageRing::new(50);
         let mut cfg = cfg_with_operator(100); // matches msg.chat_id
         cfg.allowed_users = vec![42];
+        // `/approve apr-1` — handler routes through
+        // `coord.approval.decide` via the stub. Stub returns
+        // `ok|<token>` for the "approved" decision, which the
+        // handler surfaces to the operator.
         handle_one_update(
             &api,
             Some(&out),
             &state,
             &ring,
             &cfg,
-            &msg("/approve task-99"),
+            &msg("/approve apr-1"),
         )
         .await;
-        let events = out.task_events.lock().unwrap().clone();
-        assert!(
-            events
-                .iter()
-                .any(|(id, ev, _)| id == "task-99" && ev == "task.approval_granted")
-        );
-        let updates = out.task_updates.lock().unwrap().clone();
-        assert!(
-            updates
-                .iter()
-                .any(|(id, s, _)| id == "task-99" && s == "running")
-        );
-        assert!(api.sent_messages()[0].text.contains("Approved task-99"));
+        let sent = api.sent_messages();
+        assert!(sent[0].text.contains("Approved apr-1"));
+        assert!(sent[0].text.contains("Token: deadbeef"));
     }
 
     #[tokio::test]
-    async fn reject_command_from_operator_chat_emits_event_and_status_update() {
+    async fn reject_command_from_operator_chat_calls_coord_approval_decide() {
         let api = MockBotApi::new();
         let out = StubOutbound::default();
         let state = state_online();
         let ring = MessageRing::new(50);
         let mut cfg = cfg_with_operator(100);
         cfg.allowed_users = vec![42];
-        handle_one_update(
-            &api,
-            Some(&out),
-            &state,
-            &ring,
-            &cfg,
-            &msg("/reject task-99"),
-        )
-        .await;
-        let events = out.task_events.lock().unwrap().clone();
-        assert!(
-            events
-                .iter()
-                .any(|(id, ev, _)| id == "task-99" && ev == "task.approval_rejected")
-        );
-        let updates = out.task_updates.lock().unwrap().clone();
-        assert!(
-            updates
-                .iter()
-                .any(|(id, s, _)| id == "task-99" && s == "failed")
-        );
-        assert!(api.sent_messages()[0].text.contains("Rejected task-99"));
+        handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("/reject apr-1")).await;
+        let sent = api.sent_messages();
+        assert!(sent[0].text.contains("Rejected apr-1"));
     }
 
     #[tokio::test]

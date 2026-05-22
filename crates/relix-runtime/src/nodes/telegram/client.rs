@@ -39,6 +39,18 @@ pub trait TelegramOutbound: Send + Sync + 'static {
     ) -> Option<String>;
     async fn task_update_status(&self, task_id: &str, status: &str, result: &str);
     async fn task_event(&self, task_id: &str, event_type: &str, payload: &str);
+    /// Call `coord.approval.decide` for an `approval_id`. The
+    /// returned string is the body the coordinator emits:
+    /// `ok\n` for reject, `ok|<token>\n` for approve. Returns
+    /// `None` on transport / parse failure so the
+    /// telegram handler can surface a friendly error.
+    async fn approval_decide(
+        &self,
+        approval_id: &str,
+        decision: &str,
+        decided_by: &str,
+        note: &str,
+    ) -> Option<String>;
     async fn task_list(
         &self,
         status_filter: Option<&str>,
@@ -327,6 +339,34 @@ impl TelegramOutboundClient {
         }
     }
 
+    /// `coord.approval.decide` — approve or reject a pending
+    /// approval. Returns the response body verbatim
+    /// (`ok\n` for reject, `ok|<token>\n` for approve).
+    pub async fn approval_decide(
+        &self,
+        approval_id: &str,
+        decision: &str,
+        decided_by: &str,
+        note: &str,
+    ) -> Option<String> {
+        let arg = format!("{approval_id}|{decision}|{decided_by}|{note}");
+        match self
+            .call_text(
+                &self.coord_alias,
+                "coord.approval.decide",
+                self.coord_deadline_secs,
+                arg.into_bytes(),
+            )
+            .await
+        {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram: coord.approval.decide failed");
+                None
+            }
+        }
+    }
+
     /// `task.event` — append a chronicle event. Best-effort.
     pub async fn task_event(&self, task_id: &str, event_type: &str, payload: &str) {
         let arg = format!("{task_id}|{event_type}|{payload}");
@@ -426,6 +466,15 @@ impl TelegramOutbound for TelegramOutboundClient {
         limit: usize,
     ) -> Vec<(String, String, String)> {
         TelegramOutboundClient::task_list(self, status_filter, limit).await
+    }
+    async fn approval_decide(
+        &self,
+        approval_id: &str,
+        decision: &str,
+        decided_by: &str,
+        note: &str,
+    ) -> Option<String> {
+        TelegramOutboundClient::approval_decide(self, approval_id, decision, decided_by, note).await
     }
 }
 

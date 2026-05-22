@@ -41,6 +41,38 @@ before the backend (visibility + stable contract + honesty).
 | `task.terminal_summary` (H5 + H14) | live | Auto-emitted on every terminal transition |
 | `task.attempt_orphan_closed` (H7) | live | Recovery-scan cleanup of orphaned attempts |
 
+## Agent employee permissions (`crates/relix-runtime/src/nodes/coordinator/agent/`)
+
+The agent gate slots between identity verification and the
+policy engine. CRUD + approval flow + standing-approval
+surface lives on the coordinator. Categorical permissions
+NARROW policy — they never widen what policy denies. See
+[agent-permissions.md](agent-permissions.md) for the full
+design.
+
+| Method | Status | Notes |
+|---|---|---|
+| `agent.create` | live | `name\|role\|title\|department\|team\|created_by\|subject_id\|risk_ceiling` → `<agent_id>\n`. |
+| `agent.get` | live | Pipe-delim `key=value` body. |
+| `agent.list` | live | Tab-separated rows + `count=N\n`. |
+| `agent.update` | live | `agent_id\|field\|value` — one of `status / role / title / department / team / surface_allowlist / risk_ceiling / allow_categories / deny_categories / allow_sensitivity_tags / deny_sensitivity_tags / approval_required_categories / approval_timeout_secs`. |
+| `agent.delete` | live | Soft delete — flips `status = disabled`. |
+| `agent.effective_capabilities` | live | Intersect an agent's permissions with a peer's manifest. Returns one method per line + `count=N\n`. |
+| `coord.approval.pending` | live | Newest-first pending approvals. |
+| `coord.approval.decide` | live | `approval_id\|approved\|decided_by\|note` → `ok\|<token>\n` mints a one-shot token; `rejected` returns `ok\n`. |
+| `agent.standing_approval.create` | live | `agent_id\|category\|expires_at\|granted_by\|note\|path_glob?` → `<standing_id>\n`. |
+| `agent.standing_approval.list` | live | Per-agent standing approvals. |
+| `agent.standing_approval.revoke` | live | Delete by standing_id. |
+
+Two new error kinds:
+- `APPROVAL_REQUIRED` (19) — returned by the gate when the
+  call matches an `approval_required_categories` entry
+  without an active standing approval. The error envelope's
+  `cause` carries the new `approval_id`.
+- `APPROVAL_TOKEN_INVALID` (20) — supplied
+  `approval_token` is unknown, expired, consumed, or
+  applies to a different method.
+
 ## Delegation (`crates/relix-runtime/src/nodes/coordinator/delegate/`)
 
 Lives on the coordinator node. Four capabilities + a 5 s background

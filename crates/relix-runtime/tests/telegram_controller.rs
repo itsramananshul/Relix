@@ -231,6 +231,19 @@ impl TelegramOutbound for StubOutbound {
     ) -> Vec<(String, String, String)> {
         Vec::new()
     }
+    async fn approval_decide(
+        &self,
+        _approval_id: &str,
+        decision: &str,
+        _decided_by: &str,
+        _note: &str,
+    ) -> Option<String> {
+        if decision == "approved" {
+            Some("ok|cafebabecafebabecafebabecafebabe\n".to_string())
+        } else {
+            Some("ok\n".to_string())
+        }
+    }
 }
 
 // ── Test helpers ──────────────────────────────────────────

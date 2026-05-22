@@ -712,10 +712,12 @@ Mentioned throughout `docs/current-limitations.md` and in source comments:
 
 ## 8. THE AGENT EMPLOYEE PERMISSION MODEL
 
-**Status: proposal-only.** Zero implementation.
+**Status: shipped end-to-end.** All five phases land:
+agent profile store + admission gate + categorical
+permissions + approval flow + standing approvals. See
+[agent-permissions.md](agent-permissions.md).
 
-The full proposal lives at `docs/proposals/agent-employee-permissions.md`
-(715 lines, written and committed in this session).
+The full proposal lives at `docs/proposals/agent-employee-permissions.md`.
 
 What exists in code today that the proposal builds on:
 

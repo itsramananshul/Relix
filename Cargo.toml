@@ -103,6 +103,14 @@ codegen-units = 1
 [profile.dev]
 opt-level = 0
 
+# relix-cli has a deeply-nested clap command tree (subcommand →
+# CronCmd / DelegateCmd / AgentCmd variants). At opt-level=0 the
+# generated parser blows the default Windows 1 MB stack. Bumping
+# to opt-level=1 lets the compiler collapse the per-variant
+# trampolines.
+[profile.dev.package."relix-cli"]
+opt-level = 1
+
 # Reduce libp2p compile time in dev
 [profile.dev.package."libp2p"]
 opt-level = 1

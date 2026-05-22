@@ -507,6 +507,61 @@ method = "delegate.list"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "agent_create"
+method = "agent.create"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_get"
+method = "agent.get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_list"
+method = "agent.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_update"
+method = "agent.update"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_delete"
+method = "agent.delete"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "agent_effective_capabilities"
+method = "agent.effective_capabilities"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "coord_approval_pending"
+method = "coord.approval.pending"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "coord_approval_decide"
+method = "coord.approval.decide"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "standing_approval_create"
+method = "agent.standing_approval.create"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "standing_approval_list"
+method = "agent.standing_approval.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "standing_approval_revoke"
+method = "agent.standing_approval.revoke"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "telegram_status"
 method = "telegram.status"
 allow_groups = ["chat-users"]

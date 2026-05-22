@@ -188,9 +188,8 @@ pub struct DispatchBridge {
 /// for the risk-ceiling + categories check. Returns `None`
 /// when the bridge has no metadata for the method (gate
 /// falls back to a category-free, risk-free admit).
-pub type CapabilityDescribeFn = Arc<
-    dyn Fn(&str) -> Option<relix_core::capability::CapabilityDescriptor> + Send + Sync,
->;
+pub type CapabilityDescribeFn =
+    Arc<dyn Fn(&str) -> Option<relix_core::capability::CapabilityDescriptor> + Send + Sync>;
 
 /// Coordinator-side closure that records an approval request
 /// when the gate returns `RequireApproval`. Implementation
