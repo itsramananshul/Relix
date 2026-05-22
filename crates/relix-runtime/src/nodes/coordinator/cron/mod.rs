@@ -10,8 +10,70 @@
 //! and the `cron.*` capability handlers (`handlers`) land in
 //! follow-up commits.
 
+pub mod handlers;
 pub mod schedule;
 pub mod store;
 
 pub use schedule::{CronField, Schedule, ScheduleError};
 pub use store::{CronJob, CronJobSummary, CronStore, CronStoreError};
+
+use std::sync::Arc;
+
+use crate::dispatch::{DispatchBridge, FnHandler, InvocationCtx};
+
+/// Register the `cron.create / list / get / update / delete`
+/// capabilities on the coordinator's dispatch bridge. The
+/// `cron.trigger` handler is registered separately alongside
+/// the scheduler since it needs both stores + the AI cell.
+pub fn register(bridge: &mut DispatchBridge, store: Arc<CronStore>) {
+    {
+        let s = store.clone();
+        bridge.register(
+            "cron.create",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_create(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "cron.list",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_list(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "cron.get",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_get(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "cron.update",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_update(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "cron.delete",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_delete(&s, &ctx) }
+            })),
+        );
+    }
+}

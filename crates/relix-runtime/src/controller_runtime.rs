@@ -1600,6 +1600,53 @@ fn register_node_type_handlers(
             }
         }
         crate::nodes::coordinator::register(bridge, store);
+        // Cron scheduler shares the coordinator's database.
+        // Opens its own rusqlite connection against the same
+        // file; SQLite handles cross-connection locking.
+        let cron_store = std::sync::Arc::new(
+            crate::nodes::coordinator::cron::CronStore::open(&coord_cfg.db_path)
+                .map_err(|e| format!("[coordinator] cron store open: {e}"))?,
+        );
+        crate::nodes::coordinator::cron::register(bridge, cron_store.clone());
+        let cron_caps: &[(&str, &str, &[&str])] = &[
+            (
+                "cron.create",
+                "Create a scheduled job. Arg: name|schedule|flow_template|prompt|subject_id.",
+                &["cron", "persist"],
+            ),
+            (
+                "cron.list",
+                "List cron jobs (filtered by subject_id; empty arg = all jobs).",
+                &["cron", "read"],
+            ),
+            (
+                "cron.get",
+                "Read one cron job (every column).",
+                &["cron", "read"],
+            ),
+            (
+                "cron.update",
+                "Update one of {enabled, schedule, prompt} on a cron job.",
+                &["cron", "mutate"],
+            ),
+            (
+                "cron.delete",
+                "Permanently delete a cron job row.",
+                &["cron", "mutate"],
+            ),
+        ];
+        for (method, doc, cats) in cron_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        tracing::info!(
+            db = %coord_cfg.db_path.display(),
+            "coordinator node: registered cron.create / list / get / update / delete"
+        );
+        // Keep `cron_store` referenced — the scheduler loop +
+        // cron.trigger handler land in the follow-up commit.
+        let _ = cron_store;
         let coord_caps: &[(&str, &str, &[&str])] = &[
             (
                 "task.create",
