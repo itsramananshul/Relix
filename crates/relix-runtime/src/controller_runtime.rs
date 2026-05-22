@@ -979,6 +979,107 @@ async fn populate_ai_memory_cell(
 /// peer is unreachable or the bundle is missing; the curator
 /// scheduler will keep ticking and just skip every agent
 /// (`memory curator: AI dispatcher not yet ready`).
+async fn populate_delegation_ai_cell(
+    cell: crate::nodes::coordinator::delegate::DelegationAiDispatcherCell,
+    cfg: crate::nodes::coordinator::delegate::DelegationAiPeerConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "delegation executor: identity bundle missing; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "delegation executor: identity bundle decode failed; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "delegation executor: client key not 32 bytes; AI dispatcher disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "delegation executor: client key missing; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.alias.clone(),
+        PeerEntry {
+            addr: cfg.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(6),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                alias = %cfg.alias,
+                addr = %cfg.addr,
+                "delegation executor: discover_and_pin returned None; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let dispatcher: Arc<dyn crate::nodes::coordinator::delegate::DelegationAiDispatcher> = Arc::new(
+        crate::nodes::coordinator::delegate::DelegationAiMeshDispatcher::new(
+            mesh,
+            cfg.alias.clone(),
+            bundle,
+            cfg.deadline_secs,
+        ),
+    );
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("delegation executor: AI cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            alias = %cfg.alias,
+            addr = %cfg.addr,
+            "coordinator node: delegation AI dispatcher online"
+        );
+    }
+}
+
 async fn populate_cron_ai_cell(
     cell: crate::nodes::coordinator::cron::CronAiDispatcherCell,
     cfg: crate::nodes::coordinator::cron::CronAiPeerConfig,
@@ -1824,6 +1925,101 @@ fn register_node_type_handlers(
             db = %coord_cfg.db_path.display(),
             "coordinator node: registered cron.create / list / get / update / delete / trigger"
         );
+
+        // ── Delegation — optional [coordinator.delegation] section.
+        let delegation_cfg_value = cfg
+            .coordinator
+            .as_ref()
+            .and_then(|v| v.get("delegation").cloned());
+        let delegation_cfg: crate::nodes::coordinator::delegate::DelegationConfig =
+            match delegation_cfg_value {
+                Some(raw) => raw
+                    .try_into()
+                    .map_err(|e: toml::de::Error| format!("[coordinator.delegation] parse: {e}"))?,
+                None => crate::nodes::coordinator::delegate::DelegationConfig::default(),
+            };
+        crate::nodes::coordinator::delegate::register(
+            bridge,
+            store.clone(),
+            delegation_cfg.max_depth,
+        );
+        let delegate_caps: &[(&str, &str, &[&str])] = &[
+            (
+                "delegate.spawn",
+                "Spawn a delegated child task. Arg: \
+                 parent_task_id|goal|context|target_subject_id|depth. \
+                 Enforces a configurable max delegation depth (default 3).",
+                &["delegate", "task", "persist"],
+            ),
+            (
+                "delegate.result",
+                "Read a delegated child's status + result preview + \
+                 completed_at (sentinel -1 when not terminal).",
+                &["delegate", "task", "read"],
+            ),
+            (
+                "delegate.cancel",
+                "Cancel a delegated child task. Refuses when the task is \
+                 already in a terminal state.",
+                &["delegate", "task", "mutate"],
+            ),
+            (
+                "delegate.list",
+                "List delegated children of a parent task. Returns rows \
+                 `child_task_id\\tgoal_preview\\tstatus\\tcreated_at` \
+                 plus a trailing `count=N` line.",
+                &["delegate", "task", "read"],
+            ),
+        ];
+        for (method, doc, cats) in delegate_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+
+        let delegation_ai_cell: crate::nodes::coordinator::delegate::DelegationAiDispatcherCell =
+            Arc::new(tokio::sync::OnceCell::new());
+        if cfg
+            .coordinator
+            .as_ref()
+            .is_some_and(|v| v.get("delegation").is_some())
+            && delegation_cfg.enabled
+        {
+            crate::nodes::coordinator::delegate::spawn_delegation_executor(
+                store.clone(),
+                delegation_ai_cell.clone(),
+                delegation_cfg.clone(),
+            );
+            tracing::info!(
+                max_depth = delegation_cfg.max_depth,
+                max_concurrent = delegation_cfg.max_concurrent,
+                executor_poll_secs = delegation_cfg.executor_poll_secs,
+                "coordinator node: delegation executor spawned"
+            );
+            if let Some(ai_peer) = delegation_cfg.ai_peer.clone() {
+                let key_path = cfg.identity.key_path.clone();
+                let cell = delegation_ai_cell.clone();
+                tokio::spawn(async move {
+                    populate_delegation_ai_cell(cell, ai_peer, key_path).await;
+                });
+            } else {
+                tracing::info!(
+                    "coordinator: no [coordinator.delegation.ai_peer]; \
+                     delegation AI dispatch disabled"
+                );
+            }
+        } else {
+            tracing::info!(
+                "coordinator: delegation executor not enabled \
+                 ([coordinator.delegation] missing or enabled=false)"
+            );
+        }
+        tracing::info!(
+            "coordinator node: registered delegate.spawn / result / cancel / list \
+             (max_depth={})",
+            delegation_cfg.max_depth
+        );
+
         let coord_caps: &[(&str, &str, &[&str])] = &[
             (
                 "task.create",

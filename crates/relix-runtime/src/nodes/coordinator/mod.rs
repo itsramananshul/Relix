@@ -144,6 +144,7 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 pub mod cron;
+pub mod delegate;
 pub mod event_summary;
 pub use event_summary::{summarize_event, summarize_event_parts};
 
@@ -1355,6 +1356,88 @@ impl TaskStore {
             out.push(r.map_err(CoordinatorError::Db)?);
         }
         Ok(out)
+    }
+
+    /// List up to `limit` pending tasks whose
+    /// `origin_surface = 'delegation'`. Used by the delegation
+    /// executor to find children that need to run. Returns
+    /// `(task_id, params_json, owner_subject_id)` per row,
+    /// oldest-first by `created_at` so old work doesn't starve.
+    pub fn list_pending_delegated(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let cap = limit.clamp(1, self.max_list);
+        let mut stmt = conn
+            .prepare(
+                "SELECT task_id, params_json, owner_subject_id
+                 FROM tasks
+                 WHERE origin_surface = 'delegation' AND status = 'pending'
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let rows = stmt
+            .query_map(params![cap as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(CoordinatorError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// Walk the `delegated_to` ancestor chain starting at
+    /// `task_id` (treated as a child). Returns the depth —
+    /// `0` when the task has no delegation parent, `1` when
+    /// its parent has none, etc. Caps the walk at
+    /// `max_depth` so a corrupted cycle can't wedge the
+    /// caller; returns `max_depth` if the limit is reached.
+    ///
+    /// Used by the delegate.spawn handler to enforce the
+    /// configured `max_depth` independently of the depth
+    /// integer the caller passes — defence in depth against
+    /// a malicious or buggy agent under-reporting its
+    /// position in the chain.
+    pub fn delegation_chain_depth(
+        &self,
+        task_id: &str,
+        max_depth: usize,
+    ) -> Result<usize, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let mut current = task_id.to_string();
+        let mut depth = 0usize;
+        while depth < max_depth {
+            // Find a delegated_to edge that points AT `current`
+            // (i.e. an ancestor that delegated to it). Take the
+            // oldest one as the canonical parent.
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT task_id FROM task_edges
+                     WHERE related_task_id = ?1 AND edge_type = 'delegated_to'
+                     ORDER BY edge_id ASC
+                     LIMIT 1",
+                    params![current],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(CoordinatorError::Db)?;
+            match row {
+                Some(parent) if parent != current => {
+                    current = parent;
+                    depth += 1;
+                }
+                _ => break,
+            }
+        }
+        Ok(depth)
     }
 
     /// List every execution edge that touches `task_id` —
