@@ -2777,6 +2777,28 @@
           </div>
         </div>
       </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Bot live status</h3>
+          <div class="card-actions">
+            <button id="tg-live-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="tg-live-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Recent messages</h3>
+          <div class="card-actions">
+            <button id="tg-recent-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="tg-recent-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
     </section>
 
     <!-- ── #/config ────────────────────────────────────────────── -->
@@ -9538,6 +9560,13 @@ function initTelegram() {
   document.getElementById('tg-test').addEventListener('click', testTelegram);
   // Show/hide webhook URL row based on mode selection.
   document.getElementById('tg-mode').addEventListener('change', updateTelegramModeUi);
+  // Refresh buttons for the live status + recent messages
+  // cards. Wired here so the listener exists before
+  // enterTelegram() runs.
+  const $live = document.getElementById('tg-live-refresh');
+  if ($live) $live.addEventListener('click', loadTelegramLive);
+  const $rec = document.getElementById('tg-recent-refresh');
+  if ($rec) $rec.addEventListener('click', loadTelegramRecent);
 }
 
 function updateTelegramModeUi() {
@@ -9581,6 +9610,84 @@ async function enterTelegram() {
     renderTelegramStatus(t);
   } catch (e) {
     setProviderStatus($status, 'load failed: ' + String(e), 'error');
+  }
+  loadTelegramLive();
+  loadTelegramRecent();
+}
+
+async function loadTelegramLive() {
+  const $host = document.getElementById('tg-live-host');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/telegram/status');
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">Bot offline: '
+        + escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    let html = '<div class="provider-meta">';
+    html += s.online
+      ? '<span class="badge ok">online</span>'
+      : '<span class="badge muted">offline</span>';
+    if (s.username) {
+      html += ' &middot; <strong>@' + escapeHtml(s.username) + '</strong>';
+    }
+    if (s.first_name) {
+      html += ' (' + escapeHtml(s.first_name) + ')';
+    }
+    html += ' &middot; user_id <span class="id">'
+      + (s.user_id || 0) + '</span>';
+    html += ' &middot; messages_seen <span>' + (s.messages_seen || 0) + '</span>';
+    if (s.last_message_at) {
+      const d = new Date(s.last_message_at * 1000);
+      html += ' &middot; last <span>' + d.toLocaleString() + '</span>';
+    }
+    html += '</div>';
+    $host.innerHTML = html;
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function loadTelegramRecent() {
+  const $host = document.getElementById('tg-recent-host');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/telegram/messages/recent?limit=20');
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">' +
+        escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    if (!s.messages || s.messages.length === 0) {
+      $host.innerHTML = '<div class="empty">no messages yet</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr>'
+      + '<th>ts</th><th>from</th><th>chat_id</th><th>text</th>'
+      + '</tr></thead><tbody>';
+    for (const m of s.messages) {
+      const d = new Date(m.ts * 1000);
+      html += '<tr>'
+        + '<td>' + d.toLocaleString() + '</td>'
+        + '<td>' + escapeHtml(m.from_username || '')
+        + ' <span class="id">' + (m.from_user_id || 0) + '</span></td>'
+        + '<td>' + (m.chat_id || 0) + '</td>'
+        + '<td>' + escapeHtml(m.text_preview || '') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    $host.innerHTML = html;
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: '
+      + escapeHtml(String(e)) + '</div>';
   }
 }
 
