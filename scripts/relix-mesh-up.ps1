@@ -646,12 +646,11 @@ try {
     }
 
     if ($TelegramEnabled) {
-        # Mint the telegram bundle on demand so this node has its
-        # own delegated identity (same pattern as the bridge).
-        if (-not (Test-Path $TelegramKey)) {
-            & $Cli identity new-client --client-key $TelegramKey
-            if ($LASTEXITCODE -ne 0) { throw "telegram identity new-client failed" }
-        }
+        # Mint the telegram outbound-identity bundle on demand. The
+        # controller process generates the .key file (ed25519) on
+        # first boot — same idempotency pattern as memory/ai/tool —
+        # but the .bundle has to be minted off the org root, so we
+        # call relix-cli once if it's missing.
         $TelegramBundlePath = "dev-keys/$Run-telegram.bundle"
         if (-not (Test-Path $TelegramBundlePath)) {
             & $Cli identity mint --root-key $OrgKey --name telegram --groups chat-users --out $TelegramBundlePath
