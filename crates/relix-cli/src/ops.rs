@@ -148,6 +148,25 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// W2-008h — print a copy-paste Open WebUI connection
+    /// setup for the current bridge. Hits `/v1/models` and
+    /// formats the host:port + advertised model ids into
+    /// a block operators can paste into Open WebUI's
+    /// Settings → Connections → OpenAI API.
+    OpenWebuiSetup {
+        /// Bridge HTTP base URL (used to fetch the model list).
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Hostname Open WebUI should dial. Defaults to
+        /// `host.docker.internal` (the Docker-on-Mac/Windows
+        /// loopback alias). Use `127.0.0.1` when Open WebUI
+        /// is native, or your machine's LAN IP when remote.
+        #[arg(long, default_value = "host.docker.internal")]
+        host: String,
+        /// Raw JSON of the bridge's `/v1/models` response.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// W2-008d — live tail of the task firehose. Polls
     /// `/v1/tasks/events/recent?since=<cursor>` on a loop
     /// and prints each new event one-per-line. Ctrl-C
@@ -242,7 +261,79 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             interval_ms,
             max_events,
         } => tail(&bridge, &filter, interval_ms, max_events).await,
+        Cmd::OpenWebuiSetup { bridge, host, json } => openwebui_setup(&bridge, &host, json).await,
     }
+}
+
+// W2-008h CLI: print Open WebUI connection setup.
+
+#[derive(Debug, Deserialize)]
+struct ModelsResp {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// W2-008h: derive the bridge's listening port from the
+/// `--bridge` URL (`http://127.0.0.1:19791` → `19791`).
+/// Falls back to `19791` (the default).
+fn port_from_bridge(bridge: &str) -> u16 {
+    bridge
+        .trim_end_matches('/')
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
+        .unwrap_or(19791)
+}
+
+async fn openwebui_setup(
+    bridge: &str,
+    host: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/models", bridge.trim_end_matches('/'));
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let resp: ModelsResp = serde_json::from_str(&body)
+        .map_err(|e| format!("decode /v1/models body: {e} (body={body})"))?;
+    let port = port_from_bridge(bridge);
+    println!("Open WebUI connection setup");
+    println!("Settings → Connections → OpenAI API");
+    println!();
+    println!("  API Base URL: http://{host}:{port}/v1");
+    println!("  API Key:      relix   (any non-empty string works)");
+    println!();
+    if resp.data.is_empty() {
+        println!("  Models:       (none advertised — bridge has no");
+        println!("                [openai_compat.models] entries and no");
+        println!("                ai.chat-capable peer in the manifest cache)");
+    } else {
+        println!("  Models:");
+        for m in &resp.data {
+            let desc = if m.description.is_empty() {
+                String::from("(no description)")
+            } else {
+                m.description.clone()
+            };
+            println!("    {id:<24}  {desc}", id = m.id, desc = desc);
+        }
+    }
+    println!();
+    println!("Note: when running native (no docker), use --host 127.0.0.1.");
+    println!("When Open WebUI is on another machine, use this host's LAN IP.");
+    Ok(())
 }
 
 // W2-008d CLI live-tail: poll /v1/tasks/events/recent on a loop.
@@ -1455,6 +1546,47 @@ mod tests {
         let r: PolicySimulateResp = serde_json::from_str(body).unwrap();
         assert_eq!(r.decision, "deny");
         assert!(r.matched_rule.is_none());
+    }
+
+    #[test]
+    fn port_from_bridge_default() {
+        assert_eq!(port_from_bridge("http://127.0.0.1:19791"), 19791);
+    }
+
+    #[test]
+    fn port_from_bridge_custom() {
+        assert_eq!(port_from_bridge("http://localhost:8080"), 8080);
+        assert_eq!(port_from_bridge("https://example.com:443"), 443);
+    }
+
+    #[test]
+    fn port_from_bridge_with_trailing_slash() {
+        assert_eq!(port_from_bridge("http://127.0.0.1:19791/"), 19791);
+    }
+
+    #[test]
+    fn port_from_bridge_falls_back_when_unparseable() {
+        // No port → default.
+        assert_eq!(port_from_bridge("http://example.com"), 19791);
+        // Garbage → default.
+        assert_eq!(port_from_bridge("not a url"), 19791);
+    }
+
+    #[test]
+    fn models_resp_parses() {
+        let body = r#"{
+            "object": "list",
+            "data": [
+                {"id":"relix-mock", "object":"model", "created":0,
+                 "owned_by":"relix", "description":"mock route"},
+                {"id":"relix-openai", "object":"model", "created":0,
+                 "owned_by":"relix", "description":"openai route"}
+            ]
+        }"#;
+        let r: ModelsResp = serde_json::from_str(body).unwrap();
+        assert_eq!(r.data.len(), 2);
+        assert_eq!(r.data[0].id, "relix-mock");
+        assert_eq!(r.data[1].description, "openai route");
     }
 
     #[test]
