@@ -33,11 +33,15 @@ use crate::config::AppState;
 const DEFAULT_PEER: &str = "memory";
 const DEFAULT_AI_PEER: &str = "ai";
 
-/// POST `/v1/memory/curate` body.
-#[derive(Debug, Deserialize)]
+/// POST `/v1/memory/curate` body. `subject_id` is required —
+/// validated inside the handler so a missing field returns
+/// `400` (with our `ApiError` JSON shape) rather than axum's
+/// default 422 for JSON deserialization failures.
+#[derive(Debug, Deserialize, Default)]
 pub struct CurateRequest {
-    /// The agent's 64-char hex subject_id (required).
-    pub subject_id: String,
+    /// The agent's 64-char hex subject_id.
+    #[serde(default)]
+    pub subject_id: Option<String>,
     /// Memory peer alias. Defaults to `"memory"`.
     #[serde(default)]
     pub peer: Option<String>,
@@ -81,7 +85,7 @@ pub async fn curate(
     State(state): State<AppState>,
     Json(req): Json<CurateRequest>,
 ) -> Result<Json<CurateResponse>, (StatusCode, Json<ApiError>)> {
-    let subject_id = req.subject_id.trim().to_string();
+    let subject_id = req.subject_id.as_deref().unwrap_or("").trim().to_string();
     if subject_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
