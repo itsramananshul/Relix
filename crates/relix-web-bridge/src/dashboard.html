@@ -4596,6 +4596,34 @@ function renderLineagePanel(payload) {
    detail when the operator-set marker is on. Renders nothing
    when unset. Shows the marker timestamp + optional reason +
    a one-click clear control. */
+// W2-001e: detect "this task is a replay of X" by scanning
+// the chronicle for the `task.replayed_from` event the
+// coordinator emits on `task.replay` (replay_from). Payload
+// shape: `from=<original_task_id>`. Returns an HTML banner
+// or empty string when the task isn't a replay.
+function renderReplayBanner(events) {
+  if (!Array.isArray(events) || events.length === 0) return '';
+  const ev = events.find(e => (e && e.event_type) === 'task.replayed_from');
+  if (!ev) return '';
+  const m = (ev.payload || '').match(/from=([0-9a-f]+)/i);
+  const orig = m ? m[1] : '';
+  if (!orig) return '';
+  const short = orig.slice(0, 8) + '…';
+  return ''
+    + '<div class="banner info" style="margin: 0 14px 12px;'
+    +   ' display: flex; align-items: center; gap: 8px;'
+    +   ' background: var(--bg-1); border: 1px solid var(--border);'
+    +   ' border-radius: 4px; padding: 8px 12px;">'
+    +   '<span style="flex: 1;">'
+    +     '<strong>Replay</strong> · this task is a replay of '
+    +     '<code title="' + escapeHtml(orig) + '">' + escapeHtml(short) + '</code>'
+    +   '</span>'
+    +   '<a class="chip" href="#/tasks?task=' + encodeURIComponent(orig) + '"'
+    +     ' data-replay-of="' + escapeHtml(orig) + '"'
+    +     ' title="open the original task">View original</a>'
+    + '</div>';
+}
+
 function renderInvestigationBanner(l) {
   const header = (l.task && l.task.header) || {};
   const markedAtRaw = header.investigation_marked_at;
@@ -5223,6 +5251,12 @@ function renderDetail(l) {
   // has at least one capability.invoked event.
   const execSlot = '<div id="exec-slot"></div>';
   const investigationBanner = renderInvestigationBanner(l);
+  // W2-001e: replay banner — if this task is itself a
+  // replay (task.replayed_from event present), surface
+  // the original task id as a click-through so operators
+  // don't have to spelunk the chronicle to know they're
+  // looking at attempt N+1 of someone else's task.
+  const replayBanner = renderReplayBanner(allEvents);
   // M66: lineage panel slot — populated async by
   // fetchLineageGraph after the detail renders. Empty slot
   // when no task is loaded so a stale graph from the prior
@@ -5230,6 +5264,7 @@ function renderDetail(l) {
   const lineageSlot = '<div id="lineage-slot"></div>';
   document.getElementById('task-detail').innerHTML =
     investigationBanner
+    + replayBanner
     + `<div class="summary">${summaryRow}</div>`
     + chainBlock
     + graphBlock
