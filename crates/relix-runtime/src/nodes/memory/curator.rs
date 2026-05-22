@@ -67,6 +67,14 @@ pub struct CuratorConfig {
     /// manual capability returns `BackendNotConnected`.
     #[serde(default, rename = "ai_peer")]
     pub ai_peer: Option<AiPeerConfig>,
+    /// Optional outbound peer pointing at the Coordinator
+    /// node. When set, the curator writes a
+    /// `memory.curator_run` chronicle event after every
+    /// scheduler tick. When absent, the chronicle event is
+    /// skipped (logged at WARN once per tick); the curator
+    /// otherwise runs normally.
+    #[serde(default, rename = "coord_peer")]
+    pub coord_peer: Option<CoordPeerConfig>,
 }
 
 impl Default for CuratorConfig {
@@ -76,6 +84,7 @@ impl Default for CuratorConfig {
             interval_secs: default_interval_secs(),
             min_chars_to_curate: default_min_chars(),
             ai_peer: None,
+            coord_peer: None,
         }
     }
 }
@@ -114,6 +123,34 @@ fn default_ai_alias() -> String {
 
 fn default_ai_deadline_secs() -> i64 {
     30
+}
+
+/// `[memory.curator.coord_peer]` — optional outbound peer
+/// pointing at a Coordinator node. When set, the curator
+/// writes a `memory.curator_run` chronicle event after every
+/// scheduler tick. When absent, the chronicle event is
+/// skipped (with a one-line WARN); the curator otherwise
+/// runs normally.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CoordPeerConfig {
+    /// libp2p multiaddr (e.g. `/ip4/127.0.0.1/tcp/19714`).
+    pub addr: String,
+    /// Alias the outbound MeshClient uses to dial. Defaults
+    /// to `"coordinator"`.
+    #[serde(default = "default_coord_alias")]
+    pub alias: String,
+    /// Per-call deadline in seconds. `task.event` is a cheap
+    /// SQLite insert; 10s is plenty.
+    #[serde(default = "default_coord_deadline_secs")]
+    pub deadline_secs: i64,
+}
+
+fn default_coord_alias() -> String {
+    "coordinator".to_string()
+}
+
+fn default_coord_deadline_secs() -> i64 {
+    10
 }
 
 // ───────────────────────── AiDispatcher ────────────────────────
@@ -197,11 +234,167 @@ impl AiDispatcher for AiMeshDispatcher {
     }
 }
 
+// ───────────────────────── CoordDispatcher ────────────────────
+
+/// Async hook the curator reaches through to write a
+/// `memory.curator_run` chronicle event to a Coordinator
+/// peer. Production wraps a `MeshClient`; tests stub it.
+///
+/// Two methods:
+///
+/// - `ensure_system_task` — get-or-create the synthetic
+///   "memory curator system" task and return its task_id.
+///   Cached by the scheduler.
+/// - `append_event` — call `task.event` on an existing
+///   task with the run summary as payload.
+///
+/// Both return `None` on any failure (network, decode,
+/// responder err). The scheduler logs a WARN and continues
+/// — chronicle writes are best-effort.
+#[async_trait]
+pub trait CoordDispatcher: Send + Sync {
+    /// Get-or-create the synthetic system task that holds
+    /// chronicle entries for curator runs. Returns the
+    /// task_id on success, `None` on failure.
+    async fn ensure_system_task(&self) -> Option<String>;
+
+    /// Append a `memory.curator_run` event to `task_id` with
+    /// a pipe-delim payload encoding the run summary. Returns
+    /// `true` on success.
+    async fn append_curator_event(&self, task_id: &str, summary: &CuratorRunSummary) -> bool;
+}
+
+/// Live `CoordDispatcher` implementation — wraps a
+/// `MeshClient` pointing at the coordinator peer.
+#[derive(Clone)]
+pub struct CoordMeshDispatcher {
+    mesh: MeshClient,
+    alias: String,
+    identity: Bundle,
+    deadline_secs: i64,
+}
+
+impl CoordMeshDispatcher {
+    pub fn new(mesh: MeshClient, alias: String, identity: Bundle, deadline_secs: i64) -> Self {
+        Self {
+            mesh,
+            alias,
+            identity,
+            deadline_secs,
+        }
+    }
+
+    /// Title used for the system task. Searched for at
+    /// `ensure_system_task` time — when found, reused;
+    /// when missing, created.
+    const SYSTEM_TASK_TITLE: &'static str = "memory-curator-system";
+    const SYSTEM_TASK_FLOW: &'static str = "system:memory-curator";
+
+    async fn call(&self, method: &str, arg: Vec<u8>) -> Option<Vec<u8>> {
+        let envelope = build_request(method, arg, self.identity.clone(), self.deadline_secs);
+        let resp_bytes = match self.mesh.call(&self.alias, envelope).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    alias = %self.alias,
+                    method = %method,
+                    error = %e,
+                    "curator coord call failed"
+                );
+                return None;
+            }
+        };
+        let resp = decode_response(&resp_bytes).ok()?;
+        match resp.res {
+            ResponseResult::Ok(body) => Some(body.to_vec()),
+            ResponseResult::Err(env) => {
+                tracing::debug!(
+                    alias = %self.alias,
+                    method = %method,
+                    cause = %env.cause,
+                    "curator coord err response"
+                );
+                None
+            }
+            ResponseResult::StreamHandle(_) => None,
+        }
+    }
+
+    /// Look for an existing system task by walking
+    /// `task.list` (paged). The coordinator doesn't expose a
+    /// title-search capability, so we paginate up to a
+    /// reasonable bound. Returns `None` if not found within
+    /// the bound.
+    async fn find_existing_system_task(&self) -> Option<String> {
+        // Page size 200, scan up to 5 pages (1000 tasks). Any
+        // real deployment with more than 1k tasks above the
+        // system task should restart-create a new one rather
+        // than waste a lot of scan budget.
+        for page in 0..5 {
+            let offset = page * 200;
+            let arg = format!("200|{offset}|");
+            let body = self.call("task.list", arg.into_bytes()).await?;
+            let text = String::from_utf8(body).ok()?;
+            // task.list rows are tab-delimited; the first column
+            // is task_id, then title. We just scan for our
+            // sentinel title. (The exact column layout is
+            // documented in coordinator/mod.rs; here we keep
+            // the parse forgiving — split each line on \t and
+            // look for an exact title match in any column.)
+            for line in text.lines() {
+                if line.starts_with("count=") || line.trim().is_empty() {
+                    continue;
+                }
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.contains(&Self::SYSTEM_TASK_TITLE) {
+                    let task_id = cols.first().copied().unwrap_or("");
+                    if !task_id.is_empty() {
+                        return Some(task_id.to_string());
+                    }
+                }
+            }
+            if !text.contains('\n') {
+                break;
+            }
+        }
+        None
+    }
+}
+
+#[async_trait]
+impl CoordDispatcher for CoordMeshDispatcher {
+    async fn ensure_system_task(&self) -> Option<String> {
+        if let Some(id) = self.find_existing_system_task().await {
+            tracing::debug!(task_id = %id, "curator: reusing existing system task");
+            return Some(id);
+        }
+        // Create. `title|flow_template` is the minimum.
+        let arg = format!("{}|{}", Self::SYSTEM_TASK_TITLE, Self::SYSTEM_TASK_FLOW);
+        let body = self.call("task.create", arg.into_bytes()).await?;
+        let id = String::from_utf8(body).ok()?.trim().to_string();
+        if id.is_empty() {
+            return None;
+        }
+        tracing::info!(task_id = %id, "curator: created system task for chronicle events");
+        Some(id)
+    }
+
+    async fn append_curator_event(&self, task_id: &str, summary: &CuratorRunSummary) -> bool {
+        let payload = format!(
+            "agents_reviewed={}|agents_curated={}|total_chars_saved={}",
+            summary.agents_reviewed, summary.agents_curated, summary.total_chars_saved,
+        );
+        let arg = format!("{task_id}|memory.curator_run|{payload}");
+        self.call("task.event", arg.into_bytes()).await.is_some()
+    }
+}
+
 // ───────────────────────── State ───────────────────────────────
 
 /// In-memory status shared between the scheduler, the
-/// `memory.agent_curate` handler, and the bridge's
-/// `/v1/memory/curator/status` proxy.
+/// `memory.agent_curate` handler, the `memory.curator_status`
+/// handler, and the bridge's `/v1/memory/curator/status`
+/// proxy.
 #[derive(Debug, Default, Clone)]
 pub struct CuratorState {
     /// Unix seconds of the last scheduler run's start. None
@@ -216,6 +409,12 @@ pub struct CuratorState {
     /// concurrency guard — a second tick that lands while the
     /// previous one is still going will skip cleanly.
     pub running: bool,
+    /// Cached system task_id used as the chronicle target for
+    /// `memory.curator_run` events. Created lazily on the
+    /// first successful tick when a coord_peer is configured;
+    /// reused for every subsequent tick within the process.
+    /// `None` means the chronicle write hasn't happened yet.
+    pub system_task_id: Option<String>,
 }
 
 /// Per-run telemetry the scheduler writes back into [`CuratorState`].
@@ -453,6 +652,7 @@ pub fn spawn_curator_scheduler(
     store: Arc<MemoryStore>,
     state: Arc<Mutex<CuratorState>>,
     ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>>,
+    coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>>,
     cfg: CuratorConfig,
 ) {
     if !cfg.enabled {
@@ -472,7 +672,15 @@ pub fn spawn_curator_scheduler(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            run_one_tick(&store, &state, &ai_cell, min_chars, interval.as_secs()).await;
+            run_one_tick(
+                &store,
+                &state,
+                &ai_cell,
+                &coord_cell,
+                min_chars,
+                interval.as_secs(),
+            )
+            .await;
         }
     });
 }
@@ -483,6 +691,7 @@ pub async fn run_one_tick(
     store: &MemoryStore,
     state: &Mutex<CuratorState>,
     ai_cell: &tokio::sync::OnceCell<Arc<dyn AiDispatcher>>,
+    coord_cell: &tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>,
     min_chars: usize,
     interval_secs: u64,
 ) -> CuratorRunSummary {
@@ -555,11 +764,82 @@ pub async fn run_one_tick(
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
-    let mut guard = state.lock().await;
-    guard.last_run_summary = Some(summary.clone());
-    guard.next_run_at = Some(super::unix_secs() + interval_secs as i64);
-    guard.running = false;
+    // Persist run telemetry into the shared state BEFORE
+    // attempting the chronicle write, so a missing coord
+    // peer doesn't hide the in-process status. Pull the
+    // cached system_task_id while we hold the lock.
+    let cached_system_task_id = {
+        let mut guard = state.lock().await;
+        guard.last_run_summary = Some(summary.clone());
+        guard.next_run_at = Some(super::unix_secs() + interval_secs as i64);
+        guard.running = false;
+        guard.system_task_id.clone()
+    };
+
+    // Best-effort chronicle write. Get-or-create the system
+    // task on first call, then append a `memory.curator_run`
+    // event with the run counters as the payload.
+    if let Some(coord) = coord_cell.get() {
+        let task_id = if let Some(id) = cached_system_task_id {
+            Some(id)
+        } else {
+            let id = coord.ensure_system_task().await;
+            if let Some(id_str) = id.as_ref() {
+                // Persist the cache so subsequent ticks skip
+                // the list-and-create dance.
+                state.lock().await.system_task_id = Some(id_str.clone());
+            }
+            id
+        };
+        match task_id {
+            Some(id) => {
+                if !coord.append_curator_event(&id, &summary).await {
+                    tracing::warn!(
+                        task_id = %id,
+                        "memory curator: chronicle write failed (continuing — curator state still recorded in-process)"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "memory curator: could not get-or-create system task; skipping chronicle event"
+                );
+            }
+        }
+    } else {
+        tracing::warn!("memory curator: coord dispatcher not configured; skipping chronicle event");
+    }
+
     summary
+}
+
+// ───────────────────────── memory.curator_status ───────────────
+
+/// Render the curator's live state as the wire body for
+/// `memory.curator_status`. Pipe-delimited key=value pairs on
+/// one line so operators can parse with a simple
+/// `split('|')`. Missing optional values render as `-1` for
+/// timestamps and `0` for counters so the consumer never has
+/// to handle `null`.
+pub fn render_status_body(state: &CuratorState, cfg: &CuratorConfig) -> String {
+    let last_run_at = state.last_run_at.unwrap_or(-1);
+    let next_run_at = state.next_run_at.unwrap_or(-1);
+    let (reviewed, curated, saved) = match &state.last_run_summary {
+        Some(s) => (s.agents_reviewed, s.agents_curated, s.total_chars_saved),
+        None => (0, 0, 0),
+    };
+    format!(
+        "enabled={}|interval_secs={}|min_chars_to_curate={}|running={}|last_run_at={}|next_run_at={}|last_agents_reviewed={}|last_agents_curated={}|last_total_chars_saved={}\n",
+        cfg.enabled,
+        cfg.interval_secs,
+        cfg.min_chars_to_curate,
+        state.running,
+        last_run_at,
+        next_run_at,
+        reviewed,
+        curated,
+        saved,
+    )
 }
 
 // ───────────────────────── Tests ───────────────────────────────
@@ -705,7 +985,9 @@ mod tests {
         let ai: Arc<dyn AiDispatcher> = Arc::new(StubAi::new(Some("short")));
         cell.set(ai).ok();
 
-        let summary = run_one_tick(&store, &state, &cell, 100, 60).await;
+        let coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let summary = run_one_tick(&store, &state, &cell, &coord_cell, 100, 60).await;
         assert_eq!(summary.agents_reviewed, 2);
         // alice was below threshold; only bob curated.
         assert_eq!(summary.agents_curated, 1);
@@ -720,13 +1002,186 @@ mod tests {
         let cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>> =
             Arc::new(tokio::sync::OnceCell::new());
         // Don't populate the cell.
-        let summary = run_one_tick(&store, &state, &cell, 100, 60).await;
+        let coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let summary = run_one_tick(&store, &state, &cell, &coord_cell, 100, 60).await;
         // No curation happens.
         assert_eq!(summary.agents_curated, 0);
         // last_run_at is still recorded (tick fired even if it
         // bailed early).
         let guard = state.lock().await;
         assert!(guard.last_run_at.is_some());
+    }
+
+    // ── Status capability + chronicle write ──────────────────
+
+    #[test]
+    fn render_status_body_shape_matches_spec() {
+        let state = CuratorState {
+            last_run_at: Some(1716000000),
+            next_run_at: Some(1716003600),
+            last_run_summary: Some(CuratorRunSummary {
+                agents_reviewed: 5,
+                agents_curated: 3,
+                total_chars_saved: 120,
+            }),
+            ..Default::default()
+        };
+        let cfg = CuratorConfig {
+            enabled: true,
+            interval_secs: 3600,
+            min_chars_to_curate: 100,
+            ai_peer: None,
+            coord_peer: None,
+        };
+        let body = render_status_body(&state, &cfg);
+        for needle in [
+            "enabled=true",
+            "interval_secs=3600",
+            "min_chars_to_curate=100",
+            "running=false",
+            "last_run_at=1716000000",
+            "next_run_at=1716003600",
+            "last_agents_reviewed=5",
+            "last_agents_curated=3",
+            "last_total_chars_saved=120",
+        ] {
+            assert!(
+                body.contains(needle),
+                "status body missing {needle}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_status_body_missing_run_uses_sentinels() {
+        let state = CuratorState::default();
+        let cfg = CuratorConfig::default();
+        let body = render_status_body(&state, &cfg);
+        // Timestamps render as -1; counters as 0.
+        assert!(body.contains("last_run_at=-1"));
+        assert!(body.contains("next_run_at=-1"));
+        assert!(body.contains("last_agents_reviewed=0"));
+        assert!(body.contains("last_agents_curated=0"));
+        assert!(body.contains("last_total_chars_saved=0"));
+    }
+
+    /// CoordDispatcher stub for chronicle-write tests.
+    struct StubCoord {
+        ensure_calls: AtomicUsize,
+        append_calls: AtomicUsize,
+        return_task_id: Option<String>,
+        appended_summaries: std::sync::Mutex<Vec<CuratorRunSummary>>,
+    }
+
+    impl StubCoord {
+        fn new(task_id: Option<&str>) -> Self {
+            Self {
+                ensure_calls: AtomicUsize::new(0),
+                append_calls: AtomicUsize::new(0),
+                return_task_id: task_id.map(str::to_string),
+                appended_summaries: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CoordDispatcher for StubCoord {
+        async fn ensure_system_task(&self) -> Option<String> {
+            self.ensure_calls.fetch_add(1, Ordering::SeqCst);
+            self.return_task_id.clone()
+        }
+        async fn append_curator_event(&self, _task_id: &str, summary: &CuratorRunSummary) -> bool {
+            self.append_calls.fetch_add(1, Ordering::SeqCst);
+            self.appended_summaries
+                .lock()
+                .unwrap()
+                .push(summary.clone());
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_writes_curator_run_event_with_real_summary() {
+        let store = Arc::new(MemoryStore::in_memory().unwrap());
+        let big: String = std::iter::repeat_n('y', 200).collect();
+        store.agent_write("bob", "agent", "add", &big).ok();
+        let state = Arc::new(Mutex::new(CuratorState::default()));
+        let ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let ai: Arc<dyn AiDispatcher> = Arc::new(StubAi::new(Some("short")));
+        ai_cell.set(ai).ok();
+        let coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let coord = Arc::new(StubCoord::new(Some("00000000000000000000000000000001")));
+        coord_cell
+            .set(coord.clone() as Arc<dyn CoordDispatcher>)
+            .ok();
+        let summary = run_one_tick(&store, &state, &ai_cell, &coord_cell, 100, 60).await;
+        assert_eq!(summary.agents_reviewed, 1);
+        // ensure_system_task fired once; append_curator_event
+        // fired once with the matching summary.
+        assert_eq!(coord.ensure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(coord.append_calls.load(Ordering::SeqCst), 1);
+        let recorded = coord.appended_summaries.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].agents_reviewed, summary.agents_reviewed);
+        assert_eq!(recorded[0].agents_curated, summary.agents_curated);
+        assert_eq!(recorded[0].total_chars_saved, summary.total_chars_saved);
+        // Cached task_id stored on state so subsequent ticks
+        // skip ensure_system_task.
+        let g = state.lock().await;
+        assert_eq!(
+            g.system_task_id.as_deref(),
+            Some("00000000000000000000000000000001"),
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_skips_chronicle_when_coord_unset_but_keeps_running() {
+        let store = Arc::new(MemoryStore::in_memory().unwrap());
+        let big: String = std::iter::repeat_n('y', 200).collect();
+        store.agent_write("bob", "agent", "add", &big).ok();
+        let state = Arc::new(Mutex::new(CuratorState::default()));
+        let ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let ai: Arc<dyn AiDispatcher> = Arc::new(StubAi::new(Some("short")));
+        ai_cell.set(ai).ok();
+        let coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        // Coord cell intentionally empty.
+        let summary = run_one_tick(&store, &state, &ai_cell, &coord_cell, 100, 60).await;
+        assert_eq!(summary.agents_reviewed, 1);
+        // Run still records into state.
+        let g = state.lock().await;
+        assert!(g.last_run_at.is_some());
+        assert!(g.last_run_summary.is_some());
+        assert!(g.system_task_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn tick_caches_system_task_id_across_calls() {
+        let store = Arc::new(MemoryStore::in_memory().unwrap());
+        let big: String = std::iter::repeat_n('y', 200).collect();
+        store.agent_write("bob", "agent", "add", &big).ok();
+        let state = Arc::new(Mutex::new(CuratorState::default()));
+        let ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let ai: Arc<dyn AiDispatcher> = Arc::new(StubAi::new(Some("short")));
+        ai_cell.set(ai).ok();
+        let coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let coord = Arc::new(StubCoord::new(Some("aaaa1111aaaa1111aaaa1111aaaa1111")));
+        coord_cell
+            .set(coord.clone() as Arc<dyn CoordDispatcher>)
+            .ok();
+        // First tick — ensure_system_task fires.
+        let _ = run_one_tick(&store, &state, &ai_cell, &coord_cell, 100, 60).await;
+        // Second tick — uses cached id, ensure_system_task
+        // should NOT fire again.
+        let _ = run_one_tick(&store, &state, &ai_cell, &coord_cell, 100, 60).await;
+        assert_eq!(coord.ensure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(coord.append_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

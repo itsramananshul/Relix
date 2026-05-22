@@ -300,20 +300,42 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(StartupWiring::MemoryCurator {
             ai_cell,
+            coord_cell,
             state,
             cfg: ccfg,
         }) => {
+            let interval_secs = ccfg.interval_secs;
             if let Some(aipeer) = ccfg.ai_peer.clone() {
                 let key_path = cfg.identity.key_path.clone();
-                let interval_secs = ccfg.interval_secs;
+                let state_for_ai = state.clone();
                 tokio::spawn(async move {
-                    populate_memory_curator_cell(ai_cell, state, aipeer, key_path, interval_secs)
-                        .await;
+                    populate_memory_curator_cell(
+                        ai_cell,
+                        state_for_ai,
+                        aipeer,
+                        key_path,
+                        interval_secs,
+                    )
+                    .await;
                 });
             } else {
-                tracing::info!("memory curator: no [memory.curator.ai_peer]; dispatcher unset");
-                let _ = state;
+                tracing::info!("memory curator: no [memory.curator.ai_peer]; AI dispatcher unset");
             }
+            if let Some(coordpeer) = ccfg.coord_peer.clone() {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_memory_curator_coord_cell(coord_cell, coordpeer, key_path).await;
+                });
+            } else {
+                tracing::info!(
+                    "memory curator: no [memory.curator.coord_peer]; chronicle events disabled"
+                );
+            }
+            // Keep `state` referenced — the curator scheduler
+            // and the memory.curator_status handler already
+            // hold their own Arc clones; this branch just
+            // owned the wiring closure-captured copy.
+            let _ = state;
         }
         _ => {}
     }
@@ -1056,6 +1078,117 @@ async fn populate_memory_curator_cell(
     }
 }
 
+/// Mirror of `populate_memory_curator_cell` for the coord-peer
+/// dispatcher. When `[memory.curator.coord_peer]` is set, the
+/// memory controller dials the coordinator post-startup and
+/// publishes a `CoordMeshDispatcher` into the cell so the
+/// curator scheduler can write `memory.curator_run` chronicle
+/// events after every tick.
+///
+/// Same silent-failure posture as the AI dispatcher path —
+/// missing bundle / bad key / discover failure all surface as
+/// a single WARN and the cell stays empty (the scheduler then
+/// logs one WARN per tick and skips the chronicle write).
+async fn populate_memory_curator_coord_cell(
+    cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::CoordDispatcher>>>,
+    cfg: crate::nodes::memory::CoordPeerConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "memory curator coord: identity bundle missing; chronicle events disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "memory curator coord: identity bundle decode failed; chronicle events disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "memory curator coord: client key not 32 bytes; chronicle events disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "memory curator coord: client key missing; chronicle events disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.alias.clone(),
+        PeerEntry {
+            addr: cfg.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(6),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                alias = %cfg.alias,
+                addr = %cfg.addr,
+                "memory curator coord: discover_and_pin returned None; chronicle events disabled"
+            );
+            return;
+        }
+    };
+    let dispatcher: Arc<dyn crate::nodes::memory::CoordDispatcher> =
+        Arc::new(crate::nodes::memory::CoordMeshDispatcher::new(
+            mesh,
+            cfg.alias.clone(),
+            bundle,
+            cfg.deadline_secs,
+        ));
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("memory curator coord: cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            alias = %cfg.alias,
+            addr = %cfg.addr,
+            "memory node: coordinator dispatcher online; chronicle events enabled"
+        );
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1074,13 +1207,15 @@ pub(crate) enum StartupWiring {
         cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::ai::MemoryFetcher>>>,
         cfg: Option<crate::nodes::ai::AiMemoryPeerConfig>,
     },
-    /// Memory node curator wiring. The AI dispatcher cell was
-    /// already passed into both `memory::register` and the
-    /// curator scheduler; the run() loop populates it post-
-    /// startup by building an [`AiMeshDispatcher`] from
-    /// `cfg.ai_peer` (when set).
+    /// Memory node curator wiring. The dispatcher cells were
+    /// already passed into `memory::register` and the curator
+    /// scheduler; the run() loop populates them post-startup
+    /// by building an [`AiMeshDispatcher`] from `cfg.ai_peer`
+    /// and a [`CoordMeshDispatcher`] from `cfg.coord_peer`
+    /// (each when set).
     MemoryCurator {
         ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
+        coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::CoordDispatcher>>>,
         state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
         cfg: crate::nodes::memory::CuratorConfig,
     },
@@ -1116,13 +1251,33 @@ fn register_node_type_handlers(
         let curator_ai_cell: Arc<
             tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>,
         > = Arc::new(tokio::sync::OnceCell::new());
+        // Shared coordinator-dispatcher cell — used by the
+        // scheduler to write `memory.curator_run` chronicle
+        // events. Empty cell == coord_peer not configured, so
+        // events are silently skipped (one WARN per tick).
+        let curator_coord_cell: Arc<
+            tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::CoordDispatcher>>,
+        > = Arc::new(tokio::sync::OnceCell::new());
         let curator_state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>> = Arc::new(
             tokio::sync::Mutex::new(crate::nodes::memory::CuratorState::default()),
         );
-        crate::nodes::memory::register(bridge, store.clone(), curator_ai_cell.clone());
+        // The new `memory.curator_status` capability reads real
+        // CuratorState; pass it as `(state, cfg)` if [memory.
+        // curator] is set, else None — handler returns a clear
+        // "configured=false" body.
+        let curator_handler_cfg = mem_cfg
+            .curator
+            .clone()
+            .map(|c| (curator_state.clone(), Arc::new(c)));
+        crate::nodes::memory::register(
+            bridge,
+            store.clone(),
+            curator_ai_cell.clone(),
+            curator_handler_cfg,
+        );
         // Spawn the curator scheduler iff [memory.curator] is
-        // configured AND enabled. Discovery of the AI peer is
-        // deferred to post-rpc::Client setup; see
+        // configured AND enabled. Discovery of the AI + coord
+        // peers is deferred to post-rpc::Client setup; see
         // `StartupWiring::MemoryCurator`.
         if let Some(curator_cfg) = mem_cfg.curator.clone() {
             if curator_cfg.enabled {
@@ -1130,6 +1285,7 @@ fn register_node_type_handlers(
                     store.clone(),
                     curator_state.clone(),
                     curator_ai_cell.clone(),
+                    curator_coord_cell.clone(),
                     curator_cfg.clone(),
                 );
             } else {
@@ -1139,6 +1295,7 @@ fn register_node_type_handlers(
             }
             *out = Some(StartupWiring::MemoryCurator {
                 ai_cell: curator_ai_cell,
+                coord_cell: curator_coord_cell,
                 state: curator_state,
                 cfg: curator_cfg,
             });
@@ -1191,6 +1348,17 @@ fn register_node_type_handlers(
                  on any AI failure.",
                 &["mutate", "memory", "agent_memory", "curate"],
                 &["mutate:memory", "external:ai"],
+            ),
+            (
+                "memory.curator_status",
+                "Read the curator scheduler's live state — \
+                 enabled, interval_secs, min_chars_to_curate, \
+                 running, last_run_at, next_run_at, and the last \
+                 run summary (agents_reviewed, agents_curated, \
+                 total_chars_saved). Returns pipe-delimited \
+                 key=value pairs. Pure read.",
+                &["read", "memory", "curator", "status"],
+                &["reads:internal"],
             ),
         ];
         for (m, desc, cats, tags) in memory_caps {

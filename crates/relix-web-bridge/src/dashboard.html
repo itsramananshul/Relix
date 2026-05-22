@@ -8520,16 +8520,31 @@ async function loadCuratorStatus() {
     // when the scheduler's in-process state isn't reachable
     // through a capability (today). Render it verbatim
     // rather than guessing.
+    // Real fields from /v1/memory/curator/status (W2-MEMORY-
+    // CURATOR-FIX). The bridge proxies memory.curator_status
+    // on the memory node; the in-process CuratorState is the
+    // source of truth.
     const lines = [];
-    if (body.enabled !== null && body.enabled !== undefined) {
-      lines.push('enabled: ' + (body.enabled ? 'yes' : 'no'));
+    if (body.configured === false) {
+      lines.push('configured: no — add [memory.curator] to the memory node config');
     }
-    if (body.interval_secs !== null && body.interval_secs !== undefined) {
-      lines.push('interval: ' + body.interval_secs + 's');
-    }
+    lines.push('enabled: ' + (body.enabled ? 'yes' : 'no'));
+    lines.push('interval: ' + (body.interval_secs || 0) + 's');
+    lines.push('min_chars_to_curate: ' + (body.min_chars_to_curate || 0));
+    lines.push('running: ' + (body.running ? 'yes' : 'no'));
     if (body.last_run_at) {
       const ago = Math.max(0, Math.floor(Date.now() / 1000) - body.last_run_at);
       lines.push('last run: ' + fmtDuration(ago) + ' ago');
+    } else {
+      lines.push('last run: (none yet)');
+    }
+    if (body.next_run_at) {
+      const left = body.next_run_at - Math.floor(Date.now() / 1000);
+      if (left > 0) {
+        lines.push('next run: in ' + fmtDuration(left));
+      } else {
+        lines.push('next run: imminent');
+      }
     }
     if (body.last_run_summary) {
       const s = body.last_run_summary;
@@ -8539,17 +8554,7 @@ async function loadCuratorStatus() {
         + ' chars_saved=' + (s.total_chars_saved || 0)
       );
     }
-    if (body.next_run_at) {
-      const left = body.next_run_at - Math.floor(Date.now() / 1000);
-      if (left > 0) {
-        lines.push('next run: in ' + fmtDuration(left));
-      }
-    }
-    if (body.bridge_note) {
-      lines.push('');
-      lines.push('note: ' + body.bridge_note);
-    }
-    $host.textContent = lines.length ? lines.join('\n') : '(no status fields surfaced)';
+    $host.textContent = lines.join('\n');
     if ($meta) $meta.textContent = 'peer=' + (body.peer || peer);
   } catch (e) {
     $host.textContent = 'load failed: ' + String(e);

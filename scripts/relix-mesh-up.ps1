@@ -299,6 +299,26 @@ method = "memory.search"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "mem_agent_read"
+method = "memory.agent_read"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "mem_agent_write"
+method = "memory.agent_write"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "mem_agent_curate"
+method = "memory.agent_curate"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "mem_curator_status"
+method = "memory.curator_status"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "ai_chat"
 method = "ai.chat"
 allow_groups = ["chat-users"]

@@ -85,8 +85,9 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 pub use curator::{
-    AiDispatcher, AiMeshDispatcher, AiPeerConfig, CuratorConfig, CuratorRunSummary, CuratorState,
-    CuratorSubjectResult, spawn_curator_scheduler,
+    AiDispatcher, AiMeshDispatcher, AiPeerConfig, CoordDispatcher, CoordMeshDispatcher,
+    CoordPeerConfig, CuratorConfig, CuratorRunSummary, CuratorState, CuratorSubjectResult,
+    render_status_body, spawn_curator_scheduler,
 };
 
 /// Per-node memory configuration parsed from the controller TOML `[memory]`
@@ -483,10 +484,18 @@ impl MemoryStore {
 /// `RESPONDER_INTERNAL` "ai dispatcher not configured" error
 /// for that one call. The curator scheduler captures the SAME
 /// cell so manual + scheduled paths see the same dispatcher.
+///
+/// `curator` carries the live `CuratorState` and the parsed
+/// `CuratorConfig` so the new `memory.curator_status`
+/// capability can render real numbers. `None` means
+/// `[memory.curator]` was unconfigured — the capability is
+/// still registered and returns a clear "not configured" body
+/// so operators see why instead of getting `unknown method`.
 pub fn register(
     bridge: &mut DispatchBridge,
     store: Arc<MemoryStore>,
     ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>>,
+    curator: Option<(Arc<tokio::sync::Mutex<CuratorState>>, Arc<CuratorConfig>)>,
 ) {
     {
         let store = store.clone();
@@ -547,6 +556,16 @@ pub fn register(
                 let store = store.clone();
                 let ai = ai.clone();
                 async move { handle_agent_curate(&store, &ai, &ctx).await }
+            })),
+        );
+    }
+    {
+        let curator = curator.clone();
+        bridge.register(
+            "memory.curator_status",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let curator = curator.clone();
+                async move { handle_curator_status(curator.as_ref()).await }
             })),
         );
     }
@@ -757,6 +776,22 @@ async fn handle_agent_curate(
             retry_after: None,
         }),
     }
+}
+
+async fn handle_curator_status(
+    curator: Option<&(Arc<tokio::sync::Mutex<CuratorState>>, Arc<CuratorConfig>)>,
+) -> HandlerOutcome {
+    let Some((state, cfg)) = curator else {
+        // No [memory.curator] section in the controller config.
+        // Render a deterministic body that explicitly says
+        // disabled so operators see WHY rather than getting an
+        // unknown-method error.
+        let body = "enabled=false|interval_secs=0|min_chars_to_curate=0|running=false|last_run_at=-1|next_run_at=-1|last_agents_reviewed=0|last_agents_curated=0|last_total_chars_saved=0|configured=false\n";
+        return HandlerOutcome::Ok(body.as_bytes().to_vec());
+    };
+    let snapshot = state.lock().await.clone();
+    let body = curator::render_status_body(&snapshot, cfg);
+    HandlerOutcome::Ok(body.into_bytes())
 }
 
 fn invalid_args(cause: String) -> HandlerOutcome {

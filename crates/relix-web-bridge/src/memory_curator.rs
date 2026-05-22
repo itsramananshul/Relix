@@ -120,41 +120,148 @@ pub struct StatusQuery {
     pub peer: Option<String>,
 }
 
+#[derive(Debug, Serialize, Default, Clone, PartialEq, Eq)]
+pub struct StatusLastRun {
+    pub agents_reviewed: usize,
+    pub agents_curated: usize,
+    pub total_chars_saved: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     /// Memory peer the bridge proxied the request to.
     pub peer: String,
-    /// Honest scope note: the runtime doesn't yet expose a
-    /// `memory.curator_status` capability — the scheduler's
-    /// state lives in-process on the memory node. This
-    /// endpoint surfaces what the bridge knows
-    /// (enabled-via-config) and an explicit `bridge_note`
-    /// field naming the gap.
-    pub enabled: Option<bool>,
-    pub interval_secs: Option<u64>,
-    pub bridge_note: String,
+    /// Whether the curator is configured + enabled.
+    pub enabled: bool,
+    /// Scheduler tick cadence (seconds).
+    pub interval_secs: u64,
+    /// Min combined chars before curation kicks in.
+    pub min_chars_to_curate: usize,
+    /// True while a scheduler tick is in progress.
+    pub running: bool,
+    /// Unix seconds of the last scheduler run, or `None`
+    /// when no run has fired yet.
+    pub last_run_at: Option<i64>,
+    /// Unix seconds of the next scheduler tick.
+    pub next_run_at: Option<i64>,
+    /// Last-run telemetry. None when no run has fired.
+    pub last_run_summary: Option<StatusLastRun>,
+    /// True when [memory.curator] is configured on the
+    /// memory node. When false, every other field is the
+    /// "disabled" defaults; operators should add the config.
+    pub configured: bool,
 }
 
 pub async fn status(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ApiError>)> {
     let peer = q.peer.unwrap_or_else(|| DEFAULT_PEER.to_string());
-    // The memory node doesn't yet expose a status capability
-    // — the in-process `CuratorState` is only readable by the
-    // node itself. We could ship a `memory.curator_status`
-    // capability that reads the state and returns it, but
-    // that's a separate follow-up. For now the bridge
-    // surface tells the operator what's missing rather than
-    // making something up.
+    let body = call_peer_string(&state, &peer, "memory.curator_status", &[]).await?;
+    let parsed = parse_status_body(&body).ok_or((
+        StatusCode::BAD_GATEWAY,
+        Json(ApiError {
+            error: format!(
+                "memory peer returned unparseable curator_status body ({} chars)",
+                body.len()
+            ),
+        }),
+    ))?;
     Ok(Json(StatusResponse {
         peer,
-        enabled: None,
-        interval_secs: None,
-        bridge_note:
-            "scheduler status is in-process on the memory node; a memory.curator_status capability that exposes last_run_at / last_run_summary / next_run_at lands in a follow-up. Trigger curation manually via POST /v1/memory/curate."
-                .into(),
+        enabled: parsed.enabled,
+        interval_secs: parsed.interval_secs,
+        min_chars_to_curate: parsed.min_chars_to_curate,
+        running: parsed.running,
+        last_run_at: parsed.last_run_at,
+        next_run_at: parsed.next_run_at,
+        last_run_summary: parsed.last_run_summary,
+        configured: parsed.configured,
     }))
+}
+
+/// Parse the pipe-delimited body emitted by the memory
+/// node's `memory.curator_status` handler. The body is a
+/// single line of `key=value|key=value|...` followed by a
+/// trailing newline. Bad parses (missing keys, garbage
+/// numbers) return `None`; the bridge surfaces that as 502.
+///
+/// `-1` is the sentinel for "no run yet" on the timestamp
+/// fields; we map it back to `None` here so the JSON
+/// response reads naturally.
+pub fn parse_status_body(body: &str) -> Option<ParsedStatus> {
+    let line = body.trim();
+    if line.is_empty() {
+        return None;
+    }
+    // Default: configured=true unless the body explicitly
+    // sets configured=false (the disabled-default body the
+    // memory node emits when [memory.curator] is missing).
+    let mut p = ParsedStatus {
+        configured: true,
+        ..ParsedStatus::default()
+    };
+    let mut reviewed = 0usize;
+    let mut curated = 0usize;
+    let mut saved = 0usize;
+    let mut saw_summary = false;
+    for field in line.split('|') {
+        let (k, v) = field.split_once('=')?;
+        match k {
+            "enabled" => p.enabled = v == "true",
+            "interval_secs" => p.interval_secs = v.parse().ok()?,
+            "min_chars_to_curate" => p.min_chars_to_curate = v.parse().ok()?,
+            "running" => p.running = v == "true",
+            "last_run_at" => {
+                let n: i64 = v.parse().ok()?;
+                p.last_run_at = if n < 0 { None } else { Some(n) };
+            }
+            "next_run_at" => {
+                let n: i64 = v.parse().ok()?;
+                p.next_run_at = if n < 0 { None } else { Some(n) };
+            }
+            "last_agents_reviewed" => {
+                reviewed = v.parse().ok()?;
+                saw_summary = true;
+            }
+            "last_agents_curated" => {
+                curated = v.parse().ok()?;
+                saw_summary = true;
+            }
+            "last_total_chars_saved" => {
+                saved = v.parse().ok()?;
+                saw_summary = true;
+            }
+            "configured" => p.configured = v == "true",
+            _ => {} // forward-compat
+        }
+    }
+    // Only surface a `last_run_summary` when the underlying
+    // run actually happened (last_run_at present). Otherwise
+    // we'd serve zeros as if they were a real "0 agents
+    // reviewed" run, which is misleading.
+    if saw_summary && p.last_run_at.is_some() {
+        p.last_run_summary = Some(StatusLastRun {
+            agents_reviewed: reviewed,
+            agents_curated: curated,
+            total_chars_saved: saved,
+        });
+    }
+    Some(p)
+}
+
+/// Result shape from `parse_status_body`. Same fields as
+/// `StatusResponse` minus `peer` (the bridge stamps it).
+#[derive(Debug, Default)]
+pub struct ParsedStatus {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub min_chars_to_curate: usize,
+    pub running: bool,
+    pub last_run_at: Option<i64>,
+    pub next_run_at: Option<i64>,
+    pub last_run_summary: Option<StatusLastRun>,
+    pub configured: bool,
 }
 
 /// Parse the pipe-delimited body emitted by
@@ -282,6 +389,48 @@ mod tests {
     fn parse_rejects_malformed_field() {
         let body = "agent_chars_before=NaN|user_chars_after=10";
         assert!(parse_curate_body(body).is_none());
+    }
+
+    #[test]
+    fn parse_status_typical_running_with_summary() {
+        let body = "enabled=true|interval_secs=3600|min_chars_to_curate=100|running=false|last_run_at=1716000000|next_run_at=1716003600|last_agents_reviewed=5|last_agents_curated=3|last_total_chars_saved=120\n";
+        let s = parse_status_body(body).unwrap();
+        assert!(s.enabled);
+        assert_eq!(s.interval_secs, 3600);
+        assert_eq!(s.min_chars_to_curate, 100);
+        assert!(!s.running);
+        assert_eq!(s.last_run_at, Some(1716000000));
+        assert_eq!(s.next_run_at, Some(1716003600));
+        let summary = s.last_run_summary.expect("summary present");
+        assert_eq!(summary.agents_reviewed, 5);
+        assert_eq!(summary.agents_curated, 3);
+        assert_eq!(summary.total_chars_saved, 120);
+        assert!(s.configured);
+    }
+
+    #[test]
+    fn parse_status_no_run_yet_drops_summary() {
+        let body = "enabled=true|interval_secs=3600|min_chars_to_curate=100|running=false|last_run_at=-1|next_run_at=1716003600|last_agents_reviewed=0|last_agents_curated=0|last_total_chars_saved=0\n";
+        let s = parse_status_body(body).unwrap();
+        assert!(s.last_run_at.is_none());
+        // No run yet → no summary surfaced (zeros are
+        // ambiguous between "haven't run" and "ran, curated
+        // nothing"; the timestamp disambiguates).
+        assert!(s.last_run_summary.is_none());
+    }
+
+    #[test]
+    fn parse_status_disabled_unconfigured_body() {
+        let body = "enabled=false|interval_secs=0|min_chars_to_curate=0|running=false|last_run_at=-1|next_run_at=-1|last_agents_reviewed=0|last_agents_curated=0|last_total_chars_saved=0|configured=false\n";
+        let s = parse_status_body(body).unwrap();
+        assert!(!s.configured);
+        assert!(!s.enabled);
+    }
+
+    #[test]
+    fn parse_status_rejects_empty_body() {
+        assert!(parse_status_body("").is_none());
+        assert!(parse_status_body("   ").is_none());
     }
 
     #[test]
