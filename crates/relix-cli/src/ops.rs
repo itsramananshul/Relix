@@ -148,6 +148,31 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// W2-008i — one-shot snapshot of the bridge's
+    /// observable state. Hits health, topology, dispatch
+    /// stats, policy denials, and the recent events ring
+    /// in parallel and combines them into a single JSON
+    /// dump. Useful for incident attachments and offline
+    /// triage — engineers without mesh access can answer
+    /// "what did the mesh look like at $time" from the
+    /// file alone.
+    Snapshot {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Target peer alias for per-peer endpoints
+        /// (dispatch stats + policy denials).
+        #[arg(long, default_value = "tool")]
+        peer: String,
+        /// Write to a file instead of stdout. `-` is the
+        /// stdout sentinel (default). Existing files are
+        /// overwritten without prompt.
+        #[arg(long, default_value = "-")]
+        output: String,
+        /// Pretty-print the JSON (indented, easy to diff).
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
     /// W2-008h — print a copy-paste Open WebUI connection
     /// setup for the current bridge. Hits `/v1/models` and
     /// formats the host:port + advertised model ids into
@@ -262,7 +287,93 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             max_events,
         } => tail(&bridge, &filter, interval_ms, max_events).await,
         Cmd::OpenWebuiSetup { bridge, host, json } => openwebui_setup(&bridge, &host, json).await,
+        Cmd::Snapshot {
+            bridge,
+            peer,
+            output,
+            pretty,
+        } => snapshot(&bridge, &peer, &output, pretty).await,
     }
+}
+
+// W2-008i CLI: combined-state snapshot for incident attachments.
+
+async fn snapshot(
+    bridge: &str,
+    peer: &str,
+    output: &str,
+    pretty: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    // Bind the URLs first so the format!() temporaries
+    // live across the tokio::join! await; passing
+    // `&format!(...)` inline races their drop.
+    let u_health = format!("{base}/v1/health");
+    let u_topology = format!("{base}/v1/topology");
+    let u_dispatch = format!("{base}/v1/dispatch/stats?peer={peer}");
+    let u_denials = format!("{base}/v1/policy/denials?peer={peer}&max=100");
+    let u_events = format!("{base}/v1/tasks/events/recent?limit=100");
+    // Run the five fetches concurrently — each is a cheap
+    // HTTP GET and incident-response wants the dump fast.
+    let (health, topology, dispatch_stats, denials, events) = tokio::join!(
+        http_get(&u_health),
+        http_get(&u_topology),
+        http_get(&u_dispatch),
+        http_get(&u_denials),
+        http_get(&u_events),
+    );
+    // Each endpoint's value is either the parsed JSON
+    // payload (preferred — pretty-prints cleanly) or an
+    // error string when the fetch failed. Operators see
+    // partial state instead of a hard fail; one section
+    // being missing in a triage dump is still useful.
+    let entry = |name: &str,
+                 res: Result<String, Box<dyn std::error::Error>>|
+     -> (String, serde_json::Value) {
+        let v = match res {
+            Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+                .unwrap_or(serde_json::Value::String(body)),
+            Err(e) => serde_json::json!({ "error": e.to_string() }),
+        };
+        (name.to_string(), v)
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "snapshot_at".to_string(),
+        serde_json::json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+    );
+    obj.insert("bridge".to_string(), serde_json::json!(base));
+    obj.insert("peer".to_string(), serde_json::json!(peer));
+    let entries = [
+        entry("health", health),
+        entry("topology", topology),
+        entry("dispatch_stats", dispatch_stats),
+        entry("denials", denials),
+        entry("events", events),
+    ];
+    for (k, v) in entries {
+        obj.insert(k, v);
+    }
+    let value = serde_json::Value::Object(obj);
+    let text = if pretty {
+        serde_json::to_string_pretty(&value)?
+    } else {
+        serde_json::to_string(&value)?
+    };
+    if output == "-" {
+        println!("{text}");
+    } else {
+        std::fs::write(output, &text).map_err(|e| format!("write {output}: {e}"))?;
+        // Status line on stderr so `> file` redirection
+        // remains clean if the operator passes `-` instead.
+        eprintln!("wrote snapshot to {output} ({len} bytes)", len = text.len());
+    }
+    Ok(())
 }
 
 // W2-008h CLI: print Open WebUI connection setup.
