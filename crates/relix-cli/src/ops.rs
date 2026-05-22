@@ -173,6 +173,24 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
+    /// W2-MEMORY-4 — read persistent agent + user memory for
+    /// a subject_id. Hits the bridge's `/v1/memory/agent`.
+    /// Pure read; writes happen via the agent's `memory` tool
+    /// inside an ai.chat session, never via this command.
+    AgentMemory {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Target peer alias (defaults to `memory`).
+        #[arg(long, default_value = "memory")]
+        peer: String,
+        /// The agent's 64-char hex subject_id.
+        #[arg(long)]
+        subject_id: String,
+        /// Raw JSON instead of the pretty summary.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// W2-008h — print a copy-paste Open WebUI connection
     /// setup for the current bridge. Hits `/v1/models` and
     /// formats the host:port + advertised model ids into
@@ -287,6 +305,12 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             max_events,
         } => tail(&bridge, &filter, interval_ms, max_events).await,
         Cmd::OpenWebuiSetup { bridge, host, json } => openwebui_setup(&bridge, &host, json).await,
+        Cmd::AgentMemory {
+            bridge,
+            peer,
+            subject_id,
+            json,
+        } => agent_memory(&bridge, &peer, &subject_id, json).await,
         Cmd::Snapshot {
             bridge,
             peer,
@@ -401,6 +425,71 @@ fn port_from_bridge(bridge: &str) -> u16 {
         .rsplit_once(':')
         .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
         .unwrap_or(19791)
+}
+
+// W2-MEMORY-4 CLI mirror: GET /v1/memory/agent
+
+#[derive(Debug, Deserialize)]
+struct AgentMemoryResp {
+    #[serde(default)]
+    peer: String,
+    #[serde(default)]
+    subject_id: String,
+    #[serde(default)]
+    agent_memory: String,
+    #[serde(default)]
+    user_memory: String,
+    #[serde(default)]
+    agent_chars: usize,
+    #[serde(default)]
+    user_chars: usize,
+}
+
+async fn agent_memory(
+    bridge: &str,
+    peer: &str,
+    subject_id: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let subj = subject_id.trim();
+    if subj.is_empty() {
+        return Err("--subject-id required".into());
+    }
+    let url = format!(
+        "{}/v1/memory/agent?peer={}&subject_id={}",
+        bridge.trim_end_matches('/'),
+        urlencoding(peer),
+        urlencoding(subj),
+    );
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let r: AgentMemoryResp = serde_json::from_str(&body)
+        .map_err(|e| format!("decode /v1/memory/agent body: {e} (body={body})"))?;
+    println!("peer={p}  subject_id={s}", p = r.peer, s = r.subject_id);
+    println!();
+    println!("--- AGENT MEMORY ({n} / 2200 chars) ---", n = r.agent_chars);
+    if r.agent_memory.is_empty() {
+        println!("(empty)");
+    } else {
+        println!("{}", r.agent_memory);
+    }
+    println!();
+    println!("--- USER MEMORY ({n} / 1375 chars) ---", n = r.user_chars);
+    if r.user_memory.is_empty() {
+        println!("(empty)");
+    } else {
+        println!("{}", r.user_memory);
+    }
+    println!();
+    println!("(Entry delimiter: § U+00A7. Memory is per-subject_id —");
+    println!(" each agent's identity bundle subject_id keys its own row.)");
+    Ok(())
 }
 
 async fn openwebui_setup(
@@ -1698,6 +1787,41 @@ mod tests {
         assert_eq!(r.data.len(), 2);
         assert_eq!(r.data[0].id, "relix-mock");
         assert_eq!(r.data[1].description, "openai route");
+    }
+
+    #[test]
+    fn agent_memory_resp_parses() {
+        let body = r#"{
+            "peer": "memory",
+            "subject_id": "abc123",
+            "agent_memory": "rust uses cargo§python uses pip",
+            "user_memory":  "prefers concise replies",
+            "agent_chars": 30,
+            "user_chars":  23
+        }"#;
+        let r: AgentMemoryResp = serde_json::from_str(body).unwrap();
+        assert_eq!(r.peer, "memory");
+        assert_eq!(r.subject_id, "abc123");
+        assert!(r.agent_memory.contains("rust uses cargo"));
+        assert!(r.user_memory.contains("prefers concise"));
+        assert_eq!(r.agent_chars, 30);
+        assert_eq!(r.user_chars, 23);
+    }
+
+    #[test]
+    fn agent_memory_resp_parses_empty_fields() {
+        // Missing fields default to empty strings / zero counts —
+        // first-call agents have no memory yet but the response
+        // still parses cleanly.
+        let body = r#"{
+            "peer": "memory",
+            "subject_id": "abc"
+        }"#;
+        let r: AgentMemoryResp = serde_json::from_str(body).unwrap();
+        assert!(r.agent_memory.is_empty());
+        assert!(r.user_memory.is_empty());
+        assert_eq!(r.agent_chars, 0);
+        assert_eq!(r.user_chars, 0);
     }
 
     #[test]
