@@ -710,19 +710,36 @@ gates) is the smallest unit and is operator-observable on its own.
 
 ### 9.1 What exists
 
-A single `memory` node type backed by **SQLite + FTS5**. Three
-capabilities:
+A single `memory` node type backed by **SQLite + FTS5**.
+
+**Per-turn memory** (chat history):
 - `memory.write_turn` — persist a turn (session_id, role, body)
 - `memory.recent_for_session` — read last N turns oldest-first (default 10)
 - `memory.search` — full-text search via FTS5 across all turns
 
+**Persistent agent memory** (W2-MEMORY, frozen-snapshot pattern,
+patterned on Hermes's `MEMORY.md` + `USER.md`):
+- `memory.agent_read` — read agent + user memory for a `subject_id`
+- `memory.agent_write` — add / replace / remove / read one target
+
+Two text stores per agent (keyed by the agent's `subject_id`):
+- `agent` target — agent's notes about environment, tools,
+  project conventions, facts. Char cap 2200.
+- `user` target — what the agent knows about the user it
+  serves — preferences, communication style, workflow habits.
+  Char cap 1375.
+
+Entries within a target are separated by `§` (U+00A7). Char
+caps enforced on every write; INVALID_ARGS on overflow.
+
 Storage path: `[memory] db_path` in the controller config, typically
-`dev-data/<run>/memory.db`. SQLite is the only backing store.
+`dev-data/<run>/memory.db`. SQLite is the only backing store. The
+W2-MEMORY work adds an `agent_memory` table alongside the
+existing `turns` table.
 
 ### 9.2 How chat flows use memory
 
-The canonical pattern (in `flows/chat.sol` and `flows/chat_with_tool.sol`):
-
+**Per-turn** (in `flows/chat.sol` and `flows/chat_with_tool.sol`):
 1. Persist user turn first (so recent-history readback includes it).
 2. Read recent history.
 3. Pass `session_id | prompt | history` to `ai.chat`.
@@ -730,22 +747,41 @@ The canonical pattern (in `flows/chat.sol` and `flows/chat_with_tool.sol`):
 
 The order is SOL-encoded; the runtime does not enforce it.
 
+**Persistent (frozen-snapshot)**: when the AI controller is
+configured with `[ai.memory_peer]`, the AI node's `ai.chat`
+handler reads `memory.agent_read` ONCE per chat call and
+prepends a labelled `--- AGENT MEMORY ---` / `--- USER MEMORY
+---` block to `ChatInput.system_prompt` before invoking the
+provider. Mid-session memory writes go to disk immediately but
+the running session's prompt does NOT re-render — the snapshot
+refreshes on the next session. Silent skip on any failure.
+
+Operators inspect persistent memory via:
+- Dashboard `#/memory` page (read-only)
+- `relix-cli ops agent-memory --subject-id <hex>` (read-only)
+
+Full doc: [`agent-memory.md`](agent-memory.md).
+
 ### 9.3 What is missing
 
-- **No per-task / per-agent memory**. There is no equivalent of a
-  Hermes-style frozen-snapshot MEMORY.md owned by the AI node.
-  `decisions-pending.md::D-001` deferred this explicitly because the
-  AI node delegates prompt assembly to the provider and would need a
-  context engine to consume the memory.
-- **No memory eviction or compaction.** Sessions grow unbounded.
-- **No memory access scope** — any caller with `memory.*` policy
-  permits can read every session.
-- **No vector embeddings.** Search is FTS5 keyword only.
-- **No cross-session knowledge synthesis.** Each session is isolated.
-- **No memory time-bounding.** A 6-month-old session and a fresh
-  session look identical to `recent_for_session`.
-- **No write-time validation.** Bodies are accepted verbatim; secrets,
-  PII, or huge documents are persisted as-is.
+- **No vector embeddings.** Search is FTS5 keyword only over
+  per-turn data. The new persistent-memory layer has no
+  search at all (operators / agents look it up by
+  subject_id).
+- **No cross-agent memory sharing.** Each `subject_id` row is
+  isolated; no team / department / org grouping.
+- **No per-session scope** on persistent memory. Memory is
+  global per-agent across all sessions.
+- **No auto-eviction.** Operators must remove old entries
+  manually (or rely on agent self-curation when that lands).
+- **No background curator.** Hermes runs a scheduled review
+  loop that archives stale skills and consolidates memory
+  entries via an auxiliary LLM. Relix does not. Future track.
+- **No write-time PII validation.** Bodies are accepted
+  verbatim; secrets / PII / huge documents are persisted
+  as-is.
+- **No memory time-bounding.** A 6-month-old session and a
+  fresh session look identical to `recent_for_session`.
 
 ---
 

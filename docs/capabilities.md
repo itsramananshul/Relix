@@ -41,11 +41,22 @@ before the backend (visibility + stable contract + honesty).
 | `task.terminal_summary` (H5 + H14) | live | Auto-emitted on every terminal transition |
 | `task.attempt_orphan_closed` (H7) | live | Recovery-scan cleanup of orphaned attempts |
 
+## Memory node (`crates/relix-runtime/src/nodes/memory/`)
+
+| Method | Status | Notes |
+|---|---|---|
+| `memory.write_turn` | live | Append one chat turn (session_id, role, body) |
+| `memory.recent_for_session` | live | Read last N turns oldest-first (default 10) |
+| `memory.search` | live | FTS5 search across all stored turns |
+| `memory.agent_read` (W2-MEMORY-1) | live | Read persistent agent + user memory for a subject_id. Returns `agent_bytes=N\|user_bytes=M\n<bytes>`. See [agent-memory.md](agent-memory.md). |
+| `memory.agent_write` (W2-MEMORY-1) | live | add/replace/remove/read one memory target. Arg: `subject_id\|target\|action\|data`. Targets: `agent` (cap 2200 chars) / `user` (cap 1375). Entries separated by `§`. |
+
 ## AI node (`crates/relix-runtime/src/nodes/ai/`)
 
 | Method | Status | Notes |
 |---|---|---|
 | `ai.chat` | live | Provider-agnostic; mock / openai-compat / anthropic / gemini-placeholder |
+| Frozen-snapshot memory injection (W2-MEMORY-2) | live | When `[ai.memory_peer]` configured, ai.chat reads `memory.agent_read` once per call and prepends a labeled `--- AGENT MEMORY ---` / `--- USER MEMORY ---` block to `ChatInput.system_prompt`. Silent skip on any failure. |
 | Anthropic prompt caching (PH-WAVE2E) | live | `cache_control: ephemeral` on system block |
 | Anthropic extended thinking (PH-WAVE2F) | live | Opt-in `thinking_budget_tokens` on ChatInput |
 | `FailoverReason` classifier (H1) | live | 12 categories + retry hint |
