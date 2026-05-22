@@ -1,0 +1,22 @@
+# W2-008g: keep the build context small so `docker build`
+# doesn't ship the entire repo (with 800MB of target/ and
+# reference projects) to the daemon every time.
+target/
+dev-data/
+dev-keys/
+configs/policies/
+reference/
+.git/
+.github/
+**/*.log
+**/*.tmp
+
+# IDE / editor noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test outputs.
+**/.cargo-ok
+**/coverage/
