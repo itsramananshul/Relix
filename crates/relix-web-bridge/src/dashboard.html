@@ -2623,6 +2623,7 @@
           style="flex: 1; min-width: 300px; background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: var(--font-mono); font-size: 12px;"
         />
         <button class="chip" id="memory-read-btn">read</button>
+        <button class="chip" id="memory-curate-btn" title="ask the AI peer to consolidate / drop stale entries for this subject; existing memory is preserved on any AI failure">curate</button>
         <span class="meta" id="memory-status"></span>
       </div>
       <div class="card">
@@ -2649,6 +2650,25 @@
         User target caps at <strong>1375</strong>. Writes exceeding
         the cap are rejected with INVALID_ARGS — agents must remove
         old entries before adding new ones.
+      </p>
+      <!-- W2-MEMORY-CURATOR: scheduler status + last-run summary. -->
+      <div class="card" id="memory-curator-status-card">
+        <div class="card-header">
+          <h3>Curator scheduler</h3>
+          <span class="meta" id="memory-curator-status-meta"></span>
+        </div>
+        <div class="card-body dense">
+          <div id="memory-curator-status-host" style="padding: 10px 14px; color: var(--dim); font-family: var(--font-mono); font-size: 12px;">
+            (status not loaded — switch to the page to refresh)
+          </div>
+        </div>
+      </div>
+      <p class="meta">
+        The curator periodically asks the AI peer to consolidate
+        / drop stale entries for each agent whose total memory
+        exceeds the configured threshold. The "curate" button
+        above triggers an immediate pass for ONE subject_id
+        without waiting for the next tick.
       </p>
     </section>
 
@@ -8412,12 +8432,18 @@ async function loadMetrics() {
 /* W2-MEMORY-3: agent-memory inspector. Hits /v1/memory/agent
    on demand (operator clicks read or hits Enter). Read-only
    surface — writes happen via the agent's `memory` tool inside
-   ai.chat sessions, never via the dashboard. */
+   ai.chat sessions, never via the dashboard.
+
+   W2-MEMORY-CURATOR-4 extends with a "curate" button that
+   POSTs /v1/memory/curate, refreshes the panels with the
+   curated contents, and a curator-scheduler status card. */
 let memoryInspectorWired = false;
 function initMemory() {
   if (memoryInspectorWired) return;
   const $btn = document.getElementById('memory-read-btn');
   if ($btn) $btn.addEventListener('click', () => loadAgentMemory());
+  const $curate = document.getElementById('memory-curate-btn');
+  if ($curate) $curate.addEventListener('click', () => runCurate());
   const $peer = document.getElementById('memory-peer-input');
   const $subj = document.getElementById('memory-subject-input');
   for (const $in of [$peer, $subj].filter(Boolean)) {
@@ -8432,9 +8458,102 @@ function initMemory() {
 }
 
 function enterMemory() {
-  // No auto-load — wait for the operator to paste a subject_id.
-  // Persistent memory is per-agent; we don't know which one to
-  // show until the operator asks.
+  // No auto-load of memory contents — wait for the operator to
+  // paste a subject_id. Persistent memory is per-agent; we
+  // don't know which one to show until the operator asks.
+  //
+  // The curator-status card IS refreshed on every entry — it's
+  // a process-wide reading, no subject_id required.
+  loadCuratorStatus();
+}
+
+async function runCurate() {
+  const $status = document.getElementById('memory-status');
+  const peer = ((document.getElementById('memory-peer-input') || {}).value || 'memory').trim();
+  const subject = ((document.getElementById('memory-subject-input') || {}).value || '').trim();
+  if (!subject) {
+    if ($status) $status.textContent = 'subject_id required';
+    return;
+  }
+  if ($status) $status.textContent = 'curating (slow — runs an LLM call)…';
+  try {
+    const r = await fetch('/v1/memory/curate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject_id: subject, peer }),
+    });
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const saved = (body.result && body.result.chars_saved) || 0;
+    toast('Curated ' + escapeHtml(subject.slice(0, 8)) + '… · ' + saved + ' chars saved', 'ok');
+    // Refresh the memory panels with the curated content.
+    await loadAgentMemory();
+    if ($status) $status.textContent = 'curated · saved ' + saved + ' chars';
+  } catch (e) {
+    if ($status) $status.textContent = 'curate failed: ' + String(e);
+    toast('Curate failed: ' + String(e), 'error');
+  }
+}
+
+async function loadCuratorStatus() {
+  const $host = document.getElementById('memory-curator-status-host');
+  const $meta = document.getElementById('memory-curator-status-meta');
+  if (!$host) return;
+  const peer = ((document.getElementById('memory-peer-input') || {}).value || 'memory').trim();
+  $host.textContent = 'loading…';
+  if ($meta) $meta.textContent = '';
+  try {
+    const r = await fetch('/v1/memory/curator/status?peer=' + encodeURIComponent(peer));
+    if (!r.ok) {
+      $host.textContent = 'load failed (HTTP ' + r.status + ')';
+      return;
+    }
+    const body = await r.json();
+    // The bridge endpoint surfaces a `bridge_note` field
+    // when the scheduler's in-process state isn't reachable
+    // through a capability (today). Render it verbatim
+    // rather than guessing.
+    const lines = [];
+    if (body.enabled !== null && body.enabled !== undefined) {
+      lines.push('enabled: ' + (body.enabled ? 'yes' : 'no'));
+    }
+    if (body.interval_secs !== null && body.interval_secs !== undefined) {
+      lines.push('interval: ' + body.interval_secs + 's');
+    }
+    if (body.last_run_at) {
+      const ago = Math.max(0, Math.floor(Date.now() / 1000) - body.last_run_at);
+      lines.push('last run: ' + fmtDuration(ago) + ' ago');
+    }
+    if (body.last_run_summary) {
+      const s = body.last_run_summary;
+      lines.push(
+        'last summary: reviewed=' + (s.agents_reviewed || 0)
+        + ' curated=' + (s.agents_curated || 0)
+        + ' chars_saved=' + (s.total_chars_saved || 0)
+      );
+    }
+    if (body.next_run_at) {
+      const left = body.next_run_at - Math.floor(Date.now() / 1000);
+      if (left > 0) {
+        lines.push('next run: in ' + fmtDuration(left));
+      }
+    }
+    if (body.bridge_note) {
+      lines.push('');
+      lines.push('note: ' + body.bridge_note);
+    }
+    $host.textContent = lines.length ? lines.join('\n') : '(no status fields surfaced)';
+    if ($meta) $meta.textContent = 'peer=' + (body.peer || peer);
+  } catch (e) {
+    $host.textContent = 'load failed: ' + String(e);
+  }
 }
 
 async function loadAgentMemory() {
