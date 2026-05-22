@@ -85,6 +85,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
 }
 
 mod blocklist;
+mod browser_captures;
 mod browser_sessions;
 mod capabilities;
 mod chat;
@@ -442,6 +443,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Returns the bounded ring of recent policy-denied
         // attempts (capacity 256 per peer). Pure read.
         .route("/v1/policy/denials", get(policy_denials::denials))
+        // W2-002g: proxy for `tool.browser.capture_read`. Streams
+        // a failure-screenshot PNG from the configured tool-peer
+        // `screenshot_on_failure_dir` back to the dashboard with
+        // `Content-Type: image/png`. Filename validation mirrors
+        // the runtime; bad paths get 400 without crossing the mesh.
+        .route(
+            "/v1/browser/captures/:filename",
+            get(browser_captures::capture),
+        )
         // JSON-shaped health summary: uptime + coordinator status
         // + per-bucket peer counts + reconnect telemetry.
         // Distinct from /health (plaintext liveness probe).
