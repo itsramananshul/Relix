@@ -94,6 +94,7 @@ mod config;
 mod config_api;
 mod cron;
 mod dashboard;
+mod delegate;
 mod dispatch_stats;
 mod flow;
 mod fs_audit;
@@ -478,6 +479,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(cron::get_one).patch(cron::update).delete(cron::delete),
         )
         .route("/v1/cron/jobs/:job_id/trigger", post(cron::trigger))
+        // PH-DELEGATE-BRIDGE: delegation surface. Four proxies onto
+        // the coordinator's `delegate.*` capabilities. POST /spawn
+        // creates the child task; GET /result polls its state;
+        // POST /cancel terminates it; GET /list enumerates a
+        // parent's children.
+        .route("/v1/delegate/spawn", post(delegate::spawn))
+        .route("/v1/delegate/result/:child_task_id", get(delegate::result))
+        .route("/v1/delegate/cancel/:child_task_id", post(delegate::cancel))
+        .route("/v1/delegate/list/:parent_task_id", get(delegate::list))
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with
