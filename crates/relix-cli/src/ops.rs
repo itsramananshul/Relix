@@ -12,8 +12,9 @@
 //! All subcommands are one-shot HTTP-against-bridge — useful
 //! for status-line scripts, on-call triage, and tmux dashboards.
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
@@ -256,6 +257,74 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         csv: bool,
     },
+    /// PH-CRON-CLI: cron scheduler. Six subcommands that proxy
+    /// onto the bridge's `/v1/cron/jobs` endpoints, themselves
+    /// forwarding to the coordinator's `cron.*` capabilities.
+    Cron(CronArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CronArgs {
+    #[command(subcommand)]
+    pub cmd: CronCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CronCmd {
+    /// List cron jobs. Filter by `--subject-id` to see only
+    /// one owner's jobs; omit to see all.
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value = "")]
+        subject_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Create a new cron job.
+    Create {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        schedule: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        subject_id: String,
+        #[arg(long, default_value = "flows/chat_template.sol")]
+        flow_template: String,
+    },
+    /// Manually trigger a job. Creates a coordinator task
+    /// immediately and dispatches `ai.chat` in the background.
+    Trigger {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Delete a cron job permanently.
+    Delete {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Re-enable a previously disabled job.
+    Enable {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Disable a job without deleting it.
+    Disable {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        job_id: String,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -317,6 +386,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             output,
             pretty,
         } => snapshot(&bridge, &peer, &output, pretty).await,
+        Cmd::Cron(args) => cron_run(args.cmd).await,
     }
 }
 
@@ -1541,6 +1611,192 @@ struct ProviderStatus {
     rate_limit_hits_5min: u64,
     #[serde(default)]
     rate_limit_hits_1h: u64,
+}
+
+// ── PH-CRON-CLI: cron scheduler subcommands ────────────────
+
+async fn cron_run(cmd: CronCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        CronCmd::List {
+            bridge,
+            subject_id,
+            json,
+        } => cron_list(&bridge, &subject_id, json).await,
+        CronCmd::Create {
+            bridge,
+            name,
+            schedule,
+            prompt,
+            subject_id,
+            flow_template,
+        } => cron_create(&bridge, &name, &schedule, &prompt, &subject_id, &flow_template).await,
+        CronCmd::Trigger { bridge, job_id } => cron_trigger(&bridge, &job_id).await,
+        CronCmd::Delete { bridge, job_id } => cron_delete(&bridge, &job_id).await,
+        CronCmd::Enable { bridge, job_id } => cron_set_enabled(&bridge, &job_id, true).await,
+        CronCmd::Disable { bridge, job_id } => cron_set_enabled(&bridge, &job_id, false).await,
+    }
+}
+
+async fn cron_list(
+    bridge: &str,
+    subject_id: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = if subject_id.trim().is_empty() {
+        format!("{base}/v1/cron/jobs")
+    } else {
+        format!("{base}/v1/cron/jobs?subject_id={}", urlencode(subject_id))
+    };
+    let body = http_get_string(&url).await?;
+    if json {
+        println!("{body}");
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let jobs = parsed
+        .get("jobs")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if jobs.is_empty() {
+        println!("(no jobs)");
+        return Ok(());
+    }
+    println!(
+        "{:<16} {:<20} {:<24} {:<8} next",
+        "job_id", "name", "schedule", "enabled"
+    );
+    for j in jobs {
+        let id = j.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+        let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let schedule = j.get("schedule").and_then(|v| v.as_str()).unwrap_or("");
+        let enabled = j.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let next = j.get("next_run_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        println!(
+            "{:<16} {:<20} {:<24} {:<8} {}",
+            short(id, 16),
+            short(name, 20),
+            short(schedule, 24),
+            enabled,
+            next
+        );
+    }
+    Ok(())
+}
+
+async fn cron_create(
+    bridge: &str,
+    name: &str,
+    schedule: &str,
+    prompt: &str,
+    subject_id: &str,
+    flow_template: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/cron/jobs");
+    let body = json!({
+        "name": name,
+        "schedule": schedule,
+        "prompt": prompt,
+        "subject_id": subject_id,
+        "flow_template": flow_template,
+    });
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn cron_trigger(bridge: &str, job_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/cron/jobs/{}/trigger", urlencode(job_id));
+    let client = reqwest::Client::new();
+    let r = client.post(&url).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn cron_delete(bridge: &str, job_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/cron/jobs/{}", urlencode(job_id));
+    let client = reqwest::Client::new();
+    let r = client.delete(&url).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn cron_set_enabled(
+    bridge: &str,
+    job_id: &str,
+    enabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/cron/jobs/{}", urlencode(job_id));
+    let client = reqwest::Client::new();
+    let r = client
+        .patch(&url)
+        .json(&json!({ "enabled": enabled }))
+        .send()
+        .await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn http_get_string(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let r = client.get(url).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {text}").into());
+    }
+    Ok(text)
+}
+
+fn short(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars - 1).collect::<String>())
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
