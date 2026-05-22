@@ -1816,6 +1816,7 @@
     <a href="#/browser"      class="nav-item" data-route="browser">Browser</a>
     <a href="#/metrics"      class="nav-item" data-route="metrics">Metrics</a>
     <a href="#/memory"       class="nav-item" data-route="memory">Agent Memory</a>
+    <a href="#/cron"         class="nav-item" data-route="cron">Cron Jobs</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2696,6 +2697,83 @@
       </div>
     </section>
 
+    <!-- ── #/cron ──────────────────────────────────────────────── -->
+    <section class="page" data-page="cron">
+      <h2>Cron Jobs</h2>
+      <p class="page-subtitle">
+        Scheduled flows on the coordinator. Three schedule formats:
+        duration (<code>30m</code>, <code>2h</code>, <code>1d</code>,
+        <code>7d</code>), 5-field cron (<code>0 9 * * 1</code>),
+        or a one-shot RFC 3339 instant
+        (<code>2026-06-01T09:00:00Z</code>). The scheduler ticks every
+        30 s, fires due jobs, dispatches <code>ai.chat</code> with the
+        job's prompt, and writes a <code>cron.job_result</code>
+        chronicle event on the task. See <a href="docs/cron.md">docs/cron.md</a>.
+      </p>
+      <div class="banner warn">
+        Manual <strong>Trigger</strong> creates a task immediately;
+        the result lands in the task chronicle. Deleting a job is
+        permanent.
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Create a job</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Name</label>
+            <div class="field">
+              <input type="text" id="cron-create-name" placeholder="e.g. daily-summary">
+            </div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Schedule</label>
+            <div class="field">
+              <input type="text" id="cron-create-schedule" placeholder="30m, 0 9 * * 1, or 2026-06-01T09:00:00Z">
+              <p class="field-help">duration · 5-field cron · RFC 3339 one-shot</p>
+            </div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Prompt</label>
+            <div class="field">
+              <textarea id="cron-create-prompt" rows="3" placeholder="prompt the AI peer will see on every fire"></textarea>
+            </div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Subject id</label>
+            <div class="field">
+              <input type="text" id="cron-create-subject" placeholder="owner subject_id">
+              <p class="field-help">cron jobs are scoped to one subject_id for session history</p>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn-primary" id="cron-create-btn">Create</button>
+            <span class="action-status" id="cron-create-status"></span>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Jobs</h3>
+          <div class="card-actions">
+            <button id="cron-list-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="cron-list-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <div class="card" id="cron-detail-card" style="display:none;">
+        <div class="card-header">
+          <h3>Job detail</h3>
+          <div class="card-actions">
+            <button id="cron-detail-close">Close</button>
+          </div>
+        </div>
+        <div class="card-body" id="cron-detail-host"></div>
+      </div>
+    </section>
+
     <!-- ── #/telegram ──────────────────────────────────────────── -->
     <section class="page" data-page="telegram">
       <h2>Telegram</h2>
@@ -2914,6 +2992,7 @@ const PAGES = {
   browser:      { label: 'Browser',      init: initBrowser,      enter: enterBrowser },
   metrics:      { label: 'Metrics',      init: initMetrics,      enter: enterMetrics },
   memory:       { label: 'Agent Memory', init: initMemory,       enter: enterMemory },
+  cron:         { label: 'Cron Jobs',    init: initCron,         enter: enterCron },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -9551,6 +9630,234 @@ function replaceProviderCard(status) {
 }
 
 /* ── Telegram page ────────────────────────────────────────── */
+// ── #/cron — scheduler page ────────────────────────────────
+
+function initCron() {
+  const $btn = document.getElementById('cron-create-btn');
+  if ($btn) $btn.addEventListener('click', cronCreateSubmit);
+  const $ref = document.getElementById('cron-list-refresh');
+  if ($ref) $ref.addEventListener('click', loadCronJobs);
+  const $close = document.getElementById('cron-detail-close');
+  if ($close) $close.addEventListener('click', () => {
+    document.getElementById('cron-detail-card').style.display = 'none';
+  });
+}
+
+function enterCron() {
+  loadCronJobs();
+}
+
+async function loadCronJobs() {
+  const $host = document.getElementById('cron-list-host');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/cron/jobs');
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">' +
+        escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    if (!s.jobs || s.jobs.length === 0) {
+      $host.innerHTML = '<div class="empty">no jobs yet — create one above</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr>'
+      + '<th>job_id</th><th>name</th><th>schedule</th><th>next run</th>'
+      + '<th>enabled</th><th>runs</th><th></th>'
+      + '</tr></thead><tbody>';
+    for (const j of s.jobs) {
+      const next = j.next_run_at
+        ? new Date(j.next_run_at * 1000).toLocaleString()
+        : '—';
+      const enabled = j.enabled
+        ? '<span class="badge ok">on</span>'
+        : '<span class="badge muted">off</span>';
+      html += '<tr>'
+        + '<td><span class="id">' + escapeHtml(j.job_id.slice(0, 12)) + '…</span></td>'
+        + '<td>' + escapeHtml(j.name) + '</td>'
+        + '<td><code>' + escapeHtml(j.schedule) + '</code></td>'
+        + '<td>' + next + '</td>'
+        + '<td>' + enabled + '</td>'
+        + '<td>' + (j.run_count || 0) + '</td>'
+        + '<td><button data-cron-job-id="' + escapeHtml(j.job_id) + '"'
+        + ' class="btn-row-detail">Detail</button></td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    $host.innerHTML = html;
+    for (const $b of $host.querySelectorAll('.btn-row-detail')) {
+      $b.addEventListener('click', (e) => {
+        const id = e.currentTarget.getAttribute('data-cron-job-id');
+        loadCronDetail(id);
+      });
+    }
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function loadCronDetail(jobId) {
+  const $card = document.getElementById('cron-detail-card');
+  const $host = document.getElementById('cron-detail-host');
+  if (!$host) return;
+  $card.style.display = '';
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/cron/jobs/' + encodeURIComponent(jobId));
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">' +
+        escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const j = await r.json();
+    const lastRun = j.last_run_at
+      ? new Date(j.last_run_at * 1000).toLocaleString()
+      : 'never';
+    const nextRun = j.next_run_at
+      ? new Date(j.next_run_at * 1000).toLocaleString()
+      : '—';
+    const lastTask = j.last_task_id
+      ? '<a href="#/tasks/' + encodeURIComponent(j.last_task_id) + '" class="id">'
+        + escapeHtml(j.last_task_id) + '</a>'
+      : '<span class="muted">none</span>';
+    let html = '<dl class="kv-list">'
+      + '<dt>job_id</dt><dd><span class="id">' + escapeHtml(j.job_id) + '</span></dd>'
+      + '<dt>name</dt><dd>' + escapeHtml(j.name) + '</dd>'
+      + '<dt>schedule</dt><dd><code>' + escapeHtml(j.schedule) + '</code></dd>'
+      + '<dt>flow_template</dt><dd><code>' + escapeHtml(j.flow_template) + '</code></dd>'
+      + '<dt>prompt</dt><dd><pre style="white-space: pre-wrap;">' + escapeHtml(j.prompt) + '</pre></dd>'
+      + '<dt>subject_id</dt><dd><span class="id">' + escapeHtml(j.subject_id) + '</span></dd>'
+      + '<dt>enabled</dt><dd>' + (j.enabled ? 'true' : 'false') + '</dd>'
+      + '<dt>run_count</dt><dd>' + (j.run_count || 0) + '</dd>'
+      + '<dt>last_run_at</dt><dd>' + lastRun + '</dd>'
+      + '<dt>next_run_at</dt><dd>' + nextRun + '</dd>'
+      + '<dt>last_task_id</dt><dd>' + lastTask + '</dd>'
+      + '<dt>last_status</dt><dd>' + escapeHtml(j.last_status || '—') + '</dd>'
+      + '</dl>';
+    html += '<div class="actions">'
+      + '<button class="btn-primary" data-cron-trigger="' + escapeHtml(j.job_id) + '">Trigger now</button>'
+      + ' <button data-cron-toggle="' + escapeHtml(j.job_id)
+      + '" data-cron-toggle-to="' + (j.enabled ? '0' : '1') + '">'
+      + (j.enabled ? 'Disable' : 'Enable') + '</button>'
+      + ' <button class="btn-danger" data-cron-delete="' + escapeHtml(j.job_id) + '">Delete</button>'
+      + ' <span class="action-status" id="cron-detail-status"></span>'
+      + '</div>';
+    $host.innerHTML = html;
+    $host.querySelector('[data-cron-trigger]').addEventListener('click', cronTrigger);
+    $host.querySelector('[data-cron-toggle]').addEventListener('click', cronToggle);
+    $host.querySelector('[data-cron-delete]').addEventListener('click', cronDelete);
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function cronCreateSubmit() {
+  const $status = document.getElementById('cron-create-status');
+  const name = document.getElementById('cron-create-name').value.trim();
+  const schedule = document.getElementById('cron-create-schedule').value.trim();
+  const prompt = document.getElementById('cron-create-prompt').value;
+  const subject = document.getElementById('cron-create-subject').value.trim();
+  setProviderStatus($status, '');
+  if (!name || !schedule || !subject) {
+    setProviderStatus($status, 'name / schedule / subject_id are required', 'error');
+    return;
+  }
+  try {
+    const r = await fetch('/v1/cron/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name, schedule, prompt,
+        subject_id: subject,
+        flow_template: 'flows/chat_template.sol',
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      setProviderStatus($status, err.error || ('HTTP ' + r.status), 'error');
+      return;
+    }
+    const s = await r.json();
+    setProviderStatus($status, 'created ' + s.job_id, 'ok');
+    document.getElementById('cron-create-name').value = '';
+    document.getElementById('cron-create-schedule').value = '';
+    document.getElementById('cron-create-prompt').value = '';
+    loadCronJobs();
+  } catch (e) {
+    setProviderStatus($status, 'failed: ' + String(e), 'error');
+  }
+}
+
+async function cronTrigger(e) {
+  const jobId = e.currentTarget.getAttribute('data-cron-trigger');
+  const $status = document.getElementById('cron-detail-status');
+  setProviderStatus($status, 'triggering…');
+  try {
+    const r = await fetch('/v1/cron/jobs/' + encodeURIComponent(jobId) + '/trigger', {
+      method: 'POST',
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      setProviderStatus($status, err.error || ('HTTP ' + r.status), 'error');
+      return;
+    }
+    const s = await r.json();
+    window.location.hash = '#/tasks/' + encodeURIComponent(s.task_id);
+  } catch (ex) {
+    setProviderStatus($status, 'failed: ' + String(ex), 'error');
+  }
+}
+
+async function cronToggle(e) {
+  const jobId = e.currentTarget.getAttribute('data-cron-toggle');
+  const to = e.currentTarget.getAttribute('data-cron-toggle-to');
+  const $status = document.getElementById('cron-detail-status');
+  setProviderStatus($status, '');
+  try {
+    const r = await fetch('/v1/cron/jobs/' + encodeURIComponent(jobId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: to === '1' }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      setProviderStatus($status, err.error || ('HTTP ' + r.status), 'error');
+      return;
+    }
+    loadCronDetail(jobId);
+    loadCronJobs();
+  } catch (ex) {
+    setProviderStatus($status, 'failed: ' + String(ex), 'error');
+  }
+}
+
+async function cronDelete(e) {
+  const jobId = e.currentTarget.getAttribute('data-cron-delete');
+  if (!window.confirm('Delete cron job ' + jobId + '? This is permanent.')) return;
+  const $status = document.getElementById('cron-detail-status');
+  setProviderStatus($status, '');
+  try {
+    const r = await fetch('/v1/cron/jobs/' + encodeURIComponent(jobId), {
+      method: 'DELETE',
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      setProviderStatus($status, err.error || ('HTTP ' + r.status), 'error');
+      return;
+    }
+    document.getElementById('cron-detail-card').style.display = 'none';
+    loadCronJobs();
+  } catch (ex) {
+    setProviderStatus($status, 'failed: ' + String(ex), 'error');
+  }
+}
+
 function initTelegram() {
   document.getElementById('tg-token-reveal').addEventListener('click', () => {
     const $i = document.getElementById('tg-token');
