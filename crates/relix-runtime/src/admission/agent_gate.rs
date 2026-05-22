@@ -80,6 +80,16 @@ pub struct GateApprovalRequest {
     pub reason: String,
     pub approver_groups: Vec<String>,
     pub approval_timeout_secs: i64,
+    /// Optional task_id the calling agent is acting on. Read
+    /// from `RequestEnvelope::task_id` at gate time. The
+    /// coordinator-side `on_require_approval` closure stamps
+    /// this on the new approval row and flips the task to
+    /// `awaiting_input`; `coord.approval.decide` resumes /
+    /// fails the same task. `None` when the caller didn't
+    /// supply one — the approval row is still created and
+    /// can be decided through poll/decide, just without
+    /// auto-pausing a task.
+    pub task_id: Option<String>,
 }
 
 /// Reasons we surface as `matched_rule` for audit + denial
@@ -358,6 +368,12 @@ fn evaluate_against_view(
                 ),
                 approver_groups: vec!["ops".into(), "admin".into()],
                 approval_timeout_secs: view.approval_timeout_secs,
+                task_id: inputs
+                    .envelope
+                    .task_id
+                    .as_ref()
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned(),
             });
         }
     }
@@ -457,6 +473,7 @@ mod tests {
             deadline: Timestamp::now().add_secs(30),
             surface: surface.map(|s| s.to_string()),
             approval_token: None,
+            task_id: None,
         }
     }
 
@@ -695,6 +712,44 @@ mod tests {
             GateDecision::RequireApproval(req) => {
                 assert_eq!(req.category, "payments");
                 assert_eq!(req.method, "tool.x");
+                // No task_id on the envelope → None on the
+                // GateApprovalRequest.
+                assert_eq!(req.task_id, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_approval_carries_envelope_task_id_through() {
+        // When the caller threaded a task_id on the envelope,
+        // the gate must surface it on the GateApprovalRequest so
+        // the coordinator-side on_require_approval closure can
+        // stamp it on the approval row + flip the task.
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let mut e = env("tool.x", None);
+        e.task_id = Some("task-42".into());
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+        match run(&s, &id, &e, Some(&c)) {
+            GateDecision::RequireApproval(req) => {
+                assert_eq!(req.task_id.as_deref(), Some("task-42"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_approval_treats_empty_string_task_id_as_none() {
+        // Defence in depth — older bridge code that stamps an
+        // empty string on the envelope shouldn't end up writing
+        // task_id = "" on the approval row.
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
+        let mut e = env("tool.x", None);
+        e.task_id = Some("".into());
+        let c = cap(&["payments"], &[], RiskLevel::Low);
+        match run(&s, &id, &e, Some(&c)) {
+            GateDecision::RequireApproval(req) => {
+                assert_eq!(req.task_id, None);
             }
             other => panic!("{other:?}"),
         }

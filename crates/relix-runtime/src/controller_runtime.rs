@@ -1210,6 +1210,7 @@ fn register_agent_capabilities(
             // would defeat the redaction guarantee. We stamp
             // the method so operators can correlate.
             let hash = hex::encode(blake3::hash(req.method.as_bytes()).as_bytes());
+            let task_id = req.task_id.as_deref();
             let approval_id = bindings_create
                 .create_approval(
                     &req.agent_id,
@@ -1219,16 +1220,46 @@ fn register_agent_capabilities(
                     &hash,
                     &req.reason,
                     &req.approver_groups,
-                    None,
+                    task_id,
                     expires_at,
                 )
                 .map_err(|e| e.to_string())?;
-            // Spawn a chronicle event on the coordinator if a
-            // task_id_hint is known. Our gate currently runs at
-            // method-call time, not task-creation time, so the
-            // hint is always empty; the chronicle event is
-            // best-effort if one is supplied.
-            let _ = &bindings_task_store;
+            // When the caller threaded a task_id through the
+            // envelope, flip it to awaiting_input and append a
+            // chronicle event so the dashboard / SOL flow
+            // polling task.get sees the pause. The
+            // `coord.approval.decide` handler later resumes
+            // (approved) or fails (rejected) the same task by
+            // reading the row's `task_id` column.
+            if let Some(tid) = task_id {
+                if let Err(e) = bindings_task_store.update(
+                    tid,
+                    Some("awaiting_input"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) {
+                    tracing::warn!(
+                        task_id = %tid,
+                        approval_id = %approval_id,
+                        error = %e,
+                        "on_require_approval: task awaiting_input flip failed"
+                    );
+                }
+                let payload = format!("approval_id={approval_id}|method={}", req.method);
+                if let Err(e) =
+                    bindings_task_store.append_event(tid, "task.approval_requested", &payload)
+                {
+                    tracing::warn!(
+                        task_id = %tid,
+                        error = %e,
+                        "on_require_approval: chronicle event failed"
+                    );
+                }
+            }
             Ok(approval_id)
         }),
     });

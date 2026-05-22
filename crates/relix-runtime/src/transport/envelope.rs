@@ -47,6 +47,16 @@ pub struct RequestEnvelope {
     /// Additive — older clients send `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_token: Option<String>,
+    /// Optional coordinator task_id the caller is acting on
+    /// behalf of. When the agent gate fires `RequireApproval`
+    /// the coordinator stamps this id on the new
+    /// `approval_requests` row, flips the task to
+    /// `awaiting_input`, and resumes it on
+    /// `coord.approval.decide`. Additive — older clients send
+    /// `None` and the approval still rounds-trips through
+    /// poll/decide, just without auto-pausing a calling task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// RELIX-1 response envelope (alpha fields).

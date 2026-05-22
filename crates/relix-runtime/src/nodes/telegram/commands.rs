@@ -107,7 +107,10 @@ pub fn unauthorised_message() -> &'static str {
 }
 
 /// Render an approval notification body for the operator
-/// chat. Matches the spec wording.
+/// chat. Matches the spec wording. `task_id` is rendered
+/// only when non-empty (the agent-employee approval flow
+/// stamps the calling task_id on the approval row; older
+/// flows that have no associated task pass `""`).
 pub fn approval_notification(
     task_id: &str,
     subject_short: &str,
@@ -119,8 +122,13 @@ pub fn approval_notification(
     } else {
         reason.trim()
     };
+    let task_line = if task_id.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Task: {task_id}\n")
+    };
     format!(
-        "⏳ Approval required\nTask: {task_id}\nAgent: {subject_short}\nAction: {method}\nReason: {reason_clean}\nReply /approve {task_id} or /reject {task_id}"
+        "⏳ Approval required\n{task_line}Agent: {subject_short}\nAction: {method}\nReason: {reason_clean}\nReply /approve {task_id} or /reject {task_id}"
     )
 }
 

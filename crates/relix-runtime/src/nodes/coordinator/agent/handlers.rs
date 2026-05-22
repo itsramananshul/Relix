@@ -697,6 +697,86 @@ mod tests {
         assert_eq!(body, "ok\n");
     }
 
+    // ── task_id round-trip on the approval row ───────────
+
+    #[test]
+    fn approval_decide_invokes_resume_closure_with_stored_task_id() {
+        let s = store();
+        // Approval stamped with task_id = "task-42".
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], Some("task-42"), 9999999999)
+            .unwrap();
+        let resumed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let resumed_clone = resumed.clone();
+        let resume: TaskResumeFn = Arc::new(move |tid: &str| {
+            *resumed_clone.lock().unwrap() = Some(tid.to_string());
+            Ok(())
+        });
+        let failed_clone = failed.clone();
+        let fail: TaskResumeFn = Arc::new(move |tid: &str| {
+            *failed_clone.lock().unwrap() = Some(tid.to_string());
+            Ok(())
+        });
+        let arg = format!("{id}|approved|alice|ok");
+        let _ = handle_approval_decide(&s, &fake_ctx(arg.as_bytes()), &resume, &fail);
+        assert_eq!(resumed.lock().unwrap().as_deref(), Some("task-42"));
+        assert!(failed.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn approval_decide_invokes_fail_closure_for_reject_with_stored_task_id() {
+        let s = store();
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], Some("task-99"), 9999999999)
+            .unwrap();
+        let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let failed_clone = failed.clone();
+        let fail: TaskResumeFn = Arc::new(move |tid: &str| {
+            *failed_clone.lock().unwrap() = Some(tid.to_string());
+            Ok(())
+        });
+        let arg = format!("{id}|rejected|alice|nope");
+        let _ = handle_approval_decide(&s, &fake_ctx(arg.as_bytes()), &resume, &fail);
+        assert_eq!(failed.lock().unwrap().as_deref(), Some("task-99"));
+    }
+
+    #[test]
+    fn approval_decide_skips_task_hop_when_row_has_no_task_id() {
+        // Backward-compat: approval rows minted without a
+        // task_id (older flows that didn't thread one through
+        // the envelope) still decide cleanly. The
+        // resume / fail closures are never called.
+        let s = store();
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .unwrap();
+        let count: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resume_count = count.clone();
+        let fail_count = count.clone();
+        let resume: TaskResumeFn = Arc::new(move |_| {
+            resume_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let fail: TaskResumeFn = Arc::new(move |_| {
+            fail_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let arg = format!("{id}|approved|alice|ok");
+        let body = ok_body(handle_approval_decide(
+            &s,
+            &fake_ctx(arg.as_bytes()),
+            &resume,
+            &fail,
+        ));
+        // Cleanly approves (returns the one-shot token) but
+        // never invokes either closure.
+        assert!(body.starts_with("ok|"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn standing_create_then_list_then_revoke_round_trips() {
         let s = store();

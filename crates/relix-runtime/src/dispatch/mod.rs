@@ -532,13 +532,13 @@ impl DispatchBridge {
                 }
                 crate::admission::agent_gate::GateDecision::RequireApproval(req_appr) => {
                     self.bump_stats(&req.method, StatBucket::Denied, now);
-                    let cause = match (bindings.on_require_approval)(
-                        &req_appr,
-                        // task_id (best-effort hint — bridge gives "" when no
-                        // task is in flight; the coordinator-side closure
-                        // is allowed to create one).
-                        "",
-                    ) {
+                    // The GateApprovalRequest already carries the
+                    // task_id from the envelope (or None when the
+                    // caller didn't supply one). Pass it through
+                    // for symmetry with the closure signature; the
+                    // closure prefers `req_appr.task_id`.
+                    let task_id_hint = req_appr.task_id.as_deref().unwrap_or("");
+                    let cause = match (bindings.on_require_approval)(&req_appr, task_id_hint) {
                         Ok(approval_id) => format!("approval_required:{approval_id}"),
                         Err(e) => format!("approval_required (create failed: {e})"),
                     };
@@ -817,14 +817,26 @@ pub fn build_request(
     identity: Bundle,
     deadline_secs_from_now: i64,
 ) -> Vec<u8> {
-    build_request_with_surface(method, args, identity, deadline_secs_from_now, None, None)
+    build_request_with_surface(
+        method,
+        args,
+        identity,
+        deadline_secs_from_now,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Same as [`build_request`] but stamps the optional
-/// `surface` + `approval_token` fields on the envelope. Used
-/// by the bridge to mark which inbound HTTP surface drove the
-/// call, and by retried callers replaying an approved
-/// approval token.
+/// `surface` + `approval_token` + `task_id` fields on the
+/// envelope. Used by the bridge to mark which inbound HTTP
+/// surface drove the call, by retried callers replaying an
+/// approved approval token, and by callers acting on behalf
+/// of a specific coordinator task (so the agent gate's
+/// `RequireApproval` path can pause + resume the right
+/// task).
+#[allow(clippy::too_many_arguments)]
 pub fn build_request_with_surface(
     method: impl Into<String>,
     args: Vec<u8>,
@@ -832,6 +844,7 @@ pub fn build_request_with_surface(
     deadline_secs_from_now: i64,
     surface: Option<String>,
     approval_token: Option<String>,
+    task_id: Option<String>,
 ) -> Vec<u8> {
     let req = RequestEnvelope {
         pv: 1,
@@ -844,6 +857,7 @@ pub fn build_request_with_surface(
         deadline: Timestamp::now().add_secs(deadline_secs_from_now),
         surface,
         approval_token,
+        task_id,
     };
     codec::encode(&req).unwrap_or_default()
 }
