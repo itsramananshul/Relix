@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `21bdc42 feat(cli): W2-006e — ascii sparkline column for ops dispatch-stats`
+- **HEAD:** `a5aa596 feat(cli): W2-008c — relix-cli ops smoke (Rust port of demo-smoke.sh)`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -39,32 +39,35 @@ as the resume command.
     (W2-003e). Live feed enhancements + status pills still
     pending.
   - **W2-007 (Policy hardening):** CLOSED end-to-end (both
-    pillars) —
+    pillars + CLI) —
     `node.policy.simulate` (W2-007a) → bridge proxy
     (W2-007b) → dashboard "What If" form (W2-007c);
     policy denial ring `node.policy.recent_denials`
     (W2-007d) → bridge proxy `GET /v1/policy/denials`
-    (W2-007e) → dashboard "Recent denials" card (W2-007f).
-    Dry-run replay mode pending.
+    (W2-007e) → dashboard "Recent denials" card (W2-007f);
+    CLI mirrors `relix-cli ops {policy-simulate,
+    policy-denials}` (W2-007g). Dry-run replay mode pending.
   - **W2-004 (SOLFlow):** started — `relix-cli sol templates`
     + `sol new --template ping --out path.sol` ship the
     quick-add workflow. Visual-editor sub-items (slash
     commands, drag-to-insert, variable picker, condition
     builder) deferred per spec ("DO NOT overcomplicate").
-  - **W2-008 (Local-first):** started — `relix-cli doctor`
-    one-command bridge health check with opinionated
-    PASS/WARN/FAIL report. Remaining: one-command startup
-    script, demo scripts, Open WebUI integration, Docker
-    reliability.
-- **Workspace tests:** **1284 passing on default features**;
+  - **W2-008 (Local-first):** substantively CLOSED —
+    `relix-cli doctor` env health check (W2-008a) +
+    `scripts/demo-smoke.sh` end-to-end mesh smoke (W2-008b)
+    + `relix-cli ops smoke` Rust port (W2-008c). One-command
+    startup (`scripts/relix-mesh-up.sh`) predates this
+    wave and already works. Remaining: Open WebUI auto-
+    config, Docker reliability.
+- **Workspace tests:** **1290 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
-  - relix-cli: 130 (+4 W2-006e sparkline)
+  - relix-cli: 136 (+6 W2-007g policy CLI mirrors)
   - relix-policy: 72
-  - relix-runtime: 742 (+1 W2-006d ring cap)
+  - relix-runtime: 742
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 307 (+4 W2-006d parser)
+  - relix-web-bridge: 307
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
