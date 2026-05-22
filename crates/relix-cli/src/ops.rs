@@ -148,6 +148,28 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// W2-008d — live tail of the task firehose. Polls
+    /// `/v1/tasks/events/recent?since=<cursor>` on a loop
+    /// and prints each new event one-per-line. Ctrl-C
+    /// exits cleanly. Lighter than SSE — pure HTTP polling,
+    /// works through every proxy / shell / tmux.
+    Tail {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Filter by event_type substring (case-insensitive).
+        /// Empty = all.
+        #[arg(long, default_value = "")]
+        filter: String,
+        /// Poll interval in milliseconds (default 1000).
+        /// Clamped to [200, 60000].
+        #[arg(long, default_value_t = 1000u64)]
+        interval_ms: u64,
+        /// Stop after N total events have been printed
+        /// (handy for CI smoke). 0 = no limit.
+        #[arg(long, default_value_t = 0usize)]
+        max_events: usize,
+    },
     /// Recent cross-task events from /v1/tasks/events/recent.
     /// Mirrors the dashboard firehose for terminal operators
     /// — shows the H2 one-line summary projection per row.
@@ -207,6 +229,105 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => policy_denials(&bridge, &peer, max, json).await,
         Cmd::Smoke { bridge, provider } => smoke(&bridge, &provider).await,
+        Cmd::Tail {
+            bridge,
+            filter,
+            interval_ms,
+            max_events,
+        } => tail(&bridge, &filter, interval_ms, max_events).await,
+    }
+}
+
+// W2-008d CLI live-tail: poll /v1/tasks/events/recent on a loop.
+
+async fn tail(
+    bridge: &str,
+    filter: &str,
+    interval_ms: u64,
+    max_events: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let interval = std::time::Duration::from_millis(interval_ms.clamp(200, 60_000));
+    let needle = filter.trim().to_ascii_lowercase();
+    let mut since: i64 = 0;
+    let mut printed: usize = 0;
+    // Header so operators know what they're looking at —
+    // matches the `events` subcommand columns.
+    eprintln!(
+        "tailing {base}/v1/tasks/events/recent  interval={ms}ms  filter='{f}'  (Ctrl-C to stop)",
+        ms = interval.as_millis(),
+        f = filter,
+    );
+    let ev_h = "event_type";
+    let tid_h = "task_id";
+    let id_h = "id";
+    let sum_h = "summary";
+    println!("{ev_h:<28}  {tid_h:<10}  {id_h:>6}  {sum_h}");
+    loop {
+        // Page size is intentionally small per tick — the
+        // operator polling cadence is the rate limiter, not
+        // the page. Bridge caps internally too.
+        let url = if since > 0 {
+            format!("{base}/v1/tasks/events/recent?limit=50&since={since}")
+        } else {
+            format!("{base}/v1/tasks/events/recent?limit=50")
+        };
+        match http_get(&url).await {
+            Ok(body) => {
+                let resp: EventsResponse = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("(decode failed: {e})");
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                };
+                // The bridge returns events oldest-first
+                // within a since= window — print in that
+                // order so operators read top-to-bottom as
+                // time flows.
+                for r in &resp.items {
+                    if !needle.is_empty() && !r.event_type.to_ascii_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    let short = if r.task_id.len() > 8 {
+                        &r.task_id[..8]
+                    } else {
+                        &r.task_id
+                    };
+                    let sum = if r.summary.is_empty() {
+                        r.payload.as_str()
+                    } else {
+                        r.summary.as_str()
+                    };
+                    println!(
+                        "{et:<28}  {tid:<10}  {id:>6}  {sum}",
+                        et = r.event_type,
+                        tid = short,
+                        id = r.event_id,
+                        sum = sum,
+                    );
+                    printed += 1;
+                    if max_events > 0 && printed >= max_events {
+                        eprintln!("(reached --max-events={max_events})");
+                        return Ok(());
+                    }
+                }
+                // Advance the cursor for the next tick. The
+                // bridge guarantees next_cursor monotonic
+                // across calls; we trust it.
+                if resp.next_cursor > since {
+                    since = resp.next_cursor;
+                }
+            }
+            Err(e) => {
+                // Don't bail on a transient blip — operators
+                // care about tail resilience. Log once per
+                // failed poll, sleep, retry.
+                eprintln!("(poll failed: {e})");
+            }
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
