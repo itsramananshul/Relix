@@ -4870,6 +4870,13 @@ function enterTasks() {
   if (query.q != null) {
     document.getElementById('filter-search').value = query.q;
   }
+  // W2-003e: pre-seed chronicle filters from the URL so a
+  // shared link like `#/tasks?task=<id>&cat=error&chq=timeout`
+  // lands with the timeline already filtered. Module state
+  // is set BEFORE loadDetail so renderDetail's first pass
+  // honors the filter without an extra re-render.
+  chronicleCategoryFilter = (query.cat || '').trim();
+  chronicleTextFilter = (query.chq || '').trim().toLowerCase();
   if (!loadedTasks.length) {
     loadTasks().then(() => {
       // If the URL named a task, open its detail panel after
@@ -5022,6 +5029,14 @@ async function loadDetail(id) {
     // stale selection state doesn't leak across tasks.
     chronicleCategoryFilter = '';
     chronicleTextFilter = '';
+    // W2-003e: also drop the URL params — otherwise a
+    // shared `?cat=error&chq=foo` would survive a click
+    // onto an unrelated task. setQueryParams below
+    // re-writes `task=<id>` and the empty cat/chq are
+    // dropped by buildHash.
+    if (currentRoute === 'tasks') {
+      setQueryParams({ cat: '', chq: '' });
+    }
   }
   selectedTaskId = id;
   lastEventId = 0;
@@ -6017,6 +6032,11 @@ document.addEventListener('click', (ev) => {
     // Re-clicking the active chip clears the filter.
     chronicleCategoryFilter = (chronicleCategoryFilter === next) ? '' : next;
     if (lastDetailLineage) renderDetail(lastDetailLineage);
+    // W2-003e: persist to URL so the filtered view is
+    // shareable / refresh-safe.
+    if (currentRoute === 'tasks') {
+      setQueryParams({ cat: chronicleCategoryFilter });
+    }
     return;
   }
   // W2-003c: clear chronicle text filter affordance.
@@ -6024,6 +6044,9 @@ document.addEventListener('click', (ev) => {
   if (clearChronText) {
     chronicleTextFilter = '';
     if (lastDetailLineage) renderDetail(lastDetailLineage);
+    if (currentRoute === 'tasks') {
+      setQueryParams({ chq: '' });
+    }
     return;
   }
   const jumpEvent = ev.target.closest('[data-jump-to-event]');
@@ -6747,6 +6770,13 @@ function onChronicleTextInput(val) {
   chronicleTextRaf = requestAnimationFrame(() => {
     chronicleTextRaf = 0;
     if (lastDetailLineage) renderDetail(lastDetailLineage);
+    // W2-003e: keep the URL in sync with the typed text
+    // so the filtered chronicle view is shareable. We
+    // update INSIDE the rAF callback so the URL hops
+    // happen at most once per paint, not per keystroke.
+    if (currentRoute === 'tasks') {
+      setQueryParams({ chq: chronicleTextFilter });
+    }
     // Re-focus + place caret at end after re-render so the
     // operator's typing flow isn't interrupted.
     const $tf = document.getElementById('chronicle-text-filter');
