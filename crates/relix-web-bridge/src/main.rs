@@ -109,6 +109,7 @@ mod secrets;
 mod sse;
 mod task_recorder;
 mod tasks;
+mod telegram;
 mod term_audit;
 mod topology;
 mod validate;
@@ -456,6 +457,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // scheduler-status read.
         .route("/v1/memory/curate", post(memory_curator::curate))
         .route("/v1/memory/curator/status", get(memory_curator::status))
+        // PH-TG-BRIDGE: proxy reads of the telegram channel
+        // node. The bridge does not stand up its own bot
+        // client; both routes call the telegram peer's
+        // read-only capabilities (telegram.status,
+        // telegram.messages_recent) and return parsed JSON.
+        .route("/v1/telegram/status", get(telegram::status))
+        .route(
+            "/v1/telegram/messages/recent",
+            get(telegram::messages_recent),
+        )
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with
