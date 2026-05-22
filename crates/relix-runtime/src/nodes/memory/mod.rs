@@ -73,6 +73,8 @@
 //!   then by `id ASC` as a tie-breaker, so identical-score results are
 //!   deterministic across runs.
 
+pub mod curator;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -81,6 +83,11 @@ use rusqlite::{Connection, params};
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
+
+pub use curator::{
+    AiDispatcher, AiMeshDispatcher, AiPeerConfig, CuratorConfig, CuratorRunSummary, CuratorState,
+    CuratorSubjectResult, spawn_curator_scheduler,
+};
 
 /// Per-node memory configuration parsed from the controller TOML `[memory]`
 /// section.
@@ -92,6 +99,12 @@ pub struct MemoryConfig {
     /// request. Defaults to 100.
     #[serde(default = "default_max_n")]
     pub max_n: usize,
+    /// Optional curator scheduler config. When `enabled = true`
+    /// AND `ai_peer` is set, the memory controller spawns a
+    /// periodic LLM-driven curation pass. See
+    /// [`curator`] for the full design.
+    #[serde(default)]
+    pub curator: Option<CuratorConfig>,
 }
 
 fn default_max_n() -> usize {
@@ -366,6 +379,64 @@ impl MemoryStore {
         Ok(AgentWriteOutcome::Updated { chars: new_chars })
     }
 
+    /// Curator-only: atomically replace the full content of
+    /// one (subject_id, target) row. Bypasses the
+    /// `memory.agent_write` action vocabulary (add / replace /
+    /// remove / read) because curation needs to set the whole
+    /// blob at once. Caps are still enforced.
+    pub fn agent_set_content(
+        &self,
+        subject_id: &str,
+        target: &str,
+        content: &str,
+    ) -> Result<(), MemoryError> {
+        let Some(cap) = curator_target_cap(target) else {
+            return Err(MemoryError::InvalidArg(format!(
+                "target must be 'agent' or 'user', got '{target}'"
+            )));
+        };
+        if subject_id.is_empty() {
+            return Err(MemoryError::InvalidArg("subject_id required".to_string()));
+        }
+        let chars = content.chars().count();
+        if chars > cap {
+            return Err(MemoryError::CapExceeded {
+                target: target.to_string(),
+                proposed: chars,
+                cap,
+            });
+        }
+        let conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        upsert_target(&conn, subject_id, target, content)?;
+        Ok(())
+    }
+
+    /// Curator-only: enumerate every subject_id that has at
+    /// least one agent_memory row, and the combined character
+    /// count of its agent + user content. Used by the
+    /// scheduler to skip agents below the curation threshold.
+    pub fn list_subjects_with_total_chars(&self) -> Result<Vec<(String, usize)>, MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT subject_id, SUM(LENGTH(content)) \
+                 FROM agent_memory \
+                 GROUP BY subject_id \
+                 ORDER BY subject_id ASC",
+            )
+            .map_err(MemoryError::Db)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })
+            .map_err(MemoryError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(MemoryError::Db)?);
+        }
+        Ok(out)
+    }
+
     /// FTS5 search across all turns. Returns (session_id, role, body) tuples.
     pub fn search(
         &self,
@@ -404,7 +475,19 @@ impl MemoryStore {
 }
 
 /// Register all memory capabilities on the supplied dispatch bridge.
-pub fn register(bridge: &mut DispatchBridge, store: Arc<MemoryStore>) {
+///
+/// `ai_cell` is the shared `OnceCell` populated by the memory
+/// controller post-startup when `[memory.curator.ai_peer]` is
+/// configured. The `memory.agent_curate` handler captures it
+/// and reads through to whatever's set; an empty cell yields a
+/// `RESPONDER_INTERNAL` "ai dispatcher not configured" error
+/// for that one call. The curator scheduler captures the SAME
+/// cell so manual + scheduled paths see the same dispatcher.
+pub fn register(
+    bridge: &mut DispatchBridge,
+    store: Arc<MemoryStore>,
+    ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>>,
+) {
     {
         let store = store.clone();
         bridge.register(
@@ -452,6 +535,18 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<MemoryStore>) {
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let store = store.clone();
                 async move { handle_agent_write(&store, &ctx) }
+            })),
+        );
+    }
+    {
+        let store = store.clone();
+        let ai = ai_cell.clone();
+        bridge.register(
+            "memory.agent_curate",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let store = store.clone();
+                let ai = ai.clone();
+                async move { handle_agent_curate(&store, &ai, &ctx).await }
             })),
         );
     }
@@ -625,6 +720,45 @@ fn handle_agent_write(store: &MemoryStore, ctx: &InvocationCtx) -> HandlerOutcom
     }
 }
 
+async fn handle_agent_curate(
+    store: &MemoryStore,
+    ai_cell: &tokio::sync::OnceCell<Arc<dyn AiDispatcher>>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid_args(format!("memory.agent_curate arg utf8: {e}")),
+    };
+    // `subject_id|ai_peer_alias` — ai_peer_alias is informational
+    // today; the dispatcher is configured at controller startup
+    // and the alias is fixed there.  We parse and accept the
+    // arg for forward-compat (multi-AI-peer routing later).
+    let mut parts = s.splitn(2, '|');
+    let subject_id = parts.next().unwrap_or("").trim();
+    let _ai_alias = parts.next().unwrap_or("ai").trim();
+    if subject_id.is_empty() {
+        return invalid_args("memory.agent_curate: subject_id required".to_string());
+    }
+    let Some(dispatcher) = ai_cell.get() else {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: "memory.agent_curate: AI dispatcher not configured (missing [memory.curator.ai_peer])".to_string(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    };
+    match curator::curate_subject(store, dispatcher.as_ref(), subject_id).await {
+        Ok(res) => HandlerOutcome::Ok(res.to_wire().into_bytes()),
+        Err(curator::CuratorError::Store(e)) => internal(format!("memory.agent_curate: {e}")),
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("memory.agent_curate: {e}"),
+            retry_hint: 1,
+            retry_after: None,
+        }),
+    }
+}
+
 fn invalid_args(cause: String) -> HandlerOutcome {
     HandlerOutcome::Err(ErrorEnvelope {
         kind: error_kinds::INVALID_ARGS,
@@ -737,6 +871,12 @@ fn unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Mirror of [`target_cap`] for curator-side code. Same
+/// table — kept identical so the two stay in lock-step.
+fn curator_target_cap(target: &str) -> Option<usize> {
+    target_cap(target)
 }
 
 // ──────────────────────────── Errors ────────────────────────────────────────
