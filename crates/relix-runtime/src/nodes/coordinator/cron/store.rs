@@ -303,6 +303,14 @@ impl CronStore {
         Ok(())
     }
 
+    /// Test-only escape hatch for tests that need to poke
+    /// the database directly (e.g. forcing `next_run_at` into
+    /// the past to make a job due immediately).
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("poisoned")
+    }
+
     /// Stamp the last_status column after a fire completes.
     /// Best-effort — failure to update the status column never
     /// fails the scheduler tick.

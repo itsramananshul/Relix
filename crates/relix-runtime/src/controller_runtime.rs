@@ -979,6 +979,106 @@ async fn populate_ai_memory_cell(
 /// peer is unreachable or the bundle is missing; the curator
 /// scheduler will keep ticking and just skip every agent
 /// (`memory curator: AI dispatcher not yet ready`).
+async fn populate_cron_ai_cell(
+    cell: crate::nodes::coordinator::cron::CronAiDispatcherCell,
+    cfg: crate::nodes::coordinator::cron::CronAiPeerConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "cron scheduler: identity bundle missing; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cron scheduler: identity bundle decode failed; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "cron scheduler: client key not 32 bytes; AI dispatcher disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "cron scheduler: client key missing; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.alias.clone(),
+        PeerEntry {
+            addr: cfg.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(6),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                alias = %cfg.alias,
+                addr = %cfg.addr,
+                "cron scheduler: discover_and_pin returned None; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let dispatcher: Arc<dyn crate::nodes::coordinator::cron::CronAiDispatcher> =
+        Arc::new(crate::nodes::coordinator::cron::CronAiMeshDispatcher::new(
+            mesh,
+            cfg.alias.clone(),
+            bundle,
+            cfg.deadline_secs,
+        ));
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("cron scheduler: AI cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            alias = %cfg.alias,
+            addr = %cfg.addr,
+            "coordinator node: cron AI dispatcher online"
+        );
+    }
+}
+
 async fn populate_telegram_outbound_cell(
     cell: crate::nodes::telegram::TelegramOutboundClientCell,
     cfg: crate::nodes::telegram::TelegramNodeConfig,
@@ -1599,7 +1699,7 @@ fn register_node_type_handlers(
                 Err(e) => tracing::error!(error = %e, "coordinator startup: recovery scan failed"),
             }
         }
-        crate::nodes::coordinator::register(bridge, store);
+        crate::nodes::coordinator::register(bridge, store.clone());
         // Cron scheduler shares the coordinator's database.
         // Opens its own rusqlite connection against the same
         // file; SQLite handles cross-connection locking.
@@ -1640,13 +1740,90 @@ fn register_node_type_handlers(
             desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
             manifest.add_capability(desc);
         }
+
+        // Cron scheduler — optional [coordinator.cron] section.
+        // The AI dispatcher cell is shared by both the periodic
+        // tick AND the `cron.trigger` handler so manual + scheduled
+        // fires use the same outbound client.
+        let cron_sched_cfg_value = cfg
+            .coordinator
+            .as_ref()
+            .and_then(|v| v.get("cron").cloned());
+        let cron_sched_cfg: crate::nodes::coordinator::cron::CronSchedulerConfig =
+            match cron_sched_cfg_value {
+                Some(raw) => raw
+                    .try_into()
+                    .map_err(|e: toml::de::Error| format!("[coordinator.cron] parse: {e}"))?,
+                None => crate::nodes::coordinator::cron::CronSchedulerConfig::default(),
+            };
+        let cron_ai_cell: crate::nodes::coordinator::cron::CronAiDispatcherCell =
+            Arc::new(tokio::sync::OnceCell::new());
+        // Register cron.trigger now so it's available even when
+        // the scheduler loop is disabled — operators can still
+        // run jobs manually.
+        crate::nodes::coordinator::cron::register_trigger(
+            bridge,
+            store.clone(),
+            cron_store.clone(),
+            cron_ai_cell.clone(),
+            cron_sched_cfg.max_job_secs,
+        );
+        manifest.add_capability(
+            CapabilityDescriptor::unary("cron.trigger")
+                .with_description(
+                    "Manually fire a cron job. Creates a coordinator task with \
+                     title `cron:<job_name>` and origin_surface=`scheduler`, \
+                     records the fire on the cron row, and dispatches ai.chat \
+                     in the background.",
+                )
+                .with_categories(["cron".into(), "mutate".into()]),
+        );
+
+        // Scheduler loop — spawned only when [coordinator.cron]
+        // enabled = true (the default when the section exists).
+        if cfg
+            .coordinator
+            .as_ref()
+            .is_some_and(|v| v.get("cron").is_some())
+            && cron_sched_cfg.enabled
+        {
+            crate::nodes::coordinator::cron::spawn_cron_scheduler(
+                store.clone(),
+                cron_store.clone(),
+                cron_ai_cell.clone(),
+                cron_sched_cfg.clone(),
+            );
+            tracing::info!(
+                tick_secs = cron_sched_cfg.tick_secs,
+                max_concurrent = cron_sched_cfg.max_concurrent,
+                max_job_secs = cron_sched_cfg.max_job_secs,
+                "coordinator node: cron scheduler spawned"
+            );
+            // Post-startup population of the AI cell — same
+            // pattern as the memory curator. Spawns a task that
+            // dials the configured AI peer and publishes a
+            // CronAiMeshDispatcher into the cell.
+            if let Some(ai_peer) = cron_sched_cfg.ai_peer.clone() {
+                let key_path = cfg.identity.key_path.clone();
+                let cell = cron_ai_cell.clone();
+                tokio::spawn(async move {
+                    populate_cron_ai_cell(cell, ai_peer, key_path).await;
+                });
+            } else {
+                tracing::info!(
+                    "coordinator: no [coordinator.cron.ai_peer]; cron AI dispatch disabled"
+                );
+            }
+        } else {
+            tracing::info!(
+                "coordinator: cron scheduler not enabled ([coordinator.cron] missing or enabled=false)"
+            );
+        }
+
         tracing::info!(
             db = %coord_cfg.db_path.display(),
-            "coordinator node: registered cron.create / list / get / update / delete"
+            "coordinator node: registered cron.create / list / get / update / delete / trigger"
         );
-        // Keep `cron_store` referenced — the scheduler loop +
-        // cron.trigger handler land in the follow-up commit.
-        let _ = cron_store;
         let coord_caps: &[(&str, &str, &[&str])] = &[
             (
                 "task.create",

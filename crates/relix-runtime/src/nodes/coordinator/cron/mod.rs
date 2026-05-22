@@ -12,9 +12,15 @@
 
 pub mod handlers;
 pub mod schedule;
+pub mod scheduler;
 pub mod store;
 
 pub use schedule::{CronField, Schedule, ScheduleError};
+pub use scheduler::{
+    CronAiDispatcher, CronAiDispatcherCell, CronAiMeshDispatcher, CronAiPeerConfig,
+    CronSchedulerConfig, FireOutcome, fire_job, register_trigger, run_one_tick,
+    spawn_cron_scheduler,
+};
 pub use store::{CronJob, CronJobSummary, CronStore, CronStoreError};
 
 use std::sync::Arc;
