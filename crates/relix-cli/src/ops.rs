@@ -261,6 +261,61 @@ pub enum Cmd {
     /// onto the bridge's `/v1/cron/jobs` endpoints, themselves
     /// forwarding to the coordinator's `cron.*` capabilities.
     Cron(CronArgs),
+    /// PH-DELEGATE-CLI: delegation surface. Four subcommands
+    /// that proxy onto the bridge's `/v1/delegate/*` endpoints,
+    /// themselves forwarding to the coordinator's `delegate.*`
+    /// capabilities.
+    Delegate(DelegateArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DelegateArgs {
+    #[command(subcommand)]
+    pub cmd: DelegateCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DelegateCmd {
+    /// Spawn a delegated child task from a parent.
+    Spawn {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        parent_task_id: String,
+        #[arg(long)]
+        goal: String,
+        #[arg(long, default_value = "")]
+        context: String,
+        #[arg(long, default_value = "")]
+        target_subject_id: String,
+        #[arg(long, default_value_t = 0usize)]
+        depth: usize,
+    },
+    /// Read a delegated child task's status + result preview.
+    Result {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        child_task_id: String,
+    },
+    /// Cancel a delegated child task.
+    Cancel {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        child_task_id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// List delegated children of a parent task.
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        parent_task_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -387,6 +442,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             pretty,
         } => snapshot(&bridge, &peer, &output, pretty).await,
         Cmd::Cron(args) => cron_run(args.cmd).await,
+        Cmd::Delegate(args) => delegate_run(args.cmd).await,
     }
 }
 
@@ -1629,7 +1685,17 @@ async fn cron_run(cmd: CronCmd) -> Result<(), Box<dyn std::error::Error>> {
             prompt,
             subject_id,
             flow_template,
-        } => cron_create(&bridge, &name, &schedule, &prompt, &subject_id, &flow_template).await,
+        } => {
+            cron_create(
+                &bridge,
+                &name,
+                &schedule,
+                &prompt,
+                &subject_id,
+                &flow_template,
+            )
+            .await
+        }
         CronCmd::Trigger { bridge, job_id } => cron_trigger(&bridge, &job_id).await,
         CronCmd::Delete { bridge, job_id } => cron_delete(&bridge, &job_id).await,
         CronCmd::Enable { bridge, job_id } => cron_set_enabled(&bridge, &job_id, true).await,
@@ -1797,6 +1863,150 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+// ── PH-DELEGATE-CLI: delegation subcommands ────────────────
+
+async fn delegate_run(cmd: DelegateCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        DelegateCmd::Spawn {
+            bridge,
+            parent_task_id,
+            goal,
+            context,
+            target_subject_id,
+            depth,
+        } => {
+            delegate_spawn(
+                &bridge,
+                &parent_task_id,
+                &goal,
+                &context,
+                &target_subject_id,
+                depth,
+            )
+            .await
+        }
+        DelegateCmd::Result {
+            bridge,
+            child_task_id,
+        } => delegate_result(&bridge, &child_task_id).await,
+        DelegateCmd::Cancel {
+            bridge,
+            child_task_id,
+            reason,
+        } => delegate_cancel(&bridge, &child_task_id, &reason).await,
+        DelegateCmd::List {
+            bridge,
+            parent_task_id,
+            json,
+        } => delegate_list(&bridge, &parent_task_id, json).await,
+    }
+}
+
+async fn delegate_spawn(
+    bridge: &str,
+    parent_task_id: &str,
+    goal: &str,
+    context: &str,
+    target_subject_id: &str,
+    depth: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/delegate/spawn");
+    let body = json!({
+        "parent_task_id": parent_task_id,
+        "goal": goal,
+        "context": context,
+        "target_subject_id": target_subject_id,
+        "depth": depth,
+    });
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn delegate_result(
+    bridge: &str,
+    child_task_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/delegate/result/{}", urlencode(child_task_id));
+    let body = http_get_string(&url).await?;
+    println!("{body}");
+    Ok(())
+}
+
+async fn delegate_cancel(
+    bridge: &str,
+    child_task_id: &str,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/delegate/cancel/{}", urlencode(child_task_id));
+    let client = reqwest::Client::new();
+    let r = client
+        .post(&url)
+        .json(&json!({ "reason": reason }))
+        .send()
+        .await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn delegate_list(
+    bridge: &str,
+    parent_task_id: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/delegate/list/{}", urlencode(parent_task_id));
+    let body = http_get_string(&url).await?;
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed
+        .get("delegations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no delegations)");
+        return Ok(());
+    }
+    println!("{:<16} {:<32} {:<10} created", "child", "goal", "status");
+    for d in rows {
+        let id = d
+            .get("child_task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let goal = d.get("goal_preview").and_then(|v| v.as_str()).unwrap_or("");
+        let status = d.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let created = d.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        println!(
+            "{:<16} {:<32} {:<10} {}",
+            short(id, 16),
+            short(goal, 32),
+            short(status, 10),
+            created
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
