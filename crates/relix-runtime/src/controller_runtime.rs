@@ -840,6 +840,23 @@ fn register_node_type_handlers(
                 &["search", "memory"],
                 &["reads:internal"],
             ),
+            (
+                "memory.agent_read",
+                "Read persistent agent + user memory for a subject_id \
+                 (frozen-snapshot pattern). Returns header `agent_bytes=N|user_bytes=M\\n` \
+                 followed by the raw bytes.",
+                &["read", "memory", "agent_memory"],
+                &["reads:internal"],
+            ),
+            (
+                "memory.agent_write",
+                "Add / replace / remove / read one persistent memory \
+                 target. Arg: subject_id|target|action|data. Targets: \
+                 'agent' (cap 2200 chars) or 'user' (cap 1375 chars). \
+                 Entries separated by `§`.",
+                &["persist", "memory", "agent_memory"],
+                &["mutate:memory"],
+            ),
         ];
         for (m, desc, cats, tags) in memory_caps {
             // PH-CAP-RISK: memory caps are either reads (Safe) or
