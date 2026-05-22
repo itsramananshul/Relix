@@ -11,5 +11,7 @@
 //! follow-up commits.
 
 pub mod schedule;
+pub mod store;
 
 pub use schedule::{CronField, Schedule, ScheduleError};
+pub use store::{CronJob, CronJobSummary, CronStore, CronStoreError};
