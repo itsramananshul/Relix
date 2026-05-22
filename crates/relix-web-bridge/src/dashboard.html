@@ -6619,21 +6619,86 @@ function renderTimeline(events) {
 
    The peer-link uses data-peer-alias so the global
    click delegator routes the click without per-element
-   wiring. */
+   wiring.
+
+   W2-002h: every payload (regardless of event_type) is
+   scanned for `screenshot=<path>.png` markers — these
+   are the failure-screenshot paths the browser backend
+   appends to BrowserError reasons (W2-002c). When one
+   is present we append an inline thumbnail wired to
+   `/v1/browser/captures/<basename>` (W2-002g). The
+   thumbnail is click-through to the full-size PNG in a
+   new tab. */
 function renderTimelinePayload(eventType, payload) {
+  let textHtml;
   if (eventType !== 'capability.invoked') {
-    return escapeHtml(payload);
+    textHtml = escapeHtml(payload);
+  } else {
+    const parsed = parseCapabilityInvokedPayload(payload);
+    if (!parsed.peer) {
+      textHtml = escapeHtml(payload);
+    } else {
+      const parts = [];
+      if (parsed.method) parts.push('method=' + escapeHtml(parsed.method));
+      if (parsed.target) parts.push('target=' + escapeHtml(parsed.target));
+      parts.push('peer=<span class="peer-link" data-peer-alias="' + escapeHtml(parsed.peer)
+        + '" title="open peer detail">' + escapeHtml(parsed.peer) + '</span>');
+      textHtml = parts.join(' ');
+    }
   }
-  const parsed = parseCapabilityInvokedPayload(payload);
-  if (!parsed.peer) return escapeHtml(payload);
-  // Re-assemble the payload with the peer segment marked.
-  // Preserve order: method=, target=, peer=, anything else.
-  const parts = [];
-  if (parsed.method) parts.push('method=' + escapeHtml(parsed.method));
-  if (parsed.target) parts.push('target=' + escapeHtml(parsed.target));
-  parts.push('peer=<span class="peer-link" data-peer-alias="' + escapeHtml(parsed.peer)
-    + '" title="open peer detail">' + escapeHtml(parsed.peer) + '</span>');
-  return parts.join(' ');
+  const thumb = renderScreenshotThumb(payload);
+  return thumb ? textHtml + thumb : textHtml;
+}
+
+/* W2-002h: extract the failure-screenshot basename from a
+   payload string. The browser backend appends
+   `; screenshot=<abs path>.png` to the BrowserError
+   reason; we tolerate any path separator + match the
+   basename only. Returns the basename or null. */
+function screenshotBasenameFromPayload(payload) {
+  if (!payload) return null;
+  // Use a non-greedy match up to the first whitespace,
+  // semicolon, or comma so adjacent text in the reason
+  // string doesn't get swallowed into the path.
+  const m = payload.match(/screenshot=([^\s;,]+\.png)/i);
+  if (!m) return null;
+  const p = m[1];
+  // Strip everything up to the last `/` or `\` so we end
+  // up with just the basename — that's what
+  // `/v1/browser/captures/:filename` expects.
+  const base = p.replace(/.*[\\/]/, '');
+  // Final shape check — the bridge will refuse a
+  // dangerous basename anyway, but bailing early keeps
+  // the URL clean.
+  if (!base || base.includes('..') || base.includes('/') || base.includes('\\')) return null;
+  return base;
+}
+
+function renderScreenshotThumb(payload) {
+  const base = screenshotBasenameFromPayload(payload);
+  if (!base) return '';
+  const src = '/v1/browser/captures/' + encodeURIComponent(base);
+  // The <img> is wrapped in <a target="_blank"> so a
+  // click opens the full-size capture. onerror swaps the
+  // <img> for a "missing" badge when the bridge / tool
+  // peer can't serve it (e.g. screenshot_on_failure_dir
+  // not configured, or capture rolled off the disk).
+  return ''
+    + '<div class="screenshot-thumb" style="margin-top: 6px;">'
+    +   '<a href="' + src + '" target="_blank" rel="noopener" '
+    +     'title="open full-size screenshot in new tab">'
+    +     '<img src="' + src + '" alt="failure screenshot"'
+    +       ' style="max-width: 320px; max-height: 200px;'
+    +       ' border: 1px solid var(--border); border-radius: 4px;'
+    +       ' display: block; background: var(--bg-1);"'
+    +       ' onerror="this.outerHTML='
+    +         '\'<span class=&quot;badge warn&quot;'
+    +         ' title=&quot;capture not available — check '
+    +         '[tool.browser] screenshot_on_failure_dir or '
+    +         'whether the capture has rolled off&quot;>'
+    +         'screenshot unavailable</span>\'" />'
+    +   '</a>'
+    + '</div>';
 }
 
 // W2-003c: bucket a chronicle event into a coarse

@@ -37,9 +37,14 @@ pub async fn page() -> impl IntoResponse {
 /// CSP that only allows inline styles + scripts (the page is
 /// fully self-contained) and disables every other origin.
 fn csp() -> &'static str {
+    // W2-002h: `img-src 'self'` lets the chronicle render
+    // failure-screenshot thumbnails served by the new
+    // `/v1/browser/captures/:filename` route. Without this,
+    // `default-src 'none'` blocks the <img> entirely.
     "default-src 'none'; \
      style-src 'unsafe-inline'; \
      script-src 'unsafe-inline'; \
+     img-src 'self'; \
      connect-src 'self'; \
      form-action 'none'; \
      base-uri 'none'; \
