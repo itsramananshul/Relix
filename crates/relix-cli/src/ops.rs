@@ -187,6 +187,12 @@ pub enum Cmd {
         /// Raw JSON instead of the table view.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// W2-008f: CSV output instead of the table — easy
+        /// spreadsheet import. Columns:
+        /// `event_id,task_id,event_type,ts,summary,payload`.
+        /// Quoting matches RFC 4180.
+        #[arg(long, default_value_t = false)]
+        csv: bool,
     },
 }
 
@@ -208,7 +214,8 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             limit,
             filter,
             json,
-        } => events(&bridge, limit, &filter, json).await,
+            csv,
+        } => events(&bridge, limit, &filter, json, csv).await,
         Cmd::RouteTest {
             bridge,
             candidates,
@@ -602,6 +609,7 @@ async fn events(
     limit: usize,
     filter: &str,
     json: bool,
+    csv: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cap = limit.clamp(1, 500);
     let url = format!(
@@ -625,6 +633,24 @@ async fn events(
         .iter()
         .filter(|r| needle.is_empty() || r.event_type.to_ascii_lowercase().contains(&needle))
         .collect();
+    // W2-008f: CSV branch — RFC 4180 quoting, no table
+    // headers stderr noise so the output pipes cleanly
+    // into `> events.csv`.
+    if csv {
+        println!("event_id,task_id,event_type,ts,summary,payload");
+        for r in &filtered {
+            println!(
+                "{id},{tid},{et},{ts},{sum},{pl}",
+                id = r.event_id,
+                tid = csv_field(&r.task_id),
+                et = csv_field(&r.event_type),
+                ts = r.ts,
+                sum = csv_field(&r.summary),
+                pl = csv_field(&r.payload),
+            );
+        }
+        return Ok(());
+    }
     println!(
         "events  shown={shown}  fetched={fetched}  next_cursor={cursor}",
         shown = filtered.len(),
@@ -774,6 +800,31 @@ struct EventRow {
     payload: String,
     #[serde(default)]
     summary: String,
+    /// W2-008f: unix-seconds timestamp the bridge ships
+    /// (defaults to 0 on older bridges that don't surface it).
+    #[serde(default)]
+    ts: i64,
+}
+
+/// W2-008f: RFC 4180 quoting — wrap in double-quotes when
+/// the value contains `,` `"` newline or CR; double any
+/// embedded `"`.
+fn csv_field(s: &str) -> String {
+    let needs_quote = s.bytes().any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'));
+    if !needs_quote {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push_str("\"\"");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -1404,6 +1455,32 @@ mod tests {
         let r: PolicySimulateResp = serde_json::from_str(body).unwrap();
         assert_eq!(r.decision, "deny");
         assert!(r.matched_rule.is_none());
+    }
+
+    #[test]
+    fn csv_field_passthrough_for_safe_strings() {
+        assert_eq!(csv_field("task.created"), "task.created");
+        assert_eq!(csv_field(""), "");
+        assert_eq!(csv_field("simple summary"), "simple summary");
+    }
+
+    #[test]
+    fn csv_field_quotes_commas() {
+        assert_eq!(csv_field("a,b,c"), "\"a,b,c\"");
+    }
+
+    #[test]
+    fn csv_field_doubles_internal_quotes() {
+        assert_eq!(csv_field("he said \"hi\""), "\"he said \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn csv_field_quotes_newlines_and_crs() {
+        assert_eq!(csv_field("line one\nline two"), "\"line one\nline two\"");
+        assert_eq!(
+            csv_field("line one\r\nline two"),
+            "\"line one\r\nline two\""
+        );
     }
 
     #[test]
