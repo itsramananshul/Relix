@@ -288,15 +288,34 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // memory peer and populates the `OnceCell` the ai.chat
     // handler already captured. Failure is non-fatal — the AI
     // node still serves chat, just without memory injection.
-    if let Some(StartupWiring::AiMemory {
-        cell,
-        cfg: Some(memcfg),
-    }) = startup_wiring.take()
-    {
-        let key_path = cfg.identity.key_path.clone();
-        tokio::spawn(async move {
-            populate_ai_memory_cell(cell, memcfg, key_path).await;
-        });
+    match startup_wiring.take() {
+        Some(StartupWiring::AiMemory {
+            cell,
+            cfg: Some(memcfg),
+        }) => {
+            let key_path = cfg.identity.key_path.clone();
+            tokio::spawn(async move {
+                populate_ai_memory_cell(cell, memcfg, key_path).await;
+            });
+        }
+        Some(StartupWiring::MemoryCurator {
+            ai_cell,
+            state,
+            cfg: ccfg,
+        }) => {
+            if let Some(aipeer) = ccfg.ai_peer.clone() {
+                let key_path = cfg.identity.key_path.clone();
+                let interval_secs = ccfg.interval_secs;
+                tokio::spawn(async move {
+                    populate_memory_curator_cell(ai_cell, state, aipeer, key_path, interval_secs)
+                        .await;
+                });
+            } else {
+                tracing::info!("memory curator: no [memory.curator.ai_peer]; dispatcher unset");
+                let _ = state;
+            }
+        }
+        _ => {}
     }
 
     tracing::info!("controller online; awaiting inbound RPCs");
@@ -921,6 +940,129 @@ async fn populate_ai_memory_cell(
     }
 }
 
+/// Build the memory controller's outbound MeshClient pointed
+/// at the AI peer and populate the curator's `OnceCell`. Same
+/// shape as `populate_ai_memory_cell`. Silent failure — the
+/// memory node keeps serving reads/writes unaffected if the AI
+/// peer is unreachable or the bundle is missing; the curator
+/// scheduler will keep ticking and just skip every agent
+/// (`memory curator: AI dispatcher not yet ready`).
+async fn populate_memory_curator_cell(
+    cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
+    state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
+    cfg: crate::nodes::memory::AiPeerConfig,
+    key_path: std::path::PathBuf,
+    interval_secs: u64,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "memory curator: identity bundle missing; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "memory curator: identity bundle decode failed; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "memory curator: client key not 32 bytes; AI dispatcher disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "memory curator: client key missing; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.alias.clone(),
+        PeerEntry {
+            addr: cfg.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(6),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                alias = %cfg.alias,
+                addr = %cfg.addr,
+                "memory curator: discover_and_pin returned None; AI dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let dispatcher: Arc<dyn crate::nodes::memory::AiDispatcher> =
+        Arc::new(crate::nodes::memory::AiMeshDispatcher::new(
+            mesh,
+            cfg.alias.clone(),
+            bundle,
+            cfg.deadline_secs,
+        ));
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("memory curator: cell already populated; spurious second wiring");
+    } else {
+        // Stamp the initial next_run_at so /v1/memory/curator/
+        // status reports it even before the first tick lands.
+        {
+            let mut guard = state.lock().await;
+            guard.next_run_at = Some(unix_now() + interval_secs as i64);
+        }
+        tracing::info!(
+            alias = %cfg.alias,
+            addr = %cfg.addr,
+            interval_secs = interval_secs,
+            "memory node: curator dispatcher online; scheduler ticking"
+        );
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Post-startup wiring the per-node-type registration handed
 /// back to `run()` because it depends on the `rpc::Client` that
 /// only exists after the dispatch bridge is built.
@@ -931,6 +1073,16 @@ pub(crate) enum StartupWiring {
     AiMemory {
         cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::ai::MemoryFetcher>>>,
         cfg: Option<crate::nodes::ai::AiMemoryPeerConfig>,
+    },
+    /// Memory node curator wiring. The AI dispatcher cell was
+    /// already passed into both `memory::register` and the
+    /// curator scheduler; the run() loop populates it post-
+    /// startup by building an [`AiMeshDispatcher`] from
+    /// `cfg.ai_peer` (when set).
+    MemoryCurator {
+        ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
+        state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
+        cfg: crate::nodes::memory::CuratorConfig,
     },
 }
 
@@ -957,7 +1109,42 @@ fn register_node_type_handlers(
             .try_into()
             .map_err(|e: toml::de::Error| format!("[memory] parse: {e}"))?;
         let store = std::sync::Arc::new(crate::nodes::memory::MemoryStore::open(&mem_cfg)?);
-        crate::nodes::memory::register(bridge, store);
+        // Shared AI dispatcher cell — passed to both the
+        // `memory.agent_curate` handler and the curator
+        // scheduler so manual + scheduled paths use the same
+        // dispatcher once it's populated post-startup.
+        let curator_ai_cell: Arc<
+            tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>,
+        > = Arc::new(tokio::sync::OnceCell::new());
+        let curator_state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>> = Arc::new(
+            tokio::sync::Mutex::new(crate::nodes::memory::CuratorState::default()),
+        );
+        crate::nodes::memory::register(bridge, store.clone(), curator_ai_cell.clone());
+        // Spawn the curator scheduler iff [memory.curator] is
+        // configured AND enabled. Discovery of the AI peer is
+        // deferred to post-rpc::Client setup; see
+        // `StartupWiring::MemoryCurator`.
+        if let Some(curator_cfg) = mem_cfg.curator.clone() {
+            if curator_cfg.enabled {
+                crate::nodes::memory::spawn_curator_scheduler(
+                    store.clone(),
+                    curator_state.clone(),
+                    curator_ai_cell.clone(),
+                    curator_cfg.clone(),
+                );
+            } else {
+                tracing::info!(
+                    "memory node: [memory.curator] enabled = false; scheduler not spawned"
+                );
+            }
+            *out = Some(StartupWiring::MemoryCurator {
+                ai_cell: curator_ai_cell,
+                state: curator_state,
+                cfg: curator_cfg,
+            });
+        } else {
+            tracing::info!("memory node: no [memory.curator] section; curator scheduler disabled");
+        }
         let memory_caps: &[(&str, &str, &[&str], &[&str])] = &[
             (
                 "memory.write_turn",
@@ -993,6 +1180,17 @@ fn register_node_type_handlers(
                  Entries separated by `§`.",
                 &["persist", "memory", "agent_memory"],
                 &["mutate:memory"],
+            ),
+            (
+                "memory.agent_curate",
+                "Curator: read a subject's agent + user memory, \
+                 ask the AI peer to consolidate / drop stale entries, \
+                 write the result back. Arg: subject_id|ai_peer_alias. \
+                 Returns pipe-delimited summary (chars before/after, \
+                 entries before/after). Existing memory is preserved \
+                 on any AI failure.",
+                &["mutate", "memory", "agent_memory", "curate"],
+                &["mutate:memory", "external:ai"],
             ),
         ];
         for (m, desc, cats, tags) in memory_caps {
