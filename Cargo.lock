@@ -3225,6 +3225,7 @@ dependencies = [
  "portable-pty",
  "rand 0.8.6",
  "relix-core",
+ "relix-telegram",
  "reqwest",
  "rusqlite",
  "serde",
@@ -3245,8 +3246,10 @@ name = "relix-telegram"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "blake3",
  "relix-core",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

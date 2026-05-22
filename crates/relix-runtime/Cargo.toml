@@ -14,6 +14,11 @@ unsafe_code = "forbid"
 
 [dependencies]
 relix-core.workspace = true
+# Telegram channel scaffold + live Bot API client. The
+# `telegram` node_type lives in nodes/telegram/ and reaches
+# into this crate for LiveBotApi, identity derivation, and
+# message types.
+relix-telegram = { path = "../relix-telegram", version = "0.1.0" }
 
 # Async runtime + transport (libp2p inherited from OpenPrem INFRA reuse)
 tokio.workspace = true

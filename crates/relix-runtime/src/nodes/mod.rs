@@ -10,5 +10,6 @@ pub mod ai;
 pub mod coordinator;
 pub mod memory;
 pub mod router;
+pub mod telegram;
 pub mod tool;
 pub mod web_bridge;

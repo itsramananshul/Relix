@@ -49,6 +49,10 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub coordinator: Option<toml::Value>,
+    /// Telegram-channel node options.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub telegram: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -336,6 +340,12 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             // hold their own Arc clones; this branch just
             // owned the wiring closure-captured copy.
             let _ = state;
+        }
+        Some(StartupWiring::Telegram { cell, cfg: tg_cfg }) => {
+            let key_path = cfg.identity.key_path.clone();
+            tokio::spawn(async move {
+                populate_telegram_outbound_cell(cell, tg_cfg, key_path).await;
+            });
         }
         _ => {}
     }
@@ -969,6 +979,127 @@ async fn populate_ai_memory_cell(
 /// peer is unreachable or the bundle is missing; the curator
 /// scheduler will keep ticking and just skip every agent
 /// (`memory curator: AI dispatcher not yet ready`).
+async fn populate_telegram_outbound_cell(
+    cell: crate::nodes::telegram::TelegramOutboundClientCell,
+    cfg: crate::nodes::telegram::TelegramNodeConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "telegram: identity bundle missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "telegram: identity bundle decode failed; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "telegram: client key not 32 bytes; outbound mesh client disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "telegram: client key missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.memory_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.memory_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.ai_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.ai_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.coord_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.coord_peer.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        // Use the AI deadline as the outer bound — it's the
+        // longest of the three configured per-call deadlines
+        // for typical configs.
+        deadline_secs: cfg.ai_peer.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                memory = %cfg.memory_peer.addr,
+                ai = %cfg.ai_peer.addr,
+                coord = %cfg.coord_peer.addr,
+                "telegram: discover_and_pin returned None; outbound client disabled"
+            );
+            return;
+        }
+    };
+
+    let client = Arc::new(crate::nodes::telegram::TelegramOutboundClient {
+        mesh,
+        identity: bundle,
+        memory_alias: cfg.memory_peer.alias.clone(),
+        memory_deadline_secs: cfg.memory_peer.deadline_secs,
+        ai_alias: cfg.ai_peer.alias.clone(),
+        ai_deadline_secs: cfg.ai_peer.deadline_secs,
+        coord_alias: cfg.coord_peer.alias.clone(),
+        coord_deadline_secs: cfg.coord_peer.deadline_secs,
+    });
+    if cell.set(client).is_err() {
+        tracing::warn!("telegram: outbound cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            memory = %cfg.memory_peer.alias,
+            ai = %cfg.ai_peer.alias,
+            coord = %cfg.coord_peer.alias,
+            "telegram node: outbound mesh client online"
+        );
+    }
+}
+
 async fn populate_memory_curator_cell(
     cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
     state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
@@ -1218,6 +1349,15 @@ pub(crate) enum StartupWiring {
         coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::CoordDispatcher>>>,
         state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
         cfg: crate::nodes::memory::CuratorConfig,
+    },
+    /// Telegram-channel outbound wiring. `cell` was already
+    /// passed into the long-poll loop; the run() loop dials
+    /// memory + ai + coord peers post-startup and publishes
+    /// a [`crate::nodes::telegram::TelegramOutboundClient`]
+    /// into it.
+    Telegram {
+        cell: crate::nodes::telegram::TelegramOutboundClientCell,
+        cfg: crate::nodes::telegram::TelegramNodeConfig,
     },
 }
 
@@ -1826,6 +1966,89 @@ fn register_node_type_handlers(
             max_list = coord_cfg.max_list,
             recovery_scan = coord_cfg.recovery_scan,
             "coordinator node: registered task.create / update / event / get / list / count / list_cursor / events / recover / attempts / retry / export / compact_events / edges / note / mark_investigation / pause / resume / lineage / recent_events / interruption_check / observe_interruption / freeze / unfreeze / record_spawned / record_delegated / record_awaited / transition_check / subtree_metrics"
+        );
+    }
+    if cfg.controller.node_type == "telegram" {
+        let raw = cfg
+            .telegram
+            .clone()
+            .ok_or_else(|| "node_type=telegram requires a [telegram] section".to_string())?;
+        let tg_cfg: crate::nodes::telegram::TelegramNodeConfig = raw
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("[telegram] parse: {e}"))?;
+        tg_cfg
+            .validate()
+            .map_err(|e| format!("[telegram] validation: {e}"))?;
+        // Resolve the token at startup so we fail loudly
+        // when the env var is missing; the live client never
+        // sees the raw token after this line.
+        let token = tg_cfg
+            .resolve_token()
+            .map_err(|e| format!("[telegram] token: {e}"))?;
+        let state = Arc::new(crate::nodes::telegram::ChannelState::default());
+        let ring = Arc::new(crate::nodes::telegram::MessageRing::new(
+            tg_cfg.messages_ring_capacity,
+        ));
+        let notifier = Arc::new(crate::nodes::telegram::NotifierState::default());
+        let out_cell: crate::nodes::telegram::TelegramOutboundClientCell =
+            Arc::new(tokio::sync::OnceCell::new());
+        crate::nodes::telegram::register(bridge, state.clone(), ring.clone());
+        // Spawn the long-poll loop now. The loop checks the
+        // out_cell on every tick and gracefully degrades when
+        // the mesh client isn't wired yet (sends a fallback
+        // reply rather than crashing).
+        let api = relix_telegram::LiveBotApi::new(token);
+        let state_for_loop = state.clone();
+        let ring_for_loop = ring.clone();
+        let cfg_for_loop = Arc::new(tg_cfg.clone());
+        let out_for_loop = out_cell.clone();
+        tokio::spawn(async move {
+            crate::nodes::telegram::run_telegram_controller_with_api(
+                api,
+                out_for_loop,
+                state_for_loop,
+                ring_for_loop,
+                notifier,
+                cfg_for_loop,
+            )
+            .await;
+        });
+        // Hand back to run() so the post-rpc::Client setup
+        // can dial memory + ai + coord and publish the
+        // outbound client into the cell.
+        let tg_cfg_for_wiring = tg_cfg.clone();
+        *out = Some(StartupWiring::Telegram {
+            cell: out_cell,
+            cfg: tg_cfg_for_wiring,
+        });
+        let telegram_caps: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "telegram.status",
+                "Bot online status + username + own user_id. Read-only \
+                 capability the bridge proxies for the dashboard.",
+                &["read", "telegram", "status"],
+                &["reads:internal"],
+            ),
+            (
+                "telegram.messages_recent",
+                "Last N inbound messages from the bounded in-memory ring \
+                 (newest-first). Used by the dashboard's recent-messages \
+                 widget.",
+                &["read", "telegram", "messages"],
+                &["reads:internal"],
+            ),
+        ];
+        for (method, doc, cats, sensitivities) in telegram_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            desc = desc.with_sensitivity(sensitivities.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        tracing::info!(
+            allow_everyone = tg_cfg.allow_everyone(),
+            operator_chat_id = tg_cfg.operator_chat_id,
+            ring_capacity = tg_cfg.messages_ring_capacity,
+            "telegram node: registered telegram.status / telegram.messages_recent; long-poll loop spawned"
         );
     }
     if cfg.controller.node_type == "tool" {
