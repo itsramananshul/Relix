@@ -41,6 +41,21 @@ before the backend (visibility + stable contract + honesty).
 | `task.terminal_summary` (H5 + H14) | live | Auto-emitted on every terminal transition |
 | `task.attempt_orphan_closed` (H7) | live | Recovery-scan cleanup of orphaned attempts |
 
+## Cron scheduler (`crates/relix-runtime/src/nodes/coordinator/cron/`)
+
+Lives on the coordinator node. Six capabilities + a 30 s background
+loop that fires due jobs through the same `task.create` path the
+rest of the mesh uses. See [cron.md](cron.md) for the full design.
+
+| Method | Status | Notes |
+|---|---|---|
+| `cron.create` | live | Arg: `name\|schedule\|flow_template\|prompt\|subject_id`. Schedule formats: duration (`30m`), 5-field cron (`0 9 * * 1`), RFC 3339 one-shot. Returns `<job_id>\n`. |
+| `cron.list` | live | Arg: `<subject_id>` (empty = all). Tab-separated `<job_id>\t<name>\t<schedule>\t<next>\t<last>\t<enabled>\t<run_count>` rows newest-first, then `count=N\n`. |
+| `cron.get` | live | Pipe-delim `key=value` body covering every column. Empty timestamps render as `-1`. |
+| `cron.update` | live | Arg: `<job_id>\|<field>\|<value>` where field ∈ {`enabled`, `schedule`, `prompt`}. Updates `next_run_at` when `schedule` changes. |
+| `cron.delete` | live | Permanent delete; returns `ok\n`. |
+| `cron.trigger` | live | Manual fire — creates a coordinator task immediately and spawns ai.chat in the background. Returns the new `task_id\n`. Skipped (INVALID_ARGS) when the previous task is still `running`. |
+
 ## Memory node (`crates/relix-runtime/src/nodes/memory/`)
 
 | Method | Status | Notes |

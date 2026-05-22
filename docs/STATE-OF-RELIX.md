@@ -18,7 +18,7 @@ small hand-written **SOL flow files** (a tiny imperative DSL with a
 `remote_call(peer, method, args)` primitive). There is no central
 gateway — the HTTP bridge that fronts OpenAI-compatible clients is just
 another peer on the mesh. The whole thing is honest about what it
-**does not** do: no plugin loading, no DHT discovery, no auto-scheduler,
+**does not** do: no plugin loading, no DHT discovery,
 no rate limiting beyond allow/deny. The differentiating posture is
 operator-facing transparency — every dispatched call, denial, retry,
 and chronicle event is queryable by both a dashboard and CLI, and the
@@ -252,6 +252,22 @@ Plus a long list of chronicle event types (`task.thrash_detected`,
 `task.replayed_from`, `task.failed`, `task.completed`,
 `task.cancelled`, `task.interrupted`, `task.attempt_started` /
 `_finished`, `flow.started`, `capability.invoked`).
+
+The coordinator also ships a **cron scheduler** that fires durable
+scheduled jobs. Six capabilities (`cron.create` / `list` / `get` /
+`update` / `delete` / `trigger`) backed by a `cron_jobs` SQLite
+table sharing the coordinator's database. A 30 s background loop
+scans for due jobs (enabled rows with `next_run_at <= now`), creates
+a `cron:<name>` task with `origin_surface = "scheduler"`, writes a
+`cron.job_fired` chronicle event, dispatches `ai.chat` against the
+configured peer with a per-job `max_job_secs` timeout, then writes
+a `cron.job_result` event with the AI reply preview. Hardening:
+semaphore caps concurrent fires (default 3), pile-up guard skips
+the next fire when the previous task is still `running`, one-shot
+jobs are auto-disabled after their first fire. Schedule formats:
+duration (`30m`, `2h`, `1d`, `7d`), 5-field cron (`0 9 * * 1`),
+RFC 3339 one-shot (`2026-06-01T09:00:00Z`). See
+[cron.md](cron.md) for the full design.
 
 ### 3.11 `router` node — control plane
 

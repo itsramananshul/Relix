@@ -457,6 +457,36 @@ method = "task.list"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "cron_create"
+method = "cron.create"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "cron_list"
+method = "cron.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "cron_get"
+method = "cron.get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "cron_update"
+method = "cron.update"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "cron_delete"
+method = "cron.delete"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "cron_trigger"
+method = "cron.trigger"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "telegram_status"
 method = "telegram.status"
 allow_groups = ["chat-users"]
