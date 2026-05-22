@@ -100,6 +100,7 @@ mod intervention_audit;
 mod lifecycle;
 mod mcp;
 mod mcp_audit;
+mod memory_curator;
 mod metrics;
 mod openai;
 mod policy_denials;
@@ -451,6 +452,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `memory` tool inside ai.chat sessions, never via the
         // dashboard.
         .route("/v1/memory/agent", get(agent_memory::agent_memory))
+        // W2-MEMORY-CURATOR-3: manual curator trigger +
+        // scheduler-status read.
+        .route("/v1/memory/curate", post(memory_curator::curate))
+        .route("/v1/memory/curator/status", get(memory_curator::status))
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with
