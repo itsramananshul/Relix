@@ -50,6 +50,7 @@ before the backend (visibility + stable contract + honesty).
 | `memory.search` | live | FTS5 search across all stored turns |
 | `memory.agent_read` (W2-MEMORY-1) | live | Read persistent agent + user memory for a subject_id. Returns `agent_bytes=N\|user_bytes=M\n<bytes>`. See [agent-memory.md](agent-memory.md). |
 | `memory.agent_write` (W2-MEMORY-1) | live | add/replace/remove/read one memory target. Arg: `subject_id\|target\|action\|data`. Targets: `agent` (cap 2200 chars) / `user` (cap 1375). Entries separated by `§`. |
+| `memory.agent_curate` (W2-MEMORY-CURATOR) | live | Asks the AI peer to consolidate / drop stale entries for one subject's agent + user memory. Arg: `subject_id\|ai_peer_alias`. Returns pipe-delim summary with before/after counts. Existing memory is preserved on any AI failure. See [agent-memory.md](agent-memory.md#memory-curator). |
 
 ## AI node (`crates/relix-runtime/src/nodes/ai/`)
 

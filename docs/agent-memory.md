@@ -190,6 +190,151 @@ The AI controller uses the same identity bundle and signing key
 the heartbeat sender uses (`<identity.key_path>.bundle`).
 Missing bundle → warn + skip; chat keeps serving.
 
+## Memory Curator
+
+A background process that periodically asks the AI peer to
+consolidate redundant entries, remove stale information, and
+keep each agent's memory lean and useful. Patterned on
+Hermes's curator subsystem (`agent/curator.py`, 1781 lines) but
+scoped to just the two memory targets that already exist —
+no skills, no procedural memory, no cross-agent state.
+
+### What it does
+
+For each agent whose total (agent + user) memory is over the
+configured threshold:
+
+1. Read both targets via `MemoryStore::agent_read`.
+2. For each non-empty target, build a structured prompt with
+   explicit rules (deduplicate, consolidate, drop stale,
+   preserve `§`, stay under the cap) and send it to `ai.chat`
+   on the AI peer.
+3. Validate the reply: non-empty AND within the target's cap.
+4. Atomically replace the target's content via the internal
+   `MemoryStore::agent_set_content` method.
+
+The capability is also exposed directly for on-demand /
+operator-triggered curation:
+
+```
+memory.agent_curate(arg = "subject_id|ai_peer_alias")
+returns pipe-delimited summary with:
+  subject_id, agent_entries_before/after,
+  agent_chars_before/after, user_entries_before/after,
+  user_chars_before/after, chars_saved
+```
+
+### How to enable it
+
+The memory controller's config grows a new section:
+
+```toml
+[memory.curator]
+enabled = true              # master switch
+interval_secs = 3600        # tick cadence (1 hour default)
+min_chars_to_curate = 100   # skip agents below this threshold
+
+[memory.curator.ai_peer]
+addr = "/ip4/127.0.0.1/tcp/19712"
+alias = "ai"                # default
+deadline_secs = 30          # ai.chat budget (slow; give it room)
+```
+
+When `[memory.curator]` is missing entirely, the scheduler is
+not spawned AND `memory.agent_curate` returns
+`RESPONDER_INTERNAL` with a clear "AI dispatcher not
+configured" message. The capability stays advertised so
+operators can see it in the manifest; calls just fail loud
+rather than silently no-op.
+
+When `enabled = false`, the scheduler is not spawned but the
+capability is still wired — operators can curate manually via
+the dashboard or `POST /v1/memory/curate`.
+
+### How to trigger manually
+
+**Dashboard** — `#/memory` page has a `curate` button next to
+`read`. Paste a subject_id, click curate, wait (slow — runs
+a real LLM call), and the panels refresh with the curated
+content. A toast announces `chars_saved`.
+
+**Bridge** — `POST /v1/memory/curate` with body
+`{ "subject_id": "...", "peer": "memory", "ai_peer": "ai" }`.
+Response shape:
+
+```json
+{
+  "peer": "memory",
+  "subject_id": "...",
+  "result": {
+    "agent_entries_before": 5,
+    "agent_entries_after":  3,
+    "agent_chars_before":   200,
+    "agent_chars_after":    120,
+    "user_entries_before":  3,
+    "user_entries_after":   2,
+    "user_chars_before":    80,
+    "user_chars_after":     50,
+    "chars_saved":          110
+  }
+}
+```
+
+**Status** — `GET /v1/memory/curator/status?peer=memory`.
+Honest scope: the runtime's `CuratorState` lives in-process on
+the memory node and isn't yet reachable via a capability. The
+endpoint surfaces what the bridge knows (configured peer alias)
+plus an explicit `bridge_note` field naming the gap. Manual
+curation through `/v1/memory/curate` works end-to-end; the
+scheduler-wide stats land when a follow-up
+`memory.curator_status` capability ships.
+
+### What the curation prompt does
+
+The prompt is templated and tested verbatim (`tests::
+build_curation_prompt_contains_delimiter_cap_and_content`):
+
+```
+Curate the following agent memory. Rules:
+1. Remove duplicate or near-duplicate entries
+2. Consolidate related entries into one clear entry
+3. Remove entries that are outdated or no longer useful
+4. Keep entries that are specific and actionable
+5. Preserve § as the delimiter between entries
+6. Stay within <cap> characters total
+7. Return ONLY the curated entries separated by §, nothing else
+
+Current entries:
+<content>
+```
+
+The history field carries a system-context line ("You are a
+memory curator…") so providers that respect history-as-context
+see the role assignment. The agent + user targets are curated
+in **separate** ai.chat calls so a bad reply on one doesn't
+poison both.
+
+### Hard invariants
+
+The curator NEVER:
+
+- **Wipes memory.** Empty or whitespace-only replies are
+  rejected; existing content is preserved.
+- **Invents entries.** The prompt explicitly tells the model
+  to return only consolidated / preserved entries — never
+  to add facts.
+- **Exceeds the cap.** Replies over `AGENT_MEMORY_CAP_CHARS`
+  (2200) / `USER_MEMORY_CAP_CHARS` (1375) are rejected;
+  existing content is preserved.
+- **Re-renders running sessions.** Curator writes hit the
+  memory store immediately, but the next ai.chat session
+  re-reads the frozen snapshot — same contract as a regular
+  agent write.
+
+Every failure path is a `tracing::warn` + the agent's existing
+memory is left untouched. The dashboard / CLI just sees the
+unchanged contents on the next read.
+
 ## What's deliberately NOT here
 
 - **Vector embeddings.** Memory is keyword text. Future waves.
