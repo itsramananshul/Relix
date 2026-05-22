@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `06666d7 feat(cli): W2-008h — relix-cli ops openwebui-setup`
+- **HEAD:** `9b26baf feat(cli): W2-008i — relix-cli ops snapshot for incident attachments`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -32,12 +32,11 @@ as the resume command.
     bridge → dashboard → CLI), plus latency-shape sparkline
     extension (W2-006d runtime ring + bridge parser + dashboard
     SVG; W2-006e CLI Unicode-block sparkline).
-  - **W2-003 (Dashboard UX):** partial — Metrics + What-If
-    form added (W2-003a/b) + chronicle category + text
-    filters (W2-003c) + per-category counts on chips
-    (W2-003d) + URL-hash persistence for chronicle filters
-    (W2-003e). Live feed enhancements + status pills still
-    pending.
+  - **W2-003 (Dashboard UX):** substantively CLOSED —
+    Metrics + What-If form (W2-003a/b) + chronicle category
+    + text filters (W2-003c/d) + URL-hash persistence
+    (W2-003e) + task-list time-window chips (W2-003f).
+    Status pills still pending.
   - **W2-007 (Policy hardening):** CLOSED end-to-end (both
     pillars + CLI) —
     `node.policy.simulate` (W2-007a) → bridge proxy
@@ -61,7 +60,9 @@ as the resume command.
     `relix-cli ops events --csv` spreadsheet dump (W2-008f) +
     multi-stage Dockerfile + ops walkthrough (W2-008g) +
     `relix-cli ops openwebui-setup` connection block
-    (W2-008h). One-command startup
+    (W2-008h) +
+    `relix-cli ops snapshot` incident-response dump
+    (W2-008i). One-command startup
     (`scripts/relix-mesh-up.sh`) predates this wave.
 - **Workspace tests:** **1299 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
