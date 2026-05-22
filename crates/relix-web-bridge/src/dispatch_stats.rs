@@ -63,6 +63,11 @@ pub struct DispatchStatsRow {
     pub last_elapsed_ms: u64,
     pub max_elapsed_ms: u64,
     pub mean_elapsed_ms: u64,
+    /// W2-006d: bounded ring of recent per-call latencies
+    /// (oldest first). Empty when the responder doesn't ship
+    /// the column (forward-compat with older peers).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub recent_latencies: Vec<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,6 +120,19 @@ fn parse_rows(body: &str) -> Vec<DispatchStatsRow> {
         let last_elapsed_ms = parts[8].parse().unwrap_or(0);
         let max_elapsed_ms = parts[9].parse().unwrap_or(0);
         let mean_elapsed_ms = parts[10].parse().unwrap_or(0);
+        // W2-006d: 12th column is the comma-separated recent
+        // latencies ring (oldest-first). Empty / missing /
+        // `-` all map to an empty Vec so an older peer
+        // without the column still parses cleanly.
+        let recent_latencies: Vec<u32> =
+            if parts.len() >= 12 && parts[11] != "-" && !parts[11].is_empty() {
+                parts[11]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u32>().ok())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         out.push(DispatchStatsRow {
             method: parts[0].to_string(),
             invocations,
@@ -127,6 +145,7 @@ fn parse_rows(body: &str) -> Vec<DispatchStatsRow> {
             last_elapsed_ms,
             max_elapsed_ms,
             mean_elapsed_ms,
+            recent_latencies,
         });
     }
     out
@@ -257,8 +276,47 @@ mod tests {
             last_elapsed_ms: 0,
             max_elapsed_ms: 0,
             mean_elapsed_ms: 0,
+            recent_latencies: Vec::new(),
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(!s.contains("last_error_at"));
+        // W2-006d: empty recent_latencies serializes away.
+        assert!(!s.contains("recent_latencies"));
+    }
+
+    #[test]
+    fn parse_rows_reads_recent_latencies_csv() {
+        let body = "node.health\t100\t2\t0\t0\t1716\t1700\t102\t5\t250\t12\t1,2,3,4,5\ncount=1\n";
+        let rows = parse_rows(body);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recent_latencies, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn parse_rows_treats_dash_as_empty_samples() {
+        let body = "node.health\t1\t0\t0\t0\t1716\t-\t1\t10\t10\t10\t-\ncount=1\n";
+        let rows = parse_rows(body);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].recent_latencies.is_empty());
+    }
+
+    #[test]
+    fn parse_rows_forward_compat_without_samples_column() {
+        // An older peer that doesn't ship column 12 still
+        // parses; recent_latencies just stays empty.
+        let body = "node.health\t1\t0\t0\t0\t1716\t-\t1\t10\t10\t10\ncount=1\n";
+        let rows = parse_rows(body);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].recent_latencies.is_empty());
+        // Other columns still parsed.
+        assert_eq!(rows[0].max_elapsed_ms, 10);
+    }
+
+    #[test]
+    fn parse_rows_drops_garbage_samples_keeps_good_ones() {
+        let body = "node.health\t1\t0\t0\t0\t1716\t-\t1\t10\t10\t10\t1,bad,3, ,4\ncount=1\n";
+        let rows = parse_rows(body);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recent_latencies, vec![1, 3, 4]);
     }
 }

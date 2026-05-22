@@ -620,9 +620,21 @@ fn dispatch_stats_body(
             .total_elapsed_ms
             .checked_div(s.latency_samples)
             .unwrap_or(0);
+        // W2-006d: 12th column is the recent-latencies ring
+        // as comma-separated u32s, oldest-first. `-` when
+        // empty so the column always has a parse target.
+        let samples_csv = if s.recent_latencies.is_empty() {
+            "-".to_string()
+        } else {
+            s.recent_latencies
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let _ = writeln!(
             body,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             name,
             s.invocations,
             s.errors,
@@ -636,6 +648,7 @@ fn dispatch_stats_body(
             s.last_elapsed_ms,
             s.max_elapsed_ms,
             mean,
+            samples_csv,
         );
     }
     let _ = writeln!(body, "count={}", snap.len());

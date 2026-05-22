@@ -8016,6 +8016,39 @@ async function loadBrowserSessions() {
   }
 }
 
+/* W2-006d: tiny inline SVG sparkline for the recent-latency
+   ring. Each sample becomes one bar; bar height is normalized
+   to the row's own max so a 5ms-mean capability and a
+   2000ms-mean capability both render legibly. Colour is a
+   single accent shade — operators reading shape, not value. */
+function renderLatencySparkline(samples) {
+  if (!Array.isArray(samples) || samples.length === 0) {
+    return '<span class="meta" style="opacity: 0.45;">—</span>';
+  }
+  const n = samples.length;
+  const max = Math.max(...samples, 1);
+  const w = 80;        // px
+  const h = 18;        // px
+  const barW = w / n;
+  const bars = samples.map((v, i) => {
+    const bh = Math.max(1, Math.round((v / max) * (h - 2)));
+    const x = (i * barW).toFixed(2);
+    const y = h - bh;
+    // 0.6px gap between bars so adjacent samples stay
+    // visually distinct even when filling the box.
+    const renderW = Math.max(1, barW - 0.6);
+    return '<rect x="' + x + '" y="' + y
+      + '" width="' + renderW.toFixed(2) + '" height="' + bh
+      + '" fill="currentColor" />';
+  }).join('');
+  const tip = samples.length + ' samples · max=' + max + 'ms';
+  return '<span title="' + escapeHtml(tip) + '">'
+    + '<svg width="' + w + '" height="' + h
+    + '" viewBox="0 0 ' + w + ' ' + h
+    + '" style="color: var(--accent); vertical-align: middle;">'
+    + bars + '</svg></span>';
+}
+
 /* W2-006d: dashboard panel for the dispatch-stats snapshot.
    Reads /v1/dispatch/stats which proxies node.dispatch.stats
    over libp2p. Sorted by mean elapsed desc — operators see the
@@ -8115,6 +8148,7 @@ async function loadMetrics() {
         + '<td>' + (s.max_elapsed_ms || 0) + ' ms</td>'
         + '<td>' + (s.last_elapsed_ms || 0) + ' ms</td>'
         + '<td>' + (s.latency_samples || 0) + '</td>'
+        + '<td>' + renderLatencySparkline(s.recent_latencies || []) + '</td>'
         + '</tr>';
     }).join('');
     $host.innerHTML = '<table class="data"><thead><tr>'
@@ -8125,6 +8159,7 @@ async function loadMetrics() {
       + '<th>max</th>'
       + '<th>last</th>'
       + '<th>samples</th>'
+      + '<th title="last 32 per-call latencies — oldest at left">trend</th>'
       + '</tr></thead><tbody>' + tr + '</tbody></table>';
   } catch (e) {
     $host.innerHTML = '<div class="error">load failed: '

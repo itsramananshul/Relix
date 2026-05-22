@@ -231,7 +231,20 @@ pub struct CapStats {
     /// unknown_method don't contribute (no handler call → no
     /// elapsed time).
     pub latency_samples: u64,
+    /// W2-006d: bounded ring of the most-recent per-call
+    /// elapsed_ms values (newest at the back). Capacity
+    /// [`RECENT_LATENCIES_CAP`]; FIFO eviction. Powers the
+    /// dashboard's inline sparkline so operators see latency
+    /// shape (steady? spiky? climbing?) without staring at
+    /// just last/mean/max numbers.
+    pub recent_latencies: std::collections::VecDeque<u32>,
 }
+
+/// W2-006d: how many recent per-call latency samples to keep
+/// per capability. 32 is enough to draw a meaningful
+/// sparkline at the dashboard's natural column width without
+/// bloating the per-row footprint.
+pub const RECENT_LATENCIES_CAP: usize = 32;
 
 impl DispatchBridge {
     /// Construct.
@@ -342,6 +355,15 @@ impl DispatchBridge {
             row.max_elapsed_ms = row.max_elapsed_ms.max(ms);
             row.total_elapsed_ms = row.total_elapsed_ms.saturating_add(ms);
             row.latency_samples = row.latency_samples.saturating_add(1);
+            // W2-006d: push into the bounded ring (clamp to
+            // u32 to keep the wire payload compact — anyone
+            // with a single-call latency > 49 days has bigger
+            // problems than a saturating cast).
+            let ms_u32 = u32::try_from(ms).unwrap_or(u32::MAX);
+            if row.recent_latencies.len() == RECENT_LATENCIES_CAP {
+                row.recent_latencies.pop_front();
+            }
+            row.recent_latencies.push_back(ms_u32);
         }
     }
 
@@ -1197,6 +1219,66 @@ mod tests {
         assert_eq!(stats.latency_samples, 3);
         assert!(stats.total_elapsed_ms >= stats.last_elapsed_ms);
         assert!(stats.max_elapsed_ms >= stats.last_elapsed_ms);
+        // W2-006d: recent latency ring tracks the same 3
+        // Ok dispatches.
+        assert_eq!(stats.recent_latencies.len(), 3);
+    }
+
+    /// W2-006d: the recent-latencies ring must cap at
+    /// RECENT_LATENCIES_CAP regardless of how many Ok / Err
+    /// dispatches land. FIFO eviction means the *newest*
+    /// sample wins over the *oldest*, not the other way
+    /// around.
+    #[tokio::test]
+    async fn capability_stats_caps_recent_latencies_ring() {
+        let dir = TempDir::new().unwrap();
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let policy = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "any"
+            method = "node.health"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let mut bridge = DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+
+        let caller_key = SigningKey::generate(&mut OsRng);
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&caller_key.verifying_key().to_bytes()),
+            name: "alice".into(),
+            org_id: NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let bundle = issue_identity(id, &org_root, 3600).unwrap();
+        // Dispatch CAP + 5 invocations so the ring has to
+        // evict the first 5.
+        let total = RECENT_LATENCIES_CAP + 5;
+        for _ in 0..total {
+            let envelope = build_request("node.health", b"x".to_vec(), bundle.clone(), 30);
+            let _ = bridge.handle_inbound(envelope).await;
+        }
+        let snap = bridge.capability_stats_snapshot();
+        let (_, stats) = snap
+            .iter()
+            .find(|(n, _)| n == "node.health")
+            .expect("node.health counter must exist");
+        assert_eq!(stats.recent_latencies.len(), RECENT_LATENCIES_CAP);
+        // Total samples counter is uncapped — it still
+        // reflects every Ok dispatch.
+        assert_eq!(stats.latency_samples as usize, total);
     }
 
     #[tokio::test]
