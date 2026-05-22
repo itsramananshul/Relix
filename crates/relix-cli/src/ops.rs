@@ -595,6 +595,33 @@ struct DispatchStatsRow {
     max_elapsed_ms: u64,
     #[serde(default)]
     mean_elapsed_ms: u64,
+    /// W2-006d: recent per-call latencies ring (oldest-first,
+    /// capped at 32 by the runtime). Empty when the responder
+    /// is an older peer that doesn't ship the column.
+    #[serde(default)]
+    recent_latencies: Vec<u32>,
+}
+
+/// W2-006d: render a ring of latency samples as a Unicode
+/// block-character sparkline. Heights normalize to the ring's
+/// own max so a 5ms-mean method and a 2000ms-mean method both
+/// render legibly side-by-side.
+fn ascii_sparkline(samples: &[u32]) -> String {
+    if samples.is_empty() {
+        return "-".to_string();
+    }
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = (*samples.iter().max().unwrap_or(&1)).max(1);
+    samples
+        .iter()
+        .map(|&v| {
+            // Map [0..=max] → BARS index. f64 keeps the
+            // mapping stable across the full u32 range
+            // without integer overflow.
+            let idx = ((v as f64 / max as f64) * (BARS.len() - 1) as f64).round() as usize;
+            BARS[idx.min(BARS.len() - 1)]
+        })
+        .collect()
 }
 
 async fn dispatch_stats(
@@ -638,12 +665,16 @@ async fn dispatch_stats(
     let max_h = "max";
     let last_h = "last";
     let samples_h = "samples";
-    println!("{m_h:<36}  {i_h:>7}  {e_h:>5}  {mean_h:>6}  {max_h:>6}  {last_h:>6}  {samples_h:>7}",);
+    let trend_h = "trend";
+    println!(
+        "{m_h:<36}  {i_h:>7}  {e_h:>5}  {mean_h:>6}  {max_h:>6}  {last_h:>6}  {samples_h:>7}  {trend_h}",
+    );
     for r in &rows {
         let method = truncate(&r.method, 36);
         let errs = r.errors + r.denied + r.unknown_method;
+        let trend = ascii_sparkline(&r.recent_latencies);
         println!(
-            "{method:<36}  {invocs:>7}  {errs:>5}  {mean:>5}ms  {max:>5}ms  {last:>5}ms  {samples:>7}",
+            "{method:<36}  {invocs:>7}  {errs:>5}  {mean:>5}ms  {max:>5}ms  {last:>5}ms  {samples:>7}  {trend}",
             method = method,
             invocs = r.invocations,
             errs = errs,
@@ -651,6 +682,7 @@ async fn dispatch_stats(
             max = r.max_elapsed_ms,
             last = r.last_elapsed_ms,
             samples = r.latency_samples,
+            trend = trend,
         );
     }
     println!("count={}", parsed.count);
@@ -834,5 +866,53 @@ mod tests {
         assert_eq!(t.peers.len(), 1);
         assert_eq!(t.peers[0].methods.len(), 2);
         assert_eq!(t.peers[0].freshness, "fresh");
+    }
+
+    // ── W2-006d: dispatch_stats CLI sparkline ──────────────────
+
+    #[test]
+    fn ascii_sparkline_empty_returns_dash() {
+        assert_eq!(ascii_sparkline(&[]), "-");
+    }
+
+    #[test]
+    fn ascii_sparkline_flat_renders_low_bars() {
+        // All-equal samples normalize to the max bar.
+        let s = ascii_sparkline(&[5, 5, 5, 5]);
+        assert_eq!(s.chars().count(), 4);
+        // Every bar at full height since v == max for all.
+        assert!(s.chars().all(|c| c == '█'));
+    }
+
+    #[test]
+    fn ascii_sparkline_renders_one_char_per_sample() {
+        let s = ascii_sparkline(&[1, 10, 5, 20, 8]);
+        assert_eq!(s.chars().count(), 5);
+        // The peak (20) should map to the tallest bar.
+        assert!(s.contains('█'));
+    }
+
+    #[test]
+    fn dispatch_stats_row_parses_recent_latencies() {
+        // Forward-compat: the JSON may or may not include
+        // recent_latencies. Both shapes parse.
+        let with_field = r#"{
+            "method": "tool.web_fetch",
+            "invocations": 5, "errors": 0, "denied": 0, "unknown_method": 0,
+            "last_invoked_at": 100, "latency_samples": 5,
+            "last_elapsed_ms": 10, "max_elapsed_ms": 25, "mean_elapsed_ms": 12,
+            "recent_latencies": [10, 15, 12, 25, 8]
+        }"#;
+        let r: DispatchStatsRow = serde_json::from_str(with_field).unwrap();
+        assert_eq!(r.recent_latencies, vec![10, 15, 12, 25, 8]);
+
+        let without_field = r#"{
+            "method": "tool.web_fetch",
+            "invocations": 5, "errors": 0, "denied": 0, "unknown_method": 0,
+            "last_invoked_at": 100, "latency_samples": 5,
+            "last_elapsed_ms": 10, "max_elapsed_ms": 25, "mean_elapsed_ms": 12
+        }"#;
+        let r2: DispatchStatsRow = serde_json::from_str(without_field).unwrap();
+        assert!(r2.recent_latencies.is_empty());
     }
 }
