@@ -16,14 +16,19 @@ serde_json.workspace = true
 toml.workspace       = true
 thiserror.workspace  = true
 async-trait.workspace = true
-tokio                = { workspace = true, features = ["sync", "macros"] }
+tokio                = { workspace = true, features = ["sync", "macros", "time", "rt", "net"] }
 tracing.workspace    = true
 # rusqlite for the optional persistent SessionStore. The
 # in-memory store still works without it (the default in
 # tests). Bundled SQLite — same as the Coordinator — so the
 # crate has no system dependency.
 rusqlite.workspace   = true
+# Live Bot API client (HTTPS, rustls — no openssl).
+reqwest.workspace    = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Spin a localhost test server for the live-client tests.
+axum.workspace     = true
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
 

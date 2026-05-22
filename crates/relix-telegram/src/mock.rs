@@ -10,12 +10,24 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::{BotApi, BotApiError, IncomingMessage, OutgoingMessage};
+use crate::{BotApi, BotApiError, BotIdentity, IncomingMessage, OutgoingMessage, ParseMode};
+
+/// `(chat_id, message_id, new_text, parse_mode)` — one
+/// recorded edit. Aliased to satisfy clippy's complex-type
+/// lint without losing column readability.
+pub type RecordedEdit = (i64, i64, String, Option<ParseMode>);
 
 #[derive(Default)]
 pub struct MockBotApi {
     inbound: Mutex<Vec<IncomingMessage>>,
     sent: Mutex<Vec<OutgoingMessage>>,
+    chat_actions: Mutex<Vec<(i64, String)>>,
+    callback_acks: Mutex<Vec<(String, Option<String>)>>,
+    edits: Mutex<Vec<RecordedEdit>>,
+    /// Override for `get_me`. Defaults to a mock identity so
+    /// existing tests work; the controller-startup test sets
+    /// this explicitly to assert format.
+    bot_identity: Mutex<BotIdentity>,
     /// When set, the next `send_message` call returns this
     /// error and clears the override. Used by tests covering
     /// the delivery retry path.
@@ -39,6 +51,28 @@ impl MockBotApi {
         self.sent.lock().unwrap().clone()
     }
 
+    /// Inspect chat actions the channel has emitted (typing
+    /// indicators). Each entry is `(chat_id, action)`.
+    pub fn chat_actions(&self) -> Vec<(i64, String)> {
+        self.chat_actions.lock().unwrap().clone()
+    }
+
+    /// Inspect callback-query acks the channel has emitted.
+    pub fn callback_acks(&self) -> Vec<(String, Option<String>)> {
+        self.callback_acks.lock().unwrap().clone()
+    }
+
+    /// Inspect edits the channel has emitted.
+    pub fn edits(&self) -> Vec<RecordedEdit> {
+        self.edits.lock().unwrap().clone()
+    }
+
+    /// Override the identity `get_me` returns. Tests use this
+    /// to assert the controller logs the right `@username`.
+    pub fn set_identity(&self, id: BotIdentity) {
+        *self.bot_identity.lock().unwrap() = id;
+    }
+
     /// Set up the next `send_message` to fail. Cleared after
     /// one call.
     pub fn fail_next_send(&self, err: BotApiError) {
@@ -48,6 +82,44 @@ impl MockBotApi {
 
 #[async_trait]
 impl BotApi for MockBotApi {
+    async fn get_me(&self) -> Result<BotIdentity, BotApiError> {
+        Ok(self.bot_identity.lock().unwrap().clone())
+    }
+
+    async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<(), BotApiError> {
+        self.callback_acks
+            .lock()
+            .unwrap()
+            .push((callback_query_id.to_string(), text.map(|s| s.to_string())));
+        Ok(())
+    }
+
+    async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<(), BotApiError> {
+        self.edits
+            .lock()
+            .unwrap()
+            .push((chat_id, message_id, text.to_string(), parse_mode));
+        Ok(())
+    }
+
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), BotApiError> {
+        self.chat_actions
+            .lock()
+            .unwrap()
+            .push((chat_id, action.to_string()));
+        Ok(())
+    }
+
     async fn get_updates(&self, offset: i64) -> Result<Vec<IncomingMessage>, BotApiError> {
         let mut q = self.inbound.lock().unwrap();
         let take: Vec<IncomingMessage> = q
@@ -111,6 +183,7 @@ mod tests {
             chat_id: 100,
             reply_to_message_id: 5,
             text: "hello back".into(),
+            parse_mode: None,
         };
         m.send_message(&out).await.unwrap();
         assert_eq!(m.sent_messages().len(), 1);
@@ -125,6 +198,7 @@ mod tests {
             chat_id: 100,
             reply_to_message_id: 5,
             text: "x".into(),
+            parse_mode: None,
         };
         let r = m.send_message(&out).await;
         assert!(matches!(r, Err(BotApiError::Transient(_))));

@@ -22,28 +22,43 @@
 
 pub mod config;
 pub mod identity;
+pub mod live;
 pub mod messages;
 pub mod mock;
 pub mod session_store;
 
 pub use config::{TelegramConfig, TelegramError};
 pub use identity::{ChannelSubject, derive_channel_subject};
-pub use messages::{IncomingMessage, OutgoingMessage};
+pub use live::{BotIdentity, LiveBotApi};
+pub use messages::{IncomingMessage, OutgoingMessage, ParseMode};
 pub use session_store::{InMemorySessionStore, SessionStorage, SessionStore, SqliteSessionStore};
 
 use async_trait::async_trait;
 
 /// Network surface a Telegram channel needs from a Bot API
-/// client. Kept narrow — only the two operations the
-/// task-native channel actually uses (long-poll and reply).
-/// Webhook mode is a follow-up that adds a separate handler;
-/// the trait stays the same shape from the channel's
-/// perspective.
+/// client.
 ///
-/// Implemented by the live HTTPS client and by [`mock::MockBotApi`]
-/// for tests.
+/// The trait is shaped to be small but cover every operation
+/// the live channel controller actually performs: bootstrap
+/// token verification (`get_me`), the long-poll receive loop
+/// (`get_updates`), the standard text reply (`send_message`),
+/// inline-button acknowledgement (`answer_callback_query`),
+/// in-place edits (`edit_message_text` — used by approval
+/// notifications to flip "pending" → "approved" after the
+/// operator replies), and the typing-indicator hint
+/// (`send_chat_action`).
+///
+/// Implemented by [`LiveBotApi`] (reqwest + rustls) and by
+/// [`mock::MockBotApi`] for tests.
 #[async_trait]
 pub trait BotApi: Send + Sync + 'static {
+    /// Verify the bot token at startup and return the bot's
+    /// own identity (username + numeric user_id). Hit once
+    /// during boot — when this fails the controller refuses
+    /// to come up so a misconfigured token can't silently
+    /// drop traffic.
+    async fn get_me(&self) -> Result<BotIdentity, BotApiError>;
+
     /// Fetch the next batch of inbound updates. The `offset`
     /// is Telegram's update_id pagination cursor; the channel
     /// passes back `max(update_id) + 1` from the previous
@@ -61,6 +76,32 @@ pub trait BotApi: Send + Sync + 'static {
     /// Implementations MUST retry transient (5xx / network)
     /// failures with bounded backoff before returning Err.
     async fn send_message(&self, out: &OutgoingMessage) -> Result<(), BotApiError>;
+
+    /// Acknowledge an inline-button press. Telegram clients
+    /// show a spinning indicator on the button until this is
+    /// called; the optional text appears as a transient toast
+    /// in the chat UI.
+    async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<(), BotApiError>;
+
+    /// Edit an existing message's text in place. Used by the
+    /// approval-notification flow to flip "⏳ pending" →
+    /// "✅ approved" without sending a second message.
+    async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<(), BotApiError>;
+
+    /// Send a chat action ("typing", "upload_photo", …). The
+    /// indicator auto-expires after 5s on Telegram clients;
+    /// callers re-send if the work takes longer.
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), BotApiError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,5 +131,16 @@ mod tests {
         let mock: Box<dyn BotApi> = Box::new(mock::MockBotApi::new());
         let v = mock.get_updates(0).await.unwrap();
         assert!(v.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_bot_api_is_also_trait_object_safe() {
+        // We never call into the network here — just confirm
+        // the live impl fits behind `dyn BotApi`.
+        let live: Box<dyn BotApi> = Box::new(LiveBotApi::with_base_url(
+            "test-token".into(),
+            "http://127.0.0.1:1".into(),
+        ));
+        let _ = &live;
     }
 }

@@ -25,14 +25,45 @@ pub struct IncomingMessage {
     pub text: String,
 }
 
+/// Telegram's `parse_mode` values. `MarkdownV2` is the only
+/// supported Markdown flavour today — the original `Markdown`
+/// is deprecated. `Html` is included because some channel
+/// flows reach for it for richer formatting (links + bold).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ParseMode {
+    MarkdownV2,
+    Html,
+}
+
+impl ParseMode {
+    /// The on-wire string Telegram expects in the
+    /// `parse_mode` request field.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            ParseMode::MarkdownV2 => "MarkdownV2",
+            ParseMode::Html => "HTML",
+        }
+    }
+}
+
 /// A reply the channel wants to send. Always threaded under
 /// `reply_to_message_id` so Telegram clients render it inline
 /// with the originating message.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OutgoingMessage {
     pub chat_id: i64,
+    /// `0` means "do not thread the reply" — Telegram silently
+    /// ignores a zero reply id and posts the message as a
+    /// top-level chat message.
     pub reply_to_message_id: i64,
     pub text: String,
+    /// Optional `parse_mode`. When `None`, the message is sent
+    /// as plain text. Approval notifications use `MarkdownV2`;
+    /// chat replies default to plain text so an LLM's stray
+    /// markdown doesn't trip Telegram's parser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_mode: Option<ParseMode>,
 }
 
 impl IncomingMessage {

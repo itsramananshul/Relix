@@ -51,6 +51,7 @@ async fn inbound_message_maps_to_subject_and_session() {
         chat_id: msg.chat_id,
         reply_to_message_id: msg.message_id,
         text: "done!".into(),
+        parse_mode: None,
     })
     .await
     .unwrap();
