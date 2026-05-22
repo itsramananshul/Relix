@@ -4601,6 +4601,12 @@ function renderLineagePanel(payload) {
 // coordinator emits on `task.replay` (replay_from). Payload
 // shape: `from=<original_task_id>`. Returns an HTML banner
 // or empty string when the task isn't a replay.
+//
+// W2-001f: also kicks off an async fetch of the original
+// task's lineage so the banner can fill in a one-line
+// comparison ("original failed in 8s · this took 6s") once
+// the data lands. Spawned as a side-effect — the synchronous
+// return value is the banner skeleton.
 function renderReplayBanner(events) {
   if (!Array.isArray(events) || events.length === 0) return '';
   const ev = events.find(e => (e && e.event_type) === 'task.replayed_from');
@@ -4609,19 +4615,81 @@ function renderReplayBanner(events) {
   const orig = m ? m[1] : '';
   if (!orig) return '';
   const short = orig.slice(0, 8) + '…';
+  // W2-001f: schedule the diff fill. requestAnimationFrame
+  // gives the DOM one frame to settle before we look up
+  // `#replay-diff-slot-<orig>` to write into.
+  requestAnimationFrame(() => fetchReplayDiff(orig));
   return ''
     + '<div class="banner info" style="margin: 0 14px 12px;'
     +   ' display: flex; align-items: center; gap: 8px;'
     +   ' background: var(--bg-1); border: 1px solid var(--border);'
-    +   ' border-radius: 4px; padding: 8px 12px;">'
+    +   ' border-radius: 4px; padding: 8px 12px; flex-wrap: wrap;">'
     +   '<span style="flex: 1;">'
     +     '<strong>Replay</strong> · this task is a replay of '
     +     '<code title="' + escapeHtml(orig) + '">' + escapeHtml(short) + '</code>'
+    +     // W2-001f: filled async by fetchReplayDiff.
+    +     '<span id="replay-diff-slot-' + escapeHtml(orig) + '"'
+    +       ' class="meta" style="margin-left: 6px;"></span>'
     +   '</span>'
     +   '<a class="chip" href="#/tasks?task=' + encodeURIComponent(orig) + '"'
     +     ' data-replay-of="' + escapeHtml(orig) + '"'
     +     ' title="open the original task">View original</a>'
     + '</div>';
+}
+
+// W2-001f: fetch the original task's lineage and fill the
+// banner's diff slot with a one-line summary. Best-effort —
+// silent failure (no slot update) keeps the banner readable
+// even when the original task isn't fetchable for some
+// reason (e.g. it's been archived).
+async function fetchReplayDiff(originalId) {
+  if (!originalId) return;
+  const slot = document.getElementById('replay-diff-slot-' + originalId);
+  if (!slot) return;
+  // Don't overwrite a previously-filled slot (avoids flash
+  // when renderDetail is called twice in quick succession).
+  if (slot.dataset.filled === '1') return;
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(originalId) + '/lineage');
+    if (!r.ok) return;
+    const orig = await r.json();
+    const origSummary = summarizeTaskForDiff(orig);
+    const curSummary = (lastDetailLineage && lastDetailLineage !== orig)
+      ? summarizeTaskForDiff(lastDetailLineage) : null;
+    if (!origSummary) return;
+    let line = ' · original ' + describeTaskRun(origSummary);
+    if (curSummary) {
+      const delta = curSummary.duration_secs - origSummary.duration_secs;
+      const sign = delta >= 0 ? '+' : '-';
+      const absStr = fmtDuration(Math.abs(delta));
+      line += ', this ' + describeTaskRun(curSummary)
+        + ' (' + sign + absStr + ')';
+    }
+    slot.textContent = line;
+    slot.dataset.filled = '1';
+  } catch (_) {
+    // swallow — banner stays as-is
+  }
+}
+
+// W2-001f: distill a /v1/tasks/<id>/lineage payload into the
+// fields the diff line needs.
+function summarizeTaskForDiff(l) {
+  if (!l || !l.task) return null;
+  const events = l.task.events || [];
+  if (events.length === 0) return null;
+  const t0 = events[0].ts || 0;
+  const tN = events[events.length - 1].ts || t0;
+  const status = (l.task.header && l.task.header.status) || '?';
+  return {
+    duration_secs: Math.max(0, tN - t0),
+    status,
+    event_count: events.length,
+  };
+}
+
+function describeTaskRun(s) {
+  return escapeHtml(s.status) + ' in ' + escapeHtml(fmtDuration(s.duration_secs));
 }
 
 function renderInvestigationBanner(l) {
