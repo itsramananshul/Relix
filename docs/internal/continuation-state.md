@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `58fc55e feat(dashboard): W2-007f — Recent denials card on Capabilities`
+- **HEAD:** `4c32366 feat(dashboard): W2-002h — inline failure-screenshot thumbnails`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -19,16 +19,22 @@ as the resume command.
     (W2-001b) + `POST /v1/tasks/:id/replay` bridge route
     (W2-001c) + Replay button (W2-001d). Remaining:
     replay-diff mode, failure-screenshot inline rendering.
-  - **W2-002 (Browser):** substantively shipped — trait
+  - **W2-002 (Browser):** CLOSED end-to-end — trait
     extension + HC live + WD live + screenshot-on-failure +
-    event-trace logging. PW live click/type/wait + dashboard
-    screenshot viewer pending.
+    event-trace logging (W2-002a–e); `tool.browser.capture_read`
+    runtime capability (W2-002f) → bridge proxy
+    `/v1/browser/captures/:filename` (W2-002g) → dashboard
+    inline thumbnail rendering (W2-002h). PW sidecar
+    click/type/wait remains the only deferred piece.
   - **W2-005 (Failure system):** substantively shipped via
     Wave 1.
   - **W2-006 (Observability):** CLOSED end-to-end (runtime →
     bridge → dashboard → CLI).
   - **W2-003 (Dashboard UX):** partial — Metrics + What-If
-    form added; live feed / status pills pending.
+    form added (W2-003a/b) + chronicle category + text
+    filters (W2-003c) + per-category counts on chips
+    (W2-003d). Live feed enhancements, status pills,
+    URL-hash persistence still pending.
   - **W2-007 (Policy hardening):** CLOSED end-to-end (both
     pillars) —
     `node.policy.simulate` (W2-007a) → bridge proxy
@@ -47,15 +53,15 @@ as the resume command.
     PASS/WARN/FAIL report. Remaining: one-command startup
     script, demo scripts, Open WebUI integration, Docker
     reliability.
-- **Workspace tests:** **1257 passing on default features**;
+- **Workspace tests:** **1275 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
   - relix-cli: 126
   - relix-policy: 72
-  - relix-runtime: 732 (+5 W2-007d denial ring)
+  - relix-runtime: 741 (+9 W2-002f capture_read)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 294 (+4 W2-007e denials parser)
+  - relix-web-bridge: 303 (+9 W2-002g captures bridge)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
