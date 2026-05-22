@@ -53,8 +53,11 @@
 //! or any presentation peer.
 
 pub mod failover;
+pub mod memory_dispatcher;
 pub mod provider;
 pub mod router;
+
+pub use memory_dispatcher::{MemoryDispatcher, MemoryFetcher};
 
 pub use failover::{
     FailoverCategory, FailoverReason, classify_http_failure, classify_transport_failure,
@@ -87,6 +90,14 @@ pub struct AiConfig {
     /// Per-provider settings, keyed by provider name (e.g. `openrouter`).
     #[serde(default)]
     pub providers: ProviderEntries,
+    /// Optional memory-peer wiring for frozen-snapshot memory
+    /// injection. When set, the AI controller dials this peer
+    /// at startup and `ai.chat` reads per-subject memory from
+    /// it before invoking the provider. When `None`, memory
+    /// injection is silently skipped — the AI node runs with no
+    /// outbound mesh capability.
+    #[serde(default, rename = "memory_peer")]
+    pub memory_peer: Option<AiMemoryPeerConfig>,
 }
 
 impl Default for AiConfig {
@@ -95,8 +106,34 @@ impl Default for AiConfig {
             provider: default_provider(),
             model: String::new(),
             providers: ProviderEntries::new(),
+            memory_peer: None,
         }
     }
+}
+
+/// `[ai.memory_peer]` config — names the memory peer this AI
+/// controller should dial for frozen-snapshot memory.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AiMemoryPeerConfig {
+    /// libp2p multiaddr of the memory peer (e.g.
+    /// `/ip4/127.0.0.1/tcp/19711`).
+    pub addr: String,
+    /// Alias the outbound MeshClient uses to dial. Defaults
+    /// to `"memory"` so chat code can just say `memory`.
+    #[serde(default = "default_memory_alias")]
+    pub alias: String,
+    /// Per-call deadline in seconds. `memory.agent_read` is a
+    /// cheap point read; 5s is plenty.
+    #[serde(default = "default_memory_deadline_secs")]
+    pub deadline_secs: i64,
+}
+
+fn default_memory_alias() -> String {
+    "memory".to_string()
+}
+
+fn default_memory_deadline_secs() -> i64 {
+    5
 }
 
 fn default_provider() -> String {
@@ -157,10 +194,19 @@ fn entry_or_err(
 }
 
 /// Register the `ai.chat` capability with the supplied provider.
+///
+/// `memory_dispatcher` is the frozen-snapshot memory hook. The
+/// AI controller populates the `OnceCell` after startup once it
+/// has dialled the memory peer; when the cell is empty (memory
+/// peer not configured or discovery hasn't finished yet),
+/// `ai.chat` proceeds without memory injection. The cell stays
+/// shared across all chat invocations, so the dispatcher is
+/// constructed exactly once per controller process.
 pub fn register(
     bridge: &mut DispatchBridge,
     provider: Arc<dyn ChatProvider>,
     default_model: String,
+    memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
 ) {
     let provider_for_handler = provider.clone();
     bridge.register(
@@ -168,7 +214,8 @@ pub fn register(
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let p = provider_for_handler.clone();
             let model = default_model.clone();
-            async move { handle_chat(p, model, ctx).await }
+            let mem = memory_dispatcher.clone();
+            async move { handle_chat(p, model, mem, ctx).await }
         })),
     );
 }
@@ -176,6 +223,7 @@ pub fn register(
 async fn handle_chat(
     provider: Arc<dyn ChatProvider>,
     default_model: String,
+    memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -211,11 +259,30 @@ async fn handle_chat(
         });
     }
 
+    // Frozen-snapshot memory injection. Fetch agent + user
+    // memory for the caller's subject_id once, build a labeled
+    // block, and route it into ChatInput.system_prompt. The
+    // dispatcher may be unset (cell empty) if the AI controller
+    // wasn't configured with a memory peer or its discovery
+    // hasn't finished yet — that's a silent skip per spec.
+    let system_prompt = if let Some(disp) = memory_dispatcher.get() {
+        let subject_id = ctx.caller.subject_id.to_string();
+        match disp.fetch(&subject_id).await {
+            Some((agent_mem, user_mem)) => {
+                memory_dispatcher::format_memory_block(&agent_mem, &user_mem)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let input = ChatInput {
         session_id: session_id.to_string(),
         prompt: prompt.to_string(),
         history: history.to_string(),
         model: default_model,
+        system_prompt,
         ..ChatInput::default()
     };
     match provider.generate_reply(input).await {
@@ -258,16 +325,76 @@ mod tests {
         }
     }
 
+    fn empty_mem() -> Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> {
+        Arc::new(tokio::sync::OnceCell::new())
+    }
+
+    /// A canned MemoryFetcher used to exercise the injection
+    /// path without a live mesh.
+    struct StubFetcher {
+        agent: String,
+        user: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryFetcher for StubFetcher {
+        async fn fetch(&self, _subject_id: &str) -> Option<(String, String)> {
+            Some((self.agent.clone(), self.user.clone()))
+        }
+    }
+
+    /// A MemoryFetcher that always reports unavailable. Models
+    /// the "memory node unreachable" silent-skip path.
+    struct UnavailableFetcher;
+
+    #[async_trait::async_trait]
+    impl MemoryFetcher for UnavailableFetcher {
+        async fn fetch(&self, _subject_id: &str) -> Option<(String, String)> {
+            None
+        }
+    }
+
+    /// A ChatProvider that records the last ChatInput it saw so
+    /// tests can verify what was sent to the provider.
+    struct RecordingProvider {
+        last: Arc<std::sync::Mutex<Option<ChatInput>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for RecordingProvider {
+        async fn generate_reply(
+            &self,
+            input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            *self.last.lock().unwrap() = Some(input.clone());
+            Ok(provider::ChatOutput {
+                text: "recorded".to_string(),
+                provider: "recording",
+                model: input.model.clone(),
+                usage: None,
+            })
+        }
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+    }
+
     #[tokio::test]
     async fn mock_provider_is_deterministic_with_and_without_history() {
         let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
-        let r1 = handle_chat(p.clone(), String::new(), ctx(b"s1|hello|")).await;
-        let r2 = handle_chat(p.clone(), String::new(), ctx(b"s1|hello|")).await;
+        let r1 = handle_chat(p.clone(), String::new(), empty_mem(), ctx(b"s1|hello|")).await;
+        let r2 = handle_chat(p.clone(), String::new(), empty_mem(), ctx(b"s1|hello|")).await;
         match (r1, r2) {
             (HandlerOutcome::Ok(a), HandlerOutcome::Ok(b)) => assert_eq!(a, b),
             _ => panic!("expected both ok"),
         }
-        let r3 = handle_chat(p, String::new(), ctx(b"s1|hello|user: prior\n")).await;
+        let r3 = handle_chat(
+            p,
+            String::new(),
+            empty_mem(),
+            ctx(b"s1|hello|user: prior\n"),
+        )
+        .await;
         match r3 {
             HandlerOutcome::Ok(body) => {
                 let t = String::from_utf8(body).unwrap();
@@ -283,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn missing_prompt_rejected() {
         let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
-        let r = handle_chat(p, String::new(), ctx(b"only-session-id")).await;
+        let r = handle_chat(p, String::new(), empty_mem(), ctx(b"only-session-id")).await;
         match r {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
             HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
@@ -293,11 +420,79 @@ mod tests {
     #[tokio::test]
     async fn empty_session_rejected() {
         let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
-        let r = handle_chat(p, String::new(), ctx(b"|hello|")).await;
+        let r = handle_chat(p, String::new(), empty_mem(), ctx(b"|hello|")).await;
         match r {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
             HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
         }
+    }
+
+    #[tokio::test]
+    async fn memory_injection_when_dispatcher_populated_sends_system_prompt() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(StubFetcher {
+            agent: "rust uses cargo".into(),
+            user: "prefers concise replies".into(),
+        });
+        cell.set(stub).ok();
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"s1|hello|")).await;
+        match r {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        }
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        let sp = captured.system_prompt.expect("system_prompt set");
+        assert!(sp.contains("--- AGENT MEMORY ---"));
+        assert!(sp.contains("rust uses cargo"));
+        assert!(sp.contains("--- USER MEMORY ---"));
+        assert!(sp.contains("prefers concise replies"));
+        assert!(sp.ends_with("--------------------"));
+    }
+
+    #[tokio::test]
+    async fn memory_injection_silent_skip_when_dispatcher_unavailable() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let unavail: Arc<dyn MemoryFetcher> = Arc::new(UnavailableFetcher);
+        cell.set(unavail).ok();
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"s1|hello|")).await;
+        match r {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        }
+        // System prompt remains None — memory peer silently
+        // skipped, provider received the chat input verbatim.
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        assert!(captured.system_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_injection_skipped_when_dispatcher_cell_empty() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        // OnceCell never populated — exercises the unconfigured
+        // path (AI controller booted without an [ai.memory_peer]
+        // section).
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"s1|hello|")).await;
+        match r {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        }
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        assert!(captured.system_prompt.is_none());
     }
 
     #[test]
@@ -315,6 +510,7 @@ mod tests {
             provider: "openrouter".into(),
             model: String::new(),
             providers: ProviderEntries::new(),
+            memory_peer: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -331,6 +527,7 @@ mod tests {
             provider: "rumple".into(),
             model: String::new(),
             providers: ProviderEntries::new(),
+            memory_peer: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -354,6 +551,7 @@ mod tests {
             provider: "anthropic".into(),
             model: String::new(),
             providers,
+            memory_peer: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -377,6 +575,7 @@ mod tests {
             provider: "local".into(),
             model: String::new(),
             providers,
+            memory_peer: None,
         };
         match build_provider(&cfg) {
             Ok(p) => assert_eq!(p.provider_name(), "local"),

@@ -179,6 +179,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Router role short-circuits: it doesn't run the per-node-type
     // capability surface (memory/ai/tool/...) — it runs the four
     // router.* capabilities and the reaper background loops.
+    let mut startup_wiring: Option<StartupWiring> = None;
     let router_state = if cfg.controller.role == "router" {
         tracing::info!(
             role = "router",
@@ -196,7 +197,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         register_router_descriptors(&manifest);
         Some(state)
     } else {
-        register_node_type_handlers(&mut bridge, &cfg, manifest.clone())?;
+        register_node_type_handlers(&mut bridge, &cfg, manifest.clone(), &mut startup_wiring)?;
         None
     };
 
@@ -280,6 +281,22 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             tracing::info!("controller: no router_peer_id configured; heartbeat sender disabled");
         }
+    }
+
+    // Post-startup wiring (AI memory injection). Spawns a small
+    // discovery task that builds a MeshClient pointing at the
+    // memory peer and populates the `OnceCell` the ai.chat
+    // handler already captured. Failure is non-fatal — the AI
+    // node still serves chat, just without memory injection.
+    if let Some(StartupWiring::AiMemory {
+        cell,
+        cfg: Some(memcfg),
+    }) = startup_wiring.take()
+    {
+        let key_path = cfg.identity.key_path.clone();
+        tokio::spawn(async move {
+            populate_ai_memory_cell(cell, memcfg, key_path).await;
+        });
     }
 
     tracing::info!("controller online; awaiting inbound RPCs");
@@ -800,6 +817,125 @@ fn spawn_heartbeat_sender(
     });
 }
 
+/// Build the AI controller's outbound MeshClient and populate
+/// the memory `OnceCell` so `ai.chat` starts injecting frozen-
+/// snapshot memory. Silent failure — the AI node keeps serving
+/// chat unaffected if the memory peer is unreachable or the
+/// identity bundle isn't on disk yet.
+async fn populate_ai_memory_cell(
+    cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::ai::MemoryFetcher>>>,
+    cfg: crate::nodes::ai::AiMemoryPeerConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    // Load the controller's identity bundle. The heartbeat
+    // sender uses the same pattern (key_path + ".bundle"). Bail
+    // silently if missing.
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "ai memory dispatcher: identity bundle missing; memory injection disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ai memory dispatcher: identity bundle decode failed; memory injection disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "ai memory dispatcher: client key not 32 bytes; memory injection disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "ai memory dispatcher: client key missing; memory injection disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.alias.clone(),
+        PeerEntry {
+            addr: cfg.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(6),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                alias = %cfg.alias,
+                addr = %cfg.addr,
+                "ai memory dispatcher: discover_and_pin returned None; memory injection disabled"
+            );
+            return;
+        }
+    };
+    let dispatcher: Arc<dyn crate::nodes::ai::MemoryFetcher> = Arc::new(
+        crate::nodes::ai::MemoryDispatcher::new(mesh, cfg.alias.clone(), bundle, cfg.deadline_secs),
+    );
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("ai memory dispatcher: cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            alias = %cfg.alias,
+            addr = %cfg.addr,
+            "ai node: memory dispatcher online; frozen-snapshot injection active"
+        );
+    }
+}
+
+/// Post-startup wiring the per-node-type registration handed
+/// back to `run()` because it depends on the `rpc::Client` that
+/// only exists after the dispatch bridge is built.
+pub(crate) enum StartupWiring {
+    /// AI node memory-injection wiring. `cell` was already passed
+    /// into `ai::register`; the run() loop populates it post-
+    /// startup by building a [`MemoryDispatcher`] from `cfg`.
+    AiMemory {
+        cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::ai::MemoryFetcher>>>,
+        cfg: Option<crate::nodes::ai::AiMemoryPeerConfig>,
+    },
+}
+
+/// Register node-type-specific capabilities based on `[controller] node_type`.
+///
 /// - `memory` → SQLite + FTS5 memory store (M7).
 /// - Other types (`ai`, `tool`, `web_bridge`, `demo`, ...) are no-ops until
 ///   their handlers ship in later milestones; the controller still serves
@@ -809,6 +945,7 @@ fn register_node_type_handlers(
     bridge: &mut DispatchBridge,
     cfg: &ControllerConfig,
     manifest: ManifestProvider,
+    out: &mut Option<StartupWiring>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
 
@@ -890,7 +1027,26 @@ fn register_node_type_handlers(
         let provider = crate::nodes::ai::build_provider(&ai_cfg)?;
         let provider_name = provider.provider_name();
         let default_model = ai_cfg.model.clone();
-        crate::nodes::ai::register(bridge, provider.clone(), default_model.clone());
+        // Frozen-snapshot memory cell. Always passed to
+        // `ai::register`; the controller populates it later
+        // (post-startup) iff `[ai.memory_peer]` is configured.
+        // When the cell stays empty, `ai.chat` proceeds without
+        // memory injection.
+        let memory_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::ai::MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        crate::nodes::ai::register(
+            bridge,
+            provider.clone(),
+            default_model.clone(),
+            memory_cell.clone(),
+        );
+        // Hand back to run() so the post-rpc::Client setup can
+        // build a MemoryDispatcher into the cell when
+        // ai_cfg.memory_peer is configured.
+        *out = Some(StartupWiring::AiMemory {
+            cell: memory_cell,
+            cfg: ai_cfg.memory_peer.clone(),
+        });
         // Carry the provider name as a sensitivity tag so consumers (bridge
         // `/v1/models`) can derive a model label without a second RPC.
         manifest.add_capability(
