@@ -93,6 +93,22 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// W2-008b mirror: end-to-end mesh smoke test against
+    /// an already-running bridge. Hits liveness, topology,
+    /// chat completion, dispatch stats, and policy denials
+    /// in sequence. Exit 1 on any failure. Pure Rust port
+    /// of `scripts/demo-smoke.sh` so Windows operators
+    /// don't need bash.
+    Smoke {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Chat model used for the round-trip step. Defaults
+        /// to `relix-mock` which works without an API key
+        /// regardless of provider configuration.
+        #[arg(long, default_value = "relix-mock")]
+        provider: String,
+    },
     /// W2-007b mirror: ask a peer's PolicyEngine "would this
     /// caller (with these groups) calling this method be
     /// allowed?" without invoking the method. Hits
@@ -190,6 +206,84 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             max,
             json,
         } => policy_denials(&bridge, &peer, max, json).await,
+        Cmd::Smoke { bridge, provider } => smoke(&bridge, &provider).await,
+    }
+}
+
+// W2-008b CLI mirror: end-to-end mesh smoke test.
+
+async fn smoke(bridge: &str, provider: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    println!("Relix smoke (bridge={base})");
+    let mut step = 0usize;
+    let mut fails = 0usize;
+    let mut run = |desc: &str, res: Result<String, Box<dyn std::error::Error>>| {
+        step += 1;
+        match &res {
+            Ok(_) => println!("  step {step} OK   — {desc}"),
+            Err(e) => {
+                println!("  step {step} FAIL — {desc}");
+                eprintln!("         {e}");
+                fails += 1;
+            }
+        }
+        res.ok()
+    };
+
+    // 1. liveness
+    let _ = run("GET /health", http_get(&format!("{base}/health")).await);
+
+    // 2. topology — count peers when we got a body back
+    let topo_body = run(
+        "GET /v1/topology",
+        http_get(&format!("{base}/v1/topology")).await,
+    );
+    if let Some(body) = topo_body {
+        let peer_count = body.matches("\"alias\":").count();
+        println!("         peers discovered: {peer_count}");
+    }
+
+    // 3. chat completion (mock by default)
+    let chat_body = format!(
+        r#"{{"model":"{provider}","messages":[{{"role":"user","content":"smoke test ping"}}]}}"#
+    );
+    let _ = run(
+        &format!("POST /v1/chat/completions (model={provider})"),
+        http_post_json(&format!("{base}/v1/chat/completions"), &chat_body).await,
+    );
+
+    // 4. dispatch stats — observability
+    let _ = run(
+        "GET /v1/dispatch/stats?peer=tool (W2-006c)",
+        http_get(&format!("{base}/v1/dispatch/stats?peer=tool")).await,
+    );
+
+    // 5. policy denials — yellow-flag a non-empty ring
+    let denials_body = run(
+        "GET /v1/policy/denials?peer=tool (W2-007e)",
+        http_get(&format!("{base}/v1/policy/denials?peer=tool&max=10")).await,
+    );
+    if let Some(body) = denials_body {
+        // Loose-parse just the count field — keeps the smoke
+        // path zero-dependency on the full denials struct.
+        let count = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("count").and_then(|c| c.as_u64()))
+            .unwrap_or(0);
+        if count > 0 {
+            println!("         ⚠  {count} recent denial(s) on tool — investigate via:");
+            println!("         relix-cli ops policy-denials --peer tool");
+        } else {
+            println!("         denial ring empty on tool");
+        }
+    }
+
+    println!();
+    if fails == 0 {
+        println!("smoke PASS — {step}/{step} steps OK");
+        Ok(())
+    } else {
+        Err(format!("smoke FAIL — {fails}/{step} step(s) failed").into())
     }
 }
 
