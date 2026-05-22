@@ -487,6 +487,26 @@ method = "cron.trigger"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "delegate_spawn"
+method = "delegate.spawn"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "delegate_result"
+method = "delegate.result"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "delegate_cancel"
+method = "delegate.cancel"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "delegate_list"
+method = "delegate.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "telegram_status"
 method = "telegram.status"
 allow_groups = ["chat-users"]

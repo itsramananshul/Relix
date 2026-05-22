@@ -41,6 +41,21 @@ before the backend (visibility + stable contract + honesty).
 | `task.terminal_summary` (H5 + H14) | live | Auto-emitted on every terminal transition |
 | `task.attempt_orphan_closed` (H7) | live | Recovery-scan cleanup of orphaned attempts |
 
+## Delegation (`crates/relix-runtime/src/nodes/coordinator/delegate/`)
+
+Lives on the coordinator node. Four capabilities + a 5 s background
+executor that picks up pending delegated children and dispatches
+`ai.chat`. Builds on the existing `task_edges` table (which already
+had the `delegated_to` edge type). See [delegation.md](delegation.md)
+for the full design.
+
+| Method | Status | Notes |
+|---|---|---|
+| `delegate.spawn` | live | Arg: `parent_task_id\|goal\|context\|target_subject_id\|depth`. Creates a child task with `origin_surface = "delegation"`, records the `delegated_to` edge, flips the parent to `awaiting_input`, writes a `task.awaiting` chronicle event with `child_task_id=<id>`. Returns `<child_task_id>\n`. Depth cap enforced twice (claimed `depth` + independent ancestor-chain walk). |
+| `delegate.result` | live | Returns `status\|preview\|completed_at\n` (`-1` sentinel when not terminal; preview cut to 500 chars). |
+| `delegate.cancel` | live | Arg: `<child_task_id>\|<reason>`. Flips to `cancelled` with a `delegate.cancelled` chronicle event. Refuses when the task is already terminal. |
+| `delegate.list` | live | Tab-separated `<child>\t<goal>\t<status>\t<created_at>` rows + a trailing `count=N\n`. |
+
 ## Cron scheduler (`crates/relix-runtime/src/nodes/coordinator/cron/`)
 
 Lives on the coordinator node. Six capabilities + a 30 s background

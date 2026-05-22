@@ -253,6 +253,26 @@ Plus a long list of chronicle event types (`task.thrash_detected`,
 `task.cancelled`, `task.interrupted`, `task.attempt_started` /
 `_finished`, `flow.started`, `capability.invoked`).
 
+The coordinator ships a **delegation** surface that lets one
+agent spawn another as a subtask. Four capabilities
+(`delegate.spawn` / `result` / `cancel` / `list`) on top of the
+existing `task_edges` table — `delegate.spawn` creates a child
+task with `origin_surface = "delegation"`, records a
+`delegated_to` edge (re-using the existing `record_delegated`
+producer), and flips the parent to `awaiting_input` with a
+`task.awaiting` chronicle event. A 5 s background executor
+picks up pending children (`max_concurrent` semaphore default 5,
+`max_job_secs` timeout default 300), dispatches `ai.chat` with
+the goal + context, then writes `delegate.completed` /
+`delegate.failed` on the child and `delegate.child_completed`
+on the parent before resuming the parent to `running`. Depth
+cap (default 3) is enforced twice — against the caller's
+claimed `depth` AND against an independent walk of the
+`delegated_to` ancestor chain. Honest contract: `delegate.spawn`
+returns the `child_task_id` immediately (not a blocking call);
+agent loops poll `delegate.result`. See
+[delegation.md](delegation.md).
+
 The coordinator also ships a **cron scheduler** that fires durable
 scheduled jobs. Six capabilities (`cron.create` / `list` / `get` /
 `update` / `delete` / `trigger`) backed by a `cron_jobs` SQLite
