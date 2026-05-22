@@ -92,6 +92,7 @@ mod capabilities;
 mod chat;
 mod config;
 mod config_api;
+mod cron;
 mod dashboard;
 mod dispatch_stats;
 mod flow;
@@ -467,6 +468,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/telegram/messages/recent",
             get(telegram::messages_recent),
         )
+        // PH-CRON-BRIDGE: cron scheduler. Six proxies onto the
+        // coordinator's `cron.*` capabilities. List + create on
+        // the collection; get / patch / delete / trigger on each
+        // job.
+        .route("/v1/cron/jobs", get(cron::list).post(cron::create))
+        .route(
+            "/v1/cron/jobs/:job_id",
+            get(cron::get_one).patch(cron::update).delete(cron::delete),
+        )
+        .route("/v1/cron/jobs/:job_id/trigger", post(cron::trigger))
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with
