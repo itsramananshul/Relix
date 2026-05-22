@@ -2021,6 +2021,16 @@
         <button class="chip" data-quick-filter="__stuck" title="running for ≥ STUCK_AGE_SECS — same age that future recovery scans would flag">stuck?</button>
         <button class="chip" data-quick-filter="__investigating" title="tasks flagged with the operator-set investigation marker">investigating</button>
       </div>
+      <!-- W2-003f: time-window filter chips. Client-side
+           post-filter on updated_at — no extra round-trip.
+           Persists in URL as ?window=1h|6h|24h. -->
+      <div class="row" style="margin-bottom: 8px; gap: 6px; align-items: center;">
+        <span class="meta" style="margin-right: 4px;">updated:</span>
+        <button class="chip" data-time-window="0" title="show every task in the loaded page">all-time</button>
+        <button class="chip" data-time-window="3600" title="only tasks touched in the last hour">last 1h</button>
+        <button class="chip" data-time-window="21600" title="only tasks touched in the last 6 hours">last 6h</button>
+        <button class="chip" data-time-window="86400" title="only tasks touched in the last 24 hours">last 24h</button>
+      </div>
       <div class="row between" style="margin-bottom: 12px; gap: 8px; flex-wrap: wrap;">
         <div class="row" style="flex-wrap: wrap; gap: 8px;">
           <label class="meta">status
@@ -4235,6 +4245,10 @@ let tasksInited = false;
 // any row that isn't running/retrying and STUCK_AGE_SECS old.
 // Driven by the "stuck?" quick-filter chip.
 let stuckOnly = false;
+// W2-003f: client-side post-filter on `updated_at`. 0 = no
+// filter ("all-time"); otherwise drop rows older than this
+// many seconds. Persists in URL as `?window=N`.
+let taskTimeWindowSecs = 0;
 // M63: when true, renderTaskList hides any row without an
 // investigation marker set. Driven by the "investigating"
 // quick-filter chip.
@@ -4306,6 +4320,18 @@ function initTasks() {
         setQueryParams({ status: v, stuck: null, investigating: null });
       }
       loadTasks();
+    });
+  });
+  // W2-003f: time-window chips. Client-side post-filter on
+  // updated_at — re-render without re-fetching since the
+  // server-side filter doesn't support a time window yet.
+  document.querySelectorAll('.chip[data-time-window]').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const w = parseInt(chip.dataset.timeWindow || '0', 10) || 0;
+      taskTimeWindowSecs = w;
+      syncChipState();
+      setQueryParams({ window: w > 0 ? String(w) : null });
+      renderTaskList(loadedTasks);
     });
   });
   syncChipState();
@@ -4961,6 +4987,11 @@ function syncChipState() {
       );
     }
   });
+  // W2-003f: highlight the active time-window chip too.
+  document.querySelectorAll('.chip[data-time-window]').forEach(chip => {
+    const w = parseInt(chip.dataset.timeWindow || '0', 10) || 0;
+    chip.classList.toggle('active', w === taskTimeWindowSecs);
+  });
 }
 function enterTasks() {
   // Apply persisted filters from URL query (so a shared
@@ -4992,6 +5023,11 @@ function enterTasks() {
   // honors the filter without an extra re-render.
   chronicleCategoryFilter = (query.cat || '').trim();
   chronicleTextFilter = (query.chq || '').trim().toLowerCase();
+  // W2-003f: pre-seed task list time-window filter from URL.
+  // Accepts integer seconds (e.g. `?window=3600`). Invalid /
+  // missing → 0 = all-time.
+  const winRaw = parseInt(query.window || '0', 10);
+  taskTimeWindowSecs = Number.isFinite(winRaw) && winRaw > 0 ? winRaw : 0;
   if (!loadedTasks.length) {
     loadTasks().then(() => {
       // If the URL named a task, open its detail panel after
@@ -5076,6 +5112,15 @@ function renderTaskList(items) {
     filtered = filtered.filter(t =>
       typeof t.investigation_marked_at === 'number'
       && t.investigation_marked_at > 0);
+  }
+  // W2-003f: time-window post-filter. Compares against
+  // `updated_at` (touched-by-write) rather than created_at
+  // so a task still receiving events stays visible even
+  // when it's older than the window.
+  if (taskTimeWindowSecs > 0) {
+    const cutoff = nowFilter - taskTimeWindowSecs;
+    filtered = filtered.filter(t =>
+      typeof t.updated_at === 'number' && t.updated_at >= cutoff);
   }
   // Update the count badge: filtered/loaded with `+` when more pages.
   const total = items.length;
