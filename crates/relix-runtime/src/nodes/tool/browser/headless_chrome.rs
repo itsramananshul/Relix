@@ -103,11 +103,7 @@ impl HeadlessChromeBackend {
     /// Filename: `<session_id>-<unix_ms>.png`. Directory must
     /// already exist; we do NOT mkdir to avoid surprising
     /// operators with arbitrary directory creation.
-    fn snapshot_on_failure(
-        &self,
-        session_id: &str,
-        tab: &Arc<Tab>,
-    ) -> Option<std::path::PathBuf> {
+    fn snapshot_on_failure(&self, session_id: &str, tab: &Arc<Tab>) -> Option<std::path::PathBuf> {
         let dir = self.screenshot_on_failure_dir.as_ref()?;
         let bytes = tab
             .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
@@ -371,9 +367,7 @@ impl BrowserBackend for HeadlessChromeBackend {
             Ok(el) => el,
             Err(e) => {
                 let base = BrowserError::BackendNotConnected {
-                    reason: format!(
-                        "headless_chrome: click find_element({selector}) failed: {e}"
-                    ),
+                    reason: format!("headless_chrome: click find_element({selector}) failed: {e}"),
                 };
                 return Err(self.enrich_with_screenshot(session_id, &tab, base));
             }
@@ -387,12 +381,7 @@ impl BrowserBackend for HeadlessChromeBackend {
         Ok(())
     }
 
-    fn type_text(
-        &self,
-        session_id: &str,
-        selector: &str,
-        text: &str,
-    ) -> Result<(), BrowserError> {
+    fn type_text(&self, session_id: &str, selector: &str, text: &str) -> Result<(), BrowserError> {
         let tab = self.lookup_session(session_id)?;
         let el = match tab.find_element(selector) {
             Ok(el) => el,
@@ -412,9 +401,7 @@ impl BrowserBackend for HeadlessChromeBackend {
         // CDP level; we don't pre-validate.
         if let Err(e) = el.click() {
             let base = BrowserError::BackendNotConnected {
-                reason: format!(
-                    "headless_chrome: type_text focus-click({selector}) failed: {e}"
-                ),
+                reason: format!("headless_chrome: type_text focus-click({selector}) failed: {e}"),
             };
             return Err(self.enrich_with_screenshot(session_id, &tab, base));
         }

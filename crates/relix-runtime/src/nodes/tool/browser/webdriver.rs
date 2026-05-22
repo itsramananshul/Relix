@@ -285,41 +285,38 @@ impl BrowserBackend for WebDriverBackend {
     fn click(&self, session_id: &str, selector: &str) -> Result<(), BrowserError> {
         let selector = selector.to_string();
         self.with_client(session_id, move |client| async move {
-            let el = client
-                .find(Locator::Css(&selector))
+            let el = client.find(Locator::Css(&selector)).await.map_err(|e| {
+                BrowserError::BackendNotConnected {
+                    reason: format!("webdriver: click find({selector}): {e}"),
+                }
+            })?;
+            el.click()
                 .await
                 .map_err(|e| BrowserError::BackendNotConnected {
-                    reason: format!("webdriver: click find({selector}): {e}"),
+                    reason: format!("webdriver: click({selector}): {e}"),
                 })?;
-            el.click().await.map_err(|e| BrowserError::BackendNotConnected {
-                reason: format!("webdriver: click({selector}): {e}"),
-            })?;
             Ok(())
         })
     }
 
-    fn type_text(
-        &self,
-        session_id: &str,
-        selector: &str,
-        text: &str,
-    ) -> Result<(), BrowserError> {
+    fn type_text(&self, session_id: &str, selector: &str, text: &str) -> Result<(), BrowserError> {
         let selector = selector.to_string();
         let text = text.to_string();
         self.with_client(session_id, move |client| async move {
-            let el = client
-                .find(Locator::Css(&selector))
-                .await
-                .map_err(|e| BrowserError::BackendNotConnected {
+            let el = client.find(Locator::Css(&selector)).await.map_err(|e| {
+                BrowserError::BackendNotConnected {
                     reason: format!("webdriver: type_text find({selector}): {e}"),
-                })?;
+                }
+            })?;
             // fantoccini's `send_keys` is the WebDriver equivalent
             // of "type into focused element"; the element click
-                // ahead of it focuses the input (mirrors the HC
+            // ahead of it focuses the input (mirrors the HC
             // backend's focus-click semantics).
-            el.click().await.map_err(|e| BrowserError::BackendNotConnected {
-                reason: format!("webdriver: type_text focus-click({selector}): {e}"),
-            })?;
+            el.click()
+                .await
+                .map_err(|e| BrowserError::BackendNotConnected {
+                    reason: format!("webdriver: type_text focus-click({selector}): {e}"),
+                })?;
             el.send_keys(&text)
                 .await
                 .map_err(|e| BrowserError::BackendNotConnected {

@@ -1040,7 +1040,11 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
                     max_sessions = br_cfg.max_sessions,
                     "tool node: registering tool.browser.* (PH-BROWSER-FEATURES — see browser/mod.rs)"
                 );
-                browser::register(bridge, bb);
+                // W2-002f: thread the captures dir through so the
+                // new `tool.browser.capture_read` capability can
+                // serve previously-failed screenshots back to the
+                // operator dashboard.
+                browser::register(bridge, bb, br_cfg.screenshot_on_failure_dir.clone());
             }
             Err(e) => {
                 tracing::error!(

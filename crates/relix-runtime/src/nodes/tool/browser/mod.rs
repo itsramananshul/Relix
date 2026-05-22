@@ -548,11 +548,47 @@ pub fn descriptor_wait_for_selector() -> CapabilityDescriptor {
     d
 }
 
+/// W2-002f: descriptor for `tool.browser.capture_read`. Reads a
+/// PNG from the configured `screenshot_on_failure_dir` and
+/// returns its raw bytes. Pure read; no browser interaction.
+pub fn descriptor_capture_read() -> CapabilityDescriptor {
+    let mut d = CapabilityDescriptor::unary("tool.browser.capture_read");
+    d.major_version = 1;
+    d.idempotency = Idempotency::Idempotent;
+    d.cost_class = CostClass::Cheap;
+    d.sensitivity_tags = vec!["browser:capture".into(), "binary:image".into()];
+    d.policy_attachment_point = "tool.browser.capture_read".to_string();
+    d.requires_groups = vec!["operators".into()];
+    d.description = Some(
+        "Read a previously-captured failure screenshot PNG by \
+         filename (basename only — path traversal refused). Source \
+         dir is `[tool.browser] screenshot_on_failure_dir`. Returns \
+         the raw PNG bytes; INVALID_ARGS when capture dir is not \
+         configured or filename is unsafe."
+            .into(),
+    );
+    d.categories = vec!["browser".into(), "capture".into(), "read".into()];
+    d.environment_requirements = vec!["filesystem:read".into()];
+    d.risk_level = RiskLevel::Safe;
+    d
+}
+
 /// Register every browser.* capability onto the dispatch bridge.
 /// Caller is `tool::register` in `tool/mod.rs` — only invoked
 /// when `[tool.browser]` is present in the operator config AND
 /// the config validated successfully at `ToolBackend::new` time.
-pub fn register(bridge: &mut DispatchBridge, backend: Arc<dyn BrowserBackend>) {
+///
+/// `captures_dir` is the resolved value of
+/// `[tool.browser] screenshot_on_failure_dir` (cloned from
+/// the same `BrowserConfig` that built the backend). When
+/// `None`, `tool.browser.capture_read` returns INVALID_ARGS
+/// for every filename — operators see "captures dir not
+/// configured" rather than a silent failure.
+pub fn register(
+    bridge: &mut DispatchBridge,
+    backend: Arc<dyn BrowserBackend>,
+    captures_dir: Option<std::path::PathBuf>,
+) {
     let b = backend.clone();
     bridge.register(
         "tool.browser.open_session",
@@ -624,6 +660,17 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<dyn BrowserBackend>) {
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let b = b.clone();
             async move { handle_wait_for_selector(&b, &ctx) }
+        })),
+    );
+    // W2-002f: capture_read doesn't touch the live backend —
+    // it reads bytes from the captures dir on disk. Wrap the
+    // dir in Arc so each invocation gets a cheap clone.
+    let dir = Arc::new(captures_dir);
+    bridge.register(
+        "tool.browser.capture_read",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let dir = dir.clone();
+            async move { handle_capture_read(&dir, &ctx) }
         })),
     );
 }
@@ -897,6 +944,78 @@ fn handle_wait_for_selector(b: &Arc<dyn BrowserBackend>, ctx: &InvocationCtx) ->
     match result {
         Ok(()) => HandlerOutcome::Ok("found\n".to_string().into_bytes()),
         Err(e) => to_envelope(&e),
+    }
+}
+
+/// W2-002f: `tool.browser.capture_read` handler. Args: a single
+/// UTF-8 filename (basename only, must end with `.png`, no path
+/// separators, no `..`, no NUL, length ≤ 256). Returns the file
+/// bytes verbatim. Errors with INVALID_ARGS for unsafe filenames
+/// or unconfigured captures dir; with RESPONDER_INTERNAL on
+/// filesystem read failure.
+fn handle_capture_read(
+    captures_dir: &Arc<Option<std::path::PathBuf>>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let raw = match utf8_arg(ctx, "capture_read") {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let name = raw.trim();
+    if name.is_empty() {
+        return invalid("tool.browser.capture_read: filename required".into());
+    }
+    if name.len() > 256 {
+        return invalid("tool.browser.capture_read: filename too long (>256)".into());
+    }
+    // Reject anything that could escape the dir or hit a
+    // weird platform code path. The list is intentionally
+    // strict; the captures the runtime writes use
+    // `<sessionid>-<unix_ms>.png`.
+    let bad = name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains('\0')
+        || name.contains(':');
+    if bad {
+        return invalid(format!(
+            "tool.browser.capture_read: unsafe filename '{name}' (path separators, '..', NUL, and ':' rejected)"
+        ));
+    }
+    if !name.to_ascii_lowercase().ends_with(".png") {
+        return invalid(format!(
+            "tool.browser.capture_read: filename '{name}' must end with .png"
+        ));
+    }
+    let dir = match captures_dir.as_ref() {
+        Some(d) => d,
+        None => {
+            return invalid(
+                "tool.browser.capture_read: [tool.browser] screenshot_on_failure_dir not configured"
+                    .into(),
+            );
+        }
+    };
+    let path = dir.join(name);
+    // Defence in depth: after join, the file's canonical path
+    // must still live under the configured dir. This catches
+    // any platform-specific path-magic the byte-level check
+    // missed.
+    if let (Ok(canon_path), Ok(canon_dir)) = (path.canonicalize(), dir.canonicalize())
+        && !canon_path.starts_with(&canon_dir)
+    {
+        return invalid(format!(
+            "tool.browser.capture_read: resolved path escapes captures dir (name='{name}')"
+        ));
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => HandlerOutcome::Ok(bytes),
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("tool.browser.capture_read: read failed for '{name}': {e}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
     }
 }
 
@@ -1373,6 +1492,108 @@ mod tests {
                 assert!(env.cause.contains("bad timeout_ms"));
             }
             _ => panic!("expected INVALID_ARGS"),
+        }
+    }
+
+    // ── W2-002f: capture_read handler tests ─────────────────────
+
+    fn capture_read(dir: Option<std::path::PathBuf>, name: &str) -> HandlerOutcome {
+        let arc = Arc::new(dir);
+        handle_capture_read(&arc, &ctx_with(name.as_bytes().to_vec()))
+    }
+
+    fn assert_invalid_args(out: HandlerOutcome) -> String {
+        match out {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(
+                    env.kind,
+                    error_kinds::INVALID_ARGS,
+                    "expected INVALID_ARGS, got kind={}",
+                    env.kind
+                );
+                env.cause
+            }
+            HandlerOutcome::Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn capture_read_rejects_empty_filename() {
+        let out = capture_read(None, "");
+        let cause = assert_invalid_args(out);
+        assert!(cause.contains("required"), "got: {cause}");
+    }
+
+    #[test]
+    fn capture_read_rejects_path_traversal_dotdot() {
+        let out = capture_read(Some(std::path::PathBuf::from("/tmp")), "../etc/passwd.png");
+        let cause = assert_invalid_args(out);
+        assert!(cause.contains("unsafe"), "got: {cause}");
+    }
+
+    #[test]
+    fn capture_read_rejects_forward_slash() {
+        let out = capture_read(Some(std::path::PathBuf::from("/tmp")), "sub/file.png");
+        let cause = assert_invalid_args(out);
+        assert!(cause.contains("unsafe"), "got: {cause}");
+    }
+
+    #[test]
+    fn capture_read_rejects_backslash() {
+        let out = capture_read(Some(std::path::PathBuf::from("/tmp")), "sub\\file.png");
+        let cause = assert_invalid_args(out);
+        assert!(cause.contains("unsafe"), "got: {cause}");
+    }
+
+    #[test]
+    fn capture_read_rejects_colon() {
+        let out = capture_read(Some(std::path::PathBuf::from("/tmp")), "C:foo.png");
+        let cause = assert_invalid_args(out);
+        assert!(cause.contains("unsafe"), "got: {cause}");
+    }
+
+    #[test]
+    fn capture_read_rejects_non_png_extension() {
+        let out = capture_read(Some(std::path::PathBuf::from("/tmp")), "shot.jpg");
+        let cause = assert_invalid_args(out);
+        assert!(cause.contains(".png"), "got: {cause}");
+    }
+
+    #[test]
+    fn capture_read_rejects_when_dir_not_configured() {
+        let out = capture_read(None, "shot.png");
+        let cause = assert_invalid_args(out);
+        assert!(cause.contains("screenshot_on_failure_dir"), "got: {cause}");
+    }
+
+    #[test]
+    fn capture_read_returns_bytes_for_valid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = "abc123-1700000000.png";
+        let file_path = tmp.path().join(name);
+        // Pretend PNG header bytes so the test asserts on real
+        // content, not just length.
+        let payload: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xff, 0xee];
+        std::fs::write(&file_path, &payload).unwrap();
+        let out = capture_read(Some(tmp.path().to_path_buf()), name);
+        match out {
+            HandlerOutcome::Ok(bytes) => assert_eq!(bytes, payload),
+            HandlerOutcome::Err(env) => {
+                panic!("expected Ok, got Err kind={} cause={}", env.kind, env.cause)
+            }
+        }
+    }
+
+    #[test]
+    fn capture_read_returns_internal_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = capture_read(Some(tmp.path().to_path_buf()), "nope-1700000000.png");
+        match out {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, error_kinds::RESPONDER_INTERNAL);
+                assert!(env.cause.contains("read failed"), "got: {}", env.cause);
+            }
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
         }
     }
 

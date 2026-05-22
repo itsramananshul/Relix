@@ -1406,6 +1406,12 @@ fn register_node_type_handlers(
             manifest.add_capability(crate::nodes::tool::browser::descriptor_click());
             manifest.add_capability(crate::nodes::tool::browser::descriptor_type_text());
             manifest.add_capability(crate::nodes::tool::browser::descriptor_wait_for_selector());
+            // W2-002f: capture_read serves failure screenshots
+            // back to the dashboard. Advertised even when
+            // `screenshot_on_failure_dir` is None — the
+            // handler returns INVALID_ARGS with a clear
+            // "not configured" message so operators see why.
+            manifest.add_capability(crate::nodes::tool::browser::descriptor_capture_read());
         }
         // CW5: tool.mcp.* — registry + discovery surface
         // advertised when [tool.mcp] is configured AND the

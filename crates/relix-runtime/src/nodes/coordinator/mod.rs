@@ -6747,16 +6747,7 @@ mod tests {
     fn handle_replay_returns_new_task_id() {
         let s = store();
         let original = s
-            .create(
-                "t",
-                "f",
-                "{}",
-                "alice",
-                RetryPolicy::None,
-                0,
-                None,
-                None,
-            )
+            .create("t", "f", "{}", "alice", RetryPolicy::None, 0, None, None)
             .unwrap();
         let out = handle_replay(&s, &ctx(original.as_bytes()));
         let new_id = match out {
