@@ -84,6 +84,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
     resp
 }
 
+mod agent;
 mod agent_memory;
 mod blocklist;
 mod browser_captures;
@@ -488,6 +489,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/delegate/result/:child_task_id", get(delegate::result))
         .route("/v1/delegate/cancel/:child_task_id", post(delegate::cancel))
         .route("/v1/delegate/list/:parent_task_id", get(delegate::list))
+        // PH-AGENT-BRIDGE: agent employee permission model.
+        // CRUD + approval-decide + standing-approvals proxies
+        // onto the coordinator's `agent.*` / `coord.approval.*`
+        // / `agent.standing_approval.*` capabilities.
+        .route(
+            "/v1/agents",
+            get(agent::list_agents).post(agent::create_agent),
+        )
+        .route(
+            "/v1/agents/:agent_id",
+            get(agent::get_agent)
+                .patch(agent::update_agent)
+                .delete(agent::delete_agent),
+        )
+        .route("/v1/approvals", get(agent::pending_approvals))
+        .route(
+            "/v1/approvals/:approval_id/decide",
+            post(agent::decide_approval),
+        )
+        .route(
+            "/v1/agents/:agent_id/standing-approvals",
+            get(agent::list_standing).post(agent::create_standing),
+        )
+        .route(
+            "/v1/standing-approvals/:standing_id",
+            axum::routing::delete(agent::revoke_standing),
+        )
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with

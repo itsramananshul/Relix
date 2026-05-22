@@ -266,6 +266,118 @@ pub enum Cmd {
     /// themselves forwarding to the coordinator's `delegate.*`
     /// capabilities.
     Delegate(DelegateArgs),
+    /// PH-AGENT-CLI: agent employee permission model.
+    Agent(AgentArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub cmd: AgentCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCmd {
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value = "")]
+        subject_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Create {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        department: String,
+        #[arg(long)]
+        team: String,
+        #[arg(long)]
+        created_by: String,
+        #[arg(long)]
+        subject_id: String,
+        #[arg(long, default_value = "medium")]
+        risk_ceiling: String,
+    },
+    Get {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        agent_id: String,
+    },
+    Enable {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        agent_id: String,
+    },
+    Suspend {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        agent_id: String,
+    },
+    Disable {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        agent_id: String,
+    },
+    ApprovalsPending {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    ApprovalDecide {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long, value_parser = ["approved", "rejected"])]
+        decision: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[arg(long, default_value = "operator")]
+        decided_by: String,
+    },
+    StandingApprovalGrant {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        category: String,
+        /// Duration like `30m`, `2h`, `1d`, `7d`. Computed
+        /// against the current time.
+        #[arg(long)]
+        expires_in: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[arg(long, default_value = "")]
+        path_glob: String,
+    },
+    StandingApprovalList {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    StandingApprovalRevoke {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        standing_id: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -443,6 +555,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         } => snapshot(&bridge, &peer, &output, pretty).await,
         Cmd::Cron(args) => cron_run(args.cmd).await,
         Cmd::Delegate(args) => delegate_run(args.cmd).await,
+        Cmd::Agent(args) => agent_run(args.cmd).await,
     }
 }
 
@@ -1863,6 +1976,396 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+// ── PH-AGENT-CLI: agent subcommands ────────────────────────
+
+async fn agent_run(cmd: AgentCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        AgentCmd::List {
+            bridge,
+            subject_id,
+            json,
+        } => agent_list(&bridge, &subject_id, json).await,
+        AgentCmd::Create {
+            bridge,
+            name,
+            role,
+            title,
+            department,
+            team,
+            created_by,
+            subject_id,
+            risk_ceiling,
+        } => {
+            agent_create(
+                &bridge,
+                &name,
+                &role,
+                &title,
+                &department,
+                &team,
+                &created_by,
+                &subject_id,
+                &risk_ceiling,
+            )
+            .await
+        }
+        AgentCmd::Get { bridge, agent_id } => agent_get(&bridge, &agent_id).await,
+        AgentCmd::Enable { bridge, agent_id } => {
+            agent_set_status(&bridge, &agent_id, "active").await
+        }
+        AgentCmd::Suspend { bridge, agent_id } => {
+            agent_set_status(&bridge, &agent_id, "suspended").await
+        }
+        AgentCmd::Disable { bridge, agent_id } => {
+            agent_set_status(&bridge, &agent_id, "disabled").await
+        }
+        AgentCmd::ApprovalsPending { bridge, json } => approvals_pending(&bridge, json).await,
+        AgentCmd::ApprovalDecide {
+            bridge,
+            approval_id,
+            decision,
+            note,
+            decided_by,
+        } => approval_decide(&bridge, &approval_id, &decision, &note, &decided_by).await,
+        AgentCmd::StandingApprovalGrant {
+            bridge,
+            agent_id,
+            category,
+            expires_in,
+            note,
+            path_glob,
+        } => {
+            standing_grant(
+                &bridge,
+                &agent_id,
+                &category,
+                &expires_in,
+                &note,
+                &path_glob,
+            )
+            .await
+        }
+        AgentCmd::StandingApprovalList {
+            bridge,
+            agent_id,
+            json,
+        } => standing_list(&bridge, &agent_id, json).await,
+        AgentCmd::StandingApprovalRevoke {
+            bridge,
+            standing_id,
+        } => standing_revoke(&bridge, &standing_id).await,
+    }
+}
+
+async fn agent_list(
+    bridge: &str,
+    subject_id: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = if subject_id.trim().is_empty() {
+        format!("{base}/v1/agents")
+    } else {
+        format!("{base}/v1/agents?subject_id={}", urlencode(subject_id))
+    };
+    let body = http_get_string(&url).await?;
+    if json {
+        println!("{body}");
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed
+        .get("agents")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no agents)");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<24} {:<16} {:<10}",
+        "agent_id", "name", "role", "status"
+    );
+    for a in rows {
+        let id = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let role = a.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let status = a.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        println!(
+            "{:<24} {:<24} {:<16} {:<10}",
+            short(id, 24),
+            short(name, 24),
+            short(role, 16),
+            short(status, 10)
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn agent_create(
+    bridge: &str,
+    name: &str,
+    role: &str,
+    title: &str,
+    department: &str,
+    team: &str,
+    created_by: &str,
+    subject_id: &str,
+    risk_ceiling: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/agents");
+    let body = json!({
+        "name": name,
+        "role": role,
+        "title": title,
+        "department": department,
+        "team": team,
+        "created_by": created_by,
+        "subject_id": subject_id,
+        "risk_ceiling": risk_ceiling,
+    });
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn agent_get(bridge: &str, agent_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/agents/{}", urlencode(agent_id));
+    let body = http_get_string(&url).await?;
+    println!("{body}");
+    Ok(())
+}
+
+async fn agent_set_status(
+    bridge: &str,
+    agent_id: &str,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/agents/{}", urlencode(agent_id));
+    let client = reqwest::Client::new();
+    let r = client
+        .patch(&url)
+        .json(&json!({ "status": status }))
+        .send()
+        .await?;
+    let s = r.status();
+    let text = r.text().await?;
+    if !s.is_success() {
+        eprintln!("error: HTTP {s}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn approvals_pending(bridge: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/approvals");
+    let body = http_get_string(&url).await?;
+    if json {
+        println!("{body}");
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed
+        .get("approvals")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no pending approvals)");
+        return Ok(());
+    }
+    println!(
+        "{:<22} {:<24} {:<32} reason",
+        "approval_id", "agent_id", "method"
+    );
+    for a in rows {
+        let id = a.get("approval_id").and_then(|v| v.as_str()).unwrap_or("");
+        let agent = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+        let method = a.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let reason = a.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        println!(
+            "{:<22} {:<24} {:<32} {}",
+            short(id, 22),
+            short(agent, 24),
+            short(method, 32),
+            reason
+        );
+    }
+    Ok(())
+}
+
+async fn approval_decide(
+    bridge: &str,
+    approval_id: &str,
+    decision: &str,
+    note: &str,
+    decided_by: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/approvals/{}/decide", urlencode(approval_id));
+    let client = reqwest::Client::new();
+    let r = client
+        .post(&url)
+        .json(&json!({ "decision": decision, "note": note, "decided_by": decided_by }))
+        .send()
+        .await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn standing_grant(
+    bridge: &str,
+    agent_id: &str,
+    category: &str,
+    expires_in: &str,
+    note: &str,
+    path_glob: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let secs = parse_duration_secs(expires_in)
+        .ok_or_else(|| format!("bad --expires-in: `{expires_in}` (use 30m / 2h / 1d / 7d)"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let expires_at = now + secs;
+    let base = bridge.trim_end_matches('/');
+    let url = format!(
+        "{base}/v1/agents/{}/standing-approvals",
+        urlencode(agent_id)
+    );
+    let mut body = json!({
+        "category": category,
+        "expires_at": expires_at,
+        "note": note,
+    });
+    if !path_glob.is_empty() {
+        body["path_glob"] = json!(path_glob);
+    }
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn standing_list(
+    bridge: &str,
+    agent_id: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!(
+        "{base}/v1/agents/{}/standing-approvals",
+        urlencode(agent_id)
+    );
+    let body = http_get_string(&url).await?;
+    if json {
+        println!("{body}");
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed
+        .get("standing")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no standing approvals)");
+        return Ok(());
+    }
+    println!(
+        "{:<22} {:<16} {:<32} expires",
+        "standing_id", "category", "path"
+    );
+    for s in rows {
+        let id = s.get("standing_id").and_then(|v| v.as_str()).unwrap_or("");
+        let cat = s
+            .get("match_category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let path = s
+            .get("match_path_glob")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let exp = s.get("expires_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        println!(
+            "{:<22} {:<16} {:<32} {}",
+            short(id, 22),
+            short(cat, 16),
+            short(path, 32),
+            exp
+        );
+    }
+    Ok(())
+}
+
+async fn standing_revoke(
+    bridge: &str,
+    standing_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/standing-approvals/{}", urlencode(standing_id));
+    let client = reqwest::Client::new();
+    let r = client.delete(&url).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+/// Parse a duration string like `30m` / `2h` / `1d` / `7d`
+/// into seconds. Returns `None` on a malformed input.
+fn parse_duration_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let last = s.chars().last()?;
+    if !"smhdw".contains(last) {
+        return None;
+    }
+    let prefix = &s[..s.len() - last.len_utf8()];
+    let n: i64 = prefix.parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    let mult = match last {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        'w' => 7 * 86400,
+        _ => unreachable!(),
+    };
+    Some(n * mult)
 }
 
 // ── PH-DELEGATE-CLI: delegation subcommands ────────────────

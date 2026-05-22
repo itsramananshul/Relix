@@ -1817,6 +1817,8 @@
     <a href="#/metrics"      class="nav-item" data-route="metrics">Metrics</a>
     <a href="#/memory"       class="nav-item" data-route="memory">Agent Memory</a>
     <a href="#/cron"         class="nav-item" data-route="cron">Cron Jobs</a>
+    <a href="#/agents"       class="nav-item" data-route="agents">Agents</a>
+    <a href="#/approvals"    class="nav-item" data-route="approvals">Approvals</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2774,6 +2776,116 @@
       </div>
     </section>
 
+    <!-- ── #/agents ────────────────────────────────────────────── -->
+    <section class="page" data-page="agents">
+      <h2>Agents</h2>
+      <p class="page-subtitle">
+        Agent employee profiles backing the categorical permission gate.
+        Every inbound call's subject_id is matched against this list; agents
+        with a profile see status / surface / risk-ceiling / category /
+        approval-required checks ahead of the policy engine. Calls from
+        subject_ids without a profile fall through unchanged
+        (backward-compat). See <a href="docs/agent-permissions.md">docs/agent-permissions.md</a>.
+      </p>
+      <div class="card">
+        <div class="card-header">
+          <h3>Create agent</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Name</label>
+            <div class="field"><input type="text" id="agent-create-name" placeholder="Display name"></div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Role</label>
+            <div class="field"><input type="text" id="agent-create-role" placeholder="research_assistant"></div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Title</label>
+            <div class="field"><input type="text" id="agent-create-title" placeholder="Junior research analyst"></div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Department</label>
+            <div class="field"><input type="text" id="agent-create-dept" placeholder="research"></div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Team</label>
+            <div class="field"><input type="text" id="agent-create-team" placeholder="research-ops"></div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Created by</label>
+            <div class="field"><input type="text" id="agent-create-by" placeholder="alice"></div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Subject id</label>
+            <div class="field">
+              <input type="text" id="agent-create-subject" placeholder="hex subject_id from `relix-cli identity mint`">
+            </div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Risk ceiling</label>
+            <div class="field">
+              <select id="agent-create-risk">
+                <option value="safe">safe</option>
+                <option value="low">low</option>
+                <option value="medium" selected>medium</option>
+                <option value="high">high</option>
+                <option value="critical">critical</option>
+              </select>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn-primary" id="agent-create-btn">Create</button>
+            <span class="action-status" id="agent-create-status"></span>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Agents</h3>
+          <div class="card-actions">
+            <button id="agent-list-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="agent-list-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <div class="card" id="agent-detail-card" style="display:none;">
+        <div class="card-header">
+          <h3>Agent detail</h3>
+          <div class="card-actions">
+            <button id="agent-detail-close">Close</button>
+          </div>
+        </div>
+        <div class="card-body" id="agent-detail-host"></div>
+      </div>
+    </section>
+
+    <!-- ── #/approvals ─────────────────────────────────────────── -->
+    <section class="page" data-page="approvals">
+      <h2>Approvals</h2>
+      <p class="page-subtitle">
+        Pending approvals across every agent. When an agent attempts a
+        capability whose category is in the agent's
+        <code>approval_required_categories</code> list, the call moves to
+        <code>awaiting_input</code> and lands here. Operators approve or
+        reject; approval mints a one-shot token the calling agent then
+        replays through the gate.
+      </p>
+      <div class="card">
+        <div class="card-header">
+          <h3>Pending approvals</h3>
+          <div class="card-actions">
+            <button id="approvals-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="approvals-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+    </section>
+
     <!-- ── #/telegram ──────────────────────────────────────────── -->
     <section class="page" data-page="telegram">
       <h2>Telegram</h2>
@@ -2993,6 +3105,8 @@ const PAGES = {
   metrics:      { label: 'Metrics',      init: initMetrics,      enter: enterMetrics },
   memory:       { label: 'Agent Memory', init: initMemory,       enter: enterMemory },
   cron:         { label: 'Cron Jobs',    init: initCron,         enter: enterCron },
+  agents:       { label: 'Agents',       init: initAgents,       enter: enterAgents },
+  approvals:    { label: 'Approvals',    init: initApprovals,    enter: enterApprovals },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -9710,6 +9824,312 @@ function replaceProviderCard(status) {
 }
 
 /* ── Telegram page ────────────────────────────────────────── */
+// ── #/agents — agent employee permission page ──────────────
+
+function initAgents() {
+  const $btn = document.getElementById('agent-create-btn');
+  if ($btn) $btn.addEventListener('click', agentCreateSubmit);
+  const $ref = document.getElementById('agent-list-refresh');
+  if ($ref) $ref.addEventListener('click', loadAgentList);
+  const $close = document.getElementById('agent-detail-close');
+  if ($close) $close.addEventListener('click', () => {
+    document.getElementById('agent-detail-card').style.display = 'none';
+  });
+}
+
+function enterAgents() {
+  loadAgentList();
+}
+
+async function loadAgentList() {
+  const $host = document.getElementById('agent-list-host');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/agents');
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">' +
+        escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    const rows = s.agents || [];
+    if (rows.length === 0) {
+      $host.innerHTML = '<div class="empty">no agents yet — create one above</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr>'
+      + '<th>agent_id</th><th>name</th><th>role</th><th>status</th><th>subject_id</th><th></th>'
+      + '</tr></thead><tbody>';
+    for (const a of rows) {
+      const badge = a.status === 'active'
+        ? '<span class="badge ok">active</span>'
+        : a.status === 'suspended'
+          ? '<span class="badge warn">suspended</span>'
+          : '<span class="badge muted">' + escapeHtml(a.status) + '</span>';
+      html += '<tr>'
+        + '<td><span class="id">' + escapeHtml(a.agent_id.slice(0, 16)) + '…</span></td>'
+        + '<td>' + escapeHtml(a.name) + '</td>'
+        + '<td>' + escapeHtml(a.role) + '</td>'
+        + '<td>' + badge + '</td>'
+        + '<td><span class="id">' + escapeHtml(a.subject_id.slice(0, 16)) + '…</span></td>'
+        + '<td><button data-agent-detail="' + escapeHtml(a.agent_id) + '">Detail</button></td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    $host.innerHTML = html;
+    for (const $b of $host.querySelectorAll('[data-agent-detail]')) {
+      $b.addEventListener('click', (e) => {
+        const id = e.currentTarget.getAttribute('data-agent-detail');
+        loadAgentDetail(id);
+      });
+    }
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function loadAgentDetail(agentId) {
+  const $card = document.getElementById('agent-detail-card');
+  const $host = document.getElementById('agent-detail-host');
+  if (!$host) return;
+  $card.style.display = '';
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/agents/' + encodeURIComponent(agentId));
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">' +
+        escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const a = await r.json();
+    let html = '<dl class="kv-list">'
+      + '<dt>agent_id</dt><dd><span class="id">' + escapeHtml(a.agent_id) + '</span></dd>'
+      + '<dt>name</dt><dd>' + escapeHtml(a.name) + '</dd>'
+      + '<dt>role / title</dt><dd>' + escapeHtml(a.role) + ' · ' + escapeHtml(a.title) + '</dd>'
+      + '<dt>department / team</dt><dd>' + escapeHtml(a.department) + ' · ' + escapeHtml(a.team) + '</dd>'
+      + '<dt>created_by</dt><dd>' + escapeHtml(a.created_by) + '</dd>'
+      + '<dt>status</dt><dd><span class="badge ' + escapeHtml(a.status) + '">' + escapeHtml(a.status) + '</span></dd>'
+      + '<dt>subject_id</dt><dd><span class="id">' + escapeHtml(a.subject_id) + '</span></dd>'
+      + '<dt>risk_ceiling</dt><dd>' + escapeHtml(a.risk_ceiling) + '</dd>'
+      + '<dt>allow_categories</dt><dd>' + (a.allow_categories.length ? a.allow_categories.map(escapeHtml).join(', ') : '<em>all</em>') + '</dd>'
+      + '<dt>deny_categories</dt><dd>' + (a.deny_categories.length ? a.deny_categories.map(escapeHtml).join(', ') : '<em>none</em>') + '</dd>'
+      + '<dt>allow_sensitivity_tags</dt><dd>' + (a.allow_sensitivity_tags.length ? a.allow_sensitivity_tags.map(escapeHtml).join(', ') : '<em>all</em>') + '</dd>'
+      + '<dt>deny_sensitivity_tags</dt><dd>' + (a.deny_sensitivity_tags.length ? a.deny_sensitivity_tags.map(escapeHtml).join(', ') : '<em>none</em>') + '</dd>'
+      + '<dt>surface_allowlist</dt><dd>' + (a.surface_allowlist.length ? a.surface_allowlist.map(escapeHtml).join(', ') : '<em>all surfaces</em>') + '</dd>'
+      + '<dt>approval_required_categories</dt><dd>' + (a.approval_required_categories.length ? a.approval_required_categories.map(escapeHtml).join(', ') : '<em>none</em>') + '</dd>'
+      + '<dt>approval_timeout_secs</dt><dd>' + (a.approval_timeout_secs || 0) + '</dd>'
+      + '</dl>';
+    html += '<div class="actions">'
+      + '<button data-agent-status="' + escapeHtml(a.agent_id) + '" data-target="active">Enable</button>'
+      + ' <button data-agent-status="' + escapeHtml(a.agent_id) + '" data-target="suspended">Suspend</button>'
+      + ' <button class="btn-danger" data-agent-status="' + escapeHtml(a.agent_id) + '" data-target="disabled">Disable</button>'
+      + ' <span class="action-status" id="agent-detail-status"></span>'
+      + '</div>';
+    // Standing approvals slot.
+    html += '<h3 style="margin-top: 16px;">Standing approvals</h3>'
+      + '<div id="standing-list-host"><div class="loading">loading…</div></div>';
+    $host.innerHTML = html;
+    for (const $b of $host.querySelectorAll('[data-agent-status]')) {
+      $b.addEventListener('click', agentSetStatus);
+    }
+    loadStandingFor(a.agent_id);
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function loadStandingFor(agentId) {
+  const $host = document.getElementById('standing-list-host');
+  if (!$host) return;
+  try {
+    const r = await fetch('/v1/agents/' + encodeURIComponent(agentId) + '/standing-approvals');
+    if (!r.ok) { $host.innerHTML = '<div class="empty">none</div>'; return; }
+    const s = await r.json();
+    if (!s.standing || s.standing.length === 0) {
+      $host.innerHTML = '<div class="empty">no standing approvals</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr>'
+      + '<th>standing_id</th><th>category</th><th>path</th><th>expires</th><th>granted_by</th><th></th>'
+      + '</tr></thead><tbody>';
+    for (const r of s.standing) {
+      const exp = new Date((r.expires_at || 0) * 1000).toLocaleString();
+      html += '<tr>'
+        + '<td><span class="id">' + escapeHtml(r.standing_id) + '</span></td>'
+        + '<td>' + escapeHtml(r.match_category) + '</td>'
+        + '<td>' + escapeHtml(r.match_path_glob || '—') + '</td>'
+        + '<td>' + exp + '</td>'
+        + '<td>' + escapeHtml(r.granted_by) + '</td>'
+        + '<td><button class="btn-danger" data-standing-revoke="' + escapeHtml(r.standing_id) + '">Revoke</button></td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    $host.innerHTML = html;
+    for (const $b of $host.querySelectorAll('[data-standing-revoke]')) {
+      $b.addEventListener('click', standingRevoke);
+    }
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function agentCreateSubmit() {
+  const $status = document.getElementById('agent-create-status');
+  const body = {
+    name: document.getElementById('agent-create-name').value.trim(),
+    role: document.getElementById('agent-create-role').value.trim(),
+    title: document.getElementById('agent-create-title').value.trim(),
+    department: document.getElementById('agent-create-dept').value.trim(),
+    team: document.getElementById('agent-create-team').value.trim(),
+    created_by: document.getElementById('agent-create-by').value.trim(),
+    subject_id: document.getElementById('agent-create-subject').value.trim(),
+    risk_ceiling: document.getElementById('agent-create-risk').value,
+  };
+  for (const k of ['name','role','title','department','team','created_by','subject_id']) {
+    if (!body[k]) {
+      setProviderStatus($status, k + ' is required', 'error');
+      return;
+    }
+  }
+  setProviderStatus($status, '');
+  try {
+    const r = await fetch('/v1/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      setProviderStatus($status, err.error || ('HTTP ' + r.status), 'error');
+      return;
+    }
+    const s = await r.json();
+    setProviderStatus($status, 'created ' + s.agent_id, 'ok');
+    loadAgentList();
+  } catch (e) {
+    setProviderStatus($status, 'failed: ' + String(e), 'error');
+  }
+}
+
+async function agentSetStatus(e) {
+  const id = e.currentTarget.getAttribute('data-agent-status');
+  const target = e.currentTarget.getAttribute('data-target');
+  const $status = document.getElementById('agent-detail-status');
+  setProviderStatus($status, '');
+  try {
+    const r = await fetch('/v1/agents/' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: target }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      setProviderStatus($status, err.error || ('HTTP ' + r.status), 'error');
+      return;
+    }
+    loadAgentDetail(id);
+    loadAgentList();
+  } catch (ex) {
+    setProviderStatus($status, 'failed: ' + String(ex), 'error');
+  }
+}
+
+async function standingRevoke(e) {
+  const id = e.currentTarget.getAttribute('data-standing-revoke');
+  if (!window.confirm('Revoke standing approval ' + id + '?')) return;
+  try {
+    await fetch('/v1/standing-approvals/' + encodeURIComponent(id), { method: 'DELETE' });
+    // Naive refresh: re-load the agent panel.
+    const $host = document.getElementById('agent-detail-host');
+    if ($host) {
+      const idAttr = $host.querySelector('[data-agent-status]');
+      if (idAttr) loadAgentDetail(idAttr.getAttribute('data-agent-status'));
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+// ── #/approvals ────────────────────────────────────────────
+
+function initApprovals() {
+  const $r = document.getElementById('approvals-refresh');
+  if ($r) $r.addEventListener('click', loadApprovals);
+}
+
+function enterApprovals() {
+  loadApprovals();
+}
+
+async function loadApprovals() {
+  const $host = document.getElementById('approvals-host');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/approvals');
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">' +
+        escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    const rows = s.approvals || [];
+    if (rows.length === 0) {
+      $host.innerHTML = '<div class="empty">no pending approvals</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr>'
+      + '<th>approval_id</th><th>agent_id</th><th>method</th><th>reason</th>'
+      + '<th>requested</th><th></th></tr></thead><tbody>';
+    for (const a of rows) {
+      const ts = new Date((a.requested_at || 0) * 1000).toLocaleString();
+      html += '<tr>'
+        + '<td><span class="id">' + escapeHtml(a.approval_id) + '</span></td>'
+        + '<td><span class="id">' + escapeHtml(a.agent_id.slice(0, 16)) + '…</span></td>'
+        + '<td>' + escapeHtml(a.method) + '</td>'
+        + '<td>' + escapeHtml(a.reason) + '</td>'
+        + '<td>' + ts + '</td>'
+        + '<td>'
+        + '<button data-approve="' + escapeHtml(a.approval_id) + '">Approve</button>'
+        + ' <button class="btn-danger" data-reject="' + escapeHtml(a.approval_id) + '">Reject</button>'
+        + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    $host.innerHTML = html;
+    for (const $b of $host.querySelectorAll('[data-approve]')) {
+      $b.addEventListener('click', (e) => approvalDecide(e.currentTarget.getAttribute('data-approve'), 'approved'));
+    }
+    for (const $b of $host.querySelectorAll('[data-reject]')) {
+      $b.addEventListener('click', (e) => approvalDecide(e.currentTarget.getAttribute('data-reject'), 'rejected'));
+    }
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: ' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function approvalDecide(approvalId, decision) {
+  try {
+    const r = await fetch('/v1/approvals/' + encodeURIComponent(approvalId) + '/decide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      window.alert('decide failed: ' + (err.error || ('HTTP ' + r.status)));
+      return;
+    }
+    loadApprovals();
+  } catch (e) {
+    window.alert('decide failed: ' + String(e));
+  }
+}
+
 // ── #/cron — scheduler page ────────────────────────────────
 
 function initCron() {
