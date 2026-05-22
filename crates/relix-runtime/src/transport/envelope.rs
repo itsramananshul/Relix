@@ -30,6 +30,23 @@ pub struct RequestEnvelope {
     pub identity_bundle: Bundle,
     /// Absolute deadline (`dl`) — unix seconds.
     pub deadline: Timestamp,
+    /// Surface tag identifying where the call originated.
+    /// Operator-asserted (not cryptographically proven). Used
+    /// by the agent-employee admission gate to enforce
+    /// `surface_allowlist`. `None` is treated as "unknown
+    /// surface" and admitted only when the agent has an
+    /// empty surface_allowlist. Additive on the wire (defaults
+    /// to None on older clients).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    /// One-shot approval token from a prior
+    /// `coord.approval.decide`. When present, the agent gate
+    /// looks it up and admits the call if (a) the token is
+    /// approved + unconsumed, (b) the method matches the
+    /// approval record. Consumed on first successful admit.
+    /// Additive — older clients send `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_token: Option<String>,
 }
 
 /// RELIX-1 response envelope (alpha fields).

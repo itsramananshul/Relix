@@ -979,6 +979,261 @@ async fn populate_ai_memory_cell(
 /// peer is unreachable or the bundle is missing; the curator
 /// scheduler will keep ticking and just skip every agent
 /// (`memory curator: AI dispatcher not yet ready`).
+async fn run_approval_expire_loop(
+    agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
+    task_store: Arc<crate::nodes::coordinator::TaskStore>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let expired = match agent_store.list_expired_pending(now) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "approval expire: list_expired_pending failed");
+                continue;
+            }
+        };
+        for (approval_id, task_id) in expired {
+            if let Err(e) = agent_store.mark_expired(&approval_id) {
+                tracing::warn!(error = %e, "approval expire: mark_expired failed");
+                continue;
+            }
+            if let Some(tid) = task_id.as_deref() {
+                let _ = task_store.append_event(
+                    tid,
+                    "task.approval_expired",
+                    &format!("approval_id={approval_id}"),
+                );
+                let _ = task_store.update(
+                    tid,
+                    Some("failed"),
+                    Some("approval expired"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("approval_timeout"),
+                );
+            }
+            tracing::info!(approval_id = %approval_id, "approval expired");
+        }
+    }
+}
+
+/// Register every `agent.*` / `coord.approval.*` /
+/// `agent.standing_approval.*` capability on the coordinator's
+/// dispatch bridge. The CRUD handlers run synchronously; the
+/// approval-decide handler captures closures that flip the
+/// waiting task back to running / failed and append the
+/// corresponding chronicle event.
+fn register_agent_capabilities(
+    bridge: &mut crate::dispatch::DispatchBridge,
+    agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
+    task_store: Arc<crate::nodes::coordinator::TaskStore>,
+) {
+    use crate::dispatch::{FnHandler, InvocationCtx};
+    use crate::nodes::coordinator::agent::handlers;
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.create",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_create(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.get",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_get(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.list",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_list(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.update",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_update(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.delete",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_delete(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.effective_capabilities",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move {
+                    handlers::handle_effective_capabilities(&s, &ctx, |_peer| {
+                        // The coordinator doesn't carry a
+                        // manifest cache of *other* peers, so the
+                        // intersection runs against an empty
+                        // capability set. The bridge proxy
+                        // (PH-AGENT-BRIDGE) injects the cached
+                        // manifest before forwarding.
+                        Vec::new()
+                    })
+                }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "coord.approval.pending",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_approval_pending(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        let ts_resume = task_store.clone();
+        let ts_fail = task_store.clone();
+        let resume: handlers::TaskResumeFn = Arc::new(move |task_id: &str| {
+            // Resume the task: awaiting_input → running. Best-effort
+            // — pause / freeze races leave the row in its current
+            // state and the chronicle event still lands.
+            let r = ts_resume.update(task_id, Some("running"), None, None, None, None, None, None);
+            let _ = ts_resume.append_event(task_id, "task.approval_decided", "decision=approved");
+            r.map_err(|e| e.to_string())
+        });
+        let fail: handlers::TaskResumeFn = Arc::new(move |task_id: &str| {
+            let r = ts_fail.update(
+                task_id,
+                Some("failed"),
+                Some("rejected via coord.approval.decide"),
+                None,
+                None,
+                None,
+                None,
+                Some("approval_rejected"),
+            );
+            let _ = ts_fail.append_event(task_id, "task.approval_decided", "decision=rejected");
+            r.map_err(|e| e.to_string())
+        });
+        bridge.register(
+            "coord.approval.decide",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let resume = resume.clone();
+                let fail = fail.clone();
+                async move { handlers::handle_approval_decide(&s, &ctx, &resume, &fail) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.standing_approval.create",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_standing_create(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.standing_approval.list",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_standing_list(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = agent_store.clone();
+        bridge.register(
+            "agent.standing_approval.revoke",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_standing_revoke(&s, &ctx) }
+            })),
+        );
+    }
+
+    // Wire the agent gate itself. The describe closure
+    // returns an empty descriptor on the coordinator — the
+    // coordinator's *own* capabilities aren't categorised in
+    // a way that would change the gate's decision. The
+    // on_require_approval closure mints the approval row
+    // synchronously.
+    let bindings_store = agent_store.clone();
+    let bindings_create = agent_store.clone();
+    let bindings_task_store = task_store.clone();
+    bridge.set_agent_gate(crate::dispatch::AgentGateBindings {
+        store: bindings_store,
+        describe: Arc::new(|_method: &str| None),
+        on_require_approval: Arc::new(move |req, _task_id_hint| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let expires_at = now + req.approval_timeout_secs;
+            // BLAKE3 hash of the request method as a placeholder
+            // for args_redacted_hash — the bridge would normally
+            // salt with request_id, but the gate doesn't have
+            // the raw args at this point and re-hashing twice
+            // would defeat the redaction guarantee. We stamp
+            // the method so operators can correlate.
+            let hash = hex::encode(blake3::hash(req.method.as_bytes()).as_bytes());
+            let approval_id = bindings_create
+                .create_approval(
+                    &req.agent_id,
+                    &req.subject_id,
+                    &req.method,
+                    &req.category,
+                    &hash,
+                    &req.reason,
+                    &req.approver_groups,
+                    None,
+                    expires_at,
+                )
+                .map_err(|e| e.to_string())?;
+            // Spawn a chronicle event on the coordinator if a
+            // task_id_hint is known. Our gate currently runs at
+            // method-call time, not task-creation time, so the
+            // hint is always empty; the chronicle event is
+            // best-effort if one is supplied.
+            let _ = &bindings_task_store;
+            Ok(approval_id)
+        }),
+    });
+}
+
 async fn populate_delegation_ai_cell(
     cell: crate::nodes::coordinator::delegate::DelegationAiDispatcherCell,
     cfg: crate::nodes::coordinator::delegate::DelegationAiPeerConfig,
@@ -2019,6 +2274,88 @@ fn register_node_type_handlers(
              (max_depth={})",
             delegation_cfg.max_depth
         );
+
+        // ── Agent employee permission model ────────────────
+        // Stored alongside the existing task ledger. Always
+        // opened — capabilities are always live so SOL flows
+        // can manage agents even when the gate-side wiring
+        // (set_agent_gate) is deferred.
+        let agent_store = std::sync::Arc::new(
+            crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
+                .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
+        );
+        register_agent_capabilities(bridge, agent_store.clone(), store.clone());
+        let agent_caps: &[(&str, &str, &[&str])] = &[
+            (
+                "agent.create",
+                "Create an agent profile. Arg: name|role|title|department|team|created_by|subject_id|risk_ceiling.",
+                &["agent", "persist"],
+            ),
+            ("agent.get", "Read one agent profile.", &["agent", "read"]),
+            (
+                "agent.list",
+                "List agent profiles (optionally filtered by subject_id).",
+                &["agent", "read"],
+            ),
+            (
+                "agent.update",
+                "Update one of {status, role, title, department, team, surface_allowlist, risk_ceiling, allow_categories, deny_categories, allow_sensitivity_tags, deny_sensitivity_tags, approval_required_categories, approval_timeout_secs}.",
+                &["agent", "mutate"],
+            ),
+            (
+                "agent.delete",
+                "Soft delete: flip the profile's status to `disabled`.",
+                &["agent", "mutate"],
+            ),
+            (
+                "agent.effective_capabilities",
+                "Given an agent_id and a peer alias, intersect the peer's manifest with the agent's categorical permissions. Returns one method per line + count=N.",
+                &["agent", "read"],
+            ),
+            (
+                "coord.approval.pending",
+                "List pending approvals (newest first). Arg: limit (default 20).",
+                &["approval", "read"],
+            ),
+            (
+                "coord.approval.decide",
+                "Approve or reject a pending approval. Arg: approval_id|approved|decided_by|note OR approval_id|rejected|decided_by|note. Returns `ok|<token>\\n` on approve, `ok\\n` on reject.",
+                &["approval", "mutate"],
+            ),
+            (
+                "agent.standing_approval.create",
+                "Grant a time-bounded categorical pre-approval. Arg: agent_id|category|expires_at|granted_by|note|path_glob?.",
+                &["standing_approval", "persist"],
+            ),
+            (
+                "agent.standing_approval.list",
+                "List active + recent standing approvals for an agent.",
+                &["standing_approval", "read"],
+            ),
+            (
+                "agent.standing_approval.revoke",
+                "Revoke a standing approval by standing_id.",
+                &["standing_approval", "mutate"],
+            ),
+        ];
+        for (method, doc, cats) in agent_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        tracing::info!("coordinator node: registered agent.* + coord.approval.* capabilities");
+
+        // Auto-expire loop: 60-second tick that scans for
+        // pending approvals whose deadline has passed and
+        // flips them to `expired` + fails the waiting task.
+        {
+            let agent_store_for_expire = agent_store.clone();
+            let task_store_for_expire = store.clone();
+            tokio::spawn(async move {
+                run_approval_expire_loop(agent_store_for_expire, task_store_for_expire).await;
+            });
+            tracing::info!("coordinator node: approval auto-expire loop spawned");
+        }
 
         let coord_caps: &[(&str, &str, &[&str])] = &[
             (

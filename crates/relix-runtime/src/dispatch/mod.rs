@@ -177,6 +177,43 @@ pub struct DispatchBridge {
     /// before the audit log is written. Surfaced via the
     /// built-in `node.policy.recent_denials` capability.
     policy_denials: Arc<PolicyDenialRing>,
+    /// Optional agent-employee gate plumbing. Wired by the
+    /// coordinator binary at startup. `None` on every other
+    /// node — those nodes skip the gate step entirely and
+    /// preserve today's behavior.
+    agent_gate: Option<AgentGateBindings>,
+}
+
+/// Describe a capability by method name. The gate uses this
+/// for the risk-ceiling + categories check. Returns `None`
+/// when the bridge has no metadata for the method (gate
+/// falls back to a category-free, risk-free admit).
+pub type CapabilityDescribeFn = Arc<
+    dyn Fn(&str) -> Option<relix_core::capability::CapabilityDescriptor> + Send + Sync,
+>;
+
+/// Coordinator-side closure that records an approval request
+/// when the gate returns `RequireApproval`. Implementation
+/// mints the approval row + chronicle event + telegram
+/// notification. Returns the new approval_id.
+pub type OnRequireApprovalFn = Arc<
+    dyn Fn(&crate::admission::agent_gate::GateApprovalRequest, &str) -> Result<String, String>
+        + Send
+        + Sync,
+>;
+
+/// What the bridge needs to run the agent gate.
+#[derive(Clone)]
+pub struct AgentGateBindings {
+    /// Read-only store handle for the categorical lookups.
+    pub store: crate::admission::agent_gate::AgentStoreHandle,
+    /// Closure the gate uses to look up a descriptor for the
+    /// method being called.
+    pub describe: CapabilityDescribeFn,
+    /// Closure that records an approval row + chronicle
+    /// event + telegram fire when the gate returns
+    /// `RequireApproval`. Returns the new approval_id.
+    pub on_require_approval: OnRequireApprovalFn,
 }
 
 /// PH-DISP1: per-capability counters. Counts are lifetime —
@@ -265,7 +302,15 @@ impl DispatchBridge {
             responder_node_id,
             capability_stats: Arc::new(std::sync::RwLock::new(HashMap::new())),
             policy_denials: Arc::new(PolicyDenialRing::default()),
+            agent_gate: None,
         })
+    }
+
+    /// Wire the agent-employee gate. Called by the coordinator
+    /// binary after the [`crate::nodes::coordinator::agent::AgentStore`]
+    /// is open. No-op on nodes that don't host an agent store.
+    pub fn set_agent_gate(&mut self, bindings: AgentGateBindings) {
+        self.agent_gate = Some(bindings);
     }
 
     /// W2-007d: cheap-clone accessor for the policy denial
@@ -437,6 +482,80 @@ impl DispatchBridge {
                 )
                 .await;
         };
+
+        // === Admission step 8: agent-employee gate (categorical / surface / risk / approval) ===
+        if let Some(bindings) = self.agent_gate.as_ref() {
+            let descriptor = (bindings.describe)(&req.method);
+            let gate_decision = crate::admission::agent_gate::evaluate(
+                Some(&bindings.store),
+                crate::admission::agent_gate::GateInputs {
+                    identity: &verified,
+                    envelope: &req,
+                    capability: descriptor.as_ref(),
+                    now,
+                },
+            );
+            match gate_decision {
+                crate::admission::agent_gate::GateDecision::Allow(a) => {
+                    if let Some(approval_id) = a.consumed_approval_id.as_deref() {
+                        // Token admit → consume the one-shot.
+                        if let Some(token) = req.approval_token.as_deref()
+                            && let Err(e) = bindings.store.consume_approval_token(token)
+                        {
+                            tracing::warn!(
+                                approval_id = %approval_id,
+                                error = %e,
+                                "agent_gate: approval token consume failed"
+                            );
+                        }
+                    }
+                }
+                crate::admission::agent_gate::GateDecision::Deny(deny) => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    self.policy_denials.push(PolicyDenialEntry {
+                        at: now,
+                        method: req.method.clone(),
+                        caller_subject_id: verified.subject_id.to_string(),
+                        caller_name: verified.name.clone(),
+                        rule: deny.matched_rule.clone(),
+                        reason: deny.reason.clone(),
+                    });
+                    return self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            format!("agent_gate:deny:{}:{}", deny.matched_rule, deny.reason),
+                            relix_core::types::error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                }
+                crate::admission::agent_gate::GateDecision::RequireApproval(req_appr) => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    let cause = match (bindings.on_require_approval)(
+                        &req_appr,
+                        // task_id (best-effort hint — bridge gives "" when no
+                        // task is in flight; the coordinator-side closure
+                        // is allowed to create one).
+                        "",
+                    ) {
+                        Ok(approval_id) => format!("approval_required:{approval_id}"),
+                        Err(e) => format!("approval_required (create failed: {e})"),
+                    };
+                    return self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            cause,
+                            relix_core::types::error_kinds::APPROVAL_REQUIRED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                }
+            }
+        }
 
         // === Admission step 9: policy ===
         let decision = self.policy.evaluate(&verified, &req.method);
@@ -699,6 +818,22 @@ pub fn build_request(
     identity: Bundle,
     deadline_secs_from_now: i64,
 ) -> Vec<u8> {
+    build_request_with_surface(method, args, identity, deadline_secs_from_now, None, None)
+}
+
+/// Same as [`build_request`] but stamps the optional
+/// `surface` + `approval_token` fields on the envelope. Used
+/// by the bridge to mark which inbound HTTP surface drove the
+/// call, and by retried callers replaying an approved
+/// approval token.
+pub fn build_request_with_surface(
+    method: impl Into<String>,
+    args: Vec<u8>,
+    identity: Bundle,
+    deadline_secs_from_now: i64,
+    surface: Option<String>,
+    approval_token: Option<String>,
+) -> Vec<u8> {
     let req = RequestEnvelope {
         pv: 1,
         rid: relix_core::types::RequestId::new(),
@@ -708,6 +843,8 @@ pub fn build_request(
         args: ByteBuf::from(args),
         identity_bundle: identity,
         deadline: Timestamp::now().add_secs(deadline_secs_from_now),
+        surface,
+        approval_token,
     };
     codec::encode(&req).unwrap_or_default()
 }

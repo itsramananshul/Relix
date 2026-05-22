@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod controller_runtime;
 pub mod coordinator;
 pub mod dispatch;

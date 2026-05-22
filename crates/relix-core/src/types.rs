@@ -192,6 +192,17 @@ pub mod error_kinds {
     pub const APPROVAL_DENIED: u32 = 16;
     pub const CANCELLED: u32 = 17;
     pub const MANIFEST_STALE: u32 = 18;
+    /// Agent-employee gate: the call requires an operator
+    /// approval. The error envelope's `cause` contains the
+    /// freshly-minted `approval_id` so callers can surface it
+    /// to the operator. Once the approval is decided, the
+    /// caller retries the same call with an `approval_token`
+    /// on the envelope.
+    pub const APPROVAL_REQUIRED: u32 = 19;
+    /// Agent-employee gate: the `approval_token` on the
+    /// envelope is unknown, expired, already consumed, or
+    /// applies to a different method.
+    pub const APPROVAL_TOKEN_INVALID: u32 = 20;
 }
 
 #[cfg(test)]

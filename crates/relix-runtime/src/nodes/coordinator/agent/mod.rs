@@ -1,0 +1,23 @@
+//! Agent employee permission model — coordinator side.
+//!
+//! Stores agent profiles, approval requests, and standing
+//! approvals in SQLite (sharing the coordinator's database).
+//! Capability handlers expose CRUD + approval-management
+//! surfaces; the admission gate (`crate::admission::agent_gate`)
+//! reads from these tables on every inbound call.
+//!
+//! Six tables:
+//!
+//! - `agent_profiles`     — Phase 1+2 — one row per agent.
+//! - `approval_requests`  — Phase 4 — one row per pending /
+//!   decided approval.
+//! - `standing_approvals` — Phase 5 — time-bounded categorical
+//!   pre-approvals.
+
+pub mod handlers;
+pub mod store;
+
+pub use store::{
+    AgentGateView, AgentProfile, AgentSnapshot, AgentStore, AgentStoreError, ApprovalRecord,
+    ApprovalStatus, StandingApproval,
+};
