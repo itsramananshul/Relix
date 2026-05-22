@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `a5aa596 feat(cli): W2-008c — relix-cli ops smoke (Rust port of demo-smoke.sh)`
+- **HEAD:** `1d61339 feat(cli): W2-008f — --csv flag on relix-cli ops events`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -52,16 +52,19 @@ as the resume command.
     quick-add workflow. Visual-editor sub-items (slash
     commands, drag-to-insert, variable picker, condition
     builder) deferred per spec ("DO NOT overcomplicate").
-  - **W2-008 (Local-first):** substantively CLOSED —
-    `relix-cli doctor` env health check (W2-008a) +
-    `scripts/demo-smoke.sh` end-to-end mesh smoke (W2-008b)
-    + `relix-cli ops smoke` Rust port (W2-008c). One-command
-    startup (`scripts/relix-mesh-up.sh`) predates this
-    wave and already works. Remaining: Open WebUI auto-
+  - **W2-008 (Local-first):** CLOSED for the operator
+    surface — `relix-cli doctor` env health (W2-008a) +
+    `scripts/demo-smoke.sh` bash smoke (W2-008b) +
+    `relix-cli ops smoke` Rust smoke (W2-008c) +
+    `relix-cli ops tail` live firehose tail (W2-008d) +
+    Metrics page auto-refresh (W2-008e) +
+    `relix-cli ops events --csv` spreadsheet dump (W2-008f).
+    One-command startup (`scripts/relix-mesh-up.sh`)
+    predates this wave. Remaining: Open WebUI auto-
     config, Docker reliability.
-- **Workspace tests:** **1290 passing on default features**;
+- **Workspace tests:** **1294 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
-  - relix-cli: 136 (+6 W2-007g policy CLI mirrors)
+  - relix-cli: 140 (+4 W2-008f csv_field)
   - relix-policy: 72
   - relix-runtime: 742
   - relix-runtime router_node integration: 6
