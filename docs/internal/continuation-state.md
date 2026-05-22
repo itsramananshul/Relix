@@ -9,7 +9,7 @@ as the resume command.
 ## Repository state at the checkpoint
 
 - **Branch:** `main`
-- **HEAD:** `4c32366 feat(dashboard): W2-002h — inline failure-screenshot thumbnails`
+- **HEAD:** `21bdc42 feat(cli): W2-006e — ascii sparkline column for ops dispatch-stats`
 - **Status:** clean working tree, branch up to date with `origin/main`
 - **Remote:** `origin` → `https://github.com/itsramananshul/Relix.git`
 - **Wave 1 status: CLOSED.** All decisions resolved.
@@ -17,8 +17,8 @@ as the resume command.
   - **W2-001 (Replay UX):** substantively CLOSED — per-step
     duration in timeline (W2-001a) + `task.replay` capability
     (W2-001b) + `POST /v1/tasks/:id/replay` bridge route
-    (W2-001c) + Replay button (W2-001d). Remaining:
-    replay-diff mode, failure-screenshot inline rendering.
+    (W2-001c) + Replay button (W2-001d) + replay banner on
+    derived task detail (W2-001e). Replay-diff mode pending.
   - **W2-002 (Browser):** CLOSED end-to-end — trait
     extension + HC live + WD live + screenshot-on-failure +
     event-trace logging (W2-002a–e); `tool.browser.capture_read`
@@ -29,12 +29,15 @@ as the resume command.
   - **W2-005 (Failure system):** substantively shipped via
     Wave 1.
   - **W2-006 (Observability):** CLOSED end-to-end (runtime →
-    bridge → dashboard → CLI).
+    bridge → dashboard → CLI), plus latency-shape sparkline
+    extension (W2-006d runtime ring + bridge parser + dashboard
+    SVG; W2-006e CLI Unicode-block sparkline).
   - **W2-003 (Dashboard UX):** partial — Metrics + What-If
     form added (W2-003a/b) + chronicle category + text
     filters (W2-003c) + per-category counts on chips
-    (W2-003d). Live feed enhancements, status pills,
-    URL-hash persistence still pending.
+    (W2-003d) + URL-hash persistence for chronicle filters
+    (W2-003e). Live feed enhancements + status pills still
+    pending.
   - **W2-007 (Policy hardening):** CLOSED end-to-end (both
     pillars) —
     `node.policy.simulate` (W2-007a) → bridge proxy
@@ -53,15 +56,15 @@ as the resume command.
     PASS/WARN/FAIL report. Remaining: one-command startup
     script, demo scripts, Open WebUI integration, Docker
     reliability.
-- **Workspace tests:** **1275 passing on default features**;
+- **Workspace tests:** **1284 passing on default features**;
   feature-gated additions preserved (+5 HC live, +8 WD live).
-  - relix-cli: 126
+  - relix-cli: 130 (+4 W2-006e sparkline)
   - relix-policy: 72
-  - relix-runtime: 741 (+9 W2-002f capture_read)
+  - relix-runtime: 742 (+1 W2-006d ring cap)
   - relix-runtime router_node integration: 6
   - relix-telegram: 23
   - relix-cli bins: 2
-  - relix-web-bridge: 303 (+9 W2-002g captures bridge)
+  - relix-web-bridge: 307 (+4 W2-006d parser)
   - bridge invariants: 3
 - **Gates:** `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
