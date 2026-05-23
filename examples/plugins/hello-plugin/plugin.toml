@@ -1,0 +1,38 @@
+# Example Relix plugin manifest — Python + stdlib only.
+#
+# Run with:
+#   $env:RELIX_PLUGINS = "1"
+#   $env:RELIX_PLUGIN_DIR = "./examples/plugins"
+#   .\scripts\relix-mesh-up.ps1
+#
+# The plugin_host loader will spawn `python.exe hello.py`,
+# read `RELIX_PLUGIN_PORT=<n>` from its stdout, poll /health
+# until it's ready, then register `hello.greet` on the mesh
+# dispatch bridge.
+
+[plugin]
+name        = "hello-plugin"
+version     = "0.1.0"
+description = "Smallest possible Relix plugin — Python stdlib only."
+author      = "Relix examples"
+homepage    = ""
+license     = "Apache-2.0"
+
+[[plugin.capabilities.provides]]
+method            = "hello.greet"
+description       = "Return 'Hello, <name>! From the Relix plugin system.'"
+categories        = ["tool", "example"]
+sensitivity_tags  = []
+risk_level        = "low"
+
+[plugin.runtime]
+kind                 = "subprocess"
+# Use the same python that's on PATH. On Windows this is python.exe
+# from the user's installed distribution. Loaders resolve this
+# relative to the manifest directory, BUT if `python` resolves
+# to an absolute path on the system, that's fine — Command::new
+# falls back to PATH lookup when the path isn't found verbatim.
+binary               = "python"
+args                 = ["hello.py"]
+protocol             = "relix-plugin-v1"
+invoke_timeout_secs  = 30

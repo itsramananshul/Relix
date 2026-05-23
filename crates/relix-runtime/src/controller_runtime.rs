@@ -3990,13 +3990,19 @@ fn register_node_type_handlers(
             let manifest_path_for_spawn = manifest_path.clone();
             // Block on the spawn synchronously so the
             // controller startup sequence sees a fully-wired
-            // bridge before run() unblocks. 10s + 30s timeouts.
-            let loaded = match host_handle.block_on(crate::plugin::PluginLoader::spawn(
-                manifest_for_spawn,
-                manifest_path_for_spawn,
-                10,
-                30,
-            )) {
+            // bridge before run() unblocks. We're inside the
+            // tokio runtime here, so use block_in_place so the
+            // worker can drive the spawn future without
+            // panicking on a nested block_on. 10s + 30s
+            // timeouts.
+            let loaded = match tokio::task::block_in_place(|| {
+                host_handle.block_on(crate::plugin::PluginLoader::spawn(
+                    manifest_for_spawn,
+                    manifest_path_for_spawn,
+                    10,
+                    30,
+                ))
+            }) {
                 Ok(p) => p,
                 Err(e) => {
                     let msg = format!("{e}");
@@ -4098,12 +4104,14 @@ fn register_node_type_handlers(
             if let Err(e) = registry.touch(&loaded.plugin_id) {
                 tracing::warn!(error = %e, "plugin_host: failed to touch last_seen_at");
             }
-            host_handle.block_on(async {
-                host_state
-                    .plugins
-                    .write()
-                    .await
-                    .insert(loaded.plugin_id.clone(), loaded.clone());
+            tokio::task::block_in_place(|| {
+                host_handle.block_on(async {
+                    host_state
+                        .plugins
+                        .write()
+                        .await
+                        .insert(loaded.plugin_id.clone(), loaded.clone());
+                });
             });
             tracing::info!(
                 plugin = %plugin_manifest.plugin.name,
@@ -4158,7 +4166,9 @@ fn register_node_type_handlers(
             desc = desc.with_sensitivity(sens.iter().map(|s| (*s).into()));
             manifest.add_capability(desc);
         }
-        let plugin_count = host_handle.block_on(async { host_state.plugins.read().await.len() });
+        let plugin_count = tokio::task::block_in_place(|| {
+            host_handle.block_on(async { host_state.plugins.read().await.len() })
+        });
         tracing::info!(
             plugin_dir = %ph_cfg.plugin_dir.display(),
             plugins_loaded = plugin_count,

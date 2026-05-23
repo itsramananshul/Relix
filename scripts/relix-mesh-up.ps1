@@ -42,6 +42,7 @@ param(
     [int]$TelegramPort      = 19715,
     [int]$DiscordPort       = 19716,
     [int]$SlackPort         = 19717,
+    [int]$PluginHostPort    = 19718,
     [switch]$ToolAllowHttp,
     [switch]$NoTool,
     [switch]$NoCoordinator,
@@ -74,7 +75,14 @@ param(
     #   $env:RELIX_SLACK_ALLOWED_USERS    = "U01,U02"
     # Without a token + channel id the polling loop idles and the
     # dashboard reports `online=false`.
-    [switch]$NoSlack
+    [switch]$NoSlack,
+    # Plugin host is opt-in. Enable by setting
+    #   $env:RELIX_PLUGINS = "1"
+    # Optional:
+    #   $env:RELIX_PLUGIN_DIR = "./examples/plugins"   # default: ./plugins
+    # The plugin_host scans the directory for plugin.toml files
+    # and spawns each plugin subprocess.
+    [switch]$NoPlugins
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,6 +110,7 @@ $CoordinatorKey = "dev-keys/$Run-coordinator.key"
 $TelegramKey    = "dev-keys/$Run-telegram.key"
 $DiscordKey     = "dev-keys/$Run-discord.key"
 $SlackKey       = "dev-keys/$Run-slack.key"
+$PluginHostKey  = "dev-keys/$Run-plugin-host.key"
 $BridgeKey      = "dev-keys/$Run-bridge.key"
 # Telegram is opt-in. Default off so existing operator
 # workflows are unaffected; explicitly set $env:RELIX_TELEGRAM=1
@@ -109,6 +118,8 @@ $BridgeKey      = "dev-keys/$Run-bridge.key"
 $TelegramEnabled = ($env:RELIX_TELEGRAM -eq '1') -and (-not $NoTelegram.IsPresent)
 $DiscordEnabled  = ($env:RELIX_DISCORD -eq '1') -and (-not $NoDiscord.IsPresent)
 $SlackEnabled    = ($env:RELIX_SLACK -eq '1') -and (-not $NoSlack.IsPresent)
+$PluginsEnabled  = ($env:RELIX_PLUGINS -eq '1') -and (-not $NoPlugins.IsPresent)
+$PluginDir       = if ($env:RELIX_PLUGIN_DIR) { $env:RELIX_PLUGIN_DIR } else { './plugins' }
 $Policy     = "configs/policies/$Run.toml"
 $BridgeHttp = "127.0.0.1:$BridgePort"
 
@@ -145,6 +156,7 @@ $CoordinatorConfig = "$DataBase/coordinator.toml"
 $TelegramConfig    = "$DataBase/telegram.toml"
 $DiscordConfig     = "$DataBase/discord.toml"
 $SlackConfig       = "$DataBase/slack.toml"
+$PluginHostConfig  = "$DataBase/plugin-host.toml"
 $BridgeConfig      = "$DataBase/bridge.toml"
 $Peers             = "$DataBase/peers.toml"
 
@@ -489,6 +501,34 @@ addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
 "@ | Set-Content -Encoding utf8 $SlackConfig
 }
 
+# 4.9) Plugin host controller config. Opt-in via $env:RELIX_PLUGINS=1.
+#      Scans $PluginDir for plugin.toml files and spawns each plugin
+#      subprocess. Registry persists at dev-data/plugin-registry.db.
+if ($PluginsEnabled) {
+@"
+[controller]
+name = "$Run-plugin-host"
+node_type = "plugin_host"
+listen_port = $PluginHostPort
+
+[identity]
+key_path = "$PluginHostKey"
+
+[trust]
+org_root_key_path = "$OrgPub"
+
+[policy]
+file = "$Policy"
+
+[plugin_host]
+plugin_dir       = "$PluginDir"
+max_plugins      = 20
+registry_db_path = "$DataBase/plugin-registry.db"
+
+[peers]
+"@ | Set-Content -Encoding utf8 $PluginHostConfig
+}
+
 # 4.5) Coordinator controller config. Owns the durable Task ledger
 #      (SQLite). Optional -- pass -NoCoordinator to skip.
 if (-not $NoCoordinator) {
@@ -819,6 +859,36 @@ allow_groups = ["chat-users"]
 name = "slack_messages_recent"
 method = "slack.messages_recent"
 allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_list"
+method = "plugin.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_status"
+method = "plugin.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_reload"
+method = "plugin.reload"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_disable"
+method = "plugin.disable"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "hello_greet"
+method = "hello.greet"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "web_lookup_fetch"
+method = "web_lookup.fetch"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
 # 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.
@@ -867,6 +937,14 @@ if ($SlackEnabled) {
 
 [peers.slack]
 addr = "/ip4/127.0.0.1/tcp/$SlackPort"
+"@
+}
+if ($PluginsEnabled) {
+    $peersToml += @"
+
+
+[peers.plugin_host]
+addr = "/ip4/127.0.0.1/tcp/$PluginHostPort"
 "@
 }
 $peersToml | Set-Content -Encoding utf8 $Peers
@@ -921,6 +999,7 @@ $CoordinatorLog = "$DataBase/coordinator.log"
 $TelegramLog    = "$DataBase/telegram.log"
 $DiscordLog     = "$DataBase/discord.log"
 $SlackLog       = "$DataBase/slack.log"
+$PluginHostLog  = "$DataBase/plugin-host.log"
 $BridgeLog      = "$DataBase/bridge.log"
 $MemErr         = "$DataBase/memory.err.log"
 $AiErr          = "$DataBase/ai.err.log"
@@ -929,6 +1008,7 @@ $CoordinatorErr = "$DataBase/coordinator.err.log"
 $TelegramErr    = "$DataBase/telegram.err.log"
 $DiscordErr     = "$DataBase/discord.err.log"
 $SlackErr       = "$DataBase/slack.err.log"
+$PluginHostErr  = "$DataBase/plugin-host.err.log"
 $BridgeErr      = "$DataBase/bridge.err.log"
 
 $env:RELIX_DATA_DIR = 'dev-data'
@@ -1071,6 +1151,16 @@ try {
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $SlackConfig -OutLog $SlackLog -ErrLog $SlackErr -RustLog 'relix_runtime=info,relix_slack=info') )
     }
 
+    if ($PluginsEnabled) {
+        $PluginHostBundlePath = "dev-keys/$Run-plugin-host.bundle"
+        if (-not (Test-Path $PluginHostBundlePath)) {
+            & $Cli identity mint --root-key $OrgKey --name plugin-host --groups chat-users --out $PluginHostBundlePath
+            if ($LASTEXITCODE -ne 0) { throw "plugin-host identity mint failed" }
+        }
+        Write-Host "starting plugin_host controller ..."
+        [void]$started.Add( (Start-Node -Exe $Controller -Cfg $PluginHostConfig -OutLog $PluginHostLog -ErrLog $PluginHostErr -RustLog 'relix_runtime=info,relix_runtime::plugin=debug') )
+    }
+
     if (-not (Wait-Log -Path $MemLog -Needle 'transport listening' -Desc 'memory controller')) { throw 'memory controller never came up' }
     if (-not (Wait-Log -Path $AiLog  -Needle 'transport listening' -Desc 'ai controller'))     { throw 'ai controller never came up' }
     if (-not $NoTool) {
@@ -1087,6 +1177,9 @@ try {
     }
     if ($SlackEnabled) {
         if (-not (Wait-Log -Path $SlackLog -Needle 'transport listening' -Desc 'slack controller')) { throw 'slack controller never came up' }
+    }
+    if ($PluginsEnabled) {
+        if (-not (Wait-Log -Path $PluginHostLog -Needle 'transport listening' -Desc 'plugin_host controller')) { throw 'plugin_host controller never came up' }
     }
     Start-Sleep -Milliseconds 400
 
@@ -1145,6 +1238,7 @@ try {
     if ($TelegramEnabled)    { Write-Host "  $TelegramLog" }
     if ($DiscordEnabled)     { Write-Host "  $DiscordLog" }
     if ($SlackEnabled)       { Write-Host "  $SlackLog" }
+    if ($PluginsEnabled)     { Write-Host "  $PluginHostLog" }
     Write-Host "  $BridgeLog"
     Write-Host ""
     Write-Host "PIDs (this script will only stop these on Ctrl-C):"

@@ -634,6 +634,65 @@ no Socket Mode WebSocket, no Events API webhook receiver, no
 typing indicator, no approval-notifier loop, no persistent
 session store, no formal slash-command registration.
 
+### 6.1d Plugin system — shipped
+
+Third-party plugins extend Relix without modifying the core
+codebase. A new `node_type = "plugin_host"` controller scans a
+`plugin_dir` for `plugin.toml` manifests, spawns each plugin as
+a subprocess, reads `RELIX_PLUGIN_PORT=<n>` from stdout
+(10s timeout), polls `/health` until 200 (30s timeout), then
+registers each declared capability on its dispatch bridge as a
+`FnHandler` that routes calls to `POST /invoke` on the plugin.
+
+The protocol is `relix-plugin-v1` — HTTP/JSON over localhost,
+documented in `docs/plugins.md`. Plugin authors get a tiny
+Rust SDK (`relix-plugin-sdk` crate, axum-based, no relix-runtime
+dep) so the boilerplate is one `PluginServer::new()` +
+`register()` + `serve()`. Python and any other language with
+an HTTP server can implement the protocol directly.
+
+The plugin_host node registers four management capabilities:
+`plugin.list / status / reload / disable`. A SQLite registry
+(`plugin-registry.db`) persists `(plugin_id, name, version,
+status, error_message, registered_at, last_seen_at,
+capabilities JSON)` across reboots. Status moves
+`registered → active → error → disabled`.
+
+Bridge endpoints `GET /v1/plugins`, `GET /v1/plugins/:id`,
+`POST /v1/plugins/:id/{reload,disable}` proxy the management
+caps; the dashboard `#/plugins` page lists plugins and lets
+operators reload / disable from a detail card;
+`relix-cli ops plugin {list,status,reload,disable}` mirrors
+the same on the terminal.
+
+Two worked examples ship in `examples/plugins/`:
+
+- `hello-plugin/` — Python stdlib only. `hello.greet` capability.
+  Smallest possible implementation of the protocol.
+- `web-lookup/` — Rust + `relix-plugin-sdk`. `web_lookup.fetch`
+  capability. Validates http(s) scheme + caps response body at
+  500 chars + maps reqwest errors to typed `PluginError` kinds.
+
+Boot via `scripts/relix-mesh-up.ps1` with
+`$env:RELIX_PLUGINS = "1"`; optional
+`$env:RELIX_PLUGIN_DIR = "./examples/plugins"`. Policy rules
+for the management caps + the example plugins' methods are
+written automatically.
+
+Subprocess isolation is the security boundary: a panicking
+plugin can't take the host down, the host kills the children
+on drop (tokio `Command::kill_on_drop(true)`), and plugin
+methods pass through the same `PolicyEngine` admission as
+built-in capabilities so operators control access in the same
+TOML they already use.
+
+Deliberate non-goals (today): no WASM runtime, no
+automatic plugin restart on crash (use `plugin.reload`), no
+remote plugin discovery (plugins must be on the same host as
+the plugin_host node), no streaming response shape (one-shot
+JSON request/reply only). The protocol leaves room for these
+without breaking compatibility.
+
 ### 6.2 Playwright browser backend — scaffold
 
 `[tool.browser] backend = "playwright"` selects a scaffold that returns

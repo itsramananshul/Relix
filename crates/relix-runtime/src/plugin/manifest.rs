@@ -198,11 +198,26 @@ impl PluginManifest {
 
     /// Canonicalised absolute path of the binary, resolved
     /// against the manifest directory.
+    ///
+    /// Bare command names (no path separator) are returned
+    /// verbatim so `Command::new` does the usual PATH lookup —
+    /// that's how `binary = "python"` reaches the system Python
+    /// without forcing the operator to write a full path.
     pub fn resolved_binary(&self) -> PathBuf {
-        let candidate = if self.plugin.runtime.binary.is_absolute() {
-            self.plugin.runtime.binary.clone()
+        let raw = &self.plugin.runtime.binary;
+        let has_sep = raw
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .any(|c| c == '/' || c == '\\');
+        if !raw.is_absolute() && !has_sep {
+            // Bare name → PATH lookup at Command::new time.
+            return raw.clone();
+        }
+        let candidate = if raw.is_absolute() {
+            raw.clone()
         } else {
-            self.manifest_dir.join(&self.plugin.runtime.binary)
+            self.manifest_dir.join(raw)
         };
         candidate.canonicalize().unwrap_or(candidate)
     }

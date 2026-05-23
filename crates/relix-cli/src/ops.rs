@@ -3423,7 +3423,10 @@ async fn plugin_status_cmd(
     Ok(())
 }
 
-async fn plugin_reload_cmd(bridge: &str, plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn plugin_reload_cmd(
+    bridge: &str,
+    plugin_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let base = bridge.trim_end_matches('/');
     let url = format!("{base}/v1/plugins/{plugin_id}/reload");
     let client = reqwest::Client::new();
@@ -3805,4 +3808,3 @@ mod tests {
         assert!(r2.recent_latencies.is_empty());
     }
 }
-
