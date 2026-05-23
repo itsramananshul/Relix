@@ -979,6 +979,180 @@ async fn populate_ai_memory_cell(
 /// peer is unreachable or the bundle is missing; the curator
 /// scheduler will keep ticking and just skip every agent
 /// (`memory curator: AI dispatcher not yet ready`).
+async fn run_message_expire_loop(
+    message_store: Arc<crate::nodes::coordinator::messaging::MessageStore>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match message_store.expire_due(now) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(expired = n, "msg expire: flipped past-ttl rows to expired"),
+            Err(e) => tracing::warn!(error = %e, "msg expire: sweep failed"),
+        }
+    }
+}
+
+/// Register every `msg.*` capability + write a `msg.sent`
+/// chronicle event on the coordinator's bookkeeping task after
+/// each successful send. The chronicle write is best-effort —
+/// failure does not propagate to the caller.
+fn register_messaging_capabilities(
+    bridge: &mut crate::dispatch::DispatchBridge,
+    message_store: Arc<crate::nodes::coordinator::messaging::MessageStore>,
+    task_store: Arc<crate::nodes::coordinator::TaskStore>,
+) {
+    use crate::dispatch::{FnHandler, HandlerOutcome, InvocationCtx};
+    use crate::nodes::coordinator::messaging::handlers;
+
+    // Ensure a single "msg-bookkeeping" task exists so the
+    // msg.sent chronicle has somewhere to land. The lookup
+    // pages through existing task rows once at register time;
+    // creation is idempotent — re-running on the same db
+    // reuses the existing row.
+    let bookkeeping_task_id = ensure_msg_bookkeeping_task(&task_store);
+
+    {
+        let s = message_store.clone();
+        let ts = task_store.clone();
+        let book = bookkeeping_task_id.clone();
+        bridge.register(
+            "msg.send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                let ts = ts.clone();
+                let book = book.clone();
+                async move {
+                    let outcome = handlers::handle_send(&s, &ctx);
+                    // Best-effort `msg.sent` chronicle event on
+                    // the bookkeeping task — capture from / to /
+                    // thread without the body so audit stays
+                    // body-redacted.
+                    if let (HandlerOutcome::Ok(body), Some(task_id)) = (&outcome, book.as_deref())
+                        && let Ok(msg_id) = std::str::from_utf8(body)
+                    {
+                        let msg_id = msg_id.trim();
+                        if let Ok(Some(rec)) = s.get(msg_id) {
+                            let payload = format!(
+                                "from={}|to={}|thread={}",
+                                short_subject(&rec.from_subject_id),
+                                short_subject(&rec.to_subject_id),
+                                rec.thread_id
+                            );
+                            let _ = ts.append_event(task_id, "msg.sent", &payload);
+                        }
+                    }
+                    outcome
+                }
+            })),
+        );
+    }
+    {
+        let s = message_store.clone();
+        bridge.register(
+            "msg.inbox",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_inbox(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = message_store.clone();
+        bridge.register(
+            "msg.read",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_read(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = message_store.clone();
+        bridge.register(
+            "msg.thread",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_thread(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = message_store.clone();
+        bridge.register(
+            "msg.delete",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_delete(&s, &ctx) }
+            })),
+        );
+    }
+}
+
+fn short_subject(s: &str) -> String {
+    let cleaned: String = s.replace('|', "_");
+    cleaned.chars().take(16).collect()
+}
+
+/// Ensure the coordinator hosts a single bookkeeping task
+/// titled `msg-bookkeeping-system` so the `msg.sent`
+/// chronicle event has somewhere to land. Returns the task_id
+/// on success; logs + returns None on any storage hiccup
+/// (the messaging capabilities still work; just the audit
+/// event is skipped).
+fn ensure_msg_bookkeeping_task(
+    task_store: &Arc<crate::nodes::coordinator::TaskStore>,
+) -> Option<String> {
+    const TITLE: &str = "msg-bookkeeping-system";
+    const FLOW: &str = "system:messaging";
+    // Page through task summaries looking for the sentinel
+    // title; reuse if present. (Same approach the memory
+    // curator uses for its bookkeeping task.)
+    let mut offset = 0usize;
+    for _ in 0..5 {
+        let rows = match task_store.list_paginated(200, offset, None) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "msg bookkeeping: task.list failed");
+                return None;
+            }
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for r in &rows {
+            if r.title == TITLE {
+                return Some(r.task_id.clone());
+            }
+        }
+        offset += rows.len();
+    }
+    match task_store.create(
+        TITLE,
+        FLOW,
+        "{}",
+        "system",
+        crate::nodes::coordinator::RetryPolicy::None,
+        0,
+        None,
+        Some("scheduler"),
+    ) {
+        Ok(id) => {
+            tracing::info!(task_id = %id, "msg bookkeeping: created system task");
+            Some(id)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "msg bookkeeping: create failed");
+            None
+        }
+    }
+}
+
 async fn run_approval_expire_loop(
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
@@ -2387,6 +2561,70 @@ fn register_node_type_handlers(
             });
             tracing::info!("coordinator node: approval auto-expire loop spawned");
         }
+
+        // ── Agent-to-agent messaging ───────────────────────
+        // Same coordinator db. Capability handlers + a
+        // 5-minute auto-expire sweeper that flips
+        // past-ttl messages to `status = expired`.
+        let message_store = std::sync::Arc::new(
+            crate::nodes::coordinator::messaging::MessageStore::open(&coord_cfg.db_path)
+                .map_err(|e| format!("[coordinator] message store open: {e}"))?,
+        );
+        register_messaging_capabilities(bridge, message_store.clone(), store.clone());
+        let msg_caps: &[(&str, &str, &[&str])] = &[
+            (
+                "msg.send",
+                "Send an agent-to-agent message. Arg: \
+                 from|to|subject|body|thread_id|reply_to|ttl_secs|origin_surface. \
+                 Empty thread_id starts a new thread (uses message_id); empty \
+                 ttl_secs defaults to 86400 (24 h).",
+                &["messaging", "persist"],
+            ),
+            (
+                "msg.inbox",
+                "Read inbox newest-first. Arg: \
+                 subject_id|limit|include_read|since_message_id. \
+                 limit defaults to 20 (max 100); include_read=1 includes \
+                 read messages; since_message_id is a pagination cursor.",
+                &["messaging", "read"],
+            ),
+            (
+                "msg.read",
+                "Mark a message as read. Arg: message_id|reader_subject_id. \
+                 Reader must equal to_subject_id; idempotent on already-read \
+                 messages.",
+                &["messaging", "mutate"],
+            ),
+            (
+                "msg.thread",
+                "List every message in a thread (oldest-first). Arg: \
+                 thread_id|subject_id. Caller must be sender or recipient on \
+                 at least one message in the thread.",
+                &["messaging", "read"],
+            ),
+            (
+                "msg.delete",
+                "Soft delete (status=expired). Arg: message_id|subject_id. \
+                 Only sender or recipient may delete.",
+                &["messaging", "mutate"],
+            ),
+        ];
+        for (method, doc, cats) in msg_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        tracing::info!("coordinator node: registered msg.* capabilities");
+
+        // Message auto-expire loop: 5-minute tick.
+        {
+            let message_store_for_expire = message_store.clone();
+            tokio::spawn(async move {
+                run_message_expire_loop(message_store_for_expire).await;
+            });
+            tracing::info!("coordinator node: message auto-expire loop spawned");
+        }
+        let _ = message_store;
 
         let coord_caps: &[(&str, &str, &[&str])] = &[
             (

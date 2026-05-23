@@ -147,6 +147,7 @@ pub mod agent;
 pub mod cron;
 pub mod delegate;
 pub mod event_summary;
+pub mod messaging;
 pub use event_summary::{summarize_event, summarize_event_parts};
 
 /// H4: number of consecutive failures sharing the same
