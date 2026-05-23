@@ -111,6 +111,7 @@ mod openai;
 mod policy_denials;
 mod policy_simulate;
 mod secrets;
+mod slack;
 mod sol_validate;
 mod sse;
 mod task_recorder;
@@ -470,6 +471,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // telegram.messages_recent) and return parsed JSON.
         .route("/v1/discord/status", get(discord::status))
         .route("/v1/discord/messages/recent", get(discord::messages_recent))
+        .route("/v1/slack/status", get(slack::status))
+        .route("/v1/slack/messages/recent", get(slack::messages_recent))
         .route("/v1/telegram/status", get(telegram::status))
         .route(
             "/v1/telegram/messages/recent",

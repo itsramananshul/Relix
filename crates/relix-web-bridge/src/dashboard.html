@@ -1825,6 +1825,7 @@
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
     <a href="#/discord"   class="nav-item" data-route="discord">Discord</a>
+    <a href="#/slack"     class="nav-item" data-route="slack">Slack</a>
     <a href="#/config"    class="nav-item" data-route="config">Bridge Config</a>
   </aside>
 
@@ -3155,6 +3156,50 @@
       </div>
     </section>
 
+    <!-- ── #/slack ──────────────────────────────────────────────── -->
+    <section class="page" data-page="slack">
+      <h2>Slack</h2>
+      <p class="page-subtitle">
+        Read-only view of the Slack channel controller — bot
+        identity, configured workspace + channel, recent
+        inbound messages. Bot token + channel id are set via env
+        vars (<code>RELIX_SLACK_BOT_TOKEN</code>,
+        <code>RELIX_SLACK_CHANNEL_ID</code>) and the mesh boot
+        script; nothing here writes secrets.
+      </p>
+      <div class="banner warn">
+        <strong>Local/dev only.</strong> No HTTP authentication on
+        these endpoints. Production: put a reverse proxy with auth
+        in front.
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Bot live status</h3>
+          <div class="card-actions">
+            <button id="sl-live-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="sl-live-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Recent inbound messages</h3>
+          <div class="card-actions">
+            <label style="font-size: 12px; margin-right: 8px;">
+              Limit
+              <input type="number" id="sl-recent-limit" min="1" max="200" value="20" style="width: 60px;">
+            </label>
+            <button id="sl-recent-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="card-body" id="sl-recent-host">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+    </section>
+
     <!-- ── #/config ────────────────────────────────────────────── -->
     <section class="page" data-page="config">
       <h2>Bridge Config</h2>
@@ -3276,6 +3321,7 @@ const PAGES = {
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   discord:      { label: 'Discord',      init: initDiscord,      enter: enterDiscord },
+  slack:        { label: 'Slack',        init: initSlack,        enter: enterSlack },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
 };
 
@@ -10872,6 +10918,85 @@ async function loadDiscordRecent() {
     }
     $host.innerHTML = '<table class="grid"><thead><tr>'
       + '<th>Time</th><th>User id</th><th>Username</th><th>Content</th>'
+      + '</tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+// ── #/slack — Slack channel status ──────────────────────────
+
+function initSlack() {
+  const $r = document.getElementById('sl-live-refresh');
+  if ($r) $r.addEventListener('click', loadSlackStatus);
+  const $rr = document.getElementById('sl-recent-refresh');
+  if ($rr) $rr.addEventListener('click', loadSlackRecent);
+  const $lim = document.getElementById('sl-recent-limit');
+  if ($lim) $lim.addEventListener('change', loadSlackRecent);
+}
+
+async function enterSlack() {
+  await loadSlackStatus();
+  await loadSlackRecent();
+}
+
+async function loadSlackStatus() {
+  const $host = document.getElementById('sl-live-host');
+  if (!$host) return;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/slack/status');
+    if (!r.ok) {
+      const body = await r.text();
+      $host.innerHTML = '<div class="error">HTTP ' + r.status + ': ' + escapeHtml(body) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    const onlineLabel = s.online ? '<span class="status-good">online</span>' : '<span class="status-bad">offline</span>';
+    const lastAt = s.last_message_at
+      ? new Date(s.last_message_at * 1000).toLocaleString()
+      : '—';
+    $host.innerHTML = '<table class="grid">'
+      + '<tr><th>Status</th><td>' + onlineLabel + '</td></tr>'
+      + '<tr><th>Username</th><td>@' + escapeHtml(s.username || '(unknown)') + '</td></tr>'
+      + '<tr><th>User id</th><td><span class="id">' + escapeHtml(s.user_id) + '</span></td></tr>'
+      + '<tr><th>Team id</th><td><span class="id">' + escapeHtml(s.team_id) + '</span></td></tr>'
+      + '<tr><th>Channel id</th><td><span class="id">' + escapeHtml(s.channel_id) + '</span></td></tr>'
+      + '<tr><th>Messages seen</th><td>' + s.messages_seen + '</td></tr>'
+      + '<tr><th>Last message</th><td>' + escapeHtml(lastAt) + '</td></tr>'
+      + '</table>';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">' + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function loadSlackRecent() {
+  const $host = document.getElementById('sl-recent-host');
+  const $lim = document.getElementById('sl-recent-limit');
+  if (!$host) return;
+  const limit = $lim ? Math.max(1, Math.min(200, parseInt($lim.value, 10) || 20)) : 20;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch('/v1/slack/messages/recent?limit=' + limit);
+    if (!r.ok) {
+      $host.innerHTML = '<div class="error">HTTP ' + r.status + '</div>';
+      return;
+    }
+    const s = await r.json();
+    const rows = (s.messages || []).map(function(m) {
+      return '<tr>'
+        + '<td><span class="id">' + escapeHtml(m.ts) + '</span></td>'
+        + '<td><span class="id">' + escapeHtml(m.user_id) + '</span></td>'
+        + '<td>@' + escapeHtml(m.username) + '</td>'
+        + '<td>' + escapeHtml(m.content_preview) + '</td>'
+        + '</tr>';
+    });
+    if (rows.length === 0) {
+      $host.innerHTML = '<p class="muted">No inbound messages yet.</p>';
+      return;
+    }
+    $host.innerHTML = '<table class="grid"><thead><tr>'
+      + '<th>ts</th><th>User id</th><th>Username</th><th>Content</th>'
       + '</tr></thead><tbody>' + rows.join('') + '</tbody></table>';
   } catch (e) {
     $host.innerHTML = '<div class="error">' + escapeHtml(String(e)) + '</div>';
