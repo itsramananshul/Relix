@@ -343,10 +343,17 @@ fn finalise_dns_check(
 }
 
 /// Try to parse the host string as a literal IP. Accepts both `127.0.0.1`
-/// and `[::1]` style (bracketed v6 — `url::Url::host_str()` strips brackets,
-/// so we don't need to here; we just parse).
+/// and `[::1]` style. `url::Url::host_str()` returns IPv6 hosts WITH the
+/// surrounding brackets (per the url crate's API), so we strip them before
+/// handing the bytes to `IpAddr::from_str` — without that, `[::1]` would
+/// fall through to DNS, and platforms whose libc resolver rejects bracketed
+/// literals (Ubuntu, macOS) would never reach the literal-IP range check.
 fn parse_literal_ip(host: &str) -> Option<IpAddr> {
-    host.parse::<IpAddr>().ok().map(|ip| match ip {
+    let stripped = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    stripped.parse::<IpAddr>().ok().map(|ip| match ip {
         // Unwrap IPv4-mapped IPv6 so `::ffff:127.0.0.1` is treated as v4.
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
