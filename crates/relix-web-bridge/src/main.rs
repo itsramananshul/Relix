@@ -96,6 +96,7 @@ mod config_api;
 mod cron;
 mod dashboard;
 mod delegate;
+mod discord;
 mod dispatch_stats;
 mod flow;
 mod fs_audit;
@@ -467,6 +468,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // client; both routes call the telegram peer's
         // read-only capabilities (telegram.status,
         // telegram.messages_recent) and return parsed JSON.
+        .route("/v1/discord/status", get(discord::status))
+        .route("/v1/discord/messages/recent", get(discord::messages_recent))
         .route("/v1/telegram/status", get(telegram::status))
         .route(
             "/v1/telegram/messages/recent",
