@@ -61,6 +61,11 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub slack: Option<toml::Value>,
+    /// Plugin-host node options. Present only when
+    /// `node_type = "plugin_host"`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub plugin_host: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -2344,6 +2349,245 @@ async fn populate_memory_embedding_cell(
     }
 }
 
+/// Register `plugin.list`, `plugin.status`, `plugin.reload`,
+/// `plugin.disable` on the supplied dispatch bridge. Shared
+/// state (`PluginHostState`) carries the registry + the
+/// in-memory map of currently-loaded plugins so reload / disable
+/// can act on the live subprocess.
+fn register_plugin_management_capabilities(
+    bridge: &mut DispatchBridge,
+    state: crate::plugin::PluginHostState,
+) {
+    use crate::dispatch::{FnHandler, HandlerOutcome, InvocationCtx};
+    use crate::plugin::PluginStatus;
+    use relix_core::types::{ErrorEnvelope, error_kinds};
+
+    {
+        let state = state.clone();
+        bridge.register(
+            "plugin.list",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let state = state.clone();
+                async move {
+                    let rows = match state.registry.list() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::RESPONDER_INTERNAL,
+                                cause: format!("plugin.list: {e}"),
+                                retry_hint: 1,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    let mut body = String::new();
+                    for r in &rows {
+                        body.push_str(&format!(
+                            "{}\t{}\t{}\t{}\t{}\n",
+                            r.plugin_id,
+                            r.name,
+                            r.version,
+                            r.status.as_wire(),
+                            r.capabilities.len()
+                        ));
+                    }
+                    body.push_str(&format!("count={}\n", rows.len()));
+                    HandlerOutcome::Ok(body.into_bytes())
+                }
+            })),
+        );
+    }
+    {
+        let state = state.clone();
+        bridge.register(
+            "plugin.status",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let state = state.clone();
+                async move {
+                    let plugin_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                    if plugin_id.is_empty() {
+                        return HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::INVALID_ARGS,
+                            cause: "plugin.status: plugin_id required".into(),
+                            retry_hint: 2,
+                            retry_after: None,
+                        });
+                    }
+                    let row = match state.registry.get(&plugin_id) {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
+                            return HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::INVALID_ARGS,
+                                cause: format!("plugin.status: not found: {plugin_id}"),
+                                retry_hint: 2,
+                                retry_after: None,
+                            });
+                        }
+                        Err(e) => {
+                            return HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::RESPONDER_INTERNAL,
+                                cause: format!("plugin.status: {e}"),
+                                retry_hint: 1,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    let caps = row.capabilities.join(",");
+                    let last_seen = row
+                        .last_seen_at
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "-1".to_string());
+                    let body = format!(
+                        "plugin_id={}|name={}|version={}|status={}|registered_at={}|last_seen_at={}|capabilities={}|node_type={}|error_message={}\n",
+                        row.plugin_id,
+                        row.name,
+                        row.version,
+                        row.status.as_wire(),
+                        row.registered_at,
+                        last_seen,
+                        caps,
+                        row.node_type,
+                        row.error_message,
+                    );
+                    HandlerOutcome::Ok(body.into_bytes())
+                }
+            })),
+        );
+    }
+    {
+        let state = state.clone();
+        bridge.register(
+            "plugin.reload",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let state = state.clone();
+                async move {
+                    let plugin_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                    if plugin_id.is_empty() {
+                        return HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::INVALID_ARGS,
+                            cause: "plugin.reload: plugin_id required".into(),
+                            retry_hint: 2,
+                            retry_after: None,
+                        });
+                    }
+                    let row = match state.registry.get(&plugin_id) {
+                        Ok(Some(r)) => r,
+                        Ok(None) => {
+                            return HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::INVALID_ARGS,
+                                cause: format!("plugin.reload: not found: {plugin_id}"),
+                                retry_hint: 2,
+                                retry_after: None,
+                            });
+                        }
+                        Err(e) => {
+                            return HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::RESPONDER_INTERNAL,
+                                cause: format!("plugin.reload: {e}"),
+                                retry_hint: 1,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    // Shutdown the existing subprocess.
+                    let existing = {
+                        let mut map = state.plugins.write().await;
+                        map.remove(&plugin_id)
+                    };
+                    if let Some(p) = existing {
+                        p.shutdown().await;
+                    }
+                    // Re-spawn from the same manifest path.
+                    let path = std::path::PathBuf::from(&row.manifest_path);
+                    let manifest = match crate::plugin::PluginManifest::load_from_path(&path) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let msg = format!("plugin.reload: re-parse: {e}");
+                            let _ = state.registry.set_status(
+                                &plugin_id,
+                                PluginStatus::Error,
+                                Some(&msg),
+                            );
+                            return HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::RESPONDER_INTERNAL,
+                                cause: msg,
+                                retry_hint: 1,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    match crate::plugin::PluginLoader::spawn(manifest, path, 10, 30).await {
+                        Ok(loaded) => {
+                            let _ = state.registry.set_status(
+                                &loaded.plugin_id,
+                                PluginStatus::Active,
+                                None,
+                            );
+                            let _ = state.registry.touch(&loaded.plugin_id);
+                            state
+                                .plugins
+                                .write()
+                                .await
+                                .insert(loaded.plugin_id.clone(), loaded);
+                            HandlerOutcome::Ok(b"ok\n".to_vec())
+                        }
+                        Err(e) => {
+                            let msg = format!("plugin.reload: spawn: {e}");
+                            let _ = state.registry.set_status(
+                                &plugin_id,
+                                PluginStatus::Error,
+                                Some(&msg),
+                            );
+                            HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::RESPONDER_INTERNAL,
+                                cause: msg,
+                                retry_hint: 1,
+                                retry_after: None,
+                            })
+                        }
+                    }
+                }
+            })),
+        );
+    }
+    {
+        let state = state.clone();
+        bridge.register(
+            "plugin.disable",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let state = state.clone();
+                async move {
+                    let plugin_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
+                    if plugin_id.is_empty() {
+                        return HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::INVALID_ARGS,
+                            cause: "plugin.disable: plugin_id required".into(),
+                            retry_hint: 2,
+                            retry_after: None,
+                        });
+                    }
+                    if state.registry.get(&plugin_id).ok().flatten().is_none() {
+                        return HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::INVALID_ARGS,
+                            cause: format!("plugin.disable: not found: {plugin_id}"),
+                            retry_hint: 2,
+                            retry_after: None,
+                        });
+                    }
+                    let existing = state.plugins.write().await.remove(&plugin_id);
+                    if let Some(p) = existing {
+                        p.shutdown().await;
+                    }
+                    let _ = state
+                        .registry
+                        .set_status(&plugin_id, PluginStatus::Disabled, None);
+                    HandlerOutcome::Ok(b"ok\n".to_vec())
+                }
+            })),
+        );
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3682,6 +3926,243 @@ fn register_node_type_handlers(
             allow_everyone = sl_cfg.allow_everyone(),
             ring_capacity = sl_cfg.messages_ring_capacity,
             "slack node: registered slack.status / slack.messages_recent; polling loop spawned"
+        );
+    }
+    if cfg.controller.node_type == "plugin_host" {
+        let raw = cfg
+            .plugin_host
+            .clone()
+            .ok_or_else(|| "node_type=plugin_host requires a [plugin_host] section".to_string())?;
+        let ph_cfg: crate::plugin::PluginHostConfig = raw
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("[plugin_host] parse: {e}"))?;
+        let registry_path = ph_cfg
+            .registry_db_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("dev-data/plugin-registry.db"));
+        let registry = Arc::new(
+            crate::plugin::PluginRegistry::open(&registry_path)
+                .map_err(|e| format!("[plugin_host] registry: {e}"))?,
+        );
+        let host_state = crate::plugin::PluginHostState::new(registry.clone());
+        // Discover + load every plugin in plugin_dir. Each
+        // successful load registers its capabilities on the
+        // bridge as FnHandlers wrapping the per-plugin
+        // dispatcher. Failures are surfaced via the registry
+        // (status = "error", error_message set) so the dashboard
+        // can show them.
+        let manifests = crate::plugin::PluginLoader::find_manifests(&ph_cfg.plugin_dir)
+            .map_err(|e| format!("[plugin_host] scan plugin_dir: {e}"))?;
+        if manifests.len() > ph_cfg.max_plugins {
+            tracing::warn!(
+                found = manifests.len(),
+                cap = ph_cfg.max_plugins,
+                "plugin_host: more manifests than max_plugins cap; truncating"
+            );
+        }
+        let host_handle = tokio::runtime::Handle::current();
+        let plugins_to_load: Vec<_> = manifests.into_iter().take(ph_cfg.max_plugins).collect();
+        for manifest_path in plugins_to_load {
+            let plugin_manifest =
+                match crate::plugin::PluginManifest::load_from_path(&manifest_path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %manifest_path.display(),
+                            error = %e,
+                            "plugin_host: skipping invalid manifest"
+                        );
+                        continue;
+                    }
+                };
+            let plugin_id = match registry.upsert(&plugin_manifest, &manifest_path) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %manifest_path.display(),
+                        error = %e,
+                        "plugin_host: registry upsert failed; skipping"
+                    );
+                    continue;
+                }
+            };
+            let manifest_for_spawn = plugin_manifest.clone();
+            let manifest_path_for_spawn = manifest_path.clone();
+            // Block on the spawn synchronously so the
+            // controller startup sequence sees a fully-wired
+            // bridge before run() unblocks. 10s + 30s timeouts.
+            let loaded = match host_handle.block_on(crate::plugin::PluginLoader::spawn(
+                manifest_for_spawn,
+                manifest_path_for_spawn,
+                10,
+                30,
+            )) {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if let Err(re) = registry.set_status(
+                        &plugin_id,
+                        crate::plugin::PluginStatus::Error,
+                        Some(&msg),
+                    ) {
+                        tracing::warn!(error = %re, "plugin_host: failed to record error status");
+                    }
+                    tracing::warn!(
+                        plugin = %plugin_manifest.plugin.name,
+                        error = %e,
+                        "plugin_host: plugin failed to start; status=error"
+                    );
+                    continue;
+                }
+            };
+            // Register each capability on the bridge. The
+            // FnHandler captures the dispatcher and routes
+            // every call to /invoke. Any plugin-level error
+            // maps to the right ErrorEnvelope kind.
+            for cap in &plugin_manifest.plugin.capabilities.provides {
+                let method = cap.method.clone();
+                let method_for_register = method.clone();
+                let dispatcher = loaded.dispatcher.clone();
+                let deadline_secs = plugin_manifest.plugin.runtime.invoke_timeout_secs as i64;
+                bridge.register(
+                    method_for_register,
+                    Arc::new(crate::dispatch::FnHandler(
+                        move |ctx: crate::dispatch::InvocationCtx| {
+                            let dispatcher = dispatcher.clone();
+                            let method = method.clone();
+                            async move {
+                                let args = String::from_utf8(ctx.args.clone())
+                                    .unwrap_or_else(|_| String::new());
+                                let req = crate::plugin::InvokeRequest {
+                                    method: method.clone(),
+                                    args,
+                                    trace_id: format!("{}", ctx.trace_id),
+                                    request_id: format!("{}", ctx.request_id),
+                                    caller_subject_id: format!("{}", ctx.caller.subject_id),
+                                    deadline_unix: unix_now() + deadline_secs,
+                                };
+                                match dispatcher.invoke(req).await {
+                                    Ok(body) => {
+                                        crate::dispatch::HandlerOutcome::Ok(body.into_bytes())
+                                    }
+                                    Err(crate::plugin::PluginInvokeError::Plugin {
+                                        kind,
+                                        cause,
+                                    }) => crate::dispatch::HandlerOutcome::Err(
+                                        relix_core::types::ErrorEnvelope {
+                                            kind,
+                                            cause: format!("{method}: {cause}"),
+                                            retry_hint: 1,
+                                            retry_after: None,
+                                        },
+                                    ),
+                                    Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                        relix_core::types::ErrorEnvelope {
+                                            kind:
+                                                relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                            cause: format!("{method}: {e}"),
+                                            retry_hint: 1,
+                                            retry_after: None,
+                                        },
+                                    ),
+                                }
+                            }
+                        },
+                    )),
+                );
+                // Advertise the plugin's capability on the
+                // node's manifest so peers discover it. The
+                // environment requirement tag carries the
+                // plugin_id so operators can correlate
+                // descriptors back to the manifest file.
+                let risk = match cap.risk_level.as_str() {
+                    "high" => relix_core::capability::RiskLevel::High,
+                    "medium" => relix_core::capability::RiskLevel::Medium,
+                    _ => relix_core::capability::RiskLevel::Low,
+                };
+                let mut node_desc =
+                    CapabilityDescriptor::unary(&cap.method).with_description(&cap.description);
+                node_desc = node_desc.with_categories(cap.categories.iter().cloned());
+                node_desc = node_desc.with_sensitivity(cap.sensitivity_tags.iter().cloned());
+                node_desc = node_desc.with_risk(risk);
+                node_desc =
+                    node_desc.with_environment_requirements([format!("plugin:{plugin_id}")]);
+                manifest.add_capability(node_desc);
+            }
+            // Mark active + cache the loaded plugin.
+            if let Err(e) =
+                registry.set_status(&loaded.plugin_id, crate::plugin::PluginStatus::Active, None)
+            {
+                tracing::warn!(error = %e, "plugin_host: failed to flip status=active");
+            }
+            if let Err(e) = registry.touch(&loaded.plugin_id) {
+                tracing::warn!(error = %e, "plugin_host: failed to touch last_seen_at");
+            }
+            host_handle.block_on(async {
+                host_state
+                    .plugins
+                    .write()
+                    .await
+                    .insert(loaded.plugin_id.clone(), loaded.clone());
+            });
+            tracing::info!(
+                plugin = %plugin_manifest.plugin.name,
+                plugin_id = %loaded.plugin_id,
+                caps = ?plugin_manifest
+                    .plugin
+                    .capabilities
+                    .provides
+                    .iter()
+                    .map(|c| c.method.as_str())
+                    .collect::<Vec<_>>(),
+                "plugin_host: plugin online"
+            );
+        }
+        // Plugin management capabilities. Always registered,
+        // even when no plugins are loaded — operators get a
+        // consistent surface.
+        register_plugin_management_capabilities(bridge, host_state.clone());
+        let mgmt_caps: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "plugin.list",
+                "List every plugin known to this plugin_host. \
+                 Tab-separated rows + trailing count.",
+                &["read", "plugin", "management"],
+                &["reads:internal"],
+            ),
+            (
+                "plugin.status",
+                "Read one plugin's status by plugin_id. \
+                 Returns pipe-delimited key=value fields.",
+                &["read", "plugin", "management"],
+                &["reads:internal"],
+            ),
+            (
+                "plugin.reload",
+                "Stop and restart one plugin's subprocess. \
+                 Arg: plugin_id. Returns ok\\n.",
+                &["mutate", "plugin", "management"],
+                &["mutate:plugin", "external:subprocess"],
+            ),
+            (
+                "plugin.disable",
+                "Disable one plugin — flip status to disabled and \
+                 kill the subprocess. Arg: plugin_id.",
+                &["mutate", "plugin", "management"],
+                &["mutate:plugin", "external:subprocess"],
+            ),
+        ];
+        for (method, doc, cats, sens) in mgmt_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            desc = desc.with_sensitivity(sens.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        let plugin_count = host_handle.block_on(async { host_state.plugins.read().await.len() });
+        tracing::info!(
+            plugin_dir = %ph_cfg.plugin_dir.display(),
+            plugins_loaded = plugin_count,
+            "plugin_host: registered plugin.list / status / reload / disable"
         );
     }
     if cfg.controller.node_type == "tool" {
