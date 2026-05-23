@@ -104,12 +104,25 @@ never uses `pkill -f relix-*` — only the PIDs it owns.
 The arrows above show what callers reach. There's one
 **responder-initiated** edge: when the AI controller is configured
 with `[ai.memory_peer]`, it dials the memory peer at startup and
-the `ai.chat` handler reads two things from it per request:
-`memory.agent_read` for the frozen-snapshot agent + user memory
-block, and `memory.recent_for_session` for automatic conversation
-history. Both are silent-skip on failure — `ai.chat` never blocks
+the `ai.chat` handler reads up to three things from it per
+request:
+
+- `memory.agent_read` — frozen-snapshot agent + user memory
+  block prepended to the system prompt.
+- `memory.recent_for_session` — automatic conversation history
+  for the current session, merged with any caller-supplied
+  history.
+- `memory.search` — optional RAG retrieval over the vector
+  store across **all past sessions**, gated by
+  `[ai.memory_peer] rag_enabled = true`. The AI node embeds
+  the prompt locally (no libp2p hop) and sends the precomputed
+  vector to `memory.search` as a base64 `embedding=` field so
+  the memory peer skips its own outbound embed call.
+
+All three are silent-skip on failure — `ai.chat` never blocks
 or errors on a degraded memory peer. Wiring detail in
-[`memory.md`](memory.md) under *Automatic history injection*.
+[`memory.md`](memory.md) under *Automatic history injection*
+and *RAG (Retrieval-Augmented Generation)*.
 
 ## Coordinator (durable Task ledger)
 

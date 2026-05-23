@@ -134,6 +134,19 @@ pub struct AiMemoryPeerConfig {
     /// own ceiling on top of this.
     #[serde(default = "default_max_history_turns")]
     pub max_history_turns: usize,
+    /// Whether `ai.chat` performs RAG retrieval against the
+    /// vector memory before invoking the provider. Defaults to
+    /// `false` so existing deployments don't pay the embed +
+    /// search cost without opting in.
+    #[serde(default)]
+    pub rag_enabled: bool,
+    /// Top-K limit for RAG. Defaults to 5.
+    #[serde(default = "default_rag_top_k")]
+    pub rag_top_k: usize,
+    /// Cosine-similarity floor for RAG hits. Defaults to 0.70.
+    /// Hits below this score are dropped before formatting.
+    #[serde(default = "default_rag_min_score")]
+    pub rag_min_score: f32,
 }
 
 fn default_memory_alias() -> String {
@@ -146,6 +159,14 @@ fn default_memory_deadline_secs() -> i64 {
 
 fn default_max_history_turns() -> usize {
     10
+}
+
+fn default_rag_top_k() -> usize {
+    5
+}
+
+fn default_rag_min_score() -> f32 {
+    0.70
 }
 
 fn default_provider() -> String {
@@ -320,6 +341,69 @@ async fn handle_embed(provider: Arc<dyn ChatProvider>, ctx: InvocationCtx) -> Ha
     }
 }
 
+/// Embed the user prompt locally via the controller's own
+/// provider (no libp2p hop — same process, same Arc), then ask
+/// the memory dispatcher to do the actual vector search. Any
+/// provider error (including "embeddings unsupported") returns
+/// `None` so RAG silently skips and `ai.chat` continues. Empty
+/// or missing query vector also returns `None`.
+async fn embed_and_rag(
+    provider: &dyn provider::ChatProvider,
+    disp: &dyn MemoryFetcher,
+    subject_id: &str,
+    prompt: &str,
+) -> Option<String> {
+    let out = match provider
+        .generate_embeddings(provider::EmbedInput {
+            model: String::new(),
+            texts: vec![prompt.to_string()],
+        })
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "ai.chat rag: local embed failed (silent skip)"
+            );
+            return None;
+        }
+    };
+    let query_vec = out.vectors.into_iter().next()?;
+    if query_vec.is_empty() {
+        return None;
+    }
+    disp.fetch_rag(
+        subject_id,
+        &query_vec,
+        disp.rag_top_k(),
+        disp.rag_min_score(),
+    )
+    .await
+}
+
+/// Build the final `system_prompt` from the two optional blocks
+/// the dispatcher might produce. Agent / user memory comes
+/// first; RAG block sits after it. A single blank line separates
+/// them so the model sees two distinct sections.
+fn combine_system_blocks(agent_block: Option<String>, rag_block: Option<String>) -> Option<String> {
+    match (agent_block, rag_block) {
+        (None, None) => None,
+        (Some(a), None) => Some(a),
+        (None, Some(r)) => Some(r),
+        (Some(a), Some(r)) => {
+            let mut out = String::with_capacity(a.len() + r.len() + 2);
+            out.push_str(&a);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(&r);
+            Some(out)
+        }
+    }
+}
+
 /// Combine auto-fetched conversation history with the caller-
 /// supplied `history` field on the wire. Auto-fetched lines come
 /// first (they're the older context), caller-supplied lines are
@@ -388,19 +472,26 @@ async fn handle_chat(
     // hasn't finished yet — that's a silent skip per spec.
     //
     // The same dispatcher also serves automatic conversation
-    // history: if `session_id` is non-empty AND the cell is
-    // populated, call `memory.recent_for_session` and merge the
-    // result with any caller-supplied history. Failure to fetch
-    // is silent — `ai.chat` never fails because memory is
-    // unavailable.
+    // history (memory.recent_for_session) and optional RAG
+    // retrieval (memory.search over the vector store). The
+    // final system prompt is the concatenation of two blocks
+    // when present: agent memory first, then RAG. Both are
+    // silent-skip on any failure — `ai.chat` never fails
+    // because memory is unavailable.
     let (system_prompt, merged_history) = if let Some(disp) = memory_dispatcher.get() {
         let subject_id = ctx.caller.subject_id.to_string();
-        let sys = match disp.fetch(&subject_id).await {
+        let agent_block = match disp.fetch(&subject_id).await {
             Some((agent_mem, user_mem)) => {
                 memory_dispatcher::format_memory_block(&agent_mem, &user_mem)
             }
             None => None,
         };
+        let rag_block = if disp.rag_enabled() {
+            embed_and_rag(provider.as_ref(), disp.as_ref(), &subject_id, prompt).await
+        } else {
+            None
+        };
+        let sys = combine_system_blocks(agent_block, rag_block);
         let auto_history = disp.fetch_history(session_id).await.unwrap_or_default();
         (sys, merge_history(&auto_history, history))
     } else {
@@ -506,6 +597,23 @@ mod tests {
         }
         fn provider_name(&self) -> &'static str {
             "recording"
+        }
+        /// Tests that drive the RAG path need an embed-capable
+        /// provider — return a fixed 4-dim vector per input so
+        /// fetch_rag sees a non-empty `query_vec`.
+        async fn generate_embeddings(
+            &self,
+            input: provider::EmbedInput,
+        ) -> Result<provider::EmbedOutput, ProviderError> {
+            let vectors = input
+                .texts
+                .iter()
+                .map(|_| vec![0.1f32, 0.2, 0.3, 0.4])
+                .collect();
+            Ok(provider::EmbedOutput {
+                model: "recording-embed".into(),
+                vectors,
+            })
         }
     }
 
@@ -720,6 +828,320 @@ mod tests {
             "history should be empty on None fetch: {:?}",
             captured.history
         );
+    }
+
+    /// A MemoryFetcher that records every call and returns
+    /// canned hits / config so RAG paths can be exercised
+    /// without a real memory peer. `embedding_seen` is shared
+    /// with the test so it can verify whether `fetch_rag` was
+    /// invoked without downcasting the Arc<dyn Trait>.
+    struct RagFetcher {
+        rag_on: bool,
+        top_k: usize,
+        min_score: f32,
+        canned: Option<String>,
+        embedding_seen: Arc<std::sync::Mutex<Option<Vec<f32>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryFetcher for RagFetcher {
+        async fn fetch(&self, _subject_id: &str) -> Option<(String, String)> {
+            None
+        }
+        async fn fetch_history(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        fn rag_enabled(&self) -> bool {
+            self.rag_on
+        }
+        fn rag_top_k(&self) -> usize {
+            self.top_k
+        }
+        fn rag_min_score(&self) -> f32 {
+            self.min_score
+        }
+        async fn fetch_rag(
+            &self,
+            _subject_id: &str,
+            embedding: &[f32],
+            _top_k: usize,
+            _min_score: f32,
+        ) -> Option<String> {
+            *self.embedding_seen.lock().unwrap() = Some(embedding.to_vec());
+            self.canned.clone()
+        }
+    }
+
+    /// A provider that fails embedding. Used to verify the
+    /// "provider doesn't support embeddings" silent-skip path.
+    struct NoEmbedProvider {
+        last: Arc<std::sync::Mutex<Option<ChatInput>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for NoEmbedProvider {
+        async fn generate_reply(
+            &self,
+            input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            *self.last.lock().unwrap() = Some(input.clone());
+            Ok(provider::ChatOutput {
+                text: "no-embed".to_string(),
+                provider: "no-embed",
+                model: input.model.clone(),
+                usage: None,
+            })
+        }
+        fn provider_name(&self) -> &'static str {
+            "no-embed"
+        }
+        async fn generate_embeddings(
+            &self,
+            _input: provider::EmbedInput,
+        ) -> Result<provider::EmbedOutput, ProviderError> {
+            Err(ProviderError::Permanent(
+                "no-embed provider does not support embeddings".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn rag_block_injected_into_system_prompt_when_enabled() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(RagFetcher {
+            rag_on: true,
+            top_k: 5,
+            min_score: 0.7,
+            canned: Some(memory_dispatcher::format_rag_block(&[
+                memory_dispatcher::RagHit {
+                    score: 0.92,
+                    target: "agent",
+                    chunk: "deadline is Friday".into(),
+                },
+                memory_dispatcher::RagHit {
+                    score: 0.81,
+                    target: "user",
+                    chunk: "prefers concise replies".into(),
+                },
+            ])),
+            embedding_seen: Arc::new(std::sync::Mutex::new(None)),
+        });
+        cell.set(stub).ok();
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        let sp = captured.system_prompt.expect("system_prompt present");
+        assert!(
+            sp.contains("--- Relevant context from memory ---"),
+            "missing RAG header: {sp}"
+        );
+        assert!(sp.contains("[score: 0.92]"));
+        assert!(sp.contains("deadline is Friday"));
+    }
+
+    #[tokio::test]
+    async fn rag_omitted_when_dispatcher_returns_none() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        // RAG enabled, but every hit is below min_score → dispatcher
+        // returns None — modelled by `canned: None` here. Same
+        // outcome covers "memory peer unreachable" since both paths
+        // resolve to `fetch_rag → None`.
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(RagFetcher {
+            rag_on: true,
+            top_k: 5,
+            min_score: 0.99,
+            canned: None,
+            embedding_seen: Arc::new(std::sync::Mutex::new(None)),
+        });
+        cell.set(stub).ok();
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        assert!(
+            captured.system_prompt.is_none(),
+            "expected no system prompt: {:?}",
+            captured.system_prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn rag_silently_skipped_when_provider_lacks_embeddings() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let provider: Arc<dyn ChatProvider> = Arc::new(NoEmbedProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let embedding_seen = Arc::new(std::sync::Mutex::new(None));
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(RagFetcher {
+            rag_on: true,
+            top_k: 5,
+            min_score: 0.5,
+            // canned would be returned IF fetch_rag were called.
+            // The test asserts it is NOT called by checking the
+            // recorded embedding is None below.
+            canned: Some("--- Relevant context from memory ---\n[score: 0.90] x\n---".into()),
+            embedding_seen: embedding_seen.clone(),
+        });
+        cell.set(stub).ok();
+        let r = handle_chat(provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        assert!(
+            captured.system_prompt.is_none(),
+            "embedding failure must skip RAG entirely: {:?}",
+            captured.system_prompt
+        );
+        assert!(
+            embedding_seen.lock().unwrap().is_none(),
+            "fetch_rag must not be invoked when embedding fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn rag_disabled_skips_embedding_and_search() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let embedding_seen = Arc::new(std::sync::Mutex::new(None));
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(RagFetcher {
+            rag_on: false,
+            top_k: 5,
+            min_score: 0.5,
+            canned: Some("--- Relevant context from memory ---\n[score: 0.95] x\n---".into()),
+            embedding_seen: embedding_seen.clone(),
+        });
+        cell.set(stub).ok();
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        assert!(
+            captured.system_prompt.is_none(),
+            "rag_enabled=false must not produce a system prompt"
+        );
+        assert!(
+            embedding_seen.lock().unwrap().is_none(),
+            "rag_enabled=false must not call fetch_rag"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_memory_precedes_rag_block_in_system_prompt() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        // Dual stub: provides BOTH agent/user memory AND RAG hits.
+        struct DualStub;
+        #[async_trait::async_trait]
+        impl MemoryFetcher for DualStub {
+            async fn fetch(&self, _: &str) -> Option<(String, String)> {
+                Some(("rust uses cargo".into(), "prefers concise replies".into()))
+            }
+            async fn fetch_history(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn rag_enabled(&self) -> bool {
+                true
+            }
+            fn rag_top_k(&self) -> usize {
+                3
+            }
+            fn rag_min_score(&self) -> f32 {
+                0.5
+            }
+            async fn fetch_rag(&self, _: &str, _: &[f32], _: usize, _: f32) -> Option<String> {
+                Some(memory_dispatcher::format_rag_block(&[
+                    memory_dispatcher::RagHit {
+                        score: 0.88,
+                        target: "agent",
+                        chunk: "rag-chunk-1".into(),
+                    },
+                ]))
+            }
+        }
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(DualStub);
+        cell.set(stub).ok();
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        let sp = captured.system_prompt.expect("system_prompt present");
+        let agent_pos = sp
+            .find("--- AGENT MEMORY ---")
+            .expect("agent memory header present");
+        let rag_pos = sp
+            .find("--- Relevant context from memory ---")
+            .expect("rag header present");
+        assert!(
+            agent_pos < rag_pos,
+            "agent memory must precede RAG block: agent_pos={agent_pos} rag_pos={rag_pos}\n{sp}"
+        );
+        // Conversation history goes into ChatInput.history, not
+        // into system_prompt.
+        assert!(captured.history.is_empty() || !captured.history.contains("---"));
+    }
+
+    #[test]
+    fn rag_block_format_matches_spec() {
+        let hits = vec![
+            memory_dispatcher::RagHit {
+                score: 0.923,
+                target: "agent",
+                chunk: "what's the deadline for X?".into(),
+            },
+            memory_dispatcher::RagHit {
+                score: 0.871,
+                target: "user",
+                chunk: "the deadline is Friday".into(),
+            },
+        ];
+        let block = memory_dispatcher::format_rag_block(&hits);
+        assert!(block.starts_with("--- Relevant context from memory ---\n"));
+        assert!(block.contains("[score: 0.92] (agent) what's the deadline for X?"));
+        assert!(block.contains("[score: 0.87] (user) the deadline is Friday"));
+        assert!(block.ends_with("---"));
+    }
+
+    #[test]
+    fn parse_rag_hits_filters_by_min_score_and_skips_count_line() {
+        let body = b"id1\t0.92\thigh score\nid2\t0.55\tlow score\nid3\t0.75\tmid score\ncount=3\n";
+        let mut out = Vec::new();
+        memory_dispatcher::parse_rag_hits(body, "agent", 0.70, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].score, 0.92);
+        assert_eq!(out[0].chunk, "high score");
+        assert_eq!(out[0].target, "agent");
+        assert_eq!(out[1].score, 0.75);
+        assert_eq!(out[1].chunk, "mid score");
+    }
+
+    #[test]
+    fn combine_system_blocks_renders_two_section_layout() {
+        let only_agent = combine_system_blocks(Some("AGENT".into()), None);
+        assert_eq!(only_agent.as_deref(), Some("AGENT"));
+        let only_rag = combine_system_blocks(None, Some("RAG".into()));
+        assert_eq!(only_rag.as_deref(), Some("RAG"));
+        let both = combine_system_blocks(Some("AGENT".into()), Some("RAG".into())).unwrap();
+        assert!(both.starts_with("AGENT"));
+        assert!(both.ends_with("RAG"));
+        // Blank line between the two blocks.
+        assert!(both.contains("AGENT\n\nRAG"));
+        assert!(combine_system_blocks(None, None).is_none());
     }
 
     #[test]

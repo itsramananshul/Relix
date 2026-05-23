@@ -36,6 +36,61 @@ the FTS5 virtual companion. No char cap on individual messages;
 the database grows monotonically until an operator truncates
 it.
 
+### RAG (Retrieval-Augmented Generation)
+
+Multi-turn history is per-session; RAG retrieves across **all
+past sessions** by searching the vector layer. Opt-in per
+deployment.
+
+When `[ai.memory_peer] rag_enabled = true` is set, every
+`ai.chat` call now also:
+
+1. Embeds the user's prompt locally — the AI node owns a
+   `ChatProvider`, so this is a synchronous in-process call,
+   no libp2p hop. Providers without embedding support (default
+   trait impl returns `Permanent("... does not support
+   embeddings")`) silently skip RAG; `ai.chat` proceeds.
+2. Calls `memory.search` on the memory peer once per target
+   (`agent`, then `user`) with the precomputed embedding sent
+   as `embedding=<base64-LE-f32>` in the wire arg. The memory
+   node detects the precomputed field and skips its own
+   outbound embed call — no AI → memory → AI(embed) circular
+   hop.
+3. Merges all hits, drops any below `rag_min_score`, sorts by
+   descending score, takes the top `rag_top_k`, and formats as:
+
+   ```
+   --- Relevant context from memory ---
+   [score: 0.92] (agent) <chunk text>
+   [score: 0.87] (user)  <other chunk>
+   ---
+   ```
+
+4. Injects the block into `system_prompt` after the existing
+   agent/user memory block. **System prompt order:** agent
+   memory → RAG block. Conversation history goes into
+   `ChatInput.history`, not the system prompt.
+
+If no hits clear `rag_min_score`, the RAG block is omitted
+silently. If the memory peer is unreachable, RAG silently
+skips. Like every other memory injection step, `ai.chat`
+never fails because RAG failed.
+
+Configuration knobs in `[ai.memory_peer]`:
+
+| Key             | Default | Meaning                                       |
+|-----------------|---------|-----------------------------------------------|
+| `rag_enabled`   | `false` | Whether the AI node performs RAG retrieval    |
+| `rag_top_k`     | `5`     | Max hits in the formatted block (after merge) |
+| `rag_min_score` | `0.70`  | Cosine-similarity floor; hits below are dropped |
+
+What gets retrieved: chunks written to the persistent memory
+layer via `memory.embed` (directly) or
+`memory.embed_all` (retrofit from `memory.agent_write`
+entries). RAG does **not** index the chat-turn store —
+multi-turn history covers that. Use `memory.embed` to
+explicitly add a memory you want surfaced across sessions.
+
 ### Automatic history injection
 
 When the AI controller is configured with `[ai.memory_peer]`

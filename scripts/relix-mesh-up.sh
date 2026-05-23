@@ -277,11 +277,22 @@ model    = ""
 # dials the memory peer at startup and ai.chat fetches recent
 # conversation turns automatically — flows no longer have to
 # call memory.recent_for_session manually. See docs/memory.md.
+#
+# Optional RAG retrieval (off by default) — when enabled the
+# AI node embeds the user prompt locally and queries the
+# vector memory for semantically related chunks across all
+# past sessions, injecting them as a "Relevant context"
+# block in the system prompt. To enable: set rag_enabled to
+# true and tune rag_top_k / rag_min_score below. See
+# docs/memory.md "RAG (Retrieval-Augmented Generation)".
 [ai.memory_peer]
 addr               = "/ip4/127.0.0.1/tcp/$MEM_PORT"
 alias              = "memory"
 deadline_secs      = 5
 max_history_turns  = 10
+rag_enabled        = false           # set true to enable RAG
+rag_top_k          = 5
+rag_min_score      = 0.70
 
 [peers]
 EOF

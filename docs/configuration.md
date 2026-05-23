@@ -166,6 +166,17 @@ alias              = "memory"
 deadline_secs      = 5
 max_history_turns  = 10              # cap on automatic history fetch
 
+# Optional RAG retrieval (off by default). When enabled the
+# AI node embeds the user prompt locally and asks the memory
+# peer for semantically similar chunks across all past
+# sessions, injecting them as a "Relevant context" block in
+# the system prompt. Failure paths are silent-skip —
+# ai.chat never fails because RAG failed. See
+# docs/memory.md "RAG (Retrieval-Augmented Generation)".
+rag_enabled        = false           # set true to enable RAG
+rag_top_k          = 5               # max hits in the block
+rag_min_score      = 0.70            # cosine floor; below is dropped
+
 [peers]
 ```
 

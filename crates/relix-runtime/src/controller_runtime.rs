@@ -1000,6 +1000,9 @@ async fn populate_ai_memory_cell(
             bundle,
             cfg.deadline_secs,
             cfg.max_history_turns,
+            cfg.rag_enabled,
+            cfg.rag_top_k,
+            cfg.rag_min_score,
         ));
     if cell.set(dispatcher).is_err() {
         tracing::warn!("ai memory dispatcher: cell already populated; spurious second wiring");
