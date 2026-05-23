@@ -148,11 +148,23 @@ provider = "mock"               # mock | openai | openrouter | xai |
                                 # anthropic | gemini | local
 model    = ""                   # caller default; empty = use provider's default_model
 
-# Optional. Wires memory injection into ai.chat.
+# Optional. Wires memory injection into ai.chat. When this
+# block is set, the AI node dials the memory peer at startup
+# and the ai.chat handler does TWO things automatically:
+#
+#   - memory.agent_read    → frozen agent + user memory block
+#                            prepended to the system prompt
+#   - memory.recent_for_session → recent conversation turns
+#                            merged with the caller-supplied
+#                            history field
+#
+# Either is silent-skip on failure; ai.chat never errors
+# because memory is unavailable. See docs/memory.md.
 [ai.memory_peer]
-addr = "/ip4/127.0.0.1/tcp/19711"
-alias = "memory"
-deadline_secs = 5
+addr               = "/ip4/127.0.0.1/tcp/19711"
+alias              = "memory"
+deadline_secs      = 5
+max_history_turns  = 10              # cap on automatic history fetch
 
 [peers]
 ```

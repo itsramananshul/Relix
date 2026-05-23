@@ -9,6 +9,11 @@
 // renders this as a template it can replace the `set prompt = ...`
 // line with the operator-supplied value (or prepend its own).
 // SIMP-016 wire format: `session_id|prompt[|history]`.
+//
+// Note: when `[ai.memory_peer]` is configured the AI node fetches
+// recent conversation history automatically using the session id
+// — no explicit memory.recent_for_session call needed. See
+// docs/memory.md.
 
 set prompt = "sflow-retry-demo|hello"
 

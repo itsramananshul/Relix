@@ -214,6 +214,16 @@ file = "$Policy"
 provider = "$Provider"
 model    = ""
 
+# Outbound memory wiring. With this block set, the AI node
+# dials the memory peer at startup and ai.chat fetches recent
+# conversation turns automatically — flows no longer have to
+# call memory.recent_for_session manually. See docs/memory.md.
+[ai.memory_peer]
+addr               = "/ip4/127.0.0.1/tcp/$MemPort"
+alias              = "memory"
+deadline_secs      = 5
+max_history_turns  = 10
+
 [peers]
 "@
 

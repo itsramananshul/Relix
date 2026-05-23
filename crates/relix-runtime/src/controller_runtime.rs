@@ -993,9 +993,14 @@ async fn populate_ai_memory_cell(
             return;
         }
     };
-    let dispatcher: Arc<dyn crate::nodes::ai::MemoryFetcher> = Arc::new(
-        crate::nodes::ai::MemoryDispatcher::new(mesh, cfg.alias.clone(), bundle, cfg.deadline_secs),
-    );
+    let dispatcher: Arc<dyn crate::nodes::ai::MemoryFetcher> =
+        Arc::new(crate::nodes::ai::MemoryDispatcher::new(
+            mesh,
+            cfg.alias.clone(),
+            bundle,
+            cfg.deadline_secs,
+            cfg.max_history_turns,
+        ));
     if cell.set(dispatcher).is_err() {
         tracing::warn!("ai memory dispatcher: cell already populated; spurious second wiring");
     } else {

@@ -36,6 +36,36 @@ the FTS5 virtual companion. No char cap on individual messages;
 the database grows monotonically until an operator truncates
 it.
 
+### Automatic history injection
+
+When the AI controller is configured with `[ai.memory_peer]`
+(see [`configuration.md`](configuration.md)), the **AI node
+fetches `memory.recent_for_session` itself** for every `ai.chat`
+call — flows no longer need a manual `remote_call` for it.
+
+The flow:
+
+1. The AI node parses the wire arg `session_id|prompt|history`.
+2. If `session_id` is non-empty and the memory dispatcher is
+   wired, it calls `memory.recent_for_session` with
+   `session_id|max_history_turns` (default 10).
+3. The returned `role: text\n` block is merged with the
+   caller-supplied `history` field — auto-fetched lines first
+   (older context), then caller-supplied (newer or extra
+   context).
+4. The merged block is passed to the provider as
+   `ChatInput.history`. OpenAI-compatible providers wrap it
+   into the user message; future providers may project each
+   line as a separate message object.
+
+Failure modes are **silent skip**: memory peer unreachable,
+unparseable response, empty session — all proceed without
+history. `ai.chat` never fails because memory is unavailable.
+
+Configure `max_history_turns` in
+`[ai.memory_peer] max_history_turns = N` to change the cap. The
+memory node enforces its own ceiling on top of this.
+
 ## Layer 2 — Vector memory
 
 Each entry written to persistent agent memory can be embedded

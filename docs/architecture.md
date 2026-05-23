@@ -99,6 +99,18 @@ coordinator → opt-in channels + plugin_host → bridge) and records
 every PID it spawned so Ctrl-C cleanup is exact. The mesh script
 never uses `pkill -f relix-*` — only the PIDs it owns.
 
+### AI → memory back-channel
+
+The arrows above show what callers reach. There's one
+**responder-initiated** edge: when the AI controller is configured
+with `[ai.memory_peer]`, it dials the memory peer at startup and
+the `ai.chat` handler reads two things from it per request:
+`memory.agent_read` for the frozen-snapshot agent + user memory
+block, and `memory.recent_for_session` for automatic conversation
+history. Both are silent-skip on failure — `ai.chat` never blocks
+or errors on a degraded memory peer. Wiring detail in
+[`memory.md`](memory.md) under *Automatic history injection*.
+
 ## Coordinator (durable Task ledger)
 
 Optional fifth peer. The bridge's chat endpoints persist every request

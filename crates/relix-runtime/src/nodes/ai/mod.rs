@@ -112,7 +112,8 @@ impl Default for AiConfig {
 }
 
 /// `[ai.memory_peer]` config — names the memory peer this AI
-/// controller should dial for frozen-snapshot memory.
+/// controller should dial for frozen-snapshot memory AND for
+/// automatic conversation history.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct AiMemoryPeerConfig {
     /// libp2p multiaddr of the memory peer (e.g.
@@ -122,10 +123,17 @@ pub struct AiMemoryPeerConfig {
     /// to `"memory"` so chat code can just say `memory`.
     #[serde(default = "default_memory_alias")]
     pub alias: String,
-    /// Per-call deadline in seconds. `memory.agent_read` is a
-    /// cheap point read; 5s is plenty.
+    /// Per-call deadline in seconds. `memory.agent_read` and
+    /// `memory.recent_for_session` are both cheap point reads;
+    /// 5s is plenty.
     #[serde(default = "default_memory_deadline_secs")]
     pub deadline_secs: i64,
+    /// How many recent turns the AI node asks
+    /// `memory.recent_for_session` for when auto-injecting
+    /// conversation history. Defaults to 10. Memory enforces its
+    /// own ceiling on top of this.
+    #[serde(default = "default_max_history_turns")]
+    pub max_history_turns: usize,
 }
 
 fn default_memory_alias() -> String {
@@ -134,6 +142,10 @@ fn default_memory_alias() -> String {
 
 fn default_memory_deadline_secs() -> i64 {
     5
+}
+
+fn default_max_history_turns() -> usize {
+    10
 }
 
 fn default_provider() -> String {
@@ -308,6 +320,27 @@ async fn handle_embed(provider: Arc<dyn ChatProvider>, ctx: InvocationCtx) -> Ha
     }
 }
 
+/// Combine auto-fetched conversation history with the caller-
+/// supplied `history` field on the wire. Auto-fetched lines come
+/// first (they're the older context), caller-supplied lines are
+/// appended after. A single trailing newline is normalised on
+/// the auto-fetched block so the two segments meet cleanly.
+fn merge_history(auto: &str, caller: &str) -> String {
+    if auto.is_empty() {
+        return caller.to_string();
+    }
+    if caller.is_empty() {
+        return auto.to_string();
+    }
+    let mut out = String::with_capacity(auto.len() + caller.len() + 1);
+    out.push_str(auto);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(caller);
+    out
+}
+
 async fn handle_chat(
     provider: Arc<dyn ChatProvider>,
     default_model: String,
@@ -353,22 +386,31 @@ async fn handle_chat(
     // dispatcher may be unset (cell empty) if the AI controller
     // wasn't configured with a memory peer or its discovery
     // hasn't finished yet — that's a silent skip per spec.
-    let system_prompt = if let Some(disp) = memory_dispatcher.get() {
+    //
+    // The same dispatcher also serves automatic conversation
+    // history: if `session_id` is non-empty AND the cell is
+    // populated, call `memory.recent_for_session` and merge the
+    // result with any caller-supplied history. Failure to fetch
+    // is silent — `ai.chat` never fails because memory is
+    // unavailable.
+    let (system_prompt, merged_history) = if let Some(disp) = memory_dispatcher.get() {
         let subject_id = ctx.caller.subject_id.to_string();
-        match disp.fetch(&subject_id).await {
+        let sys = match disp.fetch(&subject_id).await {
             Some((agent_mem, user_mem)) => {
                 memory_dispatcher::format_memory_block(&agent_mem, &user_mem)
             }
             None => None,
-        }
+        };
+        let auto_history = disp.fetch_history(session_id).await.unwrap_or_default();
+        (sys, merge_history(&auto_history, history))
     } else {
-        None
+        (None, history.to_string())
     };
 
     let input = ChatInput {
         session_id: session_id.to_string(),
         prompt: prompt.to_string(),
-        history: history.to_string(),
+        history: merged_history,
         model: default_model,
         system_prompt,
         ..ChatInput::default()
@@ -561,6 +603,137 @@ mod tests {
         // skipped, provider received the chat input verbatim.
         let captured = recorded.lock().unwrap().clone().unwrap();
         assert!(captured.system_prompt.is_none());
+    }
+
+    /// A canned MemoryFetcher that returns a fixed history block so
+    /// tests can verify the auto-history path.
+    struct HistoryFetcher {
+        history: String,
+        last_session_seen: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryFetcher for HistoryFetcher {
+        async fn fetch(&self, _subject_id: &str) -> Option<(String, String)> {
+            // Not exercising agent+user memory in these tests.
+            None
+        }
+        async fn fetch_history(&self, session_id: &str) -> Option<String> {
+            *self.last_session_seen.lock().unwrap() = Some(session_id.to_string());
+            if self.history.is_empty() {
+                None
+            } else {
+                Some(self.history.clone())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_history_is_injected_into_chat_input() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(HistoryFetcher {
+            history: "user: prior question\nassistant: prior reply\n".into(),
+            last_session_seen: std::sync::Mutex::new(None),
+        });
+        cell.set(stub).ok();
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            ctx(b"sess1|new question|"),
+        )
+        .await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        assert_eq!(captured.session_id, "sess1");
+        assert!(
+            captured.history.contains("user: prior question"),
+            "history not propagated: {:?}",
+            captured.history
+        );
+        assert!(captured.history.contains("assistant: prior reply"));
+    }
+
+    #[tokio::test]
+    async fn auto_history_merges_with_caller_supplied_history() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(HistoryFetcher {
+            history: "user: auto-1\nassistant: auto-2\n".into(),
+            last_session_seen: std::sync::Mutex::new(None),
+        });
+        cell.set(stub).ok();
+        // Caller-supplied history is the third pipe-delimited
+        // field; the merged value should put auto first, caller
+        // second.
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            ctx(b"sess1|q|user: caller-1\n"),
+        )
+        .await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        let auto_pos = captured.history.find("user: auto-1").expect("auto present");
+        let caller_pos = captured
+            .history
+            .find("user: caller-1")
+            .expect("caller present");
+        assert!(
+            auto_pos < caller_pos,
+            "auto-fetched history must come before caller-supplied: {:?}",
+            captured.history
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_history_silently_skipped_when_fetcher_returns_none() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        // HistoryFetcher with empty history returns None — models
+        // both "memory peer unreachable" and "session has no
+        // turns yet" cases.
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(HistoryFetcher {
+            history: String::new(),
+            last_session_seen: std::sync::Mutex::new(None),
+        });
+        cell.set(stub).ok();
+        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        assert!(
+            captured.history.is_empty(),
+            "history should be empty on None fetch: {:?}",
+            captured.history
+        );
+    }
+
+    #[test]
+    fn merge_history_concatenates_with_normalised_newline() {
+        // Auto without trailing newline gets one inserted before
+        // caller content so the boundary lines stay distinct.
+        let m = merge_history("user: a", "user: b\n");
+        assert_eq!(m, "user: a\nuser: b\n");
+        let m = merge_history("user: a\n", "user: b\n");
+        assert_eq!(m, "user: a\nuser: b\n");
+        // Either side empty → the other side wins verbatim.
+        assert_eq!(merge_history("", "x"), "x");
+        assert_eq!(merge_history("x", ""), "x");
+        assert_eq!(merge_history("", ""), "");
     }
 
     #[tokio::test]

@@ -31,11 +31,21 @@ pub trait MemoryFetcher: Send + Sync {
     /// success, or `None` on any failure. The caller silently
     /// skips memory injection on `None`.
     async fn fetch(&self, subject_id: &str) -> Option<(String, String)>;
+
+    /// Return recent conversation turns for a session as a
+    /// `role: text\n` block (oldest first; same wire format as
+    /// `memory.recent_for_session`), or `None` on any failure
+    /// or when no auto-fetch is wired. Default returns `None`
+    /// so existing test stubs keep working unchanged.
+    async fn fetch_history(&self, _session_id: &str) -> Option<String> {
+        None
+    }
 }
 
-/// A long-lived dispatcher that calls `memory.agent_read` on the
-/// memory peer. The AI controller builds this at startup (once)
-/// and the ai.chat handler captures an `Arc<OnceCell<_>>` of it.
+/// A long-lived dispatcher that calls `memory.agent_read` and
+/// `memory.recent_for_session` on the memory peer. The AI
+/// controller builds this once at startup; the ai.chat handler
+/// captures an `Arc<OnceCell<_>>` of it.
 #[derive(Clone)]
 pub struct MemoryDispatcher {
     mesh: MeshClient,
@@ -47,20 +57,34 @@ pub struct MemoryDispatcher {
     /// the heartbeat sender uses — loaded from
     /// `<identity.key_path>.bundle` at controller startup.
     identity: Bundle,
-    /// Per-call deadline. `memory.agent_read` is a cheap read;
-    /// 5s is plenty and keeps the chat call snappy even when
-    /// memory is degraded.
+    /// Per-call deadline. `memory.agent_read` and
+    /// `memory.recent_for_session` are both cheap reads; 5s is
+    /// plenty and keeps the chat call snappy even when memory
+    /// is degraded.
     deadline_secs: i64,
+    /// How many recent turns `fetch_history` requests. Sent
+    /// to `memory.recent_for_session` as the `N` field.
+    max_history_turns: usize,
 }
 
 impl MemoryDispatcher {
-    /// Construct. Caller owns the MeshClient + identity.
-    pub fn new(mesh: MeshClient, alias: String, identity: Bundle, deadline_secs: i64) -> Self {
+    /// Construct. Caller owns the MeshClient + identity. The
+    /// `max_history_turns` value caps how many turns
+    /// `fetch_history` asks for; memory enforces its own ceiling
+    /// (`max_recent` in the memory config).
+    pub fn new(
+        mesh: MeshClient,
+        alias: String,
+        identity: Bundle,
+        deadline_secs: i64,
+        max_history_turns: usize,
+    ) -> Self {
         Self {
             mesh,
             alias,
             identity,
             deadline_secs,
+            max_history_turns,
         }
     }
 }
@@ -104,6 +128,58 @@ impl MemoryFetcher for MemoryDispatcher {
             ResponseResult::StreamHandle(_) => return None,
         };
         parse_agent_read_body(&body)
+    }
+
+    /// Fetch the last N conversation turns for a session. Wire
+    /// format mirrors `memory.recent_for_session`: arg
+    /// `session_id|N`, response body `role: text\n` per turn,
+    /// oldest first. `None` on any transport, decode, or
+    /// responder error — `ai.chat` proceeds without history
+    /// rather than failing.
+    async fn fetch_history(&self, session_id: &str) -> Option<String> {
+        if session_id.is_empty() {
+            return None;
+        }
+        let arg = format!("{session_id}|{}", self.max_history_turns);
+        let envelope = build_request(
+            "memory.recent_for_session",
+            arg.into_bytes(),
+            self.identity.clone(),
+            self.deadline_secs,
+        );
+        let resp_bytes = match self.mesh.call(&self.alias, envelope).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    alias = %self.alias,
+                    session_id = %session_id,
+                    error = %e,
+                    "ai.chat history fetch failed (silent skip)"
+                );
+                return None;
+            }
+        };
+        let resp = decode_response(&resp_bytes).ok()?;
+        match resp.res {
+            ResponseResult::Ok(b) => {
+                let text = std::str::from_utf8(b.as_ref()).ok()?;
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text.to_string())
+                }
+            }
+            ResponseResult::Err(env) => {
+                tracing::debug!(
+                    alias = %self.alias,
+                    session_id = %session_id,
+                    cause = %env.cause,
+                    "ai.chat history peer returned err (silent skip)"
+                );
+                None
+            }
+            ResponseResult::StreamHandle(_) => None,
+        }
     }
 }
 
