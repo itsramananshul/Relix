@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" role="img" aria-label="Vex — Relix mascot">
+  <defs>
+    <radialGradient id="vex-ember" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#FFF7CC"/>
+      <stop offset="35%" stop-color="#FCD34D"/>
+      <stop offset="75%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#7C2D12" stop-opacity="0.95"/>
+    </radialGradient>
+    <radialGradient id="vex-halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#F59E0B" stop-opacity="0.55"/>
+      <stop offset="55%" stop-color="#F59E0B" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#F59E0B" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background frame -->
+  <rect width="240" height="240" rx="36" fill="#0D1117"/>
+
+  <!-- Outer ember halo -->
+  <circle cx="120" cy="120" r="64" fill="url(#vex-halo)"/>
+
+  <!-- Spider legs: 4 per side, angular, two-bend, body-anchored.
+       Drawn first so wings and ember sit on top. -->
+  <g fill="none" stroke="#1F2937" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Right side -->
+    <polyline points="124,118 158,108 196,82"/>
+    <polyline points="125,124 168,124 212,118"/>
+    <polyline points="124,132 168,150 210,168"/>
+    <polyline points="120,140 148,178 168,220"/>
+    <!-- Left side (mirror) -->
+    <polyline points="116,118  82,108  44,82"/>
+    <polyline points="115,124  72,124  28,118"/>
+    <polyline points="116,132  72,150  30,168"/>
+    <polyline points="120,140  92,178  72,220"/>
+  </g>
+
+  <!-- Leg tips: amber points to suggest fire-touched claws -->
+  <g fill="#F59E0B">
+    <circle cx="196" cy="82"  r="2.4"/>
+    <circle cx="212" cy="118" r="2.4"/>
+    <circle cx="210" cy="168" r="2.4"/>
+    <circle cx="168" cy="220" r="2.4"/>
+    <circle cx="44"  cy="82"  r="2.4"/>
+    <circle cx="28"  cy="118" r="2.4"/>
+    <circle cx="30"  cy="168" r="2.4"/>
+    <circle cx="72"  cy="220" r="2.4"/>
+  </g>
+
+  <!-- Wings: triangular mesh panels, fanning up-and-out.
+       Two stacked panels per side give the phoenix silhouette. -->
+  <g stroke="#F59E0B" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">
+    <!-- Right wing - upper panel -->
+    <polygon points="124,108 168,60 200,30 184,72 148,86" fill="#F59E0B" fill-opacity="0.10"/>
+    <!-- Right wing - lower panel -->
+    <polygon points="124,116 152,96 196,86 220,118 184,118 152,112" fill="#F59E0B" fill-opacity="0.08"/>
+    <!-- Right wing - internal mesh lines -->
+    <line x1="124" y1="108" x2="184" y2="72"/>
+    <line x1="148" y1="86"  x2="200" y2="30"/>
+    <line x1="168" y1="60"  x2="148" y2="86"/>
+    <line x1="124" y1="116" x2="196" y2="86"/>
+    <line x1="152" y1="96"  x2="184" y2="118"/>
+    <line x1="152" y1="112" x2="220" y2="118"/>
+
+    <!-- Left wing - upper panel (mirror) -->
+    <polygon points="116,108  72,60  40,30  56,72  92,86" fill="#F59E0B" fill-opacity="0.10"/>
+    <!-- Left wing - lower panel -->
+    <polygon points="116,116  88,96  44,86  20,118  56,118  88,112" fill="#F59E0B" fill-opacity="0.08"/>
+    <!-- Left wing - internal mesh lines -->
+    <line x1="116" y1="108" x2="56"  y2="72"/>
+    <line x1="92"  y1="86"  x2="40"  y2="30"/>
+    <line x1="72"  y1="60"  x2="92"  y2="86"/>
+    <line x1="116" y1="116" x2="44"  y2="86"/>
+    <line x1="88"  y1="96"  x2="56"  y2="118"/>
+    <line x1="88"  y1="112" x2="20"  y2="118"/>
+  </g>
+
+  <!-- Electric blue web-junction nodes at wing vertices -->
+  <g fill="#4FC3F7">
+    <circle cx="200" cy="30"  r="2.8"/>
+    <circle cx="168" cy="60"  r="2.4"/>
+    <circle cx="184" cy="72"  r="2.0"/>
+    <circle cx="148" cy="86"  r="2.0"/>
+    <circle cx="196" cy="86"  r="2.4"/>
+    <circle cx="220" cy="118" r="2.8"/>
+    <circle cx="152" cy="96"  r="1.8"/>
+    <circle cx="184" cy="118" r="2.0"/>
+
+    <circle cx="40"  cy="30"  r="2.8"/>
+    <circle cx="72"  cy="60"  r="2.4"/>
+    <circle cx="56"  cy="72"  r="2.0"/>
+    <circle cx="92"  cy="86"  r="2.0"/>
+    <circle cx="44"  cy="86"  r="2.4"/>
+    <circle cx="20"  cy="118" r="2.8"/>
+    <circle cx="88"  cy="96"  r="1.8"/>
+    <circle cx="56"  cy="118" r="2.0"/>
+  </g>
+
+  <!-- Central glowing ember (the body) -->
+  <circle cx="120" cy="120" r="26" fill="url(#vex-ember)"/>
+  <circle cx="120" cy="120" r="10" fill="#FFFBEB" opacity="0.92"/>
+  <circle cx="116" cy="116" r="3"  fill="#FFFFFF" opacity="0.95"/>
+</svg>
