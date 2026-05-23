@@ -7,66 +7,66 @@ You will end this guide with:
 - Open WebUI (optional) talking to the mesh as if it were an OpenAI server,
 - a successful `tool.web_fetch` against a public URL.
 
-The whole thing takes a few minutes on a working Rust toolchain.
+The whole thing takes a few minutes.
 
-## Prerequisites
+## Install
 
-- **Rust 1.95** or newer (the workspace pins it in `rust-toolchain.toml`).
-  Install via [rustup](https://rustup.rs/) if you don't already have it.
-- **Git** to clone the repo.
-- **A POSIX shell or PowerShell.** Windows users should use PowerShell
-  (the `.ps1` bringup script is Windows-safe and uses no `taskkill`).
-- **Optional**: Docker (only if you want to run Open WebUI in a
-  container) and a provider API key
-  ([OpenRouter](https://openrouter.ai/), [OpenAI](https://platform.openai.com/),
-  Anthropic, etc.) if you want real model responses instead of the
-  deterministic mock provider.
+The simplest path is the install script:
 
-No other system dependencies. libp2p, SQLite (bundled), and reqwest's
-TLS roots are all pulled in via Cargo.
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.sh | bash
 
-## Build
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/itsramananshul/Relix/main/install.ps1 | iex
+```
 
-```bash
+Both install the `relix` binary under `~/.local/bin` (or the value of
+`RELIX_INSTALL_DIR`) and add it to your PATH. Re-run them to upgrade.
+
+Prefer to build from source? You need [rustup](https://rustup.rs)
+and Git:
+
+```sh
 git clone https://github.com/itsramananshul/Relix.git
 cd Relix
 cargo build --workspace
 ```
 
-First build downloads + compiles libp2p and friends; budget 5–10 minutes
-on a cold cache. Subsequent builds are seconds.
+The first build compiles libp2p and friends — budget 5–10 minutes on
+a cold cache. Subsequent builds are seconds.
 
 ## Boot the mesh
 
-The bringup script spawns four real OS processes — a memory peer, an AI
-peer, a tool peer, and the HTTP bridge — and parks until you press
-Ctrl-C.
+```sh
+# Default — mock AI provider, no credentials.
+relix boot
 
-```powershell
-# Windows (PowerShell)
-.\scripts\relix-mesh-up.ps1
+# Real provider — set the env var first.
+export OPENROUTER_API_KEY='<your key>'   # or OPENAI_API_KEY, ANTHROPIC_API_KEY, ...
+relix boot --provider openrouter
 ```
 
-```bash
-# macOS / Linux / Git Bash
-./scripts/relix-mesh-up.sh
+The boot script spawns the mesh's controller processes (memory, ai,
+tool, coordinator) plus the HTTP bridge, waits for each to come up,
+and opens the dashboard in your default browser. Channels and plugins
+are opt-in:
+
+```sh
+relix boot --with-telegram                    # needs RELIX_TELEGRAM_BOT_TOKEN
+relix boot --with-discord                     # needs RELIX_DISCORD_BOT_TOKEN + ..._CHANNEL_ID
+relix boot --with-slack                       # needs RELIX_SLACK_BOT_TOKEN + ..._CHANNEL_ID
+relix boot --with-plugins --plugin-dir ./plugins
 ```
 
-The default provider is `mock` (deterministic, no API key needed). To
-pick a real provider:
+`relix boot` blocks on the bridge in the foreground. In another
+terminal: `relix status` to see what's up, `relix stop` to tear it
+down.
 
-```powershell
-.\scripts\relix-mesh-up.ps1 -Provider openrouter
-$env:OPENROUTER_API_KEY = '<your key>'
-```
-
-```bash
-./scripts/relix-mesh-up.sh --provider openrouter
-export OPENROUTER_API_KEY='<your key>'
-```
-
-(The env var must be set in the shell that *runs the script*, since
-the AI peer is the only process that ever sees it.)
+From-source users can call the underlying scripts directly:
+`scripts/relix-mesh-up.ps1` on Windows, `scripts/relix-mesh-up.sh`
+elsewhere. Both accept the same `--with-*` env vars `relix boot`
+translates into.
 
 When the mesh is up the script prints something like:
 
@@ -281,9 +281,11 @@ affected.
 ## What next
 
 - [`architecture.md`](architecture.md) — how the pieces fit together.
-- [`operator-guide.md`](operator-guide.md) — running the mesh, logs, common failures.
-- [`flows-and-sol.md`](flows-and-sol.md) — write your own SOL flow.
-- [`task-recovery.md`](task-recovery.md) — operator playbook for failed / interrupted tasks.
-- [`runtime-lifecycle.md`](runtime-lifecycle.md) — the canonical task status diagram.
-- [`capability-discovery.md`](capability-discovery.md) — discovery model + planner foundations.
+- [`configuration.md`](configuration.md) — every config file, env var, and TOML key.
+- [`sol.md`](sol.md) — write your own flow in SOL or .sflow.
+- [`channels/index.md`](channels/index.md) — connect Telegram, Discord, or Slack.
+- [`plugins.md`](plugins.md) — ship a plugin in Rust or Python.
+- [`coordination.md`](coordination.md) — multi-agent tasks, delegation, messaging.
+- [`memory.md`](memory.md) — chat history, vector search, persistent agent memory.
+- [`security.md`](security.md) — threat model + admission pipeline.
 - [`current-limitations.md`](current-limitations.md) — read before relying on Relix in production.
