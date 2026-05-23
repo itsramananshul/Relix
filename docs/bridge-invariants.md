@@ -122,7 +122,7 @@ Before merging a bridge change, confirm:
   bridge participates in.
 - [`task-api.md`](task-api.md) — the HTTP surface the bridge
   exposes today.
-- [`coordinator.md`](coordinator.md) — where task state actually
+- [`coordination.md`](coordination.md) — where task state actually
   lives.
 - [`runtime-observability.md`](runtime-observability.md) — the
   observability primitives the bridge surfaces (it does not

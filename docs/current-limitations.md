@@ -20,7 +20,7 @@ where a limitation here corresponds to a SIMP entry there, it's cited.
 
 The Coordinator node-type owns a durable SQLite ledger of Task records
 + per-attempt execution rows + events (see
-[`coordinator.md`](coordinator.md) and
+[`coordination.md`](coordination.md) and
 [`attempt-lineage.md`](attempt-lineage.md)). It does **not**:
 
 - Watch for peer health.

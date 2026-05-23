@@ -6,7 +6,7 @@ piece of work — a chat turn, a tool flow, a future scheduled agent run
 
 This document covers the schema, the wire format of the five `task.*`
 capabilities, and the state-transition convention. For the *peer* that
-owns the ledger see [`coordinator.md`](coordinator.md); for what
+owns the ledger see [`coordination.md`](coordination.md); for what
 "checkpointed re-run" actually delivers see
 [`replay-model.md`](replay-model.md).
 
@@ -336,7 +336,7 @@ See [`current-limitations.md`](current-limitations.md). Highlights:
 
 ## See also
 
-- [`coordinator.md`](coordinator.md) — the peer.
+- [`coordination.md`](coordination.md) — the peer.
 - [`replay-model.md`](replay-model.md) — what "checkpointed re-run"
   actually delivers.
 - [`runtime-lifecycle.md`](runtime-lifecycle.md) — canonical status

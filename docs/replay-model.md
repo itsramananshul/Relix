@@ -191,7 +191,7 @@ about the alpha's "replay", it's wrong.
 
 ## See also
 
-- [`coordinator.md`](coordinator.md) — the peer.
+- [`coordination.md`](coordination.md) — the peer.
 - [`task-runtime.md`](task-runtime.md) — schema + wire.
 - [`current-limitations.md`](current-limitations.md) — global honesty list.
 - [`flows-and-sol.md`](flows-and-sol.md) — why SIMP-001 / SIMP-014 are

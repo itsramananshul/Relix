@@ -107,7 +107,7 @@ for the full design.
 
 Lives on the coordinator node. Six capabilities + a 30 s background
 loop that fires due jobs through the same `task.create` path the
-rest of the mesh uses. See [cron.md](cron.md) for the full design.
+rest of the mesh uses. See [scheduler.md](scheduler.md) for the full design.
 
 | Method | Status | Notes |
 |---|---|---|

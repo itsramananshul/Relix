@@ -687,7 +687,7 @@ Operator playbook with concrete CLI invocations for each case is in
 (what `retry_policy` / `max_retries` mean today, why nothing
 auto-retries yet) is in [`docs/retry-model.md`](retry-model.md).
 
-See also: [`docs/coordinator.md`](coordinator.md),
+See also: [`docs/coordination.md`](coordination.md),
 [`docs/task-runtime.md`](task-runtime.md),
 [`docs/attempt-lineage.md`](attempt-lineage.md),
 [`docs/runtime-lifecycle.md`](runtime-lifecycle.md),

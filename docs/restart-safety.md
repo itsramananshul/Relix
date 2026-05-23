@@ -263,7 +263,7 @@ rebuild.
 
 - [`failure-modes.md`](failure-modes.md) — per-component
   recovery steps when one piece is unreachable.
-- [`coordinator.md`](coordinator.md) — durable Task ledger
+- [`coordination.md`](coordination.md) — durable Task ledger
   schema + lifecycle details.
 - [`channel-node-architecture.md`](channel-node-architecture.md)
   — SqliteSessionStore design + restart-safety contract.

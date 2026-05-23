@@ -215,7 +215,7 @@ admission pipeline.
   model.
 - [`docs/flows-and-sol.md`](flows-and-sol.md) — SOL semantics; what
   a planner would have to produce.
-- [`docs/coordinator.md`](coordinator.md) — the Task layer a
+- [`docs/coordination.md`](coordination.md) — the Task layer a
   planner consults to know what's been tried.
 - [`crates/relix-core/src/capability.rs`](../crates/relix-core/src/capability.rs)
   — the descriptor type.

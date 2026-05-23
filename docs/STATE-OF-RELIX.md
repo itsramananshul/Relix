@@ -312,7 +312,7 @@ the next fire when the previous task is still `running`, one-shot
 jobs are auto-disabled after their first fire. Schedule formats:
 duration (`30m`, `2h`, `1d`, `7d`), 5-field cron (`0 9 * * 1`),
 RFC 3339 one-shot (`2026-06-01T09:00:00Z`). See
-[cron.md](cron.md) for the full design.
+[scheduler.md](scheduler.md) for the full design.
 
 ### 3.11 `router` node — control plane
 
@@ -553,7 +553,7 @@ optionally posts approval-required notifications to a configured
 operator chat. Bridge endpoints `GET /v1/telegram/status` and
 `GET /v1/telegram/messages/recent` proxy the channel's read
 capabilities; the dashboard `#/telegram` page renders both as live
-cards. Setup is documented in `docs/telegram.md`. Boot via
+cards. Setup is documented in `docs/channels/telegram.md`. Boot via
 `scripts/relix-mesh-up.ps1` with `$env:RELIX_TELEGRAM = "1"` and
 `$env:RELIX_TELEGRAM_BOT_TOKEN = "<token>"`.
 
@@ -581,7 +581,7 @@ same data on the terminal. Boot via
 `$env:RELIX_DISCORD = "1"`,
 `$env:RELIX_DISCORD_BOT_TOKEN = "<token>"`, and
 `$env:RELIX_DISCORD_CHANNEL_ID = "<channel-snowflake>"`.
-Setup is documented in `docs/discord.md`.
+Setup is documented in `docs/channels/discord.md`.
 
 The Discord controller deliberately ships smaller than Telegram:
 no Gateway/WebSocket client (REST polling only), no webhook
@@ -627,7 +627,7 @@ data on the terminal. Boot via `scripts/relix-mesh-up.ps1` with
 `$env:RELIX_SLACK = "1"`,
 `$env:RELIX_SLACK_BOT_TOKEN = "xoxb-..."`, and
 `$env:RELIX_SLACK_CHANNEL_ID = "C01234567"`. Setup is documented
-in `docs/slack.md`.
+in `docs/channels/slack.md`.
 
 The Slack controller deliberately ships smaller than Telegram:
 no Socket Mode WebSocket, no Events API webhook receiver, no

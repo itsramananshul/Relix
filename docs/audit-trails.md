@@ -245,7 +245,7 @@ Honest list of out-of-scope items:
 
 ## See also
 
-- [`coordinator.md`](coordinator.md) — the Task ledger that points
+- [`coordination.md`](coordination.md) — the Task ledger that points
   at the flow logs.
 - [`event-vocabulary.md`](event-vocabulary.md) — the chronicle
   events the Coordinator records.

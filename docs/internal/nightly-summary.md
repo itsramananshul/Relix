@@ -204,7 +204,7 @@ docs/runtime-lifecycle.md                               # attempt-lineage cross-
 docs/task-recovery.md                                   # task.retry recipe
 docs/retry-model.md                                     # rewrite TL;DR for task.retry
 docs/current-limitations.md                             # C2 reframing
-docs/coordinator.md                                     # event vocabulary refresh
+docs/coordination.md                                     # event vocabulary refresh
 README.md                                               # task lifecycle docs
 ```
 

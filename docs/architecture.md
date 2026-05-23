@@ -91,7 +91,7 @@ The bridge does not own Task state — it just **writes through** to
 the Coordinator. The Coordinator does not own flow execution — it
 just records what other peers attempt. Operators inspect via
 `relix-cli task list/get`; details in
-[`coordinator.md`](coordinator.md), [`task-runtime.md`](task-runtime.md),
+[`coordination.md`](coordination.md), [`task-runtime.md`](task-runtime.md),
 [`replay-model.md`](replay-model.md).
 
 Fail-soft: a missing or unreachable Coordinator does not block,

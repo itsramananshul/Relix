@@ -325,7 +325,7 @@ crates/
 
 ## See also
 
-- [`docs/coordinator.md`](coordinator.md) — the Task ledger this
+- [`docs/coordination.md`](coordination.md) — the Task ledger this
   channel writes into.
 - [`docs/task-runtime.md`](task-runtime.md) — wire format for the
   `task.*` capabilities the channel consumes.

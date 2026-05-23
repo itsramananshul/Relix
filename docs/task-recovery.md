@@ -194,4 +194,4 @@ this kind of pipeline.
 - [`retry-model.md`](retry-model.md) — what `task.retry` actually
   does and why nothing auto-retries today.
 - [`task-runtime.md`](task-runtime.md) — schema and wire format.
-- [`coordinator.md`](coordinator.md) — the peer and its trust model.
+- [`coordination.md`](coordination.md) — the peer and its trust model.
