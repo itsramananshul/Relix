@@ -109,6 +109,7 @@ mod memory_embed;
 mod messaging;
 mod metrics;
 mod openai;
+mod plugins;
 mod policy_denials;
 mod policy_simulate;
 mod secrets;
@@ -477,6 +478,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/discord/messages/recent", get(discord::messages_recent))
         .route("/v1/slack/status", get(slack::status))
         .route("/v1/slack/messages/recent", get(slack::messages_recent))
+        .route("/v1/plugins", get(plugins::list))
+        .route("/v1/plugins/:plugin_id", get(plugins::status))
+        .route("/v1/plugins/:plugin_id/reload", post(plugins::reload))
+        .route("/v1/plugins/:plugin_id/disable", post(plugins::disable))
         .route("/v1/telegram/status", get(telegram::status))
         .route(
             "/v1/telegram/messages/recent",

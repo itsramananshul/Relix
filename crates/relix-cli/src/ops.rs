@@ -283,6 +283,45 @@ pub enum Cmd {
     /// subject's per-target vector store, run a semantic search,
     /// or re-embed all existing entries.
     Memory(MemoryArgs),
+    /// Plugin host management — list / status / reload / disable
+    /// the plugins loaded by a plugin_host node.
+    Plugin(PluginArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PluginArgs {
+    #[command(subcommand)]
+    pub cmd: PluginCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginCmd {
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Status {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long = "plugin-id")]
+        plugin_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Reload {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long = "plugin-id")]
+        plugin_id: String,
+    },
+    Disable {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long = "plugin-id")]
+        plugin_id: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -747,6 +786,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Discord(args) => discord_run(args.cmd).await,
         Cmd::Slack(args) => slack_run(args.cmd).await,
         Cmd::Memory(args) => memory_run(args.cmd).await,
+        Cmd::Plugin(args) => plugin_run(args.cmd).await,
     }
 }
 
@@ -3269,6 +3309,153 @@ async fn delegate_list(
     Ok(())
 }
 
+// ── plugin subcommands ──────────────────────────────────────
+
+async fn plugin_run(cmd: PluginCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        PluginCmd::List { bridge, json } => plugin_list_cmd(&bridge, json).await,
+        PluginCmd::Status {
+            bridge,
+            plugin_id,
+            json,
+        } => plugin_status_cmd(&bridge, &plugin_id, json).await,
+        PluginCmd::Reload { bridge, plugin_id } => plugin_reload_cmd(&bridge, &plugin_id).await,
+        PluginCmd::Disable { bridge, plugin_id } => plugin_disable_cmd(&bridge, &plugin_id).await,
+    }
+}
+
+async fn plugin_list_cmd(bridge: &str, json_out: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let body = http_get_string(&format!("{base}/v1/plugins")).await?;
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let plugins = v
+        .get("plugins")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if plugins.is_empty() {
+        println!("(no plugins)");
+        return Ok(());
+    }
+    println!(
+        "{:<18} {:<24} {:<10} {:<12} caps",
+        "plugin_id", "name", "version", "status"
+    );
+    for p in plugins {
+        let id = p.get("plugin_id").and_then(|x| x.as_str()).unwrap_or("");
+        let name = p.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        let version = p.get("version").and_then(|x| x.as_str()).unwrap_or("");
+        let status = p.get("status").and_then(|x| x.as_str()).unwrap_or("");
+        let caps = p
+            .get("capabilities_count")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        println!(
+            "{:<18} {:<24} {:<10} {:<12} {caps}",
+            short(id, 18),
+            short(name, 24),
+            short(version, 10),
+            short(status, 12)
+        );
+    }
+    Ok(())
+}
+
+async fn plugin_status_cmd(
+    bridge: &str,
+    plugin_id: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let body = http_get_string(&format!("{base}/v1/plugins/{plugin_id}")).await?;
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    println!(
+        "plugin_id      {}",
+        v.get("plugin_id").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "name           {}",
+        v.get("name").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "version        {}",
+        v.get("version").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "status         {}",
+        v.get("status").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "registered_at  {}",
+        v.get("registered_at").and_then(|x| x.as_i64()).unwrap_or(0)
+    );
+    let last = v.get("last_seen_at").and_then(|x| x.as_i64());
+    println!(
+        "last_seen_at   {}",
+        last.map(|t| t.to_string()).unwrap_or_else(|| "—".into())
+    );
+    let caps = v
+        .get("capabilities")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    println!("capabilities   {caps}");
+    let err = v
+        .get("error_message")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if !err.is_empty() {
+        println!("error_message  {err}");
+    }
+    Ok(())
+}
+
+async fn plugin_reload_cmd(bridge: &str, plugin_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/plugins/{plugin_id}/reload");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).send().await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    println!("{body}");
+    Ok(())
+}
+
+async fn plugin_disable_cmd(
+    bridge: &str,
+    plugin_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/plugins/{plugin_id}/disable");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).send().await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    println!("{body}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3618,3 +3805,4 @@ mod tests {
         assert!(r2.recent_latencies.is_empty());
     }
 }
+
