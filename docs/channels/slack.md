@@ -14,33 +14,51 @@ messages newer than its last-seen `ts`. Simpler operationally;
 the trade-off is a 2-second baseline cadence between message
 arrival and visible reply.
 
-## What you need to run it
+## Setup
 
-1. **A Slack app + Bot User OAuth Token**:
-   - Create an app at <https://api.slack.com/apps>.
-   - Under **OAuth & Permissions**, add the **Bot Token Scopes**
-     below.
-   - **Install to Workspace** — copy the **Bot User OAuth Token**
-     (starts with `xoxb-…`). Treat it like an API key.
-2. **A target channel id**: in the Slack client, right-click the
-   channel → **View channel details** → bottom of the panel,
-   copy the **Channel ID**. Slack channel ids start with `C`
-   (public), `G` (private), or `D` (IM).
-3. **Required Bot Token Scopes**:
+### 1. Create the Slack app
+
+1. Go to <https://api.slack.com/apps> and click
+   **Create New App → From scratch**.
+2. Name the app (e.g. "Relix"), pick the target workspace, create.
+3. On the app's **OAuth & Permissions** page, under **Bot Token
+   Scopes**, add:
    - `channels:history` — read messages in public channels.
-   - `groups:history` — read messages in private channels (only
-     if you target a `G…` channel).
+   - `chat:write` — post messages as the bot.
    - `im:history` — read direct-message channels (only if you
      target a `D…` channel).
-   - `chat:write` — post messages as the bot.
+   - `im:write` — open / write to DM channels.
+   - `app_mentions:read` — receive `@app` mention events when the
+     bot is mentioned in a channel.
+4. (Optional, depending on target channel)
+   - `groups:history` — read messages in private channels (target
+     a `G…` channel).
    - `users:read` — populate `username` on inbound messages
      (Slack does not include display names on every event;
      `users.info` lookup needs this scope).
-4. **Bot in the channel**: invite the bot to the channel with
-   `/invite @<botname>`. Without that, `conversations.history`
-   returns `not_in_channel`.
+5. Scroll up, **Install to Workspace**, accept the permission
+   prompt.
+6. Copy the **Bot User OAuth Token** that Slack returns — it
+   starts with `xoxb-…`. Treat it like an API key.
 
-## Configuration
+### 2. Find the target channel id
+
+In the Slack client:
+
+1. Right-click the channel → **View channel details**.
+2. Bottom of the panel → **Channel ID** (a "Copy" button is
+   provided).
+
+Slack channel ids start with `C` (public), `G` (private), or `D`
+(IM).
+
+### 3. Invite the bot to the channel
+
+In the target channel: `/invite @<your-bot-name>`. Without that,
+`conversations.history` returns `not_in_channel` and the
+controller stays offline.
+
+### 4. Configure + boot
 
 Three env vars before booting the mesh:
 
@@ -55,6 +73,14 @@ Optional:
 ```
 RELIX_SLACK_OPERATOR_USER_ID=U01234567
 RELIX_SLACK_ALLOWED_USERS=U01,U02      # comma-separated user_ids
+```
+
+Boot:
+
+```powershell
+relix boot --with-slack
+# or, equivalently:
+# .\scripts\relix-mesh-up.ps1
 ```
 
 The mesh boot script (`scripts/relix-mesh-up.ps1`) reads these
@@ -89,6 +115,17 @@ The raw `xoxb-…` token never appears in any config file — only
 the `token_env` indirection. Without `RELIX_SLACK_BOT_TOKEN` set,
 the controller still boots but `auth.test` fails and the bot
 stays offline (the dashboard reports `online=false`).
+
+### 5. Verify
+
+```
+GET http://127.0.0.1:19791/v1/slack/status
+```
+
+returns the controller's view of `auth.test`. Send a message in
+the channel from a non-bot account; the bot should reply within
+`poll_interval_secs`, and `GET /v1/slack/messages/recent` should
+list the inbound row.
 
 ## Polling model — no Socket Mode
 
@@ -215,3 +252,14 @@ Slack has no REST API for posting a typing indicator. The
 `user_typing` event exists on the Events API / Socket Mode
 streams (inbound only). The controller deliberately omits the
 typing call rather than inventing one.
+
+See [`../current-limitations.md`](../current-limitations.md) for
+the alpha-wide list of deferred features.
+
+## See also
+
+- [index.md](index.md) — overview of all three channels.
+- [`../channel-node-architecture.md`](../channel-node-architecture.md) —
+  the design contract.
+- [`../configuration.md`](../configuration.md) — full env-var
+  reference for the mesh boot script.

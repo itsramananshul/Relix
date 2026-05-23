@@ -17,9 +17,10 @@ For every inbound text message:
 1. Derives a stable `subject_id` for the sender by hashing
    `telegram:<user_id>:<chat_id>` with blake3. Same user in the same
    chat is always the same subject across restarts.
-2. Records the message in a bounded in-memory ring (capacity 200) so
-   the dashboard can render the recent-messages widget without
-   touching the AI / memory peers.
+2. Records the message in a bounded in-memory ring (default capacity
+   200, configurable via `[telegram] messages_ring_capacity`) so the
+   dashboard can render the recent-messages widget without touching
+   the AI / memory peers.
 3. Enforces the `allowed_users` permit list (empty list = allow
    everyone). Unauthorised callers get a static reply and no further
    dispatch happens.
@@ -35,16 +36,32 @@ For every inbound text message:
    again in a moment."*
 6. When an `operator_chat_id` is configured a background notifier
    polls the coordinator every 15 s for tasks in `awaiting_input`
-   and posts a one-line "⏳ Approval required" message (deduped
+   and posts a one-line "Approval required" message (deduped
    across polls).
 
 ## Setup
 
 ### 1. Mint a bot token with @BotFather
 
-Open Telegram, message [@BotFather](https://t.me/BotFather), run
-`/newbot`, and follow the prompts. Copy the token it gives you. It
-looks like `1234567:ABCDEFghijklmnop`.
+Open Telegram and message [@BotFather](https://t.me/BotFather):
+
+1. Send `/newbot`.
+2. Pick a **display name** (this is what users see at the top of the
+   chat — e.g. "My Relix Agent").
+3. Pick a **username** that ends in `bot` and is globally unique on
+   Telegram — e.g. `myrelix_dev_bot`.
+4. BotFather replies with the bot's HTTP API token. It looks like
+   `1234567:ABCDEFghijklmnop`. **Copy it now** — BotFather will not
+   show it again without `/revoke`.
+
+Optionally tighten the bot from BotFather:
+
+- `/setprivacy` → **Disable** if you want the bot to read all group
+  messages (it defaults to "Enabled", which means it only sees
+  messages addressed to it via `@<username>` or replies). For the 1:1
+  DM flow Relix ships in alpha you can leave it on.
+- `/setjoingroups` → **Disable** if you want to keep the bot a
+  pure-DM bot.
 
 ### 2. Decide where the token lives
 
@@ -71,7 +88,10 @@ Windows / PowerShell:
 ```powershell
 $env:RELIX_TELEGRAM = "1"
 $env:RELIX_TELEGRAM_BOT_TOKEN = "<your-bot-token>"
-.\scripts\relix-mesh-up.ps1
+$env:RELIX_TELEGRAM_ALLOWED_USERS = "<your-numeric-user-id>"
+relix boot --with-telegram
+# or, equivalently:
+# .\scripts\relix-mesh-up.ps1
 ```
 
 When `RELIX_TELEGRAM = 1` the script:
@@ -84,9 +104,10 @@ When `RELIX_TELEGRAM = 1` the script:
   policy file,
 - starts the telegram controller alongside the other nodes.
 
-The mesh banner reports the telegram port and whether the token env
-var is set. If the token is missing the controller boots but its
-long-poll loop idles — the dashboard shows `online=false`.
+The mesh banner reports the telegram port (default `tcp/19715`) and
+whether the token env var is set. If the token is missing the
+controller boots but its long-poll loop idles — the dashboard shows
+`online=false`.
 
 ### 4. Verify
 
@@ -140,6 +161,10 @@ static reply:
 The reply still records the inbound in the ring so the operator can
 see who attempted to talk to the bot.
 
+To find your own numeric user_id: message `@userinfobot` (or any
+similar id bot) on Telegram, or read it out of
+`GET /v1/telegram/messages/recent` after you send a test message.
+
 ## Approval notifications
 
 Set `RELIX_TELEGRAM_OPERATOR_CHAT_ID` to a numeric chat_id (your
@@ -150,7 +175,7 @@ by default; tweak via `[telegram] approval_poll_interval_secs`.
 The notification body:
 
 ```
-⏳ Approval required
+Approval required
 Task: <task_id>
 Agent: (see dashboard)
 Action: (awaiting_input)
@@ -164,6 +189,9 @@ doesn't match the configured `operator_chat_id`.
 
 ## Slash commands
 
+The commands the controller actually understands (see
+`crates/relix-runtime/src/nodes/telegram/commands.rs`):
+
 | Command | What it does |
 |---|---|
 | `/start` | Welcome message explaining what the bot does. |
@@ -171,8 +199,8 @@ doesn't match the configured `operator_chat_id`.
 | `/status` | Mesh-side summary: bot online state, messages seen, allow-list mode. |
 | `/memory` | Show the caller's persistent agent + user memory blobs. |
 | `/forget` | Clear the caller's agent + user memory. |
-| `/approve <task_id>` | Mark a `awaiting_input` task as `running` and append a `task.approval_granted` chronicle event. Operator-only. |
-| `/reject <task_id>` | Flip a `awaiting_input` task to `failed` and append `task.approval_rejected`. Operator-only. |
+| `/approve <task_id>` | Mark an `awaiting_input` task as `running` and append a `task.approval_granted` chronicle event. Operator-only. |
+| `/reject <task_id>` | Flip an `awaiting_input` task to `failed` and append `task.approval_rejected`. Operator-only. |
 
 Telegram appends `@<bot_username>` to slash commands sent in group
 chats; the parser strips it transparently. Command heads are
@@ -199,6 +227,22 @@ swallowed.
   this). Updates that arrive during a restart are buffered by
   Telegram (24h) and picked up on next poll.
 
+## HTTP / CLI surfaces
+
+Bridge endpoints:
+
+```
+GET /v1/telegram/status
+GET /v1/telegram/messages/recent?limit=20
+```
+
+CLI (one-shot snapshots):
+
+```
+relix-cli ops telegram status
+relix-cli ops telegram messages --limit 50
+```
+
 ## Reading the wire
 
 The two read capabilities the bridge proxies:
@@ -215,3 +259,14 @@ The two read capabilities the bridge proxies:
 Both bodies are stable across releases; the bridge JSON layer is the
 recommended consumer (the wire format is documented here for SOL
 flows that want to call the capabilities directly).
+
+## See also
+
+- [index.md](index.md) — overview of all three channels.
+- [`../channel-node-architecture.md`](../channel-node-architecture.md) —
+  the design contract.
+- [`../current-limitations.md`](../current-limitations.md) — what
+  alpha deliberately omits (group chats, media, multi-channel
+  session unification).
+- [`../configuration.md`](../configuration.md) — full env-var
+  reference for the mesh boot script.

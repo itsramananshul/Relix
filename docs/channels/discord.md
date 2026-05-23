@@ -13,27 +13,46 @@ uses REST polling against
 operationally; the trade-off is a 2-second cadence (configurable)
 between message arrival and visible reply.
 
-## What you need to run it
+## Setup
 
-1. **A Discord bot token** — create an application at
-   <https://discord.com/developers/applications>, enable a Bot
-   user, copy the token from the **Bot** tab. Treat it like an
-   API key.
-2. **A target channel id** — right-click the channel in the
-   Discord client (with Developer Mode enabled in user settings
-   → Advanced → Developer Mode), choose **Copy Channel ID**.
-   Discord snowflakes are 17–19 digits today.
-3. **Bot permissions in that channel** — the bot needs
-   `View Channel`, `Send Messages`, `Read Message History`. The
-   Developer Portal's **OAuth2 URL Generator** can produce an
-   install URL with those scopes / permissions.
-4. **Message Content Intent** — enable it under the Bot tab.
-   Without it Discord returns empty `content` strings to the
-   REST poll and the controller will see nothing usable.
+### 1. Create the Discord application
 
-## Configuration
+1. Go to the **Discord Developer Portal**:
+   <https://discord.com/developers/applications>.
+2. Click **New Application**, give it a name (e.g. "Relix"), accept
+   the developer terms.
+3. In the left sidebar choose **Bot**. The portal mints a bot user
+   for the application automatically.
+4. Click **Reset Token** (or **Copy** if it's a fresh app) to get
+   the bot token. **Copy it now** — Discord only shows it once.
+   Treat it like an API key.
+5. **Privileged Gateway Intents**: on the same Bot page enable
+   **Message Content Intent**. Without it Discord returns empty
+   `content` strings to the REST poll and the controller will see
+   nothing usable.
 
-Two env vars before booting the mesh:
+### 2. Find the target channel id
+
+In the Discord client:
+
+1. **User Settings → Advanced → Developer Mode** → On.
+2. Right-click the channel you want the bot to listen on →
+   **Copy Channel ID**. Discord snowflakes are 17–19 digits today
+   and are strings end-to-end (they exceed the JS safe-int range).
+
+### 3. Invite the bot to the channel
+
+In the Developer Portal:
+
+1. **OAuth2 → URL Generator**, tick scope **`bot`**.
+2. Under **Bot Permissions** tick **View Channel**, **Send
+   Messages**, **Read Message History**.
+3. Copy the generated install URL, paste it in a browser logged into
+   the target server, choose the server, authorise.
+
+### 4. Configure + boot
+
+Three env vars before booting the mesh:
 
 ```
 RELIX_DISCORD=1
@@ -46,6 +65,14 @@ Optional:
 ```
 RELIX_DISCORD_OPERATOR_USER_ID=<discord-user-id>
 RELIX_DISCORD_ALLOWED_USERS=42,1234       # comma-separated user_ids
+```
+
+Boot:
+
+```powershell
+relix boot --with-discord
+# or, equivalently:
+# .\scripts\relix-mesh-up.ps1
 ```
 
 The mesh boot script (`scripts/relix-mesh-up.ps1`) reads these
@@ -81,6 +108,17 @@ The raw token never appears in any config file — only the
 `token_env` indirection. Without `RELIX_DISCORD_BOT_TOKEN` set,
 the controller still boots but `get_me` fails and the bot stays
 offline (the dashboard reports `online=false`).
+
+### 5. Verify
+
+```
+GET http://127.0.0.1:19791/v1/discord/status
+```
+
+returns the controller's view of `get_me`. Send a message in the
+channel from a non-bot account; the bot should reply within
+`poll_interval_secs`, and `GET /v1/discord/messages/recent` should
+list the inbound row.
 
 ## Slash commands
 
@@ -196,3 +234,14 @@ Both support `--json` for raw payloads.
 - **No persistent session store.** In-memory state only. A
   restart loses the polling cursor and any in-flight subject
   mappings; the next poll resumes from the most recent message.
+
+See [`../current-limitations.md`](../current-limitations.md) for
+the alpha-wide list of deferred features.
+
+## See also
+
+- [index.md](index.md) — overview of all three channels.
+- [`../channel-node-architecture.md`](../channel-node-architecture.md) —
+  the design contract.
+- [`../configuration.md`](../configuration.md) — full env-var
+  reference for the mesh boot script.
