@@ -1,10 +1,16 @@
-# Cron scheduler
+# Scheduler
 
-The cron scheduler lets agents (and operators) schedule their own
-future work. "Send me a summary at 9am every Monday." "Re-run this
-flow in 30 minutes." "Fire once on June 1st." It lives on the
+Lets agents (and operators) schedule their own future work.
+"Send me a summary at 9am every Monday." "Re-run this flow in
+30 minutes." "Fire once on June 1st." Lives on the
 **coordinator** node — there's no new node type — and runs as a
 background tokio task next to the existing task ledger.
+
+The wire capabilities are spelled `cron.*` (that's what the mesh
+policy admits and what flows call). The dashboard, the
+`relix-cli ops cron` subcommand, and the bridge surface
+(`/v1/cron/jobs`) all share that prefix. "Scheduler" is the
+broader concept; "cron" is the verb on the wire.
 
 ## What it does
 
