@@ -105,6 +105,7 @@ mod lifecycle;
 mod mcp;
 mod mcp_audit;
 mod memory_curator;
+mod memory_embed;
 mod messaging;
 mod metrics;
 mod openai;
@@ -464,6 +465,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // scheduler-status read.
         .route("/v1/memory/curate", post(memory_curator::curate))
         .route("/v1/memory/curator/status", get(memory_curator::status))
+        .route("/v1/memory/embed", post(memory_embed::embed))
+        .route("/v1/memory/search", post(memory_embed::search))
+        .route("/v1/memory/embed_all", post(memory_embed::embed_all))
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's

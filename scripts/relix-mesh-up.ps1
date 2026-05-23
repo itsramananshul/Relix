@@ -125,6 +125,18 @@ if (-not (Test-Path $BridgeAic)) {
     & $Cli identity mint --root-key $OrgKey --name web-bridge --groups chat-users --out $BridgeAic
     if ($LASTEXITCODE -ne 0) { throw "identity mint failed (exit $LASTEXITCODE)" }
 }
+# Memory node's identity bundle. Needed so the memory node can
+# dial the AI peer to call ai.embed for the vector-memory
+# pipeline (and the agent_curate AI peer when [memory.curator]
+# is enabled). Without this bundle the embedding dispatcher
+# stays empty and memory.embed / memory.search return
+# "embedding dispatcher not configured".
+$MemoryAic = "dev-keys/$Run-memory.bundle"
+if (-not (Test-Path $MemoryAic)) {
+    Write-Host "minting memory identity bundle ..."
+    & $Cli identity mint --root-key $OrgKey --name memory --groups chat-users --out $MemoryAic
+    if ($LASTEXITCODE -ne 0) { throw "memory identity mint failed (exit $LASTEXITCODE)" }
+}
 
 $MemConfig         = "$DataBase/memory.toml"
 $AiConfig          = "$DataBase/ai.toml"
@@ -154,6 +166,18 @@ file = "$Policy"
 
 [memory]
 db_path = "$DataBase/memory.db"
+
+# Vector-embedding wiring. Points at the AI peer's ai.embed
+# capability. Defaults to the mock provider's 8-dim vectors so
+# the full embed/search pipeline works without a real OpenAI
+# key; switch to text-embedding-3-small (1536 dims) when the AI
+# node runs against OpenAI-compatible.
+[memory.embedding_peer]
+addr = "/ip4/127.0.0.1/tcp/$AiPort"
+alias = "ai"
+deadline_secs = 30
+model = "mock-embed"
+dimensions = 8
 
 [peers]
 "@ | Set-Content -Encoding utf8 $MemConfig
@@ -547,8 +571,33 @@ method = "memory.curator_status"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "mem_search_turns"
+method = "memory.search_turns"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "mem_embed"
+method = "memory.embed"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "mem_semantic_search"
+method = "memory.search"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "mem_embed_all"
+method = "memory.embed_all"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "ai_chat"
 method = "ai.chat"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "ai_embed"
+method = "ai.embed"
 allow_groups = ["chat-users"]
 
 [[rules]]

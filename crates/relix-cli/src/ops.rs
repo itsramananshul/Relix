@@ -279,6 +279,59 @@ pub enum Cmd {
     /// inbound messages from the slack controller's ring.
     /// Proxies onto the bridge's `/v1/slack/*` endpoints.
     Slack(SlackArgs),
+    /// Memory vector-embedding surface — embed text into a
+    /// subject's per-target vector store, run a semantic search,
+    /// or re-embed all existing entries.
+    Memory(MemoryArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MemoryArgs {
+    #[command(subcommand)]
+    pub cmd: MemoryCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MemoryCmd {
+    /// Embed and store one chunk of text. Hits POST /v1/memory/embed.
+    Embed {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long = "subject-id")]
+        subject_id: String,
+        #[arg(long, value_parser = ["agent", "user"])]
+        target: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Semantic search over a subject's embeddings. Hits POST
+    /// /v1/memory/search.
+    Search {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long = "subject-id")]
+        subject_id: String,
+        #[arg(long, value_parser = ["agent", "user"])]
+        target: String,
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Re-embed all existing memory entries for a subject. Hits
+    /// POST /v1/memory/embed_all.
+    EmbedAll {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long = "subject-id")]
+        subject_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -693,7 +746,165 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Msg(args) => msg_run(args.cmd).await,
         Cmd::Discord(args) => discord_run(args.cmd).await,
         Cmd::Slack(args) => slack_run(args.cmd).await,
+        Cmd::Memory(args) => memory_run(args.cmd).await,
     }
+}
+
+async fn memory_run(cmd: MemoryCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        MemoryCmd::Embed {
+            bridge,
+            subject_id,
+            target,
+            text,
+            json,
+        } => memory_embed_cmd(&bridge, &subject_id, &target, &text, json).await,
+        MemoryCmd::Search {
+            bridge,
+            subject_id,
+            target,
+            query,
+            limit,
+            json,
+        } => memory_search_cmd(&bridge, &subject_id, &target, &query, limit, json).await,
+        MemoryCmd::EmbedAll {
+            bridge,
+            subject_id,
+            json,
+        } => memory_embed_all_cmd(&bridge, &subject_id, json).await,
+    }
+}
+
+async fn memory_embed_cmd(
+    bridge: &str,
+    subject_id: &str,
+    target: &str,
+    text: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/embed");
+    let client = reqwest::Client::new();
+    let r = client
+        .post(&url)
+        .json(&json!({
+            "subject_id": subject_id,
+            "target": target,
+            "text": text,
+        }))
+        .send()
+        .await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let id = v.get("embedding_id").and_then(|x| x.as_str()).unwrap_or("");
+    let already = v
+        .get("already_present")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    println!(
+        "embedding_id      {id}{}",
+        if already { "  (already present)" } else { "" }
+    );
+    Ok(())
+}
+
+async fn memory_search_cmd(
+    bridge: &str,
+    subject_id: &str,
+    target: &str,
+    query: &str,
+    limit: usize,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/search");
+    let client = reqwest::Client::new();
+    let r = client
+        .post(&url)
+        .json(&json!({
+            "subject_id": subject_id,
+            "target": target,
+            "query": query,
+            "limit": limit,
+        }))
+        .send()
+        .await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let results = v
+        .get("results")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if results.is_empty() {
+        println!("(no results)");
+        return Ok(());
+    }
+    println!("{:<18} {:<8} chunk_text", "embedding_id", "score");
+    for hit in results {
+        let id = hit
+            .get("embedding_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let score = hit.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let chunk = hit.get("chunk_text").and_then(|x| x.as_str()).unwrap_or("");
+        println!("{:<18} {:<8.4} {}", short(id, 18), score as f32, chunk);
+    }
+    Ok(())
+}
+
+async fn memory_embed_all_cmd(
+    bridge: &str,
+    subject_id: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/embed_all");
+    let client = reqwest::Client::new();
+    let r = client
+        .post(&url)
+        .json(&json!({ "subject_id": subject_id }))
+        .send()
+        .await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let n = v
+        .get("chunks_embedded")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    println!(
+        "ok                {}\nchunks_embedded   {n}",
+        if ok { "yes" } else { "no" }
+    );
+    Ok(())
 }
 
 async fn slack_run(cmd: SlackCmd) -> Result<(), Box<dyn std::error::Error>> {

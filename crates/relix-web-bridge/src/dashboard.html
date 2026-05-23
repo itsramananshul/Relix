@@ -2677,6 +2677,39 @@
         above triggers an immediate pass for ONE subject_id
         without waiting for the next tick.
       </p>
+
+      <!-- Vector-embedding semantic search -->
+      <div class="card">
+        <div class="card-header">
+          <h3>Embeddings — semantic search</h3>
+          <span class="meta">requires [memory.embedding_peer]</span>
+        </div>
+        <div class="card-body">
+          <div class="form-row" style="grid-template-columns: 100px 1fr;">
+            <label>Subject id</label>
+            <input type="text" id="mem-embed-subject" placeholder="subject_id (NodeId hex)">
+          </div>
+          <div class="form-row" style="grid-template-columns: 100px 1fr;">
+            <label>Target</label>
+            <select id="mem-embed-target">
+              <option value="agent">agent</option>
+              <option value="user">user</option>
+            </select>
+          </div>
+          <div class="form-row" style="grid-template-columns: 100px 1fr;">
+            <label>Query</label>
+            <input type="text" id="mem-embed-query" placeholder="What are you looking for?">
+          </div>
+          <div class="actions">
+            <button class="btn-primary" id="mem-search-btn">Search</button>
+            <button id="mem-embed-all-btn" title="Re-embed all existing entries for this subject">
+              Embed all entries
+            </button>
+            <span class="action-status" id="mem-embed-status"></span>
+          </div>
+          <div id="mem-embed-results-host" style="margin-top: 10px;"></div>
+        </div>
+      </div>
     </section>
 
     <!-- ── #/providers ─────────────────────────────────────────── -->
@@ -8962,7 +8995,107 @@ function initMemory() {
       }
     });
   }
+  // Embeddings card.
+  const $sb = document.getElementById('mem-search-btn');
+  if ($sb) $sb.addEventListener('click', () => memSemanticSearch());
+  const $eab = document.getElementById('mem-embed-all-btn');
+  if ($eab) $eab.addEventListener('click', () => memEmbedAll());
+  const $q = document.getElementById('mem-embed-query');
+  if ($q) {
+    $q.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        memSemanticSearch();
+      }
+    });
+  }
   memoryInspectorWired = true;
+}
+
+async function memSemanticSearch() {
+  const $subj = document.getElementById('mem-embed-subject');
+  const $tgt = document.getElementById('mem-embed-target');
+  const $q = document.getElementById('mem-embed-query');
+  const $host = document.getElementById('mem-embed-results-host');
+  const $status = document.getElementById('mem-embed-status');
+  if (!$subj || !$tgt || !$q || !$host) return;
+  const subject_id = $subj.value.trim();
+  const target = $tgt.value;
+  const query = $q.value;
+  if (!subject_id || !query) {
+    $host.innerHTML = '<div class="error">subject_id and query required</div>';
+    return;
+  }
+  if ($status) $status.textContent = 'searching…';
+  try {
+    const r = await fetch('/v1/memory/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject_id, target, query, limit: 10 }),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      $host.innerHTML = '<div class="error">HTTP ' + r.status + ': ' + escapeHtml(body) + '</div>';
+      if ($status) $status.textContent = '';
+      return;
+    }
+    const s = await r.json();
+    const rows = s.results || [];
+    if (rows.length === 0) {
+      $host.innerHTML = '<p class="muted">No matches for subject_id <code>'
+        + escapeHtml(subject_id) + '</code> in target <code>'
+        + escapeHtml(target) + '</code>.</p>';
+      if ($status) $status.textContent = '0 hits';
+      return;
+    }
+    const html = rows.map(function(h) {
+      return '<tr>'
+        + '<td><span class="id">' + escapeHtml(h.embedding_id) + '</span></td>'
+        + '<td>' + (Number(h.score).toFixed(4)) + '</td>'
+        + '<td>' + escapeHtml(h.chunk_text) + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="grid"><thead><tr>'
+      + '<th>embedding_id</th><th>score</th><th>chunk_text</th>'
+      + '</tr></thead><tbody>' + html + '</tbody></table>';
+    if ($status) $status.textContent = rows.length + ' hits';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">' + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = '';
+  }
+}
+
+async function memEmbedAll() {
+  const $subj = document.getElementById('mem-embed-subject');
+  const $host = document.getElementById('mem-embed-results-host');
+  const $status = document.getElementById('mem-embed-status');
+  if (!$subj || !$host) return;
+  const subject_id = $subj.value.trim();
+  if (!subject_id) {
+    $host.innerHTML = '<div class="error">subject_id required</div>';
+    return;
+  }
+  if ($status) $status.textContent = 'embedding…';
+  try {
+    const r = await fetch('/v1/memory/embed_all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject_id }),
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      $host.innerHTML = '<div class="error">HTTP ' + r.status + ': ' + escapeHtml(body) + '</div>';
+      if ($status) $status.textContent = '';
+      return;
+    }
+    const s = await r.json();
+    $host.innerHTML = '<p class="status-good">ok — chunks_embedded='
+      + s.chunks_embedded + '</p>';
+    if ($status) $status.textContent = 'embedded ' + s.chunks_embedded + ' chunks';
+  } catch (e) {
+    $host.innerHTML = '<div class="error">' + escapeHtml(String(e)) + '</div>';
+    if ($status) $status.textContent = '';
+  }
 }
 
 function enterMemory() {

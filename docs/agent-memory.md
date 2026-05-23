@@ -166,9 +166,13 @@ cannot contain agent B's content.
 
 ### Memory node
 
-No new config — the memory node grows the table automatically
-on first start. Existing `memory.write_turn` / `memory.search`
-behavior is unchanged.
+No new config — the memory node grows the `turns` / `agent_memory`
+tables automatically on first start. Note: the old FTS5-over-turns
+capability is now called `memory.search_turns`; the name
+`memory.search` is taken by the new vector-embedding semantic
+search (see [`docs/vector-memory.md`](./vector-memory.md)).
+Optional `[memory.embedding_peer]` enables the new
+`memory.embed` / `memory.search` / `memory.embed_all` surface.
 
 ### AI node
 

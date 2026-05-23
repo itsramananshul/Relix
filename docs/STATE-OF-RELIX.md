@@ -132,13 +132,27 @@ on every controller regardless of `node_type`.
 | --- | --- | --- |
 | `memory.write_turn` | Real | Persist `session_id\|role\|body` into SQLite |
 | `memory.recent_for_session` | Real | Read last N turns oldest-first (default 10) |
-| `memory.search` | Real | FTS5 query across all turns |
+| `memory.search_turns` | Real | FTS5 query across all turns (was `memory.search` before vector memory landed) |
+| `memory.embed` | Real | Embed one chunk into the per-subject vector store; idempotent by content hash. Requires `[memory.embedding_peer]` |
+| `memory.search` | Real | Semantic search over a subject's embeddings (cosine, top-K up to 20) |
+| `memory.embed_all` | Real | Re-embed all persistent-memory entries for one subject (split on `§`; idempotent) |
+| `memory.agent_read` | Real | Read agent + user persistent memory for a subject |
+| `memory.agent_write` | Real | Add / replace / remove / read persistent memory |
+| `memory.agent_curate` | Real | Curator (LLM-driven memory consolidation) |
+| `memory.curator_status` | Real | Curator scheduler status snapshot |
+
+Vector memory is documented in [`docs/vector-memory.md`](./vector-memory.md).
+SQLite store, cosine similarity in Rust, full table scan (good for
+the hundreds-per-subject row count the cap budgets allow). Switch
+to `sqlite-vec` or HNSW is a local change to
+`nodes/memory/embeddings.rs` if the scan ever hurts.
 
 ### 3.3 `ai` node
 
 | Method | Status | What it does |
 | --- | --- | --- |
 | `ai.chat` | Real | Provider-routed completion via `[ai] provider = ...` |
+| `ai.embed` | Real | Batch text embedding. Mock provider returns deterministic 8-dim vectors; OpenAI-compatible hits `/v1/embeddings` |
 
 Provider routing supports `mock`, `openai`, `anthropic`, `openrouter`,
 `xai`, `gemini`, and a `local` Ollama-compatible base URL. Provider
