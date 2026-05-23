@@ -3262,6 +3262,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "relix-slack"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "blake3",
+ "relix-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "relix-telegram"
 version = "0.1.0"
 dependencies = [
