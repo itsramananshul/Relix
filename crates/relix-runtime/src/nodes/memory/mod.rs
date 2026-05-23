@@ -74,6 +74,7 @@
 //!   deterministic across runs.
 
 pub mod curator;
+pub mod embeddings;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -160,6 +161,7 @@ impl MemoryStore {
         }
         let conn = Connection::open(&cfg.db_path).map_err(MemoryError::Db)?;
         init_schema(&conn)?;
+        embeddings::apply_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             max_n: cfg.max_n.max(1),
@@ -170,10 +172,19 @@ impl MemoryStore {
     pub fn in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory().map_err(MemoryError::Db)?;
         init_schema(&conn)?;
+        embeddings::apply_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             max_n: 100,
         })
+    }
+
+    /// Build an [`embeddings::EmbeddingStore`] sharing this
+    /// connection. Used by the memory.embed / memory.search
+    /// handlers — they reuse the same SQLite handle as the rest
+    /// of the memory node.
+    pub fn embedding_store(&self) -> embeddings::EmbeddingStore {
+        embeddings::EmbeddingStore::new(self.conn.clone())
     }
 
     /// Append a turn.
