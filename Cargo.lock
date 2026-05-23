@@ -3245,6 +3245,7 @@ dependencies = [
  "regex",
  "relix-core",
  "relix-discord",
+ "relix-slack",
  "relix-telegram",
  "reqwest",
  "rusqlite",

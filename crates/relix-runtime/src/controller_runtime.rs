@@ -57,6 +57,10 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub discord: Option<toml::Value>,
+    /// Slack-channel node options.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub slack: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -355,6 +359,12 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             let key_path = cfg.identity.key_path.clone();
             tokio::spawn(async move {
                 populate_discord_outbound_cell(cell, dc_cfg, key_path).await;
+            });
+        }
+        Some(StartupWiring::Slack { cell, cfg: sl_cfg }) => {
+            let key_path = cfg.identity.key_path.clone();
+            tokio::spawn(async move {
+                populate_slack_outbound_cell(cell, sl_cfg, key_path).await;
             });
         }
         _ => {}
@@ -1889,6 +1899,124 @@ async fn populate_discord_outbound_cell(
     }
 }
 
+async fn populate_slack_outbound_cell(
+    cell: crate::nodes::slack::SlackOutboundClientCell,
+    cfg: crate::nodes::slack::SlackNodeConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "slack: identity bundle missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "slack: identity bundle decode failed; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "slack: client key not 32 bytes; outbound mesh client disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "slack: client key missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.memory_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.memory_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.ai_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.ai_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.coord_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.coord_peer.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.ai_peer.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                memory = %cfg.memory_peer.addr,
+                ai = %cfg.ai_peer.addr,
+                coord = %cfg.coord_peer.addr,
+                "slack: discover_and_pin returned None; outbound client disabled"
+            );
+            return;
+        }
+    };
+
+    let client = Arc::new(crate::nodes::slack::SlackOutboundClient {
+        mesh,
+        identity: bundle,
+        memory_alias: cfg.memory_peer.alias.clone(),
+        memory_deadline_secs: cfg.memory_peer.deadline_secs,
+        ai_alias: cfg.ai_peer.alias.clone(),
+        ai_deadline_secs: cfg.ai_peer.deadline_secs,
+        coord_alias: cfg.coord_peer.alias.clone(),
+        coord_deadline_secs: cfg.coord_peer.deadline_secs,
+    });
+    if cell.set(client).is_err() {
+        tracing::warn!("slack: outbound cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            memory = %cfg.memory_peer.alias,
+            ai = %cfg.ai_peer.alias,
+            coord = %cfg.coord_peer.alias,
+            "slack node: outbound mesh client online"
+        );
+    }
+}
+
 async fn populate_memory_curator_cell(
     cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
     state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
@@ -2154,6 +2282,11 @@ pub(crate) enum StartupWiring {
     Discord {
         cell: crate::nodes::discord::DiscordOutboundClientCell,
         cfg: crate::nodes::discord::DiscordNodeConfig,
+    },
+    /// Slack-channel outbound wiring. Same shape as Discord.
+    Slack {
+        cell: crate::nodes::slack::SlackOutboundClientCell,
+        cfg: crate::nodes::slack::SlackNodeConfig,
     },
 }
 
@@ -3286,6 +3419,82 @@ fn register_node_type_handlers(
             allow_everyone = dc_cfg.allow_everyone(),
             ring_capacity = dc_cfg.messages_ring_capacity,
             "discord node: registered discord.status / discord.messages_recent; polling loop spawned"
+        );
+    }
+    if cfg.controller.node_type == "slack" {
+        let raw = cfg
+            .slack
+            .clone()
+            .ok_or_else(|| "node_type=slack requires a [slack] section".to_string())?;
+        let sl_cfg: crate::nodes::slack::SlackNodeConfig = raw
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("[slack] parse: {e}"))?;
+        sl_cfg
+            .validate()
+            .map_err(|e| format!("[slack] validation: {e}"))?;
+        let token = sl_cfg
+            .resolve_token()
+            .map_err(|e| format!("[slack] token: {e}"))?;
+        let state = Arc::new(crate::nodes::slack::ChannelState::default());
+        let ring = Arc::new(crate::nodes::slack::MessageRing::new(
+            sl_cfg.messages_ring_capacity,
+        ));
+        let out_cell: crate::nodes::slack::SlackOutboundClientCell =
+            Arc::new(tokio::sync::OnceCell::new());
+        crate::nodes::slack::register(
+            bridge,
+            state.clone(),
+            ring.clone(),
+            sl_cfg.channel_id.clone(),
+        );
+        let api = relix_slack::LiveSlackApi::new(token);
+        let state_for_loop = state.clone();
+        let ring_for_loop = ring.clone();
+        let cfg_for_loop = Arc::new(sl_cfg.clone());
+        let out_for_loop = out_cell.clone();
+        tokio::spawn(async move {
+            crate::nodes::slack::run_slack_controller_with_api(
+                api,
+                out_for_loop,
+                state_for_loop,
+                ring_for_loop,
+                cfg_for_loop,
+            )
+            .await;
+        });
+        let sl_cfg_for_wiring = sl_cfg.clone();
+        *out = Some(StartupWiring::Slack {
+            cell: out_cell,
+            cfg: sl_cfg_for_wiring,
+        });
+        let slack_caps: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "slack.status",
+                "Bot online status + username + user_id + team_id + channel_id. \
+                 Read-only capability the bridge proxies for the dashboard.",
+                &["read", "slack", "status"],
+                &["reads:internal"],
+            ),
+            (
+                "slack.messages_recent",
+                "Last N inbound messages from the bounded in-memory ring \
+                 (newest-first). Used by the dashboard's recent-messages \
+                 widget.",
+                &["read", "slack", "messages"],
+                &["reads:internal"],
+            ),
+        ];
+        for (method, doc, cats, sensitivities) in slack_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            desc = desc.with_sensitivity(sensitivities.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        tracing::info!(
+            channel_id = %sl_cfg.channel_id,
+            allow_everyone = sl_cfg.allow_everyone(),
+            ring_capacity = sl_cfg.messages_ring_capacity,
+            "slack node: registered slack.status / slack.messages_recent; polling loop spawned"
         );
     }
     if cfg.controller.node_type == "tool" {

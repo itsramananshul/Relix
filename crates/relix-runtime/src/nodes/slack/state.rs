@@ -1,0 +1,92 @@
+//! Shared in-memory state for the slack controller. Same shape
+//! as the discord controller's state but carrying the Slack-
+//! specific identity (team_id) and using a `ts` string for the
+//! polling cursor.
+
+use std::sync::Mutex;
+
+use relix_slack::BotIdentity;
+
+#[derive(Default)]
+pub struct ChannelState {
+    online: Mutex<bool>,
+    identity: Mutex<BotIdentity>,
+    messages_seen: Mutex<u64>,
+    last_message_at: Mutex<Option<i64>>,
+    /// Slack `ts` of the most recent message processed. Doubles
+    /// as the `oldest` parameter for the next
+    /// `conversations.history` poll.
+    cursor: Mutex<String>,
+}
+
+impl ChannelState {
+    pub fn online(&self) -> bool {
+        *self.online.lock().expect("poisoned")
+    }
+
+    pub fn identity(&self) -> BotIdentity {
+        self.identity.lock().expect("poisoned").clone()
+    }
+
+    pub fn messages_seen(&self) -> u64 {
+        *self.messages_seen.lock().expect("poisoned")
+    }
+
+    pub fn last_message_at(&self) -> Option<i64> {
+        *self.last_message_at.lock().expect("poisoned")
+    }
+
+    pub fn cursor(&self) -> String {
+        self.cursor.lock().expect("poisoned").clone()
+    }
+
+    pub fn set_cursor(&self, ts: &str) {
+        *self.cursor.lock().expect("poisoned") = ts.to_string();
+    }
+
+    pub fn mark_online(&self, id: BotIdentity) {
+        *self.identity.lock().expect("poisoned") = id;
+        *self.online.lock().expect("poisoned") = true;
+    }
+
+    pub fn record_inbound(&self, ts: i64) {
+        *self.messages_seen.lock().expect("poisoned") += 1;
+        *self.last_message_at.lock().expect("poisoned") = Some(ts);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn online_defaults_false_until_marked() {
+        let s = ChannelState::default();
+        assert!(!s.online());
+        s.mark_online(BotIdentity {
+            user_id: "U0".into(),
+            team_id: "T0".into(),
+            bot_id: "B0".into(),
+            username: "bot".into(),
+        });
+        assert!(s.online());
+        assert_eq!(s.identity().team_id, "T0");
+    }
+
+    #[test]
+    fn record_inbound_advances_counter_and_timestamp() {
+        let s = ChannelState::default();
+        s.record_inbound(123);
+        s.record_inbound(456);
+        assert_eq!(s.messages_seen(), 2);
+        assert_eq!(s.last_message_at(), Some(456));
+    }
+
+    #[test]
+    fn cursor_defaults_empty_then_advances() {
+        let s = ChannelState::default();
+        assert_eq!(s.cursor(), "");
+        s.set_cursor("1700000000.000200");
+        assert_eq!(s.cursor(), "1700000000.000200");
+    }
+}

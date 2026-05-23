@@ -24,6 +24,11 @@ relix-telegram = { path = "../relix-telegram", version = "0.1.0" }
 # into this crate for LiveDiscordApi, identity derivation,
 # and message types.
 relix-discord = { path = "../relix-discord", version = "0.1.0" }
+# Slack channel scaffold + live Bot API client. The
+# `slack` node_type lives in nodes/slack/ and reaches
+# into this crate for LiveSlackApi, identity derivation,
+# and message types.
+relix-slack = { path = "../relix-slack", version = "0.1.0" }
 
 # Async runtime + transport (libp2p inherited from OpenPrem INFRA reuse)
 tokio.workspace = true

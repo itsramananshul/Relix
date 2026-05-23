@@ -11,6 +11,7 @@ pub mod coordinator;
 pub mod discord;
 pub mod memory;
 pub mod router;
+pub mod slack;
 pub mod telegram;
 pub mod tool;
 pub mod web_bridge;
