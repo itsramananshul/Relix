@@ -73,6 +73,21 @@ Two new error kinds:
   `approval_token` is unknown, expired, consumed, or
   applies to a different method.
 
+## Agent-to-agent messaging (`crates/relix-runtime/src/nodes/coordinator/messaging/`)
+
+Direct point-to-point mail-drop between two agents. Stored on
+the coordinator alongside the task ledger; no task is created
+per message. A 5-minute background loop sweeps messages past
+their TTL. See [messaging.md](messaging.md).
+
+| Method | Status | Notes |
+|---|---|---|
+| `msg.send` | live | `from\|to\|subject\|body\|thread_id\|reply_to\|ttl_secs\|origin_surface`. Empty thread_id starts a new thread (uses the new message_id); ttl_secs defaults to 86400. |
+| `msg.inbox` | live | `subject_id\|limit\|include_read\|since_message_id`. Newest-first 8-column tab rows + `count=N\n`. Cursor-paginated. |
+| `msg.read` | live | `message_id\|reader_subject_id`. Reader must equal to_subject_id; idempotent. |
+| `msg.thread` | live | `thread_id\|subject_id`. Oldest-first within the thread. Caller must be a participant. |
+| `msg.delete` | live | `message_id\|subject_id`. Soft delete (flips to `status=expired`). Sender or recipient only. |
+
 ## Delegation (`crates/relix-runtime/src/nodes/coordinator/delegate/`)
 
 Lives on the coordinator node. Four capabilities + a 5 s background

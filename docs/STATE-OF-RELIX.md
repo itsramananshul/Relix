@@ -253,6 +253,17 @@ Plus a long list of chronicle event types (`task.thrash_detected`,
 `task.cancelled`, `task.interrupted`, `task.attempt_started` /
 `_finished`, `flow.started`, `capability.invoked`).
 
+The coordinator ships an **agent-to-agent messaging** surface
+on the same db — five `msg.*` capabilities (`send` / `inbox` /
+`read` / `thread` / `delete`) over an `agent_messages` table.
+Distinct from delegation: no task is created per message, just
+one `msg.sent` chronicle entry on a `msg-bookkeeping-system`
+task that excludes the body for audit redaction. Messages
+auto-expire after `ttl_secs` (default 24 h) via a 5-minute
+sweeper. Thread access is participant-gated; soft delete
+flips status to `expired` so audit retains the row. See
+[messaging.md](messaging.md).
+
 The coordinator ships a **delegation** surface that lets one
 agent spawn another as a subtask. Four capabilities
 (`delegate.spawn` / `result` / `cancel` / `list`) on top of the

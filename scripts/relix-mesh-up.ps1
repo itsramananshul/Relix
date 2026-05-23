@@ -562,6 +562,31 @@ method = "agent.standing_approval.revoke"
 allow_groups = ["chat-users"]
 
 [[rules]]
+name = "msg_send"
+method = "msg.send"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_inbox"
+method = "msg.inbox"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_read"
+method = "msg.read"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_thread"
+method = "msg.thread"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "msg_delete"
+method = "msg.delete"
+allow_groups = ["chat-users"]
+
+[[rules]]
 name = "telegram_status"
 method = "telegram.status"
 allow_groups = ["chat-users"]
