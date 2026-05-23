@@ -53,6 +53,10 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub telegram: Option<toml::Value>,
+    /// Discord-channel node options.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub discord: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -345,6 +349,12 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             let key_path = cfg.identity.key_path.clone();
             tokio::spawn(async move {
                 populate_telegram_outbound_cell(cell, tg_cfg, key_path).await;
+            });
+        }
+        Some(StartupWiring::Discord { cell, cfg: dc_cfg }) => {
+            let key_path = cfg.identity.key_path.clone();
+            tokio::spawn(async move {
+                populate_discord_outbound_cell(cell, dc_cfg, key_path).await;
             });
         }
         _ => {}
@@ -1761,6 +1771,124 @@ async fn populate_telegram_outbound_cell(
     }
 }
 
+async fn populate_discord_outbound_cell(
+    cell: crate::nodes::discord::DiscordOutboundClientCell,
+    cfg: crate::nodes::discord::DiscordNodeConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "discord: identity bundle missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "discord: identity bundle decode failed; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "discord: client key not 32 bytes; outbound mesh client disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "discord: client key missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.memory_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.memory_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.ai_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.ai_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.coord_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.coord_peer.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.ai_peer.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                memory = %cfg.memory_peer.addr,
+                ai = %cfg.ai_peer.addr,
+                coord = %cfg.coord_peer.addr,
+                "discord: discover_and_pin returned None; outbound client disabled"
+            );
+            return;
+        }
+    };
+
+    let client = Arc::new(crate::nodes::discord::DiscordOutboundClient {
+        mesh,
+        identity: bundle,
+        memory_alias: cfg.memory_peer.alias.clone(),
+        memory_deadline_secs: cfg.memory_peer.deadline_secs,
+        ai_alias: cfg.ai_peer.alias.clone(),
+        ai_deadline_secs: cfg.ai_peer.deadline_secs,
+        coord_alias: cfg.coord_peer.alias.clone(),
+        coord_deadline_secs: cfg.coord_peer.deadline_secs,
+    });
+    if cell.set(client).is_err() {
+        tracing::warn!("discord: outbound cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            memory = %cfg.memory_peer.alias,
+            ai = %cfg.ai_peer.alias,
+            coord = %cfg.coord_peer.alias,
+            "discord node: outbound mesh client online"
+        );
+    }
+}
+
 async fn populate_memory_curator_cell(
     cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
     state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
@@ -2019,6 +2147,13 @@ pub(crate) enum StartupWiring {
     Telegram {
         cell: crate::nodes::telegram::TelegramOutboundClientCell,
         cfg: crate::nodes::telegram::TelegramNodeConfig,
+    },
+    /// Discord-channel outbound wiring. Same shape as Telegram —
+    /// the polling loop already runs; the run() loop dials peers
+    /// and publishes the outbound client into `cell`.
+    Discord {
+        cell: crate::nodes::discord::DiscordOutboundClientCell,
+        cfg: crate::nodes::discord::DiscordNodeConfig,
     },
 }
 
@@ -3075,6 +3210,82 @@ fn register_node_type_handlers(
             operator_chat_id = tg_cfg.operator_chat_id,
             ring_capacity = tg_cfg.messages_ring_capacity,
             "telegram node: registered telegram.status / telegram.messages_recent; long-poll loop spawned"
+        );
+    }
+    if cfg.controller.node_type == "discord" {
+        let raw = cfg
+            .discord
+            .clone()
+            .ok_or_else(|| "node_type=discord requires a [discord] section".to_string())?;
+        let dc_cfg: crate::nodes::discord::DiscordNodeConfig = raw
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("[discord] parse: {e}"))?;
+        dc_cfg
+            .validate()
+            .map_err(|e| format!("[discord] validation: {e}"))?;
+        let token = dc_cfg
+            .resolve_token()
+            .map_err(|e| format!("[discord] token: {e}"))?;
+        let state = Arc::new(crate::nodes::discord::ChannelState::default());
+        let ring = Arc::new(crate::nodes::discord::MessageRing::new(
+            dc_cfg.messages_ring_capacity,
+        ));
+        let out_cell: crate::nodes::discord::DiscordOutboundClientCell =
+            Arc::new(tokio::sync::OnceCell::new());
+        crate::nodes::discord::register(
+            bridge,
+            state.clone(),
+            ring.clone(),
+            dc_cfg.channel_id.clone(),
+        );
+        let api = relix_discord::LiveDiscordApi::new(token);
+        let state_for_loop = state.clone();
+        let ring_for_loop = ring.clone();
+        let cfg_for_loop = Arc::new(dc_cfg.clone());
+        let out_for_loop = out_cell.clone();
+        tokio::spawn(async move {
+            crate::nodes::discord::run_discord_controller_with_api(
+                api,
+                out_for_loop,
+                state_for_loop,
+                ring_for_loop,
+                cfg_for_loop,
+            )
+            .await;
+        });
+        let dc_cfg_for_wiring = dc_cfg.clone();
+        *out = Some(StartupWiring::Discord {
+            cell: out_cell,
+            cfg: dc_cfg_for_wiring,
+        });
+        let discord_caps: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "discord.status",
+                "Bot online status + username + user_id + channel_id. \
+                 Read-only capability the bridge proxies for the dashboard.",
+                &["read", "discord", "status"],
+                &["reads:internal"],
+            ),
+            (
+                "discord.messages_recent",
+                "Last N inbound messages from the bounded in-memory ring \
+                 (newest-first). Used by the dashboard's recent-messages \
+                 widget.",
+                &["read", "discord", "messages"],
+                &["reads:internal"],
+            ),
+        ];
+        for (method, doc, cats, sensitivities) in discord_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            desc = desc.with_sensitivity(sensitivities.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        tracing::info!(
+            channel_id = %dc_cfg.channel_id,
+            allow_everyone = dc_cfg.allow_everyone(),
+            ring_capacity = dc_cfg.messages_ring_capacity,
+            "discord node: registered discord.status / discord.messages_recent; polling loop spawned"
         );
     }
     if cfg.controller.node_type == "tool" {

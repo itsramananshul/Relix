@@ -8,6 +8,7 @@
 
 pub mod ai;
 pub mod coordinator;
+pub mod discord;
 pub mod memory;
 pub mod router;
 pub mod telegram;

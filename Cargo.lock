@@ -3244,6 +3244,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "relix-core",
+ "relix-discord",
  "relix-telegram",
  "reqwest",
  "rusqlite",
