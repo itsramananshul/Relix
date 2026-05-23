@@ -104,6 +104,7 @@ mod lifecycle;
 mod mcp;
 mod mcp_audit;
 mod memory_curator;
+mod messaging;
 mod metrics;
 mod openai;
 mod policy_denials;
@@ -515,6 +516,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v1/standing-approvals/:standing_id",
             axum::routing::delete(agent::revoke_standing),
+        )
+        // PH-MSG-BRIDGE: agent-to-agent messaging. Five
+        // proxies onto the coordinator's `msg.*` capabilities.
+        .route("/v1/messages", post(messaging::send))
+        .route("/v1/messages/inbox/:subject_id", get(messaging::inbox))
+        .route("/v1/messages/:message_id/read", post(messaging::read))
+        .route("/v1/messages/thread/:thread_id", get(messaging::thread))
+        .route(
+            "/v1/messages/:message_id",
+            axum::routing::delete(messaging::delete),
         )
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer

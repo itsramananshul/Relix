@@ -1819,6 +1819,7 @@
     <a href="#/cron"         class="nav-item" data-route="cron">Cron Jobs</a>
     <a href="#/agents"       class="nav-item" data-route="agents">Agents</a>
     <a href="#/approvals"    class="nav-item" data-route="approvals">Approvals</a>
+    <a href="#/messages"     class="nav-item" data-route="messages">Messages</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2886,6 +2887,85 @@
       </div>
     </section>
 
+    <!-- ── #/messages ──────────────────────────────────────────── -->
+    <section class="page" data-page="messages">
+      <h2>Messages</h2>
+      <p class="page-subtitle">
+        Direct point-to-point messages between agents. Distinct from
+        delegation — no task is created per message, only a single
+        <code>msg.sent</code> chronicle entry on the coordinator's
+        bookkeeping task. Messages auto-expire after their
+        <code>ttl_secs</code> (default 24 h). See
+        <a href="docs/messaging.md">docs/messaging.md</a>.
+      </p>
+      <div class="page-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+        <div class="card">
+          <div class="card-header">
+            <h3>Inbox</h3>
+            <div class="card-actions">
+              <select id="msg-inbox-subject" style="margin-right: 6px;"></select>
+              <label style="font-size: 12px; color: var(--text-muted);">
+                <input type="checkbox" id="msg-include-read"> include read
+              </label>
+              <button id="msg-inbox-refresh" style="margin-left: 6px;">Refresh</button>
+            </div>
+          </div>
+          <div class="card-body" id="msg-inbox-host">
+            <div class="empty">select an agent to view their inbox</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h3>Compose</h3>
+          </div>
+          <div class="card-body">
+            <div class="form-row" style="grid-template-columns: 100px 1fr;">
+              <label>From</label>
+              <div class="field"><select id="msg-compose-from"></select></div>
+            </div>
+            <div class="form-row" style="grid-template-columns: 100px 1fr;">
+              <label>To</label>
+              <div class="field">
+                <input type="text" id="msg-compose-to" placeholder="recipient subject_id">
+              </div>
+            </div>
+            <div class="form-row" style="grid-template-columns: 100px 1fr;">
+              <label>Subject</label>
+              <div class="field">
+                <input type="text" id="msg-compose-subject" placeholder="(optional)">
+              </div>
+            </div>
+            <div class="form-row" style="grid-template-columns: 100px 1fr;">
+              <label>Body</label>
+              <div class="field">
+                <textarea id="msg-compose-body" rows="5"
+                          placeholder="message body (must not contain `|`)"></textarea>
+              </div>
+            </div>
+            <div class="form-row" style="grid-template-columns: 100px 1fr;">
+              <label>Thread id</label>
+              <div class="field">
+                <input type="text" id="msg-compose-thread" placeholder="(for replies)">
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn-primary" id="msg-send-btn">Send</button>
+              <span class="action-status" id="msg-send-status"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="card" id="msg-detail-card" style="display:none; margin-top: 12px;">
+        <div class="card-header">
+          <h3>Message detail</h3>
+          <div class="card-actions">
+            <button id="msg-detail-close">Close</button>
+          </div>
+        </div>
+        <div class="card-body" id="msg-detail-host"></div>
+      </div>
+    </section>
+
     <!-- ── #/telegram ──────────────────────────────────────────── -->
     <section class="page" data-page="telegram">
       <h2>Telegram</h2>
@@ -3107,6 +3187,7 @@ const PAGES = {
   cron:         { label: 'Cron Jobs',    init: initCron,         enter: enterCron },
   agents:       { label: 'Agents',       init: initAgents,       enter: enterAgents },
   approvals:    { label: 'Approvals',    init: initApprovals,    enter: enterApprovals },
+  messages:     { label: 'Messages',     init: initMessages,     enter: enterMessages },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -10127,6 +10208,231 @@ async function approvalDecide(approvalId, decision) {
     loadApprovals();
   } catch (e) {
     window.alert('decide failed: ' + String(e));
+  }
+}
+
+// ── #/messages — agent-to-agent messaging page ─────────────
+
+function initMessages() {
+  const $btn = document.getElementById('msg-send-btn');
+  if ($btn) $btn.addEventListener('click', msgSendSubmit);
+  const $ref = document.getElementById('msg-inbox-refresh');
+  if ($ref) $ref.addEventListener('click', loadInbox);
+  const $sub = document.getElementById('msg-inbox-subject');
+  if ($sub) $sub.addEventListener('change', loadInbox);
+  const $inc = document.getElementById('msg-include-read');
+  if ($inc) $inc.addEventListener('change', loadInbox);
+  const $close = document.getElementById('msg-detail-close');
+  if ($close) $close.addEventListener('click', () => {
+    document.getElementById('msg-detail-card').style.display = 'none';
+  });
+}
+
+async function enterMessages() {
+  await populateMessageAgentSelects();
+  loadInbox();
+}
+
+async function populateMessageAgentSelects() {
+  const $inbox = document.getElementById('msg-inbox-subject');
+  const $from = document.getElementById('msg-compose-from');
+  if (!$inbox || !$from) return;
+  try {
+    const r = await fetch('/v1/agents');
+    if (!r.ok) return;
+    const s = await r.json();
+    const rows = s.agents || [];
+    const opts = ['<option value="">— select agent —</option>'];
+    for (const a of rows) {
+      opts.push(
+        '<option value="' + escapeHtml(a.subject_id) + '">'
+        + escapeHtml(a.name) + ' (' + escapeHtml(a.subject_id.slice(0, 12)) + '…)'
+        + '</option>'
+      );
+    }
+    $inbox.innerHTML = opts.join('');
+    $from.innerHTML = opts.join('');
+  } catch (e) {
+    // silent
+  }
+}
+
+async function loadInbox() {
+  const $host = document.getElementById('msg-inbox-host');
+  const $sub = document.getElementById('msg-inbox-subject');
+  if (!$host || !$sub) return;
+  const subject = $sub.value;
+  if (!subject) {
+    $host.innerHTML = '<div class="empty">select an agent to view their inbox</div>';
+    return;
+  }
+  const includeRead = document.getElementById('msg-include-read').checked ? 1 : 0;
+  $host.innerHTML = '<div class="loading">loading…</div>';
+  try {
+    const r = await fetch(
+      '/v1/messages/inbox/' + encodeURIComponent(subject)
+      + '?limit=50&include_read=' + includeRead
+    );
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">'
+        + escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    const rows = s.messages || [];
+    if (rows.length === 0) {
+      $host.innerHTML = '<div class="empty">inbox is empty</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr>'
+      + '<th>from</th><th>subject</th><th>preview</th><th>sent</th><th></th>'
+      + '</tr></thead><tbody>';
+    for (const m of rows) {
+      const ts = new Date((m.sent_at || 0) * 1000).toLocaleString();
+      const unreadBadge = m.read_at == null
+        ? ' <span class="badge ok">new</span>'
+        : '';
+      html += '<tr>'
+        + '<td>' + escapeHtml(m.from_subject_id.slice(0, 12)) + '…' + unreadBadge + '</td>'
+        + '<td>' + escapeHtml(m.subject || '(no subject)') + '</td>'
+        + '<td>' + escapeHtml(m.body_preview || '') + '</td>'
+        + '<td>' + ts + '</td>'
+        + '<td><button data-msg-detail="' + escapeHtml(m.message_id)
+        + '" data-msg-thread="' + escapeHtml(m.thread_id)
+        + '">View</button></td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    $host.innerHTML = html;
+    for (const $b of $host.querySelectorAll('[data-msg-detail]')) {
+      $b.addEventListener('click', msgDetail);
+    }
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function msgDetail(e) {
+  const messageId = e.currentTarget.getAttribute('data-msg-detail');
+  const threadId = e.currentTarget.getAttribute('data-msg-thread');
+  const $sub = document.getElementById('msg-inbox-subject');
+  const subject = $sub.value;
+  const $card = document.getElementById('msg-detail-card');
+  const $host = document.getElementById('msg-detail-host');
+  $card.style.display = '';
+  $host.innerHTML = '<div class="loading">loading thread…</div>';
+  try {
+    const r = await fetch(
+      '/v1/messages/thread/' + encodeURIComponent(threadId)
+      + '?subject_id=' + encodeURIComponent(subject)
+    );
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      $host.innerHTML = '<div class="banner warn">'
+        + escapeHtml(err.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const s = await r.json();
+    let html = '<h4>Thread <span class="id">' + escapeHtml(threadId) + '</span></h4>';
+    for (const m of s.messages || []) {
+      const ts = new Date((m.sent_at || 0) * 1000).toLocaleString();
+      const isThisOne = m.message_id === messageId;
+      html += '<div class="event' + (isThisOne ? ' selected' : '') + '" style="padding: 6px 0;">'
+        + '<div><strong>' + escapeHtml(m.from_subject_id.slice(0, 16)) + '…</strong> '
+        + '<span class="meta" style="color: var(--text-muted);">'
+        + ts + ' · ' + escapeHtml(m.status) + '</span></div>'
+        + (m.subject ? '<div><em>' + escapeHtml(m.subject) + '</em></div>' : '')
+        + '<div>' + escapeHtml(m.body_preview) + '</div>'
+        + '</div>';
+    }
+    html += '<div class="actions">'
+      + '<button data-msg-mark-read="' + escapeHtml(messageId) + '">Mark read</button>'
+      + ' <button class="btn-danger" data-msg-delete="' + escapeHtml(messageId)
+      + '">Delete</button>'
+      + '</div>';
+    $host.innerHTML = html;
+    const $mark = $host.querySelector('[data-msg-mark-read]');
+    if ($mark) $mark.addEventListener('click', msgMarkRead);
+    const $del = $host.querySelector('[data-msg-delete]');
+    if ($del) $del.addEventListener('click', msgDelete);
+  } catch (e) {
+    $host.innerHTML = '<div class="banner warn">load failed: '
+      + escapeHtml(String(e)) + '</div>';
+  }
+}
+
+async function msgSendSubmit() {
+  const $status = document.getElementById('msg-send-status');
+  const from = document.getElementById('msg-compose-from').value;
+  const to = document.getElementById('msg-compose-to').value.trim();
+  const subject = document.getElementById('msg-compose-subject').value;
+  const body = document.getElementById('msg-compose-body').value;
+  const thread_id = document.getElementById('msg-compose-thread').value.trim();
+  if (!from || !to || !body) {
+    setProviderStatus($status, 'from / to / body are required', 'error');
+    return;
+  }
+  setProviderStatus($status, '');
+  try {
+    const r = await fetch('/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from_subject_id: from,
+        to_subject_id: to,
+        subject,
+        body,
+        thread_id: thread_id || undefined,
+        origin_surface: 'dashboard',
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      setProviderStatus($status, err.error || ('HTTP ' + r.status), 'error');
+      return;
+    }
+    const s = await r.json();
+    setProviderStatus($status, 'sent ' + s.message_id, 'ok');
+    document.getElementById('msg-compose-subject').value = '';
+    document.getElementById('msg-compose-body').value = '';
+    loadInbox();
+  } catch (e) {
+    setProviderStatus($status, 'failed: ' + String(e), 'error');
+  }
+}
+
+async function msgMarkRead(e) {
+  const id = e.currentTarget.getAttribute('data-msg-mark-read');
+  const $sub = document.getElementById('msg-inbox-subject');
+  try {
+    await fetch('/v1/messages/' + encodeURIComponent(id) + '/read', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reader_subject_id: $sub.value }),
+    });
+    loadInbox();
+    document.getElementById('msg-detail-card').style.display = 'none';
+  } catch (e) {
+    // ignore
+  }
+}
+
+async function msgDelete(e) {
+  const id = e.currentTarget.getAttribute('data-msg-delete');
+  const $sub = document.getElementById('msg-inbox-subject');
+  if (!window.confirm('Delete message ' + id + '?')) return;
+  try {
+    await fetch('/v1/messages/' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject_id: $sub.value }),
+    });
+    loadInbox();
+    document.getElementById('msg-detail-card').style.display = 'none';
+  } catch (e) {
+    // ignore
   }
 }
 

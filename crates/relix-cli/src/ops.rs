@@ -268,6 +268,80 @@ pub enum Cmd {
     Delegate(DelegateArgs),
     /// PH-AGENT-CLI: agent employee permission model.
     Agent(AgentArgs),
+    /// PH-MSG-CLI: agent-to-agent messaging. Five subcommands
+    /// that proxy onto the bridge's `/v1/messages` endpoints.
+    Msg(MsgArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MsgArgs {
+    #[command(subcommand)]
+    pub cmd: MsgCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MsgCmd {
+    /// Send a message from one agent to another.
+    Send {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "")]
+        subject: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long, default_value = "")]
+        thread_id: String,
+        #[arg(long, default_value = "")]
+        reply_to_message_id: String,
+        #[arg(long, default_value_t = 0i64)]
+        ttl_secs: i64,
+    },
+    /// Read an agent's inbox.
+    Inbox {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        subject_id: String,
+        #[arg(long, default_value_t = false)]
+        include_read: bool,
+        #[arg(long, default_value_t = 20usize)]
+        limit: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Mark a message as read.
+    Read {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        reader_subject_id: String,
+    },
+    /// List every message in a thread.
+    Thread {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        thread_id: String,
+        #[arg(long)]
+        subject_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Soft delete a message (flips status to expired).
+    Delete {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        subject_id: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -556,6 +630,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Cron(args) => cron_run(args.cmd).await,
         Cmd::Delegate(args) => delegate_run(args.cmd).await,
         Cmd::Agent(args) => agent_run(args.cmd).await,
+        Cmd::Msg(args) => msg_run(args.cmd).await,
     }
 }
 
@@ -2366,6 +2441,237 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
         _ => unreachable!(),
     };
     Some(n * mult)
+}
+
+// ── PH-MSG-CLI: messaging subcommands ──────────────────────
+
+async fn msg_run(cmd: MsgCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        MsgCmd::Send {
+            bridge,
+            from,
+            to,
+            subject,
+            body,
+            thread_id,
+            reply_to_message_id,
+            ttl_secs,
+        } => {
+            msg_send_call(
+                &bridge,
+                &from,
+                &to,
+                &subject,
+                &body,
+                &thread_id,
+                &reply_to_message_id,
+                ttl_secs,
+            )
+            .await
+        }
+        MsgCmd::Inbox {
+            bridge,
+            subject_id,
+            include_read,
+            limit,
+            json,
+        } => msg_inbox(&bridge, &subject_id, include_read, limit, json).await,
+        MsgCmd::Read {
+            bridge,
+            message_id,
+            reader_subject_id,
+        } => msg_read(&bridge, &message_id, &reader_subject_id).await,
+        MsgCmd::Thread {
+            bridge,
+            thread_id,
+            subject_id,
+            json,
+        } => msg_thread(&bridge, &thread_id, &subject_id, json).await,
+        MsgCmd::Delete {
+            bridge,
+            message_id,
+            subject_id,
+        } => msg_delete(&bridge, &message_id, &subject_id).await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn msg_send_call(
+    bridge: &str,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    thread_id: &str,
+    reply_to_message_id: &str,
+    ttl_secs: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/messages");
+    let mut payload = json!({
+        "from_subject_id": from,
+        "to_subject_id": to,
+        "subject": subject,
+        "body": body,
+    });
+    if !thread_id.is_empty() {
+        payload["thread_id"] = json!(thread_id);
+    }
+    if !reply_to_message_id.is_empty() {
+        payload["reply_to_message_id"] = json!(reply_to_message_id);
+    }
+    if ttl_secs > 0 {
+        payload["ttl_secs"] = json!(ttl_secs);
+    }
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&payload).send().await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn msg_inbox(
+    bridge: &str,
+    subject_id: &str,
+    include_read: bool,
+    limit: usize,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!(
+        "{base}/v1/messages/inbox/{}?limit={limit}&include_read={}",
+        urlencode(subject_id),
+        if include_read { 1 } else { 0 }
+    );
+    let body = http_get_string(&url).await?;
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no messages)");
+        return Ok(());
+    }
+    println!(
+        "{:<18} {:<14} {:<20} {:<8} preview",
+        "message_id", "from", "subject", "status"
+    );
+    for m in rows {
+        let id = m.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
+        let from = m
+            .get("from_subject_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let subj = m.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+        let status = m.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let preview = m.get("body_preview").and_then(|v| v.as_str()).unwrap_or("");
+        println!(
+            "{:<18} {:<14} {:<20} {:<8} {}",
+            short(id, 18),
+            short(from, 14),
+            short(subj, 20),
+            short(status, 8),
+            preview
+        );
+    }
+    Ok(())
+}
+
+async fn msg_read(
+    bridge: &str,
+    message_id: &str,
+    reader_subject_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/messages/{}/read", urlencode(message_id));
+    let client = reqwest::Client::new();
+    let r = client
+        .post(&url)
+        .json(&json!({ "reader_subject_id": reader_subject_id }))
+        .send()
+        .await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
+}
+
+async fn msg_thread(
+    bridge: &str,
+    thread_id: &str,
+    subject_id: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!(
+        "{base}/v1/messages/thread/{}?subject_id={}",
+        urlencode(thread_id),
+        urlencode(subject_id)
+    );
+    let body = http_get_string(&url).await?;
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(empty thread)");
+        return Ok(());
+    }
+    for m in rows {
+        let from = m
+            .get("from_subject_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let preview = m.get("body_preview").and_then(|v| v.as_str()).unwrap_or("");
+        let status = m.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let sent_at = m.get("sent_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        println!("[{sent_at}] {} ({status}): {preview}", short(from, 14));
+    }
+    Ok(())
+}
+
+async fn msg_delete(
+    bridge: &str,
+    message_id: &str,
+    subject_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/messages/{}", urlencode(message_id));
+    let client = reqwest::Client::new();
+    let r = client
+        .delete(&url)
+        .json(&json!({ "subject_id": subject_id }))
+        .send()
+        .await?;
+    let status = r.status();
+    let text = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {text}");
+        std::process::exit(1);
+    }
+    println!("{text}");
+    Ok(())
 }
 
 // ── PH-DELEGATE-CLI: delegation subcommands ────────────────
