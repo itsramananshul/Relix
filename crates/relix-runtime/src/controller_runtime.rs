@@ -2496,10 +2496,23 @@ fn register_node_type_handlers(
                 .with_environment_requirements([format!("provider:{provider_name}")])
                 .with_risk(relix_core::capability::RiskLevel::Medium),
         );
+        manifest.add_capability(
+            CapabilityDescriptor::unary("ai.embed")
+                .with_sensitivity([format!("provider:{provider_name}")])
+                .with_description(
+                    "Batch text embedding. Arg `model|text1§text2§…`; returns \
+                     `model|base64(f32-le)|...`. Used by the memory node's \
+                     vector search; mock provider returns deterministic 8-dim \
+                     vectors so the pipeline works without a real key.",
+                )
+                .with_categories(["generate".into(), "ai".into(), "embedding".into()])
+                .with_environment_requirements([format!("provider:{provider_name}")])
+                .with_risk(relix_core::capability::RiskLevel::Low),
+        );
         tracing::info!(
             provider = %provider_name,
             default_model = %default_model,
-            "ai node: registered ai.chat"
+            "ai node: registered ai.chat / ai.embed"
         );
     }
     if cfg.controller.node_type == "coordinator" {

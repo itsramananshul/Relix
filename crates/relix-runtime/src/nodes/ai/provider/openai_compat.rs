@@ -18,8 +18,11 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    ChatInput, ChatOutput, ChatProvider, ProviderEntry, ProviderError, TokenUsage, load_api_key,
+    ChatInput, ChatOutput, ChatProvider, EmbedInput, EmbedOutput, ProviderEntry, ProviderError,
+    TokenUsage, load_api_key,
 };
+
+const DEFAULT_EMBED_MODEL: &str = "text-embedding-3-small";
 
 /// One instance per active OpenAI-compatible provider name.
 pub struct OpenAICompatibleProvider {
@@ -191,6 +194,102 @@ impl ChatProvider for OpenAICompatibleProvider {
 
     fn provider_name(&self) -> &'static str {
         self.name
+    }
+
+    async fn generate_embeddings(&self, input: EmbedInput) -> Result<EmbedOutput, ProviderError> {
+        let model = if input.model.is_empty() {
+            DEFAULT_EMBED_MODEL.to_string()
+        } else {
+            input.model.clone()
+        };
+        if input.texts.is_empty() {
+            return Ok(EmbedOutput {
+                model,
+                vectors: Vec::new(),
+            });
+        }
+
+        let body = json!({
+            "model": model,
+            "input": input.texts,
+        });
+        let url = format!("{}/embeddings", self.base_url);
+        let mut req = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body.to_string());
+        if let Some(key) = &self.api_key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().await.map_err(|e| {
+            ProviderError::Transient(format!(
+                "{provider}: http embeddings: {e}",
+                provider = self.name
+            ))
+        })?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| {
+            ProviderError::Transient(format!(
+                "{provider}: read embeddings body: {e}",
+                provider = self.name
+            ))
+        })?;
+        if !status.is_success() {
+            let msg = format!("{}: HTTP {status} embeddings: {text}", self.name);
+            return Err(if status.as_u16() == 429 || status.is_server_error() {
+                ProviderError::Transient(msg)
+            } else {
+                ProviderError::Permanent(msg)
+            });
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            ProviderError::Permanent(format!(
+                "{provider}: parse embeddings: {e}",
+                provider = self.name
+            ))
+        })?;
+        let data = parsed
+            .get("data")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                ProviderError::Permanent(format!(
+                    "{provider}: no data[] in embeddings response: {text}",
+                    provider = self.name
+                ))
+            })?;
+        if data.len() != input.texts.len() {
+            return Err(ProviderError::Permanent(format!(
+                "{provider}: embeddings response had {got} vectors for {want} inputs",
+                provider = self.name,
+                got = data.len(),
+                want = input.texts.len(),
+            )));
+        }
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(data.len());
+        for (idx, item) in data.iter().enumerate() {
+            let arr = item
+                .get("embedding")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    ProviderError::Permanent(format!(
+                        "{provider}: no embedding[] at data[{idx}]",
+                        provider = self.name
+                    ))
+                })?;
+            let mut v: Vec<f32> = Vec::with_capacity(arr.len());
+            for x in arr {
+                let f = x.as_f64().ok_or_else(|| {
+                    ProviderError::Permanent(format!(
+                        "{provider}: non-numeric embedding component at data[{idx}]",
+                        provider = self.name
+                    ))
+                })? as f32;
+                v.push(f);
+            }
+            vectors.push(v);
+        }
+        Ok(EmbedOutput { model, vectors })
     }
 }
 

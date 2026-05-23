@@ -73,8 +73,8 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 pub use provider::ChatInput;
 use provider::{
-    AnthropicProvider, ChatProvider, GeminiProvider, MockProvider, OpenAICompatibleProvider,
-    ProviderEntries, ProviderEntry, ProviderError,
+    AnthropicProvider, ChatProvider, EmbedInput, GeminiProvider, MockProvider,
+    OpenAICompatibleProvider, ProviderEntries, ProviderEntry, ProviderError,
 };
 
 /// Per-node AI configuration parsed from controller TOML `[ai]`.
@@ -208,16 +208,104 @@ pub fn register(
     default_model: String,
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
 ) {
-    let provider_for_handler = provider.clone();
+    let provider_for_chat = provider.clone();
+    let model_for_chat = default_model.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
-            let p = provider_for_handler.clone();
-            let model = default_model.clone();
+            let p = provider_for_chat.clone();
+            let model = model_for_chat.clone();
             let mem = memory_dispatcher.clone();
             async move { handle_chat(p, model, mem, ctx).await }
         })),
     );
+    let provider_for_embed = provider.clone();
+    bridge.register(
+        "ai.embed",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let p = provider_for_embed.clone();
+            async move { handle_embed(p, ctx).await }
+        })),
+    );
+}
+
+/// Render an `f32` array as standard base64 of the little-endian
+/// packed bytes. Used by `ai.embed` to keep the wire format ASCII.
+fn encode_embedding_b64(v: &[f32]) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+async fn handle_embed(provider: Arc<dyn ChatProvider>, ctx: InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("ai.embed arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    // Wire: `model|text1§text2§text3...`. Model may be empty
+    // (provider chooses default); texts are §-separated since `|`
+    // is the field separator. Empty text segments are dropped.
+    let Some((model, rest)) = s.split_once('|') else {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "ai.embed arg must be `model|text1§text2§...`".to_string(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    };
+    let texts: Vec<String> = rest
+        .split('§')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if texts.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "ai.embed: at least one non-empty text required".to_string(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let result = provider
+        .generate_embeddings(EmbedInput {
+            model: model.to_string(),
+            texts,
+        })
+        .await;
+    match result {
+        Ok(out) => {
+            let mut body = String::with_capacity(out.model.len() + out.vectors.len() * 64);
+            body.push_str(&out.model);
+            for v in &out.vectors {
+                body.push('|');
+                body.push_str(&encode_embedding_b64(v));
+            }
+            body.push('\n');
+            HandlerOutcome::Ok(body.into_bytes())
+        }
+        Err(ProviderError::Transient(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_OVERLOADED,
+            cause: format!("ai.embed: {c}"),
+            retry_hint: 1,
+            retry_after: None,
+        }),
+        Err(ProviderError::Permanent(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("ai.embed: {c}"),
+            retry_hint: 2,
+            retry_after: None,
+        }),
+    }
 }
 
 async fn handle_chat(
@@ -493,6 +581,52 @@ mod tests {
         }
         let captured = recorded.lock().unwrap().clone().unwrap();
         assert!(captured.system_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn embed_handler_returns_model_and_b64_vectors() {
+        use crate::nodes::ai::provider::MOCK_EMBED_DIMS;
+        let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
+        // arg: model|text1§text2 with empty model → mock-embed.
+        let r = handle_embed(p, ctx(b"|hello there\xc2\xa7second one")).await;
+        let bytes = match r {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        let text = std::str::from_utf8(&bytes).unwrap().trim_end_matches('\n');
+        let mut parts = text.split('|');
+        let model = parts.next().unwrap();
+        assert_eq!(model, "mock-embed");
+        let vecs: Vec<&str> = parts.collect();
+        assert_eq!(vecs.len(), 2);
+        // Each base64-decoded chunk is MOCK_EMBED_DIMS * 4 bytes.
+        use base64::Engine;
+        for v in &vecs {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(v.as_bytes())
+                .unwrap();
+            assert_eq!(raw.len(), MOCK_EMBED_DIMS * 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_handler_rejects_arg_without_pipe() {
+        let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
+        let r = handle_embed(p, ctx(b"no-pipe-here")).await;
+        match r {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_handler_rejects_no_texts() {
+        let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
+        let r = handle_embed(p, ctx(b"model|")).await;
+        match r {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
+        }
     }
 
     #[test]

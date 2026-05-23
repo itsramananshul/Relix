@@ -88,7 +88,8 @@ use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 pub use curator::{
     AiDispatcher, AiMeshDispatcher, AiPeerConfig, CoordDispatcher, CoordMeshDispatcher,
     CoordPeerConfig, CuratorConfig, CuratorRunSummary, CuratorState, CuratorSubjectResult,
-    render_status_body, spawn_curator_scheduler,
+    EmbeddingDispatcher, EmbeddingError, EmbeddingMeshDispatcher, render_status_body,
+    spawn_curator_scheduler,
 };
 
 /// Per-node memory configuration parsed from the controller TOML `[memory]`

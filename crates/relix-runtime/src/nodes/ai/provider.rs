@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 
 pub use anthropic::AnthropicProvider;
 pub use gemini::GeminiProvider;
-pub use mock::MockProvider;
+pub use mock::{MOCK_EMBED_DIMS, MockProvider};
 pub use openai_compat::OpenAICompatibleProvider;
 
 // ──────────────────────────── Trait ────────────────────────────────────────
@@ -114,6 +114,39 @@ pub trait ChatProvider: Send + Sync {
 
     /// Short identifier shown in startup logs and audit metadata.
     fn provider_name(&self) -> &'static str;
+
+    /// Generate embeddings for a batch of texts. Default impl returns
+    /// `Permanent("not supported")` so providers that have no
+    /// embedding API (Anthropic, Gemini today) don't need to
+    /// be touched. Mock + OpenAI-compatible override.
+    async fn generate_embeddings(&self, input: EmbedInput) -> Result<EmbedOutput, ProviderError> {
+        let _ = input;
+        Err(ProviderError::Permanent(format!(
+            "{} provider does not support embeddings",
+            self.provider_name()
+        )))
+    }
+}
+
+/// Batch embedding request.
+#[derive(Clone, Debug, Default)]
+pub struct EmbedInput {
+    /// Model id (provider-specific — `text-embedding-3-small`,
+    /// `nomic-embed-text`, …). Empty means "use the provider's
+    /// default embedding model" — for OpenAI-compatible this is
+    /// `text-embedding-3-small`; for mock it's `mock-embed`.
+    pub model: String,
+    /// Inputs to embed. Order is preserved in the response.
+    pub texts: Vec<String>,
+}
+
+/// Batch embedding response.
+#[derive(Clone, Debug)]
+pub struct EmbedOutput {
+    /// Model id the provider actually used.
+    pub model: String,
+    /// One f32 vector per input text, in input order.
+    pub vectors: Vec<Vec<f32>>,
 }
 
 /// Provider-layer error class. The handler maps:

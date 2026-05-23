@@ -234,7 +234,139 @@ impl AiDispatcher for AiMeshDispatcher {
     }
 }
 
-// ───────────────────────── CoordDispatcher ────────────────────
+// ───────────────────────── EmbeddingDispatcher ────────────────
+
+/// Errors a [`EmbeddingDispatcher`] can surface. Kept narrow on
+/// purpose — the memory.embed / memory.search handlers map every
+/// variant to `RESPONDER_INTERNAL`.
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddingError {
+    #[error("not connected: embedding dispatcher not wired (no [memory.embedding_peer])")]
+    NotConnected,
+    #[error("transport: {0}")]
+    Transport(String),
+    #[error("decode: {0}")]
+    Decode(String),
+    #[error("responder: {0}")]
+    Responder(String),
+}
+
+/// Async hook the memory node reaches through to call `ai.embed`
+/// on a configured embedding peer. Production wraps a
+/// `MeshClient`; tests stub it. Modelled on [`AiDispatcher`].
+#[async_trait]
+pub trait EmbeddingDispatcher: Send + Sync {
+    /// Generate embeddings for a batch of texts. Returns one
+    /// vector per input text in the same order; vectors are not
+    /// guaranteed to be unit-length (cosine similarity
+    /// normalises).
+    async fn embed(&self, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
+}
+
+/// Live `EmbeddingDispatcher` — wraps a `MeshClient` pointing at
+/// the AI peer that exposes `ai.embed`. Constructed by the
+/// memory controller at startup once
+/// `[memory.embedding_peer]` is parsed and the peer dialled.
+#[derive(Clone)]
+pub struct EmbeddingMeshDispatcher {
+    mesh: MeshClient,
+    alias: String,
+    identity: Bundle,
+    deadline_secs: i64,
+}
+
+impl EmbeddingMeshDispatcher {
+    pub fn new(mesh: MeshClient, alias: String, identity: Bundle, deadline_secs: i64) -> Self {
+        Self {
+            mesh,
+            alias,
+            identity,
+            deadline_secs,
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingDispatcher for EmbeddingMeshDispatcher {
+    async fn embed(&self, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        use base64::Engine;
+        // Wire: arg `model|text1§text2§…`. Each text must not
+        // contain `§` (the responder splits on it); the caller is
+        // expected to have stripped or escaped them upstream.
+        let mut arg =
+            String::with_capacity(model.len() + texts.iter().map(|t| t.len() + 1).sum::<usize>());
+        arg.push_str(model);
+        arg.push('|');
+        for (i, t) in texts.iter().enumerate() {
+            if i > 0 {
+                arg.push('§');
+            }
+            arg.push_str(t);
+        }
+        let envelope = build_request(
+            "ai.embed",
+            arg.into_bytes(),
+            self.identity.clone(),
+            self.deadline_secs,
+        );
+        let resp_bytes = self
+            .mesh
+            .call(&self.alias, envelope)
+            .await
+            .map_err(|e| EmbeddingError::Transport(format!("call: {e}")))?;
+        let resp = decode_response(&resp_bytes)
+            .map_err(|e| EmbeddingError::Decode(format!("decode: {e}")))?;
+        let body = match resp.res {
+            ResponseResult::Ok(b) => b.to_vec(),
+            ResponseResult::Err(env) => {
+                return Err(EmbeddingError::Responder(format!(
+                    "kind={} cause={}",
+                    env.kind, env.cause
+                )));
+            }
+            ResponseResult::StreamHandle(_) => {
+                return Err(EmbeddingError::Decode(
+                    "unexpected stream response from ai.embed".into(),
+                ));
+            }
+        };
+        let text =
+            String::from_utf8(body).map_err(|e| EmbeddingError::Decode(format!("utf8: {e}")))?;
+        // Response: `model|b64(vec_1)|b64(vec_2)|…\n`. We don't
+        // need the model on this side — the call site supplied
+        // it.
+        let trimmed = text.trim_end_matches('\n');
+        let mut parts = trimmed.split('|');
+        let _model = parts.next().unwrap_or_default();
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for (i, p) in parts.enumerate() {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(p.as_bytes())
+                .map_err(|e| EmbeddingError::Decode(format!("vector {i}: base64: {e}")))?;
+            if bytes.len() % 4 != 0 {
+                return Err(EmbeddingError::Decode(format!(
+                    "vector {i}: byte length {} not a multiple of 4",
+                    bytes.len()
+                )));
+            }
+            let mut v = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            out.push(v);
+        }
+        if out.len() != texts.len() {
+            return Err(EmbeddingError::Decode(format!(
+                "expected {} vectors, got {}",
+                texts.len(),
+                out.len()
+            )));
+        }
+        Ok(out)
+    }
+}
+
+// ───────────────────────── CoordDispatcher ────────────────
 
 /// Async hook the curator reaches through to write a
 /// `memory.curator_run` chronicle event to a Coordinator
