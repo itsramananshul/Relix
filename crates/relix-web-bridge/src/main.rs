@@ -110,6 +110,7 @@ mod openai;
 mod policy_denials;
 mod policy_simulate;
 mod secrets;
+mod sol_validate;
 mod sse;
 mod task_recorder;
 mod tasks;
@@ -527,6 +528,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/messages/:message_id",
             axum::routing::delete(messaging::delete),
         )
+        // SOL/Sflow parse-only validator. Dashboard editors call this
+        // to surface line-numbered errors inline before a flow is
+        // deployed. No execution happens here — pure parse.
+        .route("/v1/sol/validate", post(sol_validate::validate))
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with

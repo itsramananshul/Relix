@@ -1820,6 +1820,7 @@
     <a href="#/agents"       class="nav-item" data-route="agents">Agents</a>
     <a href="#/approvals"    class="nav-item" data-route="approvals">Approvals</a>
     <a href="#/messages"     class="nav-item" data-route="messages">Messages</a>
+    <a href="#/sol"          class="nav-item" data-route="sol">SOL / Sflow</a>
     <div class="nav-group">Configure</div>
     <a href="#/providers" class="nav-item" data-route="providers">AI Providers</a>
     <a href="#/telegram"  class="nav-item" data-route="telegram">Telegram</a>
@@ -2966,6 +2967,44 @@
       </div>
     </section>
 
+    <!-- ── #/sol — SOL / Sflow validator ─────────────────────────── -->
+    <section class="page" data-page="sol">
+      <h2>SOL / Sflow editor</h2>
+      <p class="page-subtitle">
+        Parse-only validator for both flow languages. Paste source on
+        the left, pick the language, hit <strong>Validate</strong> —
+        errors come back with line numbers. No flow is executed from
+        this page.
+      </p>
+      <div class="card">
+        <div class="card-header">
+          <h3>Source</h3>
+          <div class="card-actions">
+            <label style="font-size: 12px; margin-right: 8px;">
+              Language
+              <select id="sol-lang">
+                <option value="sflow">Sflow (.sflow)</option>
+                <option value="sol">SOL (.sol)</option>
+              </select>
+            </label>
+            <button id="sol-validate-btn" class="btn-primary">Validate</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <textarea
+            id="sol-source"
+            spellcheck="false"
+            style="width:100%; min-height: 280px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;"
+            placeholder="// sflow example&#10;step reply: ai.chat &quot;hello&quot;&#10;return step.reply.result"
+          ></textarea>
+        </div>
+      </div>
+      <div class="card" id="sol-result-card" style="display:none; margin-top: 12px;">
+        <div class="card-header"><h3>Validation result</h3></div>
+        <div class="card-body" id="sol-result-host"></div>
+      </div>
+    </section>
+
     <!-- ── #/telegram ──────────────────────────────────────────── -->
     <section class="page" data-page="telegram">
       <h2>Telegram</h2>
@@ -3188,6 +3227,7 @@ const PAGES = {
   agents:       { label: 'Agents',       init: initAgents,       enter: enterAgents },
   approvals:    { label: 'Approvals',    init: initApprovals,    enter: enterApprovals },
   messages:     { label: 'Messages',     init: initMessages,     enter: enterMessages },
+  sol:          { label: 'SOL / Sflow',  init: initSol,          enter: enterSol },
   providers:    { label: 'AI Providers', init: null,             enter: enterProviders },
   telegram:     { label: 'Telegram',     init: initTelegram,     enter: enterTelegram },
   config:       { label: 'Bridge Config', init: initConfig,       enter: enterConfig },
@@ -10208,6 +10248,55 @@ async function approvalDecide(approvalId, decision) {
     loadApprovals();
   } catch (e) {
     window.alert('decide failed: ' + String(e));
+  }
+}
+
+// ── #/sol — SOL / Sflow editor ──────────────────────────────
+
+function initSol() {
+  const $btn = document.getElementById('sol-validate-btn');
+  if ($btn) $btn.addEventListener('click', solValidate);
+}
+
+async function enterSol() {
+  const $host = document.getElementById('sol-result-host');
+  if ($host) $host.innerHTML = '';
+  const $card = document.getElementById('sol-result-card');
+  if ($card) $card.style.display = 'none';
+}
+
+async function solValidate() {
+  const $src = document.getElementById('sol-source');
+  const $lang = document.getElementById('sol-lang');
+  const $card = document.getElementById('sol-result-card');
+  const $host = document.getElementById('sol-result-host');
+  if (!$src || !$lang || !$card || !$host) return;
+  const source = $src.value;
+  const kind = $lang.value || 'sflow';
+  $card.style.display = '';
+  $host.innerHTML = '<em>validating…</em>';
+  try {
+    const r = await fetch('/v1/sol/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, kind }),
+    });
+    if (!r.ok) {
+      $host.innerHTML = '<span class="error">HTTP ' + r.status + '</span>';
+      return;
+    }
+    const body = await r.json();
+    if (body.valid) {
+      $host.innerHTML = '<div class="status-good">Valid ' + escapeHtml(kind) + '. No errors.</div>';
+      return;
+    }
+    const rows = (body.errors || []).map(function(e) {
+      const where = e.line && e.line > 0 ? ('line ' + e.line) : '—';
+      return '<tr><td><span class="id">' + escapeHtml(where) + '</span></td><td>' + escapeHtml(e.message) + '</td></tr>';
+    });
+    $host.innerHTML = '<table class="grid"><thead><tr><th>Location</th><th>Message</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+  } catch (err) {
+    $host.innerHTML = '<span class="error">' + escapeHtml(String(err)) + '</span>';
   }
 }
 
