@@ -575,6 +575,51 @@ delivery mode, no approval-notifier loop, no persistent session
 store, no formal slash-command registration. `operator_user_id`
 is reserved for the future approval surface.
 
+### 6.1c Slack channel — shipped
+
+`relix-slack` ships a live `SlackApi` HTTPS client (reqwest +
+rustls) covering `auth.test` / `conversations.history` /
+`chat.postMessage` / `chat.update`. **HTTP 200 + ok=false** is
+the Slack error model — the generic request helper parses the
+envelope first and maps `ok: false` to `ClientError`, never
+retried. 429 honours the `Retry-After` HEADER (integer seconds,
+clamped 1..30s); 5xx uses exponential backoff (1s, 2s, 4s, max
+3 retries).
+
+`node_type = "slack"` is wired into the controller binary; it
+polls `POST /api/conversations.history` on a configurable
+interval (default 2s) using the per-message `ts` string as the
+`oldest` cursor, filters bot self-loops at two layers (SDK
+parse drops `subtype` + `bot_id` messages; controller adds a
+`user_id == bot.user_id` check), enforces `allowed_users`,
+handles `/help /status /memory /forget`, runs the same
+memory + ai dispatch sequence Telegram + Discord use, and
+creates a coordinator task per turn with
+`origin_surface = "slack"`. Replies are threaded under the
+inbound message's `ts`. There is **no typing indicator** —
+Slack has no REST equivalent and the implementation does not
+invent one.
+
+Snowflake-ish ids (user_id, team_id, bot_id, channel_id) are
+strings end-to-end. The status capability exposes a `team_id`
+slot in addition to user_id / username — Slack's identity model
+has a workspace dimension that Discord and Telegram don't.
+
+Bridge endpoints `GET /v1/slack/status` +
+`GET /v1/slack/messages/recent` proxy the channel's read
+capabilities; the dashboard `#/slack` page renders both as live
+cards; `relix-cli ops slack {status,messages}` mirrors the same
+data on the terminal. Boot via `scripts/relix-mesh-up.ps1` with
+`$env:RELIX_SLACK = "1"`,
+`$env:RELIX_SLACK_BOT_TOKEN = "xoxb-..."`, and
+`$env:RELIX_SLACK_CHANNEL_ID = "C01234567"`. Setup is documented
+in `docs/slack.md`.
+
+The Slack controller deliberately ships smaller than Telegram:
+no Socket Mode WebSocket, no Events API webhook receiver, no
+typing indicator, no approval-notifier loop, no persistent
+session store, no formal slash-command registration.
+
 ### 6.2 Playwright browser backend — scaffold
 
 `[tool.browser] backend = "playwright"` selects a scaffold that returns

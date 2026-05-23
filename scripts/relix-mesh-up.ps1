@@ -41,6 +41,7 @@ param(
     [int]$CoordinatorPort   = 19714,
     [int]$TelegramPort      = 19715,
     [int]$DiscordPort       = 19716,
+    [int]$SlackPort         = 19717,
     [switch]$ToolAllowHttp,
     [switch]$NoTool,
     [switch]$NoCoordinator,
@@ -63,7 +64,17 @@ param(
     #   $env:RELIX_DISCORD_ALLOWED_USERS    = "42,1234"  # comma-separated user_ids
     # Without a token + channel id the polling loop idles and the
     # dashboard reports `online=false`.
-    [switch]$NoDiscord
+    [switch]$NoDiscord,
+    # Slack channel is opt-in. Enable by setting
+    #   $env:RELIX_SLACK = "1"
+    #   $env:RELIX_SLACK_BOT_TOKEN = "xoxb-..."
+    #   $env:RELIX_SLACK_CHANNEL_ID = "C01234567"
+    # before invoking this script. Optional:
+    #   $env:RELIX_SLACK_OPERATOR_USER_ID = "U01234"
+    #   $env:RELIX_SLACK_ALLOWED_USERS    = "U01,U02"
+    # Without a token + channel id the polling loop idles and the
+    # dashboard reports `online=false`.
+    [switch]$NoSlack
 )
 
 $ErrorActionPreference = 'Stop'
@@ -90,12 +101,14 @@ $ToolKey        = "dev-keys/$Run-tool.key"
 $CoordinatorKey = "dev-keys/$Run-coordinator.key"
 $TelegramKey    = "dev-keys/$Run-telegram.key"
 $DiscordKey     = "dev-keys/$Run-discord.key"
+$SlackKey       = "dev-keys/$Run-slack.key"
 $BridgeKey      = "dev-keys/$Run-bridge.key"
 # Telegram is opt-in. Default off so existing operator
 # workflows are unaffected; explicitly set $env:RELIX_TELEGRAM=1
 # to enable.
 $TelegramEnabled = ($env:RELIX_TELEGRAM -eq '1') -and (-not $NoTelegram.IsPresent)
 $DiscordEnabled  = ($env:RELIX_DISCORD -eq '1') -and (-not $NoDiscord.IsPresent)
+$SlackEnabled    = ($env:RELIX_SLACK -eq '1') -and (-not $NoSlack.IsPresent)
 $Policy     = "configs/policies/$Run.toml"
 $BridgeHttp = "127.0.0.1:$BridgePort"
 
@@ -119,6 +132,7 @@ $ToolConfig        = "$DataBase/tool.toml"
 $CoordinatorConfig = "$DataBase/coordinator.toml"
 $TelegramConfig    = "$DataBase/telegram.toml"
 $DiscordConfig     = "$DataBase/discord.toml"
+$SlackConfig       = "$DataBase/slack.toml"
 $BridgeConfig      = "$DataBase/bridge.toml"
 $Peers             = "$DataBase/peers.toml"
 
@@ -386,6 +400,69 @@ addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
 
 [peers]
 "@ | Set-Content -Encoding utf8 $DiscordConfig
+}
+
+# 4.8) Slack controller config. Opt-in via $env:RELIX_SLACK=1.
+#      Same shape as Discord but with Slack-specific id forms
+#      (allowed_users / operator_user_id are string ids like
+#      "U01234567"; channel_id starts with C/G/D).
+if ($SlackEnabled) {
+    $slAllowedRaw = $env:RELIX_SLACK_ALLOWED_USERS
+    if (-not $slAllowedRaw) { $slAllowedRaw = '' }
+    $slAllowed = if ($slAllowedRaw -eq '') {
+        '[]'
+    } else {
+        '[' + (($slAllowedRaw -split ',' | ForEach-Object { '"' + $_.Trim() + '"' }) -join ', ') + ']'
+    }
+    $slOperator = if ($env:RELIX_SLACK_OPERATOR_USER_ID) {
+        $env:RELIX_SLACK_OPERATOR_USER_ID
+    } else {
+        ''
+    }
+    $slChannel = if ($env:RELIX_SLACK_CHANNEL_ID) {
+        $env:RELIX_SLACK_CHANNEL_ID
+    } else {
+        # Placeholder Slack channel id — passes the prefix +
+        # length check so the controller boots; the polling loop
+        # will get an error from Slack and stay offline. Operator
+        # must supply a real id via the env var.
+        'C000000000'
+    }
+@"
+[controller]
+name = "$Run-slack"
+node_type = "slack"
+listen_port = $SlackPort
+
+[identity]
+key_path = "$SlackKey"
+
+[trust]
+org_root_key_path = "$OrgPub"
+
+[policy]
+file = "$Policy"
+
+[slack]
+token_env = "RELIX_SLACK_BOT_TOKEN"
+channel_id = "$slChannel"
+allowed_users = $slAllowed
+operator_user_id = "$slOperator"
+messages_ring_capacity = 200
+poll_interval_secs = 2
+
+[slack.memory_peer]
+addr = "/ip4/127.0.0.1/tcp/$MemPort"
+
+[slack.ai_peer]
+addr = "/ip4/127.0.0.1/tcp/$AiPort"
+deadline_secs = 60
+
+[slack.coord_peer]
+addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
+
+[peers]
+"@ | Set-Content -Encoding utf8 $SlackConfig
 }
 
 # 4.5) Coordinator controller config. Owns the durable Task ledger
@@ -683,6 +760,16 @@ allow_groups = ["chat-users"]
 name = "discord_messages_recent"
 method = "discord.messages_recent"
 allow_groups = ["chat-users"]
+
+[[rules]]
+name = "slack_status"
+method = "slack.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "slack_messages_recent"
+method = "slack.messages_recent"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
 # 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.
@@ -723,6 +810,14 @@ if ($DiscordEnabled) {
 
 [peers.discord]
 addr = "/ip4/127.0.0.1/tcp/$DiscordPort"
+"@
+}
+if ($SlackEnabled) {
+    $peersToml += @"
+
+
+[peers.slack]
+addr = "/ip4/127.0.0.1/tcp/$SlackPort"
 "@
 }
 $peersToml | Set-Content -Encoding utf8 $Peers
@@ -776,6 +871,7 @@ $ToolLog        = "$DataBase/tool.log"
 $CoordinatorLog = "$DataBase/coordinator.log"
 $TelegramLog    = "$DataBase/telegram.log"
 $DiscordLog     = "$DataBase/discord.log"
+$SlackLog       = "$DataBase/slack.log"
 $BridgeLog      = "$DataBase/bridge.log"
 $MemErr         = "$DataBase/memory.err.log"
 $AiErr          = "$DataBase/ai.err.log"
@@ -783,6 +879,7 @@ $ToolErr        = "$DataBase/tool.err.log"
 $CoordinatorErr = "$DataBase/coordinator.err.log"
 $TelegramErr    = "$DataBase/telegram.err.log"
 $DiscordErr     = "$DataBase/discord.err.log"
+$SlackErr       = "$DataBase/slack.err.log"
 $BridgeErr      = "$DataBase/bridge.err.log"
 
 $env:RELIX_DATA_DIR = 'dev-data'
@@ -855,6 +952,13 @@ if ($DiscordEnabled) {
 } else {
     Write-Host "  discord port:  (disabled - set RELIX_DISCORD=1 to enable)"
 }
+if ($SlackEnabled) {
+    $hasSlToken = if ($env:RELIX_SLACK_BOT_TOKEN) { 'token=set' } else { 'token=MISSING' }
+    $hasSlCh    = if ($env:RELIX_SLACK_CHANNEL_ID) { 'channel=set' } else { 'channel=MISSING' }
+    Write-Host ("  slack port:    tcp/{0}  ({1}, {2})" -f $SlackPort, $hasSlToken, $hasSlCh)
+} else {
+    Write-Host "  slack port:    (disabled - set RELIX_SLACK=1 to enable)"
+}
 Write-Host "  bridge HTTP:   http://$BridgeHttp"
 Write-Host "  data dir:      $DataBase"
 Write-Host ""
@@ -908,6 +1012,16 @@ try {
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $DiscordConfig -OutLog $DiscordLog -ErrLog $DiscordErr -RustLog 'relix_runtime=info,relix_discord=info') )
     }
 
+    if ($SlackEnabled) {
+        $SlackBundlePath = "dev-keys/$Run-slack.bundle"
+        if (-not (Test-Path $SlackBundlePath)) {
+            & $Cli identity mint --root-key $OrgKey --name slack --groups chat-users --out $SlackBundlePath
+            if ($LASTEXITCODE -ne 0) { throw "slack identity mint failed" }
+        }
+        Write-Host "starting slack controller ..."
+        [void]$started.Add( (Start-Node -Exe $Controller -Cfg $SlackConfig -OutLog $SlackLog -ErrLog $SlackErr -RustLog 'relix_runtime=info,relix_slack=info') )
+    }
+
     if (-not (Wait-Log -Path $MemLog -Needle 'transport listening' -Desc 'memory controller')) { throw 'memory controller never came up' }
     if (-not (Wait-Log -Path $AiLog  -Needle 'transport listening' -Desc 'ai controller'))     { throw 'ai controller never came up' }
     if (-not $NoTool) {
@@ -921,6 +1035,9 @@ try {
     }
     if ($DiscordEnabled) {
         if (-not (Wait-Log -Path $DiscordLog -Needle 'transport listening' -Desc 'discord controller')) { throw 'discord controller never came up' }
+    }
+    if ($SlackEnabled) {
+        if (-not (Wait-Log -Path $SlackLog -Needle 'transport listening' -Desc 'slack controller')) { throw 'slack controller never came up' }
     }
     Start-Sleep -Milliseconds 400
 
@@ -978,6 +1095,7 @@ try {
     if (-not $NoCoordinator) { Write-Host "  $CoordinatorLog" }
     if ($TelegramEnabled)    { Write-Host "  $TelegramLog" }
     if ($DiscordEnabled)     { Write-Host "  $DiscordLog" }
+    if ($SlackEnabled)       { Write-Host "  $SlackLog" }
     Write-Host "  $BridgeLog"
     Write-Host ""
     Write-Host "PIDs (this script will only stop these on Ctrl-C):"
