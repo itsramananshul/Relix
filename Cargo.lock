@@ -3222,6 +3222,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "relix-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "relix-plugin-web-lookup"
+version = "0.1.0"
+dependencies = [
+ "relix-plugin-sdk",
+ "reqwest",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "relix-runtime"
 version = "0.1.0"
 dependencies = [

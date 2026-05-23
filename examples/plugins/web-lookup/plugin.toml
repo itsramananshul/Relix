@@ -1,0 +1,34 @@
+# Example Relix plugin manifest — Rust + relix-plugin-sdk.
+#
+# Build with:
+#   cargo build -p relix-plugin-web-lookup
+#
+# Point the plugin_host at this directory:
+#   $env:RELIX_PLUGIN_DIR = "./examples/plugins/web-lookup"
+#
+# The host's PluginLoader spawns the binary, reads
+# `RELIX_PLUGIN_PORT=<n>` from stdout, polls /health, and then
+# routes every `web_lookup.fetch` call to /invoke on that port.
+
+[plugin]
+name        = "web-lookup"
+version     = "0.1.0"
+description = "Fetch a URL and return the first 500 chars of its body."
+author      = "Relix examples"
+homepage    = ""
+license     = "Apache-2.0"
+
+[[plugin.capabilities.provides]]
+method            = "web_lookup.fetch"
+description       = "Fetch one HTTP/HTTPS URL and return the first 500 chars of its body."
+categories        = ["tool", "external", "http"]
+sensitivity_tags  = ["external:api"]
+risk_level        = "low"
+
+[plugin.runtime]
+kind                 = "subprocess"
+# Resolved relative to the plugin.toml directory.
+binary               = "../../../target/debug/relix-plugin-web-lookup.exe"
+args                 = []
+protocol             = "relix-plugin-v1"
+invoke_timeout_secs  = 30

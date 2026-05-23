@@ -10,6 +10,8 @@ members = [
     "crates/relix-telegram",
     "crates/relix-discord",
     "crates/relix-slack",
+    "crates/relix-plugin-sdk",
+    "examples/plugins/web-lookup",
 ]
 
 # Shared metadata applied to every crate via `package.workspace = true`.

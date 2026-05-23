@@ -1,0 +1,25 @@
+[package]
+name        = "relix-plugin-sdk"
+description = "Plugin author SDK for the relix-plugin-v1 protocol. Tiny axum-based HTTP server that exposes registered capabilities to a hosting Relix mesh node."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+# Deliberately MINIMAL — plugin authors should be able to pull this
+# in without inheriting relix-runtime / relix-core. Only axum + tokio
+# + serde + tracing live here.
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+async-trait.workspace = true
+tokio                = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread", "net", "io-util", "io-std"] }
+tracing.workspace    = true
+axum.workspace       = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "sync"] }

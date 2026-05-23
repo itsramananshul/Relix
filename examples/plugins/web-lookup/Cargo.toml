@@ -1,0 +1,21 @@
+[package]
+name        = "relix-plugin-web-lookup"
+description = "Example Relix plugin — wraps an HTTP GET into a relix-plugin-v1 capability."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish      = false
+
+[[bin]]
+name = "relix-plugin-web-lookup"
+path = "src/main.rs"
+
+[dependencies]
+relix-plugin-sdk = { path = "../../../crates/relix-plugin-sdk", version = "0.1.0" }
+tokio            = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
