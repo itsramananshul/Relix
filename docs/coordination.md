@@ -1,15 +1,21 @@
-# Coordinator
+# Coordination
 
-The Coordinator is a Relix peer that owns the **durable Task ledger**. It
-runs as a regular controller (`node_type = "coordinator"`), is dialled
-like any other peer, and serves five capabilities through the standard
+The Coordinator is the Relix peer that owns the **durable Task ledger**
+and is the home for everything multi-agent: task state, delegation,
+agent-to-agent messaging, approvals, and the cron scheduler. It runs
+as a regular controller (`node_type = "coordinator"`), is dialled like
+any other peer, and serves these capabilities through the standard
 admission pipeline.
 
 It is **not** a central gateway, an orchestrator, or a flow executor.
 Flow execution still happens on the caller's side (bridge or
 `relix-cli flow-run`). The Coordinator's job is to remember that the
-work happened, what state it's in, and where the per-flow event log
-lives on disk.
+work happened, what state it's in, where the per-flow event log
+lives on disk, who delegated what to whom, what messages crossed
+between agents, and which actions are waiting on operator approval.
+
+For the cron / scheduler surface specifically see
+[`scheduler.md`](scheduler.md) — same node, separate doc.
 
 For the **semantics** of "checkpointed re-run" (and why this is not
 yet full resumable replay), see [`replay-model.md`](replay-model.md).
@@ -193,6 +199,130 @@ The Coordinator inherits Relix's per-peer admission posture verbatim:
   passed to `task.create` matches the caller's `subject_id`. Operators
   who care can wire a policy rule (or a dispatch-layer check in a
   future milestone) that pins `task.create` to the bridge's group only.
+
+## Delegation
+
+One agent spawns another as a subtask. Builds on the same task
+ledger — the child is a full first-class task with
+`origin_surface = "delegation"` — and is enforced through a
+hard depth cap.
+
+| Method            | Arg                                                              | Returns |
+|-------------------|------------------------------------------------------------------|---------|
+| `delegate.spawn`  | `parent_task_id\|goal\|context\|target_subject_id\|depth`        | `<child_task_id>\n` |
+| `delegate.result` | `<child_task_id>`                                                | `status\|result_preview\|completed_at\n` (`-1` if not terminal) |
+| `delegate.cancel` | `<child_task_id>\|<reason>`                                      | `ok\n` |
+| `delegate.list`   | `<parent_task_id>`                                               | `<child_task_id>\t<goal_preview>\t<status>\t<created_at>\n` per row + `count=N\n` |
+
+`delegate.spawn` writes a `delegated_to` edge from parent to
+child, flips the parent to `awaiting_input`, and writes a
+`task.awaiting` chronicle event on the parent. A background
+executor on the coordinator polls for `origin_surface =
+"delegation"` + `status = "pending"` children, dispatches
+`ai.chat` with the goal + context, flips the child to
+`completed` / `failed`, and writes a `delegate.child_completed`
+chronicle event on the parent that flips it back to `running`.
+
+Depth is capped two ways: the caller's `depth` integer is
+rejected if `>= max_depth` (default 3), AND an independent
+walk of the `delegated_to` ancestor chain has to report a
+depth below the cap. A caller that under-reports `depth` still
+gets caught by the second check.
+
+HTTP surface:
+
+```
+POST /v1/delegate/spawn                     { parent_task_id, goal, context?, target_subject_id?, depth }
+GET  /v1/delegate/result/:child_task_id
+POST /v1/delegate/cancel/:child_task_id     { reason? }
+GET  /v1/delegate/list/:parent_task_id
+```
+
+Source: `crates/relix-runtime/src/nodes/coordinator/delegate/`
+(`mod.rs` registers the four capabilities; `handlers.rs` owns
+the wire contracts; `executor.rs` runs the dispatcher loop).
+
+## Agent-to-agent messaging
+
+Direct point-to-point channel between two agents that lives
+independently of the task ledger. Distinct from delegation:
+delegation creates a child task and the parent waits on its
+outcome; messaging is a mail drop — sender posts, recipient
+reads + replies, no task is created. A single
+`msg.sent` chronicle event lands on the coordinator's
+bookkeeping task (`msg-bookkeeping-system`) per send so audit
+records from / to / thread without storing the body.
+
+| Method       | Arg                                                                                | Returns |
+|--------------|------------------------------------------------------------------------------------|---------|
+| `msg.send`   | `from\|to\|subject\|body\|thread_id\|reply_to\|ttl_secs\|origin_surface`           | `<message_id>\n` |
+| `msg.inbox`  | `subject_id\|limit\|include_read\|since_message_id`                                | tab rows + `count=N\n` |
+| `msg.read`   | `message_id\|reader_subject_id`                                                    | `ok\n` |
+| `msg.thread` | `thread_id\|subject_id`                                                            | tab rows (oldest-first) + `count=N\n` |
+| `msg.delete` | `message_id\|subject_id`                                                           | `ok\n` |
+
+Lifecycle: `delivered → read → expired`. Soft-delete writes
+`status = expired` so the row stays visible to audit but
+disappears from operator inboxes. `ttl_secs = 0` means "no
+auto-expire"; a non-zero value sets the auto-expire deadline
+relative to `sent_at`.
+
+HTTP surface:
+
+```
+POST   /v1/messages                          { from, to, subject, body, thread_id?, reply_to?, ttl_secs?, origin_surface }
+GET    /v1/messages/inbox/:subject_id        ?limit=&include_read=&since=
+POST   /v1/messages/:message_id/read         { reader_subject_id }
+GET    /v1/messages/thread/:thread_id        ?subject_id=
+DELETE /v1/messages/:message_id              { subject_id }
+```
+
+Source: `crates/relix-runtime/src/nodes/coordinator/messaging/`
+(handlers + `MessageStore` SQLite table).
+
+## Approvals
+
+A capability invocation can be gated on an explicit operator
+decision. The coordinator owns the pending-approvals queue;
+the bridge proxies the read + decide surface.
+
+| Method                              | Arg                                | Returns |
+|-------------------------------------|------------------------------------|---------|
+| `coord.approval.pending`            | (empty)                            | JSON list of pending approvals |
+| `coord.approval.decide`             | `<approval_id>\|<approve\|deny>\|<reason>` | `ok\n` |
+| `agent.standing_approval.create`    | `<agent_id>\|<method>\|<ttl_secs>` | `<standing_id>\n` |
+| `agent.standing_approval.list`      | `<agent_id>`                       | rows + `count=N\n` |
+| `agent.standing_approval.revoke`    | `<standing_id>`                    | `ok\n` |
+
+A standing approval pre-authorises a `(subject, method)` pair
+for `ttl_secs`; pending approvals are the one-off
+operator-decision queue.
+
+HTTP surface:
+
+```
+GET    /v1/approvals                                       — pending list
+POST   /v1/approvals/:approval_id/decide                   { decision, reason? }
+GET    /v1/agents/:agent_id/standing-approvals
+POST   /v1/agents/:agent_id/standing-approvals             { method, ttl_secs }
+DELETE /v1/standing-approvals/:standing_id
+```
+
+A background `run_approval_expire_loop` ticks once per minute,
+sweeps expired approvals, and writes the deny outcome to the
+chronicle.
+
+Source: `crates/relix-runtime/src/nodes/coordinator/agent/`
+plus the `coord.approval.*` registrations in
+`crates/relix-runtime/src/controller_runtime.rs`.
+
+## Scheduler
+
+The cron scheduler is also wired on this node. The wire
+capabilities are `cron.create`, `cron.list`, `cron.get`,
+`cron.update`, `cron.delete`, `cron.trigger`; the HTTP surface
+is `/v1/cron/jobs[/...]`. See [`scheduler.md`](scheduler.md)
+for the full design.
 
 ## Open / NOT in scope
 
