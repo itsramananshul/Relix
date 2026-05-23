@@ -1,0 +1,15 @@
+// flows/loop_demo.sflow — `loop N times` with iteration interpolation.
+//
+// `${loop.iter}` is 0-indexed and only set inside a loop body. The flow
+// runs the inner block exactly N times (capped at coordinator-side
+// max_loop_iters); each iteration writes a sol.log chronicle event.
+//
+// No mesh calls — useful for exercising the executor + event-log
+// chronicle path in isolation.
+
+set counter = "0"
+loop 3 times
+  sol.log "iteration ${loop.iter}"
+end
+sol.set_result "done"
+return

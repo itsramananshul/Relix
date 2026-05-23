@@ -41,6 +41,7 @@ use relix_core::types::{FlowId, RequestId, TraceId};
 
 use crate::dispatch::{build_request, decode_response};
 use crate::manifest::{ManifestCache, MeshClient};
+use crate::sflow;
 use crate::sol::analyzer::Analyzer;
 use crate::sol::bytecode::Codegen;
 use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError, RemoteCallResult};
@@ -190,10 +191,7 @@ impl FlowRunner {
             (client, peer_ids)
         };
 
-        // 3. Compile the SOL source.
-        let bytecode = compile_sol(&opts.flow_path)?;
-
-        // 4. Open the per-flow event log. The flow_log_signer = the local
+        // 3. Open the per-flow event log. The flow_log_signer = the local
         //    client_key; the log records are signed by whoever ran the flow
         //    (alpha-equivalent of "the owning controller" per RELIX-3 §3.2).
         let flow_id = FlowId::new();
@@ -207,11 +205,11 @@ impl FlowRunner {
             .map_err(|e| FlowRunnerError::EventLog(format!("open: {e}")))?;
         let event_log = Arc::new(Mutex::new(event_log));
 
-        // 5. Write FlowStarted (log-before-act: VM execution about to begin).
+        // 4. Write FlowStarted (log-before-act: execution about to begin).
         let started_payload = encode_flow_started_payload(&opts, trace_id);
         append_log(&event_log, EventType::FlowStarted, started_payload)?;
 
-        // 6. Build dispatcher.
+        // 5. Build dispatcher (shared by both SOL and Sflow paths).
         let dispatcher: Arc<dyn RemoteCallDispatcher> = Arc::new(RealDispatcher {
             client: client.clone(),
             peer_ids,
@@ -224,27 +222,23 @@ impl FlowRunner {
             mesh: opts.mesh_client.clone(),
         });
 
-        // 7. Spawn the VM on blocking so dispatcher.block_on(...) is safe.
-        let bytecode_for_vm = bytecode.clone();
-        let dispatcher_for_vm = dispatcher.clone();
-        let vm_result = tokio::task::spawn_blocking(move || {
-            let mut vm = VM::from(&bytecode_for_vm).with_dispatcher(dispatcher_for_vm);
-            let exit = vm.run();
-            let last_err = vm.last_error().cloned();
-            // If the program returned a heap-string ref, resolve it for display.
-            let final_string = if exit == VM_ERROR_SENTINEL {
-                None
-            } else {
-                vm.heap_string(exit).map(|s| s.to_string())
-            };
-            (exit, last_err, final_string)
-        })
-        .await
-        .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))?;
+        // 6. Dispatch on file extension. `.sflow` runs the AST-walking
+        //    executor; everything else (default `.sol`) compiles to the
+        //    SOL bytecode and runs the VM.
+        let is_sflow = opts
+            .flow_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("sflow"))
+            .unwrap_or(false);
 
-        let (vm_exit, last_err, final_string) = vm_result;
+        let (vm_exit, last_err, final_string) = if is_sflow {
+            run_sflow(&opts.flow_path, dispatcher.clone(), event_log.clone()).await?
+        } else {
+            run_sol(&opts.flow_path, dispatcher.clone()).await?
+        };
 
-        // 8. Terminal event.
+        // 7. Terminal event.
         if vm_exit == VM_ERROR_SENTINEL {
             let cause = last_err
                 .as_ref()
@@ -269,6 +263,88 @@ impl FlowRunner {
             last_error,
             last_error_kind,
         })
+    }
+}
+
+// ──────────────────────────── Per-language run helpers ──────────────────────
+
+/// Run a `.sol` flow through the existing VM. Returns `(exit, last_err,
+/// final_string)` matching the original FlowRunner::run shape so the caller
+/// can write a uniform FlowCompleted / FlowFailed terminal event.
+async fn run_sol(
+    flow_path: &Path,
+    dispatcher: Arc<dyn RemoteCallDispatcher>,
+) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
+    let bytecode = compile_sol(flow_path)?;
+    let vm_result = tokio::task::spawn_blocking(move || {
+        let mut vm = VM::from(&bytecode).with_dispatcher(dispatcher);
+        let exit = vm.run();
+        let last_err = vm.last_error().cloned();
+        let final_string = if exit == VM_ERROR_SENTINEL {
+            None
+        } else {
+            vm.heap_string(exit).map(|s| s.to_string())
+        };
+        (exit, last_err, final_string)
+    })
+    .await
+    .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))?;
+    Ok(vm_result)
+}
+
+/// Run a `.sflow` flow through the AST executor. Translates the executor's
+/// `ExecOutcome` into the same `(exit, last_err, final_string)` tuple the
+/// SOL path returns so the terminal-event branch above is shared.
+async fn run_sflow(
+    flow_path: &Path,
+    dispatcher: Arc<dyn RemoteCallDispatcher>,
+    event_log: Arc<Mutex<EventLog>>,
+) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
+    let source = std::fs::read_to_string(flow_path)
+        .map_err(|e| FlowRunnerError::Config(format!("read {}: {}", flow_path.display(), e)))?;
+    let program = sflow::compile(&source)
+        .map_err(|e| FlowRunnerError::Config(format!("sflow parse: {e}")))?;
+    let chronicle: Arc<dyn sflow::executor::ChronicleSink> =
+        Arc::new(EventLogChronicle { log: event_log });
+    let exe = sflow::Executor::new(dispatcher, chronicle);
+    let outcome = tokio::task::spawn_blocking(move || exe.run(&program))
+        .await
+        .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))?;
+    match outcome.error {
+        Some(err) => Ok((
+            VM_ERROR_SENTINEL,
+            Some(RemoteCallError {
+                kind: err.error_kind,
+                peer: String::new(),
+                method: format!("sflow:{}", err.kind.as_str()),
+                cause: err.message,
+            }),
+            None,
+        )),
+        None => Ok((0, None, Some(outcome.result))),
+    }
+}
+
+/// Chronicle sink that writes Sflow events into the per-flow EventLog using
+/// `RemoteCallIssued` as a transport — the on-disk format is unchanged
+/// (still signed, hash-chained CBOR records), but each Sflow event is
+/// prefixed with `event=<sol.*>` so flow-log readers and operator tooling
+/// can recognise it. Adding a dedicated EventType variant would change
+/// the signed record format, which is a Gate 2 concern.
+struct EventLogChronicle {
+    log: Arc<Mutex<EventLog>>,
+}
+
+impl sflow::executor::ChronicleSink for EventLogChronicle {
+    fn write(&self, kind: &str, payload: &str) {
+        let body = format!("event={kind}\n{payload}\n").into_bytes();
+        if let Ok(mut g) = self.log.lock() {
+            // Best-effort: a write failure here must not crash the flow
+            // (the executor has no path to surface it cleanly). The
+            // terminal FlowCompleted / FlowFailed event will still be
+            // written by the caller.
+            let _ = g.append(EventType::RemoteCallIssued, body);
+        }
     }
 }
 

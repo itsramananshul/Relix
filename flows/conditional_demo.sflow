@@ -1,0 +1,14 @@
+// flows/conditional_demo.sflow — branch on a named step's status.
+//
+// Walks the if/else surface of the .sflow language: a step is named with
+// `step <name>:`, then a later condition reads `step.<name>.status` and
+// `step.<name>.result`. Useful as a smoke test for a freshly bootstrapped
+// mesh — the AI peer answering the ping at all means routing is live.
+
+step check: ai.chat "ping"
+if step.check.status == "completed"
+  sol.set_result "AI is online"
+else
+  sol.set_result "AI is unavailable"
+end
+return

@@ -1,0 +1,17 @@
+// flows/chat_with_retry.sflow — chat with try/catch fallback.
+//
+// Demonstrates error handling: if ai.chat times out or fails for any
+// other reason, the flow falls back to a canned message instead of
+// halting the way the equivalent .sol flow does.
+//
+// `${prompt}` is supplied by the host as a variable before execution.
+// In this template form, the bridge calls `set prompt = "..."` first.
+
+try
+  step reply: ai.chat "${prompt}"
+  return step.reply.result
+catch timeout
+  sol.set_result "Taking too long. Please retry."
+catch any
+  sol.set_result "Something went wrong. Please retry."
+end
