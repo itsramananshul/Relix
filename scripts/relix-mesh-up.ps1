@@ -880,14 +880,51 @@ name = "plugin_disable"
 method = "plugin.disable"
 allow_groups = ["chat-users"]
 
+# `.sflow` callers see the peer-prefixed alias on the wire
+# because the parser preserves the dotted target the user
+# typed (`step y: plugin_host.plugin.list ""`). The bridge
+# registers each management cap under both names; the
+# policy needs to allow both spellings too.
+[[rules]]
+name = "plugin_host_plugin_list"
+method = "plugin_host.plugin.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_host_plugin_status"
+method = "plugin_host.plugin.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_host_plugin_reload"
+method = "plugin_host.plugin.reload"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_host_plugin_disable"
+method = "plugin_host.plugin.disable"
+allow_groups = ["chat-users"]
+
 [[rules]]
 name = "hello_greet"
 method = "hello.greet"
 allow_groups = ["chat-users"]
 
+# Same prefix-alias allow for the example hello plugin so
+# `.sflow` can call it as `plugin_host.hello.greet`.
+[[rules]]
+name = "plugin_host_hello_greet"
+method = "plugin_host.hello.greet"
+allow_groups = ["chat-users"]
+
 [[rules]]
 name = "web_lookup_fetch"
 method = "web_lookup.fetch"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "plugin_host_web_lookup_fetch"
+method = "plugin_host.web_lookup.fetch"
 allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 

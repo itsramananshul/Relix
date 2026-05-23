@@ -25,10 +25,16 @@ pub struct Program {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     /// `step <name>: <peer>.<method> <arg>` or bare `<peer>.<method> <arg>`.
+    ///
+    /// `peer` is the alias used to dial the responder (split off at the
+    /// first dot). `wire_method` is the original, unmodified dotted token
+    /// — that is the string the responder admits against, so for
+    /// `plugin_host.hello.greet` it stays `plugin_host.hello.greet` even
+    /// though `peer == "plugin_host"`.
     Step {
         name: Option<String>,
         peer: String,
-        method: String,
+        wire_method: String,
         arg: Expr,
         line: usize,
     },
@@ -320,29 +326,32 @@ impl<'a> Parser<'a> {
                 ));
             }
         }
-        let (peer, method, arg) = self.parse_step_call(line)?;
+        let (peer, wire_method, arg) = self.parse_step_call(line)?;
         self.expect_newline("step")?;
         Ok(Stmt::Step {
             name: Some(name),
             peer,
-            method,
+            wire_method,
             arg,
             line,
         })
     }
 
     fn parse_unnamed_step(&mut self, line: usize) -> Result<Stmt, SflowError> {
-        let (peer, method, arg) = self.parse_step_call(line)?;
+        let (peer, wire_method, arg) = self.parse_step_call(line)?;
         self.expect_newline("step")?;
         Ok(Stmt::Step {
             name: None,
             peer,
-            method,
+            wire_method,
             arg,
             line,
         })
     }
 
+    /// Returns `(peer, wire_method, arg)`. `peer` is the alias to dial;
+    /// `wire_method` is the entire dotted token the user typed, untouched —
+    /// that's what the responder admits against.
     fn parse_step_call(&mut self, line: usize) -> Result<(String, String, Expr), SflowError> {
         let dotted = match self.advance() {
             Some(Lexed {
@@ -356,9 +365,9 @@ impl<'a> Parser<'a> {
                 ));
             }
         };
-        let (peer, method) = split_dotted_call(&dotted, line)?;
+        let (peer, _method_suffix) = split_dotted_call(&dotted, line)?;
         let arg = self.parse_step_arg(line)?;
-        Ok((peer, method, arg))
+        Ok((peer, dotted, arg))
     }
 
     /// A step's arg is one of: a quoted string literal, the bareword
@@ -912,11 +921,63 @@ mod tests {
         assert_eq!(prog.stmts.len(), 1);
         match &prog.stmts[0] {
             Stmt::Step {
-                name, peer, method, ..
+                name,
+                peer,
+                wire_method,
+                ..
             } => {
                 assert!(name.is_none());
                 assert_eq!(peer, "ai");
-                assert_eq!(method, "chat");
+                assert_eq!(wire_method, "ai.chat");
+            }
+            other => panic!("expected step, got {other:?}"),
+        }
+    }
+
+    /// Three-segment dotted targets (peer + namespaced method, as plugins
+    /// produce) must round-trip with `peer` = first segment and
+    /// `wire_method` = the entire original string. The first-dot split is
+    /// only used to pick the dial alias; nothing else.
+    #[test]
+    fn three_segment_step_preserves_wire_method() {
+        let prog = p("step x: plugin_host.hello.greet \"alice\"\n").unwrap();
+        match &prog.stmts[0] {
+            Stmt::Step {
+                name,
+                peer,
+                wire_method,
+                arg,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("x"));
+                assert_eq!(peer, "plugin_host");
+                assert_eq!(wire_method, "plugin_host.hello.greet");
+                assert!(matches!(arg, Expr::Literal(s) if s == "alice"));
+            }
+            other => panic!("expected step, got {other:?}"),
+        }
+
+        // Unnamed form must behave identically.
+        let prog2 = p("plugin_host.plugin.list \"\"\n").unwrap();
+        match &prog2.stmts[0] {
+            Stmt::Step {
+                peer, wire_method, ..
+            } => {
+                assert_eq!(peer, "plugin_host");
+                assert_eq!(wire_method, "plugin_host.plugin.list");
+            }
+            other => panic!("expected step, got {other:?}"),
+        }
+
+        // The classic two-segment form must continue to work; wire_method
+        // is the full string the user typed, equal to the original token.
+        let prog3 = p("ai.chat \"hi\"\n").unwrap();
+        match &prog3.stmts[0] {
+            Stmt::Step {
+                peer, wire_method, ..
+            } => {
+                assert_eq!(peer, "ai");
+                assert_eq!(wire_method, "ai.chat");
             }
             other => panic!("expected step, got {other:?}"),
         }

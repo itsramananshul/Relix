@@ -187,11 +187,11 @@ impl Executor {
             Stmt::Step {
                 name,
                 peer,
-                method,
+                wire_method,
                 arg,
                 line,
             } => {
-                self.exec_step(name.as_deref(), peer, method, arg, *line, state)?;
+                self.exec_step(name.as_deref(), peer, wire_method, arg, *line, state)?;
                 Ok(BlockFlow::Continue)
             }
             Stmt::Set { name, value, line } => {
@@ -262,21 +262,20 @@ impl Executor {
         &self,
         name: Option<&str>,
         peer: &str,
-        method: &str,
+        wire_method: &str,
         arg: &Expr,
         line: usize,
         state: &mut ExecState,
     ) -> Result<(), RuntimeError> {
         let interpolated = state.resolve(arg, line)?;
-        let method_full = format!("{peer}.{method}");
         let label = name.unwrap_or("(unnamed)");
         self.chronicle.write(
             "sol.step_start",
-            &format!("step={label} peer={peer} method={method_full} line={line}"),
+            &format!("step={label} peer={peer} method={wire_method} line={line}"),
         );
         let res = self
             .dispatcher
-            .remote_call(peer, &method_full, interpolated.as_bytes());
+            .remote_call(peer, wire_method, interpolated.as_bytes());
         match res {
             Ok(bytes) => {
                 let body = String::from_utf8(bytes).unwrap_or_else(|e| {
@@ -298,7 +297,7 @@ impl Executor {
                 self.chronicle.write(
                     "sol.step_done",
                     &format!(
-                        "step={label} peer={peer} method={method_full} status=completed bytes={}",
+                        "step={label} peer={peer} method={wire_method} status=completed bytes={}",
                         body.len()
                     ),
                 );
@@ -328,7 +327,7 @@ impl Executor {
                 self.chronicle.write(
                     "sol.step_done",
                     &format!(
-                        "step={label} peer={peer} method={method_full} status=failed kind={} cause={}",
+                        "step={label} peer={peer} method={wire_method} status=failed kind={} cause={}",
                         kind.as_str(),
                         err.cause
                     ),

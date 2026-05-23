@@ -1,0 +1,13 @@
+// Smoke flow exercising the .sflow → plugin path.
+//
+// `step reply` exercises a three-segment plugin capability
+// (plugin_host.hello.greet) — admits against the
+// plugin_host alias the bridge registers alongside the
+// bare manifest name.
+//
+// `step listing` exercises a built-in plugin_host
+// management capability (plugin_host.plugin.list) — same
+// admission path, prefix-aliased identically.
+step reply: plugin_host.hello.greet "alice"
+step listing: plugin_host.plugin.list ""
+return step.reply.result

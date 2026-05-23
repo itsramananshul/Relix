@@ -2362,10 +2362,17 @@ fn register_plugin_management_capabilities(
     use crate::plugin::PluginStatus;
     use relix_core::types::{ErrorEnvelope, error_kinds};
 
+    // Each management cap is registered under TWO names:
+    //   - the bare "plugin.list" / "plugin.status" / "plugin.reload"
+    //     / "plugin.disable" — direct ping, SOL `remote_call`, and
+    //     the bridge HTTP routes use these,
+    //   - the peer-prefixed "plugin_host.plugin.list" etc. — what
+    //     .sflow's `step y: plugin_host.plugin.list ""` arrives as
+    //     on the wire, since sflow's wire_method carries the peer
+    //     prefix the user typed.
     {
         let state = state.clone();
-        bridge.register(
-            "plugin.list",
+        let handler: Arc<dyn crate::dispatch::Handler> =
             Arc::new(FnHandler(move |_ctx: InvocationCtx| {
                 let state = state.clone();
                 async move {
@@ -2394,14 +2401,14 @@ fn register_plugin_management_capabilities(
                     body.push_str(&format!("count={}\n", rows.len()));
                     HandlerOutcome::Ok(body.into_bytes())
                 }
-            })),
-        );
+            }));
+        bridge.register("plugin.list", handler.clone());
+        bridge.register("plugin_host.plugin.list", handler);
     }
     {
         let state = state.clone();
-        bridge.register(
-            "plugin.status",
-            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+        let handler: Arc<dyn crate::dispatch::Handler> = Arc::new(FnHandler(
+            move |ctx: InvocationCtx| {
                 let state = state.clone();
                 async move {
                     let plugin_id = String::from_utf8_lossy(&ctx.args).trim().to_string();
@@ -2451,13 +2458,14 @@ fn register_plugin_management_capabilities(
                     );
                     HandlerOutcome::Ok(body.into_bytes())
                 }
-            })),
-        );
+            },
+        ));
+        bridge.register("plugin.status", handler.clone());
+        bridge.register("plugin_host.plugin.status", handler);
     }
     {
         let state = state.clone();
-        bridge.register(
-            "plugin.reload",
+        let handler: Arc<dyn crate::dispatch::Handler> =
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let state = state.clone();
                 async move {
@@ -2547,13 +2555,13 @@ fn register_plugin_management_capabilities(
                         }
                     }
                 }
-            })),
-        );
+            }));
+        bridge.register("plugin.reload", handler.clone());
+        bridge.register("plugin_host.plugin.reload", handler);
     }
     {
         let state = state.clone();
-        bridge.register(
-            "plugin.disable",
+        let handler: Arc<dyn crate::dispatch::Handler> =
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let state = state.clone();
                 async move {
@@ -2583,8 +2591,9 @@ fn register_plugin_management_capabilities(
                         .set_status(&plugin_id, PluginStatus::Disabled, None);
                     HandlerOutcome::Ok(b"ok\n".to_vec())
                 }
-            })),
-        );
+            }));
+        bridge.register("plugin.disable", handler.clone());
+        bridge.register("plugin_host.plugin.disable", handler);
     }
 }
 
@@ -4025,57 +4034,61 @@ fn register_node_type_handlers(
             // FnHandler captures the dispatcher and routes
             // every call to /invoke. Any plugin-level error
             // maps to the right ErrorEnvelope kind.
+            //
+            // The handler is registered under TWO method names:
+            //   - the bare manifest name (e.g. "hello.greet") so
+            //     `remote_call("plugin_host", "hello.greet", ...)`
+            //     in SOL and direct libp2p ping continue to work,
+            //   - the peer-prefixed alias ("plugin_host.<method>")
+            //     so `.sflow` callers, whose wire_method always
+            //     carries the peer prefix the user typed, can hit
+            //     the same handler. The Arc is cloned, so the
+            //     second registration costs only an Arc bump.
             for cap in &plugin_manifest.plugin.capabilities.provides {
                 let method = cap.method.clone();
-                let method_for_register = method.clone();
                 let dispatcher = loaded.dispatcher.clone();
                 let deadline_secs = plugin_manifest.plugin.runtime.invoke_timeout_secs as i64;
-                bridge.register(
-                    method_for_register,
-                    Arc::new(crate::dispatch::FnHandler(
-                        move |ctx: crate::dispatch::InvocationCtx| {
-                            let dispatcher = dispatcher.clone();
-                            let method = method.clone();
-                            async move {
-                                let args = String::from_utf8(ctx.args.clone())
-                                    .unwrap_or_else(|_| String::new());
-                                let req = crate::plugin::InvokeRequest {
-                                    method: method.clone(),
-                                    args,
-                                    trace_id: format!("{}", ctx.trace_id),
-                                    request_id: format!("{}", ctx.request_id),
-                                    caller_subject_id: format!("{}", ctx.caller.subject_id),
-                                    deadline_unix: unix_now() + deadline_secs,
-                                };
-                                match dispatcher.invoke(req).await {
-                                    Ok(body) => {
-                                        crate::dispatch::HandlerOutcome::Ok(body.into_bytes())
-                                    }
-                                    Err(crate::plugin::PluginInvokeError::Plugin {
-                                        kind,
-                                        cause,
-                                    }) => crate::dispatch::HandlerOutcome::Err(
+                let handler: Arc<dyn crate::dispatch::Handler> = Arc::new(
+                    crate::dispatch::FnHandler(move |ctx: crate::dispatch::InvocationCtx| {
+                        let dispatcher = dispatcher.clone();
+                        let method = method.clone();
+                        async move {
+                            let args = String::from_utf8(ctx.args.clone())
+                                .unwrap_or_else(|_| String::new());
+                            let req = crate::plugin::InvokeRequest {
+                                method: method.clone(),
+                                args,
+                                trace_id: format!("{}", ctx.trace_id),
+                                request_id: format!("{}", ctx.request_id),
+                                caller_subject_id: format!("{}", ctx.caller.subject_id),
+                                deadline_unix: unix_now() + deadline_secs,
+                            };
+                            match dispatcher.invoke(req).await {
+                                Ok(body) => crate::dispatch::HandlerOutcome::Ok(body.into_bytes()),
+                                Err(crate::plugin::PluginInvokeError::Plugin { kind, cause }) => {
+                                    crate::dispatch::HandlerOutcome::Err(
                                         relix_core::types::ErrorEnvelope {
                                             kind,
                                             cause: format!("{method}: {cause}"),
                                             retry_hint: 1,
                                             retry_after: None,
                                         },
-                                    ),
-                                    Err(e) => crate::dispatch::HandlerOutcome::Err(
-                                        relix_core::types::ErrorEnvelope {
-                                            kind:
-                                                relix_core::types::error_kinds::RESPONDER_INTERNAL,
-                                            cause: format!("{method}: {e}"),
-                                            retry_hint: 1,
-                                            retry_after: None,
-                                        },
-                                    ),
+                                    )
                                 }
+                                Err(e) => crate::dispatch::HandlerOutcome::Err(
+                                    relix_core::types::ErrorEnvelope {
+                                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                        cause: format!("{method}: {e}"),
+                                        retry_hint: 1,
+                                        retry_after: None,
+                                    },
+                                ),
                             }
-                        },
-                    )),
+                        }
+                    }),
                 );
+                bridge.register(cap.method.clone(), handler.clone());
+                bridge.register(format!("plugin_host.{}", cap.method), handler);
                 // Advertise the plugin's capability on the
                 // node's manifest so peers discover it. The
                 // environment requirement tag carries the

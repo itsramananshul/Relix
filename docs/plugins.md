@@ -204,9 +204,12 @@ The host walks `plugin_dir` at depth 1, accepting either:
 
 ## Calling a plugin from a flow
 
-SOL is the recommended call path: `remote_call(peer, method, arg)`
-passes `method` verbatim, so a capability named exactly as the
-plugin manifest declared it just works.
+Both SOL and `.sflow` work. The plugin_host bridge registers
+each capability under two names — the bare manifest name and a
+`plugin_host.<method>` alias — so callers can use whichever
+form is natural for the language.
+
+SOL — call by the bare manifest name:
 
 ```rust
 // flows/hello.sol
@@ -216,13 +219,18 @@ function start() -> str {
 }
 ```
 
-`.sflow` rejoins `<peer>.<method>` into one wire string. If you
-want to call plugins from `.sflow`, name the capability so the
-prefix matches the plugin_host peer alias — e.g. declare
-`method = "plugin_host.greet"` in `plugin.toml`, then
-`step reply: plugin_host.greet "alice"` round-trips. With the
-default `hello.greet` naming, `.sflow` callers will get
-`UNKNOWN_METHOD` (kind=4).
+`.sflow` — the parser preserves the full dotted target as the
+wire method, so the natural `plugin_host.<method>` form admits
+correctly against the prefixed alias:
+
+```
+step reply: plugin_host.hello.greet "alice"
+return step.reply.result
+```
+
+The same applies to plugin management capabilities — they're
+callable from sflow as `plugin_host.plugin.list` /
+`plugin_host.plugin.status` / etc.
 
 ## Management capabilities + HTTP / CLI
 
