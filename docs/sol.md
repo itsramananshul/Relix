@@ -73,12 +73,17 @@ needing to know Rust-style block syntax.
 ### 2.1 Basic structure
 
 ```sflow
-step reply: ai.chat "hello"
+step reply: ai.chat "basic-demo|hello"
 return step.reply.result
 ```
 
 Execution starts at the first statement. Falling off the end is
 the same as `return` with the last step's result.
+
+`ai.chat`'s arg is `session_id|prompt[|history]` per SIMP-016 —
+a bare prompt is rejected with `INVALID_ARGS`. Every capability
+defines its own arg format; check the responder before authoring
+the call.
 
 Comments use `// …` to end of line. Lines blank or containing
 only a comment are skipped.
@@ -177,6 +182,8 @@ breaks out — never crashes, never hangs.
 ### 2.6 Error handling
 
 ```sflow
+set prompt = "session|hello"
+
 try
   step reply: ai.chat "${prompt}"
 catch timeout
@@ -185,6 +192,11 @@ catch any
   sol.set_result "Something went wrong. Please retry."
 end
 ```
+
+`prompt` is set up-front so the snippet is self-contained — the
+arg `${prompt}` interpolates to a valid SIMP-016 string
+(`session_id|prompt[|history]`). A host-rendered template can
+overwrite this seed before execution.
 
 Error kinds:
 
@@ -305,12 +317,21 @@ canonical event records — no new tooling required.
 
 ## 5. Worked examples
 
+> **SIMP-016 reminder:** all `ai.chat` calls must pass args as
+> `session_id|prompt[|history]`. A bare prompt string is
+> rejected by the responder with `INVALID_ARGS` (error kind 5,
+> classified as `responder_error` for catch purposes). The
+> examples below use distinct session ids per flow so they don't
+> step on each other's memory traces.
+
 ### 5.1 `flows/chat_with_retry.sflow`
 
 Chat with a fallback message when the AI peer times out or
 fails for any other reason:
 
 ```sflow
+set prompt = "sflow-retry-demo|hello"
+
 try
   step reply: ai.chat "${prompt}"
   return step.reply.result
@@ -321,12 +342,17 @@ catch any
 end
 ```
 
+The `set prompt = …` seed makes the flow runnable standalone via
+`relix-cli flow-run`. When the bridge grows a `.sflow` template
+renderer it will replace this line (or override the variable
+before the try block) with the operator-supplied value.
+
 ### 5.2 `flows/conditional_demo.sflow`
 
 Branch on a named step's status:
 
 ```sflow
-step check: ai.chat "ping"
+step check: ai.chat "sflow-conditional-demo|ping"
 if step.check.status == "completed"
   sol.set_result "AI is online"
 else
@@ -334,6 +360,10 @@ else
 end
 return
 ```
+
+`return` with no value returns the current `sol.set_result`
+value — the flow exits with `"AI is online"` when the AI peer
+answers the ping, `"AI is unavailable"` otherwise.
 
 ### 5.3 `flows/loop_demo.sflow`
 
@@ -347,6 +377,10 @@ end
 sol.set_result "done"
 return
 ```
+
+No mesh calls — useful for exercising the executor + chronicle
+event path in isolation. Each iteration writes one `sol.loop_iter`
+event followed by one `sol.log` event; the flow returns `"done"`.
 
 ---
 
