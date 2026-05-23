@@ -7,6 +7,7 @@ mod flow_run;
 mod fs;
 mod identity;
 mod mcp;
+mod mesh;
 mod ops;
 mod ping;
 mod router;
@@ -152,6 +153,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: terminal::Cmd,
     },
+    /// Boot the local Relix mesh.
+    ///
+    /// Wraps the platform-specific boot script
+    /// (`scripts/relix-mesh-up.ps1` on Windows,
+    /// `scripts/relix-mesh-up.sh` elsewhere). `--with-telegram`,
+    /// `--with-discord`, `--with-slack`, and `--with-plugins`
+    /// translate into the env vars those scripts already understand.
+    /// Polls the bridge's `/health` until it returns 200, then opens
+    /// the dashboard in the default browser unless `--no-browser`.
+    Boot(mesh::BootArgs),
+
+    /// Stop every running `relix-controller` and `relix-web-bridge`
+    /// on this machine. Idempotent — exits 0 if nothing was running.
+    Stop,
+
+    /// Print bridge health + topology snapshot. Exits 1 if the bridge
+    /// is unreachable, so this is safe to use as a CI / shell gate.
+    Status(mesh::StatusArgs),
+
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -207,6 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             method,
             client_key,
         } => ping::run(&peer, &identity, &method, &client_key).await,
+        Cmd::Boot(args) => mesh::boot(args).await,
+        Cmd::Stop => mesh::stop(),
+        Cmd::Status(args) => mesh::status(args).await,
         Cmd::FlowRun {
             flow,
             identity,
