@@ -1,0 +1,268 @@
+//! `GET /ws/chat` — WebSocket streaming chat endpoint.
+//!
+//! The client opens a WebSocket with `Authorization: Bearer <token>`
+//! (a missing or empty header returns 401 before the upgrade).
+//! After the upgrade, the client sends ONE JSON message:
+//!
+//! ```json
+//! { "session_id": "...", "message": "...", "model": "..." }
+//! ```
+//!
+//! `model` is optional and currently informational only — the
+//! provider routing lives on the AI node, not in the bridge.
+//!
+//! The server replies with a stream of JSON messages, one per
+//! frame, terminated by a `done` (or `error` on failure):
+//!
+//! ```json
+//! { "type": "chunk", "text": "Hello" }
+//! { "type": "chunk", "text": " world" }
+//! { "type": "done",  "session_id": "...", "text": "Hello world" }
+//! { "type": "error", "message": "..." }
+//! ```
+//!
+//! ## Where the streaming actually happens
+//!
+//! The `ChatProvider` trait now has a real `generate_reply_stream`
+//! method (mock + OpenAI-compatible providers override it; the
+//! default impl wraps `generate_reply`). Through the **mesh**
+//! though, the alpha bridge calls the AI peer via the synchronous
+//! `ai.chat` capability — the chat flow runs to completion before
+//! the bridge sees the final reply. This endpoint therefore
+//! delivers the bridge-level chunking shape (same as the existing
+//! `/chat/stream` SSE), now framed over WebSocket and using the
+//! same word-by-word splitter the mock provider streams with.
+//! End-to-end provider-native streaming through the mesh requires
+//! libp2p stream support and lands post-alpha; the trait-level
+//! API exists today so the wire and client code don't need to
+//! change when that lands.
+
+use std::time::Duration;
+
+use axum::{
+    extract::{
+        State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::config::AppState;
+use crate::flow::{FlowExecError, execute_chat_flow};
+
+#[derive(Debug, Deserialize)]
+struct WsRequest {
+    session_id: String,
+    message: String,
+    /// Reserved for future per-call model override; currently
+    /// informational. Provider routing lives on the AI node.
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkMsg<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+/// `GET /ws/chat`. Validates the `Authorization: Bearer <token>`
+/// header on the upgrade request, then hands the socket off to
+/// [`run_ws_session`].
+pub async fn chat_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    match parse_bearer(&headers) {
+        Ok(()) => upgrade.on_upgrade(move |socket| run_ws_session(socket, state)),
+        Err(reason) => (StatusCode::UNAUTHORIZED, reason).into_response(),
+    }
+}
+
+/// Run one WebSocket chat session end-to-end. Reads the request,
+/// executes the chat flow, splits the materialised reply
+/// word-by-word, streams chunks over the socket, and finishes
+/// with a `done` or `error` JSON message.
+async fn run_ws_session(mut socket: WebSocket, state: AppState) {
+    let Some(req) = read_request(&mut socket).await else {
+        return;
+    };
+
+    match execute_chat_flow(&state, &req.session_id, &req.message).await {
+        Ok(outcome) => {
+            stream_reply(&mut socket, &req.session_id, &outcome.reply).await;
+        }
+        Err(e) => {
+            let msg = match e {
+                FlowExecError::InvalidInput(s) => s,
+                FlowExecError::Transport(s) => format!("mesh transport: {s}"),
+                FlowExecError::Internal(s) => s,
+            };
+            let payload = json!({ "type": "error", "message": msg }).to_string();
+            let _ = socket.send(Message::Text(payload)).await;
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+/// Read the client's opening JSON request. Returns `None` if the
+/// socket closes early, the payload is binary, or the JSON
+/// doesn't parse — in each of those cases we just hang up
+/// silently (no `error` frame, since the protocol assumes a
+/// request message and we never received one).
+async fn read_request(socket: &mut WebSocket) -> Option<WsRequest> {
+    use futures::StreamExt;
+    let msg = socket.next().await?.ok()?;
+    let text = match msg {
+        Message::Text(t) => t,
+        Message::Binary(b) => String::from_utf8(b).ok()?,
+        _ => return None,
+    };
+    serde_json::from_str::<WsRequest>(&text).ok()
+}
+
+/// Split `reply` into word-sized pieces with a 20ms gap between
+/// frames so a human watching the dashboard sees the response
+/// appearing word-by-word. Always finishes with a `done` frame
+/// carrying the full assembled text.
+async fn stream_reply(socket: &mut WebSocket, session_id: &str, reply: &str) {
+    let chunks = split_words(reply);
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let payload = serde_json::to_string(&ChunkMsg {
+            kind: "chunk",
+            text: chunk,
+        })
+        .unwrap_or_else(|_| String::new());
+        if socket.send(Message::Text(payload)).await.is_err() {
+            return;
+        }
+    }
+    let done = json!({
+        "type":       "done",
+        "session_id": session_id,
+        "text":       reply,
+    })
+    .to_string();
+    let _ = socket.send(Message::Text(done)).await;
+}
+
+/// Verify the bearer header. The alpha bridge is loopback-only,
+/// so we accept any non-empty token — the value isn't matched
+/// against a registry yet. Missing header / wrong scheme / empty
+/// token all return a clear error string for the 401 body.
+pub fn parse_bearer(headers: &HeaderMap) -> Result<(), &'static str> {
+    let Some(raw) = headers.get(AUTHORIZATION) else {
+        return Err("missing Authorization: Bearer <token> header\n");
+    };
+    let Ok(value) = raw.to_str() else {
+        return Err("Authorization header is not valid UTF-8\n");
+    };
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let scheme = parts.next().unwrap_or("").trim();
+    let token = parts.next().unwrap_or("").trim();
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Err("Authorization header must use the Bearer scheme\n");
+    }
+    if token.is_empty() {
+        return Err("Authorization Bearer token is empty\n");
+    }
+    Ok(())
+}
+
+/// Split a string into word-shaped emission chunks. Whitespace is
+/// attached to the preceding word so concatenating the result
+/// reproduces the original. Lossless and round-trip safe.
+pub fn split_words(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in s.chars() {
+        current.push(ch);
+        if ch.is_whitespace() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn hdrs(bearer: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(b) = bearer {
+            h.insert(AUTHORIZATION, HeaderValue::from_str(b).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn parse_bearer_accepts_well_formed_header() {
+        assert!(parse_bearer(&hdrs(Some("Bearer abc123"))).is_ok());
+        assert!(parse_bearer(&hdrs(Some("bearer abc123"))).is_ok());
+        assert!(parse_bearer(&hdrs(Some("Bearer    looong-token-here"))).is_ok());
+    }
+
+    #[test]
+    fn parse_bearer_rejects_missing_header() {
+        let e = parse_bearer(&hdrs(None)).unwrap_err();
+        assert!(e.contains("missing"));
+    }
+
+    #[test]
+    fn parse_bearer_rejects_wrong_scheme() {
+        let e = parse_bearer(&hdrs(Some("Basic dXNlcjpwYXNz"))).unwrap_err();
+        assert!(e.contains("Bearer"));
+    }
+
+    #[test]
+    fn parse_bearer_rejects_empty_token() {
+        let e = parse_bearer(&hdrs(Some("Bearer "))).unwrap_err();
+        assert!(e.contains("empty"));
+        let e = parse_bearer(&hdrs(Some("Bearer    "))).unwrap_err();
+        assert!(e.contains("empty"));
+    }
+
+    #[test]
+    fn split_words_round_trips_through_join() {
+        let s = "Hello world\nThis is a test";
+        let chunks = split_words(s);
+        assert_eq!(chunks.concat(), s);
+        assert_eq!(chunks[0], "Hello ");
+        assert_eq!(chunks[1], "world\n");
+    }
+
+    #[test]
+    fn split_words_empty_yields_nothing() {
+        assert!(split_words("").is_empty());
+    }
+
+    #[test]
+    fn ws_request_deserialises_with_optional_model() {
+        let r: WsRequest =
+            serde_json::from_str(r#"{"session_id":"s1","message":"hi"}"#).expect("parse");
+        assert_eq!(r.session_id, "s1");
+        assert_eq!(r.message, "hi");
+        assert!(r.model.is_none());
+        let r: WsRequest =
+            serde_json::from_str(r#"{"session_id":"s1","message":"hi","model":"relix-mock"}"#)
+                .expect("parse");
+        assert_eq!(r.model.as_deref(), Some("relix-mock"));
+    }
+}

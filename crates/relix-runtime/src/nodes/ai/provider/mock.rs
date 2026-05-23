@@ -5,7 +5,8 @@
 use async_trait::async_trait;
 
 use super::{
-    ChatInput, ChatOutput, ChatProvider, EmbedInput, EmbedOutput, ProviderError, TokenUsage,
+    ChatInput, ChatOutput, ChatProvider, ChatStream, EmbedInput, EmbedOutput, ProviderError,
+    TokenUsage,
 };
 
 /// Dimensionality the mock embedding generator returns. 8 is
@@ -77,6 +78,47 @@ impl ChatProvider for MockProvider {
         let vectors: Vec<Vec<f32>> = input.texts.iter().map(|t| mock_embed_one(t)).collect();
         Ok(EmbedOutput { model, vectors })
     }
+
+    /// Stream the deterministic reply word-by-word with a 20ms
+    /// delay between yields. Makes the streaming wire path
+    /// visible without a real provider — `relix boot` against the
+    /// mock provider behaves like a real streaming API end-to-end.
+    async fn generate_reply_stream(&self, input: ChatInput) -> Result<ChatStream, ProviderError> {
+        let out = self.generate_reply(input).await?;
+        let words: Vec<String> = mock_split_into_chunks(&out.text);
+        let s = async_stream::stream! {
+            for (i, w) in words.into_iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                yield Ok(w);
+            }
+        };
+        Ok(Box::pin(s))
+    }
+}
+
+/// Split a string into emission chunks for mock streaming. We
+/// preserve whitespace and newlines by attaching them to the
+/// preceding word — so concatenating the yielded chunks
+/// reproduces the original text byte-for-byte. Empty input yields
+/// nothing.
+fn mock_split_into_chunks(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in s.chars() {
+        current.push(ch);
+        if ch.is_whitespace() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -163,6 +205,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.model, "mock-embed");
+    }
+
+    #[tokio::test]
+    async fn streaming_yields_word_by_word_and_assembles_to_full_reply() {
+        use futures::StreamExt;
+        let p = MockProvider;
+        let stream = p
+            .generate_reply_stream(ChatInput {
+                session_id: "s1".into(),
+                prompt: "hi".into(),
+                ..ChatInput::default()
+            })
+            .await
+            .expect("stream");
+        let chunks: Vec<String> = stream.map(|r| r.unwrap()).collect().await;
+        assert!(chunks.len() >= 2, "expected multi-chunk reply: {chunks:?}");
+        // Concatenation must equal what generate_reply would
+        // have returned — streaming must be lossless.
+        let assembled: String = chunks.join("");
+        let full = p
+            .generate_reply(ChatInput {
+                session_id: "s1".into(),
+                prompt: "hi".into(),
+                ..ChatInput::default()
+            })
+            .await
+            .unwrap()
+            .text;
+        assert_eq!(assembled, full);
+    }
+
+    #[test]
+    fn mock_split_preserves_whitespace_and_round_trips() {
+        let s = "hello world\nthis is a test";
+        let chunks = mock_split_into_chunks(s);
+        assert_eq!(chunks.concat(), s);
+        // First two chunks include their trailing whitespace.
+        assert_eq!(chunks[0], "hello ");
+        assert_eq!(chunks[1], "world\n");
+        // Empty input yields nothing.
+        assert!(mock_split_into_chunks("").is_empty());
     }
 
     #[tokio::test]

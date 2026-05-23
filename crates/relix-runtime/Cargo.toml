@@ -33,6 +33,7 @@ relix-slack = { path = "../relix-slack", version = "0.1.0" }
 # Async runtime + transport (libp2p inherited from OpenPrem INFRA reuse)
 tokio.workspace = true
 futures.workspace = true
+async-stream.workspace = true
 async-trait.workspace = true
 libp2p.workspace = true
 

@@ -126,7 +126,28 @@ pub trait ChatProvider: Send + Sync {
             self.provider_name()
         )))
     }
+
+    /// Generate a reply as a stream of text chunks. Each `Ok(String)`
+    /// is one chunk; the stream ends when the provider stops
+    /// emitting. The default implementation calls `generate_reply`
+    /// and yields the full response as a single item — so providers
+    /// that have no native streaming API (Anthropic, Gemini today)
+    /// still satisfy the contract. Mock + OpenAI-compatible
+    /// override to yield real per-token deltas.
+    async fn generate_reply_stream(&self, input: ChatInput) -> Result<ChatStream, ProviderError> {
+        let out = self.generate_reply(input).await?;
+        let s = futures::stream::once(async move { Ok(out.text) });
+        Ok(Box::pin(s))
+    }
 }
+
+/// Streaming reply type alias. Producers yield one piece of reply
+/// text at a time; consumers join them in order. A `ProviderError`
+/// on any item terminates the stream — callers should treat the
+/// chunks accumulated before the error as a partial reply and
+/// surface the error to the client.
+pub type ChatStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<String, ProviderError>> + Send>>;
 
 /// Batch embedding request.
 #[derive(Clone, Debug, Default)]

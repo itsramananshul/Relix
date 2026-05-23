@@ -278,6 +278,29 @@ Ctrl-C in the script's terminal. The script intercepts the signal and
 stops the four child PIDs it tracked. Nothing else on your machine is
 affected.
 
+## Stream tokens over WebSocket
+
+`/ws/chat` is the streaming endpoint — JSON `chunk` frames as the
+provider emits text, a final `done` frame with the assembled
+reply.
+
+```js
+const ws = new WebSocket("ws://127.0.0.1:19791/ws/chat", [], {
+  headers: { Authorization: "Bearer dev-token" },
+});
+ws.onopen = () => ws.send(JSON.stringify({
+  session_id: "demo",
+  message:    "Hello",
+}));
+ws.onmessage = (ev) => {
+  const f = JSON.parse(ev.data);
+  if (f.type === "chunk") process.stdout.write(f.text);
+  if (f.type === "done")  ws.close();
+};
+```
+
+Full client examples + the auth contract: [`websocket.md`](websocket.md).
+
 ## What next
 
 - [`architecture.md`](architecture.md) — how the pieces fit together.

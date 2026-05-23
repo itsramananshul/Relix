@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    ChatInput, ChatOutput, ChatProvider, EmbedInput, EmbedOutput, ProviderEntry, ProviderError,
-    TokenUsage, load_api_key,
+    ChatInput, ChatOutput, ChatProvider, ChatStream, EmbedInput, EmbedOutput, ProviderEntry,
+    ProviderError, TokenUsage, load_api_key,
 };
 
 const DEFAULT_EMBED_MODEL: &str = "text-embedding-3-small";
@@ -196,6 +196,124 @@ impl ChatProvider for OpenAICompatibleProvider {
         self.name
     }
 
+    /// Stream `delta.content` chunks from the upstream OpenAI-style
+    /// `/v1/chat/completions` SSE response. The request body adds
+    /// `stream: true`; the response body is a sequence of
+    /// `data: <json>\n\n` frames terminated by `data: [DONE]`.
+    /// Each yielded chunk is the `choices[0].delta.content`
+    /// string from one SSE frame. Frames without `delta.content`
+    /// (role-only header frames, finish_reason frames) are
+    /// skipped silently. Transport / decode errors map to
+    /// `ProviderError::Transient` / `Permanent` the same way
+    /// `generate_reply` already does.
+    async fn generate_reply_stream(&self, input: ChatInput) -> Result<ChatStream, ProviderError> {
+        let model = if input.model.is_empty() {
+            self.default_model.clone()
+        } else {
+            input.model.clone()
+        };
+        let mut messages = Vec::with_capacity(2);
+        if let Some(sys) = &input.system_prompt {
+            messages.push(json!({ "role": "system", "content": sys }));
+        }
+        let user_content = if input.history.trim().is_empty() {
+            input.prompt.clone()
+        } else {
+            format!(
+                "Recent conversation (session={s}):\n{h}\n\nNew message: {p}",
+                s = input.session_id,
+                h = input.history,
+                p = input.prompt,
+            )
+        };
+        messages.push(json!({ "role": "user", "content": user_content }));
+        let mut body = json!({
+            "model":    model,
+            "messages": messages,
+            "stream":   true,
+        });
+        if let Some(t) = input.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(m) = input.max_tokens {
+            body["max_tokens"] = json!(m);
+        }
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut req = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .body(body.to_string());
+        if let Some(key) = &self.api_key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().await.map_err(|e| {
+            ProviderError::Transient(format!(
+                "{provider}: stream http: {e}",
+                provider = self.name
+            ))
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let reason = crate::nodes::ai::classify_http_failure(status.as_u16(), &text);
+            let perm = matches!(
+                reason.category(),
+                crate::nodes::ai::FailoverCategory::Permanent
+            );
+            let msg = format!(
+                "{}: HTTP {status} [{label}]: {text}",
+                self.name,
+                label = reason.label(),
+            );
+            return Err(if perm {
+                ProviderError::Permanent(msg)
+            } else {
+                ProviderError::Transient(msg)
+            });
+        }
+
+        let provider_name = self.name;
+        let byte_stream = resp.bytes_stream();
+        let s = async_stream::stream! {
+            use futures::StreamExt;
+            let mut byte_stream = std::pin::pin!(byte_stream);
+            let mut buf = String::new();
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(e) => {
+                        yield Err(ProviderError::Transient(format!(
+                            "{provider_name}: stream read: {e}"
+                        )));
+                        return;
+                    }
+                };
+                let chunk_str = match std::str::from_utf8(&bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                buf.push_str(&chunk_str);
+                // Frames end on a blank line (\n\n). Drain
+                // complete frames from the front; the partial
+                // tail stays in `buf` for the next byte chunk.
+                while let Some(end) = buf.find("\n\n") {
+                    let frame = buf[..end].to_string();
+                    buf.drain(..end + 2);
+                    for line in frame.lines() {
+                        match parse_sse_line(line) {
+                            SseLine::Delta(text) => yield Ok(text),
+                            SseLine::Done => return,
+                            SseLine::Skip => {}
+                        }
+                    }
+                }
+            }
+        };
+        Ok(Box::pin(s))
+    }
+
     async fn generate_embeddings(&self, input: EmbedInput) -> Result<EmbedOutput, ProviderError> {
         let model = if input.model.is_empty() {
             DEFAULT_EMBED_MODEL.to_string()
@@ -293,9 +411,102 @@ impl ChatProvider for OpenAICompatibleProvider {
     }
 }
 
+/// What a single SSE line means after parsing. `Delta` carries
+/// one `choices[0].delta.content` token, `Done` is the upstream
+/// `[DONE]` terminator, `Skip` is everything else — keep-alive
+/// comments, role-only header frames, finish_reason frames.
+enum SseLine {
+    Delta(String),
+    Done,
+    Skip,
+}
+
+/// Parse a single line from the upstream `/v1/chat/completions`
+/// SSE stream. Returns `Done` on `data: [DONE]`, `Delta(text)`
+/// when the line carries a non-empty `choices[0].delta.content`,
+/// `Skip` for every other shape (event lines, comments, role-only
+/// header frames, malformed JSON).
+fn parse_sse_line(line: &str) -> SseLine {
+    let Some(payload) = line.strip_prefix("data:") else {
+        return SseLine::Skip;
+    };
+    let payload = payload.trim();
+    if payload == "[DONE]" {
+        return SseLine::Done;
+    }
+    if payload.is_empty() {
+        return SseLine::Skip;
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return SseLine::Skip,
+    };
+    match parsed
+        .pointer("/choices/0/delta/content")
+        .and_then(|v| v.as_str())
+    {
+        Some(text) if !text.is_empty() => SseLine::Delta(text.to_string()),
+        _ => SseLine::Skip,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_sse_line_extracts_delta_content() {
+        let line =
+            r#"data: {"choices":[{"delta":{"content":"Hello"},"index":0,"finish_reason":null}]}"#;
+        match parse_sse_line(line) {
+            SseLine::Delta(s) => assert_eq!(s, "Hello"),
+            _ => panic!("expected Delta"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_handles_done_terminator() {
+        assert!(matches!(parse_sse_line("data: [DONE]"), SseLine::Done));
+        assert!(matches!(parse_sse_line("data:[DONE]"), SseLine::Done));
+    }
+
+    #[test]
+    fn parse_sse_line_skips_role_only_header_frame() {
+        // OpenAI's first frame typically carries just the role —
+        // no content delta yet. We must skip it without yielding
+        // an empty string to the consumer.
+        let line =
+            r#"data: {"choices":[{"delta":{"role":"assistant"},"index":0,"finish_reason":null}]}"#;
+        assert!(matches!(parse_sse_line(line), SseLine::Skip));
+    }
+
+    #[test]
+    fn parse_sse_line_skips_finish_reason_only_frame() {
+        let line = r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}"#;
+        assert!(matches!(parse_sse_line(line), SseLine::Skip));
+    }
+
+    #[test]
+    fn parse_sse_line_skips_event_lines_and_comments() {
+        assert!(matches!(parse_sse_line("event: chunk"), SseLine::Skip));
+        assert!(matches!(parse_sse_line(": keep-alive"), SseLine::Skip));
+        assert!(matches!(parse_sse_line(""), SseLine::Skip));
+        assert!(matches!(parse_sse_line("data:"), SseLine::Skip));
+    }
+
+    #[test]
+    fn parse_sse_line_skips_malformed_json() {
+        assert!(matches!(
+            parse_sse_line("data: {not really json"),
+            SseLine::Skip
+        ));
+    }
+
+    #[test]
+    fn parse_sse_line_skips_empty_content_string() {
+        let line = r#"data: {"choices":[{"delta":{"content":""},"index":0,"finish_reason":null}]}"#;
+        assert!(matches!(parse_sse_line(line), SseLine::Skip));
+    }
 
     #[test]
     fn missing_base_url_errors_clearly() {

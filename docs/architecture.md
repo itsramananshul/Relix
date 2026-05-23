@@ -382,6 +382,28 @@ call?" — the flow file picks the tool. Real tool-use integration
 model that lands at Gate 2. The alpha demonstrates the architecture
 on a fixed flow; the architecture generalises.
 
+## Streaming and WebSockets
+
+The bridge has two streaming surfaces:
+
+- **`POST /chat/stream`** — Server-Sent Events. Byte-sized
+  slices of the assembled reply, used by OpenAI-compatible
+  clients (Open WebUI, etc.).
+- **`GET /ws/chat`** — WebSocket with JSON frames (`chunk` then
+  `done`, or `error`). Requires `Authorization: Bearer <token>`
+  on the upgrade. Used by app-level chat UIs.
+
+The `ChatProvider` trait carries a `generate_reply_stream`
+method that the mock and OpenAI-compatible providers override —
+mock streams word-by-word, OpenAI-compatible parses upstream
+`data: <json>\n\n` SSE frames and yields per-token deltas.
+End-to-end mesh streaming through `ai.chat` still goes through
+the synchronous request/response path; the bridge currently
+chunks the materialised reply word-by-word over both endpoints.
+Real provider-token-to-client streaming through the mesh lands
+post-alpha; the trait surface is already in place to consume it.
+See [`websocket.md`](websocket.md).
+
 ## Flow languages
 
 Both languages dispatch on file extension via `flow_runner.rs`:

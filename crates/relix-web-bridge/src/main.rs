@@ -122,6 +122,7 @@ mod telegram;
 mod term_audit;
 mod topology;
 mod validate;
+mod ws;
 
 use crate::config::{AppState, BridgeConfig};
 
@@ -297,6 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(chat::health))
         .route("/chat", post(chat::chat))
         .route("/chat/stream", post(chat::chat_stream))
+        .route("/ws/chat", get(ws::chat_ws))
         .route("/chat_with_tool", post(chat::chat_with_tool))
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat_completions))
