@@ -28,9 +28,9 @@ The org id printed by `init-org` is `blake3(pubkey)` and is what every
 identity bundle records as `org_id`.
 
 There is exactly one trust level in the alpha. Hierarchical issuance
-(IA → user) ships with Gate 2; the alpha SIMP is documented in
-[`specs/alpha-simplifications.md`](../specs/alpha-simplifications.md)
-under SIMP-002.
+(IA → user) is post-alpha. See
+[`current-limitations.md`](current-limitations.md) for the full list
+of what the alpha does and does not do.
 
 ## Identity bundles
 
@@ -64,7 +64,7 @@ admission step 5: validate_identity_bundle(bundle, trust_root, now)
 ```
 
 No CRL, no revocation gossip — expired bundles fail the timestamp
-check; short-lived bundles are the alpha mitigation (SIMP-003).
+check; short-lived bundles are the alpha mitigation.
 
 ## Transport
 
@@ -279,12 +279,24 @@ These are all listed in
       not be able to reach internal infrastructure beyond the
       hostnames you intend it to fetch.
 
+## Agent gate (optional second admission step)
+
+When the responder has agent profiles configured (see
+[`agents.md`](agents.md)), an additional **agent gate** runs between
+the identity-bundle check (step 3) and the policy evaluation (step
+5). It compares the caller's subject_id against the agent ledger and
+applies a five-phase check (status / surface allowlist / risk
+ceiling / deny lists / allow lists), with an optional
+"approval-required" path that pauses the call until an operator
+approves it. The gate **narrows** policy, never widens it — policy
+remains the floor. Empty agent ledger ⇒ gate is a no-op.
+
 ## See also
 
 - [`tool-node-security.md`](tool-node-security.md) — full SSRF model.
+- [`agents.md`](agents.md) — the agent gate, identity minting,
+  permission model.
+- [`configuration.md`](configuration.md) — every policy rule, trust
+  file, identity bundle path.
 - [`current-limitations.md`](current-limitations.md) — what the alpha
   doesn't promise.
-- [`specs/alpha-simplifications.md`](../specs/alpha-simplifications.md)
-  — every documented SIMP with rationale and resolution gate.
-- [`specs/RELIX-1-rpc.md`](../specs/RELIX-1-rpc.md) — the wire
-  protocol the admission pipeline implements.
