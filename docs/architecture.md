@@ -1,9 +1,10 @@
 # Architecture
 
-Relix is a small set of peer processes that talk to each other over
-libp2p, plus a SOL VM that runs hand-written flow files. This document
-explains how those pieces compose, what each one is responsible for,
-and — equally importantly — what each one is **not** responsible for.
+Relix is a mesh of peer processes that talk to each other over libp2p,
+plus two small flow languages (`SOL` and `.sflow`) that orchestrate
+work across those peers. This document explains how those pieces
+compose, what each one is responsible for, and — equally importantly
+— what each one is **not** responsible for.
 
 If you want install + boot instructions, start with
 [`getting-started.md`](getting-started.md). This document assumes the
@@ -18,57 +19,85 @@ pipeline. There is no central service.
 - The HTTP **bridge** is a peer. It happens to also speak HTTP for the
   benefit of Open WebUI and other OpenAI-compatible clients, but on the
   mesh side it behaves identically to any other peer.
-- The **memory**, **AI**, and **tool** nodes are peers. Each owns
-  exactly one concern: SQLite + FTS5; provider routing; SSRF-guarded
-  HTTP fetch.
+- The built-in controllers — **memory**, **AI**, **tool**,
+  **coordinator**, **router**, **plugin_host** — are peers. Each owns
+  exactly one concern.
+- The optional channels — **telegram**, **discord**, **slack** — are
+  peers too. Each polls its platform's REST API and forwards
+  conversations into the same SOL chat flow as the HTTP bridge.
 - The **operator CLI** (`relix-cli`) is a peer when it makes a call.
-  `ping` and `flow-run` spin up an ephemeral libp2p client with the
-  operator's identity bundle.
+  `ping`, `flow-run`, and the per-capability commands spin up an
+  ephemeral libp2p client with the operator's identity bundle.
 
 A call from peer A to peer B is a `/relix/rpc/1` request-response
-exchange carrying a CBOR-encoded RELIX-1 envelope. The transport is
-TCP + Noise XK + Yamux + CBOR request/response (libp2p 0.54). The
+exchange carrying a CBOR-encoded envelope. The transport stack is
+TCP + Noise XK + Yamux + CBOR request/response on libp2p 0.54. The
 envelope carries the caller's signed identity bundle, the method name,
 opaque argument bytes, and a deadline.
 
+## Node types
+
+One binary (`relix-controller`) whose behaviour is selected by
+`[controller] node_type` in the per-node TOML. Plus one separate
+binary for the HTTP front (`relix-web-bridge`).
+
+| `node_type`    | Default port | Purpose                                                                |
+|----------------|--------------|------------------------------------------------------------------------|
+| `memory`       | 19711        | SQLite + FTS5 session store, vector embeddings, persistent agent memory |
+| `ai`           | 19712        | `ai.chat` / `ai.embed` — provider-agnostic chat + embeddings           |
+| `tool`         | 19713        | File system jail, SSRF-guarded web client, allowlisted terminal, headless browser, MCP, PDF, text chunk |
+| `coordinator`  | 19714        | Durable Task ledger, delegation, agent-to-agent messaging, scheduler   |
+| `telegram`     | 19715        | Telegram bot bridge (opt-in via `RELIX_TELEGRAM=1`)                    |
+| `discord`      | 19716        | Discord bot bridge (opt-in via `RELIX_DISCORD=1`)                      |
+| `slack`        | 19717        | Slack bot bridge (opt-in via `RELIX_SLACK=1`)                          |
+| `plugin_host`  | 19718        | Loads subprocess plugins over `relix-plugin-v1` (opt-in via `RELIX_PLUGINS=1`) |
+| `router`       | configurable | Mesh observability + heartbeat aggregator (control plane only — never routes requests) |
+| *(bridge)*     | 19791        | HTTP front + OpenAI shim + dashboard — its own binary, not a `node_type` |
+
+Every node — including the bridge — runs the same admission pipeline
+on every inbound `/relix/rpc/1` call. See [`security.md`](security.md)
+for the pipeline detail.
+
 ## Process map
 
-A typical local mesh, exactly what
-[`scripts/relix-mesh-up.ps1`](../scripts/relix-mesh-up.ps1) brings up:
+What `scripts/relix-mesh-up.{ps1,sh}` (and therefore `relix boot`)
+brings up in the default + opt-in configuration:
 
 ```
-┌────────────────────────────┐
-│         Open WebUI         │
-│  (or curl / SDK / shim)    │
-└─────────────┬──────────────┘
+   OpenAI client / curl / SDK
               │ HTTP
               ▼
-┌────────────────────────────┐         dev-keys/<run>-bridge.aic
-│      relix-web-bridge      │◀──────── IdentityBundle (group: chat-users)
-│  127.0.0.1:19791  (HTTP)   │
-│  ephemeral libp2p PeerId   │
-└─────────────┬──────────────┘
-              │ libp2p /relix/rpc/1
-   ┌──────────┴──────────┐
-   │                     │
-   ▼                     ▼
-┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-│ relix-         │  │ relix-         │  │ relix-         │
-│ controller     │  │ controller     │  │ controller     │
-│ node_type =    │  │ node_type =    │  │ node_type =    │
-│ "memory"       │  │ "ai"           │  │ "tool"         │
-│ tcp/19711      │  │ tcp/19712      │  │ tcp/19713      │
-│ SQLite+FTS5    │  │ provider key   │  │ reqwest + SSRF │
-└────────────────┘  └────────────────┘  └────────────────┘
-        ▲                  ▲                    ▲
-        │                  │                    │
-        └────── memory.*  ai.chat  tool.web_fetch (+ node.health, node.manifest)
+   ┌─────────────────────────────────┐    dev-keys/<run>-bridge.aic
+   │       relix-web-bridge          │◀── IdentityBundle (chat-users)
+   │   127.0.0.1:19791   (HTTP)      │
+   │   ephemeral libp2p PeerId       │
+   └────────────────┬────────────────┘
+                    │ libp2p /relix/rpc/1
+   ┌────────────────┼────────────────────────────────────────────┐
+   ▼                ▼                ▼            ▼              ▼
+┌─────────┐  ┌─────────────┐  ┌─────────┐  ┌─────────────┐  ┌─────────────┐
+│ memory  │  │     ai      │  │  tool   │  │ coordinator │  │ plugin_host │
+│ :19711  │  │   :19712    │  │ :19713  │  │   :19714    │  │   :19718    │
+│ SQLite  │  │  provider   │  │ jail+   │  │ Task ledger │  │ subprocess  │
+│ + FTS5  │  │  routing    │  │ SSRF +  │  │ delegation  │  │ plugins via │
+│ vectors │  │ ai.chat /   │  │ term +  │  │ msg / cron  │  │ HTTP/JSON   │
+│         │  │ ai.embed    │  │ browser │  │             │  │             │
+└─────────┘  └─────────────┘  └─────────┘  └─────────────┘  └─────────────┘
+
+   Channels (opt-in; each polls its platform and forwards to the
+   chat flow via the memory + ai peers, persists to memory):
+
+   ┌──────────┐  ┌─────────┐  ┌────────┐
+   │ telegram │  │ discord │  │ slack  │
+   │  :19715  │  │ :19716  │  │ :19717 │
+   └──────────┘  └─────────┘  └────────┘
 ```
 
 Each box is a real OS process with its own PID. The bringup script
-launches them in order (memory + AI + tool first, then the bridge once
-the controllers are listening) and records every PID it spawned so
-Ctrl-C cleanup is exact.
+launches them in dependency order (memory + ai + tool +
+coordinator → opt-in channels + plugin_host → bridge) and records
+every PID it spawned so Ctrl-C cleanup is exact. The mesh script
+never uses `pkill -f relix-*` — only the PIDs it owns.
 
 ## Coordinator (durable Task ledger)
 
@@ -328,11 +357,50 @@ call?" — the flow file picks the tool. Real tool-use integration
 model that lands at Gate 2. The alpha demonstrates the architecture
 on a fixed flow; the architecture generalises.
 
+## Flow languages
+
+Both languages dispatch on file extension via `flow_runner.rs`:
+
+- **`.sol`** — Rust-like imperative DSL. `let x: str = ...;`,
+  `if cond { … }`, `while`, `for`, function definitions, `print`,
+  `return`. One mesh primitive: `remote_call(peer, method, args)`.
+  Use it for chat flows and any logic that benefits from typed
+  locals.
+- **`.sflow`** — line-oriented step DSL. `step <name>: peer.method
+  "arg"`, `set var = "value"`, `${var}` interpolation,
+  `if`/`elif`/`else`, `loop N times`, `while` / `until`,
+  `try`/`catch`/`rethrow`, plus `sol.log` / `sol.sleep` /
+  `sol.assert` / `sol.set_result` built-ins. Use it for operator
+  recipes and anything that needs error recovery.
+
+The parser preserves the user-typed dotted method name as
+`wire_method`, so `step x: plugin_host.hello.greet "alice"` sends
+the full string on the wire and matches the bridge handler
+registered under `plugin_host.hello.greet`. Full reference:
+[`sol.md`](sol.md).
+
+## Plugin system
+
+`plugin_host` is a controller node type whose handlers are loaded
+from subprocesses at boot, not compiled into the binary. The host
+reads `plugin.toml` manifests under `--plugin-dir`, spawns each
+plugin, reads its `RELIX_PLUGIN_PORT=<n>` line, polls `/health` until
+200, then registers every declared capability on its own dispatch
+bridge as an `FnHandler` that forwards `POST /invoke` over loopback
+HTTP. Each capability is registered under both the bare manifest
+name (`hello.greet`) and the prefixed alias (`plugin_host.hello.greet`)
+so SOL and `.sflow` callers both reach the same handler. Detail:
+[`plugins.md`](plugins.md).
+
 ## Next
 
-- [`flows-and-sol.md`](flows-and-sol.md) — what SOL is, how to write a
-  new flow.
-- [`security.md`](security.md) — identity, policy, audit, what the
-  alpha guarantees and what it doesn't.
+- [`sol.md`](sol.md) — full reference for SOL and `.sflow`.
+- [`security.md`](security.md) — identity, policy, audit, the
+  admission pipeline.
+- [`configuration.md`](configuration.md) — every config knob.
+- [`coordination.md`](coordination.md) — multi-agent tasks,
+  delegation, messaging, approvals.
+- [`channels/index.md`](channels/index.md) — telegram, discord, slack.
+- [`plugins.md`](plugins.md) — plugin protocol, SDK, lifecycle.
 - [`operator-guide.md`](operator-guide.md) — running, logging,
   troubleshooting.
