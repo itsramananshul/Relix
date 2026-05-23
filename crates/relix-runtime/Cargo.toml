@@ -40,6 +40,10 @@ blake3.workspace = true
 ed25519-dalek.workspace = true
 bytes.workspace = true
 
+# Sflow `matches` operator uses regex. Direct dep (not workspace) — only
+# the sflow executor pulls it in, keeping the workspace dep list focused.
+regex = "1"
+
 # Node implementations (memory / ai / tool / web_bridge are modules of this crate)
 rusqlite.workspace = true
 reqwest.workspace = true

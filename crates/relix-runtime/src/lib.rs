@@ -21,6 +21,7 @@ pub mod dispatch;
 pub mod flow_runner;
 pub mod manifest;
 pub mod nodes;
+pub mod sflow;
 pub mod sol;
 pub mod transport;
 

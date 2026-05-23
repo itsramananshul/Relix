@@ -3224,6 +3224,7 @@ dependencies = [
  "lopdf",
  "portable-pty",
  "rand 0.8.6",
+ "regex",
  "relix-core",
  "relix-telegram",
  "reqwest",
