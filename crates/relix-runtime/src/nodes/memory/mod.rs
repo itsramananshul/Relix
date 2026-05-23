@@ -108,6 +108,51 @@ pub struct MemoryConfig {
     /// [`curator`] for the full design.
     #[serde(default)]
     pub curator: Option<CuratorConfig>,
+    /// Optional embedding-peer wiring. When set, the memory
+    /// controller dials this peer at startup and populates the
+    /// embedding-dispatcher cell so `memory.embed` /
+    /// `memory.search` / `memory.embed_all` can route through
+    /// it. When `None`, those handlers return a clear "not
+    /// configured" error.
+    #[serde(default)]
+    pub embedding_peer: Option<EmbeddingPeerConfig>,
+}
+
+/// `[memory.embedding_peer]` — points at an AI peer that
+/// exposes `ai.embed`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct EmbeddingPeerConfig {
+    /// Peer multiaddr to dial.
+    pub addr: String,
+    /// Peer alias (defaults to `"ai"`).
+    #[serde(default = "default_embedding_alias")]
+    pub alias: String,
+    /// Per-call deadline (defaults to 30s).
+    #[serde(default = "default_embedding_deadline")]
+    pub deadline_secs: i64,
+    /// Embedding model name passed to ai.embed. Defaults to
+    /// `"text-embedding-3-small"`. Mock provider ignores the
+    /// value and always returns 8-dim vectors.
+    #[serde(default = "default_embedding_model")]
+    pub model: String,
+    /// Expected dimensionality. Reserved for a future schema
+    /// check; today it's accepted for forward compatibility but
+    /// not enforced (the store accepts any length).
+    #[serde(default = "default_embedding_dims")]
+    pub dimensions: usize,
+}
+
+fn default_embedding_alias() -> String {
+    "ai".to_string()
+}
+fn default_embedding_deadline() -> i64 {
+    30
+}
+fn default_embedding_model() -> String {
+    "text-embedding-3-small".to_string()
+}
+fn default_embedding_dims() -> usize {
+    1536
 }
 
 fn default_max_n() -> usize {
@@ -507,6 +552,8 @@ pub fn register(
     bridge: &mut DispatchBridge,
     store: Arc<MemoryStore>,
     ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn AiDispatcher>>>,
+    embedding_cell: Arc<tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>>,
+    embedding_model: String,
     curator: Option<(Arc<tokio::sync::Mutex<CuratorState>>, Arc<CuratorConfig>)>,
 ) {
     {
@@ -532,7 +579,7 @@ pub fn register(
     {
         let store = store.clone();
         bridge.register(
-            "memory.search",
+            "memory.search_turns",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let store = store.clone();
                 async move { handle_search(&store, &ctx) }
@@ -578,6 +625,48 @@ pub fn register(
             Arc::new(FnHandler(move |_ctx: InvocationCtx| {
                 let curator = curator.clone();
                 async move { handle_curator_status(curator.as_ref()).await }
+            })),
+        );
+    }
+    {
+        let store = store.clone();
+        let embed_cell = embedding_cell.clone();
+        let model = embedding_model.clone();
+        bridge.register(
+            "memory.embed",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let store = store.clone();
+                let embed_cell = embed_cell.clone();
+                let model = model.clone();
+                async move { handle_embed(&store, embed_cell.as_ref(), &model, &ctx).await }
+            })),
+        );
+    }
+    {
+        let store = store.clone();
+        let embed_cell = embedding_cell.clone();
+        let model = embedding_model.clone();
+        bridge.register(
+            "memory.search",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let store = store.clone();
+                let embed_cell = embed_cell.clone();
+                let model = model.clone();
+                async move { handle_semantic_search(&store, embed_cell.as_ref(), &model, &ctx).await }
+            })),
+        );
+    }
+    {
+        let store = store.clone();
+        let embed_cell = embedding_cell.clone();
+        let model = embedding_model.clone();
+        bridge.register(
+            "memory.embed_all",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let store = store.clone();
+                let embed_cell = embed_cell.clone();
+                let model = model.clone();
+                async move { handle_embed_all(&store, embed_cell.as_ref(), &model, &ctx).await }
             })),
         );
     }
@@ -804,6 +893,236 @@ async fn handle_curator_status(
     let snapshot = state.lock().await.clone();
     let body = curator::render_status_body(&snapshot, cfg);
     HandlerOutcome::Ok(body.into_bytes())
+}
+
+async fn handle_embed(
+    store: &MemoryStore,
+    embed_cell: &tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>,
+    model: &str,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid_args(format!("memory.embed arg utf8: {e}")),
+    };
+    let mut parts = s.splitn(3, '|');
+    let subject_id = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let text = parts.next().unwrap_or("");
+    if subject_id.is_empty() || target.is_empty() || text.is_empty() {
+        return invalid_args(
+            "memory.embed arg must be `subject_id|target|text` (all non-empty)".to_string(),
+        );
+    }
+    let estore = store.embedding_store();
+    // Dedup early so we don't even call the dispatcher when the
+    // text is already embedded for this (subject_id, target).
+    let entry_hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+    if let Ok(Some(existing)) = lookup_existing(&estore, subject_id, target, &entry_hash) {
+        return HandlerOutcome::Ok(format!("ok|embedding_id={existing}\n").into_bytes());
+    }
+    let Some(dispatcher) = embed_cell.get() else {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: "memory.embed: embedding dispatcher not configured (missing [memory.embedding_peer])"
+                .to_string(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    };
+    let vectors = match dispatcher.embed(model, &[text]).await {
+        Ok(v) => v,
+        Err(e) => return internal(format!("memory.embed: {e}")),
+    };
+    let Some(vec) = vectors.into_iter().next() else {
+        return internal("memory.embed: dispatcher returned no vector".to_string());
+    };
+    match estore.insert(subject_id, target, text, &vec, model) {
+        Ok(out) => {
+            HandlerOutcome::Ok(format!("embedding_id={}\n", out.embedding_id()).into_bytes())
+        }
+        Err(MemoryError::InvalidArg(c)) => invalid_args(format!("memory.embed: {c}")),
+        Err(e) => internal(format!("memory.embed: {e}")),
+    }
+}
+
+async fn handle_semantic_search(
+    store: &MemoryStore,
+    embed_cell: &tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>,
+    model: &str,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid_args(format!("memory.search arg utf8: {e}")),
+    };
+    // Wire: `subject_id|target|query[|limit]`. Query may contain
+    // `|`, so we split off the limit from the *right* if the
+    // last segment is numeric; otherwise the whole tail is query.
+    let mut parts = s.splitn(3, '|');
+    let subject_id = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("");
+    if subject_id.is_empty() || target.is_empty() || rest.is_empty() {
+        return invalid_args(
+            "memory.search arg must be `subject_id|target|query[|limit]`".to_string(),
+        );
+    }
+    let (query, limit) = match rest.rsplit_once('|') {
+        Some((q, n_str)) if n_str.trim().parse::<usize>().is_ok() => {
+            (q, n_str.trim().parse::<usize>().unwrap_or(5))
+        }
+        _ => (rest, 5),
+    };
+    if query.is_empty() {
+        return invalid_args("memory.search: query required".to_string());
+    }
+    let estore = store.embedding_store();
+    let Some(dispatcher) = embed_cell.get() else {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: "memory.search: embedding dispatcher not configured (missing [memory.embedding_peer])"
+                .to_string(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    };
+    let vectors = match dispatcher.embed(model, &[query]).await {
+        Ok(v) => v,
+        Err(e) => return internal(format!("memory.search: {e}")),
+    };
+    let Some(query_vec) = vectors.into_iter().next() else {
+        return internal("memory.search: dispatcher returned no query vector".to_string());
+    };
+    let hits = match estore.search(subject_id, target, &query_vec, limit) {
+        Ok(h) => h,
+        Err(MemoryError::InvalidArg(c)) => return invalid_args(format!("memory.search: {c}")),
+        Err(e) => return internal(format!("memory.search: {e}")),
+    };
+    let mut body = String::new();
+    for hit in &hits {
+        // tab-separated: embedding_id, score (6-decimal float),
+        // chunk_text (tabs/newlines stripped to keep rows
+        // parseable).
+        let clean: String = hit
+            .chunk_text
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' | '\t' => ' ',
+                other => other,
+            })
+            .collect();
+        body.push_str(&hit.embedding_id);
+        body.push('\t');
+        body.push_str(&format!("{:.6}", hit.score));
+        body.push('\t');
+        body.push_str(&clean);
+        body.push('\n');
+    }
+    body.push_str(&format!("count={}\n", hits.len()));
+    HandlerOutcome::Ok(body.into_bytes())
+}
+
+async fn handle_embed_all(
+    store: &MemoryStore,
+    embed_cell: &tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>,
+    model: &str,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid_args(format!("memory.embed_all arg utf8: {e}")),
+    };
+    let subject_id = s.trim();
+    if subject_id.is_empty() {
+        return invalid_args("memory.embed_all: subject_id required".to_string());
+    }
+    let Some(dispatcher) = embed_cell.get() else {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: "memory.embed_all: embedding dispatcher not configured (missing [memory.embedding_peer])"
+                .to_string(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    };
+    let (agent, user) = match store.agent_read(subject_id) {
+        Ok(p) => p,
+        Err(e) => return internal(format!("memory.embed_all: {e}")),
+    };
+    let estore = store.embedding_store();
+    let mut total: usize = 0;
+    for (target, content) in [("agent", &agent), ("user", &user)] {
+        let chunks: Vec<String> = content
+            .split(ENTRY_DELIMITER)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if chunks.is_empty() {
+            continue;
+        }
+        // Skip chunks already embedded so embed_all is cheap on
+        // re-runs. We do this without calling the dispatcher.
+        let mut needed: Vec<&str> = Vec::new();
+        let mut needed_hashes: Vec<String> = Vec::new();
+        for c in &chunks {
+            let h = blake3::hash(c.as_bytes()).to_hex().to_string();
+            if matches!(
+                lookup_existing(&estore, subject_id, target, &h),
+                Ok(Some(_))
+            ) {
+                // Already embedded — count it toward the total
+                // so the caller sees a stable "everything is
+                // covered" number, not the delta.
+                total += 1;
+                continue;
+            }
+            needed.push(c.as_str());
+            needed_hashes.push(h);
+        }
+        if needed.is_empty() {
+            continue;
+        }
+        let vectors = match dispatcher.embed(model, &needed).await {
+            Ok(v) => v,
+            Err(e) => return internal(format!("memory.embed_all ({target}): {e}")),
+        };
+        if vectors.len() != needed.len() {
+            return internal(format!(
+                "memory.embed_all ({target}): expected {} vectors, got {}",
+                needed.len(),
+                vectors.len()
+            ));
+        }
+        for (c, v) in needed.iter().zip(vectors.iter()) {
+            match estore.insert(subject_id, target, c, v, model) {
+                Ok(_) => total += 1,
+                Err(MemoryError::InvalidArg(c)) => {
+                    return invalid_args(format!("memory.embed_all: {c}"));
+                }
+                Err(e) => return internal(format!("memory.embed_all: {e}")),
+            }
+        }
+    }
+    HandlerOutcome::Ok(format!("ok|chunks_embedded={total}\n").into_bytes())
+}
+
+/// Helper that checks for an existing entry by content hash
+/// without touching the embedding dispatcher. Used by both
+/// `memory.embed` (early dedup) and `memory.embed_all` (skip
+/// re-embed of already-stored chunks).
+fn lookup_existing(
+    estore: &embeddings::EmbeddingStore,
+    subject_id: &str,
+    target: &str,
+    entry_hash: &str,
+) -> Result<Option<String>, MemoryError> {
+    // Cheapest path: a one-row insert against a known-impossible
+    // entry would be wasteful. The store doesn't expose a
+    // dedicated by-hash lookup, so use the existing dedup behaviour
+    // of `insert` indirectly by reading from SQLite. Implementing
+    // a getter on EmbeddingStore avoids that round trip.
+    estore.lookup_by_hash(subject_id, target, entry_hash)
 }
 
 fn invalid_args(cause: String) -> HandlerOutcome {
@@ -1353,5 +1672,211 @@ mod tests {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
             HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
         }
+    }
+
+    /// Deterministic stub EmbeddingDispatcher for the
+    /// handler-level memory.embed / memory.search tests. Returns
+    /// a tiny f32 vector derived from blake3(text), same shape as
+    /// the AI node's MockProvider.
+    struct StubEmbed;
+
+    #[async_trait::async_trait]
+    impl crate::nodes::memory::EmbeddingDispatcher for StubEmbed {
+        async fn embed(
+            &self,
+            _model: &str,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, crate::nodes::memory::EmbeddingError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let h = blake3::hash(t.as_bytes());
+                    let bytes = h.as_bytes();
+                    (0..4)
+                        .map(|i| {
+                            let lo = bytes[i * 2] as u16;
+                            let hi = bytes[i * 2 + 1] as u16;
+                            let u = ((hi << 8) | lo) as f32;
+                            (u - 32_768.0) / 32_768.0
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    fn embed_cell_populated() -> Arc<tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>> {
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let d: Arc<dyn EmbeddingDispatcher> = Arc::new(StubEmbed);
+        cell.set(d).ok();
+        cell
+    }
+
+    fn handler_ctx(args: &[u8]) -> InvocationCtx {
+        InvocationCtx {
+            caller: relix_core::identity::VerifiedIdentity {
+                subject_id: relix_core::types::NodeId::from_pubkey(b"caller"),
+                name: "caller".into(),
+                org_id: relix_core::types::NodeId::from_pubkey(b"org"),
+                groups: vec![],
+                role: "".into(),
+                clearance: "".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: relix_core::types::TraceId::new(),
+            request_id: relix_core::types::RequestId::new(),
+            args: args.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_handler_returns_embedding_id() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        let cell = embed_cell_populated();
+        let r = handle_embed(
+            &store,
+            &cell,
+            "stub-model",
+            &handler_ctx(b"subj-a|agent|the quick brown fox"),
+        )
+        .await;
+        let bytes = match r {
+            HandlerOutcome::Ok(b) => b,
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        let body = String::from_utf8(bytes).unwrap();
+        assert!(body.starts_with("embedding_id="), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn embed_handler_dedups_identical_text() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        let cell = embed_cell_populated();
+        let _ = handle_embed(
+            &store,
+            &cell,
+            "stub-model",
+            &handler_ctx(b"subj-a|agent|same text"),
+        )
+        .await;
+        let r = handle_embed(
+            &store,
+            &cell,
+            "stub-model",
+            &handler_ctx(b"subj-a|agent|same text"),
+        )
+        .await;
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        // Second call hits the dedup branch: `ok|embedding_id=...`
+        assert!(body.starts_with("ok|embedding_id="), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn embed_then_search_returns_ranked_result() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        let cell = embed_cell_populated();
+        // Embed three distinct chunks under subj-a/agent.
+        for t in ["alpha", "beta", "gamma"] {
+            let arg = format!("subj-a|agent|{t}");
+            let r = handle_embed(&store, &cell, "stub-model", &handler_ctx(arg.as_bytes())).await;
+            assert!(matches!(r, HandlerOutcome::Ok(_)));
+        }
+        // Query for "alpha" — same text should rank first.
+        let r = handle_semantic_search(
+            &store,
+            &cell,
+            "stub-model",
+            &handler_ctx(b"subj-a|agent|alpha"),
+        )
+        .await;
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        let mut lines: Vec<&str> = body.lines().collect();
+        let count_line = lines.pop().unwrap();
+        assert!(count_line.starts_with("count="), "{count_line}");
+        // Each row: embedding_id\tscore\tchunk_text — first row
+        // (highest score) must be "alpha" itself (cosine 1.0).
+        let first_row = lines[0];
+        let cols: Vec<&str> = first_row.split('\t').collect();
+        assert_eq!(cols.len(), 3, "row={first_row}");
+        let score: f32 = cols[1].parse().unwrap();
+        assert!((score - 1.0).abs() < 1e-5, "score={score}");
+        assert_eq!(cols[2], "alpha");
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_for_unknown_subject() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        let cell = embed_cell_populated();
+        let r = handle_semantic_search(
+            &store,
+            &cell,
+            "stub-model",
+            &handler_ctx(b"unknown-subject|agent|nothing"),
+        )
+        .await;
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        // Only the count line — no rows.
+        assert_eq!(body, "count=0\n");
+    }
+
+    #[tokio::test]
+    async fn search_returns_not_configured_when_cell_empty() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        // Empty cell — exercises the "embedding dispatcher not
+        // configured" path so operators see a clear error rather
+        // than "unknown method".
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let r = handle_semantic_search(
+            &store,
+            &cell,
+            "stub-model",
+            &handler_ctx(b"subj-a|agent|query"),
+        )
+        .await;
+        match r {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, error_kinds::RESPONDER_INTERNAL);
+                assert!(e.cause.contains("not configured"));
+            }
+            HandlerOutcome::Ok(_) => panic!("expected RESPONDER_INTERNAL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_all_chunks_existing_memory_and_returns_count() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        // Seed agent + user memory with §-separated entries.
+        store
+            .agent_write("subj-a", "agent", "add", "alpha")
+            .unwrap();
+        store.agent_write("subj-a", "agent", "add", "beta").unwrap();
+        store.agent_write("subj-a", "user", "add", "delta").unwrap();
+        let cell = embed_cell_populated();
+        let r = handle_embed_all(&store, &cell, "stub-model", &handler_ctx(b"subj-a")).await;
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        // 2 agent + 1 user = 3 chunks embedded.
+        assert_eq!(body, "ok|chunks_embedded=3\n");
+        // Re-running embed_all is idempotent: same count (all
+        // already embedded, dedup hits).
+        let r2 = handle_embed_all(&store, &cell, "stub-model", &handler_ctx(b"subj-a")).await;
+        let body2 = match r2 {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        assert_eq!(body2, "ok|chunks_embedded=3\n");
     }
 }

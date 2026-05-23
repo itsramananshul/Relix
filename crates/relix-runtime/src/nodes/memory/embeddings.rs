@@ -210,6 +210,29 @@ impl EmbeddingStore {
         Ok(scored)
     }
 
+    /// Look up an existing row by content hash without
+    /// inserting. Returns `Ok(Some(id))` when a row for
+    /// `(subject_id, target, entry_hash)` exists, `Ok(None)`
+    /// otherwise. Used by callers that want to skip re-embedding
+    /// a chunk they've seen before.
+    pub fn lookup_by_hash(
+        &self,
+        subject_id: &str,
+        target: &str,
+        entry_hash: &str,
+    ) -> Result<Option<String>, MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        conn.query_row(
+            "SELECT embedding_id FROM memory_embeddings \
+             WHERE subject_id = ?1 AND target = ?2 AND entry_hash = ?3 \
+             LIMIT 1",
+            params![subject_id, target, entry_hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(MemoryError::Db)
+    }
+
     /// Count rows for a `(subject_id, target)`. Useful for
     /// observability and the `embed_all` summary.
     pub fn count_for(&self, subject_id: &str, target: &str) -> Result<usize, MemoryError> {

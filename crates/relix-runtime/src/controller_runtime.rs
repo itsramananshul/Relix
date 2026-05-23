@@ -315,6 +315,8 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             coord_cell,
             state,
             cfg: ccfg,
+            embedding_cell,
+            embedding_cfg,
         }) => {
             let interval_secs = ccfg.interval_secs;
             if let Some(aipeer) = ccfg.ai_peer.clone() {
@@ -343,11 +345,19 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     "memory curator: no [memory.curator.coord_peer]; chronicle events disabled"
                 );
             }
-            // Keep `state` referenced — the curator scheduler
-            // and the memory.curator_status handler already
-            // hold their own Arc clones; this branch just
-            // owned the wiring closure-captured copy.
+            if let (Some(cell), Some(epeer)) = (embedding_cell, embedding_cfg) {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_memory_embedding_cell(cell, epeer, key_path).await;
+                });
+            }
             let _ = state;
+        }
+        Some(StartupWiring::MemoryEmbedding { cell, cfg: epeer }) => {
+            let key_path = cfg.identity.key_path.clone();
+            tokio::spawn(async move {
+                populate_memory_embedding_cell(cell, epeer, key_path).await;
+            });
         }
         Some(StartupWiring::Telegram { cell, cfg: tg_cfg }) => {
             let key_path = cfg.identity.key_path.clone();
@@ -2237,6 +2247,103 @@ async fn populate_memory_curator_coord_cell(
     }
 }
 
+/// Dial the AI peer named in `[memory.embedding_peer]` and
+/// populate the embedding-dispatcher cell so memory.embed /
+/// memory.search / memory.embed_all can route through it.
+/// Mirrors `populate_memory_curator_cell` — same identity-bundle
+/// + client-key + discover_and_pin pattern.
+async fn populate_memory_embedding_cell(
+    cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::EmbeddingDispatcher>>>,
+    cfg: crate::nodes::memory::EmbeddingPeerConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "memory embedding: identity bundle missing; dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "memory embedding: bundle decode failed");
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "memory embedding: client key not 32 bytes; dispatcher disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "memory embedding: client key missing");
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.alias.clone(),
+        PeerEntry {
+            addr: cfg.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                addr = %cfg.addr,
+                "memory embedding: discover_and_pin returned None; dispatcher disabled"
+            );
+            return;
+        }
+    };
+
+    let dispatcher: Arc<dyn crate::nodes::memory::EmbeddingDispatcher> =
+        Arc::new(crate::nodes::memory::EmbeddingMeshDispatcher::new(
+            mesh,
+            cfg.alias.clone(),
+            bundle,
+            cfg.deadline_secs,
+        ));
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("memory embedding: cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            alias = %cfg.alias,
+            model = %cfg.model,
+            "memory node: embedding dispatcher online"
+        );
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2260,12 +2367,22 @@ pub(crate) enum StartupWiring {
     /// scheduler; the run() loop populates them post-startup
     /// by building an [`AiMeshDispatcher`] from `cfg.ai_peer`
     /// and a [`CoordMeshDispatcher`] from `cfg.coord_peer`
-    /// (each when set).
+    /// (each when set). Optionally also carries an embedding
+    /// dispatcher cell + config — operators can enable
+    /// `[memory.embedding_peer]` independent of the curator.
     MemoryCurator {
         ai_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
         coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::CoordDispatcher>>>,
         state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
         cfg: crate::nodes::memory::CuratorConfig,
+        embedding_cell:
+            Option<Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::EmbeddingDispatcher>>>>,
+        embedding_cfg: Option<crate::nodes::memory::EmbeddingPeerConfig>,
+    },
+    /// Memory node with embedding-only wiring (no curator).
+    MemoryEmbedding {
+        cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::EmbeddingDispatcher>>>,
+        cfg: crate::nodes::memory::EmbeddingPeerConfig,
     },
     /// Telegram-channel outbound wiring. `cell` was already
     /// passed into the long-poll loop; the run() loop dials
@@ -2338,10 +2455,24 @@ fn register_node_type_handlers(
             .curator
             .clone()
             .map(|c| (curator_state.clone(), Arc::new(c)));
+        // Embedding-dispatcher cell — populated post-startup
+        // when [memory.embedding_peer] is configured. Empty cell
+        // makes memory.embed / memory.search return a clear
+        // "not configured" error rather than crashing.
+        let embedding_cell: Arc<
+            tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::EmbeddingDispatcher>>,
+        > = Arc::new(tokio::sync::OnceCell::new());
+        let embedding_model = mem_cfg
+            .embedding_peer
+            .as_ref()
+            .map(|p| p.model.clone())
+            .unwrap_or_else(|| "text-embedding-3-small".to_string());
         crate::nodes::memory::register(
             bridge,
             store.clone(),
             curator_ai_cell.clone(),
+            embedding_cell.clone(),
+            embedding_model,
             curator_handler_cfg,
         );
         // Spawn the curator scheduler iff [memory.curator] is
@@ -2367,9 +2498,20 @@ fn register_node_type_handlers(
                 coord_cell: curator_coord_cell,
                 state: curator_state,
                 cfg: curator_cfg,
+                embedding_cell: mem_cfg
+                    .embedding_peer
+                    .as_ref()
+                    .map(|_| embedding_cell.clone()),
+                embedding_cfg: mem_cfg.embedding_peer.clone(),
             });
         } else {
             tracing::info!("memory node: no [memory.curator] section; curator scheduler disabled");
+            if let Some(epeer) = mem_cfg.embedding_peer.clone() {
+                *out = Some(StartupWiring::MemoryEmbedding {
+                    cell: embedding_cell.clone(),
+                    cfg: epeer,
+                });
+            }
         }
         let memory_caps: &[(&str, &str, &[&str], &[&str])] = &[
             (
@@ -2385,10 +2527,42 @@ fn register_node_type_handlers(
                 &["reads:internal"],
             ),
             (
-                "memory.search",
-                "FTS5 substring search across all stored turns.",
-                &["search", "memory"],
+                "memory.search_turns",
+                "FTS5 substring search across all stored chat turns. \
+                 Was `memory.search` before the vector-memory landing; \
+                 renamed so `memory.search` can be the semantic search \
+                 over per-subject embeddings.",
+                &["search", "memory", "fts"],
                 &["reads:internal"],
+            ),
+            (
+                "memory.embed",
+                "Embed a memory chunk and store it in the per-subject \
+                 vector store. Arg: subject_id|target|text. Returns \
+                 `embedding_id=<id>\\n` or `ok|embedding_id=<id>\\n` on \
+                 dedup. Requires [memory.embedding_peer] in the memory \
+                 controller config.",
+                &["persist", "memory", "embedding"],
+                &["mutate:memory", "external:ai"],
+            ),
+            (
+                "memory.search",
+                "Semantic search over a subject's memory embeddings. \
+                 Arg: subject_id|target|query[|limit] (default 5, max 20). \
+                 Returns tab-separated rows `embedding_id\\tscore\\tchunk_text\\n` \
+                 newest-first, then `count=N\\n`. Requires \
+                 [memory.embedding_peer].",
+                &["search", "memory", "embedding", "semantic"],
+                &["reads:internal", "external:ai"],
+            ),
+            (
+                "memory.embed_all",
+                "Re-embed all existing persistent memory entries for a \
+                 subject_id. Chunks are split on `§`. Dedupes \
+                 already-embedded chunks via blake3(text). Returns \
+                 `ok|chunks_embedded=N\\n`.",
+                &["mutate", "memory", "embedding"],
+                &["mutate:memory", "external:ai"],
             ),
             (
                 "memory.agent_read",
