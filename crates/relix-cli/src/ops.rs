@@ -271,6 +271,38 @@ pub enum Cmd {
     /// PH-MSG-CLI: agent-to-agent messaging. Five subcommands
     /// that proxy onto the bridge's `/v1/messages` endpoints.
     Msg(MsgArgs),
+    /// Discord channel surface — read-only status + recent
+    /// inbound messages from the discord controller's ring.
+    /// Proxies onto the bridge's `/v1/discord/*` endpoints.
+    Discord(DiscordArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DiscordArgs {
+    #[command(subcommand)]
+    pub cmd: DiscordCmd,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DiscordCmd {
+    /// Print the discord bot's live status. Hits
+    /// `/v1/discord/status` and pretty-prints the JSON.
+    Status {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Print the last N inbound messages from the discord
+    /// controller's ring.
+    Messages {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -631,7 +663,95 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Delegate(args) => delegate_run(args.cmd).await,
         Cmd::Agent(args) => agent_run(args.cmd).await,
         Cmd::Msg(args) => msg_run(args.cmd).await,
+        Cmd::Discord(args) => discord_run(args.cmd).await,
     }
+}
+
+async fn discord_run(cmd: DiscordCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        DiscordCmd::Status { bridge, json } => discord_status(&bridge, json).await,
+        DiscordCmd::Messages {
+            bridge,
+            limit,
+            json,
+        } => discord_messages(&bridge, limit, json).await,
+    }
+}
+
+async fn discord_status(bridge: &str, json_out: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let body = http_get_string(&format!("{base}/v1/discord/status")).await?;
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let online = v.get("online").and_then(|x| x.as_bool()).unwrap_or(false);
+    let last = v.get("last_message_at").and_then(|x| x.as_i64());
+    let last_disp = match last {
+        Some(t) => format!("{t}"),
+        None => "—".to_string(),
+    };
+    println!("online            {}", if online { "yes" } else { "no" });
+    println!(
+        "username          @{}",
+        v.get("username").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "user_id           {}",
+        v.get("user_id").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "channel_id        {}",
+        v.get("channel_id").and_then(|x| x.as_str()).unwrap_or("")
+    );
+    println!(
+        "messages_seen     {}",
+        v.get("messages_seen").and_then(|x| x.as_u64()).unwrap_or(0)
+    );
+    println!("last_message_at   {last_disp}");
+    Ok(())
+}
+
+async fn discord_messages(
+    bridge: &str,
+    limit: usize,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let body = http_get_string(&format!("{base}/v1/discord/messages/recent?limit={limit}")).await?;
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = v
+        .get("messages")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no messages)");
+        return Ok(());
+    }
+    println!("{:<22} {:<20} {:<16} content", "ts", "user_id", "username");
+    for m in rows {
+        let ts = m.get("ts").and_then(|x| x.as_i64()).unwrap_or(0);
+        let user_id = m.get("user_id").and_then(|x| x.as_str()).unwrap_or("");
+        let username = m.get("username").and_then(|x| x.as_str()).unwrap_or("");
+        let content = m
+            .get("content_preview")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        println!(
+            "{:<22} {:<20} {:<16} {}",
+            ts,
+            short(user_id, 20),
+            short(username, 16),
+            content
+        );
+    }
+    Ok(())
 }
 
 // W2-008i CLI: combined-state snapshot for incident attachments.

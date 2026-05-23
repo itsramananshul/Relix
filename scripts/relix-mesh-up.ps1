@@ -40,6 +40,7 @@ param(
     [int]$ToolPort          = 19713,
     [int]$CoordinatorPort   = 19714,
     [int]$TelegramPort      = 19715,
+    [int]$DiscordPort       = 19716,
     [switch]$ToolAllowHttp,
     [switch]$NoTool,
     [switch]$NoCoordinator,
@@ -52,7 +53,17 @@ param(
     # If RELIX_TELEGRAM=1 but RELIX_TELEGRAM_BOT_TOKEN is unset, the
     # telegram controller will boot but its long-poll loop will idle
     # (the bot stays offline; the dashboard reports `online=false`).
-    [switch]$NoTelegram
+    [switch]$NoTelegram,
+    # Discord channel is opt-in. Enable by setting
+    #   $env:RELIX_DISCORD = "1"
+    #   $env:RELIX_DISCORD_BOT_TOKEN = "<bot-token>"
+    #   $env:RELIX_DISCORD_CHANNEL_ID = "<channel-snowflake>"
+    # before invoking this script. Optional:
+    #   $env:RELIX_DISCORD_OPERATOR_USER_ID = "<user-id>"
+    #   $env:RELIX_DISCORD_ALLOWED_USERS    = "42,1234"  # comma-separated user_ids
+    # Without a token + channel id the polling loop idles and the
+    # dashboard reports `online=false`.
+    [switch]$NoDiscord
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,11 +89,13 @@ $AiKey          = "dev-keys/$Run-ai.key"
 $ToolKey        = "dev-keys/$Run-tool.key"
 $CoordinatorKey = "dev-keys/$Run-coordinator.key"
 $TelegramKey    = "dev-keys/$Run-telegram.key"
+$DiscordKey     = "dev-keys/$Run-discord.key"
 $BridgeKey      = "dev-keys/$Run-bridge.key"
 # Telegram is opt-in. Default off so existing operator
 # workflows are unaffected; explicitly set $env:RELIX_TELEGRAM=1
 # to enable.
 $TelegramEnabled = ($env:RELIX_TELEGRAM -eq '1') -and (-not $NoTelegram.IsPresent)
+$DiscordEnabled  = ($env:RELIX_DISCORD -eq '1') -and (-not $NoDiscord.IsPresent)
 $Policy     = "configs/policies/$Run.toml"
 $BridgeHttp = "127.0.0.1:$BridgePort"
 
@@ -105,6 +118,7 @@ $AiConfig          = "$DataBase/ai.toml"
 $ToolConfig        = "$DataBase/tool.toml"
 $CoordinatorConfig = "$DataBase/coordinator.toml"
 $TelegramConfig    = "$DataBase/telegram.toml"
+$DiscordConfig     = "$DataBase/discord.toml"
 $BridgeConfig      = "$DataBase/bridge.toml"
 $Peers             = "$DataBase/peers.toml"
 
@@ -308,6 +322,70 @@ addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
 
 [peers]
 "@ | Set-Content -Encoding utf8 $TelegramConfig
+}
+
+# 4.7) Discord controller config. Opt-in via $env:RELIX_DISCORD=1.
+#      The discord node dials memory/ai/coordinator directly; without
+#      a bot token + channel id the controller boots but idles.
+if ($DiscordEnabled) {
+    $dcAllowedRaw = $env:RELIX_DISCORD_ALLOWED_USERS
+    if (-not $dcAllowedRaw) { $dcAllowedRaw = '' }
+    # Discord snowflakes are STRINGS. Wrap each comma-separated id
+    # in quotes so the TOML emits e.g. ["42", "1234"].
+    $dcAllowed = if ($dcAllowedRaw -eq '') {
+        '[]'
+    } else {
+        '[' + (($dcAllowedRaw -split ',' | ForEach-Object { '"' + $_.Trim() + '"' }) -join ', ') + ']'
+    }
+    $opUser = if ($env:RELIX_DISCORD_OPERATOR_USER_ID) {
+        $env:RELIX_DISCORD_OPERATOR_USER_ID
+    } else {
+        ''
+    }
+    $dcChannel = if ($env:RELIX_DISCORD_CHANNEL_ID) {
+        $env:RELIX_DISCORD_CHANNEL_ID
+    } else {
+        # Placeholder snowflake — passes the 10-digit numeric check
+        # so the controller boots; the polling loop will get 404
+        # from Discord and stay offline. Operator must supply a
+        # real channel_id via the env var.
+        '0000000000'
+    }
+@"
+[controller]
+name = "$Run-discord"
+node_type = "discord"
+listen_port = $DiscordPort
+
+[identity]
+key_path = "$DiscordKey"
+
+[trust]
+org_root_key_path = "$OrgPub"
+
+[policy]
+file = "$Policy"
+
+[discord]
+token_env = "RELIX_DISCORD_BOT_TOKEN"
+channel_id = "$dcChannel"
+allowed_users = $dcAllowed
+operator_user_id = "$opUser"
+messages_ring_capacity = 200
+poll_interval_secs = 2
+
+[discord.memory_peer]
+addr = "/ip4/127.0.0.1/tcp/$MemPort"
+
+[discord.ai_peer]
+addr = "/ip4/127.0.0.1/tcp/$AiPort"
+deadline_secs = 60
+
+[discord.coord_peer]
+addr = "/ip4/127.0.0.1/tcp/$CoordinatorPort"
+
+[peers]
+"@ | Set-Content -Encoding utf8 $DiscordConfig
 }
 
 # 4.5) Coordinator controller config. Owns the durable Task ledger
@@ -595,6 +673,16 @@ allow_groups = ["chat-users"]
 name = "telegram_messages_recent"
 method = "telegram.messages_recent"
 allow_groups = ["chat-users"]
+
+[[rules]]
+name = "discord_status"
+method = "discord.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "discord_messages_recent"
+method = "discord.messages_recent"
+allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
 # 6) Peer alias map consumed by the bridge. Tool entry omitted when -NoTool.
@@ -627,6 +715,14 @@ if ($TelegramEnabled) {
 
 [peers.telegram]
 addr = "/ip4/127.0.0.1/tcp/$TelegramPort"
+"@
+}
+if ($DiscordEnabled) {
+    $peersToml += @"
+
+
+[peers.discord]
+addr = "/ip4/127.0.0.1/tcp/$DiscordPort"
 "@
 }
 $peersToml | Set-Content -Encoding utf8 $Peers
@@ -679,12 +775,14 @@ $AiLog          = "$DataBase/ai.log"
 $ToolLog        = "$DataBase/tool.log"
 $CoordinatorLog = "$DataBase/coordinator.log"
 $TelegramLog    = "$DataBase/telegram.log"
+$DiscordLog     = "$DataBase/discord.log"
 $BridgeLog      = "$DataBase/bridge.log"
 $MemErr         = "$DataBase/memory.err.log"
 $AiErr          = "$DataBase/ai.err.log"
 $ToolErr        = "$DataBase/tool.err.log"
 $CoordinatorErr = "$DataBase/coordinator.err.log"
 $TelegramErr    = "$DataBase/telegram.err.log"
+$DiscordErr     = "$DataBase/discord.err.log"
 $BridgeErr      = "$DataBase/bridge.err.log"
 
 $env:RELIX_DATA_DIR = 'dev-data'
@@ -750,6 +848,13 @@ if ($TelegramEnabled) {
 } else {
     Write-Host "  telegram port: (disabled - set RELIX_TELEGRAM=1 to enable)"
 }
+if ($DiscordEnabled) {
+    $hasDcToken = if ($env:RELIX_DISCORD_BOT_TOKEN) { 'token=set' } else { 'token=MISSING' }
+    $hasDcCh    = if ($env:RELIX_DISCORD_CHANNEL_ID) { 'channel=set' } else { 'channel=MISSING' }
+    Write-Host ("  discord port:  tcp/{0}  ({1}, {2})" -f $DiscordPort, $hasDcToken, $hasDcCh)
+} else {
+    Write-Host "  discord port:  (disabled - set RELIX_DISCORD=1 to enable)"
+}
 Write-Host "  bridge HTTP:   http://$BridgeHttp"
 Write-Host "  data dir:      $DataBase"
 Write-Host ""
@@ -790,6 +895,19 @@ try {
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $TelegramConfig -OutLog $TelegramLog -ErrLog $TelegramErr -RustLog 'relix_runtime=info,relix_telegram=info') )
     }
 
+    if ($DiscordEnabled) {
+        # Same identity-bundle pattern as telegram: the controller
+        # generates its .key on first boot, but the .bundle is
+        # minted off the org root and persisted across restarts.
+        $DiscordBundlePath = "dev-keys/$Run-discord.bundle"
+        if (-not (Test-Path $DiscordBundlePath)) {
+            & $Cli identity mint --root-key $OrgKey --name discord --groups chat-users --out $DiscordBundlePath
+            if ($LASTEXITCODE -ne 0) { throw "discord identity mint failed" }
+        }
+        Write-Host "starting discord controller ..."
+        [void]$started.Add( (Start-Node -Exe $Controller -Cfg $DiscordConfig -OutLog $DiscordLog -ErrLog $DiscordErr -RustLog 'relix_runtime=info,relix_discord=info') )
+    }
+
     if (-not (Wait-Log -Path $MemLog -Needle 'transport listening' -Desc 'memory controller')) { throw 'memory controller never came up' }
     if (-not (Wait-Log -Path $AiLog  -Needle 'transport listening' -Desc 'ai controller'))     { throw 'ai controller never came up' }
     if (-not $NoTool) {
@@ -800,6 +918,9 @@ try {
     }
     if ($TelegramEnabled) {
         if (-not (Wait-Log -Path $TelegramLog -Needle 'transport listening' -Desc 'telegram controller')) { throw 'telegram controller never came up' }
+    }
+    if ($DiscordEnabled) {
+        if (-not (Wait-Log -Path $DiscordLog -Needle 'transport listening' -Desc 'discord controller')) { throw 'discord controller never came up' }
     }
     Start-Sleep -Milliseconds 400
 
@@ -856,6 +977,7 @@ try {
     if (-not $NoTool)        { Write-Host "  $ToolLog" }
     if (-not $NoCoordinator) { Write-Host "  $CoordinatorLog" }
     if ($TelegramEnabled)    { Write-Host "  $TelegramLog" }
+    if ($DiscordEnabled)     { Write-Host "  $DiscordLog" }
     Write-Host "  $BridgeLog"
     Write-Host ""
     Write-Host "PIDs (this script will only stop these on Ctrl-C):"

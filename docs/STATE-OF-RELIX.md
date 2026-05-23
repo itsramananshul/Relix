@@ -543,6 +543,38 @@ cards. Setup is documented in `docs/telegram.md`. Boot via
 `scripts/relix-mesh-up.ps1` with `$env:RELIX_TELEGRAM = "1"` and
 `$env:RELIX_TELEGRAM_BOT_TOKEN = "<token>"`.
 
+### 6.1b Discord channel — shipped
+
+`relix-discord` ships a live `DiscordApi` HTTPS client (reqwest +
+rustls) covering `getMe` / `getMessages` / `sendMessage` /
+`sendTyping` / `deleteMessage` with 429 (`retry_after` is a
+float, clamped 1..30s) and 5xx retry semantics. `node_type =
+"discord"` is wired into the controller binary; it polls
+`GET /channels/:channel_id/messages?after=:last_id` on a
+configurable interval (default 2s), filters bot self-loops by
+matching the cached `get_me` user_id and `author.bot=true`,
+enforces `allowed_users`, handles `/help /status /memory
+/forget`, runs the same memory + ai dispatch sequence Telegram
+uses, and creates a coordinator task per turn with
+`origin_surface = "discord"`. Snowflake ids (user_id, channel_id,
+message_id) are strings end-to-end — they exceed JS safe-int
+range. Bridge endpoints `GET /v1/discord/status` +
+`GET /v1/discord/messages/recent` proxy the channel's read
+capabilities; the dashboard `#/discord` page renders both as
+live cards; `relix-cli ops discord {status,messages}` mirrors the
+same data on the terminal. Boot via
+`scripts/relix-mesh-up.ps1` with
+`$env:RELIX_DISCORD = "1"`,
+`$env:RELIX_DISCORD_BOT_TOKEN = "<token>"`, and
+`$env:RELIX_DISCORD_CHANNEL_ID = "<channel-snowflake>"`.
+Setup is documented in `docs/discord.md`.
+
+The Discord controller deliberately ships smaller than Telegram:
+no Gateway/WebSocket client (REST polling only), no webhook
+delivery mode, no approval-notifier loop, no persistent session
+store, no formal slash-command registration. `operator_user_id`
+is reserved for the future approval surface.
+
 ### 6.2 Playwright browser backend — scaffold
 
 `[tool.browser] backend = "playwright"` selects a scaffold that returns
