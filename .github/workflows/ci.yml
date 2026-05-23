@@ -30,6 +30,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        # The cache post-step intermittently fails on the Windows
+        # runner when target/ is large (tar/zstd compression + cache
+        # upload occasionally errors with no diagnostic). Cache is a
+        # build-speed optimisation, not a correctness gate, so a
+        # cache restore / save failure must never fail CI for an
+        # otherwise-green commit.
+        continue-on-error: true
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -43,4 +50,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        # See note on the clippy job — cache is a build-speed
+        # optimisation, not a correctness gate. Without this, the
+        # Windows runner's cache-save post-step (large target/, slow
+        # tar pipeline) intermittently fails the job AFTER every
+        # test has already passed.
+        continue-on-error: true
       - run: cargo test --workspace
