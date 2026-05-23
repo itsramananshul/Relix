@@ -4,8 +4,13 @@
 // other reason, the flow falls back to a canned message instead of
 // halting the way the equivalent .sol flow does.
 //
-// `${prompt}` is supplied by the host as a variable before execution.
-// In this template form, the bridge calls `set prompt = "..."` first.
+// `prompt` defaults to a self-contained value so `relix-cli flow-run`
+// can execute this flow without external substitution. When the bridge
+// renders this as a template it can replace the `set prompt = ...`
+// line with the operator-supplied value (or prepend its own).
+// SIMP-016 wire format: `session_id|prompt[|history]`.
+
+set prompt = "sflow-retry-demo|hello"
 
 try
   step reply: ai.chat "${prompt}"

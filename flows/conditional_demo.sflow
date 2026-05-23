@@ -5,7 +5,7 @@
 // `step.<name>.result`. Useful as a smoke test for a freshly bootstrapped
 // mesh — the AI peer answering the ping at all means routing is live.
 
-step check: ai.chat "ping"
+step check: ai.chat "sflow-conditional-demo|ping"
 if step.check.status == "completed"
   sol.set_result "AI is online"
 else
