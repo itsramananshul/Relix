@@ -1,0 +1,365 @@
+# Flow languages
+
+Relix ships **two** flow languages side-by-side:
+
+| File ext | Language | When to reach for it |
+|---|---|---|
+| `.sol` | Rust-like SOL | Power users; existing chat flows; anything that wants typed locals and `{}` blocks |
+| `.sflow` | Step-based Sflow | Operator-authored flows; error recovery via try/catch; loops with caps; lightweight conditional routing |
+
+The `flow_runner` dispatches on extension. Both languages share
+the same `RemoteCallDispatcher`, the same per-flow event log,
+the same `FlowRunResult` shape returned to the bridge / CLI.
+Choose whichever fits the flow — there is no "wrong" answer for
+a given use case.
+
+`POST /v1/sol/validate { source, kind: "sflow" | "sol" }`
+parse-checks either language without executing it; the
+dashboard `#/sol` page calls it.
+
+---
+
+## 1. SOL (`.sol`) — Rust-like
+
+A real little programming language ported verbatim from OpenPrem
+(`crates/relix-runtime/src/sol/`):
+
+- `function start() -> str { ... }` — single entry point per file.
+- `let x: str = "literal";` — typed locals (`int`, `float`, `char`,
+  `bool`, `str`, arrays, tuples, structs, enums).
+- `if cond { … } else { … }`, `while cond { … }`, `for x in arr { … }`
+  — all compile to `Jump` / `JumpFalse` opcodes; the VM executes them.
+- `"a" + "b"` — string concatenation. Literals have no escape
+  sequences (SIMP-016).
+- `print(x)` — stdout for `flow-run`.
+- `return x;`
+- `remote_call("peer_or_capability_uri", "method", "arg") -> str` —
+  the mesh primitive. Pipe-delimited args by convention.
+
+A failed `remote_call` halts the VM with `VM_ERROR_SENTINEL` and
+the dispatcher's structured error is surfaced on
+`FlowRunResult::last_error`. The host classifies it into a
+`FailureClass` for the task ledger. **SOL has no `try/catch`**;
+if you need recovery, use Sflow.
+
+### Worked example
+
+```sol
+function start() -> str {
+    let session: str = "demo";
+    let user_msg: str = "hello memory";
+
+    remote_call("memory", "memory.write_turn", "demo|user|" + user_msg);
+    let history: str = remote_call("memory", "memory.recent_for_session", "demo");
+    let reply: str = remote_call("ai", "ai.chat", "demo|" + user_msg + "|" + history);
+    remote_call("memory", "memory.write_turn", "demo|assistant|" + reply);
+
+    return reply;
+}
+```
+
+The bridge `chat_template.sol` substitutes `{{SESSION}}` and
+`{{MESSAGE}}` at request time; the substitution validator rejects
+`"`, `|`, and `\n` so the rendered literal cannot break out.
+
+---
+
+## 2. Sflow (`.sflow`) — step-based
+
+A flat sequence of statements. No functions, no types, no
+semicolons. Designed for operators to author and review without
+needing to know Rust-style block syntax.
+
+### 2.1 Basic structure
+
+```sflow
+step reply: ai.chat "hello"
+return step.reply.result
+```
+
+Execution starts at the first statement. Falling off the end is
+the same as `return` with the last step's result.
+
+Comments use `// …` to end of line. Lines blank or containing
+only a comment are skipped.
+
+### 2.2 Capability steps
+
+```sflow
+step <name>: <peer>.<method> <arg>     // named — referenceable later
+<peer>.<method> <arg>                  // unnamed
+```
+
+`<arg>` is one of: a double-quoted string literal (possibly with
+`${…}` interpolations), the bareword `result`, `var.<name>`, or
+`step.<other>.result`. The arg is interpolated before the
+dispatcher sees it.
+
+The result of a named step is captured under that name; both
+the implicit `result` / `status` slots and a by-name map keep
+the value around for later conditions and interpolations.
+
+### 2.3 Variables
+
+```sflow
+set my_var = "literal value"
+set my_var = result
+set my_var = step.fetch.result
+set my_var = var.other_var
+```
+
+- Scoped to one execution. No cross-flow persistence.
+- Max **50 variables** per flow. The 51st `set` fails the flow.
+- Names: alphanumeric + underscore, max 32 chars, must start
+  with a letter or underscore.
+- Reference in args / conditions with `${my_var}` interpolation
+  or the `var.my_var` bareword.
+
+### 2.4 Conditional branching
+
+```sflow
+if status == "completed"
+  <statements>
+elif status != "failed"
+  <statements>
+else
+  <statements>
+end
+```
+
+Condition grammar:
+
+| Form | Meaning |
+|---|---|
+| `status == "completed"` | Last step's status equals literal |
+| `status != "failed"` | Last step's status not equal |
+| `result contains "error"` | Last result contains substring |
+| `result matches "^ERR.*"` | Last result matches Rust-regex |
+| `var.my_var == "value"` | Variable equals literal |
+| `var.my_var exists` | Variable is set and non-empty |
+| `step.my_step.status == "completed"` | Named-step status |
+| `step.my_step.result contains "ok"` | Named-step result substring |
+| `true` / `false` | Literals |
+| `<expr> and <expr>` | Logical and |
+| `<expr> or <expr>` | Logical or |
+| `not <expr>` | Logical not |
+
+Nesting cap: **8 levels**. The parser rejects deeper trees at
+parse time with the offending line number. Refactor into smaller
+flows before chasing that limit.
+
+### 2.5 Loops
+
+```sflow
+loop <N> times
+  <statements>
+end
+
+while <condition>
+  <statements>
+end
+
+until <condition>
+  <statements>
+end
+```
+
+- `loop N times` runs the body 0..N-1 times. `${loop.iter}` is
+  the 0-indexed iteration counter, available inside the body.
+- `while` runs the body while the condition is true.
+- `until` is sugar for `while not <condition>`.
+
+**Iteration cap: 100 per loop** (configurable in the
+coordinator config under `[sol] max_loop_iters = N`). When hit,
+the executor writes `sol.loop_limit_hit` to the chronicle and
+breaks out — never crashes, never hangs.
+
+### 2.6 Error handling
+
+```sflow
+try
+  step reply: ai.chat "${prompt}"
+catch timeout
+  sol.set_result "Taking too long. Please retry."
+catch any
+  sol.set_result "Something went wrong. Please retry."
+end
+```
+
+Error kinds:
+
+| Kind | Triggers on |
+|---|---|
+| `timeout` | `TIMEOUT` / `APPROVAL_TIMEOUT` |
+| `mesh_error` | `TRANSPORT` / `PEER_UNREACHABLE` / local dispatch errors |
+| `policy_denied` | `POLICY_DENIED` / `APPROVAL_DENIED` / `APPROVAL_REQUIRED` |
+| `responder_error` | Application errors from the responder (`RESPONDER_INTERNAL`, `INVALID_ARGS`, …) |
+| `any` | Catches anything not handled above |
+
+Catch ordering: the first matching `catch` runs; if none match
+but `catch any` is present, that runs. Otherwise the error
+propagates to the next enclosing `try` or fails the flow.
+
+Inside a catch block, `${error.kind}` and `${error.message}` are
+available as interpolations. `rethrow` re-raises the current
+error to the next outer handler; at the top level, the flow
+fails with the captured cause.
+
+A `remote_call` failure outside any `try` block aborts the flow
+and the host writes `failure_class = sol_uncaught_error` on the
+task ledger.
+
+### 2.7 Built-in steps
+
+```sflow
+sol.log "message ${var.x}"         // chronicle event sol.log
+sol.sleep <seconds>                // clamped to 30s max
+sol.assert <condition>             // fails flow if condition false
+sol.set_result "value"             // sets the running flow result
+sol.set_result var.name
+```
+
+None of these dispatch to the mesh. `sol.set_result` sets the
+result that `return` (without a value) and the falls-off-the-end
+case both return.
+
+### 2.8 Return
+
+```sflow
+return                  // exit with current sol.set_result / last result
+return "literal"        // exit with this string
+return var.my_var       // exit with variable value
+return step.x.result    // exit with a named step's result
+```
+
+### 2.9 Interpolation placeholders
+
+Any string literal can carry `${…}` placeholders that the
+executor expands at run time:
+
+| Placeholder | Expands to |
+|---|---|
+| `${result}` | Last step's result |
+| `${status}` | Last step's status (`completed` / `failed` / empty) |
+| `${var.name}` | Variable `name`, or empty if unset |
+| `${step.name.result}` | Named step's result |
+| `${step.name.status}` | Named step's status |
+| `${loop.iter}` | 0-indexed iteration (loop body only) |
+| `${error.kind}` | Error kind, inside a catch block |
+| `${error.message}` | Error cause, inside a catch block |
+
+Unknown placeholders expand to the empty string. Unmatched `$`
+characters pass through verbatim.
+
+---
+
+## 3. Choosing between SOL and Sflow
+
+Use **SOL** when:
+- You're extending the existing chat flows (`chat_template.sol`,
+  `chat_with_tool.sol`). The bridge already renders them.
+- You want typed locals, arrays, or struct-style data shaping.
+- The flow has no recoverable failure modes — a failed
+  `remote_call` *should* abort the flow.
+
+Use **Sflow** when:
+- You want try/catch / rethrow error recovery.
+- The flow has conditional routing on a step's outcome
+  (`if step.x.status == "completed"`).
+- You need bounded iteration (`loop 5 times`).
+- The flow is operator-authored and you want the parser to
+  reject deep nesting / too-long variable names / unclosed
+  blocks at validate time.
+
+Both languages call the same `remote_call` pipeline, so a flow
+can be translated either way without changing the responders.
+
+---
+
+## 4. Chronicle events
+
+The executor (Sflow) and dispatcher (both languages) write
+events to the per-flow event log on disk. SOL emits the canonical
+`RemoteCallIssued` / `RemoteCallCompleted` / `RemoteCallFailed`
+records. Sflow additionally emits these structured events,
+multiplexed under `RemoteCallIssued` records with an
+`event=<name>` payload prefix (the on-disk record format stays
+signed and hash-chained — adding new `EventType` variants is a
+Gate 2 concern).
+
+| Event | When written |
+|---|---|
+| `sol.step_start` | Before each capability step is dispatched |
+| `sol.step_done` | After each capability step (success or failure) |
+| `sol.loop_iter` | At the start of each iteration of `loop` / `while` / `until` |
+| `sol.condition_branch` | When an `if` / `elif` / `else` branch is taken (or `none` if no branch matched) |
+| `sol.error_caught` | When a `catch` block fires |
+| `sol.loop_limit_hit` | When a loop hits the iteration cap |
+| `sol.log` | From the `sol.log` built-in |
+| `sol.flow_failed` | When an uncaught error aborts the flow |
+
+`relix-flow-inspect` prints these as UTF-8 payloads against the
+canonical event records — no new tooling required.
+
+---
+
+## 5. Worked examples
+
+### 5.1 `flows/chat_with_retry.sflow`
+
+Chat with a fallback message when the AI peer times out or
+fails for any other reason:
+
+```sflow
+try
+  step reply: ai.chat "${prompt}"
+  return step.reply.result
+catch timeout
+  sol.set_result "Taking too long. Please retry."
+catch any
+  sol.set_result "Something went wrong. Please retry."
+end
+```
+
+### 5.2 `flows/conditional_demo.sflow`
+
+Branch on a named step's status:
+
+```sflow
+step check: ai.chat "ping"
+if step.check.status == "completed"
+  sol.set_result "AI is online"
+else
+  sol.set_result "AI is unavailable"
+end
+return
+```
+
+### 5.3 `flows/loop_demo.sflow`
+
+`loop N times` with `${loop.iter}`:
+
+```sflow
+set counter = "0"
+loop 3 times
+  sol.log "iteration ${loop.iter}"
+end
+sol.set_result "done"
+return
+```
+
+---
+
+## 6. Limits
+
+| Cap | Where | Value |
+|---|---|---|
+| Variables per execution | Sflow | 50 |
+| Loop iterations per block | Sflow | 100 (configurable) |
+| Block nesting depth | Sflow | 8 |
+| Identifier length | Sflow | 32 chars |
+| `sol.sleep` seconds | Sflow | 30 (hard clamp) |
+| String literal escape sequences | Both | none (SIMP-016) |
+
+Hitting any of these aborts the flow with a structured error
+rather than misbehaving silently.

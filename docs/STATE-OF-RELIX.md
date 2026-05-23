@@ -848,38 +848,67 @@ Full doc: [`agent-memory.md`](agent-memory.md).
 
 ### 10.1 SOL today
 
-SOL is a small imperative DSL with:
-- Variables (`let x: str = ...`)
-- String concatenation (`+`)
-- `print(x)` (writes to stdout for `flow-run`)
-- `return x`
-- `function start() -> str { ... }` — the single entry point
-- **`remote_call(peer_alias_or_capability_uri, method, args)`** —
-  the mesh primitive
+Relix ships **two** flow languages side-by-side. The `flow_runner`
+dispatches on file extension: `.sol` → SOL VM, `.sflow` → Sflow
+AST executor. Both run against the same `RemoteCallDispatcher`
+and write to the same per-flow event log.
 
-That's it. No conditionals. No loops. No types beyond `str`. No
-collections. No escapes in string literals.
+**SOL (`.sol`)** — the Rust-like language ported from OpenPrem. A
+real little programming language: typed `let` bindings, `{}`
+blocks, `;`-terminated statements, function definitions,
+`if`/`else`, `while`, `for-in`, structs, enums, arrays. The VM is
+a stack machine with `Jump`/`JumpFalse` opcodes; codegen lowers
+control flow to those instructions. The mesh primitive is
+`remote_call(peer_alias_or_capability_uri, method, args) -> str`.
+String concatenation uses `+`; literals are quoted with no escape
+sequences (SIMP-016).
 
-Argument convention: pipe-delimited strings (`session|prompt|history`).
-SIMP-016 — the alpha keeps the SOL ↔ handler boundary as `String` to
-avoid inventing a SOL type system. Gate 2 replaces this with typed
-CDDL.
+**Sflow (`.sflow`)** — the step-based DSL added in W4. Flat
+sequence of statements, no functions, no types, no semicolons.
+Named steps via `step <name>: <peer>.<method> "arg"`, variables
+via `set x = ...`, `${var}` interpolation in step args, `if /
+elif / else / end`, `loop N times / end`, `while / until / end`,
+`try / catch <kind> / rethrow / end`, `sol.log /sleep /assert
+/set_result` built-ins. Error kinds map to `RemoteCallError`
+(`timeout`, `mesh_error`, `policy_denied`, `responder_error`,
+`any`). Hard caps: 50 vars per execution, 100 loop iterations
+(configurable), 8-deep nesting.
 
-Bridge templates substitute `{{SESSION}}`, `{{MESSAGE}}`, `{{TOOL_URL}}`
-into `.sol` files before compiling. The substitution validator rejects
-`"`, `|`, and `\n` in user input. SIMP-018.
+Argument convention: still pipe-delimited strings
+(`session|prompt|history`). SIMP-016 keeps the
+SOL ↔ handler boundary as `String` to avoid inventing a SOL
+type system. Gate 2 replaces this with typed CDDL.
 
-### 10.2 What SOL cannot do
+Bridge templates substitute `{{SESSION}}`, `{{MESSAGE}}`,
+`{{TOOL_URL}}` into `.sol` files before compiling. The
+substitution validator rejects `"`, `|`, and `\n` in user input.
+SIMP-018. The same validator applies to `.sflow` templates when
+the bridge starts rendering them.
 
-- No branching (`if`, `match`)
-- No loops (`while`, `for`)
-- No error handling (a failed `remote_call` halts the VM with
-  `VM_ERROR_SENTINEL`; subsequent statements do not run)
-- No data structures (`list`, `map`)
-- No async (the VM is synchronous; no yield)
-- No mid-flow pause / resume (see `docs/replay-model.md`)
-- No types beyond `str`
-- No function composition (one `start()` per file)
+`POST /v1/sol/validate { source, kind }` parses either language
+without executing it and returns line-numbered errors —
+dashboard editors call it on demand. See `docs/sol.md` for the
+full language reference.
+
+### 10.2 What SOL / Sflow cannot do
+
+- **(SOL only)** No `try / catch` error recovery — a failed
+  `remote_call` halts the VM with `VM_ERROR_SENTINEL` and
+  subsequent statements do not run. Sflow has try/catch.
+- No `match`-style branching (Sflow has if/elif/else; SOL has
+  Rust-like if/else).
+- No data structures beyond Sflow's flat variable map and SOL's
+  arrays of `int`/`str` (`list`/`map` literals are not parseable).
+- No async (the executors are synchronous; no yield).
+- No mid-flow pause / resume (see `docs/replay-model.md`).
+- **(SOL only)** No types beyond `str` for `remote_call` args
+  (function-typed `int`/`float`/`char`/`bool` exist but don't
+  cross the dispatcher boundary).
+- **(SOL only)** No function composition (one `start()` per file).
+- **(Sflow only)** No user-defined functions — flows are a flat
+  statement list.
+- No regex captures (Sflow's `matches` is boolean only).
+- No multi-line string literals (newline inside `"..."` rejected).
 
 ### 10.3 Policy today
 
