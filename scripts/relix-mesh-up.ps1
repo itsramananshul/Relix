@@ -89,15 +89,59 @@ $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
 $Root = (Get-Location).Path
 
-$Cli        = Join-Path $Root 'target\debug\relix-cli.exe'
-$Controller = Join-Path $Root 'target\debug\relix-controller.exe'
-$Bridge     = Join-Path $Root 'target\debug\relix-web-bridge.exe'
-
-foreach ($exe in @($Cli, $Controller, $Bridge)) {
-    if (-not (Test-Path $exe)) {
-        throw "missing binary: $exe`nRun:  cargo build --workspace"
+# Locate the three binaries `relix boot` needs to spawn. Probed in
+# the order an operator's setup is most likely to hit:
+#
+#   1. Same install prefix as the script — `$PSScriptRoot\..\bin\`.
+#      This is the layout `install.ps1` produces: the script lives
+#      at `~/.local/scripts/relix-mesh-up.ps1` next to
+#      `~/.local/bin/relix.exe`, `~/.local/bin/relix-controller.exe`,
+#      `~/.local/bin/relix-web-bridge.exe`.
+#   2. `target\debug\`   relative to the repo root — repo checkout
+#      with `cargo build --workspace`.
+#   3. `target\release\` relative to the repo root — repo checkout
+#      with `cargo build --release --workspace`.
+#
+# The CLI binary ships as `relix.exe` from the release archive (the
+# `relix-cli` crate is renamed in `release.yml` so the installed
+# command is just `relix`) but stays as `relix-cli.exe` under
+# `target\...\`, so the CLI candidate list covers both.
+function Resolve-Bin {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string[]]$Candidates
+    )
+    foreach ($p in $Candidates) {
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $p).Path
+        }
     }
+    $lines = @("missing binary: $Name", "Searched:")
+    foreach ($p in $Candidates) { $lines += "  - $p" }
+    $lines += ""
+    $lines += "Install the release binaries from https://github.com/itsramananshul/Relix/releases"
+    $lines += "or run ``cargo build --workspace`` in a repo checkout."
+    throw ($lines -join "`n")
 }
+
+$InstallBin = Join-Path $PSScriptRoot '..\bin'
+
+$Cli = Resolve-Bin -Name 'relix-cli' -Candidates @(
+    (Join-Path $InstallBin 'relix.exe'),
+    (Join-Path $InstallBin 'relix-cli.exe'),
+    (Join-Path $Root 'target\debug\relix-cli.exe'),
+    (Join-Path $Root 'target\release\relix-cli.exe')
+)
+$Controller = Resolve-Bin -Name 'relix-controller' -Candidates @(
+    (Join-Path $InstallBin 'relix-controller.exe'),
+    (Join-Path $Root 'target\debug\relix-controller.exe'),
+    (Join-Path $Root 'target\release\relix-controller.exe')
+)
+$Bridge = Resolve-Bin -Name 'relix-web-bridge' -Candidates @(
+    (Join-Path $InstallBin 'relix-web-bridge.exe'),
+    (Join-Path $Root 'target\debug\relix-web-bridge.exe'),
+    (Join-Path $Root 'target\release\relix-web-bridge.exe')
+)
 
 $DataBase   = "dev-data/$Run"
 $OrgKey     = "dev-keys/$Run-org-root.key"

@@ -123,19 +123,59 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+INSTALL_BIN="$SCRIPT_DIR/../bin"
+
+# Resolve a binary by trying a list of candidate paths in order.
+# Order:
+#
+#   1. Same install prefix as the script — `$SCRIPT_DIR/../bin/`.
+#      `install.sh` drops the binaries into `~/.local/bin/` and the
+#      mesh scripts into `~/.local/scripts/`, so this is the right
+#      relative hop on a clean binary install.
+#   2. `target/debug/`   relative to the repo root — repo checkout
+#      with `cargo build --workspace`.
+#   3. `target/release/` relative to the repo root — repo checkout
+#      with `cargo build --release --workspace`.
+#
+# The CLI ships as `relix` from the release archive (the `relix-cli`
+# crate is renamed in `release.yml` so the installed command is just
+# `relix`) but stays as `relix-cli` under `target/...`. The CLI
+# candidate list covers both names.
+resolve_bin() {
+    local name="$1"; shift
+    local cand
+    for cand in "$@"; do
+        if [[ -x "$cand" ]]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    {
+        echo "missing binary: $name"
+        echo "Searched:"
+        for cand in "$@"; do echo "  - $cand"; done
+        echo
+        echo "Install the release binaries from https://github.com/itsramananshul/Relix/releases"
+        echo "or run \`cargo build --workspace\` in a repo checkout."
+    } >&2
+    exit 1
+}
+
+CLI="$(resolve_bin relix-cli \
+    "$INSTALL_BIN/relix" \
+    "$INSTALL_BIN/relix-cli" \
+    "$REPO_ROOT/target/debug/relix-cli" \
+    "$REPO_ROOT/target/release/relix-cli")"
+CONTROLLER="$(resolve_bin relix-controller \
+    "$INSTALL_BIN/relix-controller" \
+    "$REPO_ROOT/target/debug/relix-controller" \
+    "$REPO_ROOT/target/release/relix-controller")"
+BRIDGE="$(resolve_bin relix-web-bridge \
+    "$INSTALL_BIN/relix-web-bridge" \
+    "$REPO_ROOT/target/debug/relix-web-bridge" \
+    "$REPO_ROOT/target/release/relix-web-bridge")"
+
 cd "$REPO_ROOT"
-
-CLI="$REPO_ROOT/target/debug/relix-cli"
-CONTROLLER="$REPO_ROOT/target/debug/relix-controller"
-BRIDGE="$REPO_ROOT/target/debug/relix-web-bridge"
-
-for bin in "$CLI" "$CONTROLLER" "$BRIDGE"; do
-    if [[ ! -x "$bin" ]]; then
-        echo "missing binary: $bin" >&2
-        echo "run: cargo build --workspace" >&2
-        exit 1
-    fi
-done
 
 # ---- Channel + plugin opt-in resolution ----
 
