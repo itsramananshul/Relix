@@ -1,10 +1,13 @@
 name: CI
 
+# Manual-only trigger. Enable push / pull_request again here when we
+# want CI to gate every commit; for now contributors run the same
+# gates locally (cargo fmt --all -- --check, cargo clippy --workspace
+# --all-targets -- -D warnings, cargo test --workspace) and CI is
+# kicked off on demand via the GitHub Actions UI or `gh workflow run
+# ci.yml`.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
