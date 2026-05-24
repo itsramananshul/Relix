@@ -104,13 +104,19 @@ jobs:
         shell: bash
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
-      - name: Build
+      - name: Build (all three binaries)
         shell: bash
         run: |
+          # relix-cli ships as `relix`; the controller + bridge ship
+          # under their own names. `relix boot` needs all three to be
+          # next to each other on disk so the install scripts can land
+          # them in the same directory.
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p relix-cli
+            cross build --release --target ${{ matrix.target }} \
+              -p relix-cli -p relix-controller -p relix-web-bridge
           else
-            cargo build --release --target ${{ matrix.target }} -p relix-cli
+            cargo build --release --target ${{ matrix.target }} \
+              -p relix-cli -p relix-controller -p relix-web-bridge
           fi
 
       - name: Package (tar.gz)
@@ -118,17 +124,24 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/relix-cli" dist/relix
-          chmod +x dist/relix
-          tar -C dist -czf "relix-${{ matrix.target }}.tar.gz" relix
+          cp "target/${{ matrix.target }}/release/relix-cli"        dist/relix
+          cp "target/${{ matrix.target }}/release/relix-controller" dist/relix-controller
+          cp "target/${{ matrix.target }}/release/relix-web-bridge" dist/relix-web-bridge
+          chmod +x dist/relix dist/relix-controller dist/relix-web-bridge
+          tar -C dist -czf "relix-${{ matrix.target }}.tar.gz" \
+            relix relix-controller relix-web-bridge
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/relix-cli.exe" "dist/relix.exe"
-          Compress-Archive -Path "dist/relix.exe" -DestinationPath "relix-${{ matrix.target }}.zip" -Force
+          Copy-Item "target/${{ matrix.target }}/release/relix-cli.exe"        "dist/relix.exe"
+          Copy-Item "target/${{ matrix.target }}/release/relix-controller.exe" "dist/relix-controller.exe"
+          Copy-Item "target/${{ matrix.target }}/release/relix-web-bridge.exe" "dist/relix-web-bridge.exe"
+          Compress-Archive `
+            -Path "dist/relix.exe","dist/relix-controller.exe","dist/relix-web-bridge.exe" `
+            -DestinationPath "relix-${{ matrix.target }}.zip" -Force
 
       - name: Upload asset
         env:
