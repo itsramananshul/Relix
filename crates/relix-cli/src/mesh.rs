@@ -77,9 +77,38 @@ pub struct StatusArgs {
 /// Boot the local mesh by shelling out to the platform-specific boot
 /// script and waiting for the bridge to become healthy.
 pub async fn boot(args: BootArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let script = locate_script("relix-mesh-up")?;
+    // Pull persistent config from `~/.relix/config.toml`. The setup
+    // wizard writes this; without it, only the explicit CLI flags
+    // matter. Config-supplied values override the BootArgs defaults
+    // (e.g. provider) but explicit `--with-telegram` style flags
+    // still stack on top of config-driven channels.
+    let cfg_opt = crate::config::RelixConfig::load_default().ok().flatten();
+    let mut effective = args;
+    if let Some(cfg) = &cfg_opt {
+        if effective.provider == "mock" && !cfg.provider.name.is_empty() {
+            effective.provider = cfg.provider.name.clone();
+        }
+        if cfg.channels.telegram {
+            effective.with_telegram = true;
+        }
+        if cfg.channels.discord {
+            effective.with_discord = true;
+        }
+        if cfg.channels.slack {
+            effective.with_slack = true;
+        }
+    } else if std::env::var_os("RELIX_SUPPRESS_NO_CONFIG_HINT").is_none() {
+        eprintln!(
+            "note: no `~/.relix/config.toml` found — using defaults. \
+             Run `relix setup` for guided configuration."
+        );
+    }
 
-    let mut cmd = build_boot_command(&script, &args)?;
+    let script = locate_script("relix-mesh-up")?;
+    let mut cmd = build_boot_command(&script, &effective)?;
+    if let Some(cfg) = &cfg_opt {
+        apply_config_env(&mut cmd, cfg);
+    }
 
     println!("starting mesh via {} ...", script.display());
     let mut child = cmd
@@ -88,8 +117,8 @@ pub async fn boot(args: BootArgs) -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .map_err(|e| format!("failed to spawn boot script: {e}"))?;
 
-    let health_url = format!("http://127.0.0.1:{}/health", args.bridge_port);
-    let dashboard_url = format!("http://127.0.0.1:{}/dashboard", args.bridge_port);
+    let health_url = format!("http://127.0.0.1:{}/health", effective.bridge_port);
+    let dashboard_url = format!("http://127.0.0.1:{}/dashboard", effective.bridge_port);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -112,8 +141,8 @@ pub async fn boot(args: BootArgs) -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    println!("bridge ready at http://127.0.0.1:{}", args.bridge_port);
-    if !args.no_browser
+    println!("bridge ready at http://127.0.0.1:{}", effective.bridge_port);
+    if !effective.no_browser
         && let Err(e) = open_browser(&dashboard_url)
     {
         eprintln!("(could not open browser: {e}; visit {dashboard_url})");
@@ -239,12 +268,79 @@ fn locate_script(stem: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
 
+    // ~/.local/scripts/<name> — the canonical curl|bash / irm|iex
+    // layout. The installer drops the mesh scripts here so a
+    // binary-only install (no repo checkout) still has something
+    // for `relix boot` to spawn.
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if let Some(home) = std::env::var_os(home_var).map(PathBuf::from) {
+        let leaf = if want_ps { &ps_name } else { &sh_name };
+        let candidate = home.join(".local").join("scripts").join(leaf);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
     Err(format!(
-        "could not find {} in any ./scripts directory (cwd: {})",
+        "could not find {} in any scripts directory (looked in ./scripts, \
+         the install dir, and ~/.local/scripts). If you installed via \
+         curl|bash / irm|iex, re-run the installer — newer versions drop \
+         the mesh scripts in ~/.local/scripts. cwd: {}",
         if want_ps { &ps_name } else { &sh_name },
         cwd.display()
     )
     .into())
+}
+
+/// Layer config-driven secrets onto the boot command's environment.
+/// The mesh-up script reads these via `$env:VAR` / `$VAR` — we set
+/// them here rather than asking the operator to export them.
+fn apply_config_env(cmd: &mut Command, cfg: &crate::config::RelixConfig) {
+    // AI provider API key. The AI-node config emitted by mesh-up
+    // points at provider-specific env vars (OPENAI_API_KEY,
+    // OPENROUTER_API_KEY, ...) via `api_key_env`. Set the right one
+    // so the provider actually authenticates.
+    if !cfg.provider.api_key.is_empty()
+        && let Some(var) = provider_api_key_env(&cfg.provider.name)
+    {
+        cmd.env(var, &cfg.provider.api_key);
+    }
+    // Channel secrets. mesh-up only emits the channel TOML when the
+    // matching `RELIX_*` flag is set (handled in build_boot_command);
+    // here we just supply the tokens it will reference.
+    if cfg.channels.telegram && !cfg.channels.telegram_token.is_empty() {
+        cmd.env("RELIX_TELEGRAM_BOT_TOKEN", &cfg.channels.telegram_token);
+    }
+    if cfg.channels.discord {
+        if !cfg.channels.discord_token.is_empty() {
+            cmd.env("RELIX_DISCORD_BOT_TOKEN", &cfg.channels.discord_token);
+        }
+        if !cfg.channels.discord_channel.is_empty() {
+            cmd.env("RELIX_DISCORD_CHANNEL_ID", &cfg.channels.discord_channel);
+        }
+    }
+    if cfg.channels.slack {
+        if !cfg.channels.slack_token.is_empty() {
+            cmd.env("RELIX_SLACK_BOT_TOKEN", &cfg.channels.slack_token);
+        }
+        if !cfg.channels.slack_channel.is_empty() {
+            cmd.env("RELIX_SLACK_CHANNEL_ID", &cfg.channels.slack_channel);
+        }
+    }
+}
+
+/// Map a provider name to the env var the AI node's TOML references
+/// via `api_key_env`. Returns `None` for providers that have no key
+/// (mock, local Ollama-style endpoints).
+fn provider_api_key_env(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "openai" => Some("OPENAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
+        "gemini" => Some("GEMINI_API_KEY"),
+        _ => None,
+    }
 }
 
 fn build_boot_command(

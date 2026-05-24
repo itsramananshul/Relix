@@ -238,6 +238,28 @@ if [ ! -x "${INSTALL_DIR}/relix" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 6b. Mesh scripts
+#
+# `relix boot` spawns the mesh through scripts/relix-mesh-up.sh; users
+# who installed via `curl | bash` don't have a repo checkout. Drop the
+# two scripts in ~/.local/scripts/ — the relix-cli locate_script helper
+# falls back to this path after the repo and binary-dir lookups.
+# ---------------------------------------------------------------------------
+SCRIPTS_DIR="${HOME}/.local/scripts"
+mkdir -p "${SCRIPTS_DIR}" || info "warning: could not create ${SCRIPTS_DIR}"
+
+MESH_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/scripts"
+for script in relix-mesh-up.sh relix-mesh-down.sh; do
+    target="${SCRIPTS_DIR}/${script}"
+    if fetch_to_file "${MESH_BASE_URL}/${script}" "${target}"; then
+        chmod +x "${target}" 2>/dev/null || true
+        info "  installed: ${target}"
+    else
+        info "warning: could not fetch ${script} (relix boot will require a repo checkout)"
+    fi
+done
+
+# ---------------------------------------------------------------------------
 # 7. PATH wiring
 # ---------------------------------------------------------------------------
 PATH_LINE='export PATH="'"${INSTALL_DIR}"':$PATH"'
@@ -302,5 +324,26 @@ fi
 # ---------------------------------------------------------------------------
 printf '\n'
 printf 'Relix %s installed to %s.\n' "${VERSION}" "${INSTALL_DIR}"
-printf 'Next: relix boot\n'
 printf 'Docs:  https://github.com/%s\n' "${REPO}"
+printf '\n'
+
+# ---------------------------------------------------------------------------
+# 10. Guided setup
+# ---------------------------------------------------------------------------
+# `relix setup` is an interactive wizard that writes
+# ~/.relix/config.toml and prints the next steps. It reads from
+# /dev/tty so it works correctly when the installer is itself piped
+# from curl. If there's no terminal at all (Docker build / CI) skip
+# silently and tell the operator how to run it later.
+if [ -t 0 ] || { [ -r /dev/tty ] && [ -w /dev/tty ]; }; then
+    info "Running guided setup..."
+    info ""
+    if [ -t 0 ]; then
+        "${INSTALL_DIR}/relix" setup
+    else
+        "${INSTALL_DIR}/relix" setup </dev/tty >/dev/tty 2>&1
+    fi
+else
+    info "No terminal available — skipping interactive setup."
+    info "Run \`relix setup\` once you have a TTY, then \`relix boot\`."
+fi

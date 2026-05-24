@@ -185,6 +185,36 @@ try {
     $relixExe = $relixDest
 
     # -----------------------------------------------------------------------
+    # 5b. Mesh scripts
+    #
+    # 'relix boot' spawns the mesh through scripts/relix-mesh-up.ps1;
+    # users who installed via 'irm | iex' don't have a repo checkout.
+    # Drop the two scripts in $env:USERPROFILE\.local\scripts\ — the
+    # relix-cli locate_script helper falls back to this path after the
+    # repo and binary-dir lookups.
+    # -----------------------------------------------------------------------
+    $ScriptsDir = Join-Path $env:USERPROFILE '.local\scripts'
+    if (-not (Test-Path -LiteralPath $ScriptsDir)) {
+        try {
+            New-Item -ItemType Directory -Path $ScriptsDir -Force | Out-Null
+        } catch {
+            Write-Host "warning: could not create $ScriptsDir ($($_.Exception.Message))"
+        }
+    }
+    $meshBaseUrl = "https://raw.githubusercontent.com/$Repo/main/scripts"
+    foreach ($script in @('relix-mesh-up.ps1', 'relix-mesh-down.ps1')) {
+        $target = Join-Path $ScriptsDir $script
+        try {
+            Invoke-WebRequest -Uri "$meshBaseUrl/$script" -OutFile $target `
+                -UseBasicParsing -Headers @{ 'User-Agent' = 'relix-installer' }
+            Write-Host "  installed: $target"
+        } catch {
+            Write-Host "warning: could not fetch $script ($($_.Exception.Message))"
+            Write-Host "         relix boot will require a repo checkout"
+        }
+    }
+
+    # -----------------------------------------------------------------------
     # 6. PATH wiring (user scope)
     # -----------------------------------------------------------------------
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -246,8 +276,24 @@ try {
     # -----------------------------------------------------------------------
     Write-Host ''
     Write-Host "Relix $version installed to $InstallDir."
-    Write-Host "Next: relix boot"
     Write-Host "Docs:  https://github.com/$Repo"
+    Write-Host ''
+
+    # -----------------------------------------------------------------------
+    # 8b. Guided setup
+    # -----------------------------------------------------------------------
+    # `relix setup` is an interactive wizard that writes
+    # %USERPROFILE%\.relix\config.toml. Skip silently when no
+    # interactive host (CI / scheduled task) — the user can run
+    # `relix setup` later.
+    if ($Host.UI.SupportsVirtualTerminal -or [Environment]::UserInteractive) {
+        Write-Host 'Running guided setup...'
+        Write-Host ''
+        & $relixExe setup
+    } else {
+        Write-Host 'No interactive host — skipping setup.'
+        Write-Host 'Run `relix setup` once you have a console, then `relix boot`.'
+    }
 }
 finally {
     # -----------------------------------------------------------------------
