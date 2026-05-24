@@ -148,30 +148,41 @@ try {
         return
     }
 
-    $exeFiles = Get-ChildItem -LiteralPath $TmpExtract -Recurse -File -Filter '*.exe' -ErrorAction SilentlyContinue
-    if (-not $exeFiles -or $exeFiles.Count -eq 0) {
-        Write-Error "archive did not contain any .exe binaries (looked in $TmpExtract)"
+    # Locate the main relix.exe first. `Select-Object -First 1` always
+    # returns a single object (or $null) regardless of how many .exe
+    # files matched — avoiding the strict-mode trap where .Count on a
+    # single-result `Get-ChildItem` throws "property 'Count' cannot be
+    # found on this object".
+    $relixSrc = Get-ChildItem -LiteralPath $TmpExtract -Recurse -File `
+            -Filter 'relix.exe' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $relixSrc) {
+        Write-Error "archive did not contain relix.exe (extract dir: $TmpExtract)"
         return
     }
 
-    $installedAny = $false
-    foreach ($exe in $exeFiles) {
-        $dest = Join-Path $InstallDir $exe.Name
-        Copy-Item -LiteralPath $exe.FullName -Destination $dest -Force
-        Write-Host "  installed: $dest"
-        $installedAny = $true
+    $relixDest = Join-Path $InstallDir 'relix.exe'
+    Copy-Item -LiteralPath $relixSrc.FullName -Destination $relixDest -Force
+    Write-Host "  installed: $relixDest"
+
+    # Install any sibling .exe files (e.g. relix-controller.exe,
+    # relix-web-bridge.exe if a future archive ships them) from the
+    # same directory as relix.exe. A `foreach` over an empty / single /
+    # multi result is safe under strict mode — no .Count access.
+    $payloadDir = $relixSrc.Directory.FullName
+    foreach ($exe in (Get-ChildItem -LiteralPath $payloadDir -File `
+                          -Filter '*.exe' -ErrorAction SilentlyContinue)) {
+        if ($exe.Name -ieq 'relix.exe') { continue }
+        $siblingDest = Join-Path $InstallDir $exe.Name
+        Copy-Item -LiteralPath $exe.FullName -Destination $siblingDest -Force
+        Write-Host "  installed: $siblingDest"
     }
 
-    if (-not $installedAny) {
-        Write-Error "no binaries were installed"
+    if (-not (Test-Path -LiteralPath $relixDest)) {
+        Write-Error "expected 'relix.exe' not found at $relixDest after install"
         return
     }
-
-    $relixExe = Join-Path $InstallDir 'relix.exe'
-    if (-not (Test-Path -LiteralPath $relixExe)) {
-        Write-Error "expected 'relix.exe' not found at $relixExe after install"
-        return
-    }
+    $relixExe = $relixDest
 
     # -----------------------------------------------------------------------
     # 6. PATH wiring (user scope)
