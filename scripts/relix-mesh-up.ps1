@@ -143,6 +143,41 @@ $Bridge = Resolve-Bin -Name 'relix-web-bridge' -Candidates @(
     (Join-Path $Root 'target\release\relix-web-bridge.exe')
 )
 
+# Locate the `flows/` directory the bridge + telegram controller read
+# their SOL/sflow templates from. Probed in the same order as the
+# binaries:
+#
+#   1. `$PSScriptRoot\..\flows\` — the install layout
+#      (`~/.local/scripts/` next to `~/.local/flows/`).
+#   2. `$Root\flows\`            — repo checkout (Set-Location to
+#      $PSScriptRoot\.. above puts $Root at the repo root in dev).
+function Resolve-Dir {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string[]]$Candidates
+    )
+    foreach ($p in $Candidates) {
+        if (Test-Path -LiteralPath $p -PathType Container) {
+            return (Resolve-Path -LiteralPath $p).Path
+        }
+    }
+    $lines = @("missing directory: $Name", "Searched:")
+    foreach ($p in $Candidates) { $lines += "  - $p" }
+    $lines += ""
+    $lines += "Install with install.ps1 (which bundles the flow templates) or run from a repo checkout."
+    throw ($lines -join "`n")
+}
+
+$FlowsDir = Resolve-Dir -Name 'flows' -Candidates @(
+    (Join-Path $PSScriptRoot '..\flows'),
+    (Join-Path $Root 'flows')
+)
+# TOML basic strings interpret `\U` as a Unicode escape, which trips
+# any Windows path with a user-profile component (`C:\Users\...`).
+# Forward slashes parse cleanly on every platform and `PathBuf` is
+# happy with them on Windows too.
+$FlowsToml = $FlowsDir -replace '\\','/'
+
 $DataBase   = "dev-data/$Run"
 $OrgKey     = "dev-keys/$Run-org-root.key"
 $OrgPub     = "dev-keys/$Run-org-root.pub"
@@ -420,7 +455,7 @@ token_env = "RELIX_TELEGRAM_BOT_TOKEN"
 allowed_users = $allowedToml
 operator_chat_id = $opChat
 messages_ring_capacity = 200
-flow_template = "flows/chat_template.sol"
+flow_template = "$FlowsToml/chat_template.sol"
 session_db_path = "$DataBase/telegram_sessions.db"
 poll_interval_secs = 1
 approval_poll_interval_secs = 15
@@ -1053,7 +1088,7 @@ $peersToml | Set-Content -Encoding utf8 $Peers
 
 # 7) Bridge config - OpenAI shim on; tool template wired only when the tool
 #    node is up so the bridge fails 404 cleanly when there's no peer.
-$toolTemplateLine = if ($NoTool) { '' } else { 'tool_template_path = "flows/chat_with_tool.sol"' }
+$toolTemplateLine = if ($NoTool) { '' } else { "tool_template_path = `"$FlowsToml/chat_with_tool.sol`"" }
 @"
 [bridge]
 listen_addr = "$BridgeHttp"
@@ -1067,7 +1102,7 @@ peers_path    = "$Peers"
 deadline_secs = 60
 
 [flow]
-template_path = "flows/chat_template.sol"
+template_path = "$FlowsToml/chat_template.sol"
 $toolTemplateLine
 
 [sse]

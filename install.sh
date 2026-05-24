@@ -260,6 +260,28 @@ for script in relix-mesh-up.sh relix-mesh-down.sh; do
 done
 
 # ---------------------------------------------------------------------------
+# 6c. Flow templates
+#
+# The bridge reads `flows/chat_template.sol` (and friends) at start to
+# wire its OpenAI-compat / tool-routing flow VMs. The mesh script
+# resolves the `flows/` directory next to itself first; drop the
+# templates in ~/.local/flows/ so that probe hits on a clean binary
+# install.
+# ---------------------------------------------------------------------------
+FLOWS_DIR="${HOME}/.local/flows"
+mkdir -p "${FLOWS_DIR}" || info "warning: could not create ${FLOWS_DIR}"
+
+FLOWS_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/flows"
+for flow in chat_template.sol chat.sol chat_with_tool.sol chat_with_retry.sflow; do
+    target="${FLOWS_DIR}/${flow}"
+    if fetch_to_file "${FLOWS_BASE_URL}/${flow}" "${target}"; then
+        info "  installed: ${target}"
+    else
+        info "warning: could not fetch ${flow} (relix boot will need a repo checkout for flows)"
+    fi
+done
+
+# ---------------------------------------------------------------------------
 # 7. PATH wiring
 # ---------------------------------------------------------------------------
 PATH_LINE='export PATH="'"${INSTALL_DIR}"':$PATH"'

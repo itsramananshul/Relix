@@ -175,6 +175,35 @@ BRIDGE="$(resolve_bin relix-web-bridge \
     "$REPO_ROOT/target/debug/relix-web-bridge" \
     "$REPO_ROOT/target/release/relix-web-bridge")"
 
+# Locate the `flows/` directory the bridge + telegram controller read
+# their SOL/sflow templates from. Same probe order as the binaries:
+#
+#   1. `$SCRIPT_DIR/../flows/` — install layout
+#      (`~/.local/scripts/` next to `~/.local/flows/`).
+#   2. `$REPO_ROOT/flows/`     — repo checkout.
+resolve_dir() {
+    local name="$1"; shift
+    local cand
+    for cand in "$@"; do
+        if [[ -d "$cand" ]]; then
+            (cd "$cand" && pwd)
+            return 0
+        fi
+    done
+    {
+        echo "missing directory: $name"
+        echo "Searched:"
+        for cand in "$@"; do echo "  - $cand"; done
+        echo
+        echo "Install with install.sh (which bundles the flow templates) or run from a repo checkout."
+    } >&2
+    exit 1
+}
+
+FLOWS_DIR="$(resolve_dir flows \
+    "$SCRIPT_DIR/../flows" \
+    "$REPO_ROOT/flows")"
+
 cd "$REPO_ROOT"
 
 # ---- Channel + plugin opt-in resolution ----
@@ -492,7 +521,7 @@ token_env                    = "RELIX_TELEGRAM_BOT_TOKEN"
 allowed_users                = $allowed_users_toml
 operator_chat_id             = $op_chat
 messages_ring_capacity       = 256
-flow_template                = "flows/chat_template.sol"
+flow_template                = "$FLOWS_DIR/chat_template.sol"
 session_db_path              = "$DATA_BASE/telegram-sessions.db"
 poll_interval_secs           = 2
 approval_poll_interval_secs  = 5
@@ -942,9 +971,9 @@ EOF
 
 # ---- 12. Bridge config ----
 
-flow_lines="template_path     = \"flows/chat.sol\""
+flow_lines="template_path     = \"$FLOWS_DIR/chat.sol\""
 if [[ "$NO_TOOL" -eq 0 ]]; then
-    flow_lines+=$'\n'"tool_template_path = \"flows/chat_with_tool.sol\""
+    flow_lines+=$'\n'"tool_template_path = \"$FLOWS_DIR/chat_with_tool.sol\""
 fi
 
 coord_block=""

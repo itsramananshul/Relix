@@ -215,6 +215,36 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # 5c. Flow templates
+    #
+    # The bridge reads `flows/chat_template.sol` (and friends) at start
+    # to wire its OpenAI-compat / tool-routing flow VMs. The mesh script
+    # resolves the `flows/` directory next to itself first; drop the
+    # templates in $env:USERPROFILE\.local\flows\ so that probe hits on
+    # a clean binary install.
+    # -----------------------------------------------------------------------
+    $FlowsDir = Join-Path $env:USERPROFILE '.local\flows'
+    if (-not (Test-Path -LiteralPath $FlowsDir)) {
+        try {
+            New-Item -ItemType Directory -Path $FlowsDir -Force | Out-Null
+        } catch {
+            Write-Host "warning: could not create $FlowsDir ($($_.Exception.Message))"
+        }
+    }
+    $flowsBaseUrl = "https://raw.githubusercontent.com/$Repo/main/flows"
+    foreach ($flow in @('chat_template.sol', 'chat.sol', 'chat_with_tool.sol', 'chat_with_retry.sflow')) {
+        $target = Join-Path $FlowsDir $flow
+        try {
+            Invoke-WebRequest -Uri "$flowsBaseUrl/$flow" -OutFile $target `
+                -UseBasicParsing -Headers @{ 'User-Agent' = 'relix-installer' }
+            Write-Host "  installed: $target"
+        } catch {
+            Write-Host "warning: could not fetch $flow ($($_.Exception.Message))"
+            Write-Host "         relix boot will need a repo checkout for flows"
+        }
+    }
+
+    # -----------------------------------------------------------------------
     # 6. PATH wiring (user scope)
     # -----------------------------------------------------------------------
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
