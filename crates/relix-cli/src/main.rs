@@ -161,7 +161,11 @@ enum Cmd {
     /// channels, and saves the result to `~/.relix/config.toml`.
     /// Run after install (the install scripts call this
     /// automatically); also runnable later to change provider /
-    /// rotate keys / add channels.
+    /// rotate keys / add channels. Re-running pre-fills every
+    /// field from the existing config so an operator only has to
+    /// change what's actually changing. `relix reconfigure` is a
+    /// visible alias for the same flow.
+    #[command(visible_alias = "reconfigure")]
     Setup,
 
     /// Boot the local Relix mesh.
