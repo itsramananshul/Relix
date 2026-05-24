@@ -84,6 +84,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Ensure rustup target is present
+        # dtolnay/rust-toolchain occasionally skips the target install
+        # when the host triple shares an OS with the requested target
+        # (notably macos-latest is ARM but we still need the x86_64
+        # Apple SDK target). Explicit rustup target add is a no-op
+        # when the target is already there.
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         # Caches are best-effort; never gate the release on a
         # cache restore / save flake.
