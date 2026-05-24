@@ -1,288 +1,194 @@
 # Getting Started
 
-You will end this guide with:
-
-- the Relix mesh running on your machine,
-- a successful chat through the bridge using the mock AI provider,
-- Open WebUI (optional) talking to the mesh as if it were an OpenAI server,
-- a successful `tool.web_fetch` against a public URL.
-
-The whole thing takes a few minutes.
+You will end this guide with the Relix mesh running on your
+machine, a chat round-tripping through the bridge, and the
+operator dashboard open in your browser. End to end, three
+commands — actually two if you count the wizard as part of
+install.
 
 ## Install
 
-The simplest path is the install script:
+**Mac / Linux:**
 
 ```sh
-# macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.sh | bash
+```
 
-# Windows (PowerShell)
+**Windows (PowerShell):**
+
+```powershell
 irm https://raw.githubusercontent.com/itsramananshul/Relix/main/install.ps1 | iex
 ```
 
-Both install the `relix` binary under `~/.local/bin` (or the value of
-`RELIX_INSTALL_DIR`) and add it to your PATH. Re-run them to upgrade.
+Both installers do the same four things:
 
-Prefer to build from source? You need [rustup](https://rustup.rs)
-and Git:
+1. Download `relix`, `relix-controller`, and `relix-web-bridge`
+   from the latest GitHub release into `~/.local/bin` (POSIX) or
+   `%USERPROFILE%\.local\bin` (Windows) and put that directory
+   on your `PATH`.
+2. Download the platform-appropriate mesh scripts
+   (`relix-mesh-up.{sh,ps1}` + `relix-mesh-down.{sh,ps1}`) into
+   `~/.local/scripts/` so the boot command can find them.
+3. Run **`relix setup`** automatically — the guided wizard
+   below.
+4. Save your configuration to `~/.relix/config.toml`.
 
-```sh
-git clone https://github.com/itsramananshul/Relix.git
-cd Relix
-cargo build --workspace
+Set `RELIX_INSTALL_DIR=/opt/relix/bin` or
+`RELIX_VERSION=v0.1.1` before piping if you want to override
+defaults.
+
+## The setup wizard
+
+`relix setup` is an interactive five-page wizard. It runs
+automatically right after install; you can also run it any time
+later to change provider, rotate keys, or add a channel.
+
+The pages are:
+
+```
+╔══════════════════════════════════════════╗
+║      RELIX — Relay Intelligence          ║
+║              Exchange  v0.1.1            ║
+║                                          ║
+║         The OS for AI Agents             ║
+║                                          ║
+║      Press Enter to begin setup          ║
+║      (Ctrl-C to cancel)                  ║
+╚══════════════════════════════════════════╝
 ```
 
-The first build compiles libp2p and friends — budget 5–10 minutes on
-a cold cache. Subsequent builds are seconds.
+Press **Enter**. Then:
+
+```
+Choose your AI provider
+(arrow keys, Enter to confirm)
+
+> OpenRouter   (recommended — access to all models)
+  OpenAI
+  Anthropic
+  xAI (Grok)
+  Gemini
+  Local       (Ollama or any OpenAI-compatible endpoint)
+  Mock        (no API key — for testing)
+```
+
+Pick a provider and press **Enter**. Unless you chose **Mock**
+or **Local**, the wizard asks for an API key — input is hidden
+(bullets per character), Backspace works:
+
+```
+Enter your openrouter API key
+(input is hidden; Enter to confirm, Ctrl-C to cancel)
+
+> ••••••••••••••••••••••••••
+```
+
+Then the channel multi-select:
+
+```
+Connect messaging channels (optional)
+Space to toggle, arrow keys to move, Enter to continue
+
+> [x] Telegram
+  [ ] Discord
+  [ ] Slack
+```
+
+For each channel you tick, a follow-up prompt asks for the bot
+token (and channel ID for Discord / Slack). The Telegram prompt
+points you at [@BotFather](https://t.me/BotFather); the Discord
+prompt points at the Developer Portal; the Slack prompt at the
+app config's OAuth section.
+
+Finally the confirmation page:
+
+```
+Ready to save configuration
+
+Provider:  openrouter
+API key:   sk-or-ab••••••••     (first 8 chars then bullets)
+Channels:  Telegram
+
+Press Enter to save, Ctrl-C to cancel.
+```
+
+Press **Enter**. The wizard writes `~/.relix/config.toml`
+(`chmod 600` on POSIX — it holds your secrets) and exits.
 
 ## Boot the mesh
 
 ```sh
-# Default — mock AI provider, no credentials.
 relix boot
-
-# Real provider — set the env var first.
-export OPENROUTER_API_KEY='<your key>'   # or OPENAI_API_KEY, ANTHROPIC_API_KEY, ...
-relix boot --provider openrouter
 ```
 
-The boot script spawns the mesh's controller processes (memory, ai,
-tool, coordinator) plus the HTTP bridge, waits for each to come up,
-and opens the dashboard in your default browser. Channels and plugins
-are opt-in:
+`relix boot` reads `~/.relix/config.toml` automatically — no
+environment variables to export, no `--provider` flag to repeat.
+The configured provider and channels are wired in, the AI node
+picks up the API key, and the mesh comes up.
 
-```sh
-relix boot --with-telegram                    # needs RELIX_TELEGRAM_BOT_TOKEN
-relix boot --with-discord                     # needs RELIX_DISCORD_BOT_TOKEN + ..._CHANNEL_ID
-relix boot --with-slack                       # needs RELIX_SLACK_BOT_TOKEN + ..._CHANNEL_ID
-relix boot --with-plugins --plugin-dir ./plugins
+You'll see something like:
+
 ```
+note: no `~/.relix/config.toml` found — using defaults.
+      Run `relix setup` for guided configuration.
+```
+
+…if you somehow got here without running the wizard. Otherwise
+the boot script prints per-node "ready" lines as memory, ai,
+tool, coordinator, your channels, and the bridge come online,
+then opens `http://127.0.0.1:19791/dashboard` in your default
+browser.
 
 `relix boot` blocks on the bridge in the foreground. In another
-terminal: `relix status` to see what's up, `relix stop` to tear it
-down.
+terminal:
 
-From-source users can call the underlying scripts directly:
-`scripts/relix-mesh-up.ps1` on Windows, `scripts/relix-mesh-up.sh`
-elsewhere. Both accept the same `--with-*` env vars `relix boot`
-translates into.
-
-When the mesh is up the script prints something like:
-
+```sh
+relix status   # is it up? print the topology table.
+relix stop     # kill the controllers + bridge by name.
 ```
-== Relix mesh up ==
-  run:           local
-  provider:      mock
-  memory port:   tcp/19711
-  ai port:       tcp/19712
-  tool port:     tcp/19713  (allow_http=False)
-  bridge HTTP:   http://127.0.0.1:19791
-  data dir:      dev-data/local
-
-mesh is UP.
-
-Endpoints:
-  http://127.0.0.1:19791/health
-  http://127.0.0.1:19791/v1/models
-  http://127.0.0.1:19791/v1/chat/completions
-  http://127.0.0.1:19791/chat_with_tool
-
-PIDs (this script will only stop these on Ctrl-C):
-  relix-controller       pid 12345
-  relix-controller       pid 12346
-  relix-controller       pid 12347
-  relix-web-bridge       pid 12348
-
-Ctrl-C to stop the mesh.
-```
-
-Logs live at `dev-data/local/{memory,ai,tool,bridge}.log`. A clean
-shutdown (Ctrl-C) stops only the four PIDs the script printed; nothing
-else is touched.
 
 ## First chat
 
-In another terminal:
+Once the dashboard is up, point any OpenAI-compatible client at
+the bridge — the official Python SDK, Open WebUI, LobeChat,
+Cursor, etc.:
 
-```bash
-# Health check.
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:19791/v1", api_key="unused")
+client.chat.completions.create(
+    model="relix-openrouter",            # or relix-openai, relix-mock, ...
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+The bridge's API-key header is ignored — the real provider key
+lives only on the AI node, sourced from `~/.relix/config.toml`.
+
+For a quick smoke test from the shell:
+
+```sh
 curl http://127.0.0.1:19791/health
-# -> ok
+# -> {"status":"ok",...}
 
-# Models the bridge knows about (mock plus anything else discovered).
-curl http://127.0.0.1:19791/v1/models
-
-# Native chat endpoint.
 curl -X POST http://127.0.0.1:19791/chat \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo","message":"hello"}'
-
-# OpenAI-compatible endpoint.
-curl -X POST http://127.0.0.1:19791/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"relix-mock","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Both responses include a `relix` provenance block (`flow_id`,
-`trace_id`, `flow_log` path) so you can inspect what the orchestration
-did:
+Each response carries a `flow_id`, `trace_id`, and `flow_log`
+path so you can replay exactly what the orchestration did:
 
-```bash
-cargo run -p relix-flow-inspect -- --flow dev-data/flow-runner/flows/<flow_id>.log
+```sh
+relix-flow-inspect --flow <flow_log path>
 ```
-
-## Open WebUI hookup
-
-Run Open WebUI any way you like (the official Docker image is the
-simplest):
-
-```bash
-docker run -d -p 3000:8080 ghcr.io/open-webui/open-webui:main
-```
-
-Open `http://localhost:3000`. In **Settings → Connections → OpenAI API**:
-
-| Field | Value |
-|---|---|
-| API Base URL | `http://host.docker.internal:19791/v1` (Docker) or `http://127.0.0.1:19791/v1` (native) |
-| API Key | anything non-empty — the bridge ignores it (provider keys live on the AI node) |
-| Model | `relix-mock` (default) or whatever your AI provider was set to (e.g. `relix-openrouter`) |
-
-Send a message. The bridge translates it into a SOL flow render against
-[`flows/chat_template.sol`](../flows/chat_template.sol), runs it
-through the memory + AI peers, and projects the result back into the
-OpenAI response shape.
-
-## First tool fetch
-
-`tool.web_fetch` is exposed via two paths:
-
-1. **Native endpoint** — explicit URL parameter:
-
-   ```bash
-   curl -X POST http://127.0.0.1:19791/chat_with_tool \
-     -H 'content-type: application/json' \
-     -d '{"session_id":"demo","message":"summarize this page","url":"https://example.com/"}'
-   ```
-
-2. **OpenAI shim auto-route** — any user message containing an http(s)
-   URL is routed through the tool flow instead of the chat flow:
-
-   ```bash
-   curl -X POST http://127.0.0.1:19791/v1/chat/completions \
-     -H 'content-type: application/json' \
-     -d '{"model":"relix-mock","messages":[{"role":"user","content":"please fetch https://example.com/ and summarize"}]}'
-   ```
-
-The tool peer fetches the URL, the body is spliced into the AI prompt,
-and the resulting reply is persisted to memory. Try an SSRF target to
-see the fail-closed posture:
-
-```bash
-curl -X POST http://127.0.0.1:19791/chat_with_tool \
-  -H 'content-type: application/json' \
-  -d '{"session_id":"demo","message":"x","url":"https://127.0.0.1/"}'
-# -> 502 with policy_denied: ip 127.0.0.1 is in forbidden range 'ipv4 loopback (127/8)'
-```
-
-Full security details: [`tool-node.md`](tool-node.md) and
-[`tool-node-security.md`](tool-node-security.md).
-
-## Inspect tasks (if the Coordinator is up)
-
-When the bringup script includes a Coordinator peer, every chat
-request becomes a durable Task with a lineage operators can
-inspect after the fact. The chat response includes a `task_id`
-field — top-level on `/chat`, under `relix.task_id` on the
-OpenAI shim.
-
-```bash
-# List recent tasks as JSON.
-curl http://127.0.0.1:19791/v1/tasks
-
-# Inspect one task in full (header + chronicle).
-curl http://127.0.0.1:19791/v1/tasks/<task_id>
-
-# Quick operator summary (status, duration, failure class, retries).
-curl http://127.0.0.1:19791/v1/tasks/<task_id>/summary
-```
-
-The CLI surface is richer; it prints a per-attempt chronology
-timeline:
-
-```bash
-relix-cli task get --peer /ip4/127.0.0.1/tcp/19714 \
-    --identity dev-keys/local-bridge.aic \
-    --client-key dev-keys/local-bridge.key \
-    --task-id <task_id> --pretty
-```
-
-Full operator playbook in
-[`task-recovery.md`](task-recovery.md). The task lifecycle is
-documented in [`runtime-lifecycle.md`](runtime-lifecycle.md);
-per-attempt detail in [`attempt-lineage.md`](attempt-lineage.md).
-
-## Operator dashboard (browser)
-
-Open `http://127.0.0.1:19791/dashboard` for the operator
-console. Sidebar nav with six routes:
-
-- **Overview** — at-a-glance health KPIs (uptime, peer
-  freshness, coordinator status, reconnect counters).
-- **Tasks** — status-filtered task list with cursor
-  pagination, per-task lineage + attempts + live SSE
-  chronology, per-task **Export** button, and a
-  **Chronicle retention** modal for dry-run candidate
-  counting.
-- **Topology** — full peer table with fresh/stale/expired
-  badges and capability counts.
-- **AI Providers** — per-provider cards (OpenAI,
-  Anthropic, OpenRouter, xAI/Grok, Google/Gemini, mock)
-  for API key + default model setup. No more hand-editing
-  TOML.
-- **Telegram** — Bot API token + delivery mode setup,
-  with a copy-paste @BotFather walkthrough.
-- **Bridge Config** — read-only snapshot of the bridge's
-  effective config (secrets redacted).
-
-Secrets supplied via the settings pages persist to a
-local `bridge-secrets.toml` at mode 0600 and are
-**never echoed back over HTTP**. Production: put a
-reverse proxy with auth in front before exposing
-beyond loopback.
-
-The dashboard is static HTML — no build step, no JS
-framework. Consumes the same `/v1/tasks*`,
-`/v1/topology`, `/v1/health`, `/v1/config/*`, and
-`/v1/tasks/compact_events` endpoints curl reaches above.
-
-## See what the mesh can do
-
-The bridge projects the discovered capability manifests as JSON,
-and the CLI offers the same view:
-
-```bash
-# Every capability the bridge knows about, with descriptions.
-curl http://127.0.0.1:19791/v1/capabilities
-
-# Same data, scoped to one peer:
-relix-cli capability ls --peer /ip4/127.0.0.1/tcp/19712 \
-    --identity dev-keys/local-bridge.aic \
-    --client-key dev-keys/local-bridge.key
-```
-
-## Shutdown
-
-Ctrl-C in the script's terminal. The script intercepts the signal and
-stops the four child PIDs it tracked. Nothing else on your machine is
-affected.
 
 ## Stream tokens over WebSocket
 
-`/ws/chat` is the streaming endpoint — JSON `chunk` frames as the
-provider emits text, a final `done` frame with the assembled
-reply.
+`/ws/chat` streams the reply chunk-by-chunk over a WebSocket
+with bearer auth on the upgrade. JSON `chunk` frames as the
+provider emits text, terminated by a `done` frame with the
+assembled reply.
 
 ```js
 const ws = new WebSocket("ws://127.0.0.1:19791/ws/chat", [], {
@@ -299,16 +205,140 @@ ws.onmessage = (ev) => {
 };
 ```
 
-Full client examples + the auth contract: [`websocket.md`](websocket.md).
+Full client examples + the auth contract:
+[`websocket.md`](websocket.md).
+
+## Connect Telegram
+
+If you ticked Telegram during setup the controller is already
+running and listening. Send your bot any message and it replies
+through the same `ai.chat` flow the HTTP bridge uses.
+
+If you skipped Telegram and want to add it now, re-run the
+wizard — it pre-fills the existing config and you only have to
+fill in the new fields:
+
+```sh
+relix setup
+```
+
+Or edit `~/.relix/config.toml` directly:
+
+```toml
+[channels]
+telegram        = true
+telegram_token  = "12345:AAEH..."   # from @BotFather
+```
+
+…then `relix stop && relix boot` to apply.
+
+The first-time Telegram bot creation flow on BotFather is
+literally:
+
+1. Open Telegram and search for `@BotFather`.
+2. Send `/newbot`, give it a display name, give it a `_bot`
+   handle.
+3. Copy the token BotFather hands back.
+4. Re-run `relix setup`, tick Telegram, paste the token.
+
+Same pattern for Discord (Developer Portal → Application → Bot
+→ Reset Token → also copy the Channel ID by right-clicking the
+channel with Developer Mode on) and Slack (App config → OAuth &
+Permissions → Bot User OAuth Token → also copy the channel ID
+from channel details).
+
+## First tool fetch
+
+`tool.web_fetch` is SSRF-guarded and runs on the tool node:
+
+```sh
+curl -X POST http://127.0.0.1:19791/chat_with_tool \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"demo","message":"summarize this page","url":"https://example.com/"}'
+```
+
+Or let the OpenAI shim auto-route: any user message containing
+an `http(s)://` URL flows through the tool template instead of
+the plain chat template.
+
+Try a loopback URL to see the fail-closed posture:
+
+```sh
+curl -X POST http://127.0.0.1:19791/chat_with_tool \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"demo","message":"x","url":"https://127.0.0.1/"}'
+# -> 502 with policy_denied: ip 127.0.0.1 is in forbidden range 'ipv4 loopback (127/8)'
+```
+
+Full security details: [`tool-node.md`](tool-node.md) and
+[`tool-node-security.md`](tool-node-security.md).
+
+## Operator dashboard
+
+`http://127.0.0.1:19791/dashboard` is opened for you when the
+bridge becomes healthy. Sidebar nav:
+
+- **Overview** — uptime, peer freshness, coordinator status,
+  reconnect counters.
+- **Tasks** — status-filtered task list with cursor pagination,
+  per-task lineage + attempts + live SSE chronology.
+- **Topology** — full peer table with fresh / stale / expired
+  badges and capability counts.
+- **AI Providers** — per-provider cards (read-only snapshot of
+  what `config.toml` configured); rotate keys by re-running
+  `relix setup`.
+- **Telegram / Discord / Slack** — bot status, recent message
+  ring, allowed-users list.
+- **Bridge Config** — read-only snapshot of the bridge's
+  effective config (secrets redacted).
+
+The dashboard is static HTML — no build step, no JS framework.
+Consumes the same `/v1/tasks*`, `/v1/topology`, `/v1/health`,
+and `/v1/capabilities` endpoints `curl` reaches above.
+
+## From source
+
+If you'd rather build from source than install the release
+binaries — for instance, you're contributing to Relix:
+
+```sh
+git clone https://github.com/itsramananshul/Relix.git
+cd Relix
+cargo build --workspace
+relix setup     # writes ~/.relix/config.toml
+relix boot      # uses your local target/debug binaries via the mesh script
+```
+
+The first build compiles libp2p and friends — budget 5–10
+minutes on a cold cache. Subsequent builds are seconds. The
+boot script discovers `target/debug/relix-controller` and
+`target/debug/relix-web-bridge` automatically when run from the
+repo root.
+
+## Shutdown
+
+`relix stop` kills every running `relix-controller` and
+`relix-web-bridge` by name — `taskkill /F /IM` on Windows,
+`pkill -x` elsewhere. Idempotent: exits 0 if nothing was
+running. Your config and data under `~/.relix/` are preserved
+so the next `relix boot` picks up exactly where you left off.
 
 ## What next
 
 - [`architecture.md`](architecture.md) — how the pieces fit together.
-- [`configuration.md`](configuration.md) — every config file, env var, and TOML key.
-- [`sol.md`](sol.md) — write your own flow in SOL or .sflow.
-- [`channels/index.md`](channels/index.md) — connect Telegram, Discord, or Slack.
+- [`configuration.md`](configuration.md) — `~/.relix/config.toml`
+  reference, every TOML key per node, every env-var override.
+- [`memory.md`](memory.md) — chat history, vector search,
+  persistent agent memory, the new RAG + auto-history paths.
+- [`sol.md`](sol.md) — write your own flow in SOL or `.sflow`.
+- [`channels/index.md`](channels/index.md) — Telegram, Discord,
+  Slack: bot setup, slash commands, troubleshooting.
 - [`plugins.md`](plugins.md) — ship a plugin in Rust or Python.
-- [`coordination.md`](coordination.md) — multi-agent tasks, delegation, messaging.
-- [`memory.md`](memory.md) — chat history, vector search, persistent agent memory.
-- [`security.md`](security.md) — threat model + admission pipeline.
-- [`current-limitations.md`](current-limitations.md) — read before relying on Relix in production.
+- [`coordination.md`](coordination.md) — multi-agent tasks,
+  delegation, messaging, approvals.
+- [`websocket.md`](websocket.md) — `/ws/chat` wire format and
+  client examples.
+- [`security.md`](security.md) — threat model + admission
+  pipeline.
+- [`current-limitations.md`](current-limitations.md) — read
+  before relying on Relix in production.

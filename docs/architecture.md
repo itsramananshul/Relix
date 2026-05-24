@@ -58,10 +58,62 @@ Every node — including the bridge — runs the same admission pipeline
 on every inbound `/relix/rpc/1` call. See [`security.md`](security.md)
 for the pipeline detail.
 
+## Boot path
+
+`relix boot` is the operator's entry point. It:
+
+1. Loads `~/.relix/config.toml` (written by `relix setup`).
+2. Translates provider + channel selections into the env vars
+   the mesh-up script consumes (`OPENROUTER_API_KEY`,
+   `RELIX_TELEGRAM_BOT_TOKEN`, etc.) so the operator never has
+   to export them by hand.
+3. Locates the platform-appropriate mesh script
+   (`relix-mesh-up.{sh,ps1}`) — first in `./scripts/` from CWD
+   (repo dev), then in `<exe_dir>/scripts/`, then in
+   `~/.local/scripts/` (the install path).
+4. Spawns it, then polls `/health` on the bridge until 200,
+   then opens `/dashboard` in the default browser.
+
+`relix stop` kills every `relix-controller` and
+`relix-web-bridge` process by name. `relix status` polls
+`/health` + `/v1/topology` and prints a one-line-per-peer
+table.
+
+## Operator data layout
+
+Every artefact the mesh writes lives under `~/.relix/` (override
+with `$RELIX_HOME`):
+
+```
+~/.relix/
+  config.toml                # written by `relix setup`; chmod 600
+  data/<run>/
+    memory.db / memory.log
+    ai.log
+    tool.toml / tool.log / fs-jail/
+    coordinator.toml / tasks.db / coordinator.log
+    bridge.toml / bridge.log
+    peers.toml
+  policies/<run>.toml        # admission policy
+
+~/.local/scripts/
+  relix-mesh-up.{sh,ps1}     # dropped here by install.{sh,ps1}
+  relix-mesh-down.{sh,ps1}
+
+~/.local/bin/
+  relix                      # the CLI (also: relix-controller,
+                             # relix-web-bridge — siblings spawned
+                             # by relix boot)
+```
+
+The legacy `dev-data/` layout is what you get when running from
+a repo checkout without a config file; production installs use
+`~/.relix/data/`.
+
 ## Process map
 
-What `scripts/relix-mesh-up.{ps1,sh}` (and therefore `relix boot`)
-brings up in the default + opt-in configuration:
+What the mesh-up script — invoked by `relix boot` — brings up in
+the default + opt-in configuration:
 
 ```
    OpenAI client / curl / SDK

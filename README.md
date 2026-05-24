@@ -54,29 +54,38 @@ curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.s
 irm https://raw.githubusercontent.com/itsramananshul/Relix/main/install.ps1 | iex
 ```
 
-Both installers drop the `relix` binary into a per-user bin dir and
-add it to your `PATH`. Set `RELIX_INSTALL_DIR` or
-`RELIX_VERSION` to override defaults; pin a specific release via
-`RELIX_VERSION=v0.1.0` before piping.
+Both installers do the same four things:
+
+1. Drop `relix`, `relix-controller`, and `relix-web-bridge` into
+   `~/.local/bin` (or `RELIX_INSTALL_DIR`) and put it on your
+   `PATH`.
+2. Drop the mesh boot scripts into `~/.local/scripts/`.
+3. Run **`relix setup`** automatically — the guided wizard:
+   pick provider, paste API key, tick channels, confirm.
+4. Save your choices to `~/.relix/config.toml`.
+
+Set `RELIX_VERSION=v0.1.1` to pin a specific release.
 
 ## Quick start
 
+After install, the wizard has already saved your config. Boot
+the mesh:
+
 ```sh
-# Boot the mock-provider mesh — no credentials required.
-relix boot
+relix boot                      # reads ~/.relix/config.toml
+                                # opens http://127.0.0.1:19791/dashboard
 
-# Boot with Telegram (set RELIX_TELEGRAM_BOT_TOKEN first).
-relix boot --with-telegram
+relix status                    # is it up? show the topology table.
+relix stop                      # kill the controllers + bridge by name.
 
-# Boot with the plugin host scanning a custom directory.
-relix boot --with-plugins --plugin-dir ./my-plugins
-
-# What's running?
-relix status
-
-# Tear it down.
-relix stop
+relix setup                     # re-run the wizard to change provider /
+                                # rotate keys / add a channel.
 ```
+
+No env vars to export. No `--provider` flag to repeat. No
+`scripts/...` to run by hand. The wizard wrote your provider +
+API key + channel selections to `~/.relix/config.toml`; `relix
+boot` reads them every time.
 
 Once the bridge is healthy you'll have:
 
@@ -84,6 +93,7 @@ Once the bridge is healthy you'll have:
 |---|---|
 | Dashboard       | http://127.0.0.1:19791/dashboard |
 | OpenAI-compat   | `POST http://127.0.0.1:19791/v1/chat/completions` |
+| WebSocket chat  | `ws://127.0.0.1:19791/ws/chat` |
 | Health          | http://127.0.0.1:19791/health |
 | Topology + caps | `GET /v1/topology`, `GET /v1/capabilities` |
 
@@ -94,14 +104,17 @@ WebUI, LobeChat, Cursor, etc.) at the bridge:
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:19791/v1", api_key="unused")
 client.chat.completions.create(
-    model="relix-mock",
+    model="relix-openrouter",       # or relix-openai, relix-mock, ...
     messages=[{"role": "user", "content": "hello"}],
 )
 ```
 
-Replace `mock` with a real provider by passing
-`relix boot --provider openai` (and exporting `OPENAI_API_KEY`).
-See [docs/configuration.md](docs/configuration.md) for every provider.
+The bridge's API-key header is ignored — the real provider key
+lives only on the AI node, sourced from `~/.relix/config.toml`.
+See [docs/configuration.md](docs/configuration.md) for the full
+config reference, including the `[ai.memory_peer]` knobs for
+automatic conversation-history injection and optional RAG over
+the vector store.
 
 ## What's in the mesh
 

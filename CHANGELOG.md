@@ -7,6 +7,108 @@ once a stable release is cut.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-24
+
+Zero-configuration install. After this release the
+`curl | bash` / `irm | iex` one-liner ends with a running mesh
+and an open dashboard — no env vars to export, no scripts to
+clone, no flags to remember.
+
+### Added
+
+- **`relix setup`** — guided interactive wizard. Five pages
+  (welcome → provider picker → hidden API-key input → channel
+  multi-select with per-channel secret follow-ups → confirm and
+  save). Runs automatically at the end of `install.sh` /
+  `install.ps1`; can be re-run any time to change provider,
+  rotate keys, or add a channel. crossterm-driven raw terminal
+  input; Ctrl-C exits 130 with the terminal restored.
+- **`~/.relix/config.toml`** — persistent operator config. Holds
+  `[provider]` (name + api_key), `[channels]` (per-channel
+  toggle + token + channel-id), and `[mesh]` (data_dir,
+  bridge_port). Written `chmod 600` on POSIX via tmp-write +
+  rename so an interrupted save can't half-write the file.
+  Every field has a serde default so partial configs deserialise.
+- **Config-driven `relix boot`** — reads
+  `~/.relix/config.toml` on startup and translates it into the
+  env vars the mesh-up script consumes. The right
+  `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / etc. is set
+  automatically from `provider.api_key`; channel toggles +
+  tokens are wired through. Explicit `--with-*` flags still
+  stack on top.
+- **`memory.recent_for_session` auto-injection** — `[ai.memory_peer]
+  max_history_turns = N`. With this set, the AI node fetches
+  recent turns itself and merges them with any caller-supplied
+  history, so flow templates no longer need to chain
+  `memory.recent_for_session` → `ai.chat` manually. Silent skip
+  on memory peer failure.
+- **RAG retrieval** — `[ai.memory_peer] rag_enabled = true` +
+  `rag_top_k` + `rag_min_score`. When set, the AI node embeds
+  the user prompt locally and queries `memory.search` across
+  both agent and user vector stores, formatting the top-K hits
+  as a "Relevant context from memory" block prepended to the
+  system prompt. `memory.search` wire grew an optional
+  `embedding=<base64-LE-f32>` 5th field so the precomputed
+  vector skips the responder's own embed RPC. Silent skip on
+  empty results, embedding failure, or peer unreachable.
+- **`GET /ws/chat`** — WebSocket streaming endpoint. JSON
+  request `{session_id, message, model?}` followed by a stream
+  of `{type: "chunk", text: "..."}` frames terminated by
+  `{type: "done", session_id, text}`. Bearer auth on the
+  upgrade (`Authorization: Bearer <token>`; loopback alpha
+  accepts any non-empty token). `ChatProvider` gained
+  `generate_reply_stream`; the mock provider streams
+  word-by-word with a 20ms gap, and the OpenAI-compatible
+  provider parses real `delta.content` deltas from the upstream
+  SSE response.
+- **`relix boot` / `relix stop` / `relix status`** — top-level
+  CLI subcommands implemented in `crates/relix-cli/src/mesh.rs`.
+  Cross-platform shim around the mesh-up scripts; `stop` kills
+  by name (`taskkill /F /IM` on Windows, `pkill -x`
+  elsewhere); `status` polls `/health` + `/v1/topology` and
+  prints a peer-by-peer table.
+- **`relix setup` bundled with install** — install scripts now
+  call `relix setup` as their last step. They also fetch the
+  mesh-up + mesh-down scripts from the main branch and drop
+  them in `~/.local/scripts/` so `relix boot` has them after a
+  binary-only install. `scripts/relix-mesh-down.ps1` ships as
+  the Windows counterpart to `relix-mesh-down.sh`.
+- **All three binaries in each release archive** — every
+  per-target archive now contains `relix` (= `relix-cli`),
+  `relix-controller`, and `relix-web-bridge` so `relix boot`
+  can spawn its siblings from the same directory.
+
+### Changed
+
+- **Default data dir** is now `~/.relix/data/<run>/` instead of
+  the repo-relative `dev-data/<run>/`. Repo-checkout
+  development still uses `dev-data/` automatically. Docs and
+  README updated.
+- **README + getting-started** rewritten around the wizard
+  flow. Env-var exports for API keys are no longer the
+  recommended path — config-file primary, env-var fallback.
+- **CI workflow** runs on manual `workflow_dispatch` only;
+  contributors run the same gates locally
+  (`cargo fmt --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo test --workspace`). Re-enable push
+  triggers when CI gates are needed on every commit.
+
+### Fixed
+
+- `install.ps1` no longer crashes with "the property 'Count'
+  cannot be found on this object" under PowerShell strict mode
+  when the release zip contains a single `relix.exe`.
+- `parse_literal_ip` in `tool.web_fetch`'s SSRF guard now
+  strips brackets from IPv6 hosts (`url::Url::host_str()`
+  returns IPv6 with brackets); previously `[::1]` and
+  `[fe80::1]` fell through to DNS and were rejected as
+  `DnsFailed` on Linux/macOS instead of `IpForbidden`.
+- `.sflow` parser preserves the user's dotted target verbatim
+  as `wire_method`, and plugin capabilities are double-
+  registered (bare name + `plugin_host.<method>` alias) so the
+  natural `step x: plugin_host.hello.greet "..."` form admits
+  against the bridge handler.
+
 ## [0.1.0] - 2026-05-23
 
 First public alpha. Everything below is real and ships.
@@ -138,5 +240,6 @@ First public alpha. Everything below is real and ships.
   `scripts/relix-mesh-up.sh` (POSIX), with `relix-mesh-down.sh` for
   shutdown.
 
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.1
 [0.1.0]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.0

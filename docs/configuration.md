@@ -1,24 +1,83 @@
 # Configuration
 
 Complete reference for every config file, env var, TOML key,
-policy rule, port, and bridge route in a Relix mesh. The
-authoritative source is `scripts/relix-mesh-up.ps1` (and its
-POSIX sibling `scripts/relix-mesh-up.sh`); this document mirrors
-what those scripts emit so operators editing the files by hand
-have an index.
+policy rule, port, and bridge route in a Relix mesh.
 
-For provider-specific detail see
-[`provider-configuration.md`](provider-configuration.md);
-this doc folds the per-provider tail into the AI-node section
-below.
+## The config file
 
-## Configuration files
+For day-to-day use, the only file you touch is
+**`~/.relix/config.toml`**. The setup wizard (`relix setup`)
+writes it on first install; `relix boot` reads it on every run.
+You can also edit it by hand — it's plain TOML and reloaded on
+each boot.
+
+Path:
+
+| Platform        | Config location                              |
+|-----------------|----------------------------------------------|
+| macOS / Linux   | `~/.relix/config.toml`                       |
+| Windows         | `%USERPROFILE%\.relix\config.toml`           |
+
+Override with `$RELIX_HOME` if you want a different parent dir.
+The file is written `chmod 600` on POSIX because it holds your
+API keys.
+
+Full shape, with every field's type and default:
+
+```toml
+[provider]
+name    = "openrouter"   # mock | openai | openrouter | xai | anthropic | gemini | local
+api_key = "sk-or-..."    # required for openai/openrouter/anthropic/xai/gemini;
+                         # ignored for mock + local
+
+[channels]
+telegram        = false  # bool
+telegram_token  = ""     # @BotFather token; required when telegram = true
+discord         = false
+discord_token   = ""     # required when discord = true
+discord_channel = ""     # snowflake; required when discord = true
+slack           = false
+slack_token     = ""     # xoxb-...; required when slack = true
+slack_channel   = ""     # channel id (C/G/D prefix); required when slack = true
+
+[mesh]
+data_dir    = "~/.relix/data"   # runtime data, logs, sqlite DBs
+bridge_port = 19791              # bridge HTTP port; the mesh nodes use
+                                 # 19711..19718 alongside (see `Ports` below)
+```
+
+`[channels]` and `[mesh]` sections (and every field within) have
+defaults, so a minimal config is just `[provider]`. Add a section
+later by editing the file or re-running `relix setup` — the
+wizard pre-fills existing values so you only fill in what's new.
+
+What `relix boot` does with this file:
+
+1. Loads it from `~/.relix/config.toml`. If it's missing, `relix
+   boot` still runs but prints a hint to run `relix setup`.
+2. Translates `provider.name` into the AI node's `[ai] provider`
+   and sets the right env var (`OPENROUTER_API_KEY`,
+   `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, or
+   `GEMINI_API_KEY`) from `provider.api_key`.
+3. For each `channels.<name> = true`, flips on the matching
+   `RELIX_<NAME>` flag the mesh-up script consumes and exports
+   the token + channel-id env vars from the config.
+4. Boots the mesh.
+
+The env vars (`RELIX_TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`,
+etc.) listed in the rest of this doc are the **fallback** wire
+format the underlying mesh-up script consumes. Setting them by
+hand still works and overrides config; the config file is the
+recommended path because it survives shell restarts and is
+managed for you by the wizard.
+
+## Per-node TOML
 
 Every controller is a peer with its own TOML config. The boot
-script generates these from CLI flags + env vars under
-`$DATA_BASE/` (default `dev-data/<run>/`) on every run. The
-files are plain TOML — operators running a production mesh edit
-them by hand and skip the boot script entirely.
+script generates these from the operator config + CLI flags into
+`$DATA_BASE/` (default `~/.relix/data/<run>/`) on every run. The
+files are plain TOML — operators running a production mesh can
+edit them by hand and skip the boot script entirely.
 
 Per-run layout:
 
