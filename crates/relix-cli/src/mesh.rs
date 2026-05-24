@@ -358,8 +358,20 @@ fn build_boot_command(
         c
     };
 
-    cmd.arg("--provider").arg(&args.provider);
-    cmd.arg("--bridge-port").arg(args.bridge_port.to_string());
+    // The two scripts declare their parameters differently: PowerShell
+    // uses PascalCase (`-Provider`, `-BridgePort`) while the bash script
+    // uses kebab-case long options. Mixing them produces a hard parser
+    // error on Windows ("A parameter cannot be found that matches
+    // parameter name '-bridge-port'."). Everything else the scripts
+    // care about flows through env vars (RELIX_DATA_DIR, RELIX_TELEGRAM,
+    // …) which both shells read identically.
+    if cfg!(windows) {
+        cmd.arg("-Provider").arg(&args.provider);
+        cmd.arg("-BridgePort").arg(args.bridge_port.to_string());
+    } else {
+        cmd.arg("--provider").arg(&args.provider);
+        cmd.arg("--bridge-port").arg(args.bridge_port.to_string());
+    }
     if let Some(data_dir) = &args.data_dir {
         cmd.env("RELIX_DATA_DIR", data_dir);
     }
