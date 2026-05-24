@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re)release, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Single job that ensures the release exists. Build jobs run in
+  # parallel afterwards and upload their assets onto it. Re-running
+  # this workflow with the same tag is idempotent — `gh release
+  # create ... || true` no-ops if the release is already there.
+  create-release:
+    name: create release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; assets will be added"
+          else
+            gh release create "$TAG" \
+              --title "Relix $TAG — Relay Intelligence Exchange" \
+              --notes "Release of Relix $TAG. See [CHANGELOG.md](https://github.com/itsramananshul/Relix/blob/main/CHANGELOG.md) for the full feature list."
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        # Caches are best-effort; never gate the release on a
+        # cache restore / save flake.
+        continue-on-error: true
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        shell: bash
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }} -p relix-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p relix-cli
+          fi
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/relix-cli" dist/relix
+          chmod +x dist/relix
+          tar -C dist -czf "relix-${{ matrix.target }}.tar.gz" relix
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/relix-cli.exe" "dist/relix.exe"
+          Compress-Archive -Path "dist/relix.exe" -DestinationPath "relix-${{ matrix.target }}.zip" -Force
+
+      - name: Upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            gh release upload "$TAG" "relix-${{ matrix.target }}.zip" --clobber
+          else
+            gh release upload "$TAG" "relix-${{ matrix.target }}.tar.gz" --clobber
+          fi
