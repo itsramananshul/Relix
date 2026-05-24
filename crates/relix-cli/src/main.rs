@@ -2,6 +2,7 @@
 
 mod browser;
 mod capability;
+mod config;
 mod doctor;
 mod flow_run;
 mod fs;
@@ -11,6 +12,7 @@ mod mesh;
 mod ops;
 mod ping;
 mod router;
+mod setup;
 mod sol;
 mod task;
 mod terminal;
@@ -153,6 +155,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: terminal::Cmd,
     },
+    /// Guided interactive setup wizard.
+    ///
+    /// Prompts for AI provider + API key, optional messaging
+    /// channels, and saves the result to `~/.relix/config.toml`.
+    /// Run after install (the install scripts call this
+    /// automatically); also runnable later to change provider /
+    /// rotate keys / add channels.
+    Setup,
+
     /// Boot the local Relix mesh.
     ///
     /// Wraps the platform-specific boot script
@@ -227,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             method,
             client_key,
         } => ping::run(&peer, &identity, &method, &client_key).await,
+        Cmd::Setup => setup::run(),
         Cmd::Boot(args) => mesh::boot(args).await,
         Cmd::Stop => mesh::stop(),
         Cmd::Status(args) => mesh::status(args).await,
