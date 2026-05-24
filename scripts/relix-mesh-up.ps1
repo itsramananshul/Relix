@@ -1384,38 +1384,41 @@ try {
     Write-Host "Ctrl-C to stop the mesh."
     Write-Host ""
 
-    # Intercept Ctrl-C so cleanup runs exactly once, hits only our PIDs, and
-    # leaves the parent terminal untouched. In non-interactive hosts (jobs,
-    # hidden windows) there's no key input - fall back to blocking on the
-    # bridge process; Stop-Process from outside will trigger the finally.
-    $interactive = $true
-    try { $null = [Console]::TreatControlCAsInput } catch { $interactive = $false }
-
-    if ($interactive) {
-        $prevCtrl = [Console]::TreatControlCAsInput
-        [Console]::TreatControlCAsInput = $true
-        try {
-            while ($true) {
-                if ([Console]::KeyAvailable) {
-                    $k = [Console]::ReadKey($true)
-                    if ( ($k.Modifiers -band [ConsoleModifiers]::Control) -and ($k.Key -eq 'C') ) { break }
-                }
-                foreach ($p in @($started)) {
-                    if ($p.HasExited) {
-                        Write-Warning "child PID $($p.Id) ($($p.ProcessName)) exited early with code $($p.ExitCode)"
-                        throw 'a child process exited unexpectedly'
-                    }
-                }
-                Start-Sleep -Milliseconds 250
+    # Block here until either:
+    #
+    #   * The operator presses Ctrl-C in this terminal — PowerShell's
+    #     default handler interrupts Start-Sleep with a
+    #     PipelineStoppedException. The `catch` below logs it and
+    #     falls through to the outer `finally`, which Stop-Processes
+    #     every PID this script started.
+    #
+    #   * One of the spawned controllers (or the bridge) exits on its
+    #     own — typically because `relix stop` taskkill'd them from
+    #     another terminal. We break the loop so the outer `finally`
+    #     tears down whatever's still running, then exit with code 1
+    #     so `relix boot` returns to the prompt instead of hanging.
+    #
+    # We deliberately don't use [Console]::TreatControlCAsInput +
+    # KeyAvailable here: the `relix boot` parent spawns this script
+    # via `Command::spawn` which can leave the console handle in a
+    # state where KeyAvailable misses keys and the loop never exits
+    # on Ctrl-C. Polling every 500ms is cheap and behaves the same
+    # across Windows Terminal, ISE, background jobs, and stdin-
+    # redirected hosts.
+    try {
+        while ($true) {
+            $exited = $started | Where-Object { $_.HasExited } | Select-Object -First 1
+            if ($null -ne $exited) {
+                Write-Host ""
+                Write-Host "$($exited.ProcessName) (pid $($exited.Id)) exited with code $($exited.ExitCode) — tearing down the rest of the mesh."
+                break
             }
+            Start-Sleep -Milliseconds 500
         }
-        finally {
-            [Console]::TreatControlCAsInput = $prevCtrl
-        }
-    } else {
-        # No console: park on the bridge until it exits (externally stopped).
-        $bridgeProc = $started[$started.Count - 1]
-        $bridgeProc.WaitForExit()
+    }
+    catch {
+        Write-Host ""
+        Write-Host "interrupted: $($_.Exception.Message)"
     }
 }
 finally {

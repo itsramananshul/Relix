@@ -147,8 +147,54 @@ pub async fn boot(args: BootArgs) -> Result<(), Box<dyn std::error::Error>> {
     {
         eprintln!("(could not open browser: {e}; visit {dashboard_url})");
     }
-    println!("Ctrl-C the boot script's terminal (or run `relix stop`) to shut down.");
+    println!("Ctrl-C this terminal (or run `relix stop` from another) to shut down.");
+
+    // Block until the boot script exits. Two paths get there:
+    //
+    //   * Operator Ctrl-Cs this terminal — the OS forwards the
+    //     CTRL_C_EVENT / SIGINT to both `relix boot` and the spawned
+    //     boot script (they share the console process group /
+    //     foreground pgrp). The script's own try/finally tears down
+    //     every controller it started. We install a tokio Ctrl-C
+    //     handler so this process stays alive long enough to observe
+    //     the script's exit, instead of dying first and leaving the
+    //     script's cleanup output racing the returned shell prompt.
+    //
+    //   * `relix stop` from another terminal taskkill's the
+    //     controllers — the boot script's HasExited / wait loop
+    //     catches the early exit, runs cleanup, and exits. Our
+    //     `child.wait()` returns and we follow it out.
+    //
+    // `child.wait()` is a blocking syscall, so it goes through
+    // spawn_blocking to keep the tokio runtime healthy.
+    let wait_handle = tokio::task::spawn_blocking(move || child.wait());
+    tokio::pin!(wait_handle);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    tokio::select! {
+        res = &mut wait_handle => report_wait_result(res),
+        _ = &mut ctrl_c => {
+            println!();
+            println!("shutting down ...");
+            // Drain the script's cleanup so its final messages don't
+            // trail past our return to the prompt.
+            let res = (&mut wait_handle).await;
+            report_wait_result(res);
+        }
+    }
     Ok(())
+}
+
+fn report_wait_result(
+    res: Result<std::io::Result<std::process::ExitStatus>, tokio::task::JoinError>,
+) {
+    match res {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => eprintln!("boot script exited with status {status}"),
+        Ok(Err(e)) => eprintln!("wait failed: {e}"),
+        Err(e) => eprintln!("wait task join error: {e}"),
+    }
 }
 
 /// Stop every running `relix-controller` and `relix-web-bridge`.
