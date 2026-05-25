@@ -7,6 +7,27 @@ once a stable release is cut.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-25
+
+Boot-loop polish on top of the v0.1.4 install fixes. No
+mesh-protocol or wire-format changes — same binaries, same flow
+templates, same configs.
+
+### Fixed
+
+- **`relix boot` now blocks the terminal until the mesh stops**
+  instead of returning the prompt as soon as the bridge becomes
+  healthy. Previously the boot script's cleanup output raced the
+  shell prompt — operators saw their prompt back before the
+  controllers had finished tearing down on `relix stop` from
+  another terminal. The boot command now waits on the script's
+  exit and forwards Ctrl-C through to it.
+- **PowerShell mesh script: replaced `TreatControlCAsInput` loop
+  with a 500ms poll loop** that works correctly when the script is
+  launched via `Command::spawn` from `relix boot`. The old loop
+  silently no-op'd in non-interactive spawned contexts, leaving
+  the script running forever after a clean `relix stop`.
+
 ## [0.1.1] - 2026-05-24
 
 Zero-configuration install. After this release the
@@ -240,6 +261,7 @@ First public alpha. Everything below is real and ships.
   `scripts/relix-mesh-up.sh` (POSIX), with `relix-mesh-down.sh` for
   shutdown.
 
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.5
 [0.1.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.1
 [0.1.0]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.0
