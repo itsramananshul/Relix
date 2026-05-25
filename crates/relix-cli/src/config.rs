@@ -151,12 +151,15 @@ impl RelixConfig {
         // half-written config in place.
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, body).map_err(ConfigError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
+        // Restrict permissions before rename. POSIX chmod 0600;
+        // Windows shells out to icacls to strip inheritance and
+        // grant Full only to the current user. See
+        // `crate::os_secure`.
+        let _ = crate::os_secure::restrict_to_current_user(&tmp);
         std::fs::rename(&tmp, path).map_err(ConfigError::Io)?;
+        // Re-apply after rename: NTFS may inherit fresh ACEs on
+        // rename in some configurations. POSIX preserves mode.
+        let _ = crate::os_secure::restrict_to_current_user(path);
         Ok(())
     }
 

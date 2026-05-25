@@ -396,16 +396,12 @@ impl BridgeSecrets {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text.as_bytes())
             .map_err(|e| format!("bridge-secrets write {}: {e}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&tmp)
-                .map_err(|e| format!("bridge-secrets stat tmp: {e}"))?
-                .permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&tmp, perms)
-                .map_err(|e| format!("bridge-secrets chmod tmp: {e}"))?;
-        }
+        // Restrict permissions on the tmp file before rename so the
+        // final atomic move drops an already-locked-down inode into
+        // place. POSIX uses chmod 0600; Windows shells out to
+        // icacls to strip inheritance and grant only the current
+        // user. See `crate::os_secure`.
+        let _ = crate::os_secure::restrict_to_current_user(&tmp);
         std::fs::rename(&tmp, path).map_err(|e| {
             format!(
                 "bridge-secrets rename {} -> {}: {e}",
@@ -413,6 +409,10 @@ impl BridgeSecrets {
                 path.display()
             )
         })?;
+        // Re-apply after rename: NTFS occasionally resets ACEs on
+        // rename in inherited-perm directories. POSIX preserves
+        // the mode through rename so this is a no-op there.
+        let _ = crate::os_secure::restrict_to_current_user(path);
         Ok(())
     }
 

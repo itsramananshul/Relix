@@ -10,6 +10,7 @@ mod identity;
 mod mcp;
 mod mesh;
 mod ops;
+mod os_secure;
 mod ping;
 mod router;
 mod setup;

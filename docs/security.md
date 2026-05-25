@@ -291,6 +291,117 @@ ceiling / deny lists / allow lists), with an optional
 approves it. The gate **narrows** policy, never widens it — policy
 remains the floor. Empty agent ledger ⇒ gate is a no-op.
 
+## HTTP bridge authentication
+
+The bridge has its own auth layer, distinct from the mesh-side
+identity-bundle pipeline above. Mesh callers prove who they are
+via the signed `IdentityBundle`; bridge callers (curl, the
+dashboard, OpenAI clients) prove who they are with a per-install
+**bearer token**.
+
+The token is 256 bits of entropy, hex-encoded, persisted at
+`~/.relix/bridge-token` on first boot. Three routes are
+intentionally unauthenticated:
+
+- `GET /health`        — plaintext liveness probe.
+- `GET /dashboard`     — the static HTML page.
+- `GET /v1/auth/token` — one-time bootstrap so the dashboard can
+  pick up its token at first load. The handler refuses callers
+  that already carry an `Authorization` header.
+
+Every other route, including the entire `/v1/*` surface and the
+chat endpoints, requires `Authorization: Bearer <token>`.
+
+**CSRF origin guard.** A second layer of defence for the
+"malicious page on the operator's browser" threat. The middleware
+rejects any request whose `Origin` header points at a host/port
+other than the bridge's own loopback address. Curl callers
+typically don't send Origin and pass through; cross-origin
+browser tabs always send it and get rejected with 403.
+
+**OpenAI shim exception.** `POST /v1/chat/completions` accepts any
+non-empty bearer. OpenAI clients always send their own provider
+key as the bearer, and the real provider key lives on the AI node
+(not the bridge), so requiring the bridge token here would break
+every OpenAI client out of the box without any security benefit.
+
+**EventSource fallback.** SSE streams (`/v1/tasks/events/stream`,
+…) can't carry custom headers from browser JavaScript, so the
+auth middleware also accepts `?token=<token>` for those routes.
+Loopback-only context makes this acceptable.
+
+Implementation: `crates/relix-web-bridge/src/auth.rs`. The
+dashboard's bootstrap JS lives at the top of
+`crates/relix-web-bridge/src/dashboard.html` — it caches the
+token in `sessionStorage` and patches `window.fetch` +
+`window.EventSource` so per-call site changes weren't needed.
+
+## Secret-file hardening
+
+Every file that contains an operator secret is written at
+restrictive permissions by code that flows through one shared
+helper (`os_secure::restrict_to_current_user`):
+
+| File                                | Owner             |
+|-------------------------------------|-------------------|
+| `~/.relix/bridge-token`             | `relix-web-bridge` |
+| `~/.relix/config.toml`              | `relix-cli` setup  |
+| `<data_dir>/bridge-secrets.toml`    | `relix-web-bridge` |
+| `dev-keys/*.key`                    | `relix-cli` / bridge |
+
+On POSIX the helper does `chmod 0600`. On Windows it shells out
+to the bundled `icacls`:
+
+```text
+icacls <path> /inheritance:r
+icacls <path> /grant:r <user>:F
+```
+
+Inheritance is stripped so a permissive ancestor can't grant
+"Authenticated Users" read; the single granted ACE is the current
+user with Full control.
+
+We deliberately do NOT depend on the heavyweight `windows` crate
+or `windows-acl` to call the Win32 ACL API. The bridge enforces
+`unsafe_code = "forbid"`, and shelling out to `icacls` is
+equivalent in effect, easier to audit, and adds no new
+dependency.
+
+## `relix doctor`
+
+`relix doctor` connects to `/v1/health` and prints a PASS / WARN
+/ FAIL report. It now also inspects the on-disk secret-file
+permissions and surfaces any file that's looser than expected:
+
+```text
+PASS  secrets.bridge_token      ~/.relix/bridge-token — permissions restrictive
+PASS  secrets.config_toml       ~/.relix/config.toml — permissions restrictive
+PASS  secrets.bridge_secrets    dev-data/bridge-secrets.toml — permissions restrictive
+```
+
+WARN rows include the exact `chmod` / `icacls` command to
+re-harden the file. Missing files emit a quiet PASS — a fresh
+install has nothing to leak.
+
+## Rotation
+
+`~/.relix/bridge-token` regenerates only when the file is deleted.
+To rotate: stop the bridge, delete the file, start the bridge —
+a fresh 256-bit token is generated and printed in the boot
+banner. The dashboard caches the token in `sessionStorage`;
+refresh after rotation so it picks up the new value via the
+bootstrap endpoint.
+
+## If keys were ever committed
+
+If any real provider key or libp2p secret was ever in a
+git-committed `dev-keys/` directory (or anywhere in the repo's
+history), **rotate it now.** Removing a key from `HEAD` does not
+undo its presence in `.git/` history; the disclosure already
+happened. Issue a fresh provider key via the provider's rotation
+flow, and for Relix-issued libp2p secrets delete the old file
+and let the next start regenerate it.
+
 ## See also
 
 - [`tool-node-security.md`](tool-node-security.md) — full SSRF model.

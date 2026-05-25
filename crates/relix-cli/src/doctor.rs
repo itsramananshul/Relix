@@ -10,10 +10,13 @@
 //! --peer <addr> --identity <bundle>`; doctor is the
 //! bridge-side counterpart.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
 use serde::Deserialize;
+
+use crate::os_secure::{PermVerdict, inspect_permissions};
 
 /// `doctor` arguments. Distinct from `Cmd` because doctor is
 /// flat (no subcommands).
@@ -84,7 +87,7 @@ impl Verdict {
 
 /// One row in the doctor report.
 struct Check {
-    label: &'static str,
+    label: String,
     verdict: Verdict,
     detail: String,
 }
@@ -108,13 +111,73 @@ pub async fn run(args: DoctorArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let resp: HealthResponse = serde_json::from_str(&body)
         .map_err(|e| format!("decode /v1/health body: {e} (body={body})"))?;
-    let checks = evaluate(&resp);
+    let mut checks = evaluate(&resp);
+    let perm_checks = evaluate_perms();
+    checks.extend(perm_checks);
     render(&args.bridge, &resp, &checks);
     let any_fail = checks.iter().any(|c| c.verdict == Verdict::Fail);
     if any_fail {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Inspect the on-disk secrets files an operator might own.
+/// Returns one row per known secret file. PASS = restrictive
+/// (POSIX 0600 or Windows non-inheriting current-user-only
+/// ACL). WARN = looser than recommended. Missing files emit a
+/// quiet PASS — a fresh install has nothing to leak.
+fn evaluate_perms() -> Vec<Check> {
+    let mut out = Vec::new();
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(home_var).map(PathBuf::from);
+
+    let mut watch: Vec<(&'static str, PathBuf)> = Vec::new();
+    if let Some(h) = home.as_ref() {
+        watch.push((
+            "secrets.bridge_token",
+            h.join(".relix").join("bridge-token"),
+        ));
+        watch.push(("secrets.config_toml", h.join(".relix").join("config.toml")));
+    }
+    // The bridge-secrets file is under the data_dir, which can
+    // vary by deployment. Probe the conventional `dev-data/`
+    // location with the cwd as a fall-through. Missing in both
+    // → PASS with a "not present" note.
+    let dev_data_secrets = PathBuf::from("dev-data").join("bridge-secrets.toml");
+    let chosen = if dev_data_secrets.exists() {
+        dev_data_secrets
+    } else {
+        PathBuf::from("bridge-secrets.toml")
+    };
+    watch.push(("secrets.bridge_secrets", chosen));
+
+    for (label, path) in watch {
+        let row = match inspect_permissions(&path) {
+            PermVerdict::Strict => Check {
+                label: label.into(),
+                verdict: Verdict::Pass,
+                detail: format!("{} — permissions restrictive", path.display()),
+            },
+            PermVerdict::Loose => Check {
+                label: label.into(),
+                verdict: Verdict::Warn,
+                detail: format!(
+                    "{} is readable by other users; \
+                     re-harden with `chmod 600` on POSIX or \
+                     `icacls <path> /inheritance:r /grant:r %USERNAME%:F` on Windows",
+                    path.display()
+                ),
+            },
+            PermVerdict::Unknown => Check {
+                label: label.into(),
+                verdict: Verdict::Pass,
+                detail: format!("{} — not present (no secrets to leak)", path.display()),
+            },
+        };
+        out.push(row);
+    }
+    out
 }
 
 /// Apply the doctor's opinions to a HealthResponse. Pure
@@ -126,13 +189,13 @@ fn evaluate(h: &HealthResponse) -> Vec<Check> {
     // bridge.status
     out.push(if h.status == "ok" {
         Check {
-            label: "bridge.status",
+            label: "bridge.status".into(),
             verdict: Verdict::Pass,
             detail: format!("status={} uptime={}s", h.status, h.uptime_secs),
         }
     } else {
         Check {
-            label: "bridge.status",
+            label: "bridge.status".into(),
             verdict: Verdict::Fail,
             detail: format!("status='{}' (expected 'ok')", h.status),
         }
@@ -141,13 +204,13 @@ fn evaluate(h: &HealthResponse) -> Vec<Check> {
     // coordinator_configured — WARN (chat still works without it).
     out.push(if h.coordinator_configured {
         Check {
-            label: "coordinator.configured",
+            label: "coordinator.configured".into(),
             verdict: Verdict::Pass,
             detail: "task.* endpoints active".into(),
         }
     } else {
         Check {
-            label: "coordinator.configured",
+            label: "coordinator.configured".into(),
             verdict: Verdict::Warn,
             detail: "no [coordinator] alias — task.* endpoints return 503; chat still works".into(),
         }
@@ -157,13 +220,13 @@ fn evaluate(h: &HealthResponse) -> Vec<Check> {
     // bridge can dispatch to).
     out.push(if h.peer_count == 0 {
         Check {
-            label: "mesh.peers",
+            label: "mesh.peers".into(),
             verdict: Verdict::Fail,
             detail: "no peers in manifest cache — start a controller and configure [peers]".into(),
         }
     } else {
         Check {
-            label: "mesh.peers",
+            label: "mesh.peers".into(),
             verdict: Verdict::Pass,
             detail: format!(
                 "{} total ({} fresh, {} stale, {} expired)",
@@ -177,7 +240,7 @@ fn evaluate(h: &HealthResponse) -> Vec<Check> {
     // bridge has lost contact with; operator should know.
     if h.peers_expired > 0 {
         out.push(Check {
-            label: "mesh.expired",
+            label: "mesh.expired".into(),
             verdict: Verdict::Fail,
             detail: format!(
                 "{} peer(s) expired — their controllers stopped sending heartbeats",
@@ -191,7 +254,7 @@ fn evaluate(h: &HealthResponse) -> Vec<Check> {
         let failures = r.attempts.saturating_sub(r.successes);
         if failures > 0 {
             out.push(Check {
-                label: "mesh.reconnect",
+                label: "mesh.reconnect".into(),
                 verdict: Verdict::Warn,
                 detail: format!(
                     "{failures} reconnect attempt(s) failed (attempts={}, successes={}) — possible flapping",
