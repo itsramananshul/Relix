@@ -142,6 +142,22 @@ pub async fn boot(args: BootArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("bridge ready at http://127.0.0.1:{}", effective.bridge_port);
+
+    // Surface the bridge auth token so operators have a single
+    // place to copy it from. The bridge writes it to
+    // `~/.relix/bridge-token` on first boot. The dashboard picks
+    // it up automatically via the bootstrap endpoint; scripts /
+    // curl invocations paste this string into the
+    // `Authorization: Bearer <token>` header.
+    if let Some((path, value)) = read_bridge_token() {
+        println!("bridge token: {value}  (stored in {})", path.display());
+    } else {
+        eprintln!(
+            "(could not read bridge-token file from ~/.relix/bridge-token — \
+             curl invocations will need to read it from the bridge log)"
+        );
+    }
+
     if !effective.no_browser
         && let Err(e) = open_browser(&dashboard_url)
     {
@@ -495,6 +511,19 @@ fn kill_by_name(name: &str) -> Result<usize, String> {
             None => Err("pkill terminated by signal".into()),
         }
     }
+}
+
+/// Try to read the bridge token from `~/.relix/bridge-token`.
+/// Returns `(path, value)` on success, `None` when the file is
+/// missing or unreadable. Trims the value so a trailing newline
+/// doesn't show up in the printed banner.
+fn read_bridge_token() -> Option<(PathBuf, String)> {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(home_var)?;
+    let path = PathBuf::from(home).join(".relix").join("bridge-token");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v = raw.trim().to_string();
+    if v.is_empty() { None } else { Some((path, v)) }
 }
 
 fn truncate(s: &str, max: usize) -> String {

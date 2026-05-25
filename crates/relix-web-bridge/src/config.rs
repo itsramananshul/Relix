@@ -59,6 +59,16 @@ pub struct BridgeSection {
     /// security model.
     #[serde(default)]
     pub secrets_path: Option<PathBuf>,
+    /// Path to the bridge auth-token file. Defaults to
+    /// `~/.relix/bridge-token` when unset (and to
+    /// `./bridge-token` if `$HOME` / `%USERPROFILE%` is
+    /// unresolvable). The file is generated on first boot
+    /// (256 bits, hex-encoded) and persisted at restrictive
+    /// permissions. Every state-changing route requires this
+    /// token via `Authorization: Bearer <token>`. See
+    /// `docs/security.md`.
+    #[serde(default)]
+    pub token_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -215,6 +225,19 @@ pub struct AppState {
     /// `GET /v1/mcp/audit`. Resets on bridge restart. See
     /// `crates/relix-web-bridge/src/mcp_audit.rs`.
     pub mcp_audit: std::sync::Arc<crate::mcp_audit::McpAuditRing>,
+    /// Bridge HTTP bearer token. Generated on first boot and
+    /// persisted to `~/.relix/bridge-token` (or the configured
+    /// override). Every state-changing route requires it via the
+    /// `auth_middleware` in `crate::auth`. Read-only on the live
+    /// state — rotation requires a bridge restart.
+    pub bridge_token: crate::auth::BridgeToken,
+    /// Host portion of the listen address (e.g. `127.0.0.1`).
+    /// Used by the CSRF origin guard to verify the request's
+    /// `Origin` header matches the bridge's own host.
+    pub bridge_host: String,
+    /// TCP port of the listen address. Used by the CSRF origin
+    /// guard for the same reason as `bridge_host`.
+    pub bridge_port: u16,
 }
 
 impl AppState {
@@ -277,6 +300,32 @@ impl AppState {
         let initial_secrets = crate::secrets::BridgeSecrets::load_or_empty(&secrets_path);
         let secrets = crate::secrets::SecretsHandle::new(initial_secrets, secrets_path);
 
+        // Resolve the bridge auth-token path. Default location is
+        // `~/.relix/bridge-token` so it sits next to the operator's
+        // other Relix state, regardless of which workspace the
+        // bridge was launched from.
+        let token_path = cfg.bridge.token_path.clone().unwrap_or_else(|| {
+            let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            match std::env::var_os(home_var) {
+                Some(h) => PathBuf::from(h).join(".relix").join("bridge-token"),
+                None => PathBuf::from("bridge-token"),
+            }
+        });
+        let bridge_token = crate::auth::BridgeToken::load_or_generate(&token_path)
+            .map_err(|e| BridgeError::Config(format!("bridge-token: {e}")))?;
+
+        // Parse listen_addr early so the auth/CSRF middleware can
+        // compare the request's Origin host against the bridge's
+        // own. Failures here mirror the late-parse error in main.rs
+        // so misconfiguration is rejected at startup either way.
+        let listen: std::net::SocketAddr = cfg
+            .bridge
+            .listen_addr
+            .parse()
+            .map_err(|e| BridgeError::Config(format!("listen_addr: {e}")))?;
+        let bridge_host = listen.ip().to_string();
+        let bridge_port = listen.port();
+
         // Intervention audit ring. JSONL persistence lives
         // next to the data_dir when one is configured; in-
         // memory only otherwise (so single-binary smoke tests
@@ -308,6 +357,9 @@ impl AppState {
             lifecycle_log: crate::lifecycle::LifecycleLog::new(),
             intervention_audit,
             mcp_audit: Arc::new(crate::mcp_audit::McpAuditRing::default()),
+            bridge_token,
+            bridge_host,
+            bridge_port,
         })
     }
 }
@@ -341,14 +393,11 @@ pub fn load_or_generate_client_key(path: &Path) -> Result<[u8; 32], BridgeError>
         std::fs::write(path, out).map_err(|e| {
             BridgeError::Config(format!("write client key {}: {e}", path.display()))
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(mut p) = std::fs::metadata(path).map(|m| m.permissions()) {
-                p.set_mode(0o600);
-                let _ = std::fs::set_permissions(path, p);
-            }
-        }
+        // POSIX chmod 0600 + Windows icacls strip-inheritance.
+        // Best-effort: a permission failure doesn't block boot
+        // (operator still has a working key) but doctor will
+        // surface the looseness on its next run.
+        let _ = crate::os_secure::restrict_to_current_user(path);
         tracing::info!(path = %path.display(), "generated new bridge client key");
         Ok(out)
     }

@@ -86,6 +86,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
 
 mod agent;
 mod agent_memory;
+mod auth;
 mod blocklist;
 mod browser_captures;
 mod browser_sessions;
@@ -109,6 +110,7 @@ mod memory_embed;
 mod messaging;
 mod metrics;
 mod openai;
+mod os_secure;
 mod plugins;
 mod policy_denials;
 mod policy_simulate;
@@ -275,6 +277,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .listen_addr
         .parse()
         .map_err(|e| format!("listen_addr: {e}"))?;
+
+    // Capture the token + its on-disk path now, before `state` is
+    // moved into the router below. The printed banner after
+    // `serve` would otherwise reach for a moved value.
+    let bridge_token_value = state.bridge_token.value().to_string();
+    let bridge_token_path = state.bridge_token.path().to_path_buf();
 
     // M78: production-posture guard. The bridge has no HTTP
     // auth in alpha (see bridge-invariants.md). When the
@@ -621,6 +629,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.
         .route("/dashboard", get(dashboard::page))
+        // One-time bootstrap so the dashboard can pick up its
+        // bearer token without the operator pasting it manually.
+        // Guarded inside the handler: refuses when the caller
+        // already has an Authorization header, and CSRF-checks
+        // the Origin. See `auth.rs`.
+        .route("/v1/auth/token", get(auth::bootstrap_token))
+        // Token + CSRF guard for every mutating route. Public
+        // routes (/health, /dashboard, /v1/auth/token, /assets/*)
+        // are allowlisted inside the middleware itself. The
+        // OpenAI shim is auth-special — any non-empty bearer
+        // wins because OpenAI clients always send one. See
+        // `auth.rs` for the full policy.
+        .layer(axum::middleware::from_fn_with_state(
+            auth::AuthState {
+                token: state.bridge_token.clone(),
+                host: state.bridge_host.clone(),
+                port: state.bridge_port,
+            },
+            auth::auth_middleware,
+        ))
         .with_state(state)
         // H15: per-request latency tracing. Emits one structured
         // `bridge: route` info line per request with method, path,
@@ -637,6 +665,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sse_chunk_bytes = cfg.sse.chunk_bytes,
         "web bridge starting"
     );
+    // Token + dashboard banner. Goes via println! (not tracing)
+    // so operators see it even when RUST_LOG silences the
+    // bridge crate. The token line is what an operator pastes
+    // into a curl `-H "Authorization: Bearer ..."` invocation.
+    println!(
+        "Bridge token: {}  (stored in {})",
+        bridge_token_value,
+        bridge_token_path.display()
+    );
+    println!("Dashboard:    http://{}/dashboard", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

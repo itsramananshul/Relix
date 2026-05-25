@@ -3369,6 +3369,81 @@
 <script>
 'use strict';
 
+/* ── Bridge auth bootstrap ─────────────────────────────────────
+ * The bridge requires `Authorization: Bearer <token>` on every
+ * state-changing route. The dashboard fetches its token once via
+ * the one-time `/v1/auth/token` bootstrap endpoint, caches it in
+ * sessionStorage, and patches window.fetch + window.EventSource
+ * so every later call carries the token without per-callsite
+ * changes. EventSource can't carry custom headers; we append a
+ * `?token=` query parameter for those instead.
+ *
+ * The bootstrap fetch is a synchronous XHR on purpose — it's the
+ * only way to block the rest of this script from issuing fetches
+ * before the token is in place. Acceptable here because the
+ * bridge is on loopback so the round-trip is sub-millisecond. */
+(function bootstrapAuth() {
+  let token = null;
+  try { token = sessionStorage.getItem('relix_bridge_token'); } catch (_) {}
+  if (!token) {
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/v1/auth/token', false);
+      xhr.send();
+      if (xhr.status === 200) {
+        const j = JSON.parse(xhr.responseText);
+        if (j && typeof j.token === 'string' && j.token.length > 0) {
+          token = j.token;
+          try { sessionStorage.setItem('relix_bridge_token', token); } catch (_) {}
+        }
+      }
+    } catch (_) { /* bootstrap unreachable — later calls will 401 */ }
+  }
+
+  const needsAuth = function (url) {
+    let path;
+    try {
+      const s = (typeof url === 'string') ? url : (url && (url.url || String(url)));
+      path = s.startsWith('/') ? s.split('?')[0]
+                               : new URL(s, location.origin).pathname;
+    } catch (_) { return false; }
+    return path.indexOf('/v1/') === 0
+        || path === '/chat'
+        || path.indexOf('/chat/') === 0
+        || path === '/chat_with_tool'
+        || path.indexOf('/ws/') === 0;
+  };
+
+  const origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    init = init || {};
+    const url = (typeof input === 'string') ? input : (input && input.url);
+    if (token && needsAuth(url)) {
+      const seed = init.headers || (input && input.headers) || {};
+      const h = new Headers(seed);
+      if (!h.has('Authorization')) h.set('Authorization', 'Bearer ' + token);
+      init.headers = h;
+    }
+    return origFetch(input, init);
+  };
+
+  const OrigES = window.EventSource;
+  if (OrigES) {
+    const Patched = function (url, opts) {
+      let u = String(url);
+      if (token && needsAuth(u) && u.indexOf('token=') === -1) {
+        const sep = u.indexOf('?') === -1 ? '?' : '&';
+        u = u + sep + 'token=' + encodeURIComponent(token);
+      }
+      return new OrigES(u, opts);
+    };
+    Patched.CONNECTING = OrigES.CONNECTING;
+    Patched.OPEN = OrigES.OPEN;
+    Patched.CLOSED = OrigES.CLOSED;
+    window.EventSource = Patched;
+  }
+})();
+
 /* ── Router ────────────────────────────────────────────────── */
 const PAGES = {
   overview:     { label: 'Overview',     init: initOverview,     enter: enterOverview },
