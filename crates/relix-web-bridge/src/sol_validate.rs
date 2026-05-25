@@ -11,7 +11,7 @@ use axum::{Json, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
 use relix_runtime::sflow;
-use relix_runtime::sol::{analyzer::Analyzer, bytecode::Codegen, lexer::Lexer, parser::Parser};
+use relix_runtime::sol;
 
 #[derive(Debug, Deserialize)]
 pub struct ValidateRequest {
@@ -26,14 +26,14 @@ fn default_kind() -> String {
     "sflow".into()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ValidateResponse {
     pub valid: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ValidateError>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ValidateError {
     /// 1-indexed source line, `0` for non-positional errors.
     pub line: usize,
@@ -58,6 +58,9 @@ pub async fn validate(Json(req): Json<ValidateRequest>) -> impl IntoResponse {
     }
 }
 
+/// 200 on a clean parse, 400 on errors. The dashboard renders the
+/// `errors` array inline next to the editor; the 400 status makes
+/// curl / scripts gate on the call without reading the body.
 fn respond(errors: Vec<ValidateError>) -> axum::response::Response {
     if errors.is_empty() {
         (
@@ -70,7 +73,7 @@ fn respond(errors: Vec<ValidateError>) -> axum::response::Response {
             .into_response()
     } else {
         (
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             Json(ValidateResponse {
                 valid: false,
                 errors,
@@ -90,74 +93,24 @@ fn validate_sflow(source: &str) -> Vec<ValidateError> {
         .collect()
 }
 
-/// SOL has no in-process Result-returning parse entry point — the verbatim
-/// port panics / exits on bad input. We isolate the compile pipeline in a
-/// `catch_unwind` so a malformed `.sol` produces a structured error
-/// instead of taking the bridge process down.
+/// Validate a SOL source. Delegates to the SOL crate's public
+/// [`sol::compile_source`] entry point, which owns the
+/// catch_unwind boundary that converts the verbatim port's
+/// panic-on-bad-input into a regular `Result`. The bridge stays
+/// pure presentation — line number is `0` because the SOL parser
+/// does not currently track line numbers; the dashboard surfaces
+/// the message string verbatim.
 fn validate_sol(source: &str) -> Vec<ValidateError> {
-    let tmp = match tempfile::Builder::new()
-        .prefix("relix-validate-")
-        .suffix(".sol")
-        .tempfile()
-    {
-        Ok(t) => t,
-        Err(e) => {
-            return vec![ValidateError {
-                line: 0,
-                message: format!("tempfile: {e}"),
-            }];
-        }
-    };
-    if let Err(e) = std::fs::write(tmp.path(), source.as_bytes()) {
-        return vec![ValidateError {
-            line: 0,
-            message: format!("write tempfile: {e}"),
-        }];
+    match sol::compile_source(source) {
+        Ok(_) => Vec::new(),
+        Err(message) => vec![ValidateError { line: 0, message }],
     }
-    let path = tmp.path().to_path_buf();
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| "non-utf8 tempfile path".to_string())?;
-        let mut lexer = Lexer::from(path_str);
-        let tokens = lexer.tokens();
-        let mut parser = Parser::from(tokens);
-        let mut program = parser.run();
-        let mut analyzer = Analyzer::new();
-        analyzer.run(&mut program);
-        let mut codegen = Codegen::from(analyzer.tt_arena);
-        let _ = codegen.gen_bcode(&program);
-        Ok::<_, String>(())
-    }));
-    match res {
-        Ok(Ok(())) => Vec::new(),
-        Ok(Err(msg)) => vec![ValidateError {
-            line: 0,
-            message: msg,
-        }],
-        Err(panic) => {
-            let msg = panic_to_string(panic);
-            vec![ValidateError {
-                line: 0,
-                message: format!("sol parse failed: {msg}"),
-            }]
-        }
-    }
-}
-
-fn panic_to_string(panic: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = panic.downcast_ref::<&'static str>() {
-        return (*s).to_string();
-    }
-    if let Some(s) = panic.downcast_ref::<String>() {
-        return s.clone();
-    }
-    "unknown panic".into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
 
     #[test]
     fn valid_sflow_returns_no_errors() {
@@ -184,5 +137,57 @@ mod tests {
         let src = "function start() -> str { let x: str = ";
         let errs = validate_sol(src);
         assert!(!errs.is_empty());
+    }
+
+    /// The validate endpoint MUST return 400 on a malformed
+    /// payload — historically, bad SOL panicked through the
+    /// stack and killed the process. The 400 contract is what
+    /// the dashboard relies on.
+    #[tokio::test]
+    async fn validate_endpoint_returns_400_on_invalid_sol() {
+        let req = ValidateRequest {
+            source: "function start() -> str { let x: str = ".into(),
+            kind: "sol".into(),
+        };
+        let resp = validate(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: ValidateResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(!body.valid);
+        assert!(!body.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_endpoint_returns_200_on_valid_sol() {
+        let req = ValidateRequest {
+            source: "function start() -> str { return \"ok\"; }\n".into(),
+            kind: "sol".into(),
+        };
+        let resp = validate(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn validate_endpoint_returns_400_on_invalid_sflow() {
+        let req = ValidateRequest {
+            source: "if true\nreturn\n".into(),
+            kind: "sflow".into(),
+        };
+        let resp = validate(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Synthesise the historical worst case: input that used to
+    /// hard-kill the controller via process::exit. The endpoint
+    /// must surface a clean error instead of taking the test
+    /// process down.
+    #[tokio::test]
+    async fn validate_endpoint_survives_unknown_token() {
+        let req = ValidateRequest {
+            source: "function start() -> str { @ }\n".into(),
+            kind: "sol".into(),
+        };
+        let resp = validate(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

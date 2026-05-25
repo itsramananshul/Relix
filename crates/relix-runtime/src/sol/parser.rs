@@ -147,9 +147,8 @@ impl Parser {
     fn eat(&mut self, tk: TokenKind, msg: &str) {
         let tkcurr = self.tokens[self.index].get_kind();
         if tkcurr != tk {
-            eprintln!("{}", msg);
             self.debtok(4);
-            std::process::exit(1);
+            panic!("{}", msg);
         }
         self.index += 1;
     }
@@ -214,8 +213,7 @@ impl Parser {
 
                 let size = if self.tokens[self.index].get_kind() != TokenKind::RSquare {
                     let Token::Integer(s) = self.tokens[self.index].clone() else {
-                        eprintln!("only integers can be used to specify an array size");
-                        std::process::exit(1);
+                        panic!("only integers can be used to specify an array size");
                     };
                     self.index += 1;
                     Some(s)
@@ -254,8 +252,7 @@ impl Parser {
     fn func_decl(&mut self) -> Option<Ast> {
         self.index += 1;
         let Token::Ident(name) = self.tokens[self.index].clone() else {
-            eprintln!("name expected after function keyword");
-            std::process::exit(1);
+            panic!("name expected after function keyword");
         };
         self.index += 1;
         self.eat(
@@ -267,8 +264,8 @@ impl Parser {
         while noob!(self) && !matches!(self.tokens[self.index], Token::RParen) {
             let Token::Ident(pname) = self.tokens[self.index].clone() else {
                 self.debtok(4);
-                eprintln!("expected parameter name");
-                std::process::exit(1);
+
+                panic!("expected parameter name");
             };
             self.index += 1;
             self.eat(TokenKind::Colon, "expected colon after parameter name");
@@ -306,8 +303,7 @@ impl Parser {
         self.index += 1;
 
         let Token::Ident(name) = self.advance().clone() else {
-            eprintln!("name expected after function keyword");
-            std::process::exit(1);
+            panic!("name expected after function keyword");
         };
 
         self.eat(
@@ -364,11 +360,11 @@ impl Parser {
                     expr
                 } else {
                     self.debtok(4);
-                    eprintln!(
+
+                    panic!(
                         "identifier `{:?}` is not the start of any known statement",
                         x
                     );
-                    std::process::exit(1);
                 }
             }
         }
@@ -377,8 +373,7 @@ impl Parser {
         self.index += 1;
 
         let Token::Ident(elem_name) = self.tokens[self.index].clone() else {
-            eprintln!("variable name expected after `for` keyword");
-            std::process::exit(1);
+            panic!("variable name expected after `for` keyword");
         };
         self.index += 1;
 
@@ -455,8 +450,7 @@ impl Parser {
         let mut path = Vec::new();
         {
             let Token::Ident(root) = self.tokens[self.index].clone() else {
-                eprintln!("expected an identifier in an import path");
-                std::process::exit(1);
+                panic!("expected an identifier in an import path");
             };
             self.index += 1;
             path.push(root);
@@ -464,8 +458,7 @@ impl Parser {
         while noob!(self) && self.tokens[self.index].get_kind() == TokenKind::Dot {
             self.index += 1;
             let Token::Ident(section) = self.tokens[self.index].clone() else {
-                eprintln!("expected an identifier in an import path");
-                std::process::exit(1);
+                panic!("expected an identifier in an import path");
             };
             self.index += 1;
             path.push(section);
@@ -474,8 +467,7 @@ impl Parser {
         let alias = if self.tokens[self.index].get_kind() == TokenKind::As {
             self.index += 1;
             let Token::Ident(section) = self.tokens[self.index].clone() else {
-                eprintln!("expected an identifier for import to alias as");
-                std::process::exit(1);
+                panic!("expected an identifier for import to alias as");
             };
             self.index += 1;
             Some(section)
@@ -508,8 +500,7 @@ impl Parser {
         self.index += 1;
 
         let Token::Ident(name) = self.tokens[self.index].clone() else {
-            eprintln!("expected a name after keyword `struct`");
-            std::process::exit(1);
+            panic!("expected a name after keyword `struct`");
         };
         self.index += 1;
 
@@ -518,8 +509,7 @@ impl Parser {
         let mut fields = HashMap::new();
         while noob!(self) && self.tokens[self.index].get_kind() != TokenKind::RCurly {
             let Token::Ident(fname) = self.tokens[self.index].clone() else {
-                eprintln!("expected identifier for a field name in struct declaration");
-                std::process::exit(1);
+                panic!("expected identifier for a field name in struct declaration");
             };
             self.index += 1;
 
@@ -544,8 +534,7 @@ impl Parser {
         self.index += 1;
 
         let Token::Ident(name) = self.tokens[self.index].clone() else {
-            eprintln!("expected a name after keyword `enum`");
-            std::process::exit(1);
+            panic!("expected a name after keyword `enum`");
         };
         self.index += 1;
 
@@ -555,16 +544,14 @@ impl Parser {
         let mut iota = 0;
         while noob!(self) && self.tokens[self.index].get_kind() != TokenKind::RCurly {
             let Token::Ident(vname) = self.tokens[self.index].clone() else {
-                eprintln!("expected identifier for a member name in enum declaration");
-                std::process::exit(1);
+                panic!("expected identifier for a member name in enum declaration");
             };
             self.index += 1;
 
             if self.tokens[self.index].get_kind() == TokenKind::Eq {
                 self.index += 1;
                 let Token::Integer(viota) = self.tokens[self.index].clone() else {
-                    eprintln!("expected an integer after equals sign in enum declaration");
-                    std::process::exit(1);
+                    panic!("expected an integer after equals sign in enum declaration");
                 };
                 self.index += 1;
 
@@ -689,8 +676,7 @@ impl Parser {
                 TokenKind::Dot => {
                     self.advance();
                     let Token::Ident(rhs) = self.advance() else {
-                        eprintln!("`{:?}` is not a valid member", self.tokens[self.index - 1]);
-                        std::process::exit(1);
+                        panic!("`{:?}` is not a valid member", self.tokens[self.index - 1]);
                     };
                     lhs = Ast::ExprMemAcc {
                         lhs: Box::new(lhs),
@@ -799,8 +785,7 @@ impl Parser {
                     let var = if let Token::Ident(n) = t {
                         n
                     } else {
-                        eprintln!("{t:?} is not a valid enum variant");
-                        std::process::exit(1);
+                        panic!("{t:?} is not a valid enum variant");
                     };
                     Some(Ast::ExprEnumVar { name, var })
                 } else {
@@ -848,8 +833,7 @@ impl Parser {
             }
         };
         if res.is_none() {
-            eprintln!("could not parse expression!");
-            std::process::exit(1);
+            panic!("could not parse expression!");
         }
         res
     }

@@ -51,8 +51,7 @@ impl Analyzer {
             .insert(name.clone(), symbol.clone())
             .is_some()
         {
-            eprintln!("\x1b[0;31merror\x1b[0;0m: redefinition of `{}`", name);
-            std::process::exit(1);
+            panic!("\x1b[0;31merror\x1b[0;0m: redefinition of `{}`", name);
         }
 
         // eprintln!("[DEBUG] added {name} as {symbol:?}");
@@ -125,13 +124,13 @@ impl Analyzer {
                 // let ret_type = match self.check(*body) {
                 //     Some(ty) => ty,
                 //     None => {
-                //         eprintln!("function `{name}` has diverging types throughout its branches");
-                //         std::process::exit(1);
+                //
+                //         panic!("function `{name}` has diverging types throughout its branches");
                 //     }
                 // };
                 // if type_eq(ret_type.clone(), ret.clone()).is_err() {
-                //     eprintln!("return type of function `{name}` ({ret:?}) does not match its body ({ret_type:?})");
-                //     std::process::exit(1);
+                //
+                //     panic!("return type of function `{name}` ({ret:?}) does not match its body ({ret_type:?})");
                 // }
                 self.can_return = old;
 
@@ -207,11 +206,10 @@ impl Analyzer {
             } => {
                 let cond = self.check(condition)?;
                 if type_eq(cond.clone(), Type::Bool).is_err() {
-                    eprintln!(
+                    panic!(
                         "condition of if statement must be of type `bool`, got {:?}",
                         cond
                     );
-                    std::process::exit(1);
                 }
                 self.check(body);
                 match alt {
@@ -226,11 +224,10 @@ impl Analyzer {
             Ast::StmtWhile { condition, body } => {
                 let cond = self.check(&mut *condition)?;
                 if type_eq(cond.clone(), Type::Bool).is_err() {
-                    eprintln!(
+                    panic!(
                         "condition of if statement must be of type `bool`, got {:?}",
                         cond
                     );
-                    std::process::exit(1);
                 }
                 let old = self.can_break;
                 self.can_break = true;
@@ -245,16 +242,14 @@ impl Analyzer {
                 body,
             } => {
                 let Some(arr_type) = self.check(array) else {
-                    eprintln!(
+                    panic!(
                         "array in which for loop is iterating over must have the known type `Array`"
                     );
-                    std::process::exit(1);
                 };
                 let Type::Array { inner, .. } = arr_type else {
-                    eprintln!(
+                    panic!(
                         "array in which for loop is iterating over must have the known type `Array`"
                     );
-                    std::process::exit(1);
                 };
 
                 self.add_entry(elem_name.to_owned(), Symbol::Variable { kind: inner });
@@ -268,24 +263,21 @@ impl Analyzer {
             Ast::ExprAssign { var_name, value } => {
                 let var_type = {
                     let entry = self.get_entry(&var_name).unwrap_or_else(|| {
-                        eprintln!("variable `{var_name}` is assigned to before initialization");
-                        std::process::exit(1);
+                        panic!("variable `{var_name}` is assigned to before initialization");
                     });
 
                     if let Symbol::Variable { kind: var_type } = entry {
                         var_type.clone()
                     } else {
-                        eprintln!(
+                        panic!(
                             "`{var_name}` is assigned to, however it is not a variable\n\t{entry:?}"
                         );
-                        std::process::exit(1);
                     }
                 };
 
                 let rhs_type = self.check(value)?;
                 if type_eq(*var_type.clone(), rhs_type.clone()).is_err() {
-                    eprintln!("variable `{var_name}` is assigned to before initialization");
-                    std::process::exit(1);
+                    panic!("variable `{var_name}` is assigned to before initialization");
                 }
                 Some(rhs_type)
             }
@@ -297,10 +289,9 @@ impl Analyzer {
                     // Arithmetic Operations
                     Token::Plus | Token::Dash | Token::Star | Token::Slash => {
                         if type_eq(lhs_type.clone(), rhs_type.clone()).is_err() {
-                            eprintln!(
+                            panic!(
                                 "mismatched types in arithmetic: {lhs_type:?} {op:?} {rhs_type:?}"
                             );
-                            std::process::exit(1);
                         }
                         // Arithmetic on numerics; Plus on strings is
                         // concatenation (codegen already emits ConcatStr).
@@ -310,10 +301,9 @@ impl Analyzer {
                             Type::Integer | Type::Float => Some(lhs_type),
                             Type::String if is_string_plus => Some(Type::String),
                             _ => {
-                                eprintln!(
+                                panic!(
                                     "arithmetic operation {op:?} not supported for type {lhs_type:?}"
                                 );
-                                std::process::exit(1);
                             }
                         }
                     }
@@ -326,10 +316,9 @@ impl Analyzer {
                     | Token::MoreEq
                     | Token::LessEq => {
                         if type_eq(lhs_type.clone(), rhs_type.clone()).is_err() {
-                            eprintln!(
+                            panic!(
                                 "cannot compare mismatched types: {lhs_type:?} {op:?} {rhs_type:?}"
                             );
-                            std::process::exit(1);
                         }
                         Some(Type::Bool)
                     }
@@ -337,8 +326,7 @@ impl Analyzer {
                     // Logical Operations (Requires Booleans)
                     Token::AmpAmp | Token::PipePipe => {
                         if !matches!(lhs_type, Type::Bool) || !matches!(rhs_type, Type::Bool) {
-                            eprintln!("logical operation {op:?} requires boolean operands");
-                            std::process::exit(1);
+                            panic!("logical operation {op:?} requires boolean operands");
                         }
                         Some(Type::Bool)
                     }
@@ -351,25 +339,22 @@ impl Analyzer {
                     | Token::RShift => {
                         if !matches!(lhs_type, Type::Integer) || !matches!(rhs_type, Type::Integer)
                         {
-                            eprintln!("bitwise operation {op:?} requires integer operands");
-                            std::process::exit(1);
+                            panic!("bitwise operation {op:?} requires integer operands");
                         }
                         Some(Type::Integer)
                     }
 
                     Token::Eq => {
                         if type_eq(lhs_type.clone(), rhs_type.clone()).is_err() {
-                            eprintln!(
+                            panic!(
                                 "cannot assign mismatched types: {lhs_type:?} {op:?} {rhs_type:?}\n{lhs:?} = {rhs:?}"
                             );
-                            std::process::exit(1);
                         }
                         Some(lhs_type)
                     }
 
                     _ => {
-                        eprintln!("unsupported binary operator: {op:?}\n{lhs:?}\n{rhs:?}");
-                        std::process::exit(1);
+                        panic!("unsupported binary operator: {op:?}\n{lhs:?}\n{rhs:?}");
                     }
                 }
             }
@@ -381,8 +366,7 @@ impl Analyzer {
                         if type_eq(child_type.clone(), Type::Integer).is_err()
                             && type_eq(child_type.clone(), Type::Float).is_err()
                         {
-                            eprintln!("cannot negate a non number type: {child:?}({child_type:?})");
-                            std::process::exit(1);
+                            panic!("cannot negate a non number type: {child:?}({child_type:?})");
                         } else {
                             Some(child_type)
                         }
@@ -392,23 +376,20 @@ impl Analyzer {
                             && type_eq(child_type.clone(), Type::Float).is_err()
                             && type_eq(child_type.clone(), Type::Bool).is_err()
                         {
-                            eprintln!("can't not this type: {child:?}({child_type:?})");
-                            std::process::exit(1);
+                            panic!("can't not this type: {child:?}({child_type:?})");
                         } else {
                             Some(child_type)
                         }
                     }
                     Token::Tilde => {
                         if type_eq(child_type.clone(), Type::Integer).is_err() {
-                            eprintln!("cannot bitwise invert a non integer type");
-                            std::process::exit(1);
+                            panic!("cannot bitwise invert a non integer type");
                         } else {
                             Some(child_type)
                         }
                     }
                     _ => {
-                        eprintln!("unsupported unary operator: {op:?}\n{child:?}");
-                        std::process::exit(1);
+                        panic!("unsupported unary operator: {op:?}\n{child:?}");
                     }
                 }
             }
@@ -425,20 +406,18 @@ impl Analyzer {
                 // of the generic "undefined function" panic.
                 if name == "remote_call" {
                     if args.len() != 3 {
-                        eprintln!(
+                        panic!(
                             "remote_call expects 3 arguments (peer, method, arg) but received {}",
                             args.len()
                         );
-                        std::process::exit(1);
                     }
                     for (i, arg) in args.iter_mut().enumerate() {
                         let arg_type = self.check(arg)?;
                         if type_eq(arg_type.clone(), Type::String).is_err() {
-                            eprintln!(
+                            panic!(
                                 "remote_call expected str in position {i} but was passed {:?}",
                                 arg_type
                             );
-                            std::process::exit(1);
                         }
                     }
                     return Some(Type::String);
@@ -446,10 +425,7 @@ impl Analyzer {
                 // 1. Fetch and clone the signature in a temporary scope
                 let (params, ret) = {
                     let entry = self.get_entry(&name).unwrap_or_else(|| {
-                        eprintln!(
-                            "attempting to make a function call on an undefined name `{name}`"
-                        );
-                        std::process::exit(1);
+                        panic!("attempting to make a function call on an undefined name `{name}`");
                     });
 
                     if let Symbol::Variable { kind } = entry
@@ -458,21 +434,19 @@ impl Analyzer {
                         // Clone the params and ret to release the borrow on self
                         (params.clone(), ret.clone())
                     } else {
-                        eprintln!(
+                        panic!(
                             "attempting to make a function call on a non-function type: `{name}`"
                         );
-                        std::process::exit(1);
                     }
                 }; // Borrow of self ends here
 
                 // 2. Validate argument count
                 if args.len() != params.len() {
-                    eprintln!(
+                    panic!(
                         "function `{name}` expects {} arguments but received {}",
                         params.len(),
                         args.len()
                     );
-                    std::process::exit(1);
                 }
 
                 // 3. Check each argument (safe to borrow self mutably now)
@@ -480,11 +454,10 @@ impl Analyzer {
                     let arg_type = self.check(arg)?;
 
                     if type_eq(arg_type.clone(), param.clone()).is_err() {
-                        eprintln!(
+                        panic!(
                             "function `{name}` expected {:?} in position {i} but was passed {:?}",
                             param, arg_type
                         );
-                        std::process::exit(1);
                     }
                 }
 
@@ -494,24 +467,20 @@ impl Analyzer {
             Ast::ExprMemAcc { lhs, member } => {
                 let lhs_type = self.check(lhs)?;
                 let Type::Ident(sname) = lhs_type else {
-                    eprintln!("{lhs_type:?} is not a struct with members");
-                    std::process::exit(1);
+                    panic!("{lhs_type:?} is not a struct with members");
                 };
 
                 let mem_type = {
                     let Some(entry) = self.get_entry(&sname) else {
-                        eprintln!("could not find struct `{sname}` in scope");
-                        std::process::exit(1);
+                        panic!("could not find struct `{sname}` in scope");
                     };
 
                     let Symbol::Struct { fields } = entry else {
-                        eprintln!("`{sname}` is not a struct");
-                        std::process::exit(1);
+                        panic!("`{sname}` is not a struct");
                     };
 
                     let Some(mem) = fields.get(member) else {
-                        eprintln!("`{sname}` has no member `{member}`");
-                        std::process::exit(1);
+                        panic!("`{sname}` has no member `{member}`");
                     };
 
                     mem.clone()
@@ -521,18 +490,15 @@ impl Analyzer {
             }
             Ast::ExprEnumVar { name, var } => {
                 let Some(entry) = self.get_entry(&name) else {
-                    eprintln!("could not find struct `{name}` in scope");
-                    std::process::exit(1);
+                    panic!("could not find struct `{name}` in scope");
                 };
 
                 let Symbol::Enum { variants } = entry else {
-                    eprintln!("`{name}` is not an enum");
-                    std::process::exit(1);
+                    panic!("`{name}` is not an enum");
                 };
 
                 if variants.get(var).is_none() {
-                    eprintln!("`{name}` has no variant `{var}`");
-                    std::process::exit(1);
+                    panic!("`{name}` has no variant `{var}`");
                 };
 
                 Some(Type::Ident(name.clone()))
@@ -552,8 +518,7 @@ impl Analyzer {
             }
             Ast::ExprReturn { val } => {
                 if !self.can_return {
-                    eprintln!("illegal return statement");
-                    std::process::exit(1);
+                    panic!("illegal return statement");
                 }
                 match val {
                     Some(v) => Some(self.check(&mut *v)?),
@@ -568,15 +533,13 @@ impl Analyzer {
             Ast::ExprVar(name) => {
                 let var_type = {
                     let entry = self.get_entry(&name).unwrap_or_else(|| {
-                        eprintln!("variable `{name}` could not be found in the current scope");
-                        std::process::exit(1);
+                        panic!("variable `{name}` could not be found in the current scope");
                     });
 
                     if let Symbol::Variable { kind: var_type } = entry {
                         var_type.clone()
                     } else {
-                        eprintln!("`{name}` is not a variable\n\t{entry:?}");
-                        std::process::exit(1);
+                        panic!("`{name}` is not a variable\n\t{entry:?}");
                     }
                 };
                 Some(*var_type)

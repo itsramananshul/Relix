@@ -42,11 +42,7 @@ use relix_core::types::{FlowId, RequestId, TraceId};
 use crate::dispatch::{build_request, decode_response};
 use crate::manifest::{ManifestCache, MeshClient};
 use crate::sflow;
-use crate::sol::analyzer::Analyzer;
-use crate::sol::bytecode::Codegen;
 use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError, RemoteCallResult};
-use crate::sol::lexer::Lexer;
-use crate::sol::parser::Parser;
 use crate::sol::vm::{VM, VM_ERROR_SENTINEL};
 use crate::transport::envelope::ResponseResult;
 use crate::transport::rpc::{self, Event as TransportEvent, Multiaddr, PeerId};
@@ -529,23 +525,18 @@ fn append_log(
 }
 
 fn compile_sol(path: &Path) -> Result<Vec<crate::sol::bytecode::Inst>, FlowRunnerError> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| FlowRunnerError::Config(format!("non-UTF-8 path: {}", path.display())))?;
     if !path.exists() {
         return Err(FlowRunnerError::Config(format!(
             "flow file not found: {}",
             path.display()
         )));
     }
-    let mut lexer = Lexer::from(path_str);
-    let tokens = lexer.tokens();
-    let mut parser = Parser::from(tokens);
-    let mut program = parser.run();
-    let mut analyzer = Analyzer::new();
-    analyzer.run(&mut program);
-    let mut codegen = Codegen::from(analyzer.tt_arena);
-    Ok(codegen.gen_bcode(&program))
+    // Hand off to the SOL crate's public compile entry point.
+    // It owns the catch_unwind that converts the verbatim port's
+    // panic-on-bad-input into a regular Result so a malformed
+    // flow loaded at startup fails cleanly instead of unwinding
+    // through the controller.
+    crate::sol::compile_path(path).map_err(FlowRunnerError::Config)
 }
 
 async fn dial_all_peers(

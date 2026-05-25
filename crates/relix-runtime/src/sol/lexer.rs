@@ -1,5 +1,3 @@
-use std::process::exit;
-
 #[derive(Debug, Clone)]
 pub enum Token {
     Ident(String),
@@ -200,6 +198,18 @@ impl Lexer {
         }
     }
 
+    /// Build a lexer from an in-memory source string. The
+    /// `Lexer::from` constructor reads from disk (and panics on
+    /// I/O failure) — this variant skips both, so the bridge's
+    /// validate endpoint can lex a user-supplied buffer without
+    /// touching the filesystem.
+    pub fn from_source(source: &str) -> Self {
+        Self {
+            source: source.chars().collect(),
+            index: 0usize,
+        }
+    }
+
     pub fn tokens(&mut self) -> Vec<Token> {
         std::iter::from_fn(|| self.next_token()).collect()
     }
@@ -323,7 +333,7 @@ impl Lexer {
 
             c => {
                 eprintln!("unrecognized character: '{c}'");
-                exit(1);
+                panic!("sol: aborted");
             }
         };
         self.index += 1;

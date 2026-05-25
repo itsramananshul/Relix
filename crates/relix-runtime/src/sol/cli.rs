@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    process,
-};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -32,7 +29,7 @@ impl CliParser {
                         options.insert(option, value.to_string());
                     } else {
                         eprintln!("Expected argument after `{option}`");
-                        process::exit(1);
+                        panic!("sol: aborted");
                     }
                 }
             } else {
