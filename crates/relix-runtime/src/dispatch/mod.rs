@@ -1682,6 +1682,79 @@ mod tests {
         assert!(snap[0].reason.contains("deny list"));
     }
 
+    #[test]
+    fn build_otel_config_returns_none_when_section_missing() {
+        let cfg_text = r#"
+            [controller]
+            name = "x"
+            node_type = "memory"
+            listen_port = 1
+            [identity]
+            key_path = "x"
+            [trust]
+            org_root_key_path = "x"
+            [policy]
+            file = "x"
+        "#;
+        let cfg: crate::controller_runtime::ControllerConfig = toml::from_str(cfg_text).unwrap();
+        assert!(crate::controller_runtime::build_otel_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn build_otel_config_returns_none_when_disabled() {
+        let cfg_text = r#"
+            [controller]
+            name = "x"
+            node_type = "memory"
+            listen_port = 1
+            [identity]
+            key_path = "x"
+            [trust]
+            org_root_key_path = "x"
+            [policy]
+            file = "x"
+
+            [observability.otel]
+            enabled = false
+            endpoint = "http://localhost:4318/v1/traces"
+        "#;
+        let cfg: crate::controller_runtime::ControllerConfig = toml::from_str(cfg_text).unwrap();
+        assert!(crate::controller_runtime::build_otel_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn build_otel_config_returns_runtime_config_when_enabled_with_endpoint() {
+        let cfg_text = r#"
+            [controller]
+            name = "x"
+            node_type = "memory"
+            listen_port = 1
+            [identity]
+            key_path = "x"
+            [trust]
+            org_root_key_path = "x"
+            [policy]
+            file = "x"
+
+            [observability.otel]
+            enabled = true
+            endpoint = "http://localhost:4318/v1/traces"
+            service_name = "my-service"
+            events = ["model_call", "tool_call"]
+        "#;
+        let cfg: crate::controller_runtime::ControllerConfig = toml::from_str(cfg_text).unwrap();
+        let otel = crate::controller_runtime::build_otel_config(&cfg)
+            .expect("otel config built when enabled + endpoint set");
+        assert!(otel.enabled);
+        assert_eq!(
+            otel.endpoint_url.as_deref(),
+            Some("http://localhost:4318/v1/traces")
+        );
+        assert_eq!(otel.service_name, "my-service");
+        assert!(otel.events.is_enabled("model_call"));
+        assert!(otel.events.is_enabled("tool_call"));
+    }
+
     #[tokio::test]
     async fn access_broker_loads_policies_from_execution_agents_config() {
         // Mirror what `build_access_broker` does so the test

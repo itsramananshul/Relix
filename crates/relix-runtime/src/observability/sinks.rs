@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::otel::OtelExporter;
 use super::provenance::ProvenanceRegistry;
 
 /// Errors raised by either sink.
@@ -306,12 +307,18 @@ impl ContentSink {
 }
 
 /// Two-sink bundle plus the provenance registry. Cheap to
-/// clone (three Arcs).
+/// clone (three / four Arcs).
 #[derive(Clone)]
 pub struct ObservabilityContext {
     pub metadata: Arc<MetadataSink>,
     pub content: Arc<ContentSink>,
     pub provenance: Arc<ProvenanceRegistry>,
+    /// W7: optional OTLP exporter. `Some(...)` when the
+    /// `[observability.otel]` config block is enabled +
+    /// pointed at an endpoint. `record_event` pushes the
+    /// metadata row onto the exporter's buffer so the periodic
+    /// flush task ships it as an OTLP span.
+    pub otel: Option<Arc<OtelExporter>>,
 }
 
 impl ObservabilityContext {
@@ -324,7 +331,15 @@ impl ObservabilityContext {
             metadata,
             content,
             provenance,
+            otel: None,
         }
+    }
+
+    /// W7: attach an OTLP exporter to an existing context.
+    /// Cheap; returns `Self` so callers can chain.
+    pub fn with_otel(mut self, exporter: Arc<OtelExporter>) -> Self {
+        self.otel = Some(exporter);
+        self
     }
 
     /// In-memory triple for tests. Content retention is 7
@@ -336,15 +351,23 @@ impl ObservabilityContext {
             provenance: Arc::new(
                 ProvenanceRegistry::in_memory().expect("in-memory provenance registry opens"),
             ),
+            otel: None,
         }
     }
 
     /// Record one event. Metadata always lands; content is
     /// optional and stored only when supplied. The two
-    /// rows share `event_id` so callers can join later.
+    /// rows share `event_id` so callers can join later. When
+    /// an OTel exporter is attached, the metadata row is also
+    /// forwarded as a span — the exporter's own
+    /// `enabled_events` whitelist decides what actually
+    /// buffers; Sink B content is never forwarded.
     pub fn record_event(&self, meta: MetadataEvent, content: Option<ContentEvent>) {
         if let Err(e) = self.metadata.record(&meta) {
             tracing::warn!(error = %e, event_id = %meta.event_id, "observability: metadata record failed");
+        }
+        if let Some(otel) = self.otel.as_ref() {
+            otel.record_event(&meta);
         }
         if let Some(c) = content
             && let Err(e) = self.content.record(&c)

@@ -89,6 +89,12 @@ pub struct ControllerConfig {
     /// broker (every check returns Allow).
     #[serde(default)]
     pub execution: Option<ExecutionSection>,
+    /// `[observability]` — root for observability-layer
+    /// wiring. W7 ships the `[observability.otel]` sub-block.
+    /// Absent / disabled means the OTel exporter never spawns
+    /// and existing deployments stay HTTP-egress-free.
+    #[serde(default)]
+    pub observability: Option<ObservabilitySection>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -147,6 +153,39 @@ pub struct TrustSection {
 #[derive(Clone, Debug, Deserialize)]
 pub struct PolicySection {
     pub file: PathBuf,
+}
+
+/// `[observability]` section — top-level container for
+/// observability wiring. W7 carries the `otel` block; future
+/// waves can add tracing exporters / metrics endpoints
+/// without re-shaping the schema.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ObservabilitySection {
+    #[serde(default)]
+    pub otel: Option<OtelConfigToml>,
+}
+
+/// `[observability.otel]` — operator-friendly shape that
+/// projects into [`crate::observability::OtelConfig`]. We
+/// avoid wiring the runtime struct directly so the operator
+/// TOML stays minimal (no JSON whitelist for the attribute
+/// keys, etc. — defaults apply).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct OtelConfigToml {
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP traces endpoint (e.g.
+    /// `http://localhost:4318/v1/traces`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Resource service.name attribute. Defaults to
+    /// `"relix-runtime"`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Event types operators want exported. When empty the
+    /// exporter buffers nothing — fail-safe default.
+    #[serde(default)]
+    pub events: Vec<String>,
 }
 
 /// `[execution]` section — wraps `[[execution.agents]]` so
@@ -290,6 +329,33 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     client.bootstrap_kademlia().await;
+
+    // W7: optional OTel exporter loop. When the controller's
+    // `[observability.otel]` block is enabled + has an
+    // endpoint, build the exporter once and spawn a tokio task
+    // that calls `flush()` every 5 seconds. The exporter is
+    // currently producer-less on a controller (controllers
+    // don't run a bridge-style ObservabilityContext), so the
+    // flush loop is forward-compat plumbing — when controllers
+    // gain their own metadata sink the same exporter
+    // instance becomes the OTLP shipping path.
+    if let Some(otel_cfg) = build_otel_config(&cfg) {
+        let exporter = std::sync::Arc::new(crate::observability::OtelExporter::new(otel_cfg));
+        // The spawned task owns its own clone — that clone
+        // keeps the exporter alive as long as the loop runs
+        // (forever, in practice), so the original Arc going
+        // out of scope here is harmless.
+        let exp_clone = exporter.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let _ = exp_clone.flush().await;
+            }
+        });
+        tracing::info!("observability: spawned OTLP exporter flush loop (interval=5s)");
+    }
 
     // Router-only background loops.
     if let Some(state) = router_state.clone() {
@@ -2783,6 +2849,39 @@ fn build_input_guardrail(cfg: &ControllerConfig) -> crate::nodes::ai::guardrails
             InputGuardrail::permissive()
         }
     }
+}
+
+/// W7: build the runtime `OtelConfig` from the controller's
+/// `[observability.otel]` block. Returns `None` when no block
+/// is configured. The returned config carries `enabled: true`
+/// only when both the section's `enabled` flag is set AND an
+/// endpoint URL is provided — otherwise the exporter stays
+/// dormant so a misconfigured operator doesn't sprout a stray
+/// outbound dependency.
+pub(crate) fn build_otel_config(
+    cfg: &ControllerConfig,
+) -> Option<crate::observability::OtelConfig> {
+    let obs = cfg.observability.as_ref()?;
+    let otel = obs.otel.as_ref()?;
+    if !otel.enabled || otel.endpoint.is_none() {
+        return None;
+    }
+    let mut runtime_cfg = crate::observability::OtelConfig {
+        enabled: true,
+        endpoint_url: otel.endpoint.clone(),
+        ..crate::observability::OtelConfig::default()
+    };
+    if let Some(s) = otel.service_name.as_deref()
+        && !s.is_empty()
+    {
+        runtime_cfg.service_name = s.to_string();
+    }
+    let mut events = runtime_cfg.events.clone();
+    for e in &otel.events {
+        events = events.enable(e);
+    }
+    runtime_cfg.events = events;
+    Some(runtime_cfg)
 }
 
 /// W2: build an `AgentAccessBroker` from the controller's
