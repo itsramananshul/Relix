@@ -36,6 +36,7 @@ hex.workspace                = true
 tempfile.workspace           = true
 rand.workspace               = true
 blake3.workspace             = true
+sha2.workspace               = true
 futures.workspace            = true
 async-stream.workspace       = true
 time.workspace               = true
