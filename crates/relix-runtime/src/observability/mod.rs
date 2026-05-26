@@ -18,10 +18,12 @@
 //! The session debugger, provenance registry, and optional
 //! OTel exporter land as separate commits + sub-modules.
 
+pub mod otel;
 pub mod provenance;
 pub mod session_debugger;
 pub mod sinks;
 
+pub use otel::{AttrValue, OtelConfig, OtelEventConfig, OtelExporter, OtelSpan};
 pub use provenance::{
     ProvenanceChange, ProvenanceDiff, ProvenanceError, ProvenanceRegistry, ProvenanceSnapshot,
     diff_snapshots,
