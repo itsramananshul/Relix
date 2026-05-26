@@ -4,6 +4,7 @@ mod browser;
 mod capability;
 mod config;
 mod doctor;
+mod export;
 mod flow_run;
 mod fs;
 mod identity;
@@ -194,6 +195,14 @@ enum Cmd {
     /// download + replace if a newer version exists.
     Update(update::UpdateArgs),
 
+    /// Export conversation history from Relix in JSON / Markdown / CSV.
+    ///
+    /// Specify exactly one scope: `--session <id>`, `--agent <name>`,
+    /// or `--all`. The CLI calls `GET /v1/sessions/export` on the
+    /// bridge; renderers + formats live on the bridge side so the
+    /// output is the single source of truth.
+    Export(export::ExportArgs),
+
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -254,6 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Stop => mesh::stop(),
         Cmd::Status(args) => mesh::status(args).await,
         Cmd::Update(args) => update::run(args).await,
+        Cmd::Export(args) => export::run(args).await,
         Cmd::FlowRun {
             flow,
             identity,

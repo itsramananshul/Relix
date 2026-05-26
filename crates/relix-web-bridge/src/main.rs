@@ -99,6 +99,7 @@ mod dashboard;
 mod delegate;
 mod discord;
 mod dispatch_stats;
+mod export;
 mod flow;
 mod fs_audit;
 mod intervention_audit;
@@ -315,6 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/models", get(openai::models))
         .route("/v1/info", get(openai::info))
         .route("/v1/schema", get(schema::schema))
+        .route("/v1/sessions/export", get(export::export))
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Task-native read API (Track 2). Bridge stays translation-only:
         // each route is a thin forwarder to a Coordinator capability.
