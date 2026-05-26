@@ -86,6 +86,11 @@ struct ChildIo {
     child: Child,
 }
 
+/// Optional resolved env map for the spawned child. Keyed by
+/// var name; values are the post-`$VAR`-substitution strings
+/// from [`crate::nodes::tool::mcp::resolve_env`].
+pub type SpawnEnv = std::collections::HashMap<String, String>;
+
 /// Per-server MCP stdio client. Cheap to construct; the actual
 /// process is spawned lazily on first call.
 pub struct McpStdioClient {
@@ -95,6 +100,14 @@ pub struct McpStdioClient {
     program: String,
     /// Arguments to pass to the program (after the program name).
     args: Vec<String>,
+    /// Resolved env vars to attach to the spawned process.
+    /// Empty means "inherit parent env unchanged"; non-empty
+    /// means "merge these into the inherited env, overwriting
+    /// any same-named parent vars". The MCP stdio shape works
+    /// either way today — operators set this to pass through
+    /// tokens like `GITHUB_PERSONAL_ACCESS_TOKEN` to subprocess
+    /// servers that need them.
+    env: SpawnEnv,
     /// Monotonic JSON-RPC id counter. Starts at 1; 0 is reserved
     /// to avoid ambiguity with some servers that treat id 0 as
     /// "unset".
@@ -111,6 +124,22 @@ impl McpStdioClient {
             server_id,
             program,
             args,
+            env: SpawnEnv::new(),
+            next_id: AtomicU64::new(1),
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Same as [`Self::new`] but attaches a resolved env map
+    /// that will be passed to the spawned subprocess. Used by
+    /// the registry construction path that reads
+    /// `[[tool.mcp.servers.env]]` from config.
+    pub fn with_env(server_id: String, program: String, args: Vec<String>, env: SpawnEnv) -> Self {
+        Self {
+            server_id,
+            program,
+            args,
+            env,
             next_id: AtomicU64::new(1),
             inner: Mutex::new(None),
         }
@@ -151,7 +180,8 @@ impl McpStdioClient {
     async fn dispatch(&self, req: JsonRpcRequest) -> Result<Value, StdioError> {
         let mut guard = self.inner.lock().await;
         if guard.is_none() {
-            let io = spawn_and_initialize(&self.program, &self.args, &self.next_id).await?;
+            let io =
+                spawn_and_initialize(&self.program, &self.args, &self.env, &self.next_id).await?;
             *guard = Some(io);
         }
         let io = guard.as_mut().expect("just inserted");
@@ -181,6 +211,7 @@ impl McpStdioClient {
 async fn spawn_and_initialize(
     program: &str,
     args: &[String],
+    env: &SpawnEnv,
     next_id: &AtomicU64,
 ) -> Result<ChildIo, StdioError> {
     let mut cmd = Command::new(program);
@@ -189,6 +220,13 @@ async fn spawn_and_initialize(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Merge operator-supplied env vars INTO the inherited
+    // parent env. The empty case is a no-op (parent env rides
+    // through unchanged). Non-empty entries overwrite same-
+    // named parent vars — that's the documented semantic.
+    if !env.is_empty() {
+        cmd.envs(env);
+    }
     let mut child = cmd.spawn().map_err(|e| StdioError::Spawn {
         program: program.to_string(),
         source: e,

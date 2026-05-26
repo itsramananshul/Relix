@@ -302,6 +302,85 @@ pub struct McpServerConfig {
     /// Short human description for dashboard / logs.
     #[serde(default)]
     pub description: Option<String>,
+    /// Environment variables to pass to the spawned process.
+    /// Each value can contain `$VAR` references that resolve
+    /// against the parent process env at startup; missing
+    /// references resolve to empty string (and a startup
+    /// `tracing::warn!` line). Ignored for `http` transport.
+    /// Example:
+    /// ```toml
+    /// [[tool.mcp.servers]]
+    /// id = "github"
+    /// transport = "stdio"
+    /// command = "npx"
+    /// args = ["-y", "@modelcontextprotocol/server-github"]
+    /// [tool.mcp.servers.env]
+    /// GITHUB_PERSONAL_ACCESS_TOKEN = "$GITHUB_TOKEN"
+    /// ```
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// Resolve `$VAR` references in `value` against `std::env`.
+/// `$` followed by anything not alphanumeric or `_` is left
+/// alone. Missing variables resolve to empty string (the
+/// caller's tracing line surfaces the gap).
+pub fn substitute_env_vars(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // A variable reference is `$` followed by at least one
+        // identifier character; the first must be a letter or
+        // underscore (matches POSIX shell variable name rules
+        // — `$9.99` is dollar-then-literal, not a var).
+        if bytes[i] == b'$'
+            && i + 1 < bytes.len()
+            && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+        {
+            let mut end = i + 1;
+            while end < bytes.len() {
+                let b = bytes[end];
+                if b.is_ascii_alphanumeric() || b == b'_' {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            let name = &value[i + 1..end];
+            let val = std::env::var(name).unwrap_or_default();
+            out.push_str(&val);
+            i = end;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Resolve every `$VAR` reference in a server's `env` map at
+/// once. Returns the resolved key→value map ready to hand to
+/// `tokio::process::Command::envs`. Logs a warn line for each
+/// `$VAR` that resolved to empty so operators see the gap.
+pub fn resolve_env(
+    server_id: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::with_capacity(env.len());
+    for (k, v) in env {
+        let resolved = substitute_env_vars(v);
+        if v.contains('$') && resolved.is_empty() {
+            tracing::warn!(
+                server = server_id,
+                key = k.as_str(),
+                template = v.as_str(),
+                "mcp: env var resolved to empty — referenced parent env var is missing"
+            );
+        }
+        out.insert(k.clone(), resolved);
+    }
+    out
 }
 
 impl McpServerConfig {
@@ -781,7 +860,70 @@ mod tests {
             args: vec![],
             declared_tools: vec![],
             description: None,
+            env: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn substitute_env_vars_replaces_known_and_drops_missing() {
+        // SAFE: env is process-global, but the runtime crate
+        // forbids unsafe_code and `std::env::set_var` is unsafe
+        // in 2024. Test against a real env var that always
+        // exists on every Relix-supported platform.
+        let path_value = std::env::var("PATH").unwrap_or_else(|_| "fallback".into());
+        let resolved = substitute_env_vars("[$PATH]");
+        assert_eq!(resolved, format!("[{path_value}]"));
+        // Missing var → empty.
+        let resolved = substitute_env_vars("token=$RELIX_DEFINITELY_NOT_A_REAL_VAR_XYZZY_999");
+        assert_eq!(resolved, "token=");
+        // Bare `$` is left alone.
+        let resolved = substitute_env_vars("price: $9.99");
+        assert_eq!(resolved, "price: $9.99");
+    }
+
+    #[test]
+    fn resolve_env_returns_empty_for_empty_input() {
+        let m = std::collections::HashMap::new();
+        let r = resolve_env("test-server", &m);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn resolve_env_substitutes_per_value() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("LITERAL".into(), "value".into());
+        let path_value = std::env::var("PATH").unwrap_or_else(|_| "fallback".into());
+        m.insert("INTERP".into(), "$PATH".into());
+        let r = resolve_env("test-server", &m);
+        assert_eq!(r.get("LITERAL").map(String::as_str), Some("value"));
+        assert_eq!(
+            r.get("INTERP").map(String::as_str),
+            Some(path_value.as_str())
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_parses_with_env_block() {
+        let toml = r#"
+            id = "github"
+            transport = "stdio"
+            endpoint = "npx"
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-github"]
+            [env]
+            GITHUB_PERSONAL_ACCESS_TOKEN = "$GITHUB_TOKEN"
+        "#;
+        let cfg: McpServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.id, "github");
+        assert_eq!(cfg.transport, "stdio");
+        assert_eq!(cfg.command.as_deref(), Some("npx"));
+        assert_eq!(cfg.args.len(), 2);
+        assert_eq!(
+            cfg.env
+                .get("GITHUB_PERSONAL_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("$GITHUB_TOKEN")
+        );
     }
 
     #[test]
@@ -954,6 +1096,7 @@ mod tests {
             args: vec!["@modelcontextprotocol/server-filesystem".into()],
             declared_tools: vec![],
             description: None,
+            env: std::collections::HashMap::new(),
         };
         // Empty endpoint is fine when command is set.
         validate_config(&make_cfg(vec![s.clone()])).unwrap();
