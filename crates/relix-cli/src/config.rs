@@ -93,6 +93,53 @@ pub struct MeshConfig {
     pub data_dir: String,
     #[serde(default = "default_bridge_port")]
     pub bridge_port: u16,
+    /// Per-principal rate-limit budgets. Operators edit these
+    /// directly in `~/.relix/config.toml`. The setup wizard
+    /// preserves the existing values across a re-run but doesn't
+    /// expose a UI for them yet — the defaults are sane for
+    /// every local-deployment shape we ship.
+    #[serde(default)]
+    pub rate_limits: RateLimitsConfig,
+}
+
+/// `[mesh.rate_limits]` — copy of the bridge's
+/// `crate::rate_limit::RateLimitConfig` shape so the wizard can
+/// round-trip the section without depending on the bridge crate.
+/// Field defaults match `crate::rate_limit::DEFAULT_*`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RateLimitsConfig {
+    #[serde(default = "default_ai_per_min")]
+    pub ai_calls_per_min: u32,
+    #[serde(default = "default_dashboard_per_min")]
+    pub dashboard_polls_per_min: u32,
+    #[serde(default = "default_task_mut_per_min")]
+    pub task_mutations_per_min: u32,
+    #[serde(default = "default_ws_max_concurrent")]
+    pub ws_max_concurrent: u32,
+}
+
+impl Default for RateLimitsConfig {
+    fn default() -> Self {
+        Self {
+            ai_calls_per_min: default_ai_per_min(),
+            dashboard_polls_per_min: default_dashboard_per_min(),
+            task_mutations_per_min: default_task_mut_per_min(),
+            ws_max_concurrent: default_ws_max_concurrent(),
+        }
+    }
+}
+
+fn default_ai_per_min() -> u32 {
+    60
+}
+fn default_dashboard_per_min() -> u32 {
+    120
+}
+fn default_task_mut_per_min() -> u32 {
+    30
+}
+fn default_ws_max_concurrent() -> u32 {
+    5
 }
 
 impl Default for MeshConfig {
@@ -100,6 +147,7 @@ impl Default for MeshConfig {
         Self {
             data_dir: default_data_dir(),
             bridge_port: default_bridge_port(),
+            rate_limits: RateLimitsConfig::default(),
         }
     }
 }

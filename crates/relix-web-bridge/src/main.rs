@@ -114,6 +114,7 @@ mod os_secure;
 mod plugins;
 mod policy_denials;
 mod policy_simulate;
+mod rate_limit;
 mod secrets;
 mod slack;
 mod sol_validate;
@@ -635,6 +636,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // already has an Authorization header, and CSRF-checks
         // the Origin. See `auth.rs`.
         .route("/v1/auth/token", get(auth::bootstrap_token))
+        // Per-principal rate-limit middleware. Runs AFTER auth so
+        // each principal gets its own bucket. Layered below the
+        // auth layer in the source — axum applies layers
+        // outermost-last, so the topology is:
+        //   incoming request -> auth -> rate_limit -> handler
+        // (auth runs first; on success the request passes through
+        // the rate limiter; on overflow the limiter returns 429).
+        .layer(axum::middleware::from_fn_with_state(
+            state.rate_limits.clone(),
+            rate_limit::rate_limit_middleware,
+        ))
         // Token + CSRF guard for every mutating route. Public
         // routes (/health, /dashboard, /v1/auth/token, /assets/*)
         // are allowlisted inside the middleware itself. The

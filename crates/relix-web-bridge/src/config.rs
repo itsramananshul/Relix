@@ -36,6 +36,22 @@ pub struct BridgeConfig {
     /// persistence; the user's request still executes).
     #[serde(default)]
     pub coordinator: Option<CoordinatorSection>,
+    /// Optional per-principal HTTP + WS rate-limit budgets. Missing
+    /// section ⇒ the documented defaults in `crate::rate_limit`
+    /// (60/min AI, 120/min dashboard polls, 30/min task mutations,
+    /// 5 concurrent WS sockets).
+    #[serde(default)]
+    pub mesh: MeshSection,
+}
+
+/// Bridge-level container for the `[mesh]` block. Only carries
+/// rate-limit settings today; future mesh-wide knobs (alternative
+/// transport pin lists, default deadlines, etc.) can extend this
+/// section without breaking existing operator configs.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MeshSection {
+    #[serde(default)]
+    pub rate_limits: Option<crate::rate_limit::RateLimitConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -238,6 +254,10 @@ pub struct AppState {
     /// TCP port of the listen address. Used by the CSRF origin
     /// guard for the same reason as `bridge_host`.
     pub bridge_port: u16,
+    /// Per-principal rate-limit buckets and the WS concurrency
+    /// gate. Shared with both the HTTP middleware and the
+    /// WebSocket handler. See `crate::rate_limit`.
+    pub rate_limits: crate::rate_limit::RateLimits,
 }
 
 impl AppState {
@@ -338,6 +358,10 @@ impl AppState {
         let intervention_audit =
             crate::intervention_audit::InterventionAudit::new(intervention_path);
 
+        // Snapshot rate-limit config before `cfg` moves into the
+        // shared Arc on the next line — the limiter owns its own
+        // copy of just the budgets.
+        let rate_limit_cfg = cfg.mesh.rate_limits.clone().unwrap_or_default();
         Ok(Self {
             cfg: Arc::new(cfg),
             identity_bundle,
@@ -360,6 +384,7 @@ impl AppState {
             bridge_token,
             bridge_host,
             bridge_port,
+            rate_limits: crate::rate_limit::RateLimits::new(rate_limit_cfg),
         })
     }
 }

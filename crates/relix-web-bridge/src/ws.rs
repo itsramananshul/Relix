@@ -72,24 +72,72 @@ struct ChunkMsg<'a> {
 }
 
 /// `GET /ws/chat`. Validates the `Authorization: Bearer <token>`
-/// header on the upgrade request, then hands the socket off to
-/// [`run_ws_session`].
+/// header on the upgrade request, takes one slot from the
+/// per-principal concurrent-WS rate limit, then hands the socket
+/// off to [`run_ws_session`]. The rate-limit guard is moved into
+/// the session so it drops (and frees the slot) only when the
+/// socket actually closes.
 pub async fn chat_ws(
     State(state): State<AppState>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    match parse_bearer(&headers) {
-        Ok(()) => upgrade.on_upgrade(move |socket| run_ws_session(socket, state)),
-        Err(reason) => (StatusCode::UNAUTHORIZED, reason).into_response(),
+    if let Err(reason) = parse_bearer(&headers) {
+        return (StatusCode::UNAUTHORIZED, reason).into_response();
     }
+    let principal = ws_principal(&headers);
+    let guard = match state.rate_limits.ws_acquire(&principal) {
+        Ok(g) => g,
+        Err(limit) => {
+            return ws_limit_response(limit);
+        }
+    };
+    upgrade.on_upgrade(move |socket| run_ws_session(socket, state, guard))
+}
+
+fn ws_principal(headers: &HeaderMap) -> String {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "anon".to_string())
+}
+
+/// 429 response mirroring the HTTP rate-limit middleware's
+/// shape: `retry_after_secs` body field + matching
+/// `Retry-After` header. Used when the per-principal concurrent
+/// WebSocket cap is exceeded.
+fn ws_limit_response(limit: u32) -> Response {
+    use axum::http::HeaderValue;
+    use axum::http::header::RETRY_AFTER;
+    let body = json!({
+        "error": "rate_limit_exceeded",
+        "retry_after_secs": 60,
+        "ws_limit": limit,
+    })
+    .to_string();
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+    resp.headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("60"));
+    resp
 }
 
 /// Run one WebSocket chat session end-to-end. Reads the request,
 /// executes the chat flow, splits the materialised reply
 /// word-by-word, streams chunks over the socket, and finishes
-/// with a `done` or `error` JSON message.
-async fn run_ws_session(mut socket: WebSocket, state: AppState) {
+/// with a `done` or `error` JSON message. The `_ws_guard`
+/// argument owns the per-principal rate-limit slot; the slot is
+/// released when the function returns (success, error, or panic).
+async fn run_ws_session(
+    mut socket: WebSocket,
+    state: AppState,
+    _ws_guard: crate::rate_limit::WsGuard,
+) {
     let Some(req) = read_request(&mut socket).await else {
         return;
     };
