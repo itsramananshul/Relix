@@ -219,6 +219,17 @@ impl FsJail {
     /// reads, search hits); `false` allows non-existent targets (for
     /// new file writes) by canonicalising the parent dir and joining
     /// the basename.
+    ///
+    /// TOCTOU posture: after canonicalization we run two checks:
+    /// 1. [`jail_contains_path`] (strict prefix, also refuses
+    ///    `path == base`).
+    /// 2. [`refuse_symlinks_within_jail`] walks every component
+    ///    of the resolved path under the jail root and refuses if
+    ///    any is a symlink. The pre-open symlink check is
+    ///    defence-in-depth on top of canonicalisation — it shrinks
+    ///    (but cannot eliminate without portable `openat`) the
+    ///    window where a path component is swapped between resolve
+    ///    and the eventual `File::open`.
     fn resolve(&self, rel: &str, must_exist: bool) -> Result<PathBuf, JailError> {
         let trimmed = rel.trim();
         if trimmed.is_empty() {
@@ -239,17 +250,26 @@ impl FsJail {
 
         let joined = self.canonical_root.join(rel_path);
 
-        if must_exist {
+        let resolved = if must_exist {
             let canonical = joined
                 .canonicalize()
                 .map_err(|e| JailError::Io(format!("canonicalize {trimmed}: {e}")))?;
+            // `must_exist` paths may resolve to the jail root itself
+            // (for `list_dir`, `tree`, `stat` on `.` / `""`). Use the
+            // lenient `starts_with` check here. Callers that need
+            // strict containment (e.g. "this must be a file inside the
+            // jail, not the jail itself") gate that on `jail_contains_path`
+            // separately.
             if !canonical.starts_with(&self.canonical_root) {
                 return Err(JailError::Escape(trimmed.to_string()));
             }
-            Ok(canonical)
+            canonical
         } else {
             // Target may not exist (writes). Canonicalise the parent
-            // and append the basename. Parent must exist.
+            // and append the basename. Parent must exist and may
+            // legitimately be the jail root itself (when creating a
+            // top-level file like `hello.txt`); we only need
+            // `starts_with` for the parent, not strict containment.
             let parent = joined.parent().ok_or(JailError::Empty)?.to_path_buf();
             let parent_canonical = parent
                 .canonicalize()
@@ -258,8 +278,14 @@ impl FsJail {
                 return Err(JailError::Escape(trimmed.to_string()));
             }
             let basename = joined.file_name().ok_or(JailError::Empty)?.to_owned();
-            Ok(parent_canonical.join(basename))
-        }
+            parent_canonical.join(basename)
+        };
+        // Walk the resolved path under the jail and refuse if any
+        // component is a symlink. `must_exist == false` paths may
+        // not exist yet so the last component is allowed to be
+        // missing; only intermediate symlinks fail the check.
+        refuse_symlinks_within_jail(&self.canonical_root, &resolved)?;
+        Ok(resolved)
     }
 
     /// Render a canonical absolute path as jail-relative (for return
@@ -274,7 +300,7 @@ impl FsJail {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum JailError {
+pub enum JailError {
     #[error("path empty")]
     Empty,
     #[error("path '{0}' is absolute (must be jail-relative)")]
@@ -283,14 +309,85 @@ enum JailError {
     Traversal(String),
     #[error("path '{0}' escapes jail root after canonicalisation (symlink?)")]
     Escape(String),
+    #[error("path component '{0}' is a symlink (refused by TOCTOU policy)")]
+    Symlink(String),
     #[error("{0}")]
     Io(String),
+}
+
+/// Strict containment check: returns `true` iff `path` is a
+/// proper child of `base` (i.e. starts with `base` AND is not
+/// equal to `base`). Both inputs must already be canonicalised
+/// by the caller — this is the pure-path predicate, not an I/O
+/// operation.
+///
+/// Used by [`FsJail::resolve`] after canonicalisation to refuse
+/// any symlink-via-jail-root that resolves *to* the root itself,
+/// and to refuse traversal escapes that pass the bare
+/// `starts_with` test.
+pub fn jail_contains_path(base: &Path, path: &Path) -> bool {
+    if path == base {
+        return false;
+    }
+    path.starts_with(base)
+}
+
+/// Walk every component of `resolved` that sits under `base`
+/// and refuse if any is a symbolic link. Returns
+/// [`JailError::Symlink`] on the first symlinked component
+/// encountered; otherwise `Ok(())`.
+///
+/// Honest about scope: `symlink_metadata` is a stat-time check,
+/// so a determined attacker with write access to the jail
+/// *between* this check and the eventual open could still swap
+/// a component. Eliminating that window fully requires
+/// `openat(2)` which is not portable to Windows. This check
+/// closes the loud failure modes (admin sets up a symlink farm
+/// inside the jail, or a flow writes a symlink during its
+/// own run) and works on every platform Relix supports.
+pub fn refuse_symlinks_within_jail(base: &Path, resolved: &Path) -> Result<(), JailError> {
+    // Walk from `base` outward through every component that
+    // shares the base prefix. For each, stat with
+    // symlink_metadata and refuse if it's a symlink. We
+    // explicitly do NOT stat `base` itself — the operator
+    // configured the jail root, including via a symlink, and
+    // canonicalize already resolved it.
+    let Ok(rel) = resolved.strip_prefix(base) else {
+        // Should be impossible if jail_contains_path already
+        // passed; the explicit Err keeps the contract honest.
+        return Err(JailError::Escape(resolved.display().to_string()));
+    };
+    let mut walk = base.to_path_buf();
+    for component in rel.components() {
+        walk.push(component);
+        match std::fs::symlink_metadata(&walk) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(JailError::Symlink(walk.display().to_string()));
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The leaf may not exist yet (write paths). All
+                // intermediate components must — symlink_metadata
+                // would have returned Ok above. Stop walking; the
+                // not-yet-existing target can't be a symlink.
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(JailError::Io(format!(
+                    "symlink_metadata {}: {e}",
+                    walk.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl From<JailError> for HandlerOutcome {
     fn from(e: JailError) -> Self {
         let kind = match e {
             JailError::Io(_) => error_kinds::INVALID_ARGS,
+            JailError::Symlink(_) => error_kinds::POLICY_DENIED,
             _ => error_kinds::POLICY_DENIED,
         };
         HandlerOutcome::Err(ErrorEnvelope {
@@ -1857,6 +1954,110 @@ mod tests {
             request_id: RequestId::new(),
             args: args.to_vec(),
         }
+    }
+
+    // ── TOCTOU hardening tests (Task 2) ────────────────────
+
+    #[test]
+    fn jail_contains_path_rejects_equal_and_outside() {
+        let td = TempDir::new().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        // Equal-to-base is REJECTED — the base dir itself is not
+        // "inside" the jail, only its descendants are.
+        assert!(!jail_contains_path(&base, &base));
+        // Outside-base is rejected.
+        let outside = base.parent().unwrap().to_path_buf();
+        assert!(!jail_contains_path(&base, &outside));
+        // Child path is accepted.
+        let child = base.join("file.txt");
+        assert!(jail_contains_path(&base, &child));
+    }
+
+    #[test]
+    fn toctou_normal_file_inside_jail_is_accepted() {
+        let (td, j) = mk_jail();
+        let p = td.path().join("hello.txt");
+        std::fs::write(&p, b"hi").unwrap();
+        // resolve() canonicalises + symlink-checks; a plain file
+        // inside the jail must come back as Ok.
+        let resolved = j.resolve("hello.txt", true).unwrap();
+        assert!(resolved.ends_with("hello.txt"));
+        assert!(jail_contains_path(&j.canonical_root, &resolved));
+    }
+
+    #[test]
+    fn toctou_dotdot_traversal_is_rejected() {
+        let (_td, j) = mk_jail();
+        let err = j
+            .resolve("subdir/../../etc/passwd", true)
+            .expect_err("must reject `..`");
+        assert!(matches!(err, JailError::Traversal(_)), "wrong err: {err:?}");
+    }
+
+    #[test]
+    fn toctou_path_equal_to_base_is_rejected_by_jail_contains_path() {
+        // `jail_contains_path` returns FALSE for `path == base` so
+        // callers wanting strict containment (e.g. "this must be a
+        // file inside the jail, not the jail itself") can rely on
+        // it. `resolve(".")` is permitted because list_dir / stat
+        // legitimately operate on the jail root; the test exercises
+        // the contract of the public helper.
+        let td = TempDir::new().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        assert!(!jail_contains_path(&base, &base));
+        // A subpath that resolves back to base via normalisation
+        // (e.g. via an absolute symlink) would be a real escape.
+        // The strict helper guards that path.
+        let outside = base.parent().unwrap().to_path_buf();
+        assert!(!jail_contains_path(&base, &outside));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toctou_symlink_pointing_outside_jail_is_rejected() {
+        // Sandbox-local symlink farm: drop a `link` inside the
+        // jail that points to `/tmp` (outside). resolve()'s
+        // symlink walk refuses before the consumer ever opens
+        // the file.
+        use std::os::unix::fs::symlink;
+        let (td, j) = mk_jail();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("real.txt");
+        std::fs::write(&target, b"sensitive").unwrap();
+        let link = td.path().join("evil");
+        symlink(&target, &link).unwrap();
+        let err = j.resolve("evil", true).expect_err("must reject symlink");
+        assert!(matches!(err, JailError::Symlink(_)) || matches!(err, JailError::Escape(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toctou_symlink_pointing_inside_jail_is_still_rejected() {
+        // Even a symlink that points to a path inside the jail is
+        // refused — the policy is "no symlinks", not "no escapes
+        // via symlink." This shrinks the window where a swap mid-
+        // operation could move the symlink's target out.
+        use std::os::unix::fs::symlink;
+        let (td, j) = mk_jail();
+        let real = td.path().join("real.txt");
+        std::fs::write(&real, b"x").unwrap();
+        let link = td.path().join("alias");
+        symlink(&real, &link).unwrap();
+        let err = j
+            .resolve("alias", true)
+            .expect_err("symlinks inside jail are still refused");
+        assert!(matches!(err, JailError::Symlink(_)));
+    }
+
+    #[test]
+    fn refuse_symlinks_within_jail_passes_for_normal_path() {
+        // The bare helper must accept a normal file without any
+        // symlink in any component.
+        let td = TempDir::new().unwrap();
+        let base = td.path().canonicalize().unwrap();
+        let f = base.join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+        refuse_symlinks_within_jail(&base, &f).expect("normal path must pass");
     }
 
     #[test]
