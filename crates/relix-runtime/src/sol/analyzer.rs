@@ -236,6 +236,14 @@ impl Analyzer {
 
                 Some(Type::Void)
             }
+            Ast::StmtTry { body, catches } => {
+                self.check(body);
+                for (_kind, catch_body) in catches.iter_mut() {
+                    self.check(catch_body);
+                }
+                Some(Type::Void)
+            }
+            Ast::StmtRethrow => Some(Type::Void),
             Ast::StmtFor {
                 elem_name,
                 array,
@@ -421,6 +429,22 @@ impl Analyzer {
                         }
                     }
                     return Some(Type::String);
+                }
+                // F2 (SOL try/catch) built-ins. Three zero-arg
+                // accessors expose the current error context
+                // inside a catch block. Calling them outside a
+                // catch returns the empty string / 0.
+                if name == "error_kind" || name == "error_cause" {
+                    if !args.is_empty() {
+                        panic!("{name}() takes no arguments");
+                    }
+                    return Some(Type::String);
+                }
+                if name == "error_retry_hint" {
+                    if !args.is_empty() {
+                        panic!("error_retry_hint() takes no arguments");
+                    }
+                    return Some(Type::Integer);
                 }
                 // 1. Fetch and clone the signature in a temporary scope
                 let (params, ret) = {

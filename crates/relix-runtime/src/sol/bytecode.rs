@@ -103,6 +103,32 @@ pub enum Inst {
     //
     // See `crate::sol::dispatcher` and `docs/sol-runtime-analysis.md`.
     RemoteCall,
+
+    // ---- F2 (try / catch / rethrow) ----
+    //
+    // TryEnter pushes a handler onto the VM's try-handler stack.
+    // The handler carries the bytecode address of the catch
+    // dispatch block — the point the VM jumps to when a
+    // RemoteCall (or nested operation) fails. TryExit pops the
+    // most recent handler when the try body completes
+    // successfully.
+    //
+    // LoadErrorKind / LoadErrorCause / LoadErrorRetryHint push
+    // the current error's classified kind (string),
+    // human-readable cause (string), or retry_hint (int) onto
+    // the stack. They are used inside catch dispatch blocks to
+    // compare kinds and inside catch bodies to surface the
+    // failure to the SOL author.
+    //
+    // Rethrow re-raises the current error, popping back through
+    // outer try handlers (or halting with `VM_ERROR_SENTINEL`
+    // when no outer handler exists).
+    TryEnter(usize),
+    TryExit,
+    LoadErrorKind,
+    LoadErrorCause,
+    LoadErrorRetryHint,
+    Rethrow,
 }
 
 pub struct Codegen {
@@ -366,6 +392,87 @@ impl Codegen {
                 self.next_slot = saved_next;
             }
 
+            // --- F2: try / catch / rethrow ---
+            //
+            // Codegen layout for `try { B } catch k1 { C1 } catch k2 { C2 }`:
+            //
+            //     TryEnter dispatch_pc
+            //     <B>
+            //     TryExit
+            //     Jump end_pc
+            //   dispatch_pc:                   ; VM lands here on B failure
+            //                                  ; last_error is set
+            //                                  ; (handler already popped)
+            //     PushConst "k1"
+            //     LoadErrorKind
+            //     EqStr
+            //     JumpFalse skip_k1
+            //     <C1>
+            //     Jump end_pc
+            //   skip_k1:
+            //     PushConst "k2"
+            //     LoadErrorKind
+            //     EqStr
+            //     JumpFalse skip_k2
+            //     <C2>
+            //     Jump end_pc
+            //   skip_k2:
+            //     Rethrow                       ; no catch matched
+            //   end_pc:
+            //
+            // The "any" kind skips the EqStr + JumpFalse pair —
+            // it unconditionally executes its body.
+            Ast::StmtTry { body, catches } => {
+                let try_enter_idx = insts.len();
+                insts.push(Inst::TryEnter(0));
+                self.compile(insts, *body);
+                insts.push(Inst::TryExit);
+                let jump_to_end_after_body = insts.len();
+                insts.push(Inst::Jump(0));
+
+                let dispatch_pc = insts.len();
+                insts[try_enter_idx] = Inst::TryEnter(dispatch_pc);
+
+                let mut jump_to_end_indices: Vec<usize> = Vec::new();
+                jump_to_end_indices.push(jump_to_end_after_body);
+
+                for (kind, catch_body) in catches.into_iter() {
+                    if kind == "any" {
+                        // Unconditional match — emit body and
+                        // jump to end. Any subsequent catch
+                        // clauses are unreachable but we still
+                        // compile them so error messages stay
+                        // honest.
+                        self.compile(insts, catch_body);
+                        let j = insts.len();
+                        insts.push(Inst::Jump(0));
+                        jump_to_end_indices.push(j);
+                        continue;
+                    }
+                    insts.push(Inst::PushConst(Ast::ExprString(kind.clone())));
+                    insts.push(Inst::LoadErrorKind);
+                    insts.push(Inst::EqStr);
+                    let jump_skip_idx = insts.len();
+                    insts.push(Inst::JumpFalse(0));
+                    self.compile(insts, catch_body);
+                    let j = insts.len();
+                    insts.push(Inst::Jump(0));
+                    jump_to_end_indices.push(j);
+                    let skip_pc = insts.len();
+                    insts[jump_skip_idx] = Inst::JumpFalse(skip_pc);
+                }
+                insts.push(Inst::Rethrow);
+
+                let end_pc = insts.len();
+                for idx in jump_to_end_indices {
+                    insts[idx] = Inst::Jump(end_pc);
+                }
+            }
+
+            Ast::StmtRethrow => {
+                insts.push(Inst::Rethrow);
+            }
+
             // --- 5. Operations & Intercepted Assignments ---
             Ast::ExprBinary { lhs, rhs, op } => {
                 if op.get_kind() == TokenKind::Eq {
@@ -489,6 +596,12 @@ impl Codegen {
                         self.compile(insts, arg);
                     }
                     insts.push(Inst::RemoteCall);
+                } else if name == "error_kind" {
+                    insts.push(Inst::LoadErrorKind);
+                } else if name == "error_cause" {
+                    insts.push(Inst::LoadErrorCause);
+                } else if name == "error_retry_hint" {
+                    insts.push(Inst::LoadErrorRetryHint);
                 } else if let Some(&target_address) = self.functions.get(&name) {
                     let count = args.len();
                     for arg in args {
@@ -655,6 +768,13 @@ impl Codegen {
                 // Relix M6: `remote_call` is a known builtin that returns String.
                 if name == "remote_call" {
                     return Type::String;
+                }
+                // F2 built-ins exposing the current error inside a catch.
+                if name == "error_kind" || name == "error_cause" {
+                    return Type::String;
+                }
+                if name == "error_retry_hint" {
+                    return Type::Integer;
                 }
                 self.fn_returns.get(name).cloned().unwrap_or(Type::Integer)
             }

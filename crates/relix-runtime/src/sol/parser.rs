@@ -73,6 +73,23 @@ pub enum Ast {
         array: Box<Ast>,
         body: Box<Ast>,
     },
+    /// `try { body } catch <kind> { body } [catch <kind> { body }]*`
+    /// — error recovery for `remote_call` failures. Each catch
+    /// clause's `kind` is one of the documented classifications:
+    /// `any`, `timeout`, `mesh_error`, `policy_denied`,
+    /// `responder_error`. The body runs when the try-block fails
+    /// with a matching kind; `any` matches every failure. Inside
+    /// a catch body, the built-ins `error_kind()`,
+    /// `error_cause()`, and `error_retry_hint()` return the
+    /// current error's fields. `rethrow` re-raises so an outer
+    /// try-block can handle the same failure.
+    StmtTry {
+        body: Box<Ast>,
+        catches: Vec<(String, Ast)>,
+    },
+    /// `rethrow;` inside a catch — propagates the current error
+    /// to the next outer try-handler or halts the VM if none.
+    StmtRethrow,
 
     #[allow(dead_code)]
     ExprAssign {
@@ -449,6 +466,12 @@ impl Parser {
             Token::While => self.while_stmt(),
             Token::Let => self.var_decl(),
             Token::Return => self.return_stmt(),
+            Token::Try => self.try_stmt(),
+            Token::Rethrow => {
+                self.index += 1;
+                self.eat(TokenKind::Semi, "expected `;` after `rethrow`");
+                Some(Ast::StmtRethrow)
+            }
             Token::LCurly => self.block(),
             x => {
                 let expr = self.expression();
@@ -494,6 +517,39 @@ impl Parser {
             body,
         })
     }
+    /// Parse `try { body } catch <kind> { body } [catch ...]*`.
+    /// At least one catch clause is required. Recognised kinds:
+    /// `any`, `timeout`, `mesh_error`, `policy_denied`,
+    /// `responder_error`. Other identifiers parse but won't
+    /// match any classified error.
+    fn try_stmt(&mut self) -> Option<Ast> {
+        self.index += 1;
+        self.eat(TokenKind::LCurly, "expected `{` after `try`");
+        self.index -= 1;
+        let body = Box::new(self.block()?);
+        let mut catches: Vec<(String, Ast)> = Vec::new();
+        while matches!(self.tokens.get(self.index), Some(Token::Catch)) {
+            self.index += 1;
+            let kind = match self.tokens[self.index].clone() {
+                Token::Ident(s) => s,
+                other => {
+                    self.debtok(4);
+                    panic!("expected catch kind identifier, got {other:?}");
+                }
+            };
+            self.index += 1;
+            self.eat(TokenKind::LCurly, "expected `{` after catch kind");
+            self.index -= 1;
+            let catch_body = self.block()?;
+            catches.push((kind, catch_body));
+        }
+        if catches.is_empty() {
+            self.debtok(4);
+            panic!("`try` block requires at least one `catch <kind> {{ ... }}` clause");
+        }
+        Some(Ast::StmtTry { body, catches })
+    }
+
     fn if_stmt(&mut self) -> Option<Ast> {
         self.index += 1;
 

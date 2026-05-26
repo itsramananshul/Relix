@@ -105,6 +105,66 @@ fn codegen_is_deterministic() {
 }
 
 #[test]
+fn try_catch_any_compiles_to_expected_opcode_sequence() {
+    let src = r#"
+        function start() {
+            try {
+                let x: str = remote_call("ai", "ai.chat", "hi");
+                print(x);
+            } catch any {
+                print("call failed");
+            }
+        }
+    "#;
+    let bc = compile(src);
+    let dis = format!("{bc:?}");
+    assert!(dis.contains("TryEnter"), "expected TryEnter: {dis}");
+    assert!(dis.contains("TryExit"), "expected TryExit: {dis}");
+    assert!(dis.contains("RemoteCall"), "expected RemoteCall: {dis}");
+    // catch any does NOT emit a LoadErrorKind/EqStr filter —
+    // it falls straight through. Confirm by counting EqStr
+    // occurrences inside the try block: should be zero.
+    let has_kind_filter = bc
+        .iter()
+        .any(|i| matches!(i, Inst::LoadErrorKind | Inst::EqStr));
+    assert!(
+        !has_kind_filter,
+        "catch any must not emit kind-comparison opcodes"
+    );
+}
+
+#[test]
+fn try_catch_kind_compiles_with_load_error_kind_filter() {
+    let src = r#"
+        function start() {
+            try {
+                let x: str = remote_call("ai", "ai.chat", "hi");
+                print(x);
+            } catch timeout {
+                print("timed out");
+            } catch any {
+                print("other failure");
+            }
+        }
+    "#;
+    let bc = compile(src);
+    let dis = format!("{bc:?}");
+    // Two catch clauses → one LoadErrorKind for the timeout
+    // filter and zero LoadErrorKind from the any clause.
+    let load_kind_count = bc
+        .iter()
+        .filter(|i| matches!(i, Inst::LoadErrorKind))
+        .count();
+    assert_eq!(
+        load_kind_count, 1,
+        "expected exactly one LoadErrorKind in dispatch table, got bc={dis}"
+    );
+    // Rethrow lands at the end of the dispatch table as the
+    // "no catch matched" fallback.
+    assert!(dis.contains("Rethrow"));
+}
+
+#[test]
 fn string_interpolation_lowers_to_concat_chain() {
     // `"hi {{name}} bye"` should compile through the same
     // path as `"hi " + name + " bye"`. The bytecode contains

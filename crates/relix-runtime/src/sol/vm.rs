@@ -21,6 +21,26 @@ struct Frame {
     old_fp: usize,
 }
 
+/// One active try-handler. Carries the bytecode address the
+/// VM jumps to when the wrapped body fails, plus the frame
+/// pointer at the time of `TryEnter` so a failure deep inside
+/// nested calls restores the stack correctly before
+/// dispatching to the catch.
+#[derive(Debug, Clone, Copy)]
+struct TryHandler {
+    /// First instruction of the catch dispatch block.
+    catch_pc: usize,
+    /// Frame pointer at TryEnter — restored on dispatch so
+    /// the catch block sees the same locals as the enclosing
+    /// frame.
+    fp_at_enter: usize,
+    /// Stack length at TryEnter — anything pushed by the
+    /// in-progress try body is unwound before the catch
+    /// runs so the dispatch starts with a clean working
+    /// stack.
+    stack_len_at_enter: usize,
+}
+
 pub struct VM {
     stack: Vec<u64>,
     heap: Vec<HeapObject>,
@@ -36,6 +56,10 @@ pub struct VM {
     /// Relix extension (M6): structured error from the last failed
     /// `RemoteCall`, if any. Cleared on successful step.
     last_error: Option<RemoteCallError>,
+    /// F2: stack of active try-handlers. Pushed by
+    /// `Inst::TryEnter`, popped by `Inst::TryExit` (clean
+    /// finish) or by the error dispatch (failure).
+    try_handlers: Vec<TryHandler>,
 }
 
 impl VM {
@@ -50,6 +74,7 @@ impl VM {
             done: false,
             dispatcher: None,
             last_error: None,
+            try_handlers: Vec::new(),
         }
     }
 
@@ -573,13 +598,93 @@ impl VM {
                     }
                     Err(e) => {
                         self.last_error = Some(e);
-                        self.done = true;
-                        return Some(VM_ERROR_SENTINEL);
+                        if let Some(sentinel) = self.try_dispatch_error() {
+                            return Some(sentinel);
+                        }
                     }
+                }
+            }
+
+            // --- F2: try / catch / rethrow ---
+            Inst::TryEnter(catch_pc) => {
+                self.try_handlers.push(TryHandler {
+                    catch_pc,
+                    fp_at_enter: self.fp,
+                    stack_len_at_enter: self.stack.len(),
+                });
+            }
+            Inst::TryExit => {
+                // Successful exit from the try body — pop the
+                // handler so an enclosing try doesn't see a
+                // stale entry.
+                self.try_handlers.pop();
+            }
+            Inst::LoadErrorKind => {
+                let kind = self
+                    .last_error
+                    .as_ref()
+                    .map(classified_error_kind)
+                    .unwrap_or("");
+                self.heap.push(HeapObject::String(kind.to_string()));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::LoadErrorCause => {
+                let cause = self
+                    .last_error
+                    .as_ref()
+                    .map(|e| e.cause.clone())
+                    .unwrap_or_default();
+                self.heap.push(HeapObject::String(cause));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::LoadErrorRetryHint => {
+                // Not currently carried on RemoteCallError —
+                // surface 0 so flows that read it inside a
+                // catch get a deterministic value rather than a
+                // panic. Future commits can add the field to
+                // the dispatcher trait.
+                self.push(0);
+            }
+            Inst::Rethrow => {
+                if let Some(sentinel) = self.try_dispatch_error() {
+                    return Some(sentinel);
                 }
             }
         }
 
         None
+    }
+
+    /// F2: route the current `last_error` to the nearest
+    /// active try-handler. Pops the handler, restores fp +
+    /// stack length, jumps to the catch dispatch block.
+    /// Returns `Some(VM_ERROR_SENTINEL)` when no handler is
+    /// available — the caller bails out exactly the way the
+    /// pre-F2 RemoteCall-failure path did.
+    fn try_dispatch_error(&mut self) -> Option<u64> {
+        let Some(handler) = self.try_handlers.pop() else {
+            self.done = true;
+            return Some(VM_ERROR_SENTINEL);
+        };
+        self.fp = handler.fp_at_enter;
+        self.stack.truncate(handler.stack_len_at_enter);
+        self.inst_ptr = handler.catch_pc;
+        None
+    }
+}
+
+/// Classify a `RemoteCallError` into one of the catch-kind
+/// labels SOL recognises. Mirrors Sflow's classification
+/// (`sflow::executor::classify_remote_error`) so the two
+/// languages agree on which errors land in which clause.
+fn classified_error_kind(err: &RemoteCallError) -> &'static str {
+    use relix_core::types::error_kinds;
+    match err.kind {
+        error_kinds::TIMEOUT | error_kinds::APPROVAL_TIMEOUT => "timeout",
+        error_kinds::TRANSPORT | error_kinds::PEER_UNREACHABLE | 0 => "mesh_error",
+        error_kinds::POLICY_DENIED
+        | error_kinds::APPROVAL_DENIED
+        | error_kinds::APPROVAL_REQUIRED => "policy_denied",
+        _ => "responder_error",
     }
 }

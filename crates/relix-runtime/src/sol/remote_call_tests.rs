@@ -126,3 +126,172 @@ fn remote_call_bytecode_includes_variant_in_disassembly() {
         "expected RemoteCall in Inst Debug output, got: {dis}"
     );
 }
+
+// ── F2: try / catch / rethrow ──────────────────────────────
+
+/// Hand-built program that wraps a failing remote_call in
+/// `try { remote_call } catch any { /* push 42 */ }`. Lets
+/// the test inspect VM state directly without going through
+/// the full SOL compiler.
+///
+/// Layout (PCs annotated):
+///   0  TryEnter(5)
+///   1  PushConst "p"
+///   2  PushConst "m"
+///   3  PushConst "a"
+///   4  RemoteCall
+///   5  TryExit               ; not reached on failure
+///   6  Jump 12
+///   7  PushConst 42          ; catch any body
+///   8  Jump 12
+///   9  Rethrow               ; unreachable (any matches)
+///  10  ... padding
+///  11  ... padding
+///  12  end_pc                ; the int 42 is left on the stack
+fn try_any_around_failing_remote_call() -> Vec<Inst> {
+    vec![
+        Inst::TryEnter(7),
+        Inst::PushConst(Ast::ExprString("p".into())),
+        Inst::PushConst(Ast::ExprString("m".into())),
+        Inst::PushConst(Ast::ExprString("a".into())),
+        Inst::RemoteCall,
+        Inst::TryExit,
+        Inst::Jump(9),
+        Inst::PushConst(Ast::ExprInteger(42)),
+        Inst::Jump(9),
+        // end_pc = 9: program ends with the catch body's value
+        // on top of the stack.
+    ]
+}
+
+#[test]
+fn try_catch_any_swallows_remote_call_failure_and_runs_catch_body() {
+    let disp = StubDispatcher::err(6, "policy denied");
+    let mut vm = VM::from(&try_any_around_failing_remote_call()).with_dispatcher(disp);
+    let final_value = vm.run();
+    assert_ne!(
+        final_value, VM_ERROR_SENTINEL,
+        "catch any must swallow the failure"
+    );
+    assert_eq!(final_value, 42, "catch body should have pushed the int 42");
+    // last_error is still set so the operator's catch body can
+    // read it via error_kind() / error_cause().
+    let err = vm
+        .last_error()
+        .expect("last_error must remain set inside catch");
+    assert_eq!(err.kind, 6);
+    assert_eq!(err.cause, "policy denied");
+}
+
+#[test]
+fn try_exit_clean_path_skips_catch_body() {
+    let disp = StubDispatcher::ok("ignored");
+    let mut vm = VM::from(&try_any_around_failing_remote_call()).with_dispatcher(disp);
+    let final_value = vm.run();
+    assert_ne!(final_value, VM_ERROR_SENTINEL);
+    // On clean exit the catch body never ran; the program
+    // ends with the heap-ref of the remote_call response on
+    // top — not the int 42. So the final value is the heap
+    // index, which is not equal to 42 (the heap has at least
+    // four entries by now from the three pushed args).
+    assert_ne!(final_value, 42, "clean try body must not fall into catch");
+}
+
+#[test]
+fn rethrow_without_outer_handler_halts_with_sentinel() {
+    // Same try/catch as above but the catch executes Rethrow
+    // before pushing 42. With no outer handler, the VM halts.
+    let mut prog = try_any_around_failing_remote_call();
+    // Replace `PushConst 42` (idx 7) with Rethrow. The Jump
+    // at idx 8 becomes unreachable.
+    prog[7] = Inst::Rethrow;
+    let disp = StubDispatcher::err(6, "policy denied");
+    let mut vm = VM::from(&prog).with_dispatcher(disp);
+    let final_value = vm.run();
+    assert_eq!(
+        final_value, VM_ERROR_SENTINEL,
+        "rethrow with no outer handler must halt"
+    );
+    let err = vm.last_error().expect("last_error preserved");
+    assert_eq!(err.kind, 6);
+}
+
+#[test]
+fn load_error_kind_classifies_remote_error() {
+    // Pure VM exercise: set last_error via a remote_call
+    // failure, then call LoadErrorKind from a try-handled
+    // catch block.
+    //
+    //   0 TryEnter 6
+    //   1 PushConst "p"
+    //   2 PushConst "m"
+    //   3 PushConst "a"
+    //   4 RemoteCall
+    //   5 TryExit
+    //   6 LoadErrorKind          ; catch dispatch: push the kind string
+    //   7 ...
+    //
+    // Final value = heap ref to the "policy_denied" string.
+    let prog = vec![
+        Inst::TryEnter(6),
+        Inst::PushConst(Ast::ExprString("p".into())),
+        Inst::PushConst(Ast::ExprString("m".into())),
+        Inst::PushConst(Ast::ExprString("a".into())),
+        Inst::RemoteCall,
+        Inst::TryExit,
+        Inst::LoadErrorKind,
+    ];
+    let disp = StubDispatcher::err(relix_core::types::error_kinds::POLICY_DENIED, "denied");
+    let mut vm = VM::from(&prog).with_dispatcher(disp);
+    let final_value = vm.run();
+    let kind = vm.heap_string(final_value).expect("kind on heap");
+    assert_eq!(kind, "policy_denied");
+}
+
+#[test]
+fn try_catch_handles_nested_failure_inside_inner_try() {
+    // outer: try { inner: try { fail } catch any { rethrow } } catch any { push 99 }
+    //
+    //   0  TryEnter(13)         ; outer
+    //   1  TryEnter(8)          ; inner
+    //   2  PushConst "p"
+    //   3  PushConst "m"
+    //   4  PushConst "a"
+    //   5  RemoteCall            ; fails → jump to inner catch (pc 8)
+    //   6  TryExit               ; unreachable
+    //   7  Jump 16
+    //   8  Rethrow               ; inner catch: propagate to outer
+    //   9  TryExit               ; unreachable
+    //  10  Jump 16
+    //  11  (unused)
+    //  12  (unused)
+    //  13  PushConst 99          ; outer catch
+    //  14  Jump 16
+    //  15  (unused)
+    //  16  end
+    let prog = vec![
+        Inst::TryEnter(13),
+        Inst::TryEnter(8),
+        Inst::PushConst(Ast::ExprString("p".into())),
+        Inst::PushConst(Ast::ExprString("m".into())),
+        Inst::PushConst(Ast::ExprString("a".into())),
+        Inst::RemoteCall,
+        Inst::TryExit,
+        Inst::Jump(16),
+        Inst::Rethrow,
+        Inst::TryExit,
+        Inst::Jump(16),
+        Inst::PushConst(Ast::ExprInteger(0)),
+        Inst::PushConst(Ast::ExprInteger(0)),
+        Inst::PushConst(Ast::ExprInteger(99)),
+        Inst::Jump(16),
+        Inst::PushConst(Ast::ExprInteger(0)),
+    ];
+    let disp = StubDispatcher::err(6, "denied");
+    let mut vm = VM::from(&prog).with_dispatcher(disp);
+    let final_value = vm.run();
+    assert_eq!(
+        final_value, 99,
+        "outer catch should have pushed 99 after inner rethrow"
+    );
+}

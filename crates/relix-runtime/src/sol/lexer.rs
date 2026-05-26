@@ -15,6 +15,9 @@ pub enum Token {
     Return,
     True,
     False,
+    Try,
+    Catch,
+    Rethrow,
 
     Integer(i128),
     Float(f64),
@@ -74,6 +77,9 @@ pub enum TokenKind {
     Return,
     True,
     False,
+    Try,
+    Catch,
+    Rethrow,
 
     Integer,
     Float,
@@ -133,6 +139,9 @@ impl Token {
             Token::Return => TokenKind::Return,
             Token::True => TokenKind::True,
             Token::False => TokenKind::False,
+            Token::Try => TokenKind::Try,
+            Token::Catch => TokenKind::Catch,
+            Token::Rethrow => TokenKind::Rethrow,
 
             Token::Integer(_) => TokenKind::Integer,
             Token::Float(_) => TokenKind::Float,
@@ -402,6 +411,9 @@ impl Lexer {
             "return" => Token::Return,
             "true" => Token::True,
             "false" => Token::False,
+            "try" => Token::Try,
+            "catch" => Token::Catch,
+            "rethrow" => Token::Rethrow,
             _ => Token::Ident(buf),
         }
     }
