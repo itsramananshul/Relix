@@ -298,6 +298,12 @@ pub struct AppState {
     /// (keyword). See
     /// `crates/relix-runtime/src/nodes/tool/registry.rs`.
     pub tool_registry: std::sync::Arc<relix_runtime::nodes::tool::registry::ToolRegistry>,
+    /// Two-sink observability. Metadata events for every
+    /// model call land in Sink A; content (prompt /
+    /// response / tool output) lands in Sink B with a
+    /// short retention window. See
+    /// `crates/relix-runtime/src/observability/sinks.rs`.
+    pub observability: relix_runtime::observability::ObservabilityContext,
     /// Four-layer memory store backing the
     /// `/v1/memory/records/*` inspector endpoints.
     /// `Some` when `[bridge] memory_db_path` is configured AND
@@ -442,6 +448,7 @@ impl AppState {
                 relix_runtime::nodes::execution::broker::AgentAccessBroker::empty(),
             ),
             tool_registry: crate::tools::empty_registry(),
+            observability: relix_runtime::observability::ObservabilityContext::in_memory(),
             layered_memory: open_layered_memory(&memory_db_path),
         })
     }

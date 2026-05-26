@@ -237,6 +237,7 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let observability_start = std::time::Instant::now();
     let translated = translate_request(&req).map_err(invalid_input)?;
     let model_label = resolve_model_label(&state, &req.model);
 
@@ -262,6 +263,20 @@ pub async fn chat_completions(
             .await
             .map_err(exec_error_to_http)?,
     };
+
+    // Two-sink observability record. Sink A always lands;
+    // Sink B carries the verbatim prompt + response. The
+    // dashboard's session debugger reads from both via the
+    // bridge endpoints landing in the next commit.
+    record_chat_observability(
+        &state,
+        &translated.session_id,
+        &outcome.trace_id,
+        &translated.prompt,
+        &outcome.reply,
+        &model_label,
+        observability_start.elapsed().as_millis() as u64,
+    );
 
     // Honest headers: the bridge knows which model it resolved
     // and which provider it routed to (best-effort from the
@@ -471,6 +486,69 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Record one `/v1/chat/completions` call to the two-sink
+/// observability surface. Metadata lands in Sink A; the
+/// prompt + response land in Sink B linked by `event_id`
+/// (= the outcome's `trace_id`). Best-effort: a sink write
+/// error is logged but never propagates to the HTTP
+/// response.
+fn record_chat_observability(
+    state: &AppState,
+    session_id: &str,
+    trace_id: &str,
+    prompt: &str,
+    reply: &str,
+    model_label: &str,
+    latency_ms: u64,
+) {
+    use relix_runtime::observability::{ContentEvent, MetadataEvent};
+    let now: i64 = unix_now() as i64;
+    let event_id = if trace_id.trim().is_empty() {
+        format!("chat-{now}-{session_id}")
+    } else {
+        trace_id.to_string()
+    };
+    let meta = MetadataEvent {
+        event_id: event_id.clone(),
+        session_id: session_id.to_string(),
+        agent_id: "bridge".to_string(),
+        event_type: "model_call".to_string(),
+        timestamp_unix: now,
+        latency_ms: Some(latency_ms),
+        token_count: None,
+        cost_cents: None,
+        error_type: None,
+        tool_name: None,
+        model_name: Some(model_label.to_string()),
+        success: true,
+    };
+    // Two content rows linked by event_id: prompt + reply.
+    // ObservabilityContext::record_event writes one at a
+    // time, so call it twice with the same meta + different
+    // content. The second metadata insert is `INSERT OR
+    // REPLACE` so it's idempotent.
+    state.observability.record_event(
+        meta.clone(),
+        Some(ContentEvent {
+            event_id: event_id.clone(),
+            content_type: "prompt".to_string(),
+            content: prompt.to_string(),
+            redacted: false,
+            timestamp_unix: now,
+        }),
+    );
+    state.observability.record_event(
+        meta,
+        Some(ContentEvent {
+            event_id,
+            content_type: "response".to_string(),
+            content: reply.to_string(),
+            redacted: false,
+            timestamp_unix: now,
+        }),
+    );
 }
 
 // ─────────────────────────── OpenAI SSE shape ──────────────────────────────
