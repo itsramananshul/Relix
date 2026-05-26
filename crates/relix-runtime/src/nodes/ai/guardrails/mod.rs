@@ -17,9 +17,11 @@
 
 pub mod drift;
 pub mod input;
+pub mod mode;
 
 pub use drift::{ChronicleEvent, DriftAction, DriftConfig, DriftDetector};
 pub use input::{InputGuardrail, InputGuardrailResult, PiiPolicy};
+pub use mode::GuardrailMode;
 
 /// Stable category tags content classification can attach to
 /// a request. Public so the bridge / dashboard can surface

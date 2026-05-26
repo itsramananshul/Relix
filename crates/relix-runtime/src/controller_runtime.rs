@@ -2702,17 +2702,25 @@ pub(crate) enum StartupWiring {
     },
 }
 
-// Parse `[guardrails.input]` from the top-level [guardrails]
-// TOML section into an InputGuardrail instance. Absent /
-// disabled / unparseable produces a permissive guardrail so
-// the AI controller behaves exactly as before.
+// Parse `[guardrails]` from the top-level TOML section into
+// an `InputGuardrail` instance.
+//
+// Precedence:
+//   1. `[guardrails.input]` block — fine-grained override.
+//   2. `[guardrails] mode = "strict"|"balanced"|"permissive"`
+//      — mode-driven defaults.
+//   3. Neither ⇒ permissive (pre-guardrail behaviour).
 fn build_input_guardrail(cfg: &ControllerConfig) -> crate::nodes::ai::guardrails::InputGuardrail {
-    use crate::nodes::ai::guardrails::{InputGuardrail, input::InputGuardrailConfig};
+    use crate::nodes::ai::guardrails::{
+        GuardrailMode, InputGuardrail, input::InputGuardrailConfig,
+    };
     let Some(raw) = cfg.guardrails.clone() else {
         return InputGuardrail::permissive();
     };
     #[derive(serde::Deserialize, Default)]
     struct GuardrailsBlock {
+        #[serde(default)]
+        mode: Option<String>,
         #[serde(default)]
         input: Option<InputGuardrailConfig>,
     }
@@ -2723,9 +2731,21 @@ fn build_input_guardrail(cfg: &ControllerConfig) -> crate::nodes::ai::guardrails
             return InputGuardrail::permissive();
         }
     };
-    match parsed.input {
-        Some(ic) => InputGuardrail::from_config(&ic),
-        None => InputGuardrail::permissive(),
+    if let Some(ic) = parsed.input {
+        return InputGuardrail::from_config(&ic);
+    }
+    let Some(mode_str) = parsed.mode else {
+        return InputGuardrail::permissive();
+    };
+    match GuardrailMode::parse(&mode_str) {
+        Some(m) => InputGuardrail::from_mode(m),
+        None => {
+            tracing::warn!(
+                mode = %mode_str,
+                "[guardrails] unknown mode; defaulting to permissive"
+            );
+            InputGuardrail::permissive()
+        }
     }
 }
 

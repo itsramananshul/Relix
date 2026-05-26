@@ -102,6 +102,21 @@ impl InputGuardrail {
         }
     }
 
+    /// Build an `InputGuardrail` whose fields are derived
+    /// from a [`super::GuardrailMode`]. This is the wiring
+    /// path the controller-runtime uses to honour
+    /// `[guardrails] mode = "balanced" | "strict" |
+    /// "permissive"` without operators having to hand-wire
+    /// every sub-field. The category gate lives at the mode
+    /// layer; this struct still carries the injection-check
+    /// and PII fields the inline check loop reads.
+    pub fn from_mode(mode: super::GuardrailMode) -> Self {
+        Self {
+            injection_check: mode.injection_check(),
+            pii_policy: mode.pii_policy(),
+        }
+    }
+
     /// Inspect `text` and return the verdict. Never panics;
     /// always returns a `text` field the caller can pass
     /// downstream (possibly redacted, possibly unchanged).
