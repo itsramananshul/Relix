@@ -273,6 +273,12 @@ pub struct AppState {
     /// gate. Shared with both the HTTP middleware and the
     /// WebSocket handler. See `crate::rate_limit`.
     pub rate_limits: crate::rate_limit::RateLimits,
+    /// Multi-agent handoff audit ring. Bounded in-memory
+    /// (`HANDOFF_RING_CAP = 100`); resets on bridge restart.
+    /// Populated via `POST /v1/guardrails/handoffs`; read via
+    /// the same path's GET. See
+    /// `crates/relix-web-bridge/src/guardrails.rs`.
+    pub handoff_audit: crate::guardrails::HandoffAuditRing,
     /// Four-layer memory store backing the
     /// `/v1/memory/records/*` inspector endpoints.
     /// `Some` when `[bridge] memory_db_path` is configured AND
@@ -409,6 +415,7 @@ impl AppState {
             bridge_host,
             bridge_port,
             rate_limits: crate::rate_limit::RateLimits::new(rate_limit_cfg),
+            handoff_audit: crate::guardrails::HandoffAuditRing::new(),
             layered_memory: open_layered_memory(&memory_db_path),
         })
     }

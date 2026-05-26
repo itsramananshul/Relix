@@ -102,6 +102,7 @@ mod dispatch_stats;
 mod export;
 mod flow;
 mod fs_audit;
+mod guardrails;
 mod intervention_audit;
 mod lifecycle;
 mod mcp;
@@ -499,6 +500,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(memory_inspect::invalidate),
         )
         .route("/v1/memory/stats", get(memory_inspect::stats))
+        // Multi-agent handoff audit ring.
+        .route(
+            "/v1/guardrails/handoffs",
+            get(guardrails::handoffs).post(guardrails::record),
+        )
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's
