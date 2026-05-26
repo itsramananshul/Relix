@@ -515,6 +515,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Tool registry — list + keyword search.
         .route("/v1/tools", get(tools::list))
         .route("/v1/tools/search", post(tools::search))
+        // Signed tool manifest (read-only).
+        .route("/v1/tools/manifest", get(tools::manifest))
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's

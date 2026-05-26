@@ -23,13 +23,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use relix_core::capability::CapabilityDescriptor;
 
 /// One tool's discoverable metadata.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,

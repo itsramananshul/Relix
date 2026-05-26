@@ -50,6 +50,7 @@ pub mod audio;
 pub mod browser;
 pub mod dispatcher;
 pub mod fs;
+pub mod manifest;
 pub mod mcp;
 pub mod mcp_stdio;
 pub mod pdf;

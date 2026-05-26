@@ -12,6 +12,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use relix_runtime::nodes::tool::manifest::{SignedManifest, ToolManifest};
 use relix_runtime::nodes::tool::registry::{ToolDefinition, ToolRegistry};
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +80,57 @@ pub async fn search(
     Json(req): Json<ToolSearchRequest>,
 ) -> Result<Json<ToolsListResponse>, (StatusCode, Json<ApiError>)> {
     search_logic(state.tool_registry.as_ref(), &req).map(Json)
+}
+
+/// Signed-manifest response. When the bridge has access to
+/// the controller's signing key (the 32-byte `client_key`),
+/// the manifest carries a real blake3 MAC and `warning` is
+/// absent. When no key is available the manifest signs with
+/// a zero key and we attach `warning: "unsigned"` so callers
+/// don't mistake the placeholder signature for a real one.
+#[derive(Debug, Serialize)]
+pub struct ManifestResponse {
+    pub signed: SignedManifest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+pub(crate) fn manifest_logic(
+    registry: &ToolRegistry,
+    signing_key: Option<&[u8]>,
+    signer: &str,
+) -> ManifestResponse {
+    let manifest = ToolManifest {
+        version: 1,
+        tools: registry.all().to_vec(),
+        signed_at: unix_secs(),
+        signer: signer.to_string(),
+    };
+    let (signed, warning) = match signing_key {
+        Some(key) if !key.is_empty() => (SignedManifest::sign(manifest, key), None),
+        _ => (
+            SignedManifest::sign(manifest, &[0u8; 32]),
+            Some("unsigned".to_string()),
+        ),
+    };
+    ManifestResponse { signed, warning }
+}
+
+pub async fn manifest(State(state): State<AppState>) -> Json<ManifestResponse> {
+    let key = state.client_key;
+    let signer = format!("{}:{}", state.bridge_host, state.bridge_port);
+    Json(manifest_logic(
+        state.tool_registry.as_ref(),
+        Some(&key),
+        &signer,
+    ))
+}
+
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Helper used by `AppState::try_new` to build the default
@@ -163,5 +215,34 @@ mod tests {
         assert!(json.contains("\"count\":2"));
         assert!(json.contains("\"tool.web_fetch\""));
         assert!(json.contains("\"reversible\":true"));
+    }
+
+    #[test]
+    fn manifest_logic_signs_with_supplied_key() {
+        let registry = sample_registry();
+        let key = b"controller-secret-key-32-bytes!!";
+        let resp = manifest_logic(&registry, Some(key), "ctrl-1");
+        assert_eq!(resp.signed.signature.len(), 64);
+        assert!(resp.warning.is_none());
+        assert_eq!(resp.signed.verify(key), Ok(()));
+        // Tools came through.
+        assert_eq!(resp.signed.manifest.tools.len(), 2);
+        assert_eq!(resp.signed.manifest.signer, "ctrl-1");
+    }
+
+    #[test]
+    fn manifest_logic_attaches_warning_when_no_key_available() {
+        let registry = sample_registry();
+        let resp = manifest_logic(&registry, None, "ctrl-1");
+        assert_eq!(
+            resp.warning.as_deref(),
+            Some("unsigned"),
+            "missing key should set the unsigned warning"
+        );
+        // Empty-slice key also triggers the warning so a
+        // misconfigured controller doesn't ship a "signed"
+        // manifest with an empty key.
+        let resp = manifest_logic(&registry, Some(&[]), "ctrl-1");
+        assert_eq!(resp.warning.as_deref(), Some("unsigned"));
     }
 }
