@@ -28,6 +28,49 @@ use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError};
 
 use super::parser::{Atom, Catch, CatchKind, CmpOp, Condition, Expr, Program, Stmt};
 
+/// F5/F7: typed value carried in `vars`. The pre-list/map
+/// executor stored everything as `String`; this enum keeps the
+/// rich shape so built-ins (`list_*`, `map_*`) can operate on
+/// the structured data, while string-context reads (step args,
+/// `${...}` interpolation, conditions) stringify the value
+/// deterministically.
+///
+/// Stringification format mirrors the encodings operators
+/// typically write by hand when wiring pipe-delimited capability
+/// payloads — pipe-separated for lists, `k=v;` for maps. This
+/// is documented in `docs/sol-language.md` so flows that
+/// interleave structured values and bare-string steps can
+/// reason about the wire layout.
+#[derive(Clone, Debug)]
+pub enum SflowValue {
+    String(String),
+    List(Vec<String>),
+    Map(Vec<(String, String)>),
+}
+
+impl SflowValue {
+    /// Return the string representation used in step args,
+    /// interpolation, conditions, and the chronicle log.
+    /// Lists become `a|b|c`; maps become `k1=v1;k2=v2`.
+    pub fn to_display(&self) -> String {
+        match self {
+            SflowValue::String(s) => s.clone(),
+            SflowValue::List(items) => items.join("|"),
+            SflowValue::Map(pairs) => pairs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(";"),
+        }
+    }
+}
+
+impl Default for SflowValue {
+    fn default() -> Self {
+        SflowValue::String(String::new())
+    }
+}
+
 /// Per-execution variable cap. Matches `crates/relix-runtime/src/sflow/`
 /// docstring + `docs/sol.md`. Exceeded → runtime error.
 pub const MAX_VARS: usize = 50;
@@ -195,7 +238,12 @@ impl Executor {
                 Ok(BlockFlow::Continue)
             }
             Stmt::Set { name, value, line } => {
-                let resolved = state.resolve(value, *line)?;
+                // F5/F7: use the typed resolver so list / map
+                // literals + built-in calls preserve their
+                // structured form in the var store. Plain
+                // string literals still stringify the same way
+                // they always did.
+                let resolved = state.resolve_value(value, *line)?;
                 state.set_var(name, resolved, *line)?;
                 Ok(BlockFlow::Continue)
             }
@@ -502,7 +550,12 @@ enum BlockFlow {
 
 #[derive(Default)]
 struct ExecState {
-    vars: HashMap<String, String>,
+    /// F5/F7: typed variable store. The previous executor held
+    /// `HashMap<String, String>`; expanding to `SflowValue`
+    /// lets `list_*` / `map_*` built-ins operate on rich values
+    /// while string-context reads stringify via
+    /// `SflowValue::to_display`.
+    vars: HashMap<String, SflowValue>,
     /// Internal `error.kind` / `error.message` injected by the executor
     /// for the duration of a catch block. Kept separate from user-defined
     /// vars so they don't count against [`MAX_VARS`].
@@ -516,7 +569,7 @@ struct ExecState {
 }
 
 impl ExecState {
-    fn set_var(&mut self, name: &str, value: String, line: usize) -> Result<(), RuntimeError> {
+    fn set_var(&mut self, name: &str, value: SflowValue, line: usize) -> Result<(), RuntimeError> {
         if !self.vars.contains_key(name) && self.vars.len() >= MAX_VARS {
             return Err(RuntimeError::local(
                 line,
@@ -535,17 +588,229 @@ impl ExecState {
         self.internal.remove(name);
     }
 
+    /// String-context resolve. Preserves the contract of the
+    /// pre-F5 executor: every step arg, every interpolation,
+    /// every condition compares against a `String`.
     fn resolve(&self, expr: &Expr, line: usize) -> Result<String, RuntimeError> {
+        Ok(self.resolve_value(expr, line)?.to_display())
+    }
+
+    /// Typed resolve. Returns the rich `SflowValue` so that
+    /// `set x = [...]` and list/map built-ins can carry the
+    /// structured shape through to the var store.
+    fn resolve_value(&self, expr: &Expr, line: usize) -> Result<SflowValue, RuntimeError> {
         Ok(match expr {
-            Expr::Literal(s) => self.interpolate(s, line)?,
-            Expr::LastResult => self.last_step.result.clone(),
+            Expr::Literal(s) => SflowValue::String(self.interpolate(s, line)?),
+            Expr::LastResult => SflowValue::String(self.last_step.result.clone()),
             Expr::Var(name) => self.vars.get(name).cloned().unwrap_or_default(),
-            Expr::StepResult(name) => self
-                .named_steps
-                .get(name)
-                .map(|s| s.result.clone())
-                .unwrap_or_default(),
+            Expr::StepResult(name) => SflowValue::String(
+                self.named_steps
+                    .get(name)
+                    .map(|s| s.result.clone())
+                    .unwrap_or_default(),
+            ),
+            Expr::ListLit(elements) => {
+                let mut out: Vec<String> = Vec::with_capacity(elements.len());
+                for e in elements {
+                    out.push(self.resolve(e, line)?);
+                }
+                SflowValue::List(out)
+            }
+            Expr::MapLit(pairs) => {
+                let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    let value = self.resolve(v, line)?;
+                    // De-dup keys with last-write-wins so the
+                    // structure mirrors how `map_set` updates
+                    // existing keys.
+                    if let Some(existing) = out.iter_mut().find(|(ek, _)| ek == k) {
+                        existing.1 = value;
+                    } else {
+                        out.push((k.clone(), value));
+                    }
+                }
+                SflowValue::Map(out)
+            }
+            Expr::Call(name, args) => self.eval_builtin(name, args, line)?,
         })
+    }
+
+    /// Evaluate a built-in call. Returns the typed result
+    /// (e.g. `list_len` is `SflowValue::String("3")` so that
+    /// `set count = list_len(var.xs)` works in string
+    /// contexts; an explicit integer type isn't needed because
+    /// Sflow has no `int` value form).
+    fn eval_builtin(
+        &self,
+        name: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<SflowValue, RuntimeError> {
+        match name {
+            "list_len" => {
+                expect_arity(name, args, 1, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let n = match v {
+                    SflowValue::List(items) => items.len(),
+                    SflowValue::String(s) if s.is_empty() => 0,
+                    SflowValue::String(s) => s.split('|').count(),
+                    SflowValue::Map(pairs) => pairs.len(),
+                };
+                Ok(SflowValue::String(n.to_string()))
+            }
+            "list_get" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let idx_str = self.resolve(&args[1], line)?;
+                let Ok(idx) = idx_str.parse::<i64>() else {
+                    return Err(RuntimeError::local(
+                        line,
+                        format!("list_get index must be an integer, got `{idx_str}`"),
+                    ));
+                };
+                let items: Vec<String> = match v {
+                    SflowValue::List(it) => it,
+                    SflowValue::String(s) if s.is_empty() => Vec::new(),
+                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
+                    SflowValue::Map(pairs) => {
+                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
+                    }
+                };
+                let s = if idx < 0 || (idx as usize) >= items.len() {
+                    String::new()
+                } else {
+                    items[idx as usize].clone()
+                };
+                Ok(SflowValue::String(s))
+            }
+            "list_push" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let val = self.resolve(&args[1], line)?;
+                let mut items: Vec<String> = match v {
+                    SflowValue::List(it) => it,
+                    SflowValue::String(s) if s.is_empty() => Vec::new(),
+                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
+                    SflowValue::Map(pairs) => {
+                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
+                    }
+                };
+                items.push(val);
+                Ok(SflowValue::List(items))
+            }
+            "list_contains" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let needle = self.resolve(&args[1], line)?;
+                let items: Vec<String> = match v {
+                    SflowValue::List(it) => it,
+                    SflowValue::String(s) if s.is_empty() => Vec::new(),
+                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
+                    SflowValue::Map(pairs) => {
+                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
+                    }
+                };
+                Ok(SflowValue::String(
+                    if items.iter().any(|x| x == &needle) {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                    .to_string(),
+                ))
+            }
+            "list_join" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let sep = self.resolve(&args[1], line)?;
+                let items: Vec<String> = match v {
+                    SflowValue::List(it) => it,
+                    SflowValue::String(s) if s.is_empty() => Vec::new(),
+                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
+                    SflowValue::Map(pairs) => {
+                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
+                    }
+                };
+                Ok(SflowValue::String(items.join(&sep)))
+            }
+            "list_split" => {
+                expect_arity(name, args, 2, line)?;
+                let src = self.resolve(&args[0], line)?;
+                let sep = self.resolve(&args[1], line)?;
+                let items: Vec<String> = if sep.is_empty() {
+                    vec![src.clone()]
+                } else {
+                    src.split(&sep).map(str::to_string).collect()
+                };
+                Ok(SflowValue::List(items))
+            }
+            "map_get" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let key = self.resolve(&args[1], line)?;
+                let pairs = map_pairs_from(v);
+                let s = pairs
+                    .into_iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v)
+                    .unwrap_or_default();
+                Ok(SflowValue::String(s))
+            }
+            "map_set" => {
+                expect_arity(name, args, 3, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let key = self.resolve(&args[1], line)?;
+                let val = self.resolve(&args[2], line)?;
+                let mut pairs = map_pairs_from(v);
+                if let Some(existing) = pairs.iter_mut().find(|(k, _)| *k == key) {
+                    existing.1 = val;
+                } else {
+                    pairs.push((key, val));
+                }
+                Ok(SflowValue::Map(pairs))
+            }
+            "map_has" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let key = self.resolve(&args[1], line)?;
+                let pairs = map_pairs_from(v);
+                Ok(SflowValue::String(
+                    if pairs.iter().any(|(k, _)| *k == key) {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                    .to_string(),
+                ))
+            }
+            "map_keys" => {
+                expect_arity(name, args, 1, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let pairs = map_pairs_from(v);
+                Ok(SflowValue::List(
+                    pairs.into_iter().map(|(k, _)| k).collect(),
+                ))
+            }
+            "map_len" => {
+                expect_arity(name, args, 1, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                Ok(SflowValue::String(map_pairs_from(v).len().to_string()))
+            }
+            "map_del" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let key = self.resolve(&args[1], line)?;
+                let pairs = map_pairs_from(v)
+                    .into_iter()
+                    .filter(|(k, _)| *k != key)
+                    .collect();
+                Ok(SflowValue::Map(pairs))
+            }
+            _ => Err(RuntimeError::local(
+                line,
+                format!("unknown built-in `{name}`"),
+            )),
+        }
     }
 
     /// Expand `${…}` placeholders in a string literal. Unknown placeholders
@@ -580,7 +845,11 @@ impl ExecState {
             "result" => self.last_step.result.clone(),
             "status" => self.last_step.status.clone(),
             "error.kind" | "error.message" => self.internal.get(key).cloned().unwrap_or_default(),
-            k if k.starts_with("var.") => self.vars.get(&k[4..]).cloned().unwrap_or_default(),
+            k if k.starts_with("var.") => self
+                .vars
+                .get(&k[4..])
+                .map(SflowValue::to_display)
+                .unwrap_or_default(),
             k if k.starts_with("step.") => {
                 if let Some(rest) = k.strip_prefix("step.") {
                     if let Some(name) = rest.strip_suffix(".result") {
@@ -601,7 +870,11 @@ impl ExecState {
                 String::new()
             }
             // bare `var_name` — treat as variable lookup for ergonomics
-            k => self.vars.get(k).cloned().unwrap_or_default(),
+            k => self
+                .vars
+                .get(k)
+                .map(SflowValue::to_display)
+                .unwrap_or_default(),
         }
     }
 
@@ -640,7 +913,11 @@ impl ExecState {
         match atom {
             Atom::Status => self.last_step.status.clone(),
             Atom::Result => self.last_step.result.clone(),
-            Atom::Var(name) => self.vars.get(name).cloned().unwrap_or_default(),
+            Atom::Var(name) => self
+                .vars
+                .get(name)
+                .map(SflowValue::to_display)
+                .unwrap_or_default(),
             Atom::StepStatus(name) => self
                 .named_steps
                 .get(name)
@@ -653,6 +930,48 @@ impl ExecState {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// Coerce a SflowValue into the pair-list shape map built-ins
+/// expect. A `Map` returns its pairs directly; a `String` is
+/// parsed against the canonical `k1=v1;k2=v2` encoding (empty
+/// string → empty map; segments without `=` map to empty
+/// values). A `List` cannot be coerced into a map and returns
+/// an empty pair list — built-ins like `map_get` on a list var
+/// silently return `""` rather than panicking, matching the
+/// SOL behaviour of `map_get(list, "k") -> ""`.
+fn map_pairs_from(v: SflowValue) -> Vec<(String, String)> {
+    match v {
+        SflowValue::Map(pairs) => pairs,
+        SflowValue::String(s) if s.is_empty() => Vec::new(),
+        SflowValue::String(s) => s
+            .split(';')
+            .map(|seg| match seg.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (seg.to_string(), String::new()),
+            })
+            .collect(),
+        SflowValue::List(_) => Vec::new(),
+    }
+}
+
+fn expect_arity(
+    name: &str,
+    args: &[Expr],
+    expected: usize,
+    line: usize,
+) -> Result<(), RuntimeError> {
+    if args.len() != expected {
+        return Err(RuntimeError::local(
+            line,
+            format!(
+                "{name}() takes {expected} argument{} but received {}",
+                if expected == 1 { "" } else { "s" },
+                args.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -692,6 +1011,281 @@ mod tests {
                 Err(RemoteCallError::local(peer, method, "no scripted response"))
             })
         }
+    }
+
+    /// Helper for tests that don't need a dispatcher — F5/F7
+    /// list & map behaviour is verified by setting vars and
+    /// inspecting flow_result, not by dispatching capabilities.
+    fn exec_no_dispatch(src: &str) -> (ExecOutcome, Arc<VecChronicle>) {
+        let prog = compile(src).unwrap();
+        let dispatcher = ScriptedDispatcher::new(Vec::new());
+        let chronicle: Arc<VecChronicle> = Arc::new(VecChronicle::default());
+        let executor = Executor::new(dispatcher, chronicle.clone());
+        let outcome = executor.run(&prog);
+        (outcome, chronicle)
+    }
+
+    #[test]
+    fn empty_list_literal_in_set_stores_empty_list() {
+        let src = r#"
+            set xs = []
+            sol.set_result list_len(var.xs)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.result, "0");
+    }
+
+    #[test]
+    fn three_element_list_literal_has_length_three() {
+        let src = r#"
+            set xs = ["a", "b", "c"]
+            sol.set_result list_len(var.xs)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.result, "3");
+    }
+
+    #[test]
+    fn list_get_returns_element_at_index() {
+        let src = r#"
+            set xs = ["alpha", "beta", "gamma"]
+            sol.set_result list_get(var.xs, "1")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "beta");
+    }
+
+    #[test]
+    fn list_get_out_of_bounds_returns_empty_string() {
+        let src = r#"
+            set xs = ["only"]
+            sol.set_result list_get(var.xs, "99")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "");
+    }
+
+    #[test]
+    fn list_push_returns_new_list_original_unchanged() {
+        let src = r#"
+            set xs = ["a", "b", "c"]
+            set ys = list_push(var.xs, "d")
+            sol.set_result list_len(var.xs)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "3", "original list must not be mutated");
+
+        let src2 = r#"
+            set xs = ["a", "b", "c"]
+            set ys = list_push(var.xs, "d")
+            sol.set_result list_len(var.ys)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src2);
+        assert_eq!(outcome.result, "4");
+    }
+
+    #[test]
+    fn list_contains_returns_true_for_present_value() {
+        let src = r#"
+            set xs = ["a", "b", "c"]
+            sol.set_result list_contains(var.xs, "b")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "true");
+    }
+
+    #[test]
+    fn list_contains_returns_false_for_absent_value() {
+        let src = r#"
+            set xs = ["a", "b"]
+            sol.set_result list_contains(var.xs, "z")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "false");
+    }
+
+    #[test]
+    fn list_join_produces_correct_string() {
+        let src = r#"
+            set xs = ["a", "b", "c"]
+            sol.set_result list_join(var.xs, "-")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "a-b-c");
+    }
+
+    #[test]
+    fn list_split_with_separator_returns_three_elements() {
+        let src = r#"
+            set xs = list_split("a|b|c", "|")
+            sol.set_result list_len(var.xs)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "3");
+    }
+
+    #[test]
+    fn list_split_empty_string_produces_single_element_list() {
+        let src = r#"
+            set xs = list_split("", "|")
+            sol.set_result list_len(var.xs)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "1");
+    }
+
+    #[test]
+    fn empty_map_literal_has_length_zero() {
+        let src = r#"
+            set m = {}
+            sol.set_result map_len(var.m)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "0");
+    }
+
+    #[test]
+    fn map_with_two_pairs_returns_correct_values() {
+        let src = r#"
+            set m = { "k1": "v1", "k2": "v2" }
+            sol.set_result map_get(var.m, "k2")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "v2");
+    }
+
+    #[test]
+    fn map_get_missing_key_returns_empty_string() {
+        let src = r#"
+            set m = { "k1": "v1" }
+            sol.set_result map_get(var.m, "absent")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "");
+    }
+
+    #[test]
+    fn map_has_returns_true_for_present_key() {
+        let src = r#"
+            set m = { "k1": "v1" }
+            sol.set_result map_has(var.m, "k1")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "true");
+    }
+
+    #[test]
+    fn map_set_returns_new_map_original_unchanged() {
+        let src = r#"
+            set m = { "k1": "v1" }
+            set m2 = map_set(var.m, "k2", "v2")
+            sol.set_result map_len(var.m)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "1");
+
+        let src2 = r#"
+            set m = { "k1": "v1" }
+            set m2 = map_set(var.m, "k2", "v2")
+            sol.set_result map_len(var.m2)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src2);
+        assert_eq!(outcome.result, "2");
+    }
+
+    #[test]
+    fn map_del_returns_new_map_with_key_removed() {
+        let src = r#"
+            set m = { "a": "1", "b": "2" }
+            set m2 = map_del(var.m, "a")
+            sol.set_result map_has(var.m2, "a")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "false");
+    }
+
+    #[test]
+    fn map_keys_returns_keys_list_in_insertion_order() {
+        let src = r#"
+            set m = { "a": "1", "b": "2", "c": "3" }
+            set ks = map_keys(var.m)
+            sol.set_result list_get(var.ks, "0")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "a");
+    }
+
+    #[test]
+    fn list_display_format_is_pipe_separated() {
+        // Lists round-trip into step-arg / interpolation
+        // contexts via `SflowValue::to_display`, which
+        // pipe-joins. Verify this so flows authors know what
+        // the wire format looks like.
+        let src = r#"
+            set xs = ["a", "b", "c"]
+            sol.set_result "joined ${var.xs}"
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "joined a|b|c");
+    }
+
+    #[test]
+    fn map_display_format_is_semicolon_separated() {
+        let src = r#"
+            set m = { "k1": "v1", "k2": "v2" }
+            sol.set_result "encoded ${var.m}"
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "encoded k1=v1;k2=v2");
+    }
+
+    #[test]
+    fn map_literal_value_can_carry_interpolation() {
+        let src = r#"
+            set name = "alice"
+            set m = { "greeting": "hi ${var.name}" }
+            sol.set_result map_get(var.m, "greeting")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "hi alice");
+    }
+
+    #[test]
+    fn nested_map_set_chains_correctly() {
+        let src = r#"
+            set m = {}
+            set m = map_set(var.m, "a", "1")
+            set m = map_set(var.m, "b", "2")
+            set m = map_set(var.m, "c", "3")
+            sol.set_result map_len(var.m)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "3");
     }
 
     fn exec(

@@ -139,6 +139,20 @@ pub enum Expr {
     Var(String),
     /// `step.<name>.result`.
     StepResult(String),
+    /// F5: list literal `[a, b, c]`. Elements are any value
+    /// expression; the executor stores the resolved values as
+    /// a `SflowValue::List`.
+    ListLit(Vec<Expr>),
+    /// F7: map literal `{ "k1": v1, "k2": v2 }`. Keys must be
+    /// string literals (consistent with SOL); values are any
+    /// value expression. The executor stores the resolved
+    /// pairs as a `SflowValue::Map`.
+    MapLit(Vec<(String, Expr)>),
+    /// F6/F8: built-in function call. The parser recognises a
+    /// fixed set of names (`list_*`, `map_*`); other call
+    /// targets are rejected with a parse error. Arguments are
+    /// arbitrary value expressions.
+    Call(String, Vec<Expr>),
 }
 
 /// Condition used by `if` / `while` / `until` / `sol.assert`.
@@ -442,9 +456,23 @@ impl<'a> Parser<'a> {
                 };
                 Ok(Expr::Literal(s.clone()))
             }
+            // F5: list literal `[a, b, c]` in a value position.
+            Some(Token::LSquare) => self.parse_list_literal(line),
+            // F7: map literal `{ "k": v, ... }` in a value
+            // position. Sflow has no `{` statement so the
+            // bracket is unambiguous here.
+            Some(Token::LCurly) => self.parse_map_literal(line),
             Some(Token::Ident(s)) => {
                 let val = s.clone();
                 self.advance();
+                // F6/F8: built-in function call. Recognised
+                // when the identifier is one of the
+                // list_* / map_* names AND the very next
+                // token is `(`. Anything else falls back to
+                // the existing var / step / result lookup.
+                if is_builtin_name(&val) && matches!(self.peek_token(), Some(Token::LParen)) {
+                    return self.parse_builtin_call(val, line);
+                }
                 expr_from_ident(&val, line)
             }
             other => Err(SflowError::new(
@@ -452,6 +480,152 @@ impl<'a> Parser<'a> {
                 format!("expected value expression, got {other:?}"),
             )),
         }
+    }
+
+    fn parse_list_literal(&mut self, line: usize) -> Result<Expr, SflowError> {
+        self.advance(); // consume `[`
+        let mut elements: Vec<Expr> = Vec::new();
+        loop {
+            if matches!(self.peek_token(), Some(Token::RSquare)) {
+                break;
+            }
+            elements.push(self.parse_value_expr(line)?);
+            match self.peek_token() {
+                Some(Token::Comma) => {
+                    self.advance();
+                }
+                Some(Token::RSquare) => break,
+                other => {
+                    return Err(SflowError::new(
+                        line,
+                        format!("expected `,` or `]` in list literal, got {other:?}"),
+                    ));
+                }
+            }
+        }
+        match self.advance() {
+            Some(Lexed {
+                token: Token::RSquare,
+                ..
+            }) => {}
+            other => {
+                return Err(SflowError::new(
+                    line,
+                    format!("expected `]` to close list literal, got {other:?}"),
+                ));
+            }
+        }
+        Ok(Expr::ListLit(elements))
+    }
+
+    fn parse_map_literal(&mut self, line: usize) -> Result<Expr, SflowError> {
+        self.advance(); // consume `{`
+        let mut pairs: Vec<(String, Expr)> = Vec::new();
+        loop {
+            if matches!(self.peek_token(), Some(Token::RCurly)) {
+                break;
+            }
+            let key = match self.advance() {
+                Some(Lexed {
+                    token: Token::String(s),
+                    ..
+                }) => s.clone(),
+                other => {
+                    return Err(SflowError::new(
+                        line,
+                        format!("map literal keys must be string literals, got {other:?}"),
+                    ));
+                }
+            };
+            match self.advance() {
+                Some(Lexed {
+                    token: Token::Colon,
+                    ..
+                }) => {}
+                other => {
+                    return Err(SflowError::new(
+                        line,
+                        format!("expected `:` after map key, got {other:?}"),
+                    ));
+                }
+            }
+            let value = self.parse_value_expr(line)?;
+            pairs.push((key, value));
+            match self.peek_token() {
+                Some(Token::Comma) => {
+                    self.advance();
+                }
+                Some(Token::RCurly) => break,
+                other => {
+                    return Err(SflowError::new(
+                        line,
+                        format!("expected `,` or `}}` in map literal, got {other:?}"),
+                    ));
+                }
+            }
+        }
+        match self.advance() {
+            Some(Lexed {
+                token: Token::RCurly,
+                ..
+            }) => {}
+            other => {
+                return Err(SflowError::new(
+                    line,
+                    format!("expected `}}` to close map literal, got {other:?}"),
+                ));
+            }
+        }
+        Ok(Expr::MapLit(pairs))
+    }
+
+    fn parse_builtin_call(&mut self, name: String, line: usize) -> Result<Expr, SflowError> {
+        // Caller has already consumed the identifier and the
+        // very next token is `(`.
+        match self.advance() {
+            Some(Lexed {
+                token: Token::LParen,
+                ..
+            }) => {}
+            other => {
+                return Err(SflowError::new(
+                    line,
+                    format!("expected `(` after {name}, got {other:?}"),
+                ));
+            }
+        }
+        let mut args: Vec<Expr> = Vec::new();
+        loop {
+            if matches!(self.peek_token(), Some(Token::RParen)) {
+                break;
+            }
+            args.push(self.parse_value_expr(line)?);
+            match self.peek_token() {
+                Some(Token::Comma) => {
+                    self.advance();
+                }
+                Some(Token::RParen) => break,
+                other => {
+                    return Err(SflowError::new(
+                        line,
+                        format!("expected `,` or `)` in {name}(...) args, got {other:?}"),
+                    ));
+                }
+            }
+        }
+        match self.advance() {
+            Some(Lexed {
+                token: Token::RParen,
+                ..
+            }) => {}
+            other => {
+                return Err(SflowError::new(
+                    line,
+                    format!("expected `)` to close {name}(...), got {other:?}"),
+                ));
+            }
+        }
+        Ok(Expr::Call(name, args))
     }
 
     fn parse_if(&mut self, line: usize, depth: usize) -> Result<Stmt, SflowError> {
@@ -794,6 +968,27 @@ impl<'a> Parser<'a> {
 
 fn token_kind_eq(a: &Token, b: &Token) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// Recognise a Sflow built-in by name. Used by `parse_value_expr`
+/// to disambiguate `ident(` from `ident` followed by an
+/// independent expression on the next line.
+pub fn is_builtin_name(s: &str) -> bool {
+    matches!(
+        s,
+        "list_len"
+            | "list_get"
+            | "list_push"
+            | "list_contains"
+            | "list_join"
+            | "list_split"
+            | "map_get"
+            | "map_set"
+            | "map_has"
+            | "map_keys"
+            | "map_len"
+            | "map_del"
+    )
 }
 
 fn ensure_depth(depth: usize, line: usize) -> Result<(), SflowError> {

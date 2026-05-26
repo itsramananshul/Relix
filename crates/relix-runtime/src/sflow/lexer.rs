@@ -54,6 +54,28 @@ pub enum Token {
     Eq,
     EqEq,
     BangEq,
+    /// `[` — opens a list literal in a value-expression
+    /// position. Statement positions never expect a `[`, so
+    /// the parser only consumes one when it's reading a value.
+    LSquare,
+    /// `]` — closes a list literal.
+    RSquare,
+    /// `{` — opens a map literal in a value-expression
+    /// position. Same statement-vs-value rule as LSquare.
+    LCurly,
+    /// `}` — closes a map literal.
+    RCurly,
+    /// `(` — opens a built-in function call argument list
+    /// (`list_len(...)`, `map_get(...)`, etc.). Only valid in
+    /// a value-expression position; statement keywords never
+    /// take parentheses.
+    LParen,
+    /// `)` — closes a built-in function call argument list.
+    RParen,
+    /// `,` — separates list elements, map pairs, and function
+    /// call arguments. Plain commas anywhere else are a parse
+    /// error (Sflow has no tuples / multi-arg statements).
+    Comma,
 
     /// End of a line that contained at least one non-whitespace, non-comment
     /// token. Consecutive blank lines collapse into a single Newline so the
@@ -131,6 +153,62 @@ pub fn tokenize(source: &str) -> Result<Vec<Lexed>, SflowError> {
             ':' => {
                 out.push(Lexed {
                     token: Token::Colon,
+                    line,
+                });
+                i += 1;
+                at_line_start = false;
+            }
+            '[' => {
+                out.push(Lexed {
+                    token: Token::LSquare,
+                    line,
+                });
+                i += 1;
+                at_line_start = false;
+            }
+            ']' => {
+                out.push(Lexed {
+                    token: Token::RSquare,
+                    line,
+                });
+                i += 1;
+                at_line_start = false;
+            }
+            '{' => {
+                out.push(Lexed {
+                    token: Token::LCurly,
+                    line,
+                });
+                i += 1;
+                at_line_start = false;
+            }
+            '}' => {
+                out.push(Lexed {
+                    token: Token::RCurly,
+                    line,
+                });
+                i += 1;
+                at_line_start = false;
+            }
+            '(' => {
+                out.push(Lexed {
+                    token: Token::LParen,
+                    line,
+                });
+                i += 1;
+                at_line_start = false;
+            }
+            ')' => {
+                out.push(Lexed {
+                    token: Token::RParen,
+                    line,
+                });
+                i += 1;
+                at_line_start = false;
+            }
+            ',' => {
+                out.push(Lexed {
+                    token: Token::Comma,
                     line,
                 });
                 i += 1;
