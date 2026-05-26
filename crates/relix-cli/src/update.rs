@@ -248,12 +248,62 @@ pub async fn run(args: UpdateArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("error: download failed: {e}");
         std::process::exit(2);
     }
+    // W6 follow-up: when the asset is an archive (.tar.gz /
+    // .tgz / .zip), extract it and find the bundled binary.
+    // Raw binaries skip extraction and replace directly.
+    let replacement_source = if is_archive_asset(asset_name) {
+        if asset_name.to_ascii_lowercase().ends_with(".zip") {
+            // .zip is the Windows release format. We don't ship
+            // the heavyweight `zip` crate today; operators on
+            // Windows need to extract manually for now.
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!(
+                "error: this build can self-replace from .tar.gz / .tgz archives but not .zip yet.\nDownload {} manually from the release page and replace your relix binary.",
+                asset.name
+            );
+            std::process::exit(2);
+        }
+        let extract_dir = dir.join(format!(".relix-update-extract-{}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&extract_dir) {
+            let _ = std::fs::remove_file(&temp_path);
+            eprintln!("error: create extract dir: {e}");
+            std::process::exit(2);
+        }
+        let extracted = match extract_tar_gz(&temp_path, &extract_dir) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                eprintln!("error: extract archive: {e}");
+                std::process::exit(2);
+            }
+        };
+        let binary = match pick_extracted_binary(&extracted) {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let _ = std::fs::remove_file(&temp_path);
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                eprintln!(
+                    "error: archive did not contain a relix-shaped binary; \
+                     extracted {} files",
+                    extracted.len()
+                );
+                std::process::exit(2);
+            }
+        };
+        // Drop the original archive so the replace step
+        // operates on the extracted binary.
+        let _ = std::fs::remove_file(&temp_path);
+        binary
+    } else {
+        temp_path.clone()
+    };
     println!("replacing {} ...", installed_path.display());
-    if let Err(e) = atomically_replace_binary(&installed_path, &temp_path) {
-        // Best-effort cleanup of the temp file on replace
+    if let Err(e) = atomically_replace_binary(&installed_path, &replacement_source) {
+        // Best-effort cleanup of the staging files on replace
         // failure; the installed binary stays untouched per
         // the replace function's contract.
-        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_file(&replacement_source);
         eprintln!("error: replace failed: {e}");
         std::process::exit(2);
     }
@@ -411,6 +461,77 @@ fn with_partial_suffix(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// W6 follow-up: extract a `.tar.gz` archive to `dest_dir`,
+/// returning the list of extracted file paths. Pure Rust via
+/// `flate2` + `tar` so there's no shell dependency.
+///
+/// Errors surface as operator-readable strings. Failed
+/// extractions leave whatever they wrote to `dest_dir`
+/// in place; the caller (which owns a tempdir) cleans up by
+/// dropping the dir.
+pub fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let file = std::fs::File::open(archive_path)
+        .map_err(|e| format!("open archive {}: {e}", archive_path.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let mut entries = Vec::new();
+    let iter = tar
+        .entries()
+        .map_err(|e| format!("read tar entries: {e}"))?;
+    for entry in iter {
+        let mut e = entry.map_err(|e| format!("tar entry: {e}"))?;
+        let header_path = e
+            .path()
+            .map_err(|e| format!("tar entry path: {e}"))?
+            .into_owned();
+        let target = dest_dir.join(&header_path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        e.unpack(&target)
+            .map_err(|e| format!("unpack {}: {e}", target.display()))?;
+        if target.is_file() {
+            entries.push(target);
+        }
+    }
+    Ok(entries)
+}
+
+/// W6 follow-up: pick the first executable-looking entry in
+/// `extracted`. The relix release matrix produces a single
+/// `relix-cli`-shaped binary per archive plus optionally a
+/// `LICENSE` / `README` sibling; we accept any file whose name
+/// stem matches `relix` (case-insensitive) and isn't an
+/// archive / doc.
+pub fn pick_extracted_binary(extracted: &[PathBuf]) -> Option<&Path> {
+    for p in extracted {
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name.starts_with("relix")
+            && !name.ends_with(".md")
+            && !name.ends_with(".txt")
+            && !name.ends_with(".sha256")
+            && !name.ends_with(".asc")
+            && !name.ends_with(".sig")
+        {
+            return Some(p.as_path());
+        }
+    }
+    None
+}
+
+/// Returns `true` when `asset_name` should be unpacked before
+/// `atomically_replace_binary`. Matches the canonical release
+/// matrix produced by `.github/workflows/release.yml`.
+pub fn is_archive_asset(asset_name: &str) -> bool {
+    let lower = asset_name.to_ascii_lowercase();
+    lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +685,85 @@ mod tests {
         // Operator-facing contract: installed binary stays put.
         let after = std::fs::read(&installed).unwrap();
         assert_eq!(after, original_bytes);
+    }
+
+    /// Build a tiny in-memory `.tar.gz` archive containing
+    /// the provided `(filename, contents)` entries and write
+    /// it to `dest`. Pure Rust; no shell call.
+    fn build_tar_gz(dest: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let file = std::fs::File::create(dest).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        for (name, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, *body).unwrap();
+        }
+        let encoder = tar.into_inner().unwrap();
+        let mut f = encoder.finish().unwrap();
+        f.flush().unwrap();
+    }
+
+    #[test]
+    fn extract_tar_gz_unpacks_every_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("relix.tar.gz");
+        build_tar_gz(
+            &archive,
+            &[("relix-cli", b"NEW_RELIX_BYTES"), ("README.md", b"docs")],
+        );
+        let dest = tmp.path().join("ex");
+        let entries = extract_tar_gz(&archive, &dest).unwrap();
+        assert_eq!(entries.len(), 2);
+        let bin = dest.join("relix-cli");
+        let readme = dest.join("README.md");
+        assert!(bin.exists());
+        assert!(readme.exists());
+        assert_eq!(std::fs::read(&bin).unwrap(), b"NEW_RELIX_BYTES");
+    }
+
+    #[test]
+    fn pick_extracted_binary_skips_docs_and_picks_relix_named_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = tmp.path().join("README.md");
+        let bin = tmp.path().join("relix-cli");
+        let sha = tmp.path().join("relix-cli.sha256");
+        std::fs::write(&docs, b"docs").unwrap();
+        std::fs::write(&bin, b"bin").unwrap();
+        std::fs::write(&sha, b"sha").unwrap();
+        let candidates = vec![docs.clone(), sha.clone(), bin.clone()];
+        let picked = pick_extracted_binary(&candidates).unwrap();
+        assert_eq!(picked, bin.as_path());
+    }
+
+    #[test]
+    fn is_archive_asset_recognises_canonical_release_formats() {
+        assert!(is_archive_asset("relix-x86_64-unknown-linux-gnu.tar.gz"));
+        assert!(is_archive_asset("relix-aarch64-apple-darwin.tgz"));
+        assert!(is_archive_asset("relix-x86_64-pc-windows-msvc.zip"));
+        assert!(!is_archive_asset("relix-cli"));
+        assert!(!is_archive_asset("relix.exe"));
+    }
+
+    #[test]
+    fn end_to_end_tar_gz_extract_then_replace_swaps_installed_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = tmp.path().join("relix-installed");
+        std::fs::write(&installed, b"OLD_INSTALLED").unwrap();
+        // Build a tar.gz that mirrors what GitHub Actions ships.
+        let archive = tmp.path().join("relix.tar.gz");
+        build_tar_gz(&archive, &[("relix-cli", b"FRESH_FROM_RELEASE_ARCHIVE")]);
+        // Extract, pick, replace.
+        let extract_dir = tmp.path().join("ex");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let entries = extract_tar_gz(&archive, &extract_dir).unwrap();
+        let binary = pick_extracted_binary(&entries).unwrap().to_path_buf();
+        atomically_replace_binary(&installed, &binary).unwrap();
+        let got = std::fs::read(&installed).unwrap();
+        assert_eq!(got, b"FRESH_FROM_RELEASE_ARCHIVE");
     }
 
     #[test]
