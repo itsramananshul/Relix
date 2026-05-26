@@ -182,6 +182,11 @@ pub struct DispatchBridge {
     /// node — those nodes skip the gate step entirely and
     /// preserve today's behavior.
     agent_gate: Option<AgentGateBindings>,
+    /// W2: per-agent capability access broker. Configured from
+    /// `[[execution.agents]]` at startup. `None` (or an empty
+    /// broker) means the broker is permissive — useful for
+    /// nodes / deployments that don't run agent policies.
+    access_broker: Option<Arc<crate::nodes::execution::broker::AgentAccessBroker>>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -302,6 +307,7 @@ impl DispatchBridge {
             capability_stats: Arc::new(std::sync::RwLock::new(HashMap::new())),
             policy_denials: Arc::new(PolicyDenialRing::default()),
             agent_gate: None,
+            access_broker: None,
         })
     }
 
@@ -310,6 +316,27 @@ impl DispatchBridge {
     /// is open. No-op on nodes that don't host an agent store.
     pub fn set_agent_gate(&mut self, bindings: AgentGateBindings) {
         self.agent_gate = Some(bindings);
+    }
+
+    /// W2: wire the per-agent access broker. Controllers that
+    /// parse `[[execution.agents]]` from their config hand the
+    /// resulting broker in at startup. Calling with an empty
+    /// broker is equivalent to leaving the slot `None`: every
+    /// check returns Allow.
+    pub fn set_access_broker(
+        &mut self,
+        broker: Arc<crate::nodes::execution::broker::AgentAccessBroker>,
+    ) {
+        self.access_broker = Some(broker);
+    }
+
+    /// Cheap-clone handle to the access broker. `None` when no
+    /// broker has been wired. Bridge endpoints + tests use this
+    /// to inspect agent policies + rate-limit state.
+    pub fn access_broker_handle(
+        &self,
+    ) -> Option<Arc<crate::nodes::execution::broker::AgentAccessBroker>> {
+        self.access_broker.clone()
     }
 
     /// W2-007d: cheap-clone accessor for the policy denial
@@ -606,6 +633,64 @@ impl DispatchBridge {
                     AuditStatus::Denied,
                 )
                 .await;
+        }
+
+        // === W2: per-agent access-broker check ===
+        // Categorical allow/deny + sliding-window rate limit
+        // sourced from `[[execution.agents]]`. The broker keys
+        // off the caller's friendly identity name. When no
+        // broker is wired or no policy matches the caller, the
+        // check returns Allow and the dispatch proceeds.
+        if let Some(broker) = self.access_broker.as_ref() {
+            match broker.check(&verified.name, &req.method) {
+                crate::nodes::execution::broker::AccessDecision::Allow => {
+                    broker.record_call(&verified.name);
+                }
+                crate::nodes::execution::broker::AccessDecision::Deny { reason } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    self.policy_denials.push(PolicyDenialEntry {
+                        at: now,
+                        method: req.method.clone(),
+                        caller_subject_id: verified.subject_id.to_string(),
+                        caller_name: verified.name.clone(),
+                        rule: "access_broker".to_string(),
+                        reason: reason.clone(),
+                    });
+                    return self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            format!("access_broker:deny:{reason}"),
+                            error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                }
+                crate::nodes::execution::broker::AccessDecision::RateLimited {
+                    retry_after_secs,
+                } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    self.policy_denials.push(PolicyDenialEntry {
+                        at: now,
+                        method: req.method.clone(),
+                        caller_subject_id: verified.subject_id.to_string(),
+                        caller_name: verified.name.clone(),
+                        rule: "access_broker_rate_limit".to_string(),
+                        reason: format!("retry after {retry_after_secs}s"),
+                    });
+                    return self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            format!("access_broker:rate_limited:{retry_after_secs}s"),
+                            error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                }
+            }
         }
 
         // === Admission step 10: dispatch ===
@@ -1517,5 +1602,137 @@ mod tests {
         let snap = bridge.capability_stats_snapshot();
         let names: Vec<&str> = snap.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["aaa.method", "mmm.method", "zzz.method"]);
+    }
+
+    // ── W2: AgentAccessBroker wiring ────────────────────────────────
+
+    #[tokio::test]
+    async fn access_broker_allows_call_when_policy_permits() {
+        use crate::nodes::execution::broker::{AccessPolicy, AgentAccessBroker};
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        bridge.set_access_broker(Arc::new(AgentAccessBroker::new(vec![AccessPolicy {
+            agent: "alice".into(),
+            // Empty allow list = unrestricted (subject to deny + rate limit).
+            allowed_capabilities: Vec::new(),
+            denied_capabilities: Vec::new(),
+            max_calls_per_minute: 60,
+            max_cost_cents_per_hour: 500,
+        }])));
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert!(matches!(resp.res, ResponseResult::Ok(_)));
+    }
+
+    #[tokio::test]
+    async fn access_broker_denies_call_when_capability_is_in_deny_list() {
+        use crate::nodes::execution::broker::{AccessPolicy, AgentAccessBroker};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        // Handler increments a counter on call. Broker deny
+        // must prevent the handler from running.
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_for_handler = counter.clone();
+        bridge.register(
+            "node.health",
+            Arc::new(FnHandler(move |_ctx| {
+                let c = counter_for_handler.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    HandlerOutcome::Ok(b"hi".to_vec())
+                }
+            })),
+        );
+        bridge.set_access_broker(Arc::new(AgentAccessBroker::new(vec![AccessPolicy {
+            agent: "alice".into(),
+            allowed_capabilities: Vec::new(),
+            denied_capabilities: vec!["node.health".into()],
+            max_calls_per_minute: 60,
+            max_cost_cents_per_hour: 500,
+        }])));
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::POLICY_DENIED),
+            other => panic!("expected POLICY_DENIED, got {other:?}"),
+        }
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "handler must NOT run when broker denies"
+        );
+        // The denial ring records the broker rule.
+        let snap = bridge.policy_denials_handle().snapshot_newest_first(10);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].rule, "access_broker");
+        assert!(snap[0].reason.contains("deny list"));
+    }
+
+    #[tokio::test]
+    async fn access_broker_loads_policies_from_execution_agents_config() {
+        // Mirror what `build_access_broker` does so the test
+        // proves the config-to-broker mapping end to end.
+        use crate::nodes::execution::broker::AccessPolicy;
+        let cfg_text = r#"
+            [controller]
+            name = "x"
+            node_type = "memory"
+            listen_port = 1
+            [identity]
+            key_path = "x"
+            [trust]
+            org_root_key_path = "x"
+            [policy]
+            file = "x"
+
+            [[execution.agents]]
+            agent = "alice"
+            allowed_capabilities = ["ai.chat"]
+            max_calls_per_minute = 30
+
+            [[execution.agents]]
+            agent = "bob"
+            denied_capabilities = ["tool.terminal"]
+        "#;
+        let cfg: crate::controller_runtime::ControllerConfig = toml::from_str(cfg_text).unwrap();
+        let broker = crate::controller_runtime::build_access_broker(&cfg);
+        let snap = broker.snapshot();
+        assert_eq!(snap.len(), 2);
+        let names: Vec<&str> = snap.iter().map(|e| e.policy.agent.as_str()).collect();
+        assert_eq!(names, vec!["alice", "bob"]);
+        // alice has allow list, bob has deny list. Spot-check
+        // the broker behaves accordingly.
+        use crate::nodes::execution::broker::AccessDecision;
+        assert_eq!(broker.check("alice", "ai.chat"), AccessDecision::Allow);
+        match broker.check("alice", "tool.terminal") {
+            AccessDecision::Deny { reason } => assert!(reason.contains("allow list")),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        match broker.check("bob", "tool.terminal") {
+            AccessDecision::Deny { reason } => assert!(reason.contains("deny list")),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        // Ensure the parsed policies preserved the per-agent
+        // rate limit override.
+        let alice = snap
+            .iter()
+            .find(|e| e.policy.agent == "alice")
+            .expect("alice in snapshot");
+        assert_eq!(alice.policy.max_calls_per_minute, 30);
+        // Use AccessPolicy to keep the type used so the import
+        // doesn't unused-trigger.
+        let _ = AccessPolicy {
+            agent: "x".into(),
+            allowed_capabilities: vec![],
+            denied_capabilities: vec![],
+            max_calls_per_minute: 0,
+            max_cost_cents_per_hour: 0,
+        };
     }
 }

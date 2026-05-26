@@ -84,6 +84,11 @@ pub struct ControllerConfig {
     /// See `crates/relix-runtime/src/nodes/ai/guardrails`.
     #[serde(default)]
     pub guardrails: Option<toml::Value>,
+    /// `[execution]` — per-agent access policies for the
+    /// dispatch broker. W2 wiring. Absent means an empty
+    /// broker (every check returns Allow).
+    #[serde(default)]
+    pub execution: Option<ExecutionSection>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -142,6 +147,21 @@ pub struct TrustSection {
 #[derive(Clone, Debug, Deserialize)]
 pub struct PolicySection {
     pub file: PathBuf,
+}
+
+/// `[execution]` section — wraps `[[execution.agents]]` so
+/// operators can extend the section with more execution-layer
+/// switches in future waves (cost caps, retry policies, etc.)
+/// without re-shaping the schema.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ExecutionSection {
+    /// Per-agent access policies consumed by
+    /// [`crate::nodes::execution::broker::AgentAccessBroker`].
+    /// The broker keys off `policy.agent` so each entry's
+    /// `agent` field must match the AIC's friendly name
+    /// (`IdentityBundle::name`).
+    #[serde(default)]
+    pub agents: Vec<crate::nodes::execution::broker::AccessPolicy>,
 }
 
 /// One peer alias.
@@ -210,6 +230,16 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Dispatch bridge.
     let mut bridge = DispatchBridge::new(policy, trust_root, &audit_path, node_signer.clone())?;
+    // W2: build the per-controller access broker from
+    // `[[execution.agents]]`. Absent / empty config produces
+    // an empty broker — every check returns Allow so
+    // existing deployments behave identically. The same Arc
+    // is shared with the ToolDispatcher (built later in the
+    // AI registration path) so both the dispatch admission
+    // pipeline and the ToolDispatcher see one source of
+    // truth.
+    let access_broker = build_access_broker(&cfg);
+    bridge.set_access_broker(access_broker.clone());
     register_builtins(&mut bridge, &cfg, manifest.clone());
     // Router role short-circuits: it doesn't run the per-node-type
     // capability surface (memory/ai/tool/...) — it runs the four
@@ -232,7 +262,13 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         register_router_descriptors(&manifest);
         Some(state)
     } else {
-        register_node_type_handlers(&mut bridge, &cfg, manifest.clone(), &mut startup_wiring)?;
+        register_node_type_handlers(
+            &mut bridge,
+            &cfg,
+            manifest.clone(),
+            access_broker.clone(),
+            &mut startup_wiring,
+        )?;
         None
     };
 
@@ -2749,6 +2785,27 @@ fn build_input_guardrail(cfg: &ControllerConfig) -> crate::nodes::ai::guardrails
     }
 }
 
+/// W2: build an `AgentAccessBroker` from the controller's
+/// `[[execution.agents]]` config. Absent / empty config
+/// produces an empty broker — `check()` returns Allow for
+/// every (agent, capability) pair so existing deployments
+/// without policies behave identically.
+pub(crate) fn build_access_broker(
+    cfg: &ControllerConfig,
+) -> std::sync::Arc<crate::nodes::execution::broker::AgentAccessBroker> {
+    use crate::nodes::execution::broker::AgentAccessBroker;
+    match cfg.execution.as_ref() {
+        Some(exec) if !exec.agents.is_empty() => {
+            tracing::info!(
+                agents = exec.agents.len(),
+                "execution: loaded [[execution.agents]] policies into AgentAccessBroker"
+            );
+            std::sync::Arc::new(AgentAccessBroker::new(exec.agents.clone()))
+        }
+        _ => std::sync::Arc::new(AgentAccessBroker::empty()),
+    }
+}
+
 // Parse `[guardrails.drift]` from the top-level [guardrails]
 // section. Returns `Some(cfg)` only when `enabled = true`; an
 // absent / disabled config returns `None` so the coordinator's
@@ -2832,6 +2889,7 @@ fn register_node_type_handlers(
     bridge: &mut DispatchBridge,
     cfg: &ControllerConfig,
     manifest: ManifestProvider,
+    access_broker: std::sync::Arc<crate::nodes::execution::broker::AgentAccessBroker>,
     out: &mut Option<StartupWiring>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
@@ -3173,19 +3231,21 @@ fn register_node_type_handlers(
         // controllers behave exactly as before.
         let input_guardrail = build_input_guardrail(cfg);
         // W1: build a per-controller ToolDispatcher that wraps
-        // the SecretStore + AgentAccessBroker. The dispatcher is
-        // the choke-point every planner-emitted ToolCall flows
-        // through; admission failures surface as structured
-        // errors in the chat response. The broker starts empty;
-        // W2 populates it from `[[execution.agents]]` so policies
-        // actually apply.
+        // the SecretStore + the shared AgentAccessBroker. The
+        // dispatcher is the choke-point every planner-emitted
+        // ToolCall flows through; admission failures surface as
+        // structured errors in the chat response. W2: the same
+        // broker is wired into the DispatchBridge admission
+        // pipeline, so per-agent policies apply uniformly
+        // whether the call enters via mesh dispatch or via the
+        // AI handler's ToolDispatcher.
         let secret_store =
             std::sync::Arc::new(crate::nodes::execution::secrets::SecretStore::from_env());
-        let access_broker =
-            std::sync::Arc::new(crate::nodes::execution::broker::AgentAccessBroker::empty());
-        let tool_dispatcher = std::sync::Arc::new(
-            crate::nodes::tool::dispatcher::ToolDispatcher::new(secret_store, access_broker),
-        );
+        let tool_dispatcher =
+            std::sync::Arc::new(crate::nodes::tool::dispatcher::ToolDispatcher::new(
+                secret_store,
+                access_broker.clone(),
+            ));
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
