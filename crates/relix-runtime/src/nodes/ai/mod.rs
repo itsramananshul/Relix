@@ -267,6 +267,7 @@ fn entry_or_err(
 /// `ai.chat` proceeds without memory injection. The cell stays
 /// shared across all chat invocations, so the dispatcher is
 /// constructed exactly once per controller process.
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     bridge: &mut DispatchBridge,
     provider: Arc<dyn ChatProvider>,
@@ -275,12 +276,14 @@ pub fn register(
     soul_cache: SoulCache,
     skills_cache: skills::SkillMatcher,
     input_guardrail: guardrails::InputGuardrail,
+    tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let soul_for_chat = soul_cache.clone();
     let skills_for_chat = skills_cache.clone();
     let guardrail_for_chat = input_guardrail.clone();
+    let dispatcher_for_chat = tool_dispatcher.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -290,7 +293,8 @@ pub fn register(
             let soul = soul_for_chat.clone();
             let sk = skills_for_chat.clone();
             let gr = guardrail_for_chat.clone();
-            async move { handle_chat(p, model, mem, soul, sk, gr, ctx).await }
+            let td = dispatcher_for_chat.clone();
+            async move { handle_chat(p, model, mem, soul, sk, gr, td, ctx).await }
         })),
     );
     let provider_for_embed = provider.clone();
@@ -586,6 +590,7 @@ fn merge_history(auto: &str, caller: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_chat(
     provider: Arc<dyn ChatProvider>,
     default_model: String,
@@ -593,6 +598,7 @@ async fn handle_chat(
     soul_cache: SoulCache,
     skills_cache: skills::SkillMatcher,
     input_guardrail: guardrails::InputGuardrail,
+    tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -761,20 +767,62 @@ async fn handle_chat(
             let approved_by = approval_token
                 .as_deref()
                 .map(|t| format!("approval_token:{}", t.chars().take(16).collect::<String>()));
-            // Evidence capture. Build the record from a
-            // single-step ExecutionState whose only step is
-            // the model call we just made. The chronicle
-            // append lands once the AI controller wires a
-            // coord dispatcher; today we log the JSON at
-            // info level so the operator's existing log
-            // pipeline catches it.
+            // Walk the parsed plan step-by-step. ModelCall
+            // steps record the provider's raw reply. ToolCall
+            // steps route through the per-controller
+            // ToolDispatcher (broker → secret resolve →
+            // handler → output guard → gateway record). When
+            // the dispatcher denies a step the runner returns
+            // a JSON-shaped error and the chat response gains
+            // a `[tool-dispatch-errors]` trailer so the caller
+            // sees a structured error rather than a silent
+            // drop. Memory / approval step kinds are skipped
+            // here; they're handled elsewhere in the pipeline.
             let mut state = execution::ExecutionState::new(plan.clone());
-            execution::Executor::advance(
-                &mut state,
-                execution::StepResult::Ok {
-                    output: output.text.clone(),
-                },
-            );
+            let tool_step_results: Vec<execution::StepResult> = match tool_dispatcher.as_ref() {
+                Some(disp) => {
+                    execution::dispatch_planner_tool_calls(disp, &ctx.caller.name, &plan).await
+                }
+                None => Vec::new(),
+            };
+            let mut tool_iter = tool_step_results.iter();
+            let mut model_recorded = false;
+            let mut tool_dispatch_errors: Vec<String> = Vec::new();
+            for step in plan.steps.iter() {
+                let result = match step {
+                    execution::PlanStep::ModelCall { .. } => {
+                        if !model_recorded {
+                            model_recorded = true;
+                            execution::StepResult::Ok {
+                                output: output.text.clone(),
+                            }
+                        } else {
+                            execution::StepResult::Skipped {
+                                reason: "subsequent ModelCall steps are not executed in this turn"
+                                    .to_string(),
+                            }
+                        }
+                    }
+                    execution::PlanStep::ToolCall { .. } => match tool_iter.next() {
+                        Some(r) => r.clone(),
+                        None => execution::StepResult::Skipped {
+                            reason: "no tool dispatcher configured for this AI controller"
+                                .to_string(),
+                        },
+                    },
+                    execution::PlanStep::MemoryRead { .. }
+                    | execution::PlanStep::MemoryWrite { .. } => execution::StepResult::Skipped {
+                        reason: "memory step not yet wired into ai.chat handler".to_string(),
+                    },
+                    execution::PlanStep::HumanApproval { .. } => execution::StepResult::Skipped {
+                        reason: "human approval handled via policy verdict".to_string(),
+                    },
+                };
+                if let execution::StepResult::Err { reason } = &result {
+                    tool_dispatch_errors.push(reason.clone());
+                }
+                execution::Executor::advance(&mut state, result);
+            }
             let evidence = execution::EvidenceRecord::from_state(
                 &state,
                 session_id,
@@ -786,10 +834,29 @@ async fn handle_chat(
                 evidence = %evidence.to_json(),
                 "ai.chat: execution evidence captured"
             );
+            // Compose the response body: provider reply +
+            // (optionally) a trailer that lists every
+            // dispatcher-rejected tool call as JSON. Callers
+            // get a structured error per failed step rather
+            // than a silent drop.
+            let body_text = if tool_dispatch_errors.is_empty() {
+                output.text.clone()
+            } else {
+                let mut b = output.text.clone();
+                if !b.is_empty() && !b.ends_with('\n') {
+                    b.push('\n');
+                }
+                b.push_str("\n[tool-dispatch-errors]\n");
+                for err in &tool_dispatch_errors {
+                    b.push_str(err);
+                    b.push('\n');
+                }
+                b
+            };
             match verdict {
-                execution::PolicyVerdict::Approved => HandlerOutcome::Ok(output.text.into_bytes()),
+                execution::PolicyVerdict::Approved => HandlerOutcome::Ok(body_text.into_bytes()),
                 execution::PolicyVerdict::RequiresApproval { reason } => {
-                    let body = format!("[approval-required] {reason}\n{}", output.text);
+                    let body = format!("[approval-required] {reason}\n{body_text}");
                     tracing::info!(
                         session_id,
                         reason = %reason,
@@ -932,6 +999,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -942,6 +1010,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -956,6 +1025,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -981,6 +1051,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"only-session-id"),
         )
         .await;
@@ -1000,6 +1071,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"|hello|"),
         )
         .await;
@@ -1040,6 +1112,7 @@ mod tests {
             soul,
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1078,6 +1151,7 @@ mod tests {
             soul,
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1107,6 +1181,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1137,6 +1212,7 @@ mod tests {
             SoulCache::no_op(),
             cache,
             guardrail,
+            None,
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -1173,6 +1249,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1206,6 +1283,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1262,6 +1340,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -1299,6 +1378,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -1339,6 +1419,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1460,6 +1541,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1501,6 +1583,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1540,6 +1623,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1580,6 +1664,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1641,6 +1726,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1742,6 +1828,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1936,6 +2023,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -1966,6 +2054,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -2035,5 +2124,146 @@ mod tests {
         assert_eq!(plan_steps.len(), 1);
         let step_results = parsed["step_results"].as_array().unwrap();
         assert_eq!(step_results.len(), 1);
+    }
+
+    // ─────────── W1 — ToolDispatcher integration ────────────
+
+    fn build_dispatcher(
+        deny: &[&str],
+        secrets: &[(&str, &str)],
+    ) -> Arc<crate::nodes::tool::dispatcher::ToolDispatcher> {
+        use crate::nodes::execution::broker::{AccessPolicy, AgentAccessBroker};
+        use crate::nodes::execution::secrets::SecretStore;
+        use std::collections::BTreeMap;
+        let store = {
+            let mut m = BTreeMap::new();
+            for (k, v) in secrets {
+                m.insert((*k).to_string(), (*v).to_string());
+            }
+            Arc::new(SecretStore::from_map(m))
+        };
+        let broker = if deny.is_empty() {
+            Arc::new(AgentAccessBroker::empty())
+        } else {
+            Arc::new(AgentAccessBroker::new(vec![AccessPolicy {
+                agent: "alice".into(),
+                allowed_capabilities: Vec::new(),
+                denied_capabilities: deny.iter().map(|s| (*s).to_string()).collect(),
+                max_calls_per_minute: 60,
+                max_cost_cents_per_hour: 500,
+            }]))
+        };
+        Arc::new(crate::nodes::tool::dispatcher::ToolDispatcher::new(
+            store, broker,
+        ))
+    }
+
+    #[tokio::test]
+    async fn handle_chat_dispatches_planner_tool_call_through_dispatcher_on_allow() {
+        // The canned reply carries a `<plan>` block with a
+        // single web.fetch step. The dispatcher's broker is
+        // empty so the call is admitted and lands in the
+        // gateway as `completed=1`.
+        let reply = "<plan>\ntool: web.fetch\nargs: https://example.com\n</plan>";
+        let provider: Arc<dyn ChatProvider> = Arc::new(CannedProvider {
+            reply: reply.into(),
+        });
+        let dispatcher = build_dispatcher(&[], &[]);
+        let r = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(dispatcher.clone()),
+            ctx(b"sess-1|fetch the example|"),
+        )
+        .await;
+        // Even though the plan was reversible, the handler
+        // returns Ok with the model reply. The gateway has the
+        // record.
+        match r {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("expected Ok, got err: {}", e.cause),
+        }
+        let snap = dispatcher.gateway_snapshot();
+        assert!(snap.contains("completed=1 failed=0"), "snap={snap}");
+        assert!(snap.contains("web.fetch"), "snap={snap}");
+    }
+
+    #[tokio::test]
+    async fn handle_chat_returns_structured_error_when_tool_dispatch_denied() {
+        // Plan asks for `tool.terminal`. Broker denies that
+        // capability for alice. The handler must NOT execute
+        // the tool and must surface a structured error in the
+        // response body.
+        let reply = "<plan>\ntool: tool.terminal\nargs: rm -rf /\n</plan>";
+        let provider: Arc<dyn ChatProvider> = Arc::new(CannedProvider {
+            reply: reply.into(),
+        });
+        let dispatcher = build_dispatcher(&["tool.terminal"], &[]);
+        let r = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(dispatcher.clone()),
+            ctx(b"sess-1|delete everything|approval_token=ok"),
+        )
+        .await;
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("expected Ok with error trailer, got: {}", e.cause),
+        };
+        assert!(
+            body.contains("[tool-dispatch-errors]"),
+            "missing error trailer: {body}"
+        );
+        // The structured error per the dispatcher contract.
+        assert!(body.contains("\"kind\":\"access_denied\""), "body={body}");
+        assert!(body.contains("tool.terminal"), "body={body}");
+        // Gateway must not show any executed call.
+        let snap = dispatcher.gateway_snapshot();
+        assert!(snap.contains("completed=0 failed=0"), "snap={snap}");
+    }
+
+    #[tokio::test]
+    async fn handle_chat_resolves_secret_placeholder_in_tool_call_args() {
+        // The plan's tool args contain `{{secret:github_token}}`.
+        // The dispatcher resolves it before invoking the
+        // admission handler; the gateway records the call so
+        // the test can confirm the dispatcher actually ran the
+        // secret pass.
+        let reply =
+            "<plan>\ntool: web.fetch\nargs: Authorization: Bearer {{secret:github_token}}\n</plan>";
+        let provider: Arc<dyn ChatProvider> = Arc::new(CannedProvider {
+            reply: reply.into(),
+        });
+        let dispatcher = build_dispatcher(&[], &[("github_token", "ghp_real")]);
+        let r = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(dispatcher.clone()),
+            ctx(b"sess-1|fetch with auth|approval_token=ok"),
+        )
+        .await;
+        assert!(
+            matches!(r, HandlerOutcome::Ok(_)),
+            "handle_chat should succeed when the broker admits the call"
+        );
+        // The gateway records the resolved args verbatim. The
+        // resolved Authorization line is 30 chars long, so the
+        // admission stub records `args_len=30`. The snapshot
+        // shows the call as completed.
+        let snap = dispatcher.gateway_snapshot();
+        assert!(snap.contains("completed=1 failed=0"), "snap={snap}");
+        assert!(snap.contains("args_len=30"), "snap={snap}");
     }
 }

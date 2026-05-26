@@ -25,7 +25,9 @@
 pub mod executor;
 pub mod planner;
 pub mod policy;
+pub mod tool_runner;
 
 pub use executor::{EvidenceRecord, ExecutionState, Executor, StepResult};
 pub use planner::{ExecutionPlan, PlanStep, Planner, Reversibility};
 pub use policy::{PolicyEngine, PolicyVerdict};
+pub use tool_runner::{dispatch_planner_tool_calls, structured_dispatch_error};

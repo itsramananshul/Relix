@@ -3172,6 +3172,20 @@ fn register_node_type_handlers(
         // false` produces a permissive instance so existing
         // controllers behave exactly as before.
         let input_guardrail = build_input_guardrail(cfg);
+        // W1: build a per-controller ToolDispatcher that wraps
+        // the SecretStore + AgentAccessBroker. The dispatcher is
+        // the choke-point every planner-emitted ToolCall flows
+        // through; admission failures surface as structured
+        // errors in the chat response. The broker starts empty;
+        // W2 populates it from `[[execution.agents]]` so policies
+        // actually apply.
+        let secret_store =
+            std::sync::Arc::new(crate::nodes::execution::secrets::SecretStore::from_env());
+        let access_broker =
+            std::sync::Arc::new(crate::nodes::execution::broker::AgentAccessBroker::empty());
+        let tool_dispatcher = std::sync::Arc::new(
+            crate::nodes::tool::dispatcher::ToolDispatcher::new(secret_store, access_broker),
+        );
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
@@ -3180,6 +3194,7 @@ fn register_node_type_handlers(
             soul_cache,
             skill_matcher,
             input_guardrail,
+            Some(tool_dispatcher),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
