@@ -74,6 +74,7 @@
 //!   deterministic across runs.
 
 pub mod curator;
+pub mod embedder;
 pub mod embeddings;
 pub mod qdrant;
 pub mod schema;
