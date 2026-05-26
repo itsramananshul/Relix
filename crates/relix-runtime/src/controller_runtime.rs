@@ -502,6 +502,12 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 populate_slack_outbound_cell(cell, sl_cfg, key_path).await;
             });
         }
+        Some(StartupWiring::CoordDriftEmbed { cell, cfg: ai_cfg }) => {
+            let key_path = cfg.identity.key_path.clone();
+            tokio::spawn(async move {
+                populate_drift_embedder_cell(cell, ai_cfg, key_path).await;
+            });
+        }
         _ => {}
     }
 
@@ -2399,6 +2405,96 @@ async fn populate_memory_curator_coord_cell(
 /// Dial the AI peer named in `[memory.embedding_peer]` and
 /// populate the embedding-dispatcher cell so memory.embed /
 /// memory.search / memory.embed_all can route through it.
+/// W4: build a `MeshDriftEmbedDispatcher` pointed at the
+/// operator-configured AI peer and publish it into the
+/// coordinator's drift-embedder cell. Mirrors
+/// `populate_memory_embedding_cell` so identity / discovery /
+/// retry semantics stay consistent across mesh-using
+/// dispatchers.
+async fn populate_drift_embedder_cell(
+    cell: crate::nodes::ai::guardrails::DriftEmbedDispatcherCell,
+    cfg: crate::nodes::coordinator::CoordinatorAiPeerConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "drift embedder: identity bundle missing; dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "drift embedder: bundle decode failed");
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        _ => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "drift embedder: client key missing / wrong length"
+            );
+            return;
+        }
+    };
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.alias.clone(),
+        PeerEntry {
+            addr: cfg.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                addr = %cfg.addr,
+                "drift embedder: discover_and_pin returned None; dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let dispatcher: Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher> =
+        Arc::new(crate::nodes::ai::guardrails::MeshDriftEmbedDispatcher::new(
+            mesh,
+            cfg.alias.clone(),
+            bundle,
+            cfg.deadline_secs,
+        ));
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("drift embedder: cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            alias = %cfg.alias,
+            addr = %cfg.addr,
+            "coordinator: drift embedder dispatcher online (W4 live)"
+        );
+    }
+}
+
 /// Mirrors `populate_memory_curator_cell` — same identity-bundle
 /// + client-key + discover_and_pin pattern.
 async fn populate_memory_embedding_cell(
@@ -2780,6 +2876,15 @@ pub(crate) enum StartupWiring {
     MemoryEmbedding {
         cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::EmbeddingDispatcher>>>,
         cfg: crate::nodes::memory::EmbeddingPeerConfig,
+    },
+    /// Coordinator drift-embedder wiring (W4). The cell was
+    /// already passed into `coordinator::register`; the run()
+    /// loop builds a `MeshDriftEmbedDispatcher` post-startup
+    /// by dialing the operator-configured AI peer and
+    /// publishes the result into the cell.
+    CoordDriftEmbed {
+        cell: crate::nodes::ai::guardrails::DriftEmbedDispatcherCell,
+        cfg: crate::nodes::coordinator::CoordinatorAiPeerConfig,
     },
     /// Telegram-channel outbound wiring. `cell` was already
     /// passed into the long-poll loop; the run() loop dials
@@ -3507,22 +3612,34 @@ fn register_node_type_handlers(
         // W4: optional embedding dispatcher for the drift
         // hook. Today the coordinator boots without an
         // outbound mesh client (that lives on the
-        // `relix-controller` binary), so we pass `None` here
-        // and the hook records summaries without a cosine
-        // score. Tests inject stub dispatchers directly so
-        // the embedding path is exercised end to end. The
-        // controller-side wiring lands when the coordinator
-        // gains an `ai.embed` peer config.
-        let drift_embedder: Option<
-            std::sync::Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher>,
-        > = None;
+        // `relix-controller` binary). The cell stays empty
+        // until the controller's post-startup wiring populates
+        // it with a `MeshDriftEmbedDispatcher`. Empty cell
+        // means the hook records `similarity=none` — honest
+        // about the absent comparison.
+        let drift_embedder_cell: crate::nodes::ai::guardrails::DriftEmbedDispatcherCell =
+            std::sync::Arc::new(tokio::sync::OnceCell::new());
+        let drift_embedder_cell_for_startup = drift_embedder_cell.clone();
         crate::nodes::coordinator::register(
             bridge,
             store.clone(),
             auto_skill_cfg,
-            drift_cfg,
-            drift_embedder,
+            drift_cfg.clone(),
+            drift_embedder_cell,
         );
+        // Park the cell + the coord_cfg ai-peer alias on
+        // StartupWiring so the run() loop can populate it after
+        // the rpc::Client is up. Falls back to the canonical
+        // alias `"ai"` when the operator hasn't configured
+        // a custom alias.
+        if drift_cfg.as_ref().is_some_and(|c| c.enabled)
+            && let Some(ai_peer_cfg) = coord_cfg.ai_peer.clone()
+        {
+            *out = Some(StartupWiring::CoordDriftEmbed {
+                cell: drift_embedder_cell_for_startup,
+                cfg: ai_peer_cfg,
+            });
+        }
         // Cron scheduler shares the coordinator's database.
         // Opens its own rusqlite connection against the same
         // file; SQLite handles cross-connection locking.

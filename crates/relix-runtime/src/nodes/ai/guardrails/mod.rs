@@ -23,7 +23,7 @@ pub mod mode;
 
 pub use drift::{
     ChronicleEvent, DriftAction, DriftConfig, DriftDetector, DriftEmbedDispatcher,
-    DriftEmbedDispatcherHandle,
+    DriftEmbedDispatcherCell, DriftEmbedDispatcherHandle, MeshDriftEmbedDispatcher,
 };
 pub use eval::{EvalCase, EvalFailure, EvalReport, GuardrailEval};
 pub use handoff::{HandoffAuditEvent, HandoffGuard, HandoffGuardResult};

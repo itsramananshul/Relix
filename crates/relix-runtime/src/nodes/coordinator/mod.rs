@@ -333,6 +333,38 @@ pub struct CoordinatorConfig {
     /// `docs/chronicle-retention.md` for the design contract.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// `[coordinator.ai_peer]` — optional AI peer config the
+    /// coordinator dials for drift embedding (W4). Absent means
+    /// the drift hook records `similarity=none` even when the
+    /// embedder cell is built — the cell stays empty.
+    #[serde(default, rename = "ai_peer")]
+    pub ai_peer: Option<CoordinatorAiPeerConfig>,
+}
+
+/// `[coordinator.ai_peer]` — operator-supplied AI peer
+/// address + alias + deadline. Mirrors the
+/// `[ai.memory_peer]` shape so an operator who already
+/// wired the AI controller's memory peer can copy/paste.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CoordinatorAiPeerConfig {
+    /// libp2p multiaddr of the AI peer (e.g.
+    /// `/ip4/127.0.0.1/tcp/19712`).
+    pub addr: String,
+    /// Mesh alias used in outbound calls. Defaults to
+    /// `"ai"`.
+    #[serde(default = "default_ai_alias")]
+    pub alias: String,
+    /// Per-call deadline in seconds. Defaults to 10.
+    #[serde(default = "default_ai_deadline_secs")]
+    pub deadline_secs: i64,
+}
+
+fn default_ai_alias() -> String {
+    "ai".to_string()
+}
+
+fn default_ai_deadline_secs() -> i64 {
+    10
 }
 
 /// `[coordinator.retention]`. Every field is optional; missing
@@ -400,6 +432,7 @@ impl Default for CoordinatorConfig {
             max_list: default_max_list(),
             recovery_scan: default_recovery_scan(),
             retention: RetentionConfig::default(),
+            ai_peer: None,
         }
     }
 }
@@ -4086,7 +4119,7 @@ pub fn register(
     store: Arc<TaskStore>,
     auto_skill_cfg: Option<Arc<crate::nodes::ai::skills::SkillsConfig>>,
     drift_cfg: Option<Arc<crate::nodes::ai::guardrails::DriftConfig>>,
-    drift_embedder: Option<Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher>>,
+    drift_embedder_cell: crate::nodes::ai::guardrails::DriftEmbedDispatcherCell,
 ) {
     {
         let s = store.clone();
@@ -4102,7 +4135,7 @@ pub fn register(
         let s = store.clone();
         let auto_cfg = auto_skill_cfg.clone();
         let drift = drift_cfg.clone();
-        let drift_embedder_for_hook = drift_embedder.clone();
+        let drift_embedder_for_hook = drift_embedder_cell.clone();
         bridge.register(
             "task.update",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -4148,7 +4181,11 @@ pub fn register(
                     {
                         let s = s.clone();
                         let cfg = cfg.clone();
-                        let embedder = drift_embedder_for_hook.clone();
+                        // Read the embedder cell on every hook
+                        // fire so a controller that wires the
+                        // dispatcher post-startup sees it on
+                        // subsequent ticks without restarting.
+                        let embedder = drift_embedder_for_hook.get().cloned();
                         tokio::spawn(async move {
                             evaluate_drift_for_task(&s, &task_id, &cfg, embedder).await;
                         });
@@ -7324,6 +7361,7 @@ mod tests {
             max_list: 50,
             recovery_scan: false,
             retention: RetentionConfig::default(),
+            ai_peer: None,
         };
         let s = TaskStore::open(&cfg).expect("open file store");
         (tmp, s)
