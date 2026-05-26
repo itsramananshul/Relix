@@ -25,6 +25,8 @@
 
 use rusqlite::{Connection, Error as SqliteError, OptionalExtension};
 
+pub mod lock_order;
+
 /// Recommended SQLite settings for a Relix store. Apply on every
 /// freshly-opened `Connection` before any schema is created or any
 /// rows are touched.
