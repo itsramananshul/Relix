@@ -235,6 +235,20 @@ fn injection_reason(text: &str) -> Option<String> {
     if let Some(r) = MemoryGuard::poison_reason(text) {
         return Some(r);
     }
+    injection_phrases_only(text)
+}
+
+/// Phrase-only injection scan. Skips MemoryGuard (which has
+/// its own length rejection — fine for memory writes, wrong
+/// for tool outputs that can legitimately be long) and runs
+/// the hidden-Unicode + AI + multilingual phrase sets.
+/// Exported so [`crate::nodes::tool::output_guard`] can run
+/// the same patterns against tool replies without inheriting
+/// the memory-side 10 000-char cap.
+pub fn injection_phrases_only(text: &str) -> Option<String> {
+    if let Some(r) = hidden_unicode_reason(text) {
+        return Some(r);
+    }
     let lower = text.to_ascii_lowercase();
     for needle in AI_INJECTION_PHRASES {
         if lower.contains(needle) {
@@ -244,6 +258,33 @@ fn injection_reason(text: &str) -> Option<String> {
     for needle in MULTILINGUAL_INJECTION_PHRASES {
         if lower.contains(needle) {
             return Some(format!("multilingual injection phrase: \"{needle}\""));
+        }
+    }
+    // Fall back to the MemoryGuard phrase patterns (instruction
+    // override / role-reassignment) but bypass its length cap
+    // — that cap is for memory writes; tool outputs are bigger.
+    memory_guard_phrases_only(text)
+}
+
+fn memory_guard_phrases_only(text: &str) -> Option<String> {
+    // Re-derive the phrase scan without the length check.
+    // Keep the rules narrow so we don't double-fire on
+    // memory writes (handled by MemoryGuard).
+    const INSTRUCTION_OVERRIDE_PHRASES: &[&str] = &[
+        "ignore previous",
+        "forget everything",
+        "you are now",
+        "you must now",
+        "from now on you",
+        "new system prompt",
+        "new system message",
+        "replace your system prompt",
+        "system prompt:",
+    ];
+    let lower = text.to_ascii_lowercase();
+    for needle in INSTRUCTION_OVERRIDE_PHRASES {
+        if lower.contains(needle) {
+            return Some(format!("instruction-override phrase: \"{needle}\""));
         }
     }
     None

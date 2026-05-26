@@ -23,6 +23,7 @@ use super::super::execution::broker::{AccessDecision, AgentAccessBroker};
 use super::super::execution::gateway::{ActionGateway, GatewayAction};
 use super::super::execution::secrets::{SecretError, SecretStore};
 use super::contracts::ToolContract;
+use super::output_guard::ToolOutputGuard;
 
 /// Errors the dispatcher surfaces. Mirrors the shape of the
 /// `AccessDecision` variants so callers can pattern-match
@@ -127,13 +128,43 @@ impl ToolDispatcher {
         }
         match result {
             Ok(output) => {
-                let recorded = action.with_result(output.clone());
+                // Output guard. Runs before the gateway record
+                // so a poisoned reply lands as `failed` (the
+                // operator still sees the attempt, but the
+                // upstream sees `HandlerFailed` rather than a
+                // contaminated success). Truncation alone is
+                // permitted to pass through — long replies are
+                // common; injection is what we have to stop.
+                let guard = ToolOutputGuard::inspect(&output);
+                if guard.injection_detected {
+                    let reason = guard
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "tool output flagged by guard".to_string());
+                    tracing::warn!(
+                        agent,
+                        tool,
+                        reason = %reason,
+                        "tool dispatch: output guard rejected reply"
+                    );
+                    self.gateway.lock().unwrap().record_failed(action);
+                    return Err(DispatchError::HandlerFailed(reason));
+                }
+                let safe_output = guard.output;
+                if guard.truncated {
+                    tracing::warn!(
+                        agent,
+                        tool,
+                        "tool dispatch: output truncated by guard (>50k chars)"
+                    );
+                }
+                let recorded = action.with_result(safe_output.clone());
                 self.gateway.lock().unwrap().record_completed(recorded);
                 // Successful dispatches feed the broker's
                 // rate limiter so the agent's window
                 // includes this call.
                 self.broker.record_call(agent);
-                Ok(output)
+                Ok(safe_output)
             }
             Err(reason) => {
                 self.gateway.lock().unwrap().record_failed(action);

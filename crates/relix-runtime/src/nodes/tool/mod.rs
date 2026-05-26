@@ -46,6 +46,7 @@
 //!
 //! These ship in later milestones if and when a flow needs them.
 
+pub mod ask_human;
 pub mod audio;
 pub mod browser;
 pub mod contracts;
@@ -54,6 +55,7 @@ pub mod fs;
 pub mod manifest;
 pub mod mcp;
 pub mod mcp_stdio;
+pub mod output_guard;
 pub mod pdf;
 pub mod registry;
 pub mod sanitize;
