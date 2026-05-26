@@ -15,6 +15,7 @@ mod os_secure;
 mod ping;
 mod router;
 mod setup;
+mod skills;
 mod sol;
 mod souls;
 mod task;
@@ -213,6 +214,16 @@ enum Cmd {
         cmd: souls::Cmd,
     },
 
+    /// Manage SKILL.md skill library. `list` shows every
+    /// discovered skill (and any AGENTS.md the loader sees);
+    /// `run <name>` prints the named skill's body so the
+    /// operator can pipe it into their own runner. See
+    /// `crates/relix-runtime/src/nodes/ai/skills.rs`.
+    Skills {
+        #[command(subcommand)]
+        cmd: skills::Cmd,
+    },
+
 
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
@@ -276,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Update(args) => update::run(args).await,
         Cmd::Export(args) => export::run(args).await,
         Cmd::Souls { cmd } => souls::run(cmd),
+        Cmd::Skills { cmd } => skills::run(cmd),
         Cmd::FlowRun {
             flow,
             identity,
