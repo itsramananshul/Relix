@@ -107,6 +107,11 @@ struct WizardState {
     /// Mesh block carried straight through from the prior config (or
     /// defaults) — the wizard doesn't expose these knobs.
     mesh: MeshConfig,
+    /// Coordinator block (retention, ...) carried straight through —
+    /// the wizard doesn't expose these knobs either; preserving the
+    /// prior value lets operators edit `~/.relix/config.toml` by
+    /// hand and have the wizard not clobber their work.
+    coordinator: crate::config::CoordinatorBlock,
     /// True when we were initialised from an existing `config.toml`.
     /// Drives diff hints on the confirm page and the "Updated" /
     /// "Saved" verb at the end.
@@ -129,6 +134,7 @@ impl WizardState {
             channels_sel: [p.channels.telegram, p.channels.discord, p.channels.slack],
             channels: p.channels.clone(),
             mesh: p.mesh.clone(),
+            coordinator: p.coordinator.clone(),
             is_reconfigure: prior.is_some(),
             prior: prior.cloned(),
         }
@@ -154,6 +160,7 @@ impl WizardState {
             },
             channels: ch,
             mesh: self.mesh.clone(),
+            coordinator: self.coordinator.clone(),
         }
     }
 }

@@ -38,6 +38,63 @@ pub struct RelixConfig {
     pub channels: ChannelsConfig,
     #[serde(default)]
     pub mesh: MeshConfig,
+    /// Coordinator-side chronicle retention. Operators control
+    /// when (or whether) old `task_events` rows get compacted; the
+    /// wizard preserves these values across re-runs without
+    /// exposing a UI for them. See
+    /// [`docs/chronicle-retention.md`](../../../docs/chronicle-retention.md).
+    #[serde(default)]
+    pub coordinator: CoordinatorBlock,
+}
+
+/// `[coordinator]` block in `~/.relix/config.toml`. Only carries
+/// retention today; future coordinator-side knobs (max_list,
+/// recovery_scan, ...) live here too.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoordinatorBlock {
+    #[serde(default)]
+    pub retention: RetentionUserConfig,
+}
+
+/// `[coordinator.retention]` — operator-facing copy of
+/// `relix_runtime::nodes::coordinator::RetentionConfig`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetentionUserConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_retention_max_age_days")]
+    pub max_task_age_days: u32,
+    #[serde(default = "default_retention_max_events_per_task")]
+    pub max_events_per_task: u32,
+    #[serde(default = "default_retention_compact_interval_h")]
+    pub compact_interval_h: u32,
+    #[serde(default = "default_retention_max_passes_per_run")]
+    pub max_passes_per_run: u32,
+}
+
+impl Default for RetentionUserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_task_age_days: default_retention_max_age_days(),
+            max_events_per_task: default_retention_max_events_per_task(),
+            compact_interval_h: default_retention_compact_interval_h(),
+            max_passes_per_run: default_retention_max_passes_per_run(),
+        }
+    }
+}
+
+fn default_retention_max_age_days() -> u32 {
+    30
+}
+fn default_retention_max_events_per_task() -> u32 {
+    500
+}
+fn default_retention_compact_interval_h() -> u32 {
+    24
+}
+fn default_retention_max_passes_per_run() -> u32 {
+    10
 }
 
 /// `[provider]` — picks the AI backend and carries its API key.

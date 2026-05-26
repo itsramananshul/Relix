@@ -327,6 +327,70 @@ pub struct CoordinatorConfig {
     /// is unaffected.
     #[serde(default = "default_recovery_scan")]
     pub recovery_scan: bool,
+    /// Operator-controlled chronicle retention. Absent ⇒ disabled
+    /// (no background deletion); operators see the dry-run via
+    /// `task.compact_events` exactly as before. See
+    /// `docs/chronicle-retention.md` for the design contract.
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+/// `[coordinator.retention]`. Every field is optional; missing
+/// section means `enabled = false` and the retention loop never
+/// starts.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RetentionConfig {
+    /// Master switch. `false` (default) means no background
+    /// deletion ever runs. Operators flip this on after they're
+    /// satisfied with the dry-run output from
+    /// `task.compact_events`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Events older than `now - max_task_age_days * 86400` are
+    /// candidates for deletion (R5 still applies — parent task
+    /// must be in a terminal state). Default 30 days.
+    #[serde(default = "default_max_task_age_days")]
+    pub max_task_age_days: u32,
+    /// Per-task event count cap. When a task has more than this
+    /// many events, the oldest ones become deletion candidates.
+    /// 0 disables the cap. Default 500.
+    #[serde(default = "default_max_events_per_task")]
+    pub max_events_per_task: u32,
+    /// How often the background retention loop runs, in hours.
+    /// Default 24. The loop only spawns when `enabled = true`.
+    #[serde(default = "default_compact_interval_h")]
+    pub compact_interval_h: u32,
+    /// Cap on the number of bounded-delete passes per run. Each
+    /// pass deletes at most `MAX_ROWS_PER_PASS` rows inside its
+    /// own transaction; the run stops when either no more rows
+    /// qualify OR this cap is reached. Default 10.
+    #[serde(default = "default_max_passes_per_run")]
+    pub max_passes_per_run: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_task_age_days: default_max_task_age_days(),
+            max_events_per_task: default_max_events_per_task(),
+            compact_interval_h: default_compact_interval_h(),
+            max_passes_per_run: default_max_passes_per_run(),
+        }
+    }
+}
+
+fn default_max_task_age_days() -> u32 {
+    30
+}
+fn default_max_events_per_task() -> u32 {
+    500
+}
+fn default_compact_interval_h() -> u32 {
+    24
+}
+fn default_max_passes_per_run() -> u32 {
+    10
 }
 
 impl Default for CoordinatorConfig {
@@ -335,6 +399,7 @@ impl Default for CoordinatorConfig {
             db_path: PathBuf::new(),
             max_list: default_max_list(),
             recovery_scan: default_recovery_scan(),
+            retention: RetentionConfig::default(),
         }
     }
 }
@@ -346,6 +411,13 @@ fn default_max_list() -> usize {
 fn default_recovery_scan() -> bool {
     true
 }
+
+/// Hard cap on per-pass deletion. Matches the spec: "Delete at
+/// most 1000 rows per pass inside a transaction." Operators
+/// can't lift this — large deletions chunk into multiple passes,
+/// each one short enough to keep the writer mutex from blocking
+/// chat traffic for a noticeable time.
+pub const MAX_ROWS_PER_RETENTION_PASS: i64 = 1000;
 
 /// SQLite-backed Task ledger. `rusqlite::Connection` is not `Sync`, so
 /// the connection lives inside an `Arc<Mutex<_>>`; the bridge serialises
@@ -3286,6 +3358,192 @@ impl TaskStore {
         })
     }
 
+    /// Compact chronicle events. Implements Step 3 + Step 4 of
+    /// `docs/chronicle-retention.md` (bounded delete + snapshot
+    /// synthesis). Returns a [`RetentionResult`] summarising the
+    /// pass.
+    ///
+    /// Contract:
+    /// - Only events whose parent task is in a terminal status
+    ///   (`completed` / `failed` / `cancelled` / `interrupted`)
+    ///   are touched (R5).
+    /// - Before deleting any event for a task, emits a single
+    ///   `task.snapshot` event whose payload_json summarises the
+    ///   compacted range (event_count, ts range, final task
+    ///   status). The snapshot is itself a `task_events` row;
+    ///   deletion queries explicitly exclude it (R3).
+    /// - Bounded per pass: each DELETE statement carries
+    ///   `LIMIT MAX_ROWS_PER_RETENTION_PASS` and runs in its own
+    ///   transaction. The outer loop stops when either no more
+    ///   candidates exist OR `max_passes` is reached (R4).
+    ///
+    /// `cutoff_ts` is unix seconds; events strictly older than
+    /// the cutoff become candidates. `max_passes` caps the loop;
+    /// callers typically pass the configured
+    /// `max_passes_per_run`.
+    pub fn run_retention(
+        &self,
+        cutoff_ts: i64,
+        max_passes: u32,
+    ) -> Result<RetentionResult, CoordinatorError> {
+        let mut total_deleted: i64 = 0;
+        let mut snapshots_emitted: i64 = 0;
+        let mut passes_run: u32 = 0;
+        let mut stopped_at_pass_limit = false;
+
+        // Phase 1: snapshot synthesis. One `task.snapshot` per
+        // terminal task that has any candidate events, BEFORE any
+        // bounded delete pass touches the actual rows.
+        let candidate_tasks: Vec<(String, String)> = {
+            let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT t.task_id, t.status
+                     FROM task_events te
+                     JOIN tasks t ON t.task_id = te.task_id
+                     WHERE te.ts < ?1
+                       AND t.status IN ('completed','failed','cancelled','interrupted')
+                       AND te.event_type != 'task.snapshot'",
+                )
+                .map_err(CoordinatorError::Db)?;
+            let rows = stmt
+                .query_map(params![cutoff_ts], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(CoordinatorError::Db)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(CoordinatorError::Db)?);
+            }
+            out
+        };
+
+        for (task_id, final_status) in &candidate_tasks {
+            let summary = self.compute_compaction_summary(task_id, cutoff_ts, final_status)?;
+            if summary.event_count == 0 {
+                // Race-condition guard: another writer drained the
+                // candidate set between the SELECT above and now.
+                continue;
+            }
+            self.emit_snapshot_event(task_id, &summary)?;
+            snapshots_emitted += 1;
+        }
+
+        // Phase 2: bounded delete passes. We delete at most
+        // MAX_ROWS_PER_RETENTION_PASS rows per transaction; the
+        // outer loop continues until either nothing matches or
+        // `max_passes` is hit. The `task.snapshot` events we just
+        // emitted are explicitly excluded by event_type so a
+        // subsequent run sees the same snapshot rows it inserted.
+        loop {
+            if passes_run >= max_passes {
+                stopped_at_pass_limit = true;
+                break;
+            }
+            let mut conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+            let tx = conn.transaction().map_err(CoordinatorError::Db)?;
+            let n = tx
+                .execute(
+                    "DELETE FROM task_events \
+                     WHERE event_id IN (\
+                         SELECT te.event_id \
+                         FROM task_events te \
+                         JOIN tasks t ON t.task_id = te.task_id \
+                         WHERE te.ts < ?1 \
+                           AND t.status IN ('completed','failed','cancelled','interrupted') \
+                           AND te.event_type != 'task.snapshot' \
+                         LIMIT ?2\
+                     )",
+                    params![cutoff_ts, MAX_ROWS_PER_RETENTION_PASS],
+                )
+                .map_err(CoordinatorError::Db)?;
+            tx.commit().map_err(CoordinatorError::Db)?;
+            drop(conn);
+            if n == 0 {
+                break;
+            }
+            total_deleted += n as i64;
+            passes_run += 1;
+            // Defence-in-depth: a short yield so the writer
+            // mutex doesn't starve concurrent chat traffic
+            // between passes. Sub-millisecond on every platform
+            // Relix supports.
+            std::thread::yield_now();
+        }
+
+        Ok(RetentionResult {
+            cutoff_ts,
+            tasks_compacted: candidate_tasks.len() as i64,
+            events_deleted: total_deleted,
+            snapshots_emitted,
+            passes_run,
+            stopped_at_pass_limit,
+        })
+    }
+
+    /// Compute the `task.snapshot` payload for one task: how many
+    /// candidate events exist, the time range they span, and the
+    /// task's final status.
+    fn compute_compaction_summary(
+        &self,
+        task_id: &str,
+        cutoff_ts: i64,
+        final_status: &str,
+    ) -> Result<CompactionSummary, CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let (count, first_ts, last_ts): (i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(ts), MAX(ts) \
+                 FROM task_events \
+                 WHERE task_id = ?1 AND ts < ?2 AND event_type != 'task.snapshot'",
+                params![task_id, cutoff_ts],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(CoordinatorError::Db)?;
+        Ok(CompactionSummary {
+            event_count: count,
+            first_ts,
+            last_ts,
+            final_status: final_status.to_string(),
+        })
+    }
+
+    /// Append one `task.snapshot` chronicle event summarising the
+    /// events about to be compacted. Wire-compatible with the
+    /// existing event-write path (schema_version = 1, structured
+    /// payload_json) so dashboards / `task.events` consumers see
+    /// it just like any other typed event.
+    fn emit_snapshot_event(
+        &self,
+        task_id: &str,
+        summary: &CompactionSummary,
+    ) -> Result<(), CoordinatorError> {
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let now = unix_secs();
+        let payload = format!(
+            "task.snapshot: compacted {} events ({} → {}); final_status={}",
+            summary.event_count,
+            summary
+                .first_ts
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            summary
+                .last_ts
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            summary.final_status,
+        );
+        let payload_json = render_snapshot_payload_json(summary);
+        conn.execute(
+            "INSERT INTO task_events \
+             (task_id, ts, event_type, payload, schema_version, payload_json) \
+             VALUES (?1, ?2, 'task.snapshot', ?3, 1, ?4)",
+            params![task_id, now, payload, payload_json],
+        )
+        .map_err(CoordinatorError::Db)?;
+        Ok(())
+    }
+
     /// Total task count, optionally filtered by status. Drives
     /// pagination "total" hints for operator tooling that wants to
     /// render "N of M" without walking every page.
@@ -3517,6 +3775,73 @@ pub struct CompactDryRun {
     /// status for stable rendering. Statuses with zero
     /// candidates do not appear.
     pub by_task_status: Vec<(String, i64)>,
+}
+
+/// Per-task summary computed before any rows are deleted; used to
+/// build the `task.snapshot` event payload. Pure data — see
+/// [`TaskStore::run_retention`] for the consuming code.
+#[derive(Debug, Clone)]
+pub struct CompactionSummary {
+    /// How many `task_events` rows for this task fall within the
+    /// retention candidate set.
+    pub event_count: i64,
+    /// `MIN(ts)` over the candidate set. `None` only on a race
+    /// where the candidate set drained between SELECT and summary.
+    pub first_ts: Option<i64>,
+    /// `MAX(ts)` over the candidate set.
+    pub last_ts: Option<i64>,
+    /// `tasks.status` at the moment retention ran. The snapshot
+    /// preserves this so a future operator scan still sees the
+    /// task's final terminal state in the chronicle even after
+    /// the per-attempt events are gone.
+    pub final_status: String,
+}
+
+/// Result of a [`TaskStore::run_retention`] pass. Surfaced in
+/// startup logs + (eventually) in the dashboard's retention
+/// panel.
+#[derive(Debug, Clone)]
+pub struct RetentionResult {
+    /// Cutoff timestamp the run honoured. Events with `ts < this`
+    /// were candidates.
+    pub cutoff_ts: i64,
+    /// Number of tasks that received at least one `task.snapshot`
+    /// event during the run.
+    pub tasks_compacted: i64,
+    /// Total `task_events` rows deleted across all passes.
+    pub events_deleted: i64,
+    /// Number of `task.snapshot` events emitted (one per
+    /// terminal task with candidate events).
+    pub snapshots_emitted: i64,
+    /// Number of bounded-delete passes that actually executed.
+    pub passes_run: u32,
+    /// True when the loop stopped because it hit
+    /// `max_passes_per_run` rather than because the candidate set
+    /// was exhausted. Honest signal for operators to bump the
+    /// limit or wait for the next scheduled run.
+    pub stopped_at_pass_limit: bool,
+}
+
+/// Hand-built JSON renderer for the `task.snapshot` payload.
+/// Same approach as the other Coordinator renderers — no
+/// serde_json on the runtime crate.
+fn render_snapshot_payload_json(s: &CompactionSummary) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(160);
+    let _ = write!(
+        out,
+        r#"{{"compacted_event_count":{},"final_status":"{}""#,
+        s.event_count,
+        json_escape(&s.final_status),
+    );
+    if let Some(t) = s.first_ts {
+        let _ = write!(out, r#","first_ts":{t}"#);
+    }
+    if let Some(t) = s.last_ts {
+        let _ = write!(out, r#","last_ts":{t}"#);
+    }
+    out.push('}');
+    out
 }
 
 /// One execution attempt of a Task, returned by `task.attempts` and
@@ -6519,6 +6844,7 @@ mod tests {
             db_path: tmp.path().join("tasks.db"),
             max_list: 50,
             recovery_scan: false,
+            retention: RetentionConfig::default(),
         };
         let s = TaskStore::open(&cfg).expect("open file store");
         (tmp, s)
@@ -6563,6 +6889,179 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _relix_migrations", [], |r| r.get(0))
             .unwrap();
         assert!(v >= 1, "expected at least one migration version row");
+    }
+
+    // ── Chronicle retention ──────────────────────────────────
+
+    /// Seed `events_per_task` events for `task_count` tasks, then
+    /// flip the tasks into a terminal status so retention picks
+    /// them up.
+    fn seed_old_chronicle(s: &TaskStore, task_count: usize, events_per_task: usize, old_ts: i64) {
+        for i in 0..task_count {
+            let tid = mk(s, &format!("retention-task-{i}"), "flow.sol", "{}", "owner");
+            // Pin events to an old ts so they fall under the cutoff.
+            {
+                let conn = s.conn.lock().unwrap();
+                for k in 0..events_per_task {
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, ts, event_type, payload) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![tid, old_ts + k as i64, "test.event", ""],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "UPDATE tasks SET status = 'completed', updated_at = ?2 WHERE task_id = ?1",
+                    rusqlite::params![tid, old_ts],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn event_count(s: &TaskStore) -> i64 {
+        let conn = s.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM task_events", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn retention_deletes_events_older_than_cutoff() {
+        let s = store();
+        let now = unix_secs();
+        let old = now - 60 * 86_400;
+        seed_old_chronicle(&s, 3, 4, old);
+        // All 12 task_events rows present pre-run.
+        assert_eq!(event_count(&s), 12);
+        let cutoff = now - 30 * 86_400;
+        let r = s.run_retention(cutoff, 10).unwrap();
+        // The 12 old events go; 3 snapshot events are emitted in
+        // their place. So we go from 12 → 3.
+        assert_eq!(r.events_deleted, 12);
+        assert_eq!(r.snapshots_emitted, 3);
+        assert_eq!(r.tasks_compacted, 3);
+        assert_eq!(event_count(&s), 3);
+    }
+
+    #[test]
+    fn retention_skips_non_terminal_tasks_r5() {
+        let s = store();
+        let now = unix_secs();
+        let old = now - 60 * 86_400;
+        seed_old_chronicle(&s, 2, 3, old);
+        // Flip one back to `running` — R5 says retention can't
+        // touch active tasks.
+        {
+            let conn = s.conn.lock().unwrap();
+            let running_id: String = conn
+                .query_row("SELECT task_id FROM tasks LIMIT 1", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'running' WHERE task_id = ?1",
+                rusqlite::params![running_id],
+            )
+            .unwrap();
+        }
+        let r = s.run_retention(now - 30 * 86_400, 10).unwrap();
+        // Only the still-completed task gets compacted (3 events).
+        assert_eq!(r.events_deleted, 3);
+        assert_eq!(r.snapshots_emitted, 1);
+        // The `running` task's 3 events survive untouched, plus
+        // 1 snapshot from the completed task = 4.
+        assert_eq!(event_count(&s), 4);
+    }
+
+    #[test]
+    fn retention_emits_snapshot_event_with_summary_payload() {
+        let s = store();
+        let now = unix_secs();
+        let old = now - 60 * 86_400;
+        seed_old_chronicle(&s, 1, 5, old);
+        let _ = s.run_retention(now - 30 * 86_400, 10).unwrap();
+        // The remaining event is the snapshot. Confirm its shape.
+        let conn = s.conn.lock().unwrap();
+        let (event_type, payload_json): (String, Option<String>) = conn
+            .query_row(
+                "SELECT event_type, payload_json FROM task_events LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event_type, "task.snapshot");
+        let pj = payload_json.expect("snapshot must carry payload_json");
+        assert!(pj.contains("\"compacted_event_count\":5"), "got {pj}");
+        assert!(pj.contains("\"final_status\":\"completed\""), "got {pj}");
+        assert!(pj.contains("\"first_ts\":"), "got {pj}");
+        assert!(pj.contains("\"last_ts\":"), "got {pj}");
+    }
+
+    #[test]
+    fn retention_respects_limit_per_pass() {
+        let s = store();
+        let now = unix_secs();
+        let old = now - 60 * 86_400;
+        // Synthesise 2500 candidate events across one task so a
+        // single 1000-row pass can't drain them; the loop must
+        // run multiple passes.
+        seed_old_chronicle(&s, 1, 2500, old);
+        let r = s.run_retention(now - 30 * 86_400, 10).unwrap();
+        assert_eq!(r.events_deleted, 2500);
+        assert_eq!(r.snapshots_emitted, 1);
+        // 2500 / 1000 = ceil 3 passes.
+        assert!(
+            r.passes_run >= 3,
+            "expected ≥3 passes, got {}",
+            r.passes_run
+        );
+        assert!(!r.stopped_at_pass_limit);
+    }
+
+    #[test]
+    fn retention_honours_max_passes_cap() {
+        let s = store();
+        let now = unix_secs();
+        let old = now - 60 * 86_400;
+        seed_old_chronicle(&s, 1, 5000, old);
+        // Cap at 2 passes — we should delete at most 2000 events
+        // and the result must signal that we stopped early.
+        let r = s.run_retention(now - 30 * 86_400, 2).unwrap();
+        assert!(
+            r.events_deleted <= MAX_ROWS_PER_RETENTION_PASS * 2,
+            "deleted more than 2 passes' worth: {}",
+            r.events_deleted
+        );
+        assert!(r.stopped_at_pass_limit);
+    }
+
+    #[test]
+    fn retention_pass_is_a_noop_when_nothing_qualifies() {
+        let s = store();
+        let now = unix_secs();
+        // No data at all.
+        let r = s.run_retention(now - 30 * 86_400, 10).unwrap();
+        assert_eq!(r.events_deleted, 0);
+        assert_eq!(r.snapshots_emitted, 0);
+        assert_eq!(r.tasks_compacted, 0);
+        assert_eq!(r.passes_run, 0);
+    }
+
+    #[test]
+    fn retention_does_not_re_compact_existing_snapshot_rows() {
+        // Running retention twice in a row must NOT delete the
+        // snapshot events emitted by the previous run. The
+        // query explicitly excludes event_type='task.snapshot'.
+        let s = store();
+        let now = unix_secs();
+        let old = now - 60 * 86_400;
+        seed_old_chronicle(&s, 2, 3, old);
+        let r1 = s.run_retention(now - 30 * 86_400, 10).unwrap();
+        let mid_count = event_count(&s);
+        assert_eq!(r1.snapshots_emitted, 2);
+        assert_eq!(mid_count, 2); // two snapshots remain
+        let r2 = s.run_retention(now - 30 * 86_400, 10).unwrap();
+        assert_eq!(r2.events_deleted, 0, "snapshots survive a second pass");
+        assert_eq!(r2.snapshots_emitted, 0);
+        assert_eq!(event_count(&s), 2);
     }
 
     #[test]

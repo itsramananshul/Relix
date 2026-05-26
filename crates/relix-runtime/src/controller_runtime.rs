@@ -2976,6 +2976,23 @@ fn register_node_type_handlers(
                 Err(e) => tracing::error!(error = %e, "coordinator startup: recovery scan failed"),
             }
         }
+        // Background chronicle retention. Only spawns when
+        // `[coordinator.retention] enabled = true`; the dry-run
+        // surface via `task.compact_events` is unaffected. See
+        // `docs/chronicle-retention.md` for the full design.
+        if coord_cfg.retention.enabled {
+            let retention_store = store.clone();
+            let retention_cfg = coord_cfg.retention.clone();
+            tokio::spawn(async move {
+                run_retention_loop(retention_store, retention_cfg).await;
+            });
+            tracing::info!(
+                interval_h = coord_cfg.retention.compact_interval_h,
+                max_age_days = coord_cfg.retention.max_task_age_days,
+                max_passes_per_run = coord_cfg.retention.max_passes_per_run,
+                "coordinator startup: chronicle retention loop spawned"
+            );
+        }
         crate::nodes::coordinator::register(bridge, store.clone());
         // Cron scheduler shares the coordinator's database.
         // Opens its own rusqlite connection against the same
@@ -4442,3 +4459,64 @@ pub use crate::transport::rpc::Client as TransportClient;
 // Channel type needed by some downstream uses; suppress unused-warning otherwise.
 #[allow(dead_code)]
 type _UnusedReceiver = mpsc::Receiver<TransportEvent>;
+
+/// Background retention loop. Sleeps for `compact_interval_h`
+/// hours, then runs one bounded compact pass against the
+/// configured cutoff. Failures are logged but never propagated
+/// — the loop continues so a transient SQLite hiccup doesn't
+/// silently disable retention until restart. See
+/// `docs/chronicle-retention.md`.
+async fn run_retention_loop(
+    store: std::sync::Arc<crate::nodes::coordinator::TaskStore>,
+    cfg: crate::nodes::coordinator::RetentionConfig,
+) {
+    use std::time::Duration;
+    let interval = Duration::from_secs(u64::from(cfg.compact_interval_h.max(1)) * 3600);
+    // Initial delay so retention doesn't run immediately at
+    // startup — gives the node time to admit traffic and
+    // confirm health before any deletion happens. One full
+    // interval is the safest choice.
+    tokio::time::sleep(interval).await;
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff_ts = now - (i64::from(cfg.max_task_age_days) * 86_400);
+        let store_for_run = store.clone();
+        let max_passes = cfg.max_passes_per_run;
+        // Move the synchronous-SQLite work onto a blocking
+        // thread so the tokio runtime's IO threads aren't
+        // pinned by the bounded-delete loop. A single
+        // retention run can stretch across several seconds on
+        // a large DB; that's fine on a blocking thread.
+        let result =
+            tokio::task::spawn_blocking(move || store_for_run.run_retention(cutoff_ts, max_passes))
+                .await;
+        match result {
+            Ok(Ok(r)) => {
+                if r.events_deleted > 0 || r.snapshots_emitted > 0 {
+                    tracing::info!(
+                        events_deleted = r.events_deleted,
+                        snapshots_emitted = r.snapshots_emitted,
+                        tasks_compacted = r.tasks_compacted,
+                        passes_run = r.passes_run,
+                        stopped_at_pass_limit = r.stopped_at_pass_limit,
+                        "coordinator: chronicle retention pass complete"
+                    );
+                } else {
+                    tracing::debug!(
+                        "coordinator: chronicle retention pass found nothing to compact"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "coordinator: retention pass failed");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "coordinator: retention task panicked");
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+}

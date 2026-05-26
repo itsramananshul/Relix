@@ -296,7 +296,107 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    print_database_sizes();
+
     Ok(())
+}
+
+/// Walk the conventional Relix data directories and print one
+/// line per SQLite file the bridge / coordinator / memory nodes
+/// might have written. Honest about scope: we look in the
+/// well-known locations (`~/.relix/data`, `./dev-data`); a
+/// custom `data_dir` set by the operator goes uncovered today
+/// — `relix doctor` is the place for an exhaustive sweep.
+fn print_database_sizes() {
+    let candidates = collect_database_paths();
+    if candidates.is_empty() {
+        return;
+    }
+    println!();
+    println!("databases:");
+    for path in candidates {
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                println!("  {:<60}  {}", path.display(), human_bytes(meta.len()));
+            }
+            Err(_) => {
+                // File disappeared between the walk + the stat —
+                // skip silently. Common when a controller is
+                // restarting concurrently with `relix status`.
+            }
+        }
+    }
+}
+
+/// Collect candidate SQLite file paths under `~/.relix/data` and
+/// `./dev-data`. Filters to files ending in `.db` or `.sqlite`
+/// so the WAL / SHM siblings don't double-count.
+fn collect_database_paths() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if let Some(h) = std::env::var_os(home_var) {
+        roots.push(PathBuf::from(h).join(".relix").join("data"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("dev-data"));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        walk_sqlite_files(&root, &mut out, 0);
+    }
+    // Deduplicate by canonical path so a symlink doesn't show
+    // twice.
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Recursively visit `dir` and append any `*.db` / `*.sqlite`
+/// file found, bounded to `depth ≤ 6` so a misconfigured
+/// `data_dir` pointing at `/` doesn't take down `relix status`.
+fn walk_sqlite_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_sqlite_files(&p, out, depth + 1);
+        } else if ft.is_file() {
+            let name = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name == "db" || name == "sqlite" {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Render a byte count as `123 B`, `4.2 KB`, `1.5 MB`, `2.1 GB`.
+/// Pure function so the tests can exercise it without disk I/O.
+pub(crate) fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n < KB {
+        format!("{n} B")
+    } else if n < MB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else if n < GB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    }
 }
 
 // ---- helpers ----
@@ -531,5 +631,22 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max.saturating_sub(1)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_renders_each_unit() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(2_500_000), "2.4 MB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(human_bytes(2_500_000_000), "2.3 GB");
     }
 }
