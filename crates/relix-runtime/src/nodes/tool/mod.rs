@@ -963,6 +963,41 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
     tracing::info!("tool node: registering tool.text.chunk (PH-PDF-CHUNK)");
     text_chunk::register(bridge);
 
+    // tool.ask_human — first-class "ask the operator" capability.
+    // Registered unconditionally so planners + flows can call it
+    // from anywhere on the mesh. Until an operator channel lands,
+    // the sender closure is a fail-soft `None` (timeout) — the
+    // handler still returns `{"timeout": true}` JSON so callers
+    // can branch deterministically. When a real channel ships
+    // (Telegram approval queue, dashboard intervention), the
+    // closure swaps in here.
+    tracing::info!("tool node: registering tool.ask_human");
+    bridge.register(
+        ask_human::AskHumanTool::descriptor().method_name.as_str(),
+        Arc::new(FnHandler(move |ctx: InvocationCtx| async move {
+            let args = match std::str::from_utf8(&ctx.args) {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    return HandlerOutcome::Err(ErrorEnvelope {
+                        kind: error_kinds::INVALID_ARGS,
+                        cause: format!("tool.ask_human arg utf8: {e}"),
+                        retry_hint: 2,
+                        retry_after: None,
+                    });
+                }
+            };
+            ask_human::AskHumanTool::handle(&args, |_question, _timeout_secs| async move {
+                // No operator channel wired yet — the handler
+                // surfaces the `{"timeout": true}` reply so
+                // callers see a structured "no operator
+                // available" outcome rather than a mesh-level
+                // CapabilityNotFound.
+                None
+            })
+            .await
+        })),
+    );
+
     // B2: tool.read_file / write_file / search_files / patch.
     // Only registered when the operator opted in by setting
     // `[tool.fs]` in the controller TOML. Bringup script enables this
@@ -1195,6 +1230,118 @@ pub enum ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W3 — ask_human registration. The first test confirms the
+    // capability appears in the bridge's handler table at all;
+    // the second drives a request through the admission
+    // pipeline end-to-end and asserts AskHumanTool::handle
+    // returned the documented `{"timeout": true}` JSON shape
+    // (i.e. the call routed to the handler, not back as a
+    // CapabilityNotFound).
+
+    fn fresh_bridge_for_tool() -> (
+        crate::dispatch::DispatchBridge,
+        ed25519_dalek::SigningKey,
+        tempfile::TempDir,
+    ) {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let dir = tempfile::TempDir::new().unwrap();
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let policy = relix_core::policy::PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "anyone_ask_human"
+            method = "tool.ask_human"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let bridge = crate::dispatch::DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        (bridge, org_root, dir)
+    }
+
+    fn aic_for(
+        org_root: &ed25519_dalek::SigningKey,
+        name: &str,
+        groups: &[&str],
+    ) -> bundle::Bundle {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let caller_key = SigningKey::generate(&mut OsRng);
+        let id = relix_core::identity::IdentityBundle {
+            subject_id: relix_core::types::NodeId::from_pubkey(
+                &caller_key.verifying_key().to_bytes(),
+            ),
+            name: name.into(),
+            org_id: relix_core::types::NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: groups.iter().map(|s| s.to_string()).collect(),
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        relix_core::identity::issue_identity(id, org_root, 3600).unwrap()
+    }
+
+    use relix_core::bundle;
+
+    #[tokio::test]
+    async fn tool_ask_human_is_registered_by_tool_register() {
+        let (mut bridge, _org_root, _dir) = fresh_bridge_for_tool();
+        let backend = Arc::new(ToolBackend::new(ToolConfig::default()).unwrap());
+        register(&mut bridge, backend);
+        assert!(
+            bridge.has_handler("tool.ask_human"),
+            "tool.ask_human must be registered after tool::register"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_ask_human_routes_through_mesh_to_handle_not_capability_not_found() {
+        use crate::transport::envelope::ResponseResult;
+        let (mut bridge, org_root, _dir) = fresh_bridge_for_tool();
+        let backend = Arc::new(ToolBackend::new(ToolConfig::default()).unwrap());
+        register(&mut bridge, backend);
+        let aic = aic_for(&org_root, "alice", &["chat-users"]);
+        // The default stub sender returns None immediately, so
+        // we pick `timeout_secs = 1` to keep the test fast. The
+        // outer timeout fires; the handler returns
+        // `{"timeout": true}`.
+        let args = br#"{"question":"deploy now?","timeout_secs":1}"#.to_vec();
+        let envelope = crate::dispatch::build_request("tool.ask_human", args, aic, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = crate::dispatch::decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Ok(body) => {
+                let s = String::from_utf8(body.into_vec()).unwrap();
+                assert!(
+                    s.contains("\"timeout\":true"),
+                    "expected timeout reply (no operator channel wired); got {s}"
+                );
+            }
+            ResponseResult::Err(e) => {
+                // The handler must not surface UNKNOWN_METHOD —
+                // that would mean the registration is missing.
+                assert_ne!(
+                    e.kind,
+                    relix_core::types::error_kinds::UNKNOWN_METHOD,
+                    "tool.ask_human surfaced UNKNOWN_METHOD — registration gap"
+                );
+                panic!(
+                    "unexpected handler error: kind={}, cause={}",
+                    e.kind, e.cause
+                );
+            }
+            other => panic!("unexpected response variant: {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn rejects_loopback() {

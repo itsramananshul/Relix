@@ -4648,6 +4648,12 @@ fn register_node_type_handlers(
         // for retrieval / context-window-fit use cases. Always
         // advertised when the tool node is up.
         manifest.add_capability(crate::nodes::tool::text_chunk::capability_descriptor());
+        // tool.ask_human — first-class "ask the operator"
+        // capability. Always advertised; today the handler
+        // surfaces `{"timeout": true}` because no operator
+        // channel is wired yet. The capability descriptor is
+        // honest: risk=Medium, cost=Expensive, idempotency=AtMostOnce.
+        manifest.add_capability(crate::nodes::tool::ask_human::AskHumanTool::descriptor());
         // B2: jailed filesystem subsystem. Only advertised when
         // `[tool.fs]` is configured -- node-type tool with no
         // `[tool.fs]` keeps fs out of the manifest.

@@ -443,6 +443,14 @@ impl DispatchBridge {
         self.handlers.insert(method.into(), handler);
     }
 
+    /// `true` when a handler has been registered under
+    /// `method`. Operator-facing utility for tests + the
+    /// manifest sanity check; the admission pipeline still
+    /// owns the actual routing decision.
+    pub fn has_handler(&self, method: &str) -> bool {
+        self.handlers.contains_key(method)
+    }
+
     /// Run the admission pipeline on an inbound encoded envelope and dispatch.
     /// Returns the encoded response envelope to send back on the wire.
     pub async fn handle_inbound(&self, encoded_envelope: Vec<u8>) -> Vec<u8> {
