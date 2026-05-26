@@ -46,6 +46,7 @@
 //!
 //! These ship in later milestones if and when a flow needs them.
 
+pub mod audio;
 pub mod browser;
 pub mod fs;
 pub mod mcp;
