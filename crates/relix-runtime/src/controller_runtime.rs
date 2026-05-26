@@ -2913,12 +2913,19 @@ fn register_node_type_handlers(
         // tracked reload — file edits take effect on the next
         // chat without a restart.
         let soul_cache = crate::nodes::ai::SoulCache::from_config(ai_cfg.agent.as_ref());
+        // Skill library. Loaded once at startup from the
+        // documented discovery roots; an empty library is a
+        // no-op (no skill hint is ever prepended). Hot reload
+        // is a follow-up — operators today restart the
+        // controller to pick up new skills.
+        let skills_cache = crate::nodes::ai::skills::SkillsCache::load(&[]);
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
             default_model.clone(),
             memory_cell.clone(),
             soul_cache,
+            skills_cache,
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when

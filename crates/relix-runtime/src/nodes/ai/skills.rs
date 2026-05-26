@@ -166,6 +166,128 @@ fn load_skill_file(path: &Path) -> Option<Skill> {
     })
 }
 
+/// Find the best-matching skill for `prompt` via a simple
+/// keyword-overlap score. Returns `None` when no skill shares
+/// any non-stopword token with the prompt.
+///
+/// Honest scope: this is the keyword fallback the spec calls
+/// out — embedding-similarity matching (the spec's preferred
+/// path when Qdrant is available) is a separate follow-up that
+/// reuses the AI node's embedding provider. The keyword
+/// matcher is what controllers without an embedding peer get;
+/// returning `None` is fine — the skill prepend is opt-in
+/// context, not required.
+pub fn match_skill_keyword<'a>(skills: &'a [Skill], prompt: &str) -> Option<&'a Skill> {
+    let prompt_tokens: std::collections::BTreeSet<String> = tokenize(prompt).collect();
+    if prompt_tokens.is_empty() {
+        return None;
+    }
+    let mut best: Option<(&Skill, usize)> = None;
+    for s in skills {
+        let haystack = format!("{} {} {}", s.name, s.title, s.body);
+        let skill_tokens: std::collections::BTreeSet<String> = tokenize(&haystack).collect();
+        let overlap = prompt_tokens.intersection(&skill_tokens).count();
+        if overlap == 0 {
+            continue;
+        }
+        match best {
+            Some((_, best_overlap)) if overlap <= best_overlap => {}
+            _ => best = Some((s, overlap)),
+        }
+    }
+    best.map(|(s, _)| s)
+}
+
+/// Lowercase, strip punctuation, split on whitespace, drop
+/// stopwords. Pure utility — exported for tests of the matcher
+/// logic.
+fn tokenize(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| !w.is_empty() && w.len() > 2 && !STOPWORDS.contains(&w.as_str()))
+}
+
+/// English stopword list. Pragmatic, not exhaustive — the
+/// matcher just needs to drop the most common noise.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "into", "are", "was", "will", "you",
+    "your", "but", "not", "all", "any", "use", "can", "may", "have", "has", "had", "would",
+    "should", "could", "what", "when", "where", "how", "who", "why",
+];
+
+/// Render a system-prompt envelope around a matched skill's
+/// body. The envelope is documented and stable: future
+/// integrations (auto-skill generator, dashboard surface) can
+/// rely on the format.
+pub fn render_skill_hint(skill: &Skill) -> String {
+    format!(
+        "## Skill: {name}\n\
+         \n\
+         You have access to this skill. Use it if relevant to the task.\n\
+         \n\
+         {body}\n",
+        name = skill.name,
+        body = skill.body.trim()
+    )
+}
+
+/// Cache for the loaded skill library. Cheap to clone (Arc
+/// inside). The cache loads once at construction; reload via
+/// `refresh()` if operators add skills mid-run (the AI node
+/// doesn't auto-refresh — refresh is operator-triggered).
+#[derive(Clone, Debug)]
+pub struct SkillsCache {
+    skills: Arc<Vec<Skill>>,
+}
+
+impl SkillsCache {
+    /// Discover skills under `extra_roots` plus the documented
+    /// default roots (cwd / `~/.relix/skills`) and store them.
+    pub fn load(extra_roots: &[PathBuf]) -> Self {
+        Self {
+            skills: Arc::new(discover_skills(extra_roots)),
+        }
+    }
+
+    /// Permanent-empty cache. Tests + the legacy code path
+    /// that doesn't load skills at all use this; the matcher
+    /// returns None against the empty list, so the AI handler
+    /// skips the prepend.
+    pub fn empty() -> Self {
+        Self {
+            skills: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Test-only constructor that wraps a pre-built skill list.
+    /// Saves tests from staging actual files on disk just to
+    /// exercise the matcher.
+    pub fn from_vec(skills: Vec<Skill>) -> Self {
+        Self {
+            skills: Arc::new(skills),
+        }
+    }
+
+    /// Match the prompt against the cached skill library; render
+    /// a system-prompt hint when a match is found. None means
+    /// "no relevant skill" and the AI handler skips the prepend.
+    pub fn matched_hint(&self, prompt: &str) -> Option<String> {
+        match_skill_keyword(&self.skills, prompt).map(render_skill_hint)
+    }
+
+    /// Count of cached skills. Useful for `relix doctor` /
+    /// debug surfaces.
+    pub fn len(&self) -> usize {
+        self.skills.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+}
+
+use std::sync::Arc;
+
 fn extract_first_heading(body: &str) -> Option<String> {
     for line in body.lines() {
         let trimmed = line.trim_start();
@@ -183,6 +305,45 @@ fn extract_first_heading(body: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn match_skill_keyword_returns_highest_overlap() {
+        let skills = vec![
+            Skill {
+                name: "deploy".into(),
+                path: PathBuf::from("deploy.md"),
+                body: "Run deploy script\nUses kubectl".into(),
+                title: "Deploy to prod".into(),
+            },
+            Skill {
+                name: "test".into(),
+                path: PathBuf::from("test.md"),
+                body: "Run cargo test\nAssert no failures".into(),
+                title: "Run tests".into(),
+            },
+        ];
+        let m = match_skill_keyword(&skills, "deploy the new build");
+        assert_eq!(m.map(|s| s.name.as_str()), Some("deploy"));
+        let m = match_skill_keyword(&skills, "run tests on the branch");
+        assert_eq!(m.map(|s| s.name.as_str()), Some("test"));
+        let m = match_skill_keyword(&skills, "look up the weather");
+        assert!(m.is_none(), "no overlap → no match");
+    }
+
+    #[test]
+    fn render_skill_hint_includes_body_in_documented_envelope() {
+        let s = Skill {
+            name: "deploy".into(),
+            path: PathBuf::from("d.md"),
+            body: "## Steps\n1. cargo build\n2. push".into(),
+            title: "Deploy".into(),
+        };
+        let hint = render_skill_hint(&s);
+        assert!(hint.contains("You have access to this skill"));
+        assert!(hint.contains("deploy"));
+        assert!(hint.contains("cargo build"));
+        assert!(hint.starts_with("## Skill: "));
+    }
 
     #[test]
     fn agents_md_walker_finds_file_in_parent_dir() {

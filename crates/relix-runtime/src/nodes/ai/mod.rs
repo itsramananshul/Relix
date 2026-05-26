@@ -271,10 +271,12 @@ pub fn register(
     default_model: String,
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
     soul_cache: SoulCache,
+    skills_cache: skills::SkillsCache,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let soul_for_chat = soul_cache.clone();
+    let skills_for_chat = skills_cache.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -282,7 +284,8 @@ pub fn register(
             let model = model_for_chat.clone();
             let mem = memory_dispatcher.clone();
             let soul = soul_for_chat.clone();
-            async move { handle_chat(p, model, mem, soul, ctx).await }
+            let sk = skills_for_chat.clone();
+            async move { handle_chat(p, model, mem, soul, sk, ctx).await }
         })),
     );
     let provider_for_embed = provider.clone();
@@ -561,6 +564,7 @@ async fn handle_chat(
     default_model: String,
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
     soul_cache: SoulCache,
+    skills_cache: skills::SkillsCache,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -638,6 +642,26 @@ async fn handle_chat(
     // sees the change on the next call.
     let system_prompt = match soul_cache.current() {
         Some(soul) => Some(soul.into_system_prompt(system_prompt.as_deref())),
+        None => system_prompt,
+    };
+    // Skill hint: keyword-match the user's prompt against the
+    // loaded skill library. When a match is found, append the
+    // skill body as a system-prompt section so the model sees
+    // "you have a procedure for this — use it." `None` (no
+    // match / empty library) leaves the prompt unchanged.
+    let system_prompt = match skills_cache.matched_hint(prompt) {
+        Some(hint) => Some(match system_prompt {
+            Some(existing) => {
+                let mut combined = existing;
+                if !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push('\n');
+                combined.push_str(&hint);
+                combined
+            }
+            None => hint,
+        }),
         None => system_prompt,
     };
 
@@ -768,6 +792,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -776,6 +801,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -788,6 +814,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -811,6 +838,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -828,6 +856,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"|hello|"),
         )
         .await;
@@ -866,6 +895,7 @@ mod tests {
             String::new(),
             empty_mem(),
             soul,
+            skills::SkillsCache::empty(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -897,7 +927,15 @@ mod tests {
         });
         cell.set(stub).ok();
         let (_tmp, soul) = make_soul_cache_with_tempfile("SOUL-PERSONA");
-        let r = handle_chat(rec_provider, String::new(), cell, soul, ctx(b"s1|hi|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            soul,
+            skills::SkillsCache::empty(),
+            ctx(b"s1|hi|"),
+        )
+        .await;
         assert!(matches!(r, HandlerOutcome::Ok(_)));
         let captured = recorded.lock().unwrap().clone().unwrap();
         let sp = captured.system_prompt.expect("system_prompt set");
@@ -922,6 +960,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -929,6 +968,41 @@ mod tests {
         let captured = recorded.lock().unwrap().clone().unwrap();
         // No memory + no soul → no system prompt at all.
         assert!(captured.system_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn skill_hint_appended_to_system_prompt_when_match_found() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let skill = skills::Skill {
+            name: "deploy-staging".into(),
+            path: std::path::PathBuf::from("dummy"),
+            body: "# deploy-staging\n\nRun ./scripts/deploy-staging.sh.".into(),
+            title: "deploy-staging".into(),
+        };
+        let cache = skills::SkillsCache::from_vec(vec![skill]);
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            cache,
+            ctx(b"s1|please deploy staging now|"),
+        )
+        .await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        let sp = captured.system_prompt.expect("system_prompt set");
+        assert!(
+            sp.contains("## Skill: deploy-staging"),
+            "skill heading missing: {sp}"
+        );
+        assert!(
+            sp.contains("./scripts/deploy-staging.sh"),
+            "skill body missing: {sp}"
+        );
     }
 
     #[tokio::test]
@@ -949,6 +1023,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -980,6 +1055,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1034,6 +1110,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -1069,6 +1146,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -1107,6 +1185,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1226,6 +1305,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1265,6 +1345,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1302,6 +1383,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1340,6 +1422,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1399,6 +1482,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1498,6 +1582,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
+            skills::SkillsCache::empty(),
             ctx(b"s1|hello|"),
         )
         .await;
