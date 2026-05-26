@@ -54,6 +54,7 @@ pub mod dispatcher;
 pub mod fs;
 pub mod manifest;
 pub mod mcp;
+pub mod mcp_http;
 pub mod mcp_stdio;
 pub mod output_guard;
 pub mod pdf;
@@ -1125,19 +1126,34 @@ pub fn register(
         );
     }
 
-    // CW5: tool.mcp.* — MCP registry + live stdio runtime
-    // (PH-MCP-RUNTIME, D-009 closed). Opt-in via [tool.mcp].
-    // stdio servers spawn lazily on first invoke / list_tools;
-    // HTTP transport still returns RuntimeNotConnected. See
-    // mcp.rs and mcp_stdio.rs.
+    // CW5 / F13: tool.mcp.* — MCP registry + live stdio AND
+    // http runtime. Opt-in via [tool.mcp]. stdio servers
+    // spawn lazily on first invoke / list_tools; http
+    // servers run a boot-time `tools/list` probe that warms
+    // the connection and surfaces the discovered tool
+    // count in the startup log. Boot-time HTTP failures are
+    // logged but do NOT fail the tool node — a down server
+    // is still recoverable on the next call.
     if let Some(mcp_cfg) = backend.mcp_config() {
         match mcp::McpRegistry::new(mcp_cfg) {
             Ok(reg) => {
                 tracing::info!(
                     servers = reg.server_count(),
-                    "tool node: registering tool.mcp.* (registry + live stdio runtime)"
+                    "tool node: registering tool.mcp.* (registry + live stdio + http runtime)"
                 );
-                mcp::register(bridge, Arc::new(reg));
+                let reg = Arc::new(reg);
+                // Spawn boot-time HTTP discovery so the
+                // tool node doesn't block startup on a slow
+                // / down server. The clone is cheap (Arc).
+                let reg_for_discovery = reg.clone();
+                tokio::spawn(async move {
+                    let ok = reg_for_discovery.discover_http_tools().await;
+                    tracing::info!(
+                        http_servers_warmed = ok,
+                        "tool node: mcp http boot-time discovery complete"
+                    );
+                });
+                mcp::register(bridge, reg);
             }
             Err(e) => {
                 tracing::warn!(

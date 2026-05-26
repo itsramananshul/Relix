@@ -56,6 +56,7 @@ use relix_core::capability::{
 };
 use relix_core::types::{ErrorEnvelope, error_kinds};
 
+use super::mcp_http::{McpHttpClient, map_http_err};
 use super::mcp_stdio::{McpStdioClient, StdioError, encode_tools_call_result};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
@@ -319,6 +320,26 @@ pub struct McpServerConfig {
     /// ```
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// F13: HTTP transport — optional Authorization header
+    /// value the client sends with every request. The
+    /// operator writes the FULL header value (e.g.
+    /// `"Bearer sk-..."` or `"Basic base64..."`) — Relix
+    /// does no envelope wrapping. Empty / unset means no
+    /// auth header is sent. Ignored for stdio transport.
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// F13: HTTP transport — max number of retry attempts
+    /// on transport-level failures (connect / read / 5xx /
+    /// 429) per JSON-RPC call. The retry uses exponential
+    /// backoff: `100ms * 2^attempt`. Defaults to 3 retries
+    /// (4 total attempts). Setting to 0 disables retry.
+    /// Ignored for stdio transport.
+    #[serde(default = "default_reconnect_max")]
+    pub reconnect_max: u32,
+}
+
+fn default_reconnect_max() -> u32 {
+    3
 }
 
 /// Resolve `$VAR` references in `value` against `std::env`.
@@ -491,14 +512,36 @@ pub struct McpRegistry {
     /// the map on first call_tool / list_tools (the clients
     /// themselves serialise their own I/O internally).
     stdio_clients: Mutex<HashMap<String, Arc<McpStdioClient>>>,
+    /// F13: pool of HTTP clients. One entry per `http`
+    /// server, built up-front in `new` (HTTP clients are
+    /// cheap — no I/O until the first request). Reused
+    /// across calls so the underlying connection pool can
+    /// keep keep-alive sessions warm.
+    http_clients: HashMap<String, Arc<McpHttpClient>>,
 }
 
 impl McpRegistry {
     pub fn new(cfg: McpConfig) -> Result<Self, McpError> {
         validate_config(&cfg)?;
+        let mut http_clients: HashMap<String, Arc<McpHttpClient>> = HashMap::new();
+        for s in &cfg.servers {
+            if s.transport == "http" {
+                let client = super::mcp_http::McpHttpClient::new(
+                    s.id.clone(),
+                    s.endpoint.clone(),
+                    s.auth_header.clone(),
+                    s.reconnect_max,
+                )
+                .map_err(|e| McpError::InvalidConfig {
+                    reason: format!("mcp http client for '{}': {e}", s.id),
+                })?;
+                http_clients.insert(s.id.clone(), Arc::new(client));
+            }
+        }
         Ok(Self {
             servers: cfg.servers,
             stdio_clients: Mutex::new(HashMap::new()),
+            http_clients,
         })
     }
 
@@ -561,21 +604,38 @@ impl McpRegistry {
         Ok(Some(client))
     }
 
-    /// Async list_tools. For stdio servers, attempts a live
-    /// `tools/list`; on transport / decode failure falls back
-    /// to the operator-declared list (per the spec in the
-    /// PH-MCP-RUNTIME directive). For http or non-stdio servers
-    /// returns the declared list.
+    /// Async list_tools. For stdio AND http servers,
+    /// attempts a live `tools/list`; on transport / decode
+    /// failure falls back to the operator-declared list (per
+    /// the PH-MCP-RUNTIME directive — never fabricated).
+    /// Unknown transports return the declared list directly.
     pub async fn list_tools(&self, server_id: &str) -> Result<Vec<String>, McpError> {
-        let declared = self.find_server(server_id)?.declared_tools.clone();
-        if let Some(client) = self.stdio_client_for(server_id).await? {
+        let server = self.find_server(server_id)?;
+        let declared = server.declared_tools.clone();
+        if server.transport == "stdio"
+            && let Some(client) = self.stdio_client_for(server_id).await?
+        {
             match client.list_tools().await {
                 Ok(res) => return Ok(res.tools.into_iter().map(|t| t.name).collect()),
                 Err(e) => {
                     tracing::warn!(
                         server = %server_id,
                         error = %e,
-                        "tool.mcp.list_tools live call failed; falling back to declared_tools"
+                        "tool.mcp.list_tools stdio call failed; falling back to declared_tools"
+                    );
+                }
+            }
+        }
+        if server.transport == "http"
+            && let Some(client) = self.http_clients.get(server_id).cloned()
+        {
+            match client.list_tools().await {
+                Ok(res) => return Ok(res.tools.into_iter().map(|t| t.name).collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        server = %server_id,
+                        error = %e,
+                        "tool.mcp.list_tools http call failed; falling back to declared_tools"
                     );
                 }
             }
@@ -604,19 +664,81 @@ impl McpRegistry {
             })?
         };
 
-        let client = self.stdio_client_for(server_id).await?.ok_or_else(|| {
-            McpError::RuntimeNotConnected {
-                reason: format!(
-                    "mcp: server '{server_id}' is not stdio transport; \
-                     live invocation only supports stdio in this Relix build"
-                ),
+        let server = self.find_server(server_id)?;
+        match server.transport.as_str() {
+            "stdio" => {
+                let client = self.stdio_client_for(server_id).await?.ok_or_else(|| {
+                    McpError::RuntimeNotConnected {
+                        reason: format!("mcp: server '{server_id}' stdio client missing"),
+                    }
+                })?;
+                match client.call_tool(tool_name, args_value).await {
+                    Ok(res) => Ok(encode_tools_call_result(&res)),
+                    Err(e) => Err(map_stdio_err(&e)),
+                }
             }
-        })?;
-
-        match client.call_tool(tool_name, args_value).await {
-            Ok(res) => Ok(encode_tools_call_result(&res)),
-            Err(e) => Err(map_stdio_err(&e)),
+            "http" => {
+                let client = self.http_clients.get(server_id).cloned().ok_or_else(|| {
+                    McpError::RuntimeNotConnected {
+                        reason: format!(
+                            "mcp: http client for server '{server_id}' missing — \
+                             registry was constructed without it"
+                        ),
+                    }
+                })?;
+                match client.call_tool(tool_name, args_value).await {
+                    Ok(res) => Ok(encode_tools_call_result(&res)),
+                    Err(e) => Err(map_http_err(&e)),
+                }
+            }
+            other => Err(McpError::RuntimeNotConnected {
+                reason: format!("mcp: server '{server_id}' has unknown transport '{other}'"),
+            }),
         }
+    }
+
+    /// F13: boot-time HTTP discovery. For every `http` server,
+    /// runs `initialize` + `tools/list` against the live
+    /// endpoint and writes a tracing event with the
+    /// discovered tool count. Failures are logged at WARN
+    /// level and ignored — a server that's down at boot
+    /// doesn't fail the tool node. Live `list_tools` calls
+    /// against `tool.mcp.list_tools` already query the
+    /// server on every invocation, so this hook is a
+    /// warmup + observability layer, not a cache-fill.
+    /// Takes `&self` so it can be spawned as a tokio task
+    /// against an `Arc<McpRegistry>` without locking.
+    pub async fn discover_http_tools(&self) -> usize {
+        let mut ok_count = 0usize;
+        for s in &self.servers {
+            if s.transport != "http" {
+                continue;
+            }
+            let Some(client) = self.http_clients.get(&s.id).cloned() else {
+                continue;
+            };
+            match client.list_tools().await {
+                Ok(res) => {
+                    tracing::info!(
+                        server = %s.id,
+                        endpoint = %s.endpoint,
+                        tools = res.tools.len(),
+                        "mcp http: boot-time discovery succeeded"
+                    );
+                    ok_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        server = %s.id,
+                        endpoint = %s.endpoint,
+                        error = %e,
+                        "mcp http: boot-time discovery failed; \
+                         keeping operator-declared list"
+                    );
+                }
+            }
+        }
+        ok_count
     }
 }
 
@@ -861,6 +983,8 @@ mod tests {
             declared_tools: vec![],
             description: None,
             env: std::collections::HashMap::new(),
+            auth_header: None,
+            reconnect_max: 0,
         }
     }
 
@@ -1097,6 +1221,8 @@ mod tests {
             declared_tools: vec![],
             description: None,
             env: std::collections::HashMap::new(),
+            auth_header: None,
+            reconnect_max: 0,
         };
         // Empty endpoint is fine when command is set.
         validate_config(&make_cfg(vec![s.clone()])).unwrap();
