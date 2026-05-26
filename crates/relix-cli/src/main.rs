@@ -18,6 +18,7 @@ mod sol;
 mod task;
 mod terminal;
 mod topology;
+mod update;
 mod web;
 
 use clap::{Parser, Subcommand};
@@ -188,6 +189,11 @@ enum Cmd {
     /// is unreachable, so this is safe to use as a CI / shell gate.
     Status(mesh::StatusArgs),
 
+    /// Check for a newer Relix release. Hits the GitHub release API,
+    /// compares against the running binary's version, and offers to
+    /// download + replace if a newer version exists.
+    Update(update::UpdateArgs),
+
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -247,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Boot(args) => mesh::boot(args).await,
         Cmd::Stop => mesh::stop(),
         Cmd::Status(args) => mesh::status(args).await,
+        Cmd::Update(args) => update::run(args).await,
         Cmd::FlowRun {
             flow,
             identity,
