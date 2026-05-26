@@ -1816,6 +1816,7 @@
     <a href="#/browser"      class="nav-item" data-route="browser">Browser</a>
     <a href="#/metrics"      class="nav-item" data-route="metrics">Metrics</a>
     <a href="#/memory"       class="nav-item" data-route="memory">Agent Memory</a>
+    <a href="#/session-search" class="nav-item" data-route="session-search">Session Search</a>
     <a href="#/cron"         class="nav-item" data-route="cron">Cron Jobs</a>
     <a href="#/agents"       class="nav-item" data-route="agents">Agents</a>
     <a href="#/approvals"    class="nav-item" data-route="approvals">Approvals</a>
@@ -2737,6 +2738,64 @@
       </div>
     </section>
 
+    <!-- ── #/session-search ─────────────────────────────────────── -->
+    <section class="page" data-page="session-search">
+      <h2>Session Search</h2>
+      <p class="page-subtitle">
+        Full-text search across chat-turn chronicle events. Matches
+        every <code>chat.user_turn</code> / <code>chat.assistant_turn</code>
+        whose content contains the query. Subject id filter
+        scopes to one owner's sessions; empty filter searches
+        across all sessions (operator path). Each result links
+        through to the full session export.
+      </p>
+      <div class="card">
+        <div class="card-header">
+          <h3>Search</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Query</label>
+            <div class="field">
+              <input type="text" id="ssearch-q" placeholder="search across chat turns…">
+            </div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Subject ID</label>
+            <div class="field">
+              <input type="text" id="ssearch-subject" placeholder="(optional — empty searches all sessions)">
+            </div>
+          </div>
+          <div class="form-row" style="grid-template-columns: 140px 1fr;">
+            <label>Limit</label>
+            <div class="field">
+              <select id="ssearch-limit">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn-primary" id="ssearch-go">Search</button>
+            <span class="action-status" id="ssearch-status"></span>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Results</h3>
+          <div class="card-actions">
+            <span id="ssearch-count"></span>
+          </div>
+        </div>
+        <div class="card-body" id="ssearch-results">
+          <div class="empty">Enter a query and hit Search.</div>
+        </div>
+      </div>
+    </section>
+
     <!-- ── #/cron ──────────────────────────────────────────────── -->
     <section class="page" data-page="cron">
       <h2>Cron Jobs</h2>
@@ -3456,6 +3515,7 @@ const PAGES = {
   browser:      { label: 'Browser',      init: initBrowser,      enter: enterBrowser },
   metrics:      { label: 'Metrics',      init: initMetrics,      enter: enterMetrics },
   memory:       { label: 'Agent Memory', init: initMemory,       enter: enterMemory },
+  'session-search': { label: 'Session Search', init: initSessionSearch, enter: enterSessionSearch },
   cron:         { label: 'Cron Jobs',    init: initCron,         enter: enterCron },
   agents:       { label: 'Agents',       init: initAgents,       enter: enterAgents },
   approvals:    { label: 'Approvals',    init: initApprovals,    enter: enterApprovals },
@@ -9248,6 +9308,120 @@ function enterMemory() {
   // The curator-status card IS refreshed on every entry — it's
   // a process-wide reading, no subject_id required.
   loadCuratorStatus();
+}
+
+// ── #/session-search ──────────────────────────────────────
+function initSessionSearch() {
+  const $btn = document.getElementById('ssearch-go');
+  if ($btn) $btn.addEventListener('click', runSessionSearch);
+  // Enter in the query field submits.
+  const $q = document.getElementById('ssearch-q');
+  if ($q) {
+    $q.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        runSessionSearch();
+      }
+    });
+  }
+}
+
+function enterSessionSearch() {
+  // No auto-load — results only fetch on explicit submit.
+}
+
+async function runSessionSearch() {
+  const $status = document.getElementById('ssearch-status');
+  const $host = document.getElementById('ssearch-results');
+  const $count = document.getElementById('ssearch-count');
+  const q = ((document.getElementById('ssearch-q') || {}).value || '').trim();
+  const subject = ((document.getElementById('ssearch-subject') || {}).value || '').trim();
+  const limit = ((document.getElementById('ssearch-limit') || {}).value || '20').trim();
+  if (!q) {
+    if ($status) $status.textContent = 'query required';
+    return;
+  }
+  if ($status) $status.textContent = 'searching…';
+  if ($host) $host.innerHTML = '<div class="loading">searching…</div>';
+  if ($count) $count.textContent = '';
+  try {
+    const params = new URLSearchParams({ q, limit });
+    if (subject) params.set('subject_id', subject);
+    const r = await fetch('/v1/memory/sessions/search?' + params.toString());
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body && body.error) detail += ' — ' + body.error;
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const body = await r.json();
+    const results = (body && body.results) || [];
+    if ($status) $status.textContent = 'done';
+    if ($count) $count.textContent = (body.total || results.length) + ' result(s)';
+    if (results.length === 0) {
+      if ($host) $host.innerHTML = '<div class="empty">No matches found for query.</div>';
+      return;
+    }
+    const rows = results.map(renderSessionSearchHit).join('');
+    if ($host) $host.innerHTML = rows;
+  } catch (e) {
+    if ($status) $status.textContent = 'search failed';
+    if ($host) {
+      $host.innerHTML = '<div class="empty" style="color:#c0392b;">Search failed: '
+        + escapeHtml(String(e)) + '</div>';
+    }
+  }
+}
+
+function renderSessionSearchHit(hit) {
+  const ts = hit.timestamp_unix
+    ? new Date(hit.timestamp_unix * 1000).toLocaleString()
+    : '—';
+  const role = (hit.role || '').toLowerCase();
+  const badgeClass = role === 'user' ? 'badge-user' : 'badge-assistant';
+  const sessionShort = (hit.session_id || '').slice(0, 16);
+  const exportHref = '/v1/sessions/export?session=' + encodeURIComponent(hit.session_id || '');
+  const snippet = highlightQueryInSnippet(hit.snippet || '', currentSessionSearchQuery());
+  const content = escapeHtml(hit.content || '');
+  return ''
+    + '<div class="result-row" style="border-bottom:1px solid var(--border); padding:8px 0;">'
+    +   '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">'
+    +     '<a href="' + exportHref + '" target="_blank" style="font-family:monospace;">'
+    +       escapeHtml(sessionShort) + '…'
+    +     '</a>'
+    +     '<span class="badge ' + badgeClass + '">' + escapeHtml(role) + '</span>'
+    +     '<span style="color:var(--text-muted); font-size:12px;">' + escapeHtml(ts) + '</span>'
+    +   '</div>'
+    +   '<div style="margin-bottom:4px;">' + snippet + '</div>'
+    +   '<div style="color:var(--text-muted); font-size:12px;">'
+    +     escapeHtml(content)
+    +   '</div>'
+    + '</div>';
+}
+
+function currentSessionSearchQuery() {
+  const v = ((document.getElementById('ssearch-q') || {}).value || '').trim();
+  return v;
+}
+
+function highlightQueryInSnippet(snippet, q) {
+  // Render the snippet with the matched substring wrapped in
+  // <mark>. Both inputs are pre-escaped before HTML insertion;
+  // we use a case-insensitive split that preserves the
+  // original casing in the snippet.
+  if (!q) return escapeHtml(snippet);
+  const lc = snippet.toLowerCase();
+  const lcq = q.toLowerCase();
+  const idx = lc.indexOf(lcq);
+  if (idx < 0) return escapeHtml(snippet);
+  const before = snippet.slice(0, idx);
+  const match = snippet.slice(idx, idx + q.length);
+  const after = snippet.slice(idx + q.length);
+  return escapeHtml(before)
+    + '<mark>' + escapeHtml(match) + '</mark>'
+    + escapeHtml(after);
 }
 
 async function runCurate() {
