@@ -279,6 +279,12 @@ pub struct AppState {
     /// the same path's GET. See
     /// `crates/relix-web-bridge/src/guardrails.rs`.
     pub handoff_audit: crate::guardrails::HandoffAuditRing,
+    /// JIT secret store loaded from `RELIX_*` env vars at
+    /// bridge startup. Backs the `/v1/secrets/available`
+    /// endpoint (NAMES ONLY — values never leave the
+    /// process). See
+    /// `crates/relix-runtime/src/nodes/execution/secrets.rs`.
+    pub jit_secrets: std::sync::Arc<relix_runtime::nodes::execution::secrets::SecretStore>,
     /// Four-layer memory store backing the
     /// `/v1/memory/records/*` inspector endpoints.
     /// `Some` when `[bridge] memory_db_path` is configured AND
@@ -416,6 +422,9 @@ impl AppState {
             bridge_port,
             rate_limits: crate::rate_limit::RateLimits::new(rate_limit_cfg),
             handoff_audit: crate::guardrails::HandoffAuditRing::new(),
+            jit_secrets: std::sync::Arc::new(
+                relix_runtime::nodes::execution::secrets::SecretStore::from_env(),
+            ),
             layered_memory: open_layered_memory(&memory_db_path),
         })
     }

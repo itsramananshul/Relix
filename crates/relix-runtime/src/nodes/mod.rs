@@ -10,6 +10,7 @@ pub mod ai;
 pub mod channels;
 pub mod coordinator;
 pub mod discord;
+pub mod execution;
 pub mod memory;
 pub mod router;
 pub mod slack;

@@ -120,6 +120,7 @@ mod policy_simulate;
 mod rate_limit;
 mod schema;
 mod secrets;
+mod secrets_available;
 mod security_headers;
 mod slack;
 mod sol_validate;
@@ -505,6 +506,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/guardrails/handoffs",
             get(guardrails::handoffs).post(guardrails::record),
         )
+        // JIT secret store inventory (NAMES ONLY).
+        .route("/v1/secrets/available", get(secrets_available::available))
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's
