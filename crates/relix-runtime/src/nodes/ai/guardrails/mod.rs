@@ -16,11 +16,13 @@
 //! admit rules, and audit trails alongside.
 
 pub mod drift;
+pub mod eval;
 pub mod handoff;
 pub mod input;
 pub mod mode;
 
 pub use drift::{ChronicleEvent, DriftAction, DriftConfig, DriftDetector};
+pub use eval::{EvalCase, EvalFailure, EvalReport, GuardrailEval};
 pub use handoff::{HandoffAuditEvent, HandoffGuard, HandoffGuardResult};
 pub use input::{InputGuardrail, InputGuardrailResult, PiiPolicy};
 pub use mode::GuardrailMode;

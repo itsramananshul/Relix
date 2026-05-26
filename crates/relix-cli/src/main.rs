@@ -4,6 +4,7 @@ mod browser;
 mod capability;
 mod config;
 mod doctor;
+mod eval;
 mod export;
 mod flow_run;
 mod fs;
@@ -152,6 +153,16 @@ enum Cmd {
     /// PASS/WARN/FAIL report. Exits non-zero on any FAIL so
     /// CI / shell scripts can gate on it.
     Doctor(doctor::DoctorArgs),
+
+    /// Run the red-team eval suite against the configured
+    /// guardrail mode. `relix eval guardrails --mode strict`
+    /// runs the full corpus; `--quick` runs a fast subset
+    /// for CI smoke. Exits non-zero when the attack-block or
+    /// safe-pass rates fall below the spec floor.
+    Eval {
+        #[command(subcommand)]
+        cmd: eval::Cmd,
+    },
     /// PH-TERM-CLI: inspect + control tool.terminal.* on a
     /// tool node. `terminal sessions` lists live runs;
     /// `terminal audit` snapshots the completion ring;
@@ -284,6 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Browser { cmd } => browser::run(cmd).await,
         Cmd::Sol { cmd } => sol::run(cmd).await,
         Cmd::Doctor(args) => doctor::run(args).await,
+        Cmd::Eval { cmd } => eval::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
