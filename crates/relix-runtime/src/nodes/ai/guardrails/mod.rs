@@ -21,7 +21,10 @@ pub mod handoff;
 pub mod input;
 pub mod mode;
 
-pub use drift::{ChronicleEvent, DriftAction, DriftConfig, DriftDetector};
+pub use drift::{
+    ChronicleEvent, DriftAction, DriftConfig, DriftDetector, DriftEmbedDispatcher,
+    DriftEmbedDispatcherHandle,
+};
 pub use eval::{EvalCase, EvalFailure, EvalReport, GuardrailEval};
 pub use handoff::{HandoffAuditEvent, HandoffGuard, HandoffGuardResult};
 pub use input::{InputGuardrail, InputGuardrailResult, PiiPolicy};

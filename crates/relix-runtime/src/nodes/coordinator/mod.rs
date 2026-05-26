@@ -4040,6 +4040,7 @@ pub fn register(
     store: Arc<TaskStore>,
     auto_skill_cfg: Option<Arc<crate::nodes::ai::skills::SkillsConfig>>,
     drift_cfg: Option<Arc<crate::nodes::ai::guardrails::DriftConfig>>,
+    drift_embedder: Option<Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher>>,
 ) {
     {
         let s = store.clone();
@@ -4055,12 +4056,14 @@ pub fn register(
         let s = store.clone();
         let auto_cfg = auto_skill_cfg.clone();
         let drift = drift_cfg.clone();
+        let drift_embedder_for_hook = drift_embedder.clone();
         bridge.register(
             "task.update",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 let auto = auto_cfg.clone();
                 let drift = drift.clone();
+                let drift_embedder_for_hook = drift_embedder_for_hook.clone();
                 async move {
                     let outcome = handle_update(&s, &ctx);
                     // Post-update hook: when a task transitions
@@ -4099,8 +4102,9 @@ pub fn register(
                     {
                         let s = s.clone();
                         let cfg = cfg.clone();
-                        tokio::task::spawn_blocking(move || {
-                            evaluate_drift_for_task(&s, &task_id, &cfg);
+                        let embedder = drift_embedder_for_hook.clone();
+                        tokio::spawn(async move {
+                            evaluate_drift_for_task(&s, &task_id, &cfg, embedder).await;
                         });
                     }
                     outcome
@@ -6896,18 +6900,27 @@ fn parse_completed_signal(args: &[u8]) -> Option<(String, String)> {
 
 /// Best-effort drift evaluation for a `running` task. Pulls
 /// the task's view + recent chronicle, hands the summary to
-/// the drift detector, and writes a `drift_evaluation`
-/// chronicle entry the operator can audit later. Honest
-/// scope: today the coordinator has no outbound embedding
-/// dispatcher, so the helper records the summary + the
-/// configured threshold without computing the cosine. When
-/// the embedding wiring lands, the same helper will fold in
-/// goal + recent embeddings and the chronicle entry will
-/// carry the verdict.
-fn evaluate_drift_for_task(
+/// the drift detector, optionally computes cosine similarity
+/// against the goal embedding via the supplied
+/// [`DriftEmbedDispatcher`], and writes a
+/// `guardrail.drift_evaluation` chronicle entry the operator
+/// can audit later.
+///
+/// Payload format (pipe-delimited so existing chronicle
+/// inspectors can read it):
+///
+/// ```text
+/// goal=<title>|threshold=<f>|similarity=<f>|drift_detected=<bool>|summary=<preview>
+/// ```
+///
+/// `similarity` is `"none"` and `drift_detected` is `false`
+/// when no embedding dispatcher is wired or one of the embed
+/// calls returned `None`.
+pub(crate) async fn evaluate_drift_for_task(
     store: &TaskStore,
     task_id: &str,
     cfg: &crate::nodes::ai::guardrails::DriftConfig,
+    embedder: Option<Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher>>,
 ) {
     use crate::nodes::ai::guardrails::{ChronicleEvent, DriftDetector};
     let detector = DriftDetector::from_config(cfg);
@@ -6945,21 +6958,48 @@ fn evaluate_drift_for_task(
         return;
     };
     let goal_preview: String = view.title.chars().take(120).collect();
+    // W4: when an embedding dispatcher is wired, embed the
+    // goal title + recent-activity summary and compute the
+    // cosine similarity. The score lands in the chronicle so
+    // operators can audit drift trend over time. Failures
+    // (provider doesn't support embeddings, mismatched
+    // dimensions, etc.) skip the comparison silently —
+    // existing deployments without a dispatcher behave
+    // identically to before.
+    let (similarity, drift_detected): (Option<f32>, bool) = match embedder.as_ref() {
+        Some(d) => {
+            let goal_vec = d.embed(&view.title).await;
+            let recent_vec = d.embed(&summary).await;
+            match (goal_vec, recent_vec) {
+                (Some(g), Some(r)) => {
+                    let s = crate::nodes::ai::guardrails::drift::cosine_similarity(&g, &r);
+                    (Some(s), s < detector.threshold())
+                }
+                _ => (None, false),
+            }
+        }
+        None => (None, false),
+    };
     tracing::info!(
         task_id,
         action = cfg.action.as_str(),
         threshold = detector.threshold(),
         goal = %goal_preview,
         summary_lines = summary.lines().count(),
-        "drift: evaluation recorded (embedding-aware comparison lands once coordinator wires an embedding dispatcher)"
+        similarity = ?similarity,
+        drift_detected,
+        "drift: evaluation recorded"
     );
-    // Write a chronicle entry so post-hoc auditing has
-    // something concrete to walk. Payload format:
-    // `goal=<title>|threshold=<f>|summary=<preview>`.
+    let similarity_field = match similarity {
+        Some(s) => format!("{s:.4}"),
+        None => "none".to_string(),
+    };
     let payload = format!(
-        "goal={}|threshold={:.3}|summary={}",
+        "goal={}|threshold={:.3}|similarity={}|drift_detected={}|summary={}",
         goal_preview.replace('|', " "),
         detector.threshold(),
+        similarity_field,
+        drift_detected,
         summary.lines().take(3).collect::<Vec<_>>().join(" / ")
     );
     if let Err(e) = store.append_event(task_id, "guardrail.drift_evaluation", &payload) {
@@ -11619,5 +11659,134 @@ mod tests {
         assert_eq!(edges[1].edge_type, "retried_from");
         assert_eq!(edges[1].attempt_id, Some(attempts[2].attempt_id));
         assert_eq!(edges[1].related_attempt_id, Some(attempts[1].attempt_id));
+    }
+
+    // ── W4: drift hook embedding wiring ──────────────────────────
+
+    fn seed_drift_task(s: &TaskStore, title: &str, events_n: usize) -> String {
+        let tid = mk(s, title, "flow.sol", "{}", "owner");
+        for i in 0..events_n {
+            s.append_event(&tid, "task.run", &format!("step {i}"))
+                .unwrap();
+        }
+        tid
+    }
+
+    fn read_drift_payload(s: &TaskStore, task_id: &str) -> String {
+        let evts = s
+            .query_events(task_id, 0, 100, None, EventOrder::Desc)
+            .unwrap();
+        evts.into_iter()
+            .find(|e| e.event_type == "guardrail.drift_evaluation")
+            .expect("drift_evaluation event present")
+            .payload
+    }
+
+    #[tokio::test]
+    async fn drift_hook_writes_cosine_score_when_embedder_returns_vectors() {
+        use crate::nodes::ai::guardrails::DriftConfig;
+        let s = store();
+        let title = "draft release announcement";
+        let tid = seed_drift_task(&s, title, 12);
+        // Configure a low threshold so similarity > threshold → no drift.
+        let cfg = DriftConfig {
+            enabled: true,
+            threshold: 0.5,
+            check_every_n: 10,
+            action: crate::nodes::ai::guardrails::DriftAction::Warn,
+        };
+        // Parallel vectors → cosine 1.0 → above threshold.
+        // The summary text is generated by the detector so we
+        // hard-code a single aligned response for any input.
+        struct AlignedEmbedder;
+        #[async_trait::async_trait]
+        impl crate::nodes::ai::guardrails::DriftEmbedDispatcher for AlignedEmbedder {
+            async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+                Some(vec![1.0f32, 0.0])
+            }
+        }
+        let embedder: Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher> =
+            Arc::new(AlignedEmbedder);
+        evaluate_drift_for_task(&s, &tid, &cfg, Some(embedder)).await;
+        let payload = read_drift_payload(&s, &tid);
+        // Aligned vectors → similarity 1.0000 (or very close).
+        assert!(
+            payload.contains("similarity=1.0000"),
+            "expected similarity=1.0000, got payload: {payload}"
+        );
+        // No drift since 1.0 >= 0.5.
+        assert!(
+            payload.contains("drift_detected=false"),
+            "payload: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drift_hook_flags_drift_detected_when_similarity_below_threshold() {
+        use crate::nodes::ai::guardrails::DriftConfig;
+        let s = store();
+        let tid = seed_drift_task(&s, "summarise quarterly report", 12);
+        let cfg = DriftConfig {
+            enabled: true,
+            threshold: 0.7,
+            check_every_n: 10,
+            action: crate::nodes::ai::guardrails::DriftAction::Warn,
+        };
+        // Embedder returns ORTHOGONAL vectors for the two
+        // calls (goal vs recent summary). Orthogonal → cosine
+        // 0.0 < 0.7 → drift_detected = true.
+        struct OrthogonalEmbedder {
+            calls: std::sync::Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::nodes::ai::guardrails::DriftEmbedDispatcher for OrthogonalEmbedder {
+            async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+                let mut c = self.calls.lock().unwrap();
+                let n = *c;
+                *c += 1;
+                if n == 0 {
+                    Some(vec![1.0f32, 0.0])
+                } else {
+                    Some(vec![0.0f32, 1.0])
+                }
+            }
+        }
+        let embedder: Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher> =
+            Arc::new(OrthogonalEmbedder {
+                calls: std::sync::Mutex::new(0),
+            });
+        evaluate_drift_for_task(&s, &tid, &cfg, Some(embedder)).await;
+        let payload = read_drift_payload(&s, &tid);
+        assert!(
+            payload.contains("similarity=0.0000"),
+            "expected similarity=0.0000, got payload: {payload}"
+        );
+        assert!(
+            payload.contains("drift_detected=true"),
+            "payload: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drift_hook_records_similarity_none_when_no_embedder_wired() {
+        use crate::nodes::ai::guardrails::DriftConfig;
+        let s = store();
+        let tid = seed_drift_task(&s, "investigate latency regression", 12);
+        let cfg = DriftConfig {
+            enabled: true,
+            threshold: 0.65,
+            check_every_n: 10,
+            action: crate::nodes::ai::guardrails::DriftAction::Warn,
+        };
+        evaluate_drift_for_task(&s, &tid, &cfg, None).await;
+        let payload = read_drift_payload(&s, &tid);
+        assert!(
+            payload.contains("similarity=none"),
+            "expected similarity=none when embedder is absent, got payload: {payload}"
+        );
+        assert!(
+            payload.contains("drift_detected=false"),
+            "payload: {payload}"
+        );
     }
 }

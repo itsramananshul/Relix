@@ -3393,7 +3393,25 @@ fn register_node_type_handlers(
         // running tasks. Absent / disabled ⇒ `None` ⇒ hook
         // stays dormant.
         let drift_cfg = build_drift_config(cfg).map(std::sync::Arc::new);
-        crate::nodes::coordinator::register(bridge, store.clone(), auto_skill_cfg, drift_cfg);
+        // W4: optional embedding dispatcher for the drift
+        // hook. Today the coordinator boots without an
+        // outbound mesh client (that lives on the
+        // `relix-controller` binary), so we pass `None` here
+        // and the hook records summaries without a cosine
+        // score. Tests inject stub dispatchers directly so
+        // the embedding path is exercised end to end. The
+        // controller-side wiring lands when the coordinator
+        // gains an `ai.embed` peer config.
+        let drift_embedder: Option<
+            std::sync::Arc<dyn crate::nodes::ai::guardrails::DriftEmbedDispatcher>,
+        > = None;
+        crate::nodes::coordinator::register(
+            bridge,
+            store.clone(),
+            auto_skill_cfg,
+            drift_cfg,
+            drift_embedder,
+        );
         // Cron scheduler shares the coordinator's database.
         // Opens its own rusqlite connection against the same
         // file; SQLite handles cross-connection locking.

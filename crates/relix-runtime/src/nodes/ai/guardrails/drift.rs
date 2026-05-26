@@ -25,7 +25,26 @@
 //!   available; that wiring is documented in
 //!   `controller_runtime.rs`.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
+
+/// Trait the coordinator's drift hook calls to embed the
+/// goal text + recent-activity summary. Implementations
+/// hand off to the AI node's `ai.embed` capability over the
+/// mesh; tests inject stubs. `None` from `embed` means the
+/// dispatcher could not produce a vector (provider doesn't
+/// support embeddings, request failed, etc.) — the drift
+/// hook treats that as a silent skip.
+#[async_trait::async_trait]
+pub trait DriftEmbedDispatcher: Send + Sync {
+    async fn embed(&self, text: &str) -> Option<Vec<f32>>;
+}
+
+/// Type alias for the optional dispatcher Arc the coordinator
+/// holds. Cheap to clone; absence means the drift hook records
+/// only the textual summary without a similarity score.
+pub type DriftEmbedDispatcherHandle = Option<Arc<dyn DriftEmbedDispatcher>>;
 
 /// Default cosine-similarity floor below which we declare
 /// drift. Empirically picked to catch "the agent wandered to
