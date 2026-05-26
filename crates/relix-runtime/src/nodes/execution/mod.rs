@@ -15,4 +15,5 @@
 //! without enabling the access broker, or load secrets from
 //! env without standing up either.
 
+pub mod gateway;
 pub mod secrets;
