@@ -86,6 +86,7 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
 
 mod agent;
 mod agent_memory;
+mod agents_access;
 mod auth;
 mod blocklist;
 mod browser_captures;
@@ -508,6 +509,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // JIT secret store inventory (NAMES ONLY).
         .route("/v1/secrets/available", get(secrets_available::available))
+        // Agent access policies + recent call counts.
+        .route("/v1/agents/access", get(agents_access::agents))
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's

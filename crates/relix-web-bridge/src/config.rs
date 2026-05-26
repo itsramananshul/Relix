@@ -285,6 +285,12 @@ pub struct AppState {
     /// process). See
     /// `crates/relix-runtime/src/nodes/execution/secrets.rs`.
     pub jit_secrets: std::sync::Arc<relix_runtime::nodes::execution::secrets::SecretStore>,
+    /// Agent access broker. Empty by default — operators
+    /// configure per-agent allow / deny / rate-limit policies
+    /// via `[[execution.agents]]` in the bridge config.
+    /// Backs the `/v1/agents/access` endpoint. See
+    /// `crates/relix-runtime/src/nodes/execution/broker.rs`.
+    pub access_broker: std::sync::Arc<relix_runtime::nodes::execution::broker::AgentAccessBroker>,
     /// Four-layer memory store backing the
     /// `/v1/memory/records/*` inspector endpoints.
     /// `Some` when `[bridge] memory_db_path` is configured AND
@@ -424,6 +430,9 @@ impl AppState {
             handoff_audit: crate::guardrails::HandoffAuditRing::new(),
             jit_secrets: std::sync::Arc::new(
                 relix_runtime::nodes::execution::secrets::SecretStore::from_env(),
+            ),
+            access_broker: std::sync::Arc::new(
+                relix_runtime::nodes::execution::broker::AgentAccessBroker::empty(),
             ),
             layered_memory: open_layered_memory(&memory_db_path),
         })
