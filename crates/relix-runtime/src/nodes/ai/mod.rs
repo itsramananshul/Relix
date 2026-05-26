@@ -548,6 +548,28 @@ fn combine_system_blocks(agent_block: Option<String>, rag_block: Option<String>)
 /// first (they're the older context), caller-supplied lines are
 /// appended after. A single trailing newline is normalised on
 /// the auto-fetched block so the two segments meet cleanly.
+/// Pull an `approval_token=<value>` field out of an `ai.chat`
+/// arg buffer. Looks for the substring anywhere in the args
+/// — operators can append it to the prompt or the history
+/// without breaking the existing pipe-delimited shape.
+/// Returns `None` when no token is present.
+fn extract_approval_token(args: &str) -> Option<String> {
+    let needle = "approval_token=";
+    let idx = args.find(needle)?;
+    let rest = &args[idx + needle.len()..];
+    // The token runs until the next whitespace or pipe so
+    // callers can suffix it without trailing garbage.
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '|')
+        .unwrap_or(rest.len());
+    let token = rest[..end].trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
 fn merge_history(auto: &str, caller: &str) -> String {
     if auto.is_empty() {
         return caller.to_string();
@@ -716,20 +738,55 @@ async fn handle_chat(
         system_prompt,
         ..ChatInput::default()
     };
+    // Extract an optional `approval_token=<value>` field
+    // from the request args. The token presence flips
+    // `RequiresApproval` plans to `Approved` so an operator
+    // who has already decided "yes, run the plan" can resume
+    // via the same `ai.chat` call. A future commit will
+    // validate the token against the coordinator's approval
+    // registry; today its presence is the operator's
+    // co-signed signal.
+    let approval_token = extract_approval_token(s);
     match provider.generate_reply(input).await {
         Ok(output) => {
-            // Planner + policy: parse the model reply into a
-            // structured plan and evaluate against the default
-            // policy. Plain chat replies fold to a single
-            // `ModelCall` step (Reversible), so this is a
-            // no-op for the existing chat traffic. When a
-            // model emits a `<plan>…</plan>` block with
-            // irreversible tool calls, the policy gate
-            // surfaces the approval-required message instead
-            // of running the plan blind.
             let plan = execution::Planner::parse_response(&output.text);
             let policy = execution::PolicyEngine::default_policy();
-            match policy.evaluate(&plan) {
+            let initial_verdict = policy.evaluate(&plan);
+            let verdict = match (&initial_verdict, approval_token.as_deref()) {
+                (execution::PolicyVerdict::RequiresApproval { .. }, Some(_)) => {
+                    execution::PolicyVerdict::Approved
+                }
+                _ => initial_verdict,
+            };
+            let approved_by = approval_token
+                .as_deref()
+                .map(|t| format!("approval_token:{}", t.chars().take(16).collect::<String>()));
+            // Evidence capture. Build the record from a
+            // single-step ExecutionState whose only step is
+            // the model call we just made. The chronicle
+            // append lands once the AI controller wires a
+            // coord dispatcher; today we log the JSON at
+            // info level so the operator's existing log
+            // pipeline catches it.
+            let mut state = execution::ExecutionState::new(plan.clone());
+            execution::Executor::advance(
+                &mut state,
+                execution::StepResult::Ok {
+                    output: output.text.clone(),
+                },
+            );
+            let evidence = execution::EvidenceRecord::from_state(
+                &state,
+                session_id,
+                session_id,
+                approved_by.clone(),
+            );
+            tracing::info!(
+                session_id,
+                evidence = %evidence.to_json(),
+                "ai.chat: execution evidence captured"
+            );
+            match verdict {
                 execution::PolicyVerdict::Approved => HandlerOutcome::Ok(output.text.into_bytes()),
                 execution::PolicyVerdict::RequiresApproval { reason } => {
                     let body = format!("[approval-required] {reason}\n{}", output.text);
@@ -1832,5 +1889,151 @@ mod tests {
             Ok(p) => assert_eq!(p.provider_name(), "local"),
             Err(e) => panic!("local should build without key: {e}"),
         }
+    }
+
+    // ── Task 2: reversibility + evidence wiring ──────────
+
+    /// A ChatProvider that returns a fixed reply — used to
+    /// drive the irreversible-plan branch of `handle_chat`.
+    struct CannedProvider {
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for CannedProvider {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Ok(provider::ChatOutput {
+                text: self.reply.clone(),
+                provider: "canned",
+                model: String::new(),
+                usage: None,
+            })
+        }
+        fn provider_name(&self) -> &'static str {
+            "canned"
+        }
+        async fn generate_embeddings(
+            &self,
+            _input: provider::EmbedInput,
+        ) -> Result<provider::EmbedOutput, ProviderError> {
+            Err(ProviderError::Permanent("not supported".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn irreversible_plan_without_token_returns_approval_required_body() {
+        let irreversible_reply = "<plan>\ntool: email.send\nargs: to=ops\n</plan>";
+        let provider: Arc<dyn ChatProvider> = Arc::new(CannedProvider {
+            reply: irreversible_reply.into(),
+        });
+        let r = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            ctx(b"sess-1|please email ops|"),
+        )
+        .await;
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        assert!(
+            body.starts_with("[approval-required]"),
+            "expected approval-required prefix, got: {body}"
+        );
+        assert!(body.contains("irreversible"));
+    }
+
+    #[tokio::test]
+    async fn irreversible_plan_with_token_in_args_proceeds_normally() {
+        let irreversible_reply = "<plan>\ntool: email.send\nargs: to=ops\n</plan>";
+        let provider: Arc<dyn ChatProvider> = Arc::new(CannedProvider {
+            reply: irreversible_reply.into(),
+        });
+        // Token rides on the history field (after the second
+        // pipe) — extract_approval_token scans the whole arg
+        // buffer so its placement is flexible.
+        let r = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            ctx(b"sess-1|please email ops|approval_token=abc123"),
+        )
+        .await;
+        let body = match r {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        };
+        assert!(
+            !body.starts_with("[approval-required]"),
+            "approval token must clear the gate; got: {body}"
+        );
+        assert!(body.contains("email.send"));
+    }
+
+    #[test]
+    fn extract_approval_token_parses_from_args() {
+        assert_eq!(
+            extract_approval_token("sess-1|prompt|approval_token=xyz"),
+            Some("xyz".to_string())
+        );
+        // Token with trailing pipe — bounded by the
+        // separator.
+        assert_eq!(
+            extract_approval_token("approval_token=xyz|extra"),
+            Some("xyz".to_string())
+        );
+        // Whitespace-bounded.
+        assert_eq!(
+            extract_approval_token("hi approval_token=xyz then more"),
+            Some("xyz".to_string())
+        );
+        // Empty value yields None.
+        assert!(extract_approval_token("approval_token= ").is_none());
+        // Absent → None.
+        assert!(extract_approval_token("nothing here").is_none());
+    }
+
+    #[test]
+    fn evidence_record_round_trip_after_handle_chat_shape() {
+        // Construct an EvidenceRecord the way handle_chat
+        // does and confirm the JSON wire shape so a future
+        // schema break here would fail this test.
+        use crate::nodes::ai::execution::{
+            EvidenceRecord, ExecutionState, Executor, Planner, StepResult,
+        };
+        let plan = Planner::parse_response("hello world");
+        let mut state = ExecutionState::new(plan);
+        Executor::advance(
+            &mut state,
+            StepResult::Ok {
+                output: "hello world".into(),
+            },
+        );
+        let rec = EvidenceRecord::from_state(
+            &state,
+            "sess-1",
+            "sess-1",
+            Some("approval_token:abc".into()),
+        );
+        let json = rec.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["task_id"], "sess-1");
+        assert_eq!(parsed["session_id"], "sess-1");
+        assert_eq!(parsed["reversibility"], "reversible");
+        assert_eq!(parsed["approved_by"], "approval_token:abc");
+        let plan_steps = parsed["plan_steps"].as_array().unwrap();
+        assert_eq!(plan_steps.len(), 1);
+        let step_results = parsed["step_results"].as_array().unwrap();
+        assert_eq!(step_results.len(), 1);
     }
 }
