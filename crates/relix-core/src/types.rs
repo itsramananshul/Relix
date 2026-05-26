@@ -203,6 +203,13 @@ pub mod error_kinds {
     /// envelope is unknown, expired, already consumed, or
     /// applies to a different method.
     pub const APPROVAL_TOKEN_INVALID: u32 = 20;
+    /// Memory-guard / safety subsystem rejected the call.
+    /// Distinct from `POLICY_DENIED` (operator-supplied admit
+    /// policy) — this kind signals "the content itself looked
+    /// like a poisoning attempt." Today only
+    /// `memory.write_turn` raises it via
+    /// `crate::nodes::memory::guard::MemoryGuard`.
+    pub const SECURITY_DENIED: u32 = 21;
 }
 
 #[cfg(test)]

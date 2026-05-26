@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
+use super::guard::MemoryGuard;
 use super::schema::{LayeredMemoryStore, MemoryLayer, MemoryRecord};
 
 /// `Fn(prompt) -> reply` shaped function the promoter uses to
@@ -144,7 +145,7 @@ impl LayerPromoter {
         for (source, group) in by_source {
             let mut kept: Vec<MemoryRecord> = Vec::new();
             for r in group {
-                if is_poisoned_placeholder(&r.text) {
+                if MemoryGuard::is_poisoned(&r.text) {
                     outcome.poisoned += 1;
                     let _ = self.store.invalidate(&r.id, now);
                     tracing::warn!(
@@ -233,7 +234,7 @@ impl LayerPromoter {
                 .filter(|s| !s.is_empty())
                 .collect();
             for (i, obs_text) in observations.iter().enumerate() {
-                if is_poisoned_placeholder(obs_text) {
+                if MemoryGuard::is_poisoned(obs_text) {
                     outcome.poisoned += 1;
                     tracing::warn!(
                         source = %source,
@@ -427,15 +428,6 @@ fn mint_promoted_id(parent_id: &str, layer: MemoryLayer, suffix: usize) -> Strin
     hasher.update(b"|");
     hasher.update(suffix.to_le_bytes().as_ref());
     hasher.finalize().to_hex().as_str()[..16].to_string()
-}
-
-/// Placeholder poison check for Task 1 — only flags absurdly
-/// long input (≥10k chars). Task 2 will replace this call site
-/// with the full `MemoryGuard::is_poisoned` rule set; keeping
-/// it inline here means the promoter compiles standalone and
-/// doesn't depend on a module that lands in a later commit.
-fn is_poisoned_placeholder(text: &str) -> bool {
-    text.chars().count() >= 10_000
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
