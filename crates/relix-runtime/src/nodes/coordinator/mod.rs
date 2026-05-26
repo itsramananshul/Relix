@@ -362,8 +362,14 @@ impl TaskStore {
         if let Some(parent) = cfg.db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CoordinatorError::Io(e.to_string()))?;
         }
-        let conn = Connection::open(&cfg.db_path).map_err(CoordinatorError::Db)?;
-        init_schema(&conn)?;
+        let mut conn = Connection::open(&cfg.db_path).map_err(CoordinatorError::Db)?;
+        // Production pragmas (FK enforcement, WAL, busy timeout) +
+        // startup integrity probe + migration-version bootstrap.
+        // See `crate::db` for the shared contract.
+        crate::db::apply_pragmas(&conn).map_err(CoordinatorError::Db)?;
+        crate::db::log_integrity_warning(&conn, "coordinator");
+        crate::db::ensure_migration_table(&conn).map_err(CoordinatorError::Db)?;
+        init_schema(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             max_list: cfg.max_list.max(1),
@@ -372,8 +378,10 @@ impl TaskStore {
 
     /// In-memory backend for unit tests.
     pub fn in_memory() -> Result<Self, CoordinatorError> {
-        let conn = Connection::open_in_memory().map_err(CoordinatorError::Db)?;
-        init_schema(&conn)?;
+        let mut conn = Connection::open_in_memory().map_err(CoordinatorError::Db)?;
+        crate::db::apply_pragmas(&conn).map_err(CoordinatorError::Db)?;
+        crate::db::ensure_migration_table(&conn).map_err(CoordinatorError::Db)?;
+        init_schema(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             max_list: 200,
@@ -5839,7 +5847,7 @@ fn internal(cause: String) -> HandlerOutcome {
 
 // ──────────────────────────── Schema + helpers ──────────────────────────────
 
-fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
+fn init_schema(conn: &mut Connection) -> Result<(), CoordinatorError> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS tasks (
@@ -6040,11 +6048,17 @@ fn init_schema(conn: &Connection) -> Result<(), CoordinatorError> {
         // this captures *which surface* dispatched it).
         "ALTER TABLE tasks ADD COLUMN origin_surface TEXT",
     ];
-    for sql in alters {
-        // Best-effort. The only error we expect is "duplicate column
-        // name" on a re-init; any other error here is a schema bug.
-        let _ = conn.execute(sql, []);
-    }
+    // Apply additive ALTER TABLE migrations inside a transaction.
+    // Duplicate-column errors (legacy boots that already added the
+    // column) are tolerated; ANY other error fails startup loudly
+    // so a typo or a schema bug surfaces immediately instead of
+    // being silently swallowed.
+    crate::db::apply_additive_migrations(conn, &alters).map_err(CoordinatorError::Db)?;
+    // Stamp the highest migration version we know about so the
+    // _relix_migrations table reflects current state. Version
+    // numbers are arbitrary — we use the count of additive
+    // statements as the cursor so adding a new ALTER bumps it.
+    crate::db::record_migration_applied(conn, alters.len() as i64).map_err(CoordinatorError::Db)?;
     Ok(())
 }
 
@@ -6494,6 +6508,80 @@ mod tests {
 
     fn store() -> TaskStore {
         TaskStore::in_memory().expect("open")
+    }
+
+    /// File-backed open helper for the DB-hardening tests. We
+    /// need an on-disk DB to confirm `journal_mode=WAL` (in-memory
+    /// SQLite silently falls back to `memory`).
+    fn file_store() -> (tempfile::TempDir, TaskStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = CoordinatorConfig {
+            db_path: tmp.path().join("tasks.db"),
+            max_list: 50,
+            recovery_scan: false,
+        };
+        let s = TaskStore::open(&cfg).expect("open file store");
+        (tmp, s)
+    }
+
+    #[test]
+    fn open_sets_wal_mode() {
+        let (_tmp, s) = file_store();
+        let conn = s.conn.lock().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+    }
+
+    #[test]
+    fn open_enables_foreign_keys() {
+        let (_tmp, s) = file_store();
+        let conn = s.conn.lock().unwrap();
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+    }
+
+    #[test]
+    fn open_creates_migration_table_with_version_stamp() {
+        let (_tmp, s) = file_store();
+        let conn = s.conn.lock().unwrap();
+        // The table itself.
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = '_relix_migrations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1, "_relix_migrations table should exist");
+        // And a version row, stamped at open.
+        let v: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _relix_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert!(v >= 1, "expected at least one migration version row");
+    }
+
+    #[test]
+    fn foreign_key_enforced_on_task_events() {
+        // The `task_events.task_id` FK is declared in init_schema
+        // but FK enforcement was off by default before the
+        // hardening. With it on, inserting an event for a
+        // non-existent task must be rejected.
+        let (_tmp, s) = file_store();
+        let conn = s.conn.lock().unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO task_events (task_id, ts, event_type, payload) \
+                 VALUES ('does-not-exist', 1, 'x', '')",
+                [],
+            )
+            .expect_err("orphan event must be rejected");
+        let m = err.to_string().to_ascii_lowercase();
+        assert!(m.contains("foreign key"), "wrong err: {m}");
     }
 
     /// Test helper: create a task with the C1 defaults so we don't have

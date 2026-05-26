@@ -204,6 +204,9 @@ impl AgentStore {
             std::fs::create_dir_all(parent).map_err(|e| AgentStoreError::Io(e.to_string()))?;
         }
         let conn = Connection::open(path)?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::log_integrity_warning(&conn, "agent_store");
+        crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -212,6 +215,8 @@ impl AgentStore {
 
     pub fn in_memory() -> Result<Self, AgentStoreError> {
         let conn = Connection::open_in_memory()?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

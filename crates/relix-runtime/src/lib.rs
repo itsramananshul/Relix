@@ -17,6 +17,7 @@
 pub mod admission;
 pub mod controller_runtime;
 pub mod coordinator;
+pub mod db;
 pub mod dispatch;
 pub mod flow_runner;
 pub mod manifest;

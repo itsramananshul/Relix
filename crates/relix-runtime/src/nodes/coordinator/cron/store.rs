@@ -77,6 +77,9 @@ impl CronStore {
             std::fs::create_dir_all(parent).map_err(|e| CronStoreError::Io(e.to_string()))?;
         }
         let conn = Connection::open(path)?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::log_integrity_warning(&conn, "cron_store");
+        crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -86,6 +89,8 @@ impl CronStore {
     /// In-memory backend for unit tests.
     pub fn in_memory() -> Result<Self, CronStoreError> {
         let conn = Connection::open_in_memory()?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

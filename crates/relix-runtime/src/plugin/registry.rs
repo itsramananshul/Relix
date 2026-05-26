@@ -82,6 +82,9 @@ impl PluginRegistry {
                 .map_err(|e| RegistryError::Io(format!("{}: {e}", parent.display())))?;
         }
         let conn = Connection::open(path)?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::log_integrity_warning(&conn, "plugin_registry");
+        crate::db::ensure_migration_table(&conn)?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -90,6 +93,8 @@ impl PluginRegistry {
 
     pub fn in_memory() -> Result<Self, RegistryError> {
         let conn = Connection::open_in_memory()?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::ensure_migration_table(&conn)?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

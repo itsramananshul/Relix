@@ -206,6 +206,9 @@ impl MemoryStore {
             std::fs::create_dir_all(parent).map_err(|e| MemoryError::Io(e.to_string()))?;
         }
         let conn = Connection::open(&cfg.db_path).map_err(MemoryError::Db)?;
+        crate::db::apply_pragmas(&conn).map_err(MemoryError::Db)?;
+        crate::db::log_integrity_warning(&conn, "memory");
+        crate::db::ensure_migration_table(&conn).map_err(MemoryError::Db)?;
         init_schema(&conn)?;
         embeddings::apply_schema(&conn)?;
         Ok(Self {
@@ -217,6 +220,8 @@ impl MemoryStore {
     /// In-memory backend for unit tests.
     pub fn in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory().map_err(MemoryError::Db)?;
+        crate::db::apply_pragmas(&conn).map_err(MemoryError::Db)?;
+        crate::db::ensure_migration_table(&conn).map_err(MemoryError::Db)?;
         init_schema(&conn)?;
         embeddings::apply_schema(&conn)?;
         Ok(Self {

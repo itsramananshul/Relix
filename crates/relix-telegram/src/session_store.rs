@@ -111,6 +111,7 @@ impl SqliteSessionStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
+        Self::apply_pragmas(&conn)?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -121,15 +122,32 @@ impl SqliteSessionStore {
     /// behaviour modulo persistence across process restarts.
     pub fn in_memory() -> Result<Self, rusqlite::Error> {
         let conn = Connection::open_in_memory()?;
+        Self::apply_pragmas(&conn)?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
+    /// Production pragmas: FK enforcement on, WAL journal,
+    /// synchronous=NORMAL, 5s busy timeout. Mirrors
+    /// `relix_runtime::db::apply_pragmas`. Inlined here because
+    /// `relix-telegram` does not depend on `relix-runtime`.
+    fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        Ok(())
+    }
+
     fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS telegram_sessions (
+            "CREATE TABLE IF NOT EXISTS _relix_migrations (
+                 version    INTEGER PRIMARY KEY,
+                 applied_at TEXT    NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS telegram_sessions (
                  chat_id     INTEGER NOT NULL,
                  message_id  INTEGER NOT NULL,
                  task_id     TEXT    NOT NULL,

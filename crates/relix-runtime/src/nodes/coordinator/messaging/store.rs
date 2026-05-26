@@ -77,6 +77,9 @@ impl MessageStore {
             std::fs::create_dir_all(parent).map_err(|e| MessageStoreError::Io(e.to_string()))?;
         }
         let conn = Connection::open(path)?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::log_integrity_warning(&conn, "messaging");
+        crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -85,6 +88,8 @@ impl MessageStore {
 
     pub fn in_memory() -> Result<Self, MessageStoreError> {
         let conn = Connection::open_in_memory()?;
+        crate::db::apply_pragmas(&conn)?;
+        crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
