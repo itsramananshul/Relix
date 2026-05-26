@@ -21,6 +21,12 @@ pub enum Cmd {
     /// surface lets operators inspect skills + pipe them into
     /// their own runners.
     Run(RunArgs),
+    /// Delete auto-generated SKILL.md files older than
+    /// `--max-age-days` (default 30) from
+    /// `~/.relix/skills/auto/`. The hand-authored skills under
+    /// `~/.relix/skills/` are never touched. Use `--dry-run`
+    /// to preview without deleting.
+    Prune(PruneArgs),
 }
 
 #[derive(Args, Debug)]
@@ -39,10 +45,27 @@ pub struct RunArgs {
     pub root: Vec<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct PruneArgs {
+    /// Max age in days. Files in the auto directory whose
+    /// mtime is older than this get deleted.
+    #[arg(long, default_value_t = 30)]
+    pub max_age_days: i64,
+    /// Show what would be deleted without removing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Override the auto directory (default:
+    /// `~/.relix/skills/auto`). Repeatable for ad-hoc cleanup
+    /// of operator-curated mirror directories.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
 pub fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Cmd::List(args) => list(&args.root),
         Cmd::Run(args) => run_skill(&args.name, &args.root),
+        Cmd::Prune(args) => prune(&args),
     }
 }
 
@@ -95,6 +118,62 @@ fn run_skill(name: &str, extra_roots: &[PathBuf]) -> Result<(), Box<dyn std::err
     if !skill.body.ends_with('\n') {
         println!();
     }
+    Ok(())
+}
+
+fn prune(args: &PruneArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = match args.dir.clone() {
+        Some(d) => d,
+        None => {
+            let cfg = relix_runtime::nodes::ai::skills::SkillsConfig::default();
+            match relix_runtime::nodes::ai::skills::resolve_auto_skill_dir(&cfg) {
+                Some(d) => d,
+                None => {
+                    return Err("no HOME / USERPROFILE in env; pass --dir explicitly".into());
+                }
+            }
+        }
+    };
+    if args.dry_run {
+        // For dry run we just enumerate candidates without
+        // deleting. Iterate the dir ourselves so the output is
+        // deterministic and we don't need a second helper in the
+        // runtime crate.
+        if !dir.exists() {
+            println!("auto-skill dir not present: {}", dir.display());
+            return Ok(());
+        }
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(
+                (args.max_age_days.max(0) as u64) * 86_400,
+            ))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let mut would_delete = 0usize;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if !p.is_file() || p.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if mtime < cutoff {
+                would_delete += 1;
+                println!("would delete: {}", p.display());
+            }
+        }
+        println!(
+            "dry-run: {would_delete} file(s) would be deleted from {}",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let (scanned, deleted) =
+        relix_runtime::nodes::ai::skills::prune_auto_skills(&dir, args.max_age_days)?;
+    println!(
+        "pruned {deleted} of {scanned} auto-skill file(s) in {}",
+        dir.display()
+    );
     Ok(())
 }
 

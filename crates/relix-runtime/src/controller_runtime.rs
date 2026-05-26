@@ -73,6 +73,11 @@ pub struct ControllerConfig {
     /// the schema; absent means no reporter spawns.
     #[serde(default)]
     pub reports: Option<toml::Value>,
+    /// `[skills]` — auto-skill generation + library config.
+    /// Absent means auto-generation stays off. See
+    /// `crates/relix-runtime/src/nodes/ai/skills.rs`.
+    #[serde(default)]
+    pub skills: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -3064,7 +3069,25 @@ fn register_node_type_handlers(
                 "coordinator startup: scheduled report loop spawned"
             );
         }
-        crate::nodes::coordinator::register(bridge, store.clone());
+        // `[skills]` is parsed on the coordinator boot path so
+        // the post-completion hook in `task.update` can mint
+        // SKILL.md auto-skills. Absent ⇒ `None` ⇒ hook stays
+        // dormant.
+        let auto_skill_cfg = match &cfg.skills {
+            Some(raw) => match raw
+                .clone()
+                .try_into::<crate::nodes::ai::skills::SkillsConfig>()
+            {
+                Ok(c) if c.auto_generate => Some(std::sync::Arc::new(c)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "[skills] parse failed; auto-generation disabled");
+                    None
+                }
+            },
+            None => None,
+        };
+        crate::nodes::coordinator::register(bridge, store.clone(), auto_skill_cfg);
         // Cron scheduler shares the coordinator's database.
         // Opens its own rusqlite connection against the same
         // file; SQLite handles cross-connection locking.

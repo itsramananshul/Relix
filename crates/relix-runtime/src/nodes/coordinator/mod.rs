@@ -4035,7 +4035,11 @@ pub struct TaskEdge {
 // ──────────────────────────── Capability registration ──────────────────────
 
 /// Register the task capabilities on the dispatch bridge.
-pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
+pub fn register(
+    bridge: &mut DispatchBridge,
+    store: Arc<TaskStore>,
+    auto_skill_cfg: Option<Arc<crate::nodes::ai::skills::SkillsConfig>>,
+) {
     {
         let s = store.clone();
         bridge.register(
@@ -4048,11 +4052,35 @@ pub fn register(bridge: &mut DispatchBridge, store: Arc<TaskStore>) {
     }
     {
         let s = store.clone();
+        let auto_cfg = auto_skill_cfg.clone();
         bridge.register(
             "task.update",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
-                async move { handle_update(&s, &ctx) }
+                let auto = auto_cfg.clone();
+                async move {
+                    let outcome = handle_update(&s, &ctx);
+                    // Post-update hook: when a task transitions
+                    // to `completed` and the operator has wired
+                    // `[skills] auto_generate = true`, spawn a
+                    // best-effort background job to synthesise a
+                    // SKILL.md from the chronicle. Failures (no
+                    // home dir, IO error, name collision) are
+                    // silent — auto-skill is opt-in flavour
+                    // rather than a required side-effect.
+                    if let HandlerOutcome::Ok(_) = &outcome
+                        && let Some(auto) = auto.as_ref()
+                        && let Some((task_id, status)) = parse_completed_signal(&ctx.args)
+                        && status == "completed"
+                    {
+                        let s = s.clone();
+                        let auto = auto.clone();
+                        tokio::task::spawn_blocking(move || {
+                            run_auto_skill_for_task(&s, &task_id, &auto);
+                        });
+                    }
+                    outcome
+                }
             })),
         );
     }
@@ -6825,6 +6853,184 @@ pub enum CoordinatorError {
     /// internal error.
     #[error("invalid: {0}")]
     Invalid(String),
+}
+
+/// Extract `(task_id, status)` from a `task.update` arg buffer
+/// for the auto-skill post-hook. The handler already validated
+/// the args, so missing fields are treated as "no signal" and
+/// returned as `None` — we never re-raise validation errors.
+fn parse_completed_signal(args: &[u8]) -> Option<(String, String)> {
+    let s = std::str::from_utf8(args).ok()?;
+    let mut parts = s.splitn(9, '|');
+    let task_id = parts.next()?.to_string();
+    let status = parts.next()?.to_string();
+    if task_id.is_empty() || status.is_empty() {
+        return None;
+    }
+    Some((task_id, status))
+}
+
+/// Best-effort SKILL.md auto-generation for a completed task.
+/// Synchronous + non-failing: every step that could error
+/// (store reads, dir create, file write) is folded into a
+/// silent skip so the post-hook can never destabilise the
+/// `task.update` path.
+fn run_auto_skill_for_task(
+    store: &TaskStore,
+    task_id: &str,
+    cfg: &crate::nodes::ai::skills::SkillsConfig,
+) {
+    if !cfg.auto_generate {
+        return;
+    }
+    let Some(dir) = crate::nodes::ai::skills::resolve_auto_skill_dir(cfg) else {
+        tracing::debug!(task_id, "auto-skill: no HOME / USERPROFILE; skipping write");
+        return;
+    };
+    let view = match store.get(task_id) {
+        Ok(Some(v)) => v,
+        Ok(None) | Err(_) => return,
+    };
+    let attempts = store.list_attempts(task_id).unwrap_or_default();
+    let duration_secs = attempts
+        .iter()
+        .filter_map(|a| a.finished_at.map(|f| (a.started_at, f)))
+        .map(|(s, f)| (f - s).max(0))
+        .sum::<i64>();
+    let events = store
+        .query_events(task_id, 0, 200, None, EventOrder::Asc)
+        .unwrap_or_default();
+    let mut summary = String::new();
+    for e in events.iter().take(20) {
+        let line = if e.payload.is_empty() {
+            format!("- {} (event_id={})\n", e.event_type, e.event_id)
+        } else {
+            // Truncate noisy payloads so the SKILL.md stays
+            // human-readable.
+            let trimmed = if e.payload.len() > 200 {
+                format!("{}…", &e.payload[..200])
+            } else {
+                e.payload.clone()
+            };
+            format!("- {}: {}\n", e.event_type, trimmed)
+        };
+        summary.push_str(&line);
+    }
+    let title = if view.title.trim().is_empty() {
+        format!("auto-{task_id}")
+    } else {
+        view.title.clone()
+    };
+    let body = crate::nodes::ai::skills::render_auto_skill_body(
+        &title,
+        &view.flow_template,
+        duration_secs,
+        summary.trim_end(),
+    );
+    let slug = crate::nodes::ai::skills::slugify_for_filename(&title);
+    match crate::nodes::ai::skills::write_auto_skill(&dir, &slug, &body) {
+        Ok(Some(path)) => {
+            tracing::info!(
+                task_id,
+                path = %path.display(),
+                "auto-skill: wrote SKILL.md from completed task"
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                task_id,
+                slug,
+                "auto-skill: skill file already exists, not overwriting"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "auto-skill: write failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod auto_skill_tests {
+    use super::*;
+
+    #[test]
+    fn parse_completed_signal_extracts_task_id_and_status() {
+        let buf = b"task-abc|completed|some result|||||||";
+        let got = parse_completed_signal(buf).expect("parse should yield a tuple");
+        assert_eq!(got.0, "task-abc");
+        assert_eq!(got.1, "completed");
+    }
+
+    #[test]
+    fn parse_completed_signal_rejects_empty_task_id() {
+        let buf = b"|completed||||||||";
+        assert!(parse_completed_signal(buf).is_none());
+    }
+
+    #[test]
+    fn run_auto_skill_writes_skill_when_enabled() {
+        let store = TaskStore::in_memory().unwrap();
+        let id = store
+            .create(
+                "deploy staging",
+                "flows/deploy.sol",
+                "{}",
+                "subject-1",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .update(&id, Some("completed"), None, None, None, None, None, None)
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::nodes::ai::skills::SkillsConfig {
+            auto_generate: true,
+            max_age_days: 30,
+            auto_dir: Some(tmp.path().to_path_buf()),
+        };
+        run_auto_skill_for_task(&store, &id, &cfg);
+        // Walk the dir for the synthesised SKILL.md.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one SKILL.md should be written");
+        let body = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(body.contains("# deploy staging"));
+        assert!(body.contains("flows/deploy.sol"));
+    }
+
+    #[test]
+    fn run_auto_skill_noop_when_disabled() {
+        let store = TaskStore::in_memory().unwrap();
+        let id = store
+            .create(
+                "anything",
+                "tpl",
+                "{}",
+                "s",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::nodes::ai::skills::SkillsConfig {
+            auto_generate: false,
+            max_age_days: 30,
+            auto_dir: Some(tmp.path().to_path_buf()),
+        };
+        run_auto_skill_for_task(&store, &id, &cfg);
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(entries.is_empty(), "disabled cfg must not write anything");
+    }
 }
 
 #[cfg(test)]

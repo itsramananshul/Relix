@@ -93,7 +93,12 @@ pub fn discover_skills(extra_roots: &[PathBuf]) -> Vec<Skill> {
     }
     let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     if let Some(home) = std::env::var_os(home_var) {
-        roots.push(PathBuf::from(home).join(".relix").join("skills"));
+        let skills_root = PathBuf::from(home).join(".relix").join("skills");
+        // Auto-generated skills live under the dedicated `auto`
+        // subdirectory so an operator can `relix skills prune`
+        // them without touching their hand-authored library.
+        roots.push(skills_root.join("auto"));
+        roots.push(skills_root);
     }
     for r in extra_roots {
         roots.push(r.clone());
@@ -288,6 +293,194 @@ impl SkillsCache {
 
 use std::sync::Arc;
 
+// ── Auto-skill generation ───────────────────────────────────
+
+/// Operator-facing config for the auto-skill generator. Lives
+/// under `[skills]` in the controller TOML so operators can
+/// toggle the behaviour without touching capability config.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SkillsConfig {
+    /// Master switch. `false` (default) means task completion
+    /// never writes a SKILL.md.
+    #[serde(default)]
+    pub auto_generate: bool,
+    /// Age threshold for `relix skills prune` AND for the
+    /// generator's "is this skill already covered" check.
+    /// Default 30 days.
+    #[serde(default = "default_max_age_days")]
+    pub max_age_days: i64,
+    /// Override for the auto-skill directory. Default is
+    /// `~/.relix/skills/auto`. Operators usually leave this
+    /// alone; the override is for sandboxed tests.
+    #[serde(default)]
+    pub auto_dir: Option<PathBuf>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            auto_generate: false,
+            max_age_days: default_max_age_days(),
+            auto_dir: None,
+        }
+    }
+}
+
+fn default_max_age_days() -> i64 {
+    30
+}
+
+/// Resolve the auto-skill directory. Honors
+/// [`SkillsConfig::auto_dir`] when set; otherwise falls back
+/// to `~/.relix/skills/auto`. Returns `None` only when there
+/// is no `HOME` / `USERPROFILE` (sandboxed processes); the
+/// caller skips writing silently in that case.
+pub fn resolve_auto_skill_dir(cfg: &SkillsConfig) -> Option<PathBuf> {
+    if let Some(d) = &cfg.auto_dir {
+        return Some(d.clone());
+    }
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(home_var)?;
+    Some(
+        PathBuf::from(home)
+            .join(".relix")
+            .join("skills")
+            .join("auto"),
+    )
+}
+
+/// Build the SKILL.md body for a completed task. Pure
+/// function: takes the inputs it summarises and returns the
+/// rendered markdown — no filesystem I/O, no DB calls.
+///
+/// The body is deliberately templated rather than free-form so
+/// the auto-generator stays cheap (no LLM dependency). When a
+/// future commit wires an LLM-driven "summarise this approach"
+/// path, it can replace this function while keeping the same
+/// "name + body" shape.
+pub fn render_auto_skill_body(
+    task_title: &str,
+    flow_template: &str,
+    duration_secs: i64,
+    event_summary: &str,
+) -> String {
+    let dur = if duration_secs > 0 {
+        format!("{duration_secs}s")
+    } else {
+        "—".to_string()
+    };
+    format!(
+        "# {title}\n\
+         \n\
+         _Auto-generated from a completed task. Edit freely; the\n\
+         generator will not overwrite this file._\n\
+         \n\
+         ## Procedure\n\
+         \n\
+         - Flow template: `{flow}`\n\
+         - Wall-clock duration: {dur}\n\
+         \n\
+         ## Chronicle highlights\n\
+         \n\
+         {summary}\n",
+        title = task_title.trim(),
+        flow = flow_template,
+        dur = dur,
+        summary = if event_summary.trim().is_empty() {
+            "(no chronicle events recorded)".to_string()
+        } else {
+            event_summary.to_string()
+        }
+    )
+}
+
+/// Sanitise a task title into a filesystem-safe slug for the
+/// auto-skill filename. ASCII alphanumerics + dashes only;
+/// everything else collapses to `-`. Caps the length so a
+/// pathological title can't blow past path-length limits.
+pub fn slugify_for_filename(title: &str) -> String {
+    let mut out = String::with_capacity(title.len().min(60));
+    let mut last_was_dash = false;
+    for c in title.chars() {
+        let mapped = if c.is_ascii_alphanumeric() {
+            last_was_dash = false;
+            c.to_ascii_lowercase()
+        } else {
+            if last_was_dash {
+                continue;
+            }
+            last_was_dash = true;
+            '-'
+        };
+        out.push(mapped);
+        if out.len() >= 60 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "auto-skill".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Write the body for an auto-generated skill into the
+/// configured directory. Returns the path of the file written.
+/// Caller decides what to do with collisions — this function
+/// refuses to overwrite an existing file, which matches the
+/// "auto-generator never clobbers operator edits" contract.
+pub fn write_auto_skill(
+    dir: &Path,
+    skill_name: &str,
+    body: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{skill_name}.md"));
+    if path.exists() {
+        return Ok(None);
+    }
+    std::fs::write(&path, body)?;
+    Ok(Some(path))
+}
+
+/// Walk `dir` and delete `*.md` files whose mtime is older
+/// than `max_age_days`. Returns `(scanned, deleted)` so the
+/// CLI can render an operator-facing summary. Missing
+/// directory is treated as "nothing to prune" (Ok((0, 0))).
+pub fn prune_auto_skills(dir: &Path, max_age_days: i64) -> std::io::Result<(usize, usize)> {
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(
+            (max_age_days.max(0) as u64) * 86_400,
+        ))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let mut scanned = 0usize;
+    let mut deleted = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        if p.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        scanned += 1;
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if mtime < cutoff && std::fs::remove_file(&p).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok((scanned, deleted))
+}
+
 fn extract_first_heading(body: &str) -> Option<String> {
     for line in body.lines() {
         let trimmed = line.trim_start();
@@ -442,5 +635,88 @@ mod tests {
         std::fs::write(nested.join("SKILL.md"), "# My Skill").unwrap();
         let skills = discover_skills(&[nested]);
         assert!(skills.iter().any(|s| s.name == "my-cool-skill"));
+    }
+
+    #[test]
+    fn slugify_collapses_punctuation_and_caps_length() {
+        let s = slugify_for_filename("Deploy STAGING!! v2.0  (urgent)");
+        assert!(s.contains("deploy"));
+        assert!(s.contains("staging"));
+        assert!(!s.contains(' '));
+        assert!(!s.contains('!'));
+        assert!(s.len() <= 60);
+        let s_empty = slugify_for_filename("***");
+        assert_eq!(s_empty, "auto-skill");
+    }
+
+    #[test]
+    fn render_auto_skill_body_includes_template_sections() {
+        let body =
+            render_auto_skill_body("deploy staging", "flows/deploy.sol", 42, "- ran 3 steps");
+        assert!(body.contains("# deploy staging"));
+        assert!(body.contains("Auto-generated"));
+        assert!(body.contains("flows/deploy.sol"));
+        assert!(body.contains("42s"));
+        assert!(body.contains("ran 3 steps"));
+    }
+
+    #[test]
+    fn write_auto_skill_creates_file_and_refuses_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("auto");
+        let p = write_auto_skill(&dir, "deploy-staging", "# Body").unwrap();
+        assert!(p.is_some());
+        let path = p.unwrap();
+        assert!(path.exists());
+        // Second write to the same name returns None (refusal),
+        // file content unchanged.
+        std::fs::write(&path, "OPERATOR EDIT").unwrap();
+        let p2 = write_auto_skill(&dir, "deploy-staging", "# Different body").unwrap();
+        assert!(p2.is_none(), "auto generator must not overwrite");
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(kept, "OPERATOR EDIT");
+    }
+
+    #[test]
+    fn prune_auto_skills_returns_zero_when_dir_missing() {
+        let (s, d) = prune_auto_skills(Path::new("definitely/does/not/exist"), 30).unwrap();
+        assert_eq!((s, d), (0, 0));
+    }
+
+    #[test]
+    fn prune_auto_skills_zero_max_age_deletes_every_md_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.md"), "a").unwrap();
+        std::fs::write(dir.join("b.md"), "b").unwrap();
+        // A non-.md file must NOT be touched — only the auto
+        // generator's own artefacts get pruned.
+        std::fs::write(dir.join("readme.txt"), "keep me").unwrap();
+        let (scanned, deleted) = prune_auto_skills(dir, 0).unwrap();
+        assert_eq!(scanned, 2, "non-md files must not count toward scan");
+        assert_eq!(deleted, 2);
+        assert!(!dir.join("a.md").exists());
+        assert!(!dir.join("b.md").exists());
+        assert!(dir.join("readme.txt").exists());
+    }
+
+    #[test]
+    fn prune_auto_skills_generous_threshold_keeps_fresh_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("fresh.md"), "fresh").unwrap();
+        // 365-day threshold leaves a just-written file alone.
+        let (scanned, deleted) = prune_auto_skills(dir, 365).unwrap();
+        assert_eq!(scanned, 1);
+        assert_eq!(deleted, 0);
+        assert!(dir.join("fresh.md").exists());
+    }
+
+    #[test]
+    fn skills_config_defaults_to_disabled_auto_generate() {
+        let cfg = SkillsConfig::default();
+        assert!(!cfg.auto_generate);
+        assert_eq!(cfg.max_age_days, 30);
+        assert!(cfg.auto_dir.is_none());
     }
 }
