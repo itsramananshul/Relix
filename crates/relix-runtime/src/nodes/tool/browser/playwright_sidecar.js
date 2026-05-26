@@ -121,6 +121,53 @@ async function handle(req) {
       return send(id, { pngBase64: buf.toString('base64') });
     }
 
+    // W2-002a / F12: page.click — dispatches a click on the
+    // first element matching the CSS selector. Playwright's
+    // locator API auto-waits for the element to be visible
+    // and actionable before clicking; the `timeout` param
+    // bounds how long it'll wait.
+    case 'page.click': {
+      const page = pages.get(params && params.guid);
+      if (!page) return sendError(id, 'page guid not found: ' + (params && params.guid));
+      const selector = String(params && params.selector || '');
+      if (!selector) return sendError(id, 'page.click: selector required');
+      const timeout = Number(params && params.timeout) || 30000;
+      await page.click(selector, { timeout });
+      return send(id, {});
+    }
+
+    // W2-002a / F12: page.type_text — focuses the matched
+    // element (Playwright's `fill` clears + sets the value)
+    // and writes the text. `fill` is the right primitive for
+    // form inputs; `type` exists but dispatches per-key
+    // events which is slower and surprises operators who
+    // expect setting a value.
+    case 'page.type_text': {
+      const page = pages.get(params && params.guid);
+      if (!page) return sendError(id, 'page guid not found: ' + (params && params.guid));
+      const selector = String(params && params.selector || '');
+      if (!selector) return sendError(id, 'page.type_text: selector required');
+      const text = String(params && params.text || '');
+      const timeout = Number(params && params.timeout) || 30000;
+      await page.fill(selector, text, { timeout });
+      return send(id, {});
+    }
+
+    // W2-002a / F12: page.wait_for_selector — block until
+    // the selector appears in the DOM or the timeout elapses.
+    // The `state: 'visible'` default makes "wait for the
+    // user-visible element" the same as the trait's
+    // operator-facing semantics.
+    case 'page.wait_for_selector': {
+      const page = pages.get(params && params.guid);
+      if (!page) return sendError(id, 'page guid not found: ' + (params && params.guid));
+      const selector = String(params && params.selector || '');
+      if (!selector) return sendError(id, 'page.wait_for_selector: selector required');
+      const timeout = Number(params && params.timeout) || 30000;
+      await page.waitForSelector(selector, { state: 'visible', timeout });
+      return send(id, {});
+    }
+
     case 'page.close': {
       const page = pages.get(params && params.guid);
       if (!page) return sendError(id, 'page guid not found: ' + (params && params.guid));

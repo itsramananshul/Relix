@@ -466,6 +466,75 @@ impl BrowserBackend for PlaywrightBackend {
         out.sort_by_key(|r| r.opened_at);
         Ok(out)
     }
+
+    // F12: click + type_text + wait_for_selector — the
+    // three trait methods the playwright driver was
+    // returning `BackendNotConnected` on (via the default
+    // impl). Each dispatches to the matching sidecar
+    // method (`page.click` / `page.type_text` /
+    // `page.wait_for_selector`) and surfaces sidecar
+    // errors as `BackendNotConnected` with the
+    // selector + structured cause embedded.
+    fn click(&self, session_id: &str, selector: &str) -> Result<(), BrowserError> {
+        let guid = self.guid_for(session_id)?;
+        let timeout_ms = self.call_timeout.as_millis() as u64;
+        Self::block_on(async {
+            self.call_inner(
+                "page.click",
+                json!({"guid": guid, "selector": selector, "timeout": timeout_ms}),
+                self.call_timeout,
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn type_text(&self, session_id: &str, selector: &str, text: &str) -> Result<(), BrowserError> {
+        let guid = self.guid_for(session_id)?;
+        let timeout_ms = self.call_timeout.as_millis() as u64;
+        Self::block_on(async {
+            self.call_inner(
+                "page.type_text",
+                json!({"guid": guid, "selector": selector, "text": text, "timeout": timeout_ms}),
+                self.call_timeout,
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn wait_for_selector(
+        &self,
+        session_id: &str,
+        selector: &str,
+        timeout_ms: u64,
+    ) -> Result<(), BrowserError> {
+        let guid = self.guid_for(session_id)?;
+        // Honour the caller's timeout, falling back to the
+        // driver's call_timeout when 0 is passed. We bound
+        // the call_inner timeout to the larger of the two
+        // so the JSON-RPC layer doesn't tear the wait down
+        // before the sidecar's playwright timeout fires.
+        let effective_timeout_ms = if timeout_ms == 0 {
+            self.call_timeout.as_millis() as u64
+        } else {
+            timeout_ms
+        };
+        let rpc_timeout = std::time::Duration::from_millis(effective_timeout_ms + 5_000);
+        Self::block_on(async {
+            self.call_inner(
+                "page.wait_for_selector",
+                json!({
+                    "guid": guid,
+                    "selector": selector,
+                    "timeout": effective_timeout_ms,
+                }),
+                rpc_timeout,
+            )
+            .await
+            .map(|_| ())
+        })
+    }
 }
 
 impl PlaywrightBackend {
@@ -573,6 +642,45 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// F12: click / type_text / wait_for_selector are no
+    /// longer the trait-default `BackendNotConnected` — they
+    /// route through the sidecar. We can verify that without
+    /// Node by checking that `click` against a session that
+    /// doesn't exist returns `SessionNotFound` (proving the
+    /// guid lookup happens first, i.e. the override is in
+    /// effect) rather than the trait-default not-yet-wired
+    /// error.
+    #[test]
+    fn click_without_session_returns_session_not_found_not_default_impl() {
+        let b = try_build(&cfg()).expect("try_build");
+        match b.click("absent-session-id", "#thing") {
+            Err(BrowserError::SessionNotFound { session_id }) => {
+                assert_eq!(session_id, "absent-session-id");
+            }
+            other => {
+                panic!("expected SessionNotFound (proves override is in effect), got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn type_text_without_session_returns_session_not_found_not_default_impl() {
+        let b = try_build(&cfg()).expect("try_build");
+        match b.type_text("absent", "#input", "hi") {
+            Err(BrowserError::SessionNotFound { .. }) => {}
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_for_selector_without_session_returns_session_not_found_not_default_impl() {
+        let b = try_build(&cfg()).expect("try_build");
+        match b.wait_for_selector("absent", "#thing", 1_000) {
+            Err(BrowserError::SessionNotFound { .. }) => {}
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
     /// Live integration smoke test. Skips silently (with an
     /// eprintln) when Node + playwright-core aren't on PATH so
     /// CI hosts without the runtime don't fail. When the
@@ -607,5 +715,73 @@ mod tests {
         .await
         .expect("spawn_blocking join");
         result.expect("live round trip");
+    }
+
+    /// F12 live smoke test for click + type_text +
+    /// wait_for_selector. Drives a `data:` URL with a single
+    /// input + button, fills the input, clicks the button, and
+    /// waits for the resulting element to appear. Skips when
+    /// Playwright isn't available — same posture as the navigate
+    /// smoke test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_playwright_click_type_wait_round_trip() {
+        if !playwright_runtime_available() {
+            eprintln!(
+                "skipping live_playwright_click_type_wait_round_trip: \
+                 node + playwright-core not detected on PATH"
+            );
+            return;
+        }
+        // Self-contained HTML: an input, a button that copies
+        // the input's value into a div with id="out" after
+        // a click. Wait for #out to appear, then assert the
+        // page text contains what we typed.
+        let html = r#"
+<!doctype html>
+<html><body>
+  <input id="inp" type="text" />
+  <button id="btn" onclick="(function(){
+    var d = document.createElement('div');
+    d.id = 'out';
+    d.textContent = document.getElementById('inp').value;
+    document.body.appendChild(d);
+  })()">go</button>
+</body></html>
+"#;
+        let data_url = format!("data:text/html;charset=utf-8,{}", urlencoding_encode(html));
+        let backend = try_build(&cfg()).expect("try_build");
+        let result = tokio::task::spawn_blocking(move || -> Result<String, BrowserError> {
+            let sid = backend.open_session()?;
+            backend.navigate(&sid, &data_url)?;
+            backend.wait_for_selector(&sid, "#inp", 5_000)?;
+            backend.type_text(&sid, "#inp", "hello-from-test")?;
+            backend.click(&sid, "#btn")?;
+            backend.wait_for_selector(&sid, "#out", 5_000)?;
+            let text = backend.get_text(&sid)?;
+            backend.close_session(&sid)?;
+            Ok(text)
+        })
+        .await
+        .expect("spawn_blocking join")
+        .expect("round trip");
+        assert!(
+            result.contains("hello-from-test"),
+            "expected page text to contain typed value, got {result:?}"
+        );
+    }
+
+    /// Minimal percent-encoding for the `data:` URL above. We
+    /// avoid adding a new dependency just for this one test.
+    fn urlencoding_encode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char);
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
     }
 }
