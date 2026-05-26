@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::provenance::ProvenanceRegistry;
+
 /// Errors raised by either sink.
 #[derive(Debug, thiserror::Error)]
 pub enum SinkError {
@@ -303,24 +305,37 @@ impl ContentSink {
     }
 }
 
-/// Two-sink bundle. Cheap to clone (two Arcs).
+/// Two-sink bundle plus the provenance registry. Cheap to
+/// clone (three Arcs).
 #[derive(Clone)]
 pub struct ObservabilityContext {
     pub metadata: Arc<MetadataSink>,
     pub content: Arc<ContentSink>,
+    pub provenance: Arc<ProvenanceRegistry>,
 }
 
 impl ObservabilityContext {
-    pub fn new(metadata: Arc<MetadataSink>, content: Arc<ContentSink>) -> Self {
-        Self { metadata, content }
+    pub fn new(
+        metadata: Arc<MetadataSink>,
+        content: Arc<ContentSink>,
+        provenance: Arc<ProvenanceRegistry>,
+    ) -> Self {
+        Self {
+            metadata,
+            content,
+            provenance,
+        }
     }
 
-    /// In-memory pair for tests. Content retention is 7
+    /// In-memory triple for tests. Content retention is 7
     /// days to match the default config.
     pub fn in_memory() -> Self {
         Self {
             metadata: Arc::new(MetadataSink::in_memory().expect("in-memory metadata sink opens")),
             content: Arc::new(ContentSink::in_memory(7).expect("in-memory content sink opens")),
+            provenance: Arc::new(
+                ProvenanceRegistry::in_memory().expect("in-memory provenance registry opens"),
+            ),
         }
     }
 

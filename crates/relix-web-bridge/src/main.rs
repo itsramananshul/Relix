@@ -118,6 +118,7 @@ mod os_secure;
 mod plugins;
 mod policy_denials;
 mod policy_simulate;
+mod provenance;
 mod rate_limit;
 mod schema;
 mod secrets;
@@ -518,6 +519,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/sessions/{session_id}/content/{event_id}",
             get(sessions_obs::content),
         )
+        // Provenance registry — recorded surface per trace
+        // plus a flat diff between two traces.
+        .route("/v1/provenance/diff", get(provenance::diff))
+        .route("/v1/provenance/{trace_id}", get(provenance::show))
         // Agent access policies + recent call counts.
         .route("/v1/agents/access", get(agents_access::agents))
         // Tool registry — list + keyword search.
