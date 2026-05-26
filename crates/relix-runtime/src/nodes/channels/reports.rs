@@ -170,6 +170,164 @@ pub trait ReportSource: Send + Sync {
     async fn assemble(&self, period_secs: i64) -> SummaryReport;
 }
 
+/// [`ReportSource`] backed by the real coordinator [`TaskStore`].
+/// Honest-scope wiring: the source walks the recent-task window
+/// via `list_cursor` + `list_attempts` + `get`, and synthesises a
+/// [`SummaryReport`] from what's actually on disk. Cost and
+/// memory-items-added remain `0`/empty in this revision — those
+/// require a billing table (not present today) and a libp2p hop
+/// into the memory peer (separate wiring) respectively, and the
+/// spec is clear that "0 + alert" is preferable to making numbers
+/// up.
+pub struct CoordinatorReportSource {
+    store: Arc<crate::nodes::coordinator::TaskStore>,
+}
+
+impl CoordinatorReportSource {
+    /// Construct over the coordinator's shared `TaskStore` Arc.
+    /// Cloning the Arc is cheap; the report loop holds one Arc and
+    /// hands it to `spawn_blocking` workers when assembling.
+    pub fn new(store: Arc<crate::nodes::coordinator::TaskStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait::async_trait]
+impl ReportSource for CoordinatorReportSource {
+    async fn assemble(&self, period_secs: i64) -> SummaryReport {
+        let store = self.store.clone();
+        let label = period_label(period_secs);
+        // `TaskStore` is rusqlite-based and synchronous; run the
+        // walk on the blocking pool so we don't stall the tokio
+        // executor for the (potentially) thousands of get+attempt
+        // round-trips a busy controller's 24-hour window touches.
+        match tokio::task::spawn_blocking(move || {
+            compute_coordinator_report(&store, period_secs, label.clone())
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "reports: assemble join failed");
+                empty_report(period_label(period_secs))
+            }
+        }
+    }
+}
+
+fn empty_report(period: String) -> SummaryReport {
+    SummaryReport {
+        period,
+        tasks_completed: 0,
+        tasks_failed: 0,
+        avg_task_duration_secs: 0,
+        total_cost_cents: 0,
+        most_active_agent: String::new(),
+        memory_items_added: 0,
+        alerts: Vec::new(),
+    }
+}
+
+fn period_label(period_secs: i64) -> String {
+    match period_secs {
+        DAILY_PERIOD_SECS => "Last 24 hours".to_string(),
+        s if s == 7 * DAILY_PERIOD_SECS => "Last 7 days".to_string(),
+        s => format!("Last {s}s"),
+    }
+}
+
+fn compute_coordinator_report(
+    store: &crate::nodes::coordinator::TaskStore,
+    period_secs: i64,
+    period: String,
+) -> SummaryReport {
+    use std::collections::BTreeMap;
+    let now = unix_secs();
+    let cutoff = now - period_secs;
+    let mut completed: i64 = 0;
+    let mut failed: i64 = 0;
+    let mut total_dur: i64 = 0;
+    let mut dur_count: i64 = 0;
+    let mut agents: BTreeMap<String, i64> = BTreeMap::new();
+    let mut alerts: Vec<String> = Vec::new();
+
+    let mut cursor: Option<crate::nodes::coordinator::TaskCursor> = None;
+    let page_size: usize = 100;
+    // Hard cap on the walk so a misconfigured period_secs can't
+    // make us walk the whole table for hours. Reports are coarse
+    // by design; this matches the spec's "no synthesis" stance.
+    let mut budget: usize = 5_000;
+    'walk: loop {
+        if budget == 0 {
+            alerts.push("report walk hit task budget; counts may be partial".into());
+            break;
+        }
+        let page = match store.list_cursor(cursor.clone(), page_size, None) {
+            Ok(p) => p,
+            Err(e) => {
+                alerts.push(format!("task listing failed: {e}"));
+                break;
+            }
+        };
+        if page.items.is_empty() {
+            break;
+        }
+        for item in &page.items {
+            budget = budget.saturating_sub(1);
+            // list_cursor orders by updated_at DESC, so once we see
+            // a task older than the cutoff we know nothing newer
+            // remains.
+            if item.updated_at < cutoff {
+                break 'walk;
+            }
+            match item.status.as_str() {
+                "completed" => completed += 1,
+                "failed" => failed += 1,
+                _ => {}
+            }
+            if let Ok(Some(view)) = store.get(&item.task_id) {
+                *agents.entry(view.owner_subject_id).or_insert(0) += 1;
+            }
+            if let Ok(attempts) = store.list_attempts(&item.task_id) {
+                for a in attempts {
+                    if a.status == "completed"
+                        && let Some(fin) = a.finished_at
+                        && fin > a.started_at
+                    {
+                        total_dur += fin - a.started_at;
+                        dur_count += 1;
+                    }
+                }
+            }
+        }
+        cursor = match page.next_cursor {
+            Some(c) => Some(c),
+            None => break,
+        };
+    }
+
+    let avg = if dur_count > 0 {
+        total_dur / dur_count
+    } else {
+        0
+    };
+    let most_active = agents
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(name, _)| name)
+        .unwrap_or_default();
+    SummaryReport {
+        period,
+        tasks_completed: completed,
+        tasks_failed: failed,
+        avg_task_duration_secs: avg,
+        total_cost_cents: 0,
+        most_active_agent: most_active,
+        memory_items_added: 0,
+        alerts,
+    }
+}
+
 /// Channels the reporter knows how to dispatch to. Each entry
 /// is a closure that takes the rendered text + returns Ok on
 /// success. The reporter calls every configured channel; one
@@ -410,5 +568,63 @@ mod tests {
         let s = r.render_plain();
         assert!(s.contains("Most active"));
         assert!(s.contains("—"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_source_counts_completed_and_failed_in_window() {
+        use crate::nodes::coordinator::{RetryPolicy, TaskStore};
+        let store = Arc::new(TaskStore::in_memory().unwrap());
+        // Two completed, one failed, all within the default 24h
+        // window because create() stamps `updated_at = now`.
+        for i in 0..2 {
+            let id = store
+                .create(
+                    &format!("t-ok-{i}"),
+                    "tpl",
+                    "{}",
+                    "agent-alice",
+                    RetryPolicy::None,
+                    0,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .update(&id, Some("completed"), None, None, None, None, None, None)
+                .unwrap();
+        }
+        let id = store
+            .create(
+                "t-fail",
+                "tpl",
+                "{}",
+                "agent-bob",
+                RetryPolicy::None,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .update(&id, Some("failed"), None, None, None, None, None, None)
+            .unwrap();
+        let src = CoordinatorReportSource::new(store);
+        let r = src.assemble(DAILY_PERIOD_SECS).await;
+        assert_eq!(r.tasks_completed, 2);
+        assert_eq!(r.tasks_failed, 1);
+        // Two completions for alice vs one fail for bob → alice is
+        // most active in the window.
+        assert_eq!(r.most_active_agent, "agent-alice");
+        assert_eq!(r.period, "Last 24 hours");
+    }
+
+    #[tokio::test]
+    async fn coordinator_source_period_label_falls_back_for_non_standard_window() {
+        use crate::nodes::coordinator::TaskStore;
+        let store = Arc::new(TaskStore::in_memory().unwrap());
+        let src = CoordinatorReportSource::new(store);
+        let r = src.assemble(3600).await;
+        assert!(r.period.starts_with("Last "));
+        assert!(r.period.contains("3600"));
     }
 }

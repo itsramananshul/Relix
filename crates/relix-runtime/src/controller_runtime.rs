@@ -66,6 +66,13 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub plugin_host: Option<toml::Value>,
+    /// `[reports]` — scheduled summary report config. Parsed on
+    /// the coordinator node so the report loop can run alongside
+    /// the retention loop. See
+    /// `crates/relix-runtime/src/nodes/channels/reports.rs` for
+    /// the schema; absent means no reporter spawns.
+    #[serde(default)]
+    pub reports: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -3008,6 +3015,37 @@ fn register_node_type_handlers(
                 max_age_days = coord_cfg.retention.max_task_age_days,
                 max_passes_per_run = coord_cfg.retention.max_passes_per_run,
                 "coordinator startup: chronicle retention loop spawned"
+            );
+        }
+        // Scheduled summary reports. Parsed from the top-level
+        // `[reports]` section so operators can configure cadence +
+        // delivery channels without touching the coordinator
+        // section. Source pulls real numbers from the same
+        // TaskStore; channel dispatch is wired separately by the
+        // operator's channel peers (an empty channel list means
+        // the loop assembles + logs but doesn't send — useful for
+        // dry-run validation).
+        let reports_cfg: crate::nodes::channels::reports::ReportsConfig = match &cfg.reports {
+            Some(raw) => raw
+                .clone()
+                .try_into()
+                .map_err(|e: toml::de::Error| format!("[reports] parse: {e}"))?,
+            None => crate::nodes::channels::reports::ReportsConfig::default(),
+        };
+        if reports_cfg.enabled {
+            let source: std::sync::Arc<dyn crate::nodes::channels::reports::ReportSource> =
+                std::sync::Arc::new(
+                    crate::nodes::channels::reports::CoordinatorReportSource::new(store.clone()),
+                );
+            crate::nodes::channels::reports::spawn_report_loop(
+                reports_cfg.clone(),
+                source,
+                Vec::new(),
+            );
+            tracing::info!(
+                schedule = %reports_cfg.schedule,
+                channels = ?reports_cfg.channels,
+                "coordinator startup: scheduled report loop spawned"
             );
         }
         crate::nodes::coordinator::register(bridge, store.clone());
