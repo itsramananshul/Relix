@@ -52,6 +52,7 @@
 //! Provider keys live ONLY here on the AI node — never in `relix-web-bridge`
 //! or any presentation peer.
 
+pub mod execution;
 pub mod failover;
 pub mod guardrails;
 pub mod memory_dispatcher;
@@ -716,7 +717,45 @@ async fn handle_chat(
         ..ChatInput::default()
     };
     match provider.generate_reply(input).await {
-        Ok(output) => HandlerOutcome::Ok(output.text.into_bytes()),
+        Ok(output) => {
+            // Planner + policy: parse the model reply into a
+            // structured plan and evaluate against the default
+            // policy. Plain chat replies fold to a single
+            // `ModelCall` step (Reversible), so this is a
+            // no-op for the existing chat traffic. When a
+            // model emits a `<plan>…</plan>` block with
+            // irreversible tool calls, the policy gate
+            // surfaces the approval-required message instead
+            // of running the plan blind.
+            let plan = execution::Planner::parse_response(&output.text);
+            let policy = execution::PolicyEngine::default_policy();
+            match policy.evaluate(&plan) {
+                execution::PolicyVerdict::Approved => HandlerOutcome::Ok(output.text.into_bytes()),
+                execution::PolicyVerdict::RequiresApproval { reason } => {
+                    let body = format!("[approval-required] {reason}\n{}", output.text);
+                    tracing::info!(
+                        session_id,
+                        reason = %reason,
+                        steps = plan.steps.len(),
+                        "ai.chat: plan requires approval"
+                    );
+                    HandlerOutcome::Ok(body.into_bytes())
+                }
+                execution::PolicyVerdict::Denied { reason } => {
+                    tracing::warn!(
+                        session_id,
+                        reason = %reason,
+                        "ai.chat: plan denied by policy"
+                    );
+                    HandlerOutcome::Err(ErrorEnvelope {
+                        kind: error_kinds::SECURITY_DENIED,
+                        cause: format!("ai.chat: policy denied plan ({reason})"),
+                        retry_hint: 0,
+                        retry_after: None,
+                    })
+                }
+            }
+        }
         Err(ProviderError::Transient(c)) => HandlerOutcome::Err(ErrorEnvelope {
             kind: error_kinds::RESPONDER_OVERLOADED,
             cause: format!("ai.chat: {c}"),
