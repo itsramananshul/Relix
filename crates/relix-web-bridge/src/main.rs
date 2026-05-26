@@ -116,6 +116,7 @@ mod policy_denials;
 mod policy_simulate;
 mod rate_limit;
 mod secrets;
+mod security_headers;
 mod slack;
 mod sol_validate;
 mod sse;
@@ -630,6 +631,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.
         .route("/dashboard", get(dashboard::page))
+        // Dashboard's JavaScript body, extracted out of the
+        // inline `<script>` so the strict CSP at
+        // `crate::security_headers` (script-src 'self', no
+        // 'unsafe-inline') can take effect. Both routes serve
+        // a single string each — the split is cached in a
+        // OnceLock the first time either is hit.
+        .route("/assets/dashboard.js", get(dashboard::script_asset))
         // One-time bootstrap so the dashboard can pick up its
         // bearer token without the operator pasting it manually.
         // Guarded inside the handler: refuses when the caller
@@ -660,6 +668,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 port: state.bridge_port,
             },
             auth::auth_middleware,
+        ))
+        // Universal security headers (CSP, X-Frame-Options,
+        // X-Content-Type-Options). Layered outermost so the
+        // headers ride 401/403/429 responses from the inner
+        // layers too. See `crate::security_headers`.
+        .layer(axum::middleware::from_fn(
+            security_headers::security_headers_middleware,
         ))
         .with_state(state)
         // H15: per-request latency tracing. Emits one structured

@@ -3610,12 +3610,43 @@ setInterval(refreshStatus, 10000);
 refreshStatus();
 
 /* ── Shared helpers ───────────────────────────────────────── */
+/* XSS-safe interpolation contract:
+ *   - Render server data into HTML by concatenating template
+ *     strings around escapeHtml(value). Never interpolate raw
+ *     server text into an innerHTML assignment.
+ *   - For attribute values (style="…", href="…", title="…"),
+ *     also wrap the dynamic part in escapeHtml() — the helper
+ *     covers '&', '<', '>', '"', and "'" so both quoted-attr
+ *     contexts are safe.
+ *   - For text-only inserts, prefer `.textContent = value` over
+ *     `innerHTML` so we don't need a helper at all.
+ *   - For HTML-bearing inserts where a small whitelist is OK,
+ *     use sanitizeInlineHtml() (b/i/span/code/pre only).
+ * The strict CSP (script-src 'self'; no 'unsafe-inline') is a
+ * second layer of defence: even if a value slipped through
+ * unescaped, an injected <script> tag would be refused load
+ * and `onclick="…"` handlers wouldn't fire. */
 function escapeHtml(s) {
   return String(s)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+/* Whitelist-based sanitiser for the rare case a string carries
+ * a small amount of inline formatting we want to keep. Allows
+ * b, i, span, code, pre with NO attributes; strips everything
+ * else by HTML-escaping. Use this instead of trusting
+ * server-side "this is safe" assertions. */
+function sanitizeInlineHtml(s) {
+  const allowed = /^<\/?(b|i|span|code|pre)>$/i;
+  return String(s).replace(/<[^>]*>/g, function (tag) {
+    return allowed.test(tag) ? tag : escapeHtml(tag);
+  })
+    // After stripping disallowed tags we still need to escape
+    // stray &, <, > that weren't part of any tag at all.
+    .replaceAll('&(?!amp;|lt;|gt;|quot;|#39;)', '&amp;');
 }
 function shortenId(id) {
   if (!id) return '';
