@@ -106,6 +106,14 @@ pub struct TelegramNodeConfig {
 
     /// Coordinator peer — required.
     pub coord_peer: CoordPeerConfig,
+
+    /// Audio-tool peer — optional. When present, the
+    /// controller will dial this peer and route voice messages
+    /// through `tool.audio.transcribe`. When absent, voice
+    /// messages get a static "voice transcription not
+    /// configured" reply instead of being silently dropped.
+    #[serde(default)]
+    pub audio_peer: Option<AudioPeerConfig>,
 }
 
 fn default_allowed_groups() -> Vec<String> {
@@ -179,6 +187,30 @@ fn default_coord_alias() -> String {
 
 fn default_coord_deadline() -> i64 {
     10
+}
+
+/// Tool peer that hosts `tool.audio.transcribe`. When the
+/// operator wires this section, voice messages get transcribed
+/// before going through the chat flow; when absent, voice
+/// messages get a static fallback reply.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AudioPeerConfig {
+    pub addr: String,
+    #[serde(default = "default_audio_alias")]
+    pub alias: String,
+    /// Per-call deadline. Default 90s — Whisper transcription
+    /// is CPU-bound and a longer voice clip can chew through
+    /// most of that budget.
+    #[serde(default = "default_audio_deadline")]
+    pub deadline_secs: i64,
+}
+
+fn default_audio_alias() -> String {
+    "tool".to_string()
+}
+
+fn default_audio_deadline() -> i64 {
+    90
 }
 
 #[derive(Debug, thiserror::Error)]

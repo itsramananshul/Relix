@@ -263,6 +263,15 @@ struct TgMessage {
     chat: TgChat,
     #[serde(default)]
     text: Option<String>,
+    /// Set on voice notes; carries the `file_id` we later
+    /// resolve via `getFile` to fetch the audio bytes.
+    #[serde(default)]
+    voice: Option<TgVoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgVoice {
+    file_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,12 +288,19 @@ struct TgChat {
 
 /// Convert a raw Telegram update into the channel's
 /// [`IncomingMessage`]. Returns `None` for updates we don't
-/// model yet (non-text messages, callback queries, etc.) —
-/// caller skips silently.
+/// model yet (callback queries, photos, stickers) — the caller
+/// skips silently. Text messages keep their existing shape;
+/// voice messages produce an [`IncomingMessage`] with an empty
+/// `text` body and a populated `voice_file_id` so the
+/// controller can transcribe before dispatching the chat flow.
 fn update_to_incoming(u: TgUpdate) -> Option<IncomingMessage> {
     let m = u.message?;
-    let text = m.text?;
     let from = m.from?;
+    let text = m.text.unwrap_or_default();
+    let voice_file_id = m.voice.map(|v| v.file_id);
+    if text.is_empty() && voice_file_id.is_none() {
+        return None;
+    }
     Some(IncomingMessage {
         update_id: u.update_id,
         chat_id: m.chat.id,
@@ -292,6 +308,7 @@ fn update_to_incoming(u: TgUpdate) -> Option<IncomingMessage> {
         message_id: m.message_id,
         username: from.username.unwrap_or_default(),
         text,
+        voice_file_id,
     })
 }
 
@@ -310,6 +327,9 @@ impl BotApi for LiveBotApi {
         let body = serde_json::to_value(TgGetUpdatesReq {
             offset,
             timeout: LONG_POLL_TIMEOUT_SECS,
+            // `message` covers text + voice; callback queries
+            // are still skipped server-side until the inline-
+            // button surface ships.
             allowed_updates: &["message"],
         })
         .map_err(|e| BotApiError::Transient(format!("getUpdates: build body: {e}")))?;
@@ -372,6 +392,56 @@ impl BotApi for LiveBotApi {
         let _: TgIgnoredResult = self.post("sendChatAction", &body).await?;
         Ok(())
     }
+
+    async fn get_file_bytes(&self, file_id: &str) -> Result<Vec<u8>, BotApiError> {
+        // Resolve file_id → file_path via getFile, then GET the
+        // raw bytes from <root>/file/bot<token>/<file_path>. The
+        // download host is the same root (api.telegram.org) but a
+        // different path prefix; we reconstruct it from the
+        // url_prefix we already hold.
+        let file: TgFile = self
+            .post("getFile", &serde_json::json!({ "file_id": file_id }))
+            .await?;
+        let path = file.file_path.ok_or_else(|| {
+            BotApiError::ClientError("getFile: telegram returned no file_path".into())
+        })?;
+        // url_prefix is "<base>/bot<token>" — split into base
+        // and token bits so we can rebuild "<base>/file/bot<token>/<path>".
+        let download_url = match self.url_prefix.find("/bot") {
+            Some(i) => {
+                let base = &self.url_prefix[..i];
+                let bot_seg = &self.url_prefix[i + 1..]; // "bot<token>"
+                format!("{base}/file/{bot_seg}/{path}")
+            }
+            None => {
+                return Err(BotApiError::Transient(
+                    "get_file_bytes: url_prefix shape unexpected".into(),
+                ));
+            }
+        };
+        let resp = self
+            .http
+            .get(&download_url)
+            .send()
+            .await
+            .map_err(|e| BotApiError::Transient(format!("getFile download: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(BotApiError::Transient(format!(
+                "getFile download: HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| BotApiError::Transient(format!("getFile read body: {e}")))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TgFile {
+    #[serde(default)]
+    file_path: Option<String>,
 }
 
 /// `Telegram` returns `true` as the `result` on most write
@@ -411,18 +481,37 @@ mod tests {
     }
 
     #[test]
-    fn update_to_incoming_drops_non_text_messages() {
+    fn update_to_incoming_drops_messages_with_neither_text_nor_voice() {
         let raw = serde_json::json!({
             "update_id": 1,
             "message": {
                 "message_id": 1,
                 "from": { "id": 42 },
                 "chat": { "id": 100 }
-                // no text — voice or photo arrives without one
+                // no text, no voice — photo / sticker / etc.
             }
         });
         let u: TgUpdate = serde_json::from_value(raw).unwrap();
         assert!(update_to_incoming(u).is_none());
+    }
+
+    #[test]
+    fn update_to_incoming_extracts_voice_file_id() {
+        let raw = serde_json::json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 21,
+                "from": { "id": 42, "username": "alice" },
+                "chat": { "id": 100 },
+                "voice": { "file_id": "AwACAg-fake-id", "duration": 3 }
+            }
+        });
+        let u: TgUpdate = serde_json::from_value(raw).unwrap();
+        let inc = update_to_incoming(u).expect("voice message must produce an IncomingMessage");
+        assert_eq!(inc.voice_file_id.as_deref(), Some("AwACAg-fake-id"));
+        // Voice-only messages arrive with an empty text body —
+        // the controller fills it in after transcription.
+        assert_eq!(inc.text, "");
     }
 
     #[test]

@@ -106,6 +106,23 @@ pub fn unauthorised_message() -> &'static str {
     "You are not authorized to use this bot."
 }
 
+/// Reply for a voice message when no audio peer is configured
+/// (so `tool.audio.transcribe` can't be dispatched). Same
+/// honest-scope posture as `brain_unreachable_message`: the
+/// operator gets a clear, actionable line instead of silence.
+pub fn voice_transcription_unavailable_message() -> &'static str {
+    "Voice transcription isn't configured on this bot. Send your message as text, or ask the \
+     operator to wire `[telegram.audio_peer]` and an audio tool node."
+}
+
+/// Reply for a voice message when transcription failed (engine
+/// down, file fetch failed, empty transcript). Distinct from
+/// the "unavailable" message above: this one tells the user
+/// the path exists but didn't succeed for this message.
+pub fn voice_transcription_failed_message() -> &'static str {
+    "I couldn't transcribe that voice message. Please try again or send your message as text."
+}
+
 /// Render an approval notification body for the operator
 /// chat. Matches the spec wording. `task_id` is rendered
 /// only when non-empty (the agent-employee approval flow

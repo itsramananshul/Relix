@@ -1762,6 +1762,14 @@ async fn populate_telegram_outbound_cell(
             addr: cfg.coord_peer.addr.clone(),
         },
     );
+    if let Some(audio) = &cfg.audio_peer {
+        peers_map.insert(
+            audio.alias.clone(),
+            PeerEntry {
+                addr: audio.addr.clone(),
+            },
+        );
+    }
     let peers_file = PeersFile { peers: peers_map };
 
     let opts = DiscoveryOptions {
@@ -1789,6 +1797,12 @@ async fn populate_telegram_outbound_cell(
         }
     };
 
+    let audio_alias = cfg.audio_peer.as_ref().map(|p| p.alias.clone());
+    let audio_deadline_secs = cfg
+        .audio_peer
+        .as_ref()
+        .map(|p| p.deadline_secs)
+        .unwrap_or(90);
     let client = Arc::new(crate::nodes::telegram::TelegramOutboundClient {
         mesh,
         identity: bundle,
@@ -1798,6 +1812,8 @@ async fn populate_telegram_outbound_cell(
         ai_deadline_secs: cfg.ai_peer.deadline_secs,
         coord_alias: cfg.coord_peer.alias.clone(),
         coord_deadline_secs: cfg.coord_peer.deadline_secs,
+        audio_alias,
+        audio_deadline_secs,
     });
     if cell.set(client).is_err() {
         tracing::warn!("telegram: outbound cell already populated; spurious second wiring");

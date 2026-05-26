@@ -23,6 +23,7 @@ async fn inbound_message_maps_to_subject_and_session() {
         message_id: 7,
         username: "alice".into(),
         text: "do the thing".into(),
+        voice_file_id: None,
     };
     api.push_update(inbound.clone());
 

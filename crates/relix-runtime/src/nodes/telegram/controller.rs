@@ -11,7 +11,8 @@ use relix_telegram::{BotApi, IncomingMessage, OutgoingMessage, ParseMode, derive
 use super::client::{TelegramOutbound, TelegramOutboundClientCell};
 use super::commands::{
     Command, approval_notification, brain_unreachable_message, help_message, memory_body,
-    status_body, unauthorised_message, welcome_message,
+    status_body, unauthorised_message, voice_transcription_failed_message,
+    voice_transcription_unavailable_message, welcome_message,
 };
 use super::config::TelegramNodeConfig;
 use super::ring::{MessageRing, RecordedInbound};
@@ -136,7 +137,70 @@ pub async fn handle_one_update(
         return;
     }
 
-    let cmd = Command::parse(&msg.text);
+    // Voice messages: when the operator wired an audio peer,
+    // download the file via Telegram's getFile + getFile-download
+    // pair and route the bytes through `tool.audio.transcribe`.
+    // The resulting transcript becomes the prompt and falls
+    // through into the regular chat flow. Both the
+    // "no audio peer configured" and "transcription failed"
+    // branches surface a clear user-facing reply per
+    // `commands.rs` so the user is never left in silence.
+    let resolved_text: String = if let Some(file_id) = msg.voice_file_id.as_deref() {
+        let Some(out) = out else {
+            let _ = send_text(
+                api,
+                msg.chat_id,
+                msg.message_id,
+                brain_unreachable_message(),
+            )
+            .await;
+            return;
+        };
+        // No audio peer ⇒ static fallback. Cheaper to check
+        // here than dispatch into the client and rely on the
+        // `None` return path.
+        let bytes = match api.get_file_bytes(file_id).await {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                tracing::warn!(file_id, "telegram: getFile returned empty body");
+                let _ = send_text(
+                    api,
+                    msg.chat_id,
+                    msg.message_id,
+                    voice_transcription_failed_message(),
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, file_id, "telegram: getFile failed");
+                let _ = send_text(
+                    api,
+                    msg.chat_id,
+                    msg.message_id,
+                    voice_transcription_failed_message(),
+                )
+                .await;
+                return;
+            }
+        };
+        match out.tool_audio_transcribe(bytes).await {
+            Some(t) if !t.trim().is_empty() => t,
+            Some(_) | None => {
+                let body = if cfg.audio_peer.is_none() {
+                    voice_transcription_unavailable_message()
+                } else {
+                    voice_transcription_failed_message()
+                };
+                let _ = send_text(api, msg.chat_id, msg.message_id, body).await;
+                return;
+            }
+        }
+    } else {
+        msg.text.clone()
+    };
+
+    let cmd = Command::parse(&resolved_text);
     match cmd {
         Command::Start => {
             let _ = send_text(api, msg.chat_id, msg.message_id, &welcome_message()).await;
@@ -497,6 +561,19 @@ mod tests {
             message_id: 7,
             username: "alice".into(),
             text: text.into(),
+            voice_file_id: None,
+        }
+    }
+
+    fn voice_msg(file_id: &str) -> IncomingMessage {
+        IncomingMessage {
+            update_id: 1,
+            chat_id: 100,
+            user_id: 42,
+            message_id: 7,
+            username: "alice".into(),
+            text: String::new(),
+            voice_file_id: Some(file_id.into()),
         }
     }
 
@@ -513,6 +590,8 @@ mod tests {
         task_updates: Mutex<Vec<(String, String, String)>>,
         task_events: Mutex<Vec<(String, String, String)>>,
         task_list_reply: Mutex<Vec<(String, String, String)>>,
+        audio_reply: Mutex<Option<String>>,
+        audio_calls: Mutex<Vec<Vec<u8>>>,
     }
 
     #[async_trait]
@@ -587,6 +666,10 @@ mod tests {
             } else {
                 Some("ok\n".to_string())
             }
+        }
+        async fn tool_audio_transcribe(&self, audio_bytes: Vec<u8>) -> Option<String> {
+            self.audio_calls.lock().unwrap().push(audio_bytes);
+            self.audio_reply.lock().unwrap().clone()
         }
     }
 
@@ -684,6 +767,73 @@ mod tests {
             sent[0].text,
             crate::nodes::channels::format_for_telegram_markdown_v2(brain_unreachable_message())
         );
+    }
+
+    #[tokio::test]
+    async fn voice_message_with_no_audio_peer_returns_unavailable_fallback() {
+        let api = MockBotApi::new();
+        api.stage_file_bytes("voice-1", vec![0xAA, 0xBB, 0xCC]);
+        let out = StubOutbound::default();
+        // audio_reply stays None and audio_peer is unset in
+        // cfg_default — the transcribe call returns None and
+        // we expect the "unavailable" reply (distinct from
+        // the "failed" reply).
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        let cfg = cfg_default();
+        assert!(
+            cfg.audio_peer.is_none(),
+            "fixture should not configure audio"
+        );
+        handle_one_update(&api, Some(&out), &state, &ring, &cfg, &voice_msg("voice-1")).await;
+        let sent = api.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].text,
+            crate::nodes::channels::format_for_telegram_markdown_v2(
+                voice_transcription_unavailable_message()
+            )
+        );
+        // The audio bytes still got handed to the transcriber
+        // stub (so the stub can record that the call was made),
+        // but no chat happened.
+        assert!(out.ai_chat_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn voice_message_with_successful_transcription_routes_to_ai_chat() {
+        let api = MockBotApi::new();
+        api.stage_file_bytes("voice-2", b"raw-audio-bytes".to_vec());
+        let out = StubOutbound::default();
+        *out.audio_reply.lock().unwrap() = Some("hello transcribed".into());
+        *out.ai_chat_reply.lock().unwrap() = Some("AI reply".into());
+        *out.task_create_id.lock().unwrap() = Some("task-1".into());
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        let mut cfg = cfg_default();
+        // Mark cfg.audio_peer as configured by parsing one.
+        cfg.audio_peer = Some(
+            toml::from_str(
+                r#"
+                    addr = "/ip4/127.0.0.1/tcp/19720"
+                    alias = "tool"
+                "#,
+            )
+            .unwrap(),
+        );
+        handle_one_update(&api, Some(&out), &state, &ring, &cfg, &voice_msg("voice-2")).await;
+        // Transcriber saw the audio bytes.
+        let calls = out.audio_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(&calls[0], b"raw-audio-bytes");
+        // AI saw the transcript as the prompt.
+        let chat_calls = out.ai_chat_calls.lock().unwrap();
+        assert_eq!(chat_calls.len(), 1);
+        assert_eq!(chat_calls[0].1, "hello transcribed");
+        // User got the AI reply, not a voice fallback.
+        let sent = api.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("AI reply"));
     }
 
     #[tokio::test]
@@ -875,6 +1025,9 @@ mod tests {
         }
         async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), BotApiError> {
             self.inner.send_chat_action(chat_id, action).await
+        }
+        async fn get_file_bytes(&self, file_id: &str) -> Result<Vec<u8>, BotApiError> {
+            self.inner.get_file_bytes(file_id).await
         }
     }
 

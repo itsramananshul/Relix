@@ -32,6 +32,11 @@ pub struct MockBotApi {
     /// error and clears the override. Used by tests covering
     /// the delivery retry path.
     fail_next_send: Mutex<Option<BotApiError>>,
+    /// Canned `file_id → bytes` map for `get_file_bytes`. Tests
+    /// that exercise the voice path push a payload here keyed
+    /// by file_id; everything else returns
+    /// `BotApiError::ClientError`.
+    file_bytes: Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
 impl MockBotApi {
@@ -77,6 +82,15 @@ impl MockBotApi {
     /// one call.
     pub fn fail_next_send(&self, err: BotApiError) {
         *self.fail_next_send.lock().unwrap() = Some(err);
+    }
+
+    /// Stage canned bytes the next `get_file_bytes(file_id)`
+    /// call will return.
+    pub fn stage_file_bytes(&self, file_id: impl Into<String>, bytes: Vec<u8>) {
+        self.file_bytes
+            .lock()
+            .unwrap()
+            .insert(file_id.into(), bytes);
     }
 }
 
@@ -140,6 +154,15 @@ impl BotApi for MockBotApi {
         self.sent.lock().unwrap().push(out.clone());
         Ok(())
     }
+
+    async fn get_file_bytes(&self, file_id: &str) -> Result<Vec<u8>, BotApiError> {
+        match self.file_bytes.lock().unwrap().get(file_id).cloned() {
+            Some(b) => Ok(b),
+            None => Err(BotApiError::ClientError(format!(
+                "mock: no staged bytes for file_id={file_id}"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +177,7 @@ mod tests {
             message_id: update_id, // ok for tests
             username: "alice".into(),
             text: format!("u{update_id}"),
+            voice_file_id: None,
         }
     }
 

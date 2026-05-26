@@ -5,12 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One inbound text message from a Telegram chat. We deliberately
-/// model only what the task-native channel needs today: chat +
-/// user identifiers, the originating message id (for threading
-/// replies), and the text body. Voice, image, inline button
-/// payloads, and forwarded-message origin are out of scope for
-/// the first slice.
+/// One inbound message from a Telegram chat. Carries either a
+/// text body OR a `voice` pointer (in which case `text` is empty
+/// and the controller transcribes the voice file before running
+/// the chat flow). Image / video / inline buttons remain out of
+/// scope.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct IncomingMessage {
     /// Telegram's `update_id` — the long-poll pagination cursor.
@@ -23,6 +22,14 @@ pub struct IncomingMessage {
     #[serde(default)]
     pub username: String,
     pub text: String,
+    /// Telegram `voice.file_id` when the inbound message is a
+    /// voice note. `None` for text-only messages. When set, the
+    /// controller will (if configured) download the audio via
+    /// `BotApi::get_file_bytes` and pass the bytes to
+    /// `tool.audio.transcribe`; the resulting text is what
+    /// drives the chat flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_file_id: Option<String>,
 }
 
 /// Telegram's `parse_mode` values. `MarkdownV2` is the only
@@ -89,6 +96,7 @@ mod tests {
             message_id: 5,
             username: "alice".into(),
             text: "hello".into(),
+            voice_file_id: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: IncomingMessage = serde_json::from_str(&json).unwrap();
@@ -111,6 +119,7 @@ mod tests {
             message_id: 0,
             username: String::new(),
             text: "a|b\tc\nd\re".into(),
+            voice_file_id: None,
         };
         let clean = m.sanitise_for_flow();
         assert!(!clean.contains('|'));

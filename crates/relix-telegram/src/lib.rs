@@ -102,6 +102,16 @@ pub trait BotApi: Send + Sync + 'static {
     /// indicator auto-expires after 5s on Telegram clients;
     /// callers re-send if the work takes longer.
     async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), BotApiError>;
+
+    /// Download a file by its Telegram `file_id`. Returns the
+    /// raw bytes. Voice transcription uses this to pull the
+    /// `.oga` audio attached to a voice message before
+    /// dispatching `tool.audio.transcribe`.
+    ///
+    /// Implementations call Telegram's `getFile` to resolve
+    /// `file_id → file_path`, then `GET <root>/file/bot<token>/<path>`
+    /// to fetch the bytes.
+    async fn get_file_bytes(&self, file_id: &str) -> Result<Vec<u8>, BotApiError>;
 }
 
 #[derive(Debug, thiserror::Error)]

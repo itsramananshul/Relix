@@ -140,6 +140,9 @@ impl BotApi for StubApi {
         });
         Ok(())
     }
+    async fn get_file_bytes(&self, _file_id: &str) -> Result<Vec<u8>, BotApiError> {
+        Err(BotApiError::ClientError("stub: no file storage".into()))
+    }
 }
 
 // ── Stub TelegramOutbound that logs to OpLog ───────────────
@@ -244,6 +247,9 @@ impl TelegramOutbound for StubOutbound {
             Some("ok\n".to_string())
         }
     }
+    async fn tool_audio_transcribe(&self, _audio_bytes: Vec<u8>) -> Option<String> {
+        None
+    }
 }
 
 // ── Test helpers ──────────────────────────────────────────
@@ -277,6 +283,7 @@ fn msg_from(chat_id: i64, user_id: i64, text: &str) -> IncomingMessage {
         message_id: 7,
         username: "alice".into(),
         text: text.into(),
+        voice_file_id: None,
     }
 }
 

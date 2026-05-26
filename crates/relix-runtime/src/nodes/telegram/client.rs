@@ -56,6 +56,12 @@ pub trait TelegramOutbound: Send + Sync + 'static {
         status_filter: Option<&str>,
         limit: usize,
     ) -> Vec<(String, String, String)>;
+    /// Call `tool.audio.transcribe` with the raw audio bytes.
+    /// Returns the transcribed text on success, `None` on
+    /// transport / decode failure OR when no audio peer is
+    /// configured. Callers map `None` to the operator-facing
+    /// fallback message.
+    async fn tool_audio_transcribe(&self, audio_bytes: Vec<u8>) -> Option<String>;
 }
 
 /// Lazily-populated outbound client. The controller's long-
@@ -77,6 +83,12 @@ pub struct TelegramOutboundClient {
     pub ai_deadline_secs: i64,
     pub coord_alias: String,
     pub coord_deadline_secs: i64,
+    /// Audio (tool.audio.transcribe) peer alias. `None` means
+    /// the operator did not configure a `[telegram.audio_peer]`
+    /// — voice messages then surface a fallback reply instead
+    /// of being transcribed.
+    pub audio_alias: Option<String>,
+    pub audio_deadline_secs: i64,
 }
 
 /// Errors surfaced to the controller loop. Kept narrow on
@@ -383,6 +395,38 @@ impl TelegramOutboundClient {
         }
     }
 
+    /// `tool.audio.transcribe` — sends the raw audio bytes
+    /// (no encoding; the tool node treats the args as binary)
+    /// and returns the transcript string. Wire shape: the
+    /// audio handler's documented `text=<utf8>` reply is
+    /// parsed here so the caller just gets the transcribed
+    /// text.
+    pub async fn tool_audio_transcribe(&self, audio_bytes: Vec<u8>) -> Option<String> {
+        let alias = self.audio_alias.as_deref()?;
+        match self
+            .call_text(
+                alias,
+                "tool.audio.transcribe",
+                self.audio_deadline_secs,
+                audio_bytes,
+            )
+            .await
+        {
+            Ok(body) => {
+                let trimmed = body.trim();
+                let text = trimmed
+                    .strip_prefix("text=")
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| trimmed.to_string());
+                if text.is_empty() { None } else { Some(text) }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram: tool.audio.transcribe failed");
+                None
+            }
+        }
+    }
+
     /// `task.list` paged scan, filtered by status. Returns
     /// `(task_id, status, title)` rows.
     pub async fn task_list(
@@ -475,6 +519,9 @@ impl TelegramOutbound for TelegramOutboundClient {
         note: &str,
     ) -> Option<String> {
         TelegramOutboundClient::approval_decide(self, approval_id, decision, decided_by, note).await
+    }
+    async fn tool_audio_transcribe(&self, audio_bytes: Vec<u8>) -> Option<String> {
+        TelegramOutboundClient::tool_audio_transcribe(self, audio_bytes).await
     }
 }
 
