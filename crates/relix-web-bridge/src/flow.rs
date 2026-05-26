@@ -89,6 +89,17 @@ pub async fn execute_chat_flow(
         rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
             .await;
     }
+    // W5: record the user turn in the chronicle so
+    // task.session_export can reconstruct the transcript.
+    record_chat_turn(
+        state.task_recorder.as_ref(),
+        task_id.as_ref(),
+        "chat.user_turn",
+        session_id,
+        "user",
+        message,
+    )
+    .await;
 
     let rendered = state
         .template
@@ -120,6 +131,7 @@ pub async fn execute_chat_flow(
         FlowRunner::new(opts).run().await,
         state.task_recorder.as_ref(),
         task_id,
+        Some(session_id.to_string()),
     )
     .await
 }
@@ -133,6 +145,7 @@ async fn finalize_flow_run(
     res: Result<relix_runtime::flow_runner::FlowRunResult, FlowRunnerError>,
     recorder: Option<&TaskRecorder>,
     task_id: Option<String>,
+    session_id_for_turn: Option<String>,
 ) -> Result<FlowOutcome, FlowExecError> {
     match res {
         Ok(result) => {
@@ -168,6 +181,21 @@ async fn finalize_flow_run(
                 let excerpt = truncate(&reply, 200);
                 rec.event(tid, "task.completed", &excerpt).await;
                 rec.complete(tid, &excerpt, &flow_id, &flow_log_path).await;
+            }
+            // W5: record the assistant turn in the chronicle so
+            // task.session_export reads the full transcript. The
+            // full reply lands here, not the 200-char excerpt the
+            // task ledger gets.
+            if let Some(sid) = session_id_for_turn.as_deref() {
+                record_chat_turn(
+                    recorder,
+                    task_id.as_ref(),
+                    "chat.assistant_turn",
+                    sid,
+                    "assistant",
+                    &reply,
+                )
+                .await;
             }
             Ok(FlowOutcome {
                 reply,
@@ -271,6 +299,16 @@ pub async fn execute_chat_with_tool_flow(
         rec.event(tid, "capability.invoked", "method=ai.chat peer=ai")
             .await;
     }
+    // W5: record the user turn for the tool-augmented flow too.
+    record_chat_turn(
+        state.task_recorder.as_ref(),
+        task_id.as_ref(),
+        "chat.user_turn",
+        session_id,
+        "user",
+        message,
+    )
+    .await;
 
     let rendered = tool_template
         .replace("{{SESSION}}", session_id)
@@ -302,6 +340,7 @@ pub async fn execute_chat_with_tool_flow(
         FlowRunner::new(opts).run().await,
         state.task_recorder.as_ref(),
         task_id,
+        Some(session_id.to_string()),
     )
     .await
 }
@@ -324,6 +363,40 @@ async fn create_task_fail_soft(
     let tid = rec.create(&title, flow_template, params_json).await?;
     rec.event(&tid, "task.created", flow_template).await;
     Some(tid)
+}
+
+/// Build the wire payload for a `chat.user_turn` /
+/// `chat.assistant_turn` chronicle event. The coordinator's
+/// `task.session_export` capability parses this with
+/// `splitn(4, '|')` so the `content` slot can carry its own
+/// pipes verbatim.
+pub fn chat_turn_payload(session_id: &str, role: &str, ts: i64, content: &str) -> String {
+    format!("{session_id}|{role}|{ts}|{content}")
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Best-effort chronicle write for one chat turn. Silent
+/// no-op when no coordinator is wired or `task_id` is None;
+/// `TaskRecorder::event` already log-warns on transport
+/// failures.
+async fn record_chat_turn(
+    recorder: Option<&TaskRecorder>,
+    task_id: Option<&String>,
+    event_type: &str,
+    session_id: &str,
+    role: &str,
+    content: &str,
+) {
+    if let (Some(rec), Some(tid)) = (recorder, task_id) {
+        let payload = chat_turn_payload(session_id, role, unix_now_secs(), content);
+        rec.event(tid, event_type, &payload).await;
+    }
 }
 
 /// Compact JSON for `task.create`'s `params_json`. Inline so we don't
@@ -392,5 +465,26 @@ mod tests {
     fn chat_params_json_shape() {
         let s = chat_params_json("demo", "hello world");
         assert_eq!(s, r#"{"session_id":"demo","message":"hello world"}"#);
+    }
+
+    #[test]
+    fn chat_turn_payload_round_trips_through_coordinator_parser() {
+        // The W5 contract: the bridge's payload writer + the
+        // coordinator's `parse_chat_turn_payload` are mirror
+        // images. Pin them together so a future drift in
+        // either side fails this test.
+        let payload = chat_turn_payload("sess-A", "user", 1_700_000_001, "hello | world");
+        assert_eq!(payload, "sess-A|user|1700000001|hello | world");
+        let turn = relix_runtime::nodes::coordinator::parse_chat_turn_payload(
+            "sess-A",
+            "chat.user_turn",
+            &payload,
+            0,
+        )
+        .expect("payload parses");
+        assert_eq!(turn.role, "user");
+        assert_eq!(turn.content, "hello | world");
+        assert_eq!(turn.timestamp_unix, 1_700_000_001);
+        assert_eq!(turn.session_id, "sess-A");
     }
 }
