@@ -48,6 +48,7 @@
 
 pub mod audio;
 pub mod browser;
+pub mod dispatcher;
 pub mod fs;
 pub mod mcp;
 pub mod mcp_stdio;
