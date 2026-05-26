@@ -16,6 +16,7 @@ members = [
     "crates/relix-discord",
     "crates/relix-slack",
     "crates/relix-plugin-sdk",
+    "crates/relix-sdk",
 ]
 # Stop Cargo from auto-discovering examples/ as workspace members
 # now that web-lookup is out of the list. Otherwise the resolver

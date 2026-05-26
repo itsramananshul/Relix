@@ -1,0 +1,26 @@
+[package]
+name        = "relix-sdk"
+description = "Minimal Rust SDK for talking to a running Relix bridge over HTTP. Does NOT link relix-runtime — app developers pull only reqwest + serde."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+publish.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+reqwest.workspace    = true
+futures.workspace    = true
+async-stream.workspace = true
+bytes.workspace      = true
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
