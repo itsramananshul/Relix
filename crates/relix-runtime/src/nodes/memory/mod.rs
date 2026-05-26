@@ -76,6 +76,7 @@
 pub mod curator;
 pub mod embedder;
 pub mod embeddings;
+pub mod promoter;
 pub mod qdrant;
 pub mod schema;
 

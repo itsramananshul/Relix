@@ -334,6 +334,52 @@ impl LayeredMemoryStore {
         Ok(())
     }
 
+    /// Append a tag to a record's `tags` JSON array. Used by
+    /// the layer promoter to stamp "promoted:<layer>" markers
+    /// so the same record isn't re-promoted on the next tick.
+    /// No-op when the tag is already present.
+    pub fn add_tag(&self, id: &str, tag: &str) -> Result<(), LayeredMemoryError> {
+        let current = match self.get(id)? {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        if current.tags.iter().any(|t| t == tag) {
+            return Ok(());
+        }
+        let mut tags = current.tags;
+        tags.push(tag.to_string());
+        let tags_json = serde_json::to_string(&tags)
+            .map_err(|e| LayeredMemoryError::Serialization(e.to_string()))?;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        conn.execute(
+            "UPDATE memory_records SET tags = ?1 WHERE id = ?2",
+            params![tags_json, id],
+        )?;
+        Ok(())
+    }
+
+    /// Return the most recent record for `(layer, source)`
+    /// regardless of validity. Used by the promoter to throttle
+    /// Model regeneration to "at most once per hour per source"
+    /// — the caller compares `observed_at` to a cutoff.
+    pub fn latest_by_layer_and_source(
+        &self,
+        layer: MemoryLayer,
+        source: &str,
+    ) -> Result<Option<MemoryRecord>, LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+                 FROM memory_records WHERE layer = ?1 AND source = ?2 \
+                 ORDER BY observed_at DESC, id ASC LIMIT 1",
+                params![layer.as_str(), source],
+                row_to_record,
+            )
+            .optional()?;
+        row.transpose()
+    }
+
     /// Count records with `embedding IS NULL`, grouped by
     /// layer. Used by the embedding pipeline to decide which
     /// layers have work pending.

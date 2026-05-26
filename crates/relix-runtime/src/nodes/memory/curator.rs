@@ -75,6 +75,30 @@ pub struct CuratorConfig {
     /// otherwise runs normally.
     #[serde(default, rename = "coord_peer")]
     pub coord_peer: Option<CoordPeerConfig>,
+    /// Master switch for the four-layer promotion loop
+    /// (`promoter.rs`). Distinct from `enabled`, which controls
+    /// the per-subject agent/user memory consolidation
+    /// scheduler. Default `false` so existing deployments keep
+    /// their current behaviour exactly.
+    #[serde(default)]
+    pub promotion_enabled: bool,
+    /// Seconds between promotion ticks. Default 300 (5 min).
+    /// Each tick runs Raw → Semantic, then Semantic →
+    /// Observation, then Observation → Model in sequence.
+    #[serde(default = "default_promotion_interval_secs")]
+    pub promotion_interval_secs: u64,
+    /// Maximum records each promotion stage processes per
+    /// tick. Default 20.
+    #[serde(default = "default_promotion_batch_size")]
+    pub promotion_batch_size: usize,
+}
+
+fn default_promotion_interval_secs() -> u64 {
+    300
+}
+
+fn default_promotion_batch_size() -> usize {
+    20
 }
 
 impl Default for CuratorConfig {
@@ -85,6 +109,9 @@ impl Default for CuratorConfig {
             min_chars_to_curate: default_min_chars(),
             ai_peer: None,
             coord_peer: None,
+            promotion_enabled: false,
+            promotion_interval_secs: default_promotion_interval_secs(),
+            promotion_batch_size: default_promotion_batch_size(),
         }
     }
 }
@@ -1165,6 +1192,9 @@ mod tests {
             min_chars_to_curate: 100,
             ai_peer: None,
             coord_peer: None,
+            promotion_enabled: false,
+            promotion_interval_secs: 300,
+            promotion_batch_size: 20,
         };
         let body = render_status_body(&state, &cfg);
         for needle in [
