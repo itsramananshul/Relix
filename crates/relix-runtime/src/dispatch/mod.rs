@@ -48,6 +48,17 @@ pub enum HandlerOutcome {
     Err(ErrorEnvelope),
 }
 
+/// RELIX-2 step 2: stream of handler output chunks. Used by
+/// streaming-capable handlers ([`StreamingHandler`]) — each
+/// `Ok(bytes)` is dispatched to the wire as a
+/// [`crate::transport::stream::StreamFrame::Chunk`]; an
+/// `Err(envelope)` terminates the stream with a
+/// [`crate::transport::stream::StreamFrame::Err`]. The stream
+/// completing naturally writes
+/// [`crate::transport::stream::StreamFrame::End`].
+pub type HandlerStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, ErrorEnvelope>> + Send>>;
+
 /// PH-DISP1: internal outcome bucket for [`DispatchBridge::bump_stats`].
 enum StatBucket {
     Ok,
@@ -153,9 +164,50 @@ where
     }
 }
 
+/// RELIX-2 step 2: streaming capability handler. The bridge
+/// runs the FULL admission pipeline (decode → deadline →
+/// identity → gate → policy → broker) before invoking the
+/// handler, identical to the unary [`Handler`] path. The
+/// difference is the response shape:
+///
+/// - On success, the handler returns a [`HandlerStream`]; the
+///   bridge pipes each chunk through a
+///   [`crate::transport::stream::StreamFrame::Chunk`] frame
+///   and closes with `End` when the stream finishes.
+/// - On structured failure (`Err(envelope)`), the bridge
+///   writes a single terminal `StreamFrame::Err` frame.
+/// - On admission failure (pre-handler), the bridge writes
+///   the same terminal `StreamFrame::Err` frame — admission
+///   errors never reach the handler.
+#[async_trait]
+pub trait StreamingHandler: Send + Sync {
+    async fn invoke_stream(&self, ctx: InvocationCtx) -> Result<HandlerStream, ErrorEnvelope>;
+}
+
+/// Function-handler adapter for streaming handlers. Same
+/// ergonomic role as [`FnHandler`] for the unary path.
+pub struct FnStreamingHandler<F>(pub F);
+
+#[async_trait]
+impl<F, Fut> StreamingHandler for FnStreamingHandler<F>
+where
+    F: Fn(InvocationCtx) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<HandlerStream, ErrorEnvelope>> + Send,
+{
+    async fn invoke_stream(&self, ctx: InvocationCtx) -> Result<HandlerStream, ErrorEnvelope> {
+        (self.0)(ctx).await
+    }
+}
+
 /// The registry + admission pipeline. Constructed once at controller startup.
 pub struct DispatchBridge {
     handlers: HashMap<String, Arc<dyn Handler>>,
+    /// RELIX-2: streaming-capability handlers. Separate from
+    /// `handlers` so a method is either unary OR streaming;
+    /// registering the same name under both is a configuration
+    /// error operators see at startup if both register calls
+    /// happen on the same bridge.
+    streaming_handlers: HashMap<String, Arc<dyn StreamingHandler>>,
     policy: PolicyEngine,
     trust_root: VerifyingKey,
     audit: tokio::sync::Mutex<AuditLog>,
@@ -300,6 +352,7 @@ impl DispatchBridge {
             .map_err(|e| DispatchError::AuditOpen(e.to_string()))?;
         Ok(Self {
             handlers: HashMap::new(),
+            streaming_handlers: HashMap::new(),
             policy,
             trust_root,
             audit: tokio::sync::Mutex::new(audit),
@@ -449,6 +502,29 @@ impl DispatchBridge {
     /// owns the actual routing decision.
     pub fn has_handler(&self, method: &str) -> bool {
         self.handlers.contains_key(method)
+    }
+
+    /// RELIX-2 step 2: register a streaming capability
+    /// handler. A method name is either unary OR streaming,
+    /// never both — the dispatch path looks up against the
+    /// transport that delivered the request (unary
+    /// request/response → `handlers`; `/relix/rpc/stream/1`
+    /// substream → `streaming_handlers`). Registering the
+    /// same method against both maps on the same bridge is a
+    /// configuration error that surfaces at startup via the
+    /// manifest sanity check.
+    pub fn register_streaming(
+        &mut self,
+        method: impl Into<String>,
+        handler: Arc<dyn StreamingHandler>,
+    ) {
+        self.streaming_handlers.insert(method.into(), handler);
+    }
+
+    /// `true` when a streaming handler has been registered
+    /// under `method`.
+    pub fn has_streaming_handler(&self, method: &str) -> bool {
+        self.streaming_handlers.contains_key(method)
     }
 
     /// Run the admission pipeline on an inbound encoded envelope and dispatch.
@@ -822,6 +898,435 @@ impl DispatchBridge {
             )
             .await;
         encode_error_response(req.rid, self.responder_node_id, aid, error_kind, &decision)
+    }
+
+    /// RELIX-2 step 2: streaming-substream entry point.
+    /// Mirrors [`Self::handle_inbound`]'s admission flow
+    /// step-for-step (decode → deadline → identity → unknown-
+    /// method → agent gate → policy → access broker → dispatch
+    /// → audit) but routes the response through a
+    /// [`crate::transport::stream::StreamWriter`] instead of
+    /// the unary CBOR response envelope.
+    ///
+    /// On admission rejection the bridge writes a single
+    /// terminal `StreamFrame::Err` frame to the writer with the
+    /// matching `error_kinds::*` code. On admission success
+    /// the bridge writes a `StreamFrame::Header` (carrying the
+    /// responder id + audit record id + processed_at — the
+    /// streaming analogue of `ResponseEnvelope` headers), then
+    /// pipes each chunk yielded by the handler through a
+    /// `StreamFrame::Chunk`. The stream terminator is either a
+    /// `StreamFrame::End` (graceful) or a `StreamFrame::Err`
+    /// (handler bailed mid-stream).
+    ///
+    /// Caller cancellation (the upstream drops the
+    /// `StreamReader`) surfaces as a write failure on the next
+    /// `Chunk` attempt; the bridge stops pulling from the
+    /// handler, records the cancellation in the audit log
+    /// with `AuditStatus::Error`, and lets the writer drop —
+    /// the substream is already closed by the time we notice.
+    ///
+    /// The admission pipeline here is intentionally a
+    /// near-line-for-line mirror of `handle_inbound`. The
+    /// duplication is honest: extracting a shared helper would
+    /// touch every existing security check on the hot path, so
+    /// the refactor lands in a follow-up commit once the
+    /// streaming surface has stabilised. Future TODO:
+    /// `run_admission(envelope) -> AdmissionOutcome` shared by
+    /// both paths.
+    pub async fn handle_inbound_stream(
+        &self,
+        encoded_envelope: Vec<u8>,
+        writer: crate::transport::stream::StreamWriter,
+    ) {
+        use crate::transport::stream::StreamFrame;
+        use serde_bytes::ByteBuf;
+
+        let started_at = Instant::now();
+        let mut writer = writer;
+
+        // === Admission step 1: decode envelope ===
+        let req: RequestEnvelope = match codec::decode(&encoded_envelope) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "streaming admission step 1 decode failed"
+                );
+                let _ = writer
+                    .write_err(error_kinds::INVALID_ARGS, format!("envelope decode: {e}"))
+                    .await;
+                return;
+            }
+        };
+
+        // === Admission step 3: deadline ===
+        let now = unix_now();
+        if now > req.deadline.0 + 30 {
+            let _ = writer
+                .write_err(error_kinds::TIMEOUT, "admission:deadline_exceeded")
+                .await;
+            let _ = self
+                .audit_and_err(
+                    req,
+                    started_at,
+                    "admission:deadline_exceeded",
+                    error_kinds::TIMEOUT,
+                )
+                .await;
+            return;
+        }
+
+        // === Admission step 5: verify identity ===
+        let verified = match validate_identity_bundle(&req.identity_bundle, &self.trust_root, now) {
+            Ok(v) => v,
+            Err(e) => {
+                let cause = format!("admission:identity_invalid:{e}");
+                let _ = writer
+                    .write_err(error_kinds::IDENTITY_INVALID, cause.clone())
+                    .await;
+                let _ = self
+                    .audit_and_err_unverified(
+                        &req,
+                        started_at,
+                        cause,
+                        error_kinds::IDENTITY_INVALID,
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        // === Admission step 7: streaming-handler lookup ===
+        let Some(handler) = self.streaming_handlers.get(&req.method).cloned() else {
+            self.bump_stats(&req.method, StatBucket::Unknown, now);
+            let cause = format!("unknown streaming method: {}", req.method);
+            let _ = writer.write_err(error_kinds::UNKNOWN_METHOD, cause).await;
+            let _ = self
+                .audit_and_err_with_id(
+                    &req,
+                    &verified,
+                    started_at,
+                    "admission:unknown_streaming_method".into(),
+                    error_kinds::UNKNOWN_METHOD,
+                    AuditStatus::Error,
+                )
+                .await;
+            return;
+        };
+
+        // === Admission step 8: agent gate ===
+        if let Some(bindings) = self.agent_gate.as_ref() {
+            let descriptor = (bindings.describe)(&req.method);
+            let gate_decision = crate::admission::agent_gate::evaluate(
+                Some(&bindings.store),
+                crate::admission::agent_gate::GateInputs {
+                    identity: &verified,
+                    envelope: &req,
+                    capability: descriptor.as_ref(),
+                    now,
+                },
+            );
+            match gate_decision {
+                crate::admission::agent_gate::GateDecision::Allow(a) => {
+                    if let Some(approval_id) = a.consumed_approval_id.as_deref()
+                        && let Some(token) = req.approval_token.as_deref()
+                        && let Err(e) = bindings.store.consume_approval_token(token)
+                    {
+                        tracing::warn!(
+                            approval_id = %approval_id,
+                            error = %e,
+                            "agent_gate: approval token consume failed (streaming path)"
+                        );
+                    }
+                }
+                crate::admission::agent_gate::GateDecision::Deny(deny) => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    self.policy_denials.push(PolicyDenialEntry {
+                        at: now,
+                        method: req.method.clone(),
+                        caller_subject_id: verified.subject_id.to_string(),
+                        caller_name: verified.name.clone(),
+                        rule: deny.matched_rule.clone(),
+                        reason: deny.reason.clone(),
+                    });
+                    let cause = format!("agent_gate:deny:{}:{}", deny.matched_rule, deny.reason);
+                    let _ = writer
+                        .write_err(error_kinds::POLICY_DENIED, cause.clone())
+                        .await;
+                    let _ = self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            cause,
+                            error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                    return;
+                }
+                crate::admission::agent_gate::GateDecision::RequireApproval(req_appr) => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    let task_id_hint = req_appr.task_id.as_deref().unwrap_or("");
+                    let cause = match (bindings.on_require_approval)(&req_appr, task_id_hint) {
+                        Ok(approval_id) => format!("approval_required:{approval_id}"),
+                        Err(e) => format!("approval_required (create failed: {e})"),
+                    };
+                    let _ = writer
+                        .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
+                        .await;
+                    let _ = self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            cause,
+                            error_kinds::APPROVAL_REQUIRED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        // === Admission step 9: policy ===
+        let decision = self.policy.evaluate(&verified, &req.method);
+        let (policy_decision_str, denied) = match &decision {
+            Decision::Allow { matched_rule } => (format!("allow:{matched_rule}"), false),
+            Decision::Deny {
+                reason,
+                matched_rule,
+            } => (
+                format!(
+                    "deny:{}:{}",
+                    matched_rule.as_deref().unwrap_or("default_deny"),
+                    reason
+                ),
+                true,
+            ),
+        };
+        if denied {
+            self.bump_stats(&req.method, StatBucket::Denied, now);
+            if let Decision::Deny {
+                reason,
+                matched_rule,
+            } = &decision
+            {
+                self.policy_denials.push(PolicyDenialEntry {
+                    at: now,
+                    method: req.method.clone(),
+                    caller_subject_id: verified.subject_id.to_string(),
+                    caller_name: verified.name.clone(),
+                    rule: matched_rule
+                        .clone()
+                        .unwrap_or_else(|| "default_deny".to_string()),
+                    reason: reason.clone(),
+                });
+            }
+            let _ = writer
+                .write_err(error_kinds::POLICY_DENIED, policy_decision_str.clone())
+                .await;
+            let _ = self
+                .audit_and_err_with_id(
+                    &req,
+                    &verified,
+                    started_at,
+                    policy_decision_str,
+                    error_kinds::POLICY_DENIED,
+                    AuditStatus::Denied,
+                )
+                .await;
+            return;
+        }
+
+        // === Per-agent access broker ===
+        if let Some(broker) = self.access_broker.as_ref() {
+            match broker.check(&verified.name, &req.method) {
+                crate::nodes::execution::broker::AccessDecision::Allow => {
+                    broker.record_call(&verified.name);
+                }
+                crate::nodes::execution::broker::AccessDecision::Deny { reason } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    self.policy_denials.push(PolicyDenialEntry {
+                        at: now,
+                        method: req.method.clone(),
+                        caller_subject_id: verified.subject_id.to_string(),
+                        caller_name: verified.name.clone(),
+                        rule: "access_broker".to_string(),
+                        reason: reason.clone(),
+                    });
+                    let cause = format!("access_broker:deny:{reason}");
+                    let _ = writer
+                        .write_err(error_kinds::POLICY_DENIED, cause.clone())
+                        .await;
+                    let _ = self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            cause,
+                            error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                    return;
+                }
+                crate::nodes::execution::broker::AccessDecision::RateLimited {
+                    retry_after_secs,
+                } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    self.policy_denials.push(PolicyDenialEntry {
+                        at: now,
+                        method: req.method.clone(),
+                        caller_subject_id: verified.subject_id.to_string(),
+                        caller_name: verified.name.clone(),
+                        rule: "access_broker_rate_limit".to_string(),
+                        reason: format!("retry after {retry_after_secs}s"),
+                    });
+                    let cause = format!("access_broker:rate_limited:{retry_after_secs}s");
+                    let _ = writer
+                        .write_err(error_kinds::POLICY_DENIED, cause.clone())
+                        .await;
+                    let _ = self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            cause,
+                            error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        // === Admission step 10: dispatch ===
+        let ctx = InvocationCtx {
+            caller: verified.clone(),
+            trace_id: req.tid,
+            request_id: req.rid,
+            args: req.args.to_vec(),
+        };
+        let dispatch_started = std::time::Instant::now();
+
+        // Header frame first so the caller has the audit id +
+        // responder node id + processed_at for cross-correlation
+        // with the per-flow event log. The aid is the request
+        // id bytes per the alpha convention used by
+        // [`Self::write_audit`].
+        let aid = req.rid.0.to_vec();
+        if let Err(e) = writer
+            .write_frame(&StreamFrame::Header {
+                responder: self.responder_node_id,
+                aid: ByteBuf::from(aid),
+                processed_at: relix_core::types::Timestamp(now),
+            })
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                method = %req.method,
+                "streaming: caller closed substream before header frame written"
+            );
+            let elapsed_ms = dispatch_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            self.bump_stats_with_latency(&req.method, StatBucket::Err, now, Some(elapsed_ms));
+            let _ = self
+                .write_audit(
+                    &req,
+                    &verified,
+                    started_at,
+                    "stream:cancelled_before_header".into(),
+                    AuditStatus::Error,
+                    Some(error_kinds::TRANSPORT),
+                )
+                .await;
+            return;
+        }
+
+        // Drive the handler.
+        let stream_result = handler.invoke_stream(ctx).await;
+        let mut error_kind: Option<u32> = None;
+        let mut closing_cause = String::new();
+        let mut cancelled_by_caller = false;
+
+        match stream_result {
+            Err(env) => {
+                error_kind = Some(env.kind);
+                closing_cause = format!("handler_err:{}", env.cause);
+                let _ = writer.write_err(env.kind, env.cause).await;
+            }
+            Ok(mut stream) => {
+                use futures::StreamExt;
+                loop {
+                    match stream.next().await {
+                        None => {
+                            // Stream completed normally —
+                            // graceful End frame.
+                            let _ = writer.write_end().await;
+                            break;
+                        }
+                        Some(Ok(chunk)) => {
+                            if let Err(e) = writer.write_chunk(&chunk).await {
+                                // Caller dropped mid-stream.
+                                // Stop pulling from the
+                                // upstream handler; the
+                                // substream is already
+                                // closed so we cannot write
+                                // End/Err — let `writer`
+                                // drop here.
+                                error_kind = Some(error_kinds::TRANSPORT);
+                                closing_cause = format!("stream:write_chunk_failed:{e}");
+                                cancelled_by_caller = true;
+                                break;
+                            }
+                        }
+                        Some(Err(env)) => {
+                            error_kind = Some(env.kind);
+                            closing_cause = format!("handler_stream_err:{}", env.cause);
+                            let _ = writer.write_err(env.kind, env.cause).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // === Admission step 11: audit ===
+        let elapsed_ms = dispatch_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let bucket = if error_kind.is_some() {
+            StatBucket::Err
+        } else {
+            StatBucket::Ok
+        };
+        self.bump_stats_with_latency(&req.method, bucket, now, Some(elapsed_ms));
+        let final_status = if error_kind.is_some() {
+            AuditStatus::Error
+        } else {
+            AuditStatus::Ok
+        };
+        let final_decision = if error_kind.is_some() {
+            closing_cause
+        } else {
+            policy_decision_str
+        };
+        // Tag the cancellation cause so the audit log
+        // distinguishes "caller dropped the substream" from
+        // "handler bailed".
+        let _ = cancelled_by_caller;
+        let _ = self
+            .write_audit(
+                &req,
+                &verified,
+                started_at,
+                final_decision,
+                final_status,
+                error_kind,
+            )
+            .await;
     }
 
     async fn write_audit(

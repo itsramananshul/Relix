@@ -318,6 +318,54 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         rpc::new(node_signer.to_bytes(), cfg.controller.listen_port).await?;
     tokio::spawn(event_loop.run());
 
+    // RELIX-2 step 2: spawn the streaming-substream accept
+    // task. Every controller registers the `/relix/rpc/stream/1`
+    // protocol — registration is idempotent at the
+    // libp2p_stream behaviour layer and zero-cost when no
+    // streaming handlers are wired (no incoming substream
+    // ever arrives). When a peer opens a streaming substream,
+    // the task pulls the inbound request envelope (which the
+    // caller wrote at the head of the stream) and routes it
+    // through `bridge.handle_inbound_stream`, where the full
+    // admission pipeline runs. A failed `accept_streams` is
+    // logged at warn level and the task exits; subsequent
+    // controllers in the same process would surface the same
+    // failure (the protocol is registered once per
+    // libp2p_stream::Behaviour instance).
+    match client.accept_streams() {
+        Ok(mut incoming) => {
+            let bridge_for_streams = bridge.clone();
+            tokio::spawn(async move {
+                use crate::transport::stream::StreamWriter;
+                use futures::StreamExt;
+                while let Some((peer, raw_stream)) = incoming.next().await {
+                    let bridge = bridge_for_streams.clone();
+                    tokio::spawn(async move {
+                        let mut writer = StreamWriter::new(raw_stream);
+                        let envelope = match writer.read_request_envelope().await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    peer = %peer,
+                                    "streaming: caller closed substream before envelope arrived"
+                                );
+                                return;
+                            }
+                        };
+                        bridge.handle_inbound_stream(envelope, writer).await;
+                    });
+                }
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "controller: failed to register streaming protocol; streaming capabilities disabled"
+            );
+        }
+    }
+
     // Dial configured peers.
     for (alias, peer_cfg) in &cfg.peers {
         let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", peer_cfg.port).parse()?;
