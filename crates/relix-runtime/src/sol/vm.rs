@@ -14,6 +14,16 @@ pub enum HeapObject {
     String(String),
     Struct(Vec<u64>),
     Array(Vec<u64>),
+    /// F5: heterogeneous list. Element refs are heap-string
+    /// indices in the common case but the VM does not enforce
+    /// that — the type is `Vec<u64>` for consistency with
+    /// `Array`, and built-ins like `list_join` interpret the
+    /// refs as heap-strings at access time.
+    List(Vec<u64>),
+    /// F7: string-keyed map. Insertion order is preserved so
+    /// `map_keys` returns keys deterministically. Values are
+    /// raw heap refs; `map_get` interprets them as strings.
+    Map(Vec<(String, u64)>),
 }
 
 struct Frame {
@@ -649,6 +659,262 @@ impl VM {
                 if let Some(sentinel) = self.try_dispatch_error() {
                     return Some(sentinel);
                 }
+            }
+
+            // ---- F5 / F7: list & map opcodes ----
+            Inst::PushList(n) => {
+                let mut elements: Vec<u64> = vec![0; n];
+                for slot in elements.iter_mut().rev() {
+                    *slot = self.pop();
+                }
+                self.heap.push(HeapObject::List(elements));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::PushMap(n) => {
+                // Stack layout: ..., key1, val1, key2, val2, ..., keyN, valN
+                // (alternating, with valN on top.) Pop into a
+                // temporary vec then reverse so insertion order
+                // matches source order.
+                let mut pairs: Vec<(String, u64)> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let value = self.pop();
+                    let key_ref = self.pop() as usize;
+                    let key = match self.heap.get(key_ref) {
+                        Some(HeapObject::String(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    pairs.push((key, value));
+                }
+                pairs.reverse();
+                self.heap.push(HeapObject::Map(pairs));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::ListLen => {
+                let lst_ref = self.pop() as usize;
+                let len = match self.heap.get(lst_ref) {
+                    Some(HeapObject::List(items)) => items.len(),
+                    Some(HeapObject::Array(items)) => items.len(),
+                    _ => 0,
+                };
+                self.push(len as u64);
+            }
+            Inst::ListGet => {
+                let idx_raw = self.pop() as i64;
+                let lst_ref = self.pop() as usize;
+                // Resolve to a string from the heap; out of
+                // bounds / wrong-type / non-string element all
+                // return the empty string (push a fresh heap
+                // string so subsequent ops see a real ref).
+                let result_idx: u64 = match self.heap.get(lst_ref) {
+                    Some(HeapObject::List(items)) => {
+                        if idx_raw < 0 || (idx_raw as usize) >= items.len() {
+                            self.heap.push(HeapObject::String(String::new()));
+                            (self.heap.len() - 1) as u64
+                        } else {
+                            items[idx_raw as usize]
+                        }
+                    }
+                    Some(HeapObject::Array(items)) => {
+                        if idx_raw < 0 || (idx_raw as usize) >= items.len() {
+                            self.heap.push(HeapObject::String(String::new()));
+                            (self.heap.len() - 1) as u64
+                        } else {
+                            items[idx_raw as usize]
+                        }
+                    }
+                    _ => {
+                        self.heap.push(HeapObject::String(String::new()));
+                        (self.heap.len() - 1) as u64
+                    }
+                };
+                self.push(result_idx);
+            }
+            Inst::ListPush => {
+                let val = self.pop();
+                let lst_ref = self.pop() as usize;
+                let mut new_items: Vec<u64> = match self.heap.get(lst_ref) {
+                    Some(HeapObject::List(items)) => items.clone(),
+                    Some(HeapObject::Array(items)) => items.clone(),
+                    _ => Vec::new(),
+                };
+                new_items.push(val);
+                self.heap.push(HeapObject::List(new_items));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::ListContains => {
+                let val_ref = self.pop() as usize;
+                let lst_ref = self.pop() as usize;
+                let needle = match self.heap.get(val_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let items: Vec<u64> = match self.heap.get(lst_ref) {
+                    Some(HeapObject::List(items)) => items.clone(),
+                    Some(HeapObject::Array(items)) => items.clone(),
+                    _ => Vec::new(),
+                };
+                let mut found = false;
+                for item_ref in items {
+                    if let Some(HeapObject::String(s)) = self.heap.get(item_ref as usize)
+                        && *s == needle
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                self.push(if found { 1 } else { 0 });
+            }
+            Inst::ListJoin => {
+                let sep_ref = self.pop() as usize;
+                let lst_ref = self.pop() as usize;
+                let sep = match self.heap.get(sep_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let items: Vec<u64> = match self.heap.get(lst_ref) {
+                    Some(HeapObject::List(items)) => items.clone(),
+                    Some(HeapObject::Array(items)) => items.clone(),
+                    _ => Vec::new(),
+                };
+                let parts: Vec<String> = items
+                    .into_iter()
+                    .map(|r| match self.heap.get(r as usize) {
+                        Some(HeapObject::String(s)) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .collect();
+                let joined = parts.join(&sep);
+                self.heap.push(HeapObject::String(joined));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::ListSplit => {
+                let sep_ref = self.pop() as usize;
+                let str_ref = self.pop() as usize;
+                let s = match self.heap.get(str_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let sep = match self.heap.get(sep_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                // Empty source splits to a single empty
+                // element (matches Rust's str::split). The task
+                // spec says "empty string produces
+                // single-element list" which agrees.
+                let parts: Vec<&str> = if sep.is_empty() {
+                    // Avoid splitting on an empty separator
+                    // (that gives an unbounded iterator). Yield
+                    // the whole string as a single element.
+                    vec![s.as_str()]
+                } else {
+                    s.split(sep.as_str()).collect()
+                };
+                let mut refs: Vec<u64> = Vec::with_capacity(parts.len());
+                for p in parts {
+                    self.heap.push(HeapObject::String(p.to_string()));
+                    refs.push((self.heap.len() - 1) as u64);
+                }
+                self.heap.push(HeapObject::List(refs));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::MapGet => {
+                let key_ref = self.pop() as usize;
+                let map_ref = self.pop() as usize;
+                let key = match self.heap.get(key_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let val_ref: u64 = match self.heap.get(map_ref) {
+                    Some(HeapObject::Map(pairs)) => pairs
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| *v)
+                        .unwrap_or_else(|| {
+                            self.heap.push(HeapObject::String(String::new()));
+                            (self.heap.len() - 1) as u64
+                        }),
+                    _ => {
+                        self.heap.push(HeapObject::String(String::new()));
+                        (self.heap.len() - 1) as u64
+                    }
+                };
+                // If the looked-up value was found and is not a
+                // heap string, return its raw ref. Callers
+                // typically use `map_get` to read string values
+                // but the VM doesn't enforce that.
+                self.push(val_ref);
+            }
+            Inst::MapSet => {
+                let val = self.pop();
+                let key_ref = self.pop() as usize;
+                let map_ref = self.pop() as usize;
+                let key = match self.heap.get(key_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let mut pairs: Vec<(String, u64)> = match self.heap.get(map_ref) {
+                    Some(HeapObject::Map(p)) => p.clone(),
+                    _ => Vec::new(),
+                };
+                if let Some(existing) = pairs.iter_mut().find(|(k, _)| *k == key) {
+                    existing.1 = val;
+                } else {
+                    pairs.push((key, val));
+                }
+                self.heap.push(HeapObject::Map(pairs));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::MapHas => {
+                let key_ref = self.pop() as usize;
+                let map_ref = self.pop() as usize;
+                let key = match self.heap.get(key_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let has = matches!(
+                    self.heap.get(map_ref),
+                    Some(HeapObject::Map(pairs)) if pairs.iter().any(|(k, _)| *k == key)
+                );
+                self.push(if has { 1 } else { 0 });
+            }
+            Inst::MapKeys => {
+                let map_ref = self.pop() as usize;
+                let keys: Vec<String> = match self.heap.get(map_ref) {
+                    Some(HeapObject::Map(pairs)) => pairs.iter().map(|(k, _)| k.clone()).collect(),
+                    _ => Vec::new(),
+                };
+                let mut refs: Vec<u64> = Vec::with_capacity(keys.len());
+                for k in keys {
+                    self.heap.push(HeapObject::String(k));
+                    refs.push((self.heap.len() - 1) as u64);
+                }
+                self.heap.push(HeapObject::List(refs));
+                self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::MapLen => {
+                let map_ref = self.pop() as usize;
+                let len = match self.heap.get(map_ref) {
+                    Some(HeapObject::Map(pairs)) => pairs.len(),
+                    _ => 0,
+                };
+                self.push(len as u64);
+            }
+            Inst::MapDel => {
+                let key_ref = self.pop() as usize;
+                let map_ref = self.pop() as usize;
+                let key = match self.heap.get(key_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let pairs: Vec<(String, u64)> = match self.heap.get(map_ref) {
+                    Some(HeapObject::Map(p)) => {
+                        p.iter().filter(|(k, _)| *k != key).cloned().collect()
+                    }
+                    _ => Vec::new(),
+                };
+                self.heap.push(HeapObject::Map(pairs));
+                self.push((self.heap.len() - 1) as u64);
             }
         }
 

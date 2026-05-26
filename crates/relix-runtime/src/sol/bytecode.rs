@@ -129,6 +129,41 @@ pub enum Inst {
     LoadErrorCause,
     LoadErrorRetryHint,
     Rethrow,
+
+    // ---- F5 / F7: list & map opcodes ----
+    //
+    // Lists and maps are heap objects (`HeapObject::List` /
+    // `HeapObject::Map`). The opcodes below pop the relevant
+    // operands and push back either a heap ref to a freshly
+    // built object (immutable update semantics — operators
+    // bind the new ref to a variable) or a scalar result.
+    //
+    // `PushList(n)` pops `n` values from the top of the
+    // stack, reverses them so iteration order matches push
+    // order, and pushes a heap ref to the new list.
+    //
+    // `PushMap(n)` pops `2n` values (key1, val1, key2, val2,
+    // ..., keyN, valN — alternating, key first in source
+    // order, so the last-pushed value at the top of the
+    // stack is `valN`) and pushes a heap ref to the new map.
+    //
+    // All list / map builtins are pure (no in-place
+    // mutation) — the original heap object survives so
+    // callers that aliased it are unaffected.
+    PushList(usize),
+    PushMap(usize),
+    ListLen,
+    ListGet,
+    ListPush,
+    ListContains,
+    ListJoin,
+    ListSplit,
+    MapGet,
+    MapSet,
+    MapHas,
+    MapKeys,
+    MapLen,
+    MapDel,
 }
 
 pub struct Codegen {
@@ -224,6 +259,8 @@ impl Codegen {
                 | Ast::ExprVar(_)
                 | Ast::ExprStructInit { .. }
                 | Ast::ExprArrayInit { .. }
+                | Ast::ExprList { .. }
+                | Ast::ExprMap { .. }
                 | Ast::ExprEnumVar { .. }
                 | Ast::ExprReturn { .. }
                 | Ast::ExprUndefined
@@ -337,10 +374,17 @@ impl Codegen {
             } => {
                 let saved_next = self.next_slot;
 
+                // F5: pick the matching len / get opcodes
+                // based on the iterable's type. Typed arrays
+                // keep the original ArrayLen / GetElem path;
+                // lists use the F5 ListLen / ListGet pair.
                 let array_type = self.infer_type(&array);
-                let elem_type = match array_type {
-                    Type::Array { inner, .. } => *inner,
-                    _ => Type::Integer,
+                let (len_op, get_op, elem_type) = match array_type {
+                    Type::Array { ref inner, .. } => {
+                        (Inst::ArrayLen, Inst::GetElem, (**inner).clone())
+                    }
+                    Type::List => (Inst::ListLen, Inst::ListGet, Type::String),
+                    _ => (Inst::ArrayLen, Inst::GetElem, Type::Integer),
                 };
                 self.get_or_create_local(&elem_name, elem_type);
 
@@ -355,7 +399,7 @@ impl Codegen {
                 insts.push(Inst::StoreLocal(self.find_local_offset(&arr_slot)));
 
                 insts.push(Inst::LoadLocal(self.find_local_offset(&arr_slot)));
-                insts.push(Inst::ArrayLen);
+                insts.push(len_op);
                 self.get_or_create_local(&len_slot, Type::Integer);
                 insts.push(Inst::StoreLocal(self.find_local_offset(&len_slot)));
 
@@ -373,7 +417,7 @@ impl Codegen {
 
                 insts.push(Inst::LoadLocal(self.find_local_offset(&arr_slot)));
                 insts.push(Inst::LoadLocal(self.find_local_offset(&idx_slot)));
-                insts.push(Inst::GetElem);
+                insts.push(get_op);
                 insts.push(Inst::StoreLocal(self.find_local_offset(&elem_name)));
 
                 self.compile(insts, *body);
@@ -602,6 +646,45 @@ impl Codegen {
                     insts.push(Inst::LoadErrorCause);
                 } else if name == "error_retry_hint" {
                     insts.push(Inst::LoadErrorRetryHint);
+                } else if matches!(
+                    name.as_str(),
+                    "list_len"
+                        | "list_get"
+                        | "list_push"
+                        | "list_contains"
+                        | "list_join"
+                        | "list_split"
+                        | "map_get"
+                        | "map_set"
+                        | "map_has"
+                        | "map_keys"
+                        | "map_len"
+                        | "map_del"
+                ) {
+                    // F6 / F8: list & map built-ins. Each one
+                    // pushes its arguments left-to-right then
+                    // emits the matching opcode. Arity has
+                    // already been validated by the analyzer
+                    // (panic on mismatch), so we trust it here.
+                    for arg in args {
+                        self.compile(insts, arg);
+                    }
+                    let op = match name.as_str() {
+                        "list_len" => Inst::ListLen,
+                        "list_get" => Inst::ListGet,
+                        "list_push" => Inst::ListPush,
+                        "list_contains" => Inst::ListContains,
+                        "list_join" => Inst::ListJoin,
+                        "list_split" => Inst::ListSplit,
+                        "map_get" => Inst::MapGet,
+                        "map_set" => Inst::MapSet,
+                        "map_has" => Inst::MapHas,
+                        "map_keys" => Inst::MapKeys,
+                        "map_len" => Inst::MapLen,
+                        "map_del" => Inst::MapDel,
+                        _ => unreachable!(),
+                    };
+                    insts.push(op);
                 } else if let Some(&target_address) = self.functions.get(&name) {
                     let count = args.len();
                     for arg in args {
@@ -667,6 +750,22 @@ impl Codegen {
                     insts.push(Inst::SetElem);
                     insts.push(Inst::Pop);
                 }
+            }
+            // F5 / F7: list / map literals.
+            Ast::ExprList { elements } => {
+                let n = elements.len();
+                for elem in elements {
+                    self.compile(insts, elem);
+                }
+                insts.push(Inst::PushList(n));
+            }
+            Ast::ExprMap { pairs } => {
+                let n = pairs.len();
+                for (key, value) in pairs {
+                    insts.push(Inst::PushConst(Ast::ExprString(key)));
+                    self.compile(insts, value);
+                }
+                insts.push(Inst::PushMap(n));
             }
             Ast::ExprArrAcc { lhs, index } => {
                 self.compile(insts, *lhs);
@@ -775,6 +874,15 @@ impl Codegen {
                 }
                 if name == "error_retry_hint" {
                     return Type::Integer;
+                }
+                // F6 / F8: list & map built-ins.
+                match name.as_str() {
+                    "list_len" | "map_len" => return Type::Integer,
+                    "list_get" | "list_join" | "map_get" => return Type::String,
+                    "list_contains" | "map_has" => return Type::Bool,
+                    "list_push" | "list_split" | "map_keys" => return Type::List,
+                    "map_set" | "map_del" => return Type::Map,
+                    _ => {}
                 }
                 self.fn_returns.get(name).cloned().unwrap_or(Type::Integer)
             }

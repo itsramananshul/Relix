@@ -85,6 +85,12 @@ pub fn type_eq(lhs: Type, rhs: Type) -> Result<(), TypeMismatch> {
         Type::Char if matches!(rhs, Type::Char) => Ok(()),
         Type::Bool if matches!(rhs, Type::Bool) => Ok(()),
         Type::Void if matches!(rhs, Type::Void) => Ok(()),
+        // F5 / F7: list and map are scalar nominal types in
+        // the analyzer's eyes — there's no inner-type
+        // parameterisation (yet) because the VM treats
+        // elements / values as raw heap refs.
+        Type::List if matches!(rhs, Type::List) => Ok(()),
+        Type::Map if matches!(rhs, Type::Map) => Ok(()),
         _ => Err(TypeMismatch::Inequal),
     }
 }

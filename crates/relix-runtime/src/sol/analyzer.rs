@@ -251,16 +251,20 @@ impl Analyzer {
             } => {
                 let Some(arr_type) = self.check(array) else {
                     panic!(
-                        "array in which for loop is iterating over must have the known type `Array`"
+                        "for-loop iterable must have a known type (list, array, or typed array)"
                     );
                 };
-                let Type::Array { inner, .. } = arr_type else {
-                    panic!(
-                        "array in which for loop is iterating over must have the known type `Array`"
-                    );
+                // F5: for-in now also accepts `list`. Each
+                // element is exposed to the loop body as
+                // `str` (the practical case operators use).
+                // Typed `[N]T` arrays keep their element type.
+                let elem_type: Box<Type> = match arr_type {
+                    Type::Array { inner, .. } => inner,
+                    Type::List => Box::new(Type::String),
+                    other => panic!("for-loop iterable must be a list or array, got {other:?}"),
                 };
 
-                self.add_entry(elem_name.to_owned(), Symbol::Variable { kind: inner });
+                self.add_entry(elem_name.to_owned(), Symbol::Variable { kind: elem_type });
                 let old = self.can_break;
                 self.can_break = true;
                 self.check(body);
@@ -446,6 +450,124 @@ impl Analyzer {
                     }
                     return Some(Type::Integer);
                 }
+                // F6: list built-ins. Element type tracking is
+                // intentionally coarse — lists are
+                // heterogeneous and operators use them as
+                // string lists. Argument arity is validated;
+                // argument types are not type-checked beyond
+                // the obvious "you need a list here" sites.
+                if name == "list_len" {
+                    if args.len() != 1 {
+                        panic!("list_len(lst) takes 1 argument, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::Integer);
+                }
+                if name == "list_get" {
+                    if args.len() != 2 {
+                        panic!("list_get(lst, idx) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::String);
+                }
+                if name == "list_push" {
+                    if args.len() != 2 {
+                        panic!("list_push(lst, val) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::List);
+                }
+                if name == "list_contains" {
+                    if args.len() != 2 {
+                        panic!(
+                            "list_contains(lst, val) takes 2 arguments, got {}",
+                            args.len()
+                        );
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::Bool);
+                }
+                if name == "list_join" {
+                    if args.len() != 2 {
+                        panic!("list_join(lst, sep) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::String);
+                }
+                if name == "list_split" {
+                    if args.len() != 2 {
+                        panic!("list_split(s, sep) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::List);
+                }
+                // F8: map built-ins. Same shape as list_*.
+                if name == "map_get" {
+                    if args.len() != 2 {
+                        panic!("map_get(m, k) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::String);
+                }
+                if name == "map_set" {
+                    if args.len() != 3 {
+                        panic!("map_set(m, k, v) takes 3 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::Map);
+                }
+                if name == "map_has" {
+                    if args.len() != 2 {
+                        panic!("map_has(m, k) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::Bool);
+                }
+                if name == "map_keys" {
+                    if args.len() != 1 {
+                        panic!("map_keys(m) takes 1 argument, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::List);
+                }
+                if name == "map_len" {
+                    if args.len() != 1 {
+                        panic!("map_len(m) takes 1 argument, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::Integer);
+                }
+                if name == "map_del" {
+                    if args.len() != 2 {
+                        panic!("map_del(m, k) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::Map);
+                }
                 // 1. Fetch and clone the signature in a temporary scope
                 let (params, ret) = {
                     let entry = self.get_entry(&name).unwrap_or_else(|| {
@@ -567,6 +689,24 @@ impl Analyzer {
                     }
                 };
                 Some(*var_type)
+            }
+            // F5 / F7: literal forms type-check their children
+            // for side-effect (catching e.g. an undefined
+            // variable inside the literal) but produce a
+            // nominal `Type::List` / `Type::Map` regardless of
+            // the element / value shape — element types are
+            // not tracked in the analyzer.
+            Ast::ExprList { elements } => {
+                for elem in elements.iter_mut() {
+                    self.check(elem);
+                }
+                Some(Type::List)
+            }
+            Ast::ExprMap { pairs } => {
+                for (_k, v) in pairs.iter_mut() {
+                    self.check(v);
+                }
+                Some(Type::Map)
             }
             // Ast::ExprStructInit { name, fields } => {}
             x => todo!("{x:?}"),

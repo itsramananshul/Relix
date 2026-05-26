@@ -19,6 +19,16 @@ pub enum Type {
         size: Option<i128>,
         inner: Box<Type>,
     },
+    /// F5: heterogeneous list, `let xs: list = [a, b, c];`.
+    /// Element values are stored as raw heap refs at the VM
+    /// level; in practice operators use them as string lists.
+    /// Built-ins (`list_get`, `list_join`, …) treat elements
+    /// as strings.
+    List,
+    /// F7: string-keyed map, `let m: map = { "k": v, … };`.
+    /// Values are raw heap refs; built-ins treat them as
+    /// strings the same way `list_*` does.
+    Map,
     Ident(String),
     Function {
         params: Vec<Type>,
@@ -137,6 +147,23 @@ pub enum Ast {
     },
     ExprArrayInit {
         values: Vec<Ast>,
+    },
+    /// F5: SOL list literal `[a, b, c]`. Empty `[]` is valid.
+    /// Elements compile to a sequence of PushConst / variable
+    /// pushes followed by `Inst::PushList(n)`. Unlike
+    /// `ExprArrayInit` (typed, fixed-size) lists are
+    /// heterogeneous at the VM level and grow dynamically.
+    ExprList {
+        elements: Vec<Ast>,
+    },
+    /// F7: SOL map literal `{ "k1": v1, "k2": v2, ... }`.
+    /// Keys MUST be string literals; values are any
+    /// expression. Empty `{}` is valid in an expression
+    /// position. Compiles to alternating `key, value` pushes
+    /// followed by `Inst::PushMap(n)` where `n` is the pair
+    /// count.
+    ExprMap {
+        pairs: Vec<(String, Ast)>,
     },
 }
 
@@ -336,6 +363,12 @@ impl Parser {
                     "str" => Some(Type::String),
                     "char" => Some(Type::Char),
                     "bool" => Some(Type::Bool),
+                    // F5 / F7: typed `list` and `map` declarations.
+                    // Element / value types are not tracked — both
+                    // are heterogeneous at the VM level and the
+                    // built-ins treat values as strings.
+                    "list" => Some(Type::List),
+                    "map" => Some(Type::Map),
                     _ => Some(Type::Ident(ptype)),
                 };
                 self.index += 1;
@@ -1120,23 +1153,57 @@ impl Parser {
                 expr
             }
             TokenKind::LSquare => {
+                // F5: `[...]` produces a list literal. The
+                // earlier `ExprArrayInit` AST node is kept as
+                // dead code for the OpenPrem typed-array port
+                // but is never emitted by the parser anymore —
+                // no flows use it and the heterogeneous list
+                // type covers the cases that matter for
+                // operator-authored flows.
                 self.advance();
-
-                let mut exprs = Vec::new();
+                let mut elements = Vec::new();
                 while !matches!(self.current(), Token::RSquare) {
-                    exprs.push(self.expression()?);
+                    elements.push(self.expression()?);
                     if self.tokens[self.index].get_kind() == TokenKind::Comma {
                         self.index += 1;
                     } else {
                         break;
                     }
                 }
-                self.eat(
-                    TokenKind::RSquare,
-                    "expected ']' to close an array initializer",
-                );
-
-                Some(Ast::ExprArrayInit { values: exprs })
+                self.eat(TokenKind::RSquare, "expected `]` to close a list literal");
+                Some(Ast::ExprList { elements })
+            }
+            // F7: `{ "k": v, ... }` map literal. Only fires
+            // when `can_struct` is true — same gate that
+            // distinguishes `Ident { foo: 1 }` struct init from
+            // an `if cond { body }` body brace. Inside an
+            // if/while/for condition the parser disables
+            // `can_struct` (see `if_stmt` etc.), so `LCurly`
+            // there will fall through to the unrecognised-token
+            // branch — preserving the pre-existing behaviour
+            // for those positions.
+            TokenKind::LCurly if self.can_struct => {
+                self.advance();
+                let mut pairs: Vec<(String, Ast)> = Vec::new();
+                while !matches!(self.current(), Token::RCurly) {
+                    let key = match self.advance() {
+                        Token::String(s) => s,
+                        other => {
+                            self.debtok(4);
+                            panic!("map literal keys must be string literals, got {other:?}");
+                        }
+                    };
+                    self.eat(TokenKind::Colon, "expected `:` between map key and value");
+                    let value = self.expression()?;
+                    pairs.push((key, value));
+                    if self.tokens[self.index].get_kind() == TokenKind::Comma {
+                        self.index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.eat(TokenKind::RCurly, "expected `}` to close a map literal");
+                Some(Ast::ExprMap { pairs })
             }
             x => {
                 eprintln!("not an expressionable token: {x:?}");
