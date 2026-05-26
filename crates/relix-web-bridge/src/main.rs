@@ -115,6 +115,7 @@ mod plugins;
 mod policy_denials;
 mod policy_simulate;
 mod rate_limit;
+mod schema;
 mod secrets;
 mod security_headers;
 mod slack;
@@ -123,6 +124,7 @@ mod sse;
 mod task_recorder;
 mod tasks;
 mod telegram;
+mod tenant;
 mod term_audit;
 mod topology;
 mod validate;
@@ -311,6 +313,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ws/chat", get(ws::chat_ws))
         .route("/chat_with_tool", post(chat::chat_with_tool))
         .route("/v1/models", get(openai::models))
+        .route("/v1/info", get(openai::info))
+        .route("/v1/schema", get(schema::schema))
         .route("/v1/chat/completions", post(openai::chat_completions))
         // Task-native read API (Track 2). Bridge stays translation-only:
         // each route is a thin forwarder to a Coordinator capability.
@@ -669,6 +673,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             auth::auth_middleware,
         ))
+        // Per-request tenant identifier middleware. Extracts
+        // `X-Relix-Tenant` and stashes it in request Extensions
+        // for downstream handlers. Defaults to `"default"` when
+        // absent. See `crate::tenant` + the SDK's
+        // `RelixClient::with_tenant`.
+        .layer(axum::middleware::from_fn(tenant::tenant_middleware))
         // Universal security headers (CSP, X-Frame-Options,
         // X-Content-Type-Options). Layered outermost so the
         // headers ride 401/403/429 responses from the inner
