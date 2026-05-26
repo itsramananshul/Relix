@@ -140,6 +140,7 @@ on every controller regardless of `node_type`.
 | `memory.agent_write` | Real | Add / replace / remove / read persistent memory |
 | `memory.agent_curate` | Real | Curator (LLM-driven memory consolidation) |
 | `memory.curator_status` | Real | Curator scheduler status snapshot |
+| `memory.session_search` | Real | Full-text search across `chat.user_turn` / `chat.assistant_turn` chronicle events. Thin proxy onto coordinator's `task.session_search`. Requires `[memory.curator]` coord_peer to forward. See `docs/agent-memory.md` |
 
 Vector memory is documented in [`docs/vector-memory.md`](./vector-memory.md).
 SQLite store, cosine similarity in Rust, full table scan (good for
@@ -256,6 +257,7 @@ Capabilities follow the convention `task.*`. Most are CRUD-shaped.
 | `task.recover` | Real (operator-driven) |
 | `task.note` / `task.mark_investigation` | Real |
 | `task.export` / `task.compact_events` (dry-run) | Real |
+| `task.session_export` / `task.session_search` | Real |
 | `task.spawned_child` / `task.delegated_to` / `task.awaiting` | Real chronicle events |
 
 Plus a long list of chronicle event types (`task.thrash_detected`,

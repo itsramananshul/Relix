@@ -339,16 +339,107 @@ Every failure path is a `tracing::warn` + the agent's existing
 memory is left untouched. The dashboard / CLI just sees the
 unchanged contents on the next read.
 
+## Session search across chat-turn history
+
+Operators searching for "what did the agent say about X last
+week" hit the **session search** surface. Unlike persistent
+agent memory (above), session search is a query over the
+coordinator's chat-turn chronicle: every `chat.user_turn` /
+`chat.assistant_turn` event landed by the bridge's chat flow
+(W5) is searchable.
+
+### Surfaces
+
+Every surface routes to the same coordinator capability
+`task.session_search` so the results stay consistent across
+clients.
+
+**From a SOL flow** — agents call the tool-node proxy:
+
+```sol
+let hits: str = remote_call("tool", "memory.session_search", "alice|kubernetes|10")
+```
+
+Wire: `subject_id|query|limit`. Empty `subject_id` searches
+every session; non-empty restricts to sessions owned by that
+subject (joined through `tasks.owner_subject_id`). Limit
+defaults to 20, capped at 100.
+
+Reply is a JSON array; each entry is:
+
+```jsonc
+{
+  "session_id":     "oa-abcdef",
+  "role":           "assistant",
+  "content":        "Yes — the kubernetes operator we …",
+  "timestamp_unix": 1716000000,
+  "snippet":        "…the kubernetes operator we recommended last…",
+  "score":          1.0
+}
+```
+
+`score` is `1.0` for every hit today; reserved for a BM25
+score when FTS5 indexing of the chronicle lands.
+
+**From the CLI** — operators search the same chronicle:
+
+```bash
+# Find every turn that mentioned "kubernetes"
+relix-cli ops session-search --query kubernetes
+
+# Restrict to one agent's sessions
+relix-cli ops session-search --query kubernetes --subject-id <hex>
+
+# JSON for piping into jq
+relix-cli ops session-search --query kubernetes --json | jq '.results | length'
+```
+
+**From the dashboard** — `#/session-search` (under Memory in
+the sidebar) renders the same search with a form: query
+input, subject_id filter, 10/20/50/100 limit selector, and a
+results list where every `session_id` links straight to
+`GET /v1/sessions/export?session=...` so the operator can pop
+the full transcript open.
+
+**From an HTTP client** — the bridge endpoint:
+
+```
+GET /v1/memory/sessions/search?q=<query>&subject_id=<id>&limit=<n>
+→ 200 { results: [...], total: N, query: "...", subject_id: "..." }
+→ 400 when q is missing or empty
+→ 503 when no memory peer is wired
+```
+
+### What it indexes
+
+Only chronicle events of type `chat.user_turn` and
+`chat.assistant_turn`. Those land on a per-turn basis through
+the bridge's chat flow (`flow.rs::record_chat_turn`). The
+search ignores task lifecycle events, capability invocations,
+and the per-turn payload of persistent agent memory.
+
+### Operator-only "search everything"
+
+When `subject_id` is empty, the gate skips the
+`tasks.owner_subject_id` join and returns hits from every
+session the coordinator knows about. That's the operator
+debugging path — agents calling through the tool node always
+have a subject_id on their bundle, so this branch only fires
+when the bridge or CLI explicitly leaves the filter blank.
+
 ## What's deliberately NOT here
 
 - **Vector embeddings.** Memory is keyword text. Future waves.
 - **Cross-agent shared memory.** Each `subject_id` owns its row.
-- **Per-session scoping.** Memory is global per-agent across all
-  sessions.
+- **Per-session scoping** on persistent memory. Persistent
+  memory is global per-agent across all sessions; session
+  search is the per-session-scoped surface for chat-turn
+  history.
 - **Per-team / department scoping.** No grouping today.
 - **Auto-eviction.** Agents must remove old entries themselves.
-- **Search across memory.** No FTS index on the new table —
-  `memory.search` only covers chat-turn `turns`.
+- **BM25 / FTS5 ranking.** Session search uses `LIKE '%q%'`
+  today. Score is always 1.0; the FTS5 index is a follow-up
+  that doesn't change the wire shape.
 - **Operator-side editing.** Dashboard + CLI are READ-ONLY.
 
 When these become real needs (and they will) they land as
