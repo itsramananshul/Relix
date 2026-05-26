@@ -1071,13 +1071,32 @@ full language reference.
 
 ### 10.2 What SOL / Sflow cannot do
 
-- **(SOL only)** No `try / catch` error recovery — a failed
-  `remote_call` halts the VM with `VM_ERROR_SENTINEL` and
-  subsequent statements do not run. Sflow has try/catch.
+- **List & map literals shipped (both languages).** SOL has
+  `Type::List` / `Type::Map`, `[a, b, c]` and `{ "k": v }`
+  literal syntax, twelve `list_*` / `map_*` built-ins, and
+  `for x in lst { … }` iteration. Sflow has the same surface
+  with values stored as a typed `SflowValue` enum; values
+  stringify as `a|b|c` (lists) and `k1=v1;k2=v2` (maps) in
+  step-arg / interpolation contexts. See
+  `docs/sol-sflow-parity.md` for the full mapping and the
+  remaining cross-language divergences (Sflow has no
+  `for-in`; Sflow built-ins return `"true"` / `"false"`
+  instead of typed bools; nested lists / maps are not yet
+  supported in either language).
+- **`try / catch` recovery shipped (both languages).** SOL
+  added `try { … } catch <kind> { … }` with the same kind
+  taxonomy as Sflow (`timeout`, `mesh_error`,
+  `policy_denied`, `responder_error`, `any`), plus
+  `error_kind()` / `error_cause()` / `error_retry_hint()`
+  built-ins inside catch blocks and a `rethrow;` statement.
+- **String interpolation `{{var}}` shipped (SOL).** Lowers to
+  a parser-time concat chain. Sflow's `${var}` is unchanged.
+- **`delegate` / `send` sugar shipped (SOL).** Soft-keyword
+  forms that lower to `remote_call("coord",
+  "delegate.spawn", …)` and `remote_call("coord",
+  "msg.send", …)` respectively.
 - No `match`-style branching (Sflow has if/elif/else; SOL has
   Rust-like if/else).
-- No data structures beyond Sflow's flat variable map and SOL's
-  arrays of `int`/`str` (`list`/`map` literals are not parseable).
 - No async (the executors are synchronous; no yield).
 - No mid-flow pause / resume (see `docs/replay-model.md`).
 - **(SOL only)** No types beyond `str` for `remote_call` args
@@ -1086,6 +1105,10 @@ full language reference.
 - **(SOL only)** No function composition (one `start()` per file).
 - **(Sflow only)** No user-defined functions — flows are a flat
   statement list.
+- **(Sflow only)** No `for x in lst { … }` — list iteration uses
+  `loop N times` + `list_get(lst, "${loop.iter}")`.
+- No nested lists / maps in either language (a list of lists
+  is parseable but the built-ins flatten on read).
 - No regex captures (Sflow's `matches` is boolean only).
 - No multi-line string literals (newline inside `"..."` rejected).
 

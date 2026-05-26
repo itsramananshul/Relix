@@ -479,6 +479,38 @@ fn map_literal_lowers_to_push_map_opcode() {
 }
 
 #[test]
+fn list_map_demo_flow_compiles_cleanly() {
+    // The shipped demo flow lives at flows/list_map_demo.sol.
+    // If it stops compiling, the docs example is broken and
+    // every README link to it goes stale.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("flows")
+        .join("list_map_demo.sol");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let bc = crate::sol::compile_source(&source).expect("list_map_demo.sol must compile");
+    // Sanity: the demo should emit at least one PushList,
+    // one PushMap, and one for-loop body. Easier than a
+    // full disassembly match.
+    let dis = format!("{bc:?}");
+    assert!(
+        dis.contains("PushList"),
+        "demo must use a list literal: {dis}"
+    );
+    assert!(
+        dis.contains("PushMap"),
+        "demo must use a map literal: {dis}"
+    );
+    assert!(
+        dis.contains("ListLen"),
+        "demo must iterate via for-in: {dis}"
+    );
+    assert!(dis.contains("MapSet"), "demo must call map_set: {dis}");
+}
+
+#[test]
 fn map_heap_object_is_distinct_from_list_in_vm_heap() {
     // Smoke-check: a flow that produces a map should leave a
     // `HeapObject::Map` at the resulting heap slot, not a

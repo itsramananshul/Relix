@@ -4109,6 +4109,29 @@ Same thing. YAML just compiles to SOL before the runtime sees it.
 
 ---
 
+## SOL & Sflow Language Extensions `[DONE — shipped May 2026]`
+
+Closing the gaps from STATE-OF-RELIX §10.2.
+
+| Feature | Status | Commits |
+|---|---|---|
+| SOL `{{var}}` string interpolation | DONE | `0c98f14` |
+| SOL `try / catch / rethrow` error recovery | DONE | `3ff371c` |
+| SOL `delegate goal G from P to T` sugar | DONE | `3fa94de` |
+| SOL `send subject S body B from F to T` sugar | DONE | `3fa94de` |
+| Dashboard delegation chain card | DONE | `35aef4f` |
+| SOL list literal `[a, b, c]` + 6 `list_*` built-ins | DONE | `7986eba` |
+| SOL map literal `{ "k": v }` + 6 `map_*` built-ins | DONE | `7986eba` |
+| Sflow list / map literal parity with same built-in surface | DONE | `8aeaf6b` |
+| Cross-language parity doc | DONE | this commit (see `docs/sol-sflow-parity.md`) |
+
+What's still open in this space:
+
+- Sflow `for x in lst { … }` (today: `loop N times` + `list_get`).
+- Nested lists / maps (today: parseable, but built-ins flatten).
+- SOL `int` / `bool` types on `remote_call` boundary (today: `str` only).
+- Mid-flow pause / resume (still genuinely absent; see §6/§12).
+
 ## SOL Language Documentation `[IDEA — HIGH PRIORITY]`
 
 SOL (Structured Operations Language) is the workflow definition language Relix uses internally. Right now it exists only in source code with no external documentation. Anyone who wants to write a workflow has to read the compiler source to understand the syntax.

@@ -26,21 +26,72 @@ A real little programming language ported verbatim from OpenPrem
 
 - `function start() -> str { ... }` — single entry point per file.
 - `let x: str = "literal";` — typed locals (`int`, `float`, `char`,
-  `bool`, `str`, arrays, tuples, structs, enums).
-- `if cond { … } else { … }`, `while cond { … }`, `for x in arr { … }`
-  — all compile to `Jump` / `JumpFalse` opcodes; the VM executes them.
+  `bool`, `str`, `list`, `map`, arrays, tuples, structs, enums).
+- `if cond { … } else { … }`, `while cond { … }`, `for x in arr { … }`,
+  `for x in lst { … }` — all compile to `Jump` / `JumpFalse` opcodes;
+  the VM executes them.
+- `"hi {{name}} bye"` — string interpolation. Markers expand to
+  variable references at parse time (F1).
 - `"a" + "b"` — string concatenation. Literals have no escape
   sequences (SIMP-016).
 - `print(x)` — stdout for `flow-run`.
 - `return x;`
 - `remote_call("peer_or_capability_uri", "method", "arg") -> str` —
   the mesh primitive. Pipe-delimited args by convention.
+- `try { … } catch <kind> { … } catch any { … }` — error recovery
+  for failing `remote_call`s. Kinds: `any`, `timeout`,
+  `mesh_error`, `policy_denied`, `responder_error`. Inside a
+  catch body, `error_kind()` / `error_cause()` /
+  `error_retry_hint()` expose the structured failure. `rethrow;`
+  propagates to the next outer try-handler.
+- `delegate goal G from P to T` and
+  `send subject S body B from F to T` — soft-keyword sugar that
+  lowers to `remote_call("coord", "delegate.spawn", …)` and
+  `remote_call("coord", "msg.send", …)`. Both forms are
+  expressions; the result is the child task id / message id
+  (`str`).
 
-A failed `remote_call` halts the VM with `VM_ERROR_SENTINEL` and
-the dispatcher's structured error is surfaced on
-`FlowRunResult::last_error`. The host classifies it into a
-`FailureClass` for the task ledger. **SOL has no `try/catch`**;
-if you need recovery, use Sflow.
+### 1.1 List & map literals
+
+```sol
+let items: list = ["alpha", "beta", "gamma"];
+let empty: list = [];
+let config: map = { "model": "gpt-4o", "temperature": "0.2" };
+let bare: map = {};
+```
+
+Lists are heterogeneous at the VM layer; in practice operators
+use them as string lists. Maps are string-keyed; values are any
+expression. Both literal forms are expressions and may appear
+anywhere a value is expected (`let` RHS, function arg, delegate
+goal, etc.).
+
+Built-in surface (each lowers to a dedicated opcode; immutable
+update semantics — `list_push` / `map_set` / `map_del` return
+fresh objects):
+
+| Function | Returns | Notes |
+|---|---|---|
+| `list_len(lst)` | `int` | |
+| `list_get(lst, i)` | `str` | out-of-bounds → `""` |
+| `list_push(lst, v)` | `list` | new list; original unchanged |
+| `list_contains(lst, v)` | `bool` | string-compare elements |
+| `list_join(lst, sep)` | `str` | |
+| `list_split(s, sep)` | `list` | empty input → one empty elem |
+| `map_get(m, k)` | `str` | missing key → `""` |
+| `map_set(m, k, v)` | `map` | new map; original unchanged |
+| `map_has(m, k)` | `bool` | |
+| `map_keys(m)` | `list` | insertion order preserved |
+| `map_len(m)` | `int` | |
+| `map_del(m, k)` | `map` | new map; original unchanged |
+
+`for x in lst { … }` iterates a list; each `x` is exposed to
+the body as `str`.
+
+A failed `remote_call` outside an enclosing `try` halts the VM
+with `VM_ERROR_SENTINEL`. The dispatcher's structured error is
+surfaced on `FlowRunResult::last_error` and the host classifies
+it into a `FailureClass` for the task ledger.
 
 ### Worked example
 
@@ -111,6 +162,9 @@ set my_var = "literal value"
 set my_var = result
 set my_var = step.fetch.result
 set my_var = var.other_var
+set xs = ["alpha", "beta", "gamma"]               // list literal
+set m = { "model": "gpt-4o", "temp": "0.2" }      // map literal
+set count = list_len(var.xs)                       // built-in call
 ```
 
 - Scoped to one execution. No cross-flow persistence.
@@ -119,6 +173,53 @@ set my_var = var.other_var
   with a letter or underscore.
 - Reference in args / conditions with `${my_var}` interpolation
   or the `var.my_var` bareword.
+- Values can be `String` / `List` / `Map`. In string contexts
+  (step args, `${…}` interpolation, conditions) lists
+  stringify as `a|b|c`, maps as `k1=v1;k2=v2`.
+
+### 2.3.1 List & map literals + built-ins
+
+```sflow
+set xs = ["alpha", "beta", "gamma"]
+set empty = []
+set m = { "k1": "v1", "k2": "v2" }
+set bare = {}
+```
+
+Built-ins mirror the SOL surface — every `list_*` / `map_*`
+returns a fresh value, never mutates the input binding.
+
+| Function | Returns | Notes |
+|---|---|---|
+| `list_len(lst)` | int (as str) | `0` for empty |
+| `list_get(lst, idx)` | str | out-of-bounds → `""` |
+| `list_push(lst, v)` | list | new list |
+| `list_contains(lst, v)` | `"true"` / `"false"` | string-compare |
+| `list_join(lst, sep)` | str | |
+| `list_split(s, sep)` | list | empty input → one empty elem |
+| `map_get(m, k)` | str | missing key → `""` |
+| `map_set(m, k, v)` | map | new map |
+| `map_has(m, k)` | `"true"` / `"false"` | |
+| `map_keys(m)` | list | insertion order |
+| `map_len(m)` | int (as str) | |
+| `map_del(m, k)` | map | new map |
+
+Sflow has no integer / bool types so numeric / boolean results
+are returned as their `str` form. `if list_contains(...) == "true"`
+is the canonical pattern for branching on a boolean built-in
+result.
+
+Lists & maps can carry over into `step` args via the
+stringification above:
+
+```sflow
+set parts = list_split("draft|finalize|publish", "|")
+loop 3 times
+  set i = "${loop.iter}"
+  set name = list_get(var.parts, var.i)
+  step do: tasks.update "task-id|status=${name}"
+end
+```
 
 ### 2.4 Conditional branching
 
