@@ -16,6 +16,7 @@ mod ping;
 mod router;
 mod setup;
 mod sol;
+mod souls;
 mod task;
 mod terminal;
 mod topology;
@@ -203,6 +204,16 @@ enum Cmd {
     /// output is the single source of truth.
     Export(export::ExportArgs),
 
+    /// Manage SOUL.md persona files. `list` shows discovered
+    /// soul files; `edit <agent>` opens the file in `$EDITOR`
+    /// (creating it from a template if it doesn't exist).
+    /// See `crates/relix-runtime/src/nodes/ai/soul.rs`.
+    Souls {
+        #[command(subcommand)]
+        cmd: souls::Cmd,
+    },
+
+
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -264,6 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Status(args) => mesh::status(args).await,
         Cmd::Update(args) => update::run(args).await,
         Cmd::Export(args) => export::run(args).await,
+        Cmd::Souls { cmd } => souls::run(cmd),
         Cmd::FlowRun {
             flow,
             identity,

@@ -108,10 +108,7 @@ fn parse_semver(s: &str) -> (u32, u32, u32) {
     // compares as `1.0.0`. Operators rarely run pre-release
     // builds via `relix update`; if they do, the comparison
     // still does the safer "treat as the base release" thing.
-    let core = stripped
-        .split(['-', '+'])
-        .next()
-        .unwrap_or(stripped);
+    let core = stripped.split(['-', '+']).next().unwrap_or(stripped);
     let mut parts = core.split('.');
     let a: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let b: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);

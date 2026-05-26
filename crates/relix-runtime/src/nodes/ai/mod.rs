@@ -56,6 +56,7 @@ pub mod failover;
 pub mod memory_dispatcher;
 pub mod provider;
 pub mod router;
+pub mod soul;
 
 pub use memory_dispatcher::{MemoryDispatcher, MemoryFetcher};
 
