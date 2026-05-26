@@ -78,6 +78,12 @@ pub struct ControllerConfig {
     /// `crates/relix-runtime/src/nodes/ai/skills.rs`.
     #[serde(default)]
     pub skills: Option<toml::Value>,
+    /// `[guardrails]` — request-time guardrail config. Carries
+    /// the optional `[guardrails.input]` block; absent means
+    /// no guardrails and existing controllers behave as before.
+    /// See `crates/relix-runtime/src/nodes/ai/guardrails`.
+    #[serde(default)]
+    pub guardrails: Option<toml::Value>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -2696,6 +2702,33 @@ pub(crate) enum StartupWiring {
     },
 }
 
+// Parse `[guardrails.input]` from the top-level [guardrails]
+// TOML section into an InputGuardrail instance. Absent /
+// disabled / unparseable produces a permissive guardrail so
+// the AI controller behaves exactly as before.
+fn build_input_guardrail(cfg: &ControllerConfig) -> crate::nodes::ai::guardrails::InputGuardrail {
+    use crate::nodes::ai::guardrails::{InputGuardrail, input::InputGuardrailConfig};
+    let Some(raw) = cfg.guardrails.clone() else {
+        return InputGuardrail::permissive();
+    };
+    #[derive(serde::Deserialize, Default)]
+    struct GuardrailsBlock {
+        #[serde(default)]
+        input: Option<InputGuardrailConfig>,
+    }
+    let parsed: GuardrailsBlock = match raw.try_into() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "[guardrails] parse failed; defaulting to permissive");
+            return InputGuardrail::permissive();
+        }
+    };
+    match parsed.input {
+        Some(ic) => InputGuardrail::from_config(&ic),
+        None => InputGuardrail::permissive(),
+    }
+}
+
 // Open the four-layer LayeredMemoryStore when the operator opted
 // in via [memory.qdrant] OR an explicit layered_db_path. Returns
 // None when neither is configured — the layered surface is purely
@@ -3093,6 +3126,11 @@ fn register_node_type_handlers(
             default_model.clone(),
             crate::nodes::ai::skills::SKILL_MATCH_THRESHOLD,
         );
+        // Input guardrail. Parses `[guardrails.input]` from the
+        // top-level config when present; absent / `enabled =
+        // false` produces a permissive instance so existing
+        // controllers behave exactly as before.
+        let input_guardrail = build_input_guardrail(cfg);
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
@@ -3100,6 +3138,7 @@ fn register_node_type_handlers(
             memory_cell.clone(),
             soul_cache,
             skill_matcher,
+            input_guardrail,
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when

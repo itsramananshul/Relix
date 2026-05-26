@@ -53,6 +53,7 @@
 //! or any presentation peer.
 
 pub mod failover;
+pub mod guardrails;
 pub mod memory_dispatcher;
 pub mod provider;
 pub mod router;
@@ -272,11 +273,13 @@ pub fn register(
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
     soul_cache: SoulCache,
     skills_cache: skills::SkillMatcher,
+    input_guardrail: guardrails::InputGuardrail,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let soul_for_chat = soul_cache.clone();
     let skills_for_chat = skills_cache.clone();
+    let guardrail_for_chat = input_guardrail.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -285,7 +288,8 @@ pub fn register(
             let mem = memory_dispatcher.clone();
             let soul = soul_for_chat.clone();
             let sk = skills_for_chat.clone();
-            async move { handle_chat(p, model, mem, soul, sk, ctx).await }
+            let gr = guardrail_for_chat.clone();
+            async move { handle_chat(p, model, mem, soul, sk, gr, ctx).await }
         })),
     );
     let provider_for_embed = provider.clone();
@@ -565,6 +569,7 @@ async fn handle_chat(
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
     soul_cache: SoulCache,
     skills_cache: skills::SkillMatcher,
+    input_guardrail: guardrails::InputGuardrail,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -599,6 +604,43 @@ async fn handle_chat(
             retry_after: None,
         });
     }
+
+    // Input guardrail. Runs before any model work so a
+    // blocked prompt costs nothing past the substring scan +
+    // a few regex find_iters. The verdict carries a possibly-
+    // redacted text (we pass the redacted form to the model
+    // when the operator picked redact mode) plus content
+    // categories the audit log can surface.
+    let guardrail_result = input_guardrail.check(prompt);
+    if !guardrail_result.allowed {
+        let reason = guardrail_result
+            .reason
+            .unwrap_or_else(|| "input guardrail rejected prompt".to_string());
+        let preview: String = prompt.chars().take(80).collect();
+        tracing::warn!(
+            session_id,
+            preview = %preview,
+            reason = %reason,
+            "ai.chat: input guardrail blocked prompt"
+        );
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::SECURITY_DENIED,
+            cause: format!("ai.chat: {reason}"),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    if guardrail_result.pii_detected {
+        tracing::info!(
+            session_id,
+            categories = ?guardrail_result.categories,
+            "ai.chat: input guardrail redacted PII before model call"
+        );
+    }
+    // Use the (possibly-redacted) text downstream. Borrow as
+    // a &str so the rest of the handler can keep its existing
+    // `prompt: &str` shape.
+    let prompt: &str = &guardrail_result.text;
 
     // Frozen-snapshot memory injection. Fetch agent + user
     // memory for the caller's subject_id once, build a labeled
@@ -793,6 +835,7 @@ mod tests {
             empty_mem(),
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -802,6 +845,7 @@ mod tests {
             empty_mem(),
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -815,6 +859,7 @@ mod tests {
             empty_mem(),
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -839,6 +884,7 @@ mod tests {
             empty_mem(),
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -857,6 +903,7 @@ mod tests {
             empty_mem(),
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"|hello|"),
         )
         .await;
@@ -896,6 +943,7 @@ mod tests {
             empty_mem(),
             soul,
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -933,6 +981,7 @@ mod tests {
             cell,
             soul,
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -961,6 +1010,7 @@ mod tests {
             empty_mem(),
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -983,12 +1033,14 @@ mod tests {
             title: "deploy-staging".into(),
         };
         let cache = skills::SkillMatcher::keyword_only(skills::SkillsCache::from_vec(vec![skill]));
+        let guardrail = guardrails::InputGuardrail::permissive();
         let r = handle_chat(
             rec_provider,
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
             cache,
+            guardrail,
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -1024,6 +1076,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1056,6 +1109,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1111,6 +1165,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -1147,6 +1202,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -1186,6 +1242,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1306,6 +1363,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1346,6 +1404,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1384,6 +1443,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1423,6 +1483,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1483,6 +1544,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1583,6 +1645,7 @@ mod tests {
             cell,
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
             ctx(b"s1|hello|"),
         )
         .await;
