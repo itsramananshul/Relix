@@ -5387,6 +5387,130 @@ function renderTodoPanel(payload) {
   }
 }
 
+/* F4: delegation chain card. Fetches /v1/tasks/:id/lineage_graph
+   and filters the edges to `delegated_to` only, then renders the
+   full parent ↔ this ↔ children tree with status pills. The
+   coordinator's BFS walks both directions (parent and child sides
+   of every edge) so a single fetch produces the entire connected
+   chain regardless of which task the operator is currently looking
+   at. Falls back to silent empty state when no delegation edges
+   touch the task — most tasks aren't delegated at all and we don't
+   want to flash an empty card. */
+async function fetchDelegationChain(taskId) {
+  const $slot = document.getElementById('delegation-chain-slot');
+  if (!$slot) return;
+  $slot.innerHTML = '';
+  try {
+    const r = await fetch('/v1/tasks/' + encodeURIComponent(taskId) + '/lineage_graph?depth=16');
+    if (!r.ok) return;
+    const lineage = await r.json();
+    const edges = (lineage.edges || []).filter(e => e.edge_type === 'delegated_to');
+    if (edges.length === 0) {
+      // No delegation edges — not a delegated task and not a
+      // delegator. Stay quiet rather than render an empty card.
+      return;
+    }
+    // Build parent (child→parent) and child (parent→[children])
+    // adjacency from the `delegated_to` edges. The coordinator
+    // emits `delegated_to` with task_id = parent and
+    // related_task_id = child, matching record_delegated.
+    const parentOf = new Map();
+    const childrenOf = new Map();
+    for (const e of edges) {
+      if (!e.related_task_id) continue;
+      parentOf.set(e.related_task_id, e.task_id);
+      const arr = childrenOf.get(e.task_id) || [];
+      arr.push(e.related_task_id);
+      childrenOf.set(e.task_id, arr);
+    }
+    // Walk up from THIS task to find the chain's root.
+    let root = taskId;
+    const seenUp = new Set([root]);
+    while (parentOf.has(root)) {
+      const next = parentOf.get(root);
+      if (seenUp.has(next)) break; // cycle defense
+      seenUp.add(next);
+      root = next;
+    }
+    // Collect tasks reachable from the root by descending — this
+    // is the scope of the chain card. Anything outside is in a
+    // sibling chain we don't care about for this view.
+    const inChain = new Set();
+    const stack = [root];
+    while (stack.length > 0) {
+      const id = stack.pop();
+      if (inChain.has(id)) continue;
+      inChain.add(id);
+      for (const k of (childrenOf.get(id) || [])) stack.push(k);
+    }
+    // Fetch task headers in parallel so we can render status
+    // pills next to each chain node. Best-effort — missing
+    // headers render as "?" status.
+    const headers = new Map();
+    await Promise.all(Array.from(inChain).map(async (id) => {
+      try {
+        const tr = await fetch('/v1/tasks/' + encodeURIComponent(id));
+        if (!tr.ok) return;
+        const tj = await tr.json();
+        if (tj && tj.task) {
+          headers.set(id, tj.task);
+        }
+      } catch (_) { /* silent */ }
+    }));
+    // Pre-order DFS render. `prefix` is the cumulative
+    // tree-drawing prefix carried from each ancestor row
+    // (`│   ` continuation, `    ` last-child gap) so the
+    // tree lines stay aligned across deep chains.
+    const lines = [];
+    function walk(id, prefix, isLast, isRoot) {
+      const header = headers.get(id);
+      const status = (header && header.status) || '?';
+      const title = (header && header.title) || '';
+      const short = shortenId(id);
+      const isMe = (id === taskId);
+      const branch = isRoot ? '' : (isLast ? '└─ ' : '├─ ');
+      const idHtml = '<a class="id" href="#/tasks/'
+        + encodeURIComponent(id) + '">' + escapeHtml(short) + '</a>';
+      const meMark = isMe
+        ? '<span style="color: var(--accent); font-weight: 600; margin-left: 6px;">← you are here</span>'
+        : '';
+      const titleHtml = title
+        ? ' <span class="meta">· ' + escapeHtml(title) + '</span>'
+        : '';
+      lines.push(
+        '<div class="dc-row">'
+          + '<span class="meta">' + escapeHtml(prefix) + escapeHtml(branch) + '</span>'
+          + idHtml
+          + ' <span class="badge ' + escapeHtml(status) + '">' + escapeHtml(status) + '</span>'
+          + titleHtml
+          + meMark
+          + '</div>'
+      );
+      const kids = (childrenOf.get(id) || []).filter(k => inChain.has(k));
+      const childPrefix = isRoot ? '' : (prefix + (isLast ? '    ' : '│   '));
+      for (let i = 0; i < kids.length; i++) {
+        walk(kids[i], childPrefix, i === kids.length - 1, false);
+      }
+    }
+    walk(root, '', true, true);
+    const totalTasks = inChain.size;
+    const totalEdges = edges.length;
+    $slot.innerHTML = '<div class="card" style="margin: 12px 14px;">'
+      + '<div class="card-header"><h3>Delegation chain</h3>'
+      + '<span class="meta">' + totalTasks + ' task'
+      + (totalTasks === 1 ? '' : 's') + ' · '
+      + totalEdges + ' delegated_to edge'
+      + (totalEdges === 1 ? '' : 's') + '</span></div>'
+      + '<div class="card-body">'
+      + '<div class="dc-tree" style="font-family: monospace; '
+      + 'white-space: pre; line-height: 1.6; font-size: 12px;">'
+      + lines.join('')
+      + '</div></div></div>';
+  } catch (_) {
+    // Silent — chain card is non-critical.
+  }
+}
+
 /* M66: execution-lineage panel. Fetches /v1/tasks/:id/lineage_graph
    (BFS over task_edges) and renders the related-tasks list + edge
    count + honest note about which edge types have producers. The
@@ -6215,6 +6339,12 @@ function renderDetail(l) {
   // when no task is loaded so a stale graph from the prior
   // task doesn't flash before the fetch lands.
   const lineageSlot = '<div id="lineage-slot"></div>';
+  // F4: delegation chain card slot — populated async by
+  // fetchDelegationChain. Filters lineage_graph edges to
+  // `delegated_to` and renders the full parent ↔ this ↔
+  // children tree. Stays empty when no delegation edges
+  // touch the task (most tasks aren't delegated).
+  const delegationChainSlot = '<div id="delegation-chain-slot"></div>';
   document.getElementById('task-detail').innerHTML =
     investigationBanner
     + replayBanner
@@ -6224,6 +6354,7 @@ function renderDetail(l) {
     + failureBlock
     + execSlot
     + corrSlot
+    + delegationChainSlot
     + lineageSlot
     + `<div class="attempts-block"><h3>attempts</h3>${attemptRows}</div>`
     // PH-DASH2: per-task todo panel slot — populated async by
@@ -6245,6 +6376,8 @@ function renderDetail(l) {
     fetchTodoPanel(l.task.task_id);
     // PH-DELEGATE-DASH: hydrate the delegations panel.
     fetchDelegationsPanel(l.task.task_id, l.task);
+    // F4: hydrate the delegation chain card.
+    fetchDelegationChain(l.task.task_id);
   }
   // Fire-and-forget correlation lookup. Status guards
   // mean we only fetch when the operator would actually
