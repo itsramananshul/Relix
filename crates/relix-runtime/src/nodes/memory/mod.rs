@@ -590,6 +590,7 @@ pub struct LayeredContext {
 /// `[memory.curator]` was unconfigured — the capability is
 /// still registered and returns a clear "not configured" body
 /// so operators see why instead of getting `unknown method`.
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     bridge: &mut DispatchBridge,
     store: Arc<MemoryStore>,
@@ -598,6 +599,7 @@ pub fn register(
     embedding_model: String,
     curator: Option<(Arc<tokio::sync::Mutex<CuratorState>>, Arc<CuratorConfig>)>,
     layered: Option<LayeredContext>,
+    coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>>,
 ) {
     {
         let store = store.clone();
@@ -628,6 +630,16 @@ pub fn register(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let store = store.clone();
                 async move { handle_search(&store, &ctx) }
+            })),
+        );
+    }
+    {
+        let coord = coord_cell.clone();
+        bridge.register(
+            "memory.session_search",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let coord = coord.clone();
+                async move { handle_session_search(coord.as_ref(), &ctx).await }
             })),
         );
     }
@@ -1024,6 +1036,54 @@ fn handle_search(store: &MemoryStore, ctx: &InvocationCtx) -> HandlerOutcome {
             HandlerOutcome::Ok(body.into_bytes())
         }
         Err(e) => internal(format!("memory.search: {e}")),
+    }
+}
+
+/// `memory.session_search` handler — thin proxy onto the
+/// coordinator's `task.session_search`. The memory node owns
+/// no chat-turn chronicle of its own; this capability exists
+/// so agents searching their own history have a single,
+/// stable mesh address (`memory.*`) rather than having to
+/// know about coordinator wiring. Wire format and JSON shape
+/// pass through verbatim.
+async fn handle_session_search(
+    coord_cell: &tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid_args(format!("memory.session_search utf8: {e}")),
+    };
+    let mut parts = s.splitn(3, '|');
+    let subject_id = parts.next().unwrap_or("").trim().to_string();
+    let query = parts.next().unwrap_or("").to_string();
+    let limit = parts
+        .next()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(20);
+    if query.trim().is_empty() {
+        return invalid_args("memory.session_search: query required".to_string());
+    }
+    let Some(coord) = coord_cell.get() else {
+        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: relix_core::types::error_kinds::PEER_UNREACHABLE,
+            cause: "memory.session_search: [memory.curator] coord peer not configured; \
+                    session search requires an outbound coord_peer in the memory config"
+                .into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    };
+    match coord.session_search(&subject_id, &query, limit).await {
+        Ok(body) => HandlerOutcome::Ok(body.into_bytes()),
+        Err(cause) => HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: relix_core::types::error_kinds::TRANSPORT,
+            cause: format!("memory.session_search: {cause}"),
+            retry_hint: 1,
+            retry_after: None,
+        }),
     }
 }
 
@@ -1577,6 +1637,126 @@ pub enum MemoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── memory.session_search ────────────────────────────────────
+
+    /// Stub CoordDispatcher that records the args the memory
+    /// handler forwarded and returns a canned JSON body. Only
+    /// the session_search method is exercised; the other trait
+    /// methods are stubbed to fail fast.
+    struct StubSessionSearchCoord {
+        last_args: std::sync::Mutex<Option<(String, String, usize)>>,
+        canned: String,
+        err: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoordDispatcher for StubSessionSearchCoord {
+        async fn ensure_system_task(&self) -> Option<String> {
+            None
+        }
+        async fn append_curator_event(&self, _task_id: &str, _summary: &CuratorRunSummary) -> bool {
+            false
+        }
+        async fn session_search(
+            &self,
+            subject_id: &str,
+            query: &str,
+            limit: usize,
+        ) -> Result<String, String> {
+            *self.last_args.lock().unwrap() =
+                Some((subject_id.to_string(), query.to_string(), limit));
+            if let Some(e) = &self.err {
+                Err(e.clone())
+            } else {
+                Ok(self.canned.clone())
+            }
+        }
+    }
+
+    fn ctx(args: &[u8]) -> InvocationCtx {
+        InvocationCtx {
+            caller: relix_core::identity::VerifiedIdentity {
+                subject_id: relix_core::types::NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: relix_core::types::NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "agent".into(),
+                clearance: "internal".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: relix_core::types::TraceId::new(),
+            request_id: relix_core::types::RequestId::new(),
+            args: args.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_search_proxies_to_coord_and_returns_body_verbatim() {
+        let cell: tokio::sync::OnceCell<Arc<dyn CoordDispatcher>> = tokio::sync::OnceCell::new();
+        let stub = Arc::new(StubSessionSearchCoord {
+            last_args: std::sync::Mutex::new(None),
+            canned: r#"[{"session_id":"sess-A","role":"user","content":"hi"}]"#.to_string(),
+            err: None,
+        });
+        cell.set(stub.clone() as Arc<dyn CoordDispatcher>).ok();
+        let outcome = handle_session_search(&cell, &ctx(b"alice|find|7")).await;
+        match outcome {
+            HandlerOutcome::Ok(body) => {
+                let body = String::from_utf8(body).unwrap();
+                assert!(body.contains("sess-A"));
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        }
+        let captured = stub.last_args.lock().unwrap().clone().unwrap();
+        assert_eq!(captured.0, "alice");
+        assert_eq!(captured.1, "find");
+        assert_eq!(captured.2, 7);
+    }
+
+    #[tokio::test]
+    async fn session_search_returns_503_style_error_when_coord_cell_empty() {
+        let cell: tokio::sync::OnceCell<Arc<dyn CoordDispatcher>> = tokio::sync::OnceCell::new();
+        let outcome = handle_session_search(&cell, &ctx(b"|needle|20")).await;
+        match outcome {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::PEER_UNREACHABLE);
+                assert!(e.cause.contains("not configured"));
+            }
+            HandlerOutcome::Ok(_) => panic!("expected Err with PEER_UNREACHABLE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_search_returns_structured_err_when_coord_call_fails() {
+        let cell: tokio::sync::OnceCell<Arc<dyn CoordDispatcher>> = tokio::sync::OnceCell::new();
+        let stub: Arc<dyn CoordDispatcher> = Arc::new(StubSessionSearchCoord {
+            last_args: std::sync::Mutex::new(None),
+            canned: String::new(),
+            err: Some("simulated transport drop".into()),
+        });
+        cell.set(stub).ok();
+        let outcome = handle_session_search(&cell, &ctx(b"|q|20")).await;
+        match outcome {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::TRANSPORT);
+                assert!(e.cause.contains("transport drop"));
+            }
+            HandlerOutcome::Ok(_) => panic!("expected Err on coord failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_search_rejects_empty_query() {
+        let cell: tokio::sync::OnceCell<Arc<dyn CoordDispatcher>> = tokio::sync::OnceCell::new();
+        let outcome = handle_session_search(&cell, &ctx(b"alice||20")).await;
+        match outcome {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::INVALID_ARGS);
+            }
+            HandlerOutcome::Ok(_) => panic!("expected Err on empty query"),
+        }
+    }
 
     #[test]
     fn write_recent_search_roundtrip() {

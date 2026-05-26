@@ -124,6 +124,7 @@ mod schema;
 mod secrets;
 mod secrets_available;
 mod security_headers;
+mod session_search;
 mod sessions_obs;
 mod slack;
 mod sol_validate;
@@ -509,6 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/memory/curator/status", get(memory_curator::status))
         .route("/v1/memory/embed", post(memory_embed::embed))
         .route("/v1/memory/search", post(memory_embed::search))
+        .route("/v1/memory/sessions/search", get(session_search::search))
         .route("/v1/memory/embed_all", post(memory_embed::embed_all))
         // Four-layer memory inspector. Reads the layered store
         // directly from `AppState::layered_memory` — set

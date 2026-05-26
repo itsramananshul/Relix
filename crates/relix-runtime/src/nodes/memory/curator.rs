@@ -421,6 +421,18 @@ pub trait CoordDispatcher: Send + Sync {
     /// a pipe-delim payload encoding the run summary. Returns
     /// `true` on success.
     async fn append_curator_event(&self, task_id: &str, summary: &CuratorRunSummary) -> bool;
+
+    /// Proxy to the coordinator's `task.session_search`
+    /// capability. Returns the JSON body verbatim on success
+    /// or `Err(human-readable)` on transport / responder
+    /// failure so callers can surface the cause rather than
+    /// turning it into a silent skip.
+    async fn session_search(
+        &self,
+        subject_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<String, String>;
 }
 
 /// Live `CoordDispatcher` implementation — wraps a
@@ -545,6 +557,39 @@ impl CoordDispatcher for CoordMeshDispatcher {
         );
         let arg = format!("{task_id}|memory.curator_run|{payload}");
         self.call("task.event", arg.into_bytes()).await.is_some()
+    }
+
+    async fn session_search(
+        &self,
+        subject_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<String, String> {
+        let arg = format!("{subject_id}|{query}|{limit}");
+        let envelope = build_request(
+            "task.session_search",
+            arg.into_bytes(),
+            self.identity.clone(),
+            self.deadline_secs,
+        );
+        let resp_bytes = self
+            .mesh
+            .call(&self.alias, envelope)
+            .await
+            .map_err(|e| format!("coord transport: {e}"))?;
+        let resp = decode_response(&resp_bytes).map_err(|e| format!("decode coord resp: {e}"))?;
+        match resp.res {
+            ResponseResult::Ok(body) => {
+                String::from_utf8(body.to_vec()).map_err(|e| format!("coord body utf8: {e}"))
+            }
+            ResponseResult::Err(env) => Err(format!(
+                "coord task.session_search err kind={} cause={}",
+                env.kind, env.cause
+            )),
+            ResponseResult::StreamHandle(_) => {
+                Err("coord task.session_search returned unexpected stream handle".to_string())
+            }
+        }
     }
 }
 
@@ -1260,6 +1305,16 @@ mod tests {
                 .unwrap()
                 .push(summary.clone());
             true
+        }
+        async fn session_search(
+            &self,
+            _subject_id: &str,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<String, String> {
+            // Tests that exercise session_search use a dedicated
+            // stub; the chronicle-write tests never call this.
+            Err("session_search not implemented in StubCoord".to_string())
         }
     }
 

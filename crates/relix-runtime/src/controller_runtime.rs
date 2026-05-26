@@ -3164,6 +3164,7 @@ fn register_node_type_handlers(
             embedding_model,
             curator_handler_cfg,
             layered_ctx.clone(),
+            curator_coord_cell.clone(),
         );
         // Spawn the curator scheduler iff [memory.curator] is
         // configured AND enabled. Discovery of the AI + coord
