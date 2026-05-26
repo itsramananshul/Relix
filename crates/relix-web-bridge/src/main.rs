@@ -131,6 +131,7 @@ mod tasks;
 mod telegram;
 mod tenant;
 mod term_audit;
+mod tools;
 mod topology;
 mod validate;
 mod ws;
@@ -511,6 +512,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/secrets/available", get(secrets_available::available))
         // Agent access policies + recent call counts.
         .route("/v1/agents/access", get(agents_access::agents))
+        // Tool registry — list + keyword search.
+        .route("/v1/tools", get(tools::list))
+        .route("/v1/tools/search", post(tools::search))
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's

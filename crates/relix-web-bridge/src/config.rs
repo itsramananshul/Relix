@@ -291,6 +291,13 @@ pub struct AppState {
     /// Backs the `/v1/agents/access` endpoint. See
     /// `crates/relix-runtime/src/nodes/execution/broker.rs`.
     pub access_broker: std::sync::Arc<relix_runtime::nodes::execution::broker::AgentAccessBroker>,
+    /// Discoverable tool registry. Empty by default — the
+    /// tool node publishes its capability descriptors at
+    /// startup and the bridge builds the registry from them.
+    /// Backs `/v1/tools` (list) and `/v1/tools/search`
+    /// (keyword). See
+    /// `crates/relix-runtime/src/nodes/tool/registry.rs`.
+    pub tool_registry: std::sync::Arc<relix_runtime::nodes::tool::registry::ToolRegistry>,
     /// Four-layer memory store backing the
     /// `/v1/memory/records/*` inspector endpoints.
     /// `Some` when `[bridge] memory_db_path` is configured AND
@@ -434,6 +441,7 @@ impl AppState {
             access_broker: std::sync::Arc::new(
                 relix_runtime::nodes::execution::broker::AgentAccessBroker::empty(),
             ),
+            tool_registry: crate::tools::empty_registry(),
             layered_memory: open_layered_memory(&memory_db_path),
         })
     }

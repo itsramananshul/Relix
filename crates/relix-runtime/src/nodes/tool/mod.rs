@@ -53,6 +53,7 @@ pub mod fs;
 pub mod mcp;
 pub mod mcp_stdio;
 pub mod pdf;
+pub mod registry;
 pub mod sanitize;
 pub mod security;
 pub mod terminal;
