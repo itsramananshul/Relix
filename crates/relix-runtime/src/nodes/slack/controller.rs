@@ -243,10 +243,15 @@ fn render_history(history: &[(String, String)]) -> String {
 }
 
 async fn send_text(api: &dyn SlackApi, channel_id: &str, thread_ts: &str, text: &str) -> bool {
+    // Convert LLM-emitted CommonMark into Slack mrkdwn so
+    // `**bold**` doesn't render as literal asterisks and
+    // language-hinted code fences don't print the hint as
+    // text. See `crate::nodes::channels::format_for_slack_mrkdwn`.
+    let formatted = crate::nodes::channels::format_for_slack_mrkdwn(text);
     let msg = OutgoingMessage {
         channel_id: channel_id.to_string(),
         thread_ts: thread_ts.to_string(),
-        text: text.to_string(),
+        text: formatted,
     };
     if let Err(e) = api.chat_post_message(&msg).await {
         tracing::warn!(error = %e, channel_id = channel_id, "slack: chat.postMessage failed");

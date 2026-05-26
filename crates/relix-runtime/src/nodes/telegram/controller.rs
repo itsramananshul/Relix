@@ -373,15 +373,37 @@ fn render_history(history: &[(String, String)]) -> String {
 }
 
 async fn send_text(api: &dyn BotApi, chat_id: i64, reply_to: i64, text: &str) -> bool {
+    // Format the assistant text as MarkdownV2 so code fences,
+    // multi-paragraph replies, and reserved characters render
+    // correctly in Telegram clients. The formatter escapes
+    // everything outside code fences; inside a fence only the
+    // backtick + backslash get escaped. See
+    // `crate::nodes::channels::format_for_telegram_markdown_v2`.
+    let formatted = crate::nodes::channels::format_for_telegram_markdown_v2(text);
     let msg = OutgoingMessage {
         chat_id,
         reply_to_message_id: reply_to,
-        text: text.to_string(),
-        parse_mode: None,
+        text: formatted,
+        parse_mode: Some(ParseMode::MarkdownV2),
     };
     if let Err(e) = api.send_message(&msg).await {
-        tracing::warn!(error = %e, chat_id = chat_id, "telegram: send_message failed");
-        return false;
+        // Fallback: if the rich-text send failed (Bot API
+        // rejected the markdown for any reason), try once more
+        // as plain text so the operator sees the reply rather
+        // than a silent drop.
+        tracing::warn!(error = %e, chat_id = chat_id,
+            "telegram: rich-text send_message failed; retrying as plain text");
+        let fallback = OutgoingMessage {
+            chat_id,
+            reply_to_message_id: reply_to,
+            text: text.to_string(),
+            parse_mode: None,
+        };
+        if let Err(e2) = api.send_message(&fallback).await {
+            tracing::warn!(error = %e2, chat_id = chat_id,
+                "telegram: plain-text send_message also failed");
+            return false;
+        }
     }
     true
 }
@@ -613,7 +635,10 @@ mod tests {
         handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("hello")).await;
         let sent = api.sent_messages();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].text, unauthorised_message());
+        assert_eq!(
+            sent[0].text,
+            crate::nodes::channels::format_for_telegram_markdown_v2(&unauthorised_message())
+        );
         // AI was not invoked.
         assert!(out.ai_chat_calls.lock().unwrap().is_empty());
     }
@@ -630,7 +655,10 @@ mod tests {
         handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("hi there")).await;
         let sent = api.sent_messages();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].text, "hello from ai");
+        assert_eq!(
+            sent[0].text,
+            crate::nodes::channels::format_for_telegram_markdown_v2("hello from ai")
+        );
         // Both user + assistant turns persisted.
         assert_eq!(out.memory_writes.lock().unwrap().len(), 2);
         // Typing indicator fired before the chat dispatch.
@@ -652,7 +680,10 @@ mod tests {
         handle_one_update(&api, None, &state, &ring, &cfg, &msg("hi")).await;
         let sent = api.sent_messages();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].text, brain_unreachable_message());
+        assert_eq!(
+            sent[0].text,
+            crate::nodes::channels::format_for_telegram_markdown_v2(&brain_unreachable_message())
+        );
     }
 
     #[tokio::test]
@@ -666,7 +697,10 @@ mod tests {
         let cfg = cfg_default();
         handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("hi")).await;
         let sent = api.sent_messages();
-        assert_eq!(sent[0].text, brain_unreachable_message());
+        assert_eq!(
+            sent[0].text,
+            crate::nodes::channels::format_for_telegram_markdown_v2(&brain_unreachable_message())
+        );
         // Task flipped to failed.
         let updates = out.task_updates.lock().unwrap();
         assert!(updates.iter().any(|(_, s, _)| s == "failed"));
@@ -682,8 +716,11 @@ mod tests {
         let cfg = cfg_default();
         handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("/memory")).await;
         let sent = api.sent_messages();
-        assert!(sent[0].text.contains("agent-x"));
-        assert!(sent[0].text.contains("user-y"));
+        // After the MarkdownV2 escape, `-` becomes `\-`. Check
+        // the escaped substrings so the test matches the new
+        // outbound contract.
+        assert!(sent[0].text.contains("agent\\-x"));
+        assert!(sent[0].text.contains("user\\-y"));
     }
 
     #[tokio::test]
@@ -716,7 +753,7 @@ mod tests {
         )
         .await;
         let sent = api.sent_messages();
-        assert!(sent[0].text.contains("operator-only"));
+        assert!(sent[0].text.contains("operator\\-only"));
         assert!(out.task_events.lock().unwrap().is_empty());
     }
 
@@ -742,7 +779,7 @@ mod tests {
         )
         .await;
         let sent = api.sent_messages();
-        assert!(sent[0].text.contains("Approved apr-1"));
+        assert!(sent[0].text.contains("Approved apr\\-1"));
         assert!(sent[0].text.contains("Token: deadbeef"));
     }
 
@@ -756,7 +793,7 @@ mod tests {
         cfg.allowed_users = vec![42];
         handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("/reject apr-1")).await;
         let sent = api.sent_messages();
-        assert!(sent[0].text.contains("Rejected apr-1"));
+        assert!(sent[0].text.contains("Rejected apr\\-1"));
     }
 
     #[tokio::test]

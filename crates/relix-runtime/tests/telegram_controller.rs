@@ -339,7 +339,7 @@ async fn e2e_chat_flow_runs_exact_sequence() {
     assert!(
         snapshot
             .iter()
-            .any(|o| matches!(o, Op::SendMessage { text, .. } if text == "hi back!")),
+            .any(|o| matches!(o, Op::SendMessage { text, .. } if text == &relix_runtime::nodes::channels::format_for_telegram_markdown_v2("hi back!"))),
         "expected send_message with AI reply; got: {snapshot:?}"
     );
 
@@ -348,7 +348,7 @@ async fn e2e_chat_flow_runs_exact_sequence() {
         .position(|o| matches!(o, Op::SendChatAction { action, .. } if action == "typing"))
         .expect("typing op");
     let i_send = log
-        .position(|o| matches!(o, Op::SendMessage { text, .. } if text == "hi back!"))
+        .position(|o| matches!(o, Op::SendMessage { text, .. } if text == &relix_runtime::nodes::channels::format_for_telegram_markdown_v2("hi back!")))
         .expect("send_message op");
     assert!(
         i_typing < i_send,
@@ -495,7 +495,16 @@ async fn e2e_allowed_users_blocks_user_not_on_the_list() {
             _ => None,
         })
         .expect("send_message must have fired with the unauthorized message");
-    assert_eq!(sent_text, "You are not authorized to use this bot.");
+    // The Telegram controller now formats outbound messages as
+    // MarkdownV2 (so code fences, multi-paragraph replies, etc.
+    // render correctly). Reserved characters like `.` get
+    // backslash-escaped — assert against the formatted form.
+    assert_eq!(
+        sent_text,
+        relix_runtime::nodes::channels::format_for_telegram_markdown_v2(
+            "You are not authorized to use this bot."
+        )
+    );
 
     // And NO downstream chat-flow ops ran.
     assert_eq!(log.count(|o| matches!(o, Op::AiChat { .. })), 0);
@@ -528,7 +537,12 @@ async fn e2e_allowed_users_admits_user_on_the_list() {
             _ => None,
         })
         .collect();
-    assert_eq!(texts, vec!["authorised-reply".to_string()]);
+    assert_eq!(
+        texts,
+        vec![relix_runtime::nodes::channels::format_for_telegram_markdown_v2(
+            "authorised-reply"
+        )]
+    );
 }
 
 // ── slash commands ────────────────────────────────────────

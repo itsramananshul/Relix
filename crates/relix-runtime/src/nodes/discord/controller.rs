@@ -271,16 +271,32 @@ fn render_history(history: &[(String, String)]) -> String {
 }
 
 async fn send_text(api: &dyn DiscordApi, channel_id: &str, reply_to: &str, text: &str) -> bool {
-    let msg = OutgoingMessage {
-        channel_id: channel_id.to_string(),
-        reply_to_message_id: reply_to.to_string(),
-        content: text.to_string(),
-    };
-    if let Err(e) = api.send_message(&msg).await {
-        tracing::warn!(error = %e, channel_id = channel_id, "discord: send_message failed");
-        return false;
+    // Discord caps a single message at ~2000 chars. The
+    // formatter splits the assistant reply at paragraph >
+    // sentence > line > space boundaries so a long answer
+    // arrives as multiple consecutive messages — never
+    // mid-word, never mid-code-block. See
+    // `crate::nodes::channels::format_for_discord`.
+    let chunks = crate::nodes::channels::format_for_discord(text);
+    let mut ok = true;
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Only the first chunk threads under the original
+        // user message; subsequent chunks are standalone so
+        // Discord doesn't pile up reply-references.
+        let reply = if i == 0 { reply_to } else { "" };
+        let msg = OutgoingMessage {
+            channel_id: channel_id.to_string(),
+            reply_to_message_id: reply.to_string(),
+            content: chunk.clone(),
+        };
+        if let Err(e) = api.send_message(&msg).await {
+            tracing::warn!(error = %e, channel_id = channel_id, chunk_idx = i,
+                "discord: send_message failed");
+            ok = false;
+            break;
+        }
     }
-    true
+    ok
 }
 
 /// Move the persistent cursor forward if the new id is

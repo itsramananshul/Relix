@@ -7,6 +7,7 @@
 //! Controller config decides which to enable per binary instance.
 
 pub mod ai;
+pub mod channels;
 pub mod coordinator;
 pub mod discord;
 pub mod memory;
