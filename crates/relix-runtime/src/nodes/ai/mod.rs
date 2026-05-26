@@ -271,7 +271,7 @@ pub fn register(
     default_model: String,
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
     soul_cache: SoulCache,
-    skills_cache: skills::SkillsCache,
+    skills_cache: skills::SkillMatcher,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
@@ -564,7 +564,7 @@ async fn handle_chat(
     default_model: String,
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
     soul_cache: SoulCache,
-    skills_cache: skills::SkillsCache,
+    skills_cache: skills::SkillMatcher,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -649,7 +649,7 @@ async fn handle_chat(
     // skill body as a system-prompt section so the model sees
     // "you have a procedure for this — use it." `None` (no
     // match / empty library) leaves the prompt unchanged.
-    let system_prompt = match skills_cache.matched_hint(prompt) {
+    let system_prompt = match skills_cache.matched_hint(prompt).await {
         Some(hint) => Some(match system_prompt {
             Some(existing) => {
                 let mut combined = existing;
@@ -792,7 +792,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -801,7 +801,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -814,7 +814,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -838,7 +838,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"only-session-id"),
         )
         .await;
@@ -856,7 +856,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"|hello|"),
         )
         .await;
@@ -895,7 +895,7 @@ mod tests {
             String::new(),
             empty_mem(),
             soul,
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -932,7 +932,7 @@ mod tests {
             String::new(),
             cell,
             soul,
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -960,7 +960,7 @@ mod tests {
             String::new(),
             empty_mem(),
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -982,7 +982,7 @@ mod tests {
             body: "# deploy-staging\n\nRun ./scripts/deploy-staging.sh.".into(),
             title: "deploy-staging".into(),
         };
-        let cache = skills::SkillsCache::from_vec(vec![skill]);
+        let cache = skills::SkillMatcher::keyword_only(skills::SkillsCache::from_vec(vec![skill]));
         let r = handle_chat(
             rec_provider,
             String::new(),
@@ -1023,7 +1023,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1055,7 +1055,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1110,7 +1110,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -1146,7 +1146,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -1185,7 +1185,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1305,7 +1305,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1345,7 +1345,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1383,7 +1383,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1422,7 +1422,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1482,7 +1482,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1582,7 +1582,7 @@ mod tests {
             String::new(),
             cell,
             SoulCache::no_op(),
-            skills::SkillsCache::empty(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             ctx(b"s1|hello|"),
         )
         .await;

@@ -3075,13 +3075,31 @@ fn register_node_type_handlers(
         // is a follow-up — operators today restart the
         // controller to pick up new skills.
         let skills_cache = crate::nodes::ai::skills::SkillsCache::load(&[]);
+        // Skill matcher prefers embedding-cosine similarity
+        // when an embedding-capable provider is wired. The
+        // matcher hands the provider directly (no libp2p hop)
+        // via `ProviderEmbedAdapter` and lazily embeds the
+        // skill catalogue on the first matching call. If the
+        // provider doesn't support embeddings, the bulk-embed
+        // returns Err and the matcher falls back to keyword
+        // overlap silently.
+        let embed_adapter: std::sync::Arc<dyn crate::nodes::ai::skills::SkillEmbedDispatcher> =
+            std::sync::Arc::new(crate::nodes::ai::skills::ProviderEmbedAdapter(
+                provider.clone(),
+            ));
+        let skill_matcher = crate::nodes::ai::skills::SkillMatcher::new(
+            skills_cache,
+            Some(embed_adapter),
+            default_model.clone(),
+            crate::nodes::ai::skills::SKILL_MATCH_THRESHOLD,
+        );
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
             default_model.clone(),
             memory_cell.clone(),
             soul_cache,
-            skills_cache,
+            skill_matcher,
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when

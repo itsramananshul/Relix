@@ -289,9 +289,238 @@ impl SkillsCache {
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
+
+    /// Borrow the underlying skill list. Used by
+    /// [`SkillMatcher`] to walk the catalogue without taking a
+    /// second clone of the inner Arc.
+    pub fn skills(&self) -> &[Skill] {
+        &self.skills
+    }
 }
 
 use std::sync::Arc;
+
+// ── Embedding-similarity matcher ───────────────────────────
+
+/// Default cosine-similarity threshold for skill matches.
+/// Empirically conservative — cosine in the 0.6-0.8 band is
+/// "topically related"; >= 0.75 is "this prompt is asking for
+/// the procedure described in this skill."
+pub const SKILL_MATCH_THRESHOLD: f32 = 0.75;
+
+/// Skill matcher that prefers embedding-cosine similarity when
+/// an embedding dispatcher is wired, falling back to the
+/// existing keyword-overlap path otherwise. The matcher is the
+/// surface the AI handler consumes; `SkillsCache` remains the
+/// underlying catalogue and stays useful on its own (the
+/// `relix skills list` CLI uses it directly).
+///
+/// The skill embedding cache is populated lazily on the first
+/// `matched_hint` call that actually has a dispatcher. We
+/// deliberately do NOT block at startup: in production the
+/// embedding dispatcher cell is filled post-rpc, so a
+/// constructor-time embed would race the cell. Lazy population
+/// also means a controller with no embedding peer never makes
+/// an embed RPC for skills.
+#[derive(Clone)]
+pub struct SkillMatcher {
+    cache: SkillsCache,
+    /// Boxed trait object — held as a generic so callers don't
+    /// have to import the embedding-dispatcher trait. The
+    /// concrete type is
+    /// `Arc<dyn crate::nodes::memory::EmbeddingDispatcher>` in
+    /// production; tests inject their own.
+    embed_dispatcher: Option<Arc<dyn SkillEmbedDispatcher>>,
+    model: String,
+    threshold: f32,
+    /// Cached skill embeddings keyed by skill name. Filled on
+    /// first matched_hint call with a dispatcher.
+    skill_vectors: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Vec<f32>>>>,
+}
+
+/// Slim dispatcher trait — narrower than the
+/// `nodes::memory::EmbeddingDispatcher` trait so callers don't
+/// need to import the whole memory module just to feed
+/// `SkillMatcher`. A blanket impl below adapts any concrete
+/// dispatcher that exposes the same shape.
+#[async_trait::async_trait]
+pub trait SkillEmbedDispatcher: Send + Sync {
+    /// Embed a batch of texts. Returns one vector per input
+    /// text in the same order.
+    async fn embed(&self, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, String>;
+}
+
+impl SkillMatcher {
+    /// New matcher. Passing `None` for `embed` short-circuits
+    /// to keyword overlap; passing `Some` enables cosine
+    /// matching gated by `threshold`. `SKILL_MATCH_THRESHOLD`
+    /// is the recommended default.
+    pub fn new(
+        cache: SkillsCache,
+        embed: Option<Arc<dyn SkillEmbedDispatcher>>,
+        model: String,
+        threshold: f32,
+    ) -> Self {
+        Self {
+            cache,
+            embed_dispatcher: embed,
+            model,
+            threshold,
+            skill_vectors: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Convenience: keyword-only matcher wrapping the supplied
+    /// cache. Same behaviour as the legacy
+    /// `SkillsCache::matched_hint` surface — used by tests and
+    /// by AI controllers that don't have an embedding peer
+    /// wired.
+    pub fn keyword_only(cache: SkillsCache) -> Self {
+        Self::new(cache, None, String::new(), SKILL_MATCH_THRESHOLD)
+    }
+
+    /// Match the prompt and return the hint envelope on hit.
+    /// `None` means "no relevant skill" and the AI handler
+    /// skips the prepend.
+    pub async fn matched_hint(&self, prompt: &str) -> Option<String> {
+        let dispatcher = match self.embed_dispatcher.clone() {
+            Some(d) => d,
+            None => return self.cache.matched_hint(prompt),
+        };
+        // Lazy embed: populate skill_vectors once with the
+        // skill bodies, then keep using the cached values for
+        // every subsequent call.
+        self.ensure_skill_vectors_loaded(&*dispatcher).await;
+        let vectors = self.skill_vectors.read().await;
+        if vectors.is_empty() {
+            // Embed failed earlier and we have nothing to
+            // compare against — fall back to keyword.
+            drop(vectors);
+            return self.cache.matched_hint(prompt);
+        }
+        let query_vec = match dispatcher.embed(&self.model, &[prompt]).await {
+            Ok(mut v) => v.pop().unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "skill matcher: prompt embed failed; falling back to keyword overlap"
+                );
+                drop(vectors);
+                return self.cache.matched_hint(prompt);
+            }
+        };
+        if query_vec.is_empty() {
+            drop(vectors);
+            return self.cache.matched_hint(prompt);
+        }
+        let mut best_score: f32 = 0.0;
+        let mut best_name: Option<String> = None;
+        for (name, vec) in vectors.iter() {
+            let score = cosine_similarity(&query_vec, vec);
+            if score > best_score {
+                best_score = score;
+                best_name = Some(name.clone());
+            }
+        }
+        if best_score < self.threshold {
+            return None;
+        }
+        let best_name = best_name?;
+        let skill = self.cache.skills().iter().find(|s| s.name == best_name)?;
+        Some(render_skill_hint(skill))
+    }
+
+    async fn ensure_skill_vectors_loaded(&self, dispatcher: &dyn SkillEmbedDispatcher) {
+        // Fast path: already populated.
+        if !self.skill_vectors.read().await.is_empty() {
+            return;
+        }
+        let skills = self.cache.skills();
+        if skills.is_empty() {
+            return;
+        }
+        let texts: Vec<String> = skills
+            .iter()
+            .map(|s| format!("{}\n{}", s.title, s.body))
+            .collect();
+        let text_refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+        match dispatcher.embed(&self.model, &text_refs).await {
+            Ok(vectors) if vectors.len() == skills.len() => {
+                let mut map = self.skill_vectors.write().await;
+                for (skill, vec) in skills.iter().zip(vectors) {
+                    map.insert(skill.name.clone(), vec);
+                }
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    got = other.len(),
+                    want = skills.len(),
+                    "skill matcher: dispatcher returned wrong number of vectors; keyword fallback active"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "skill matcher: bulk skill embed failed; keyword fallback active"
+                );
+            }
+        }
+    }
+}
+
+/// Adapter that wraps the memory module's wider
+/// `EmbeddingDispatcher` trait so callers in the AI handler
+/// can pass the same dispatcher they hand to the memory
+/// embedder without writing a second one.
+pub struct MemoryEmbedAdapter(pub Arc<dyn crate::nodes::memory::EmbeddingDispatcher>);
+
+#[async_trait::async_trait]
+impl SkillEmbedDispatcher for MemoryEmbedAdapter {
+    async fn embed(&self, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        self.0.embed(model, texts).await.map_err(|e| e.to_string())
+    }
+}
+
+/// Adapter that wraps the AI controller's own
+/// [`crate::nodes::ai::provider::ChatProvider`] so the matcher
+/// can call `generate_embeddings` directly without a libp2p
+/// hop. Production wiring in `controller_runtime` uses this so
+/// skill matching reuses the same provider instance that
+/// already serves `ai.chat` / `ai.embed`.
+pub struct ProviderEmbedAdapter(pub Arc<dyn crate::nodes::ai::provider::ChatProvider>);
+
+#[async_trait::async_trait]
+impl SkillEmbedDispatcher for ProviderEmbedAdapter {
+    async fn embed(&self, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        let input = crate::nodes::ai::provider::EmbedInput {
+            model: model.to_string(),
+            texts: texts.iter().map(|s| s.to_string()).collect(),
+        };
+        match self.0.generate_embeddings(input).await {
+            Ok(out) => Ok(out.vectors),
+            Err(e) => Err(format!("provider embed: {e}")),
+        }
+    }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na <= 0.0 || nb <= 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
 
 // ── Auto-skill generation ───────────────────────────────────
 
@@ -718,5 +947,139 @@ mod tests {
         assert!(!cfg.auto_generate);
         assert_eq!(cfg.max_age_days, 30);
         assert!(cfg.auto_dir.is_none());
+    }
+
+    // ── SkillMatcher ─────────────────────────────────────
+
+    fn deploy_skill() -> Skill {
+        Skill {
+            name: "deploy-staging".into(),
+            path: PathBuf::from("deploy-staging.md"),
+            body: "# deploy-staging\n\nProcedure to ship code to the staging env.".into(),
+            title: "deploy-staging".into(),
+        }
+    }
+
+    fn coffee_skill() -> Skill {
+        Skill {
+            name: "make-coffee".into(),
+            path: PathBuf::from("make-coffee.md"),
+            body: "# make-coffee\n\nGrind beans, brew water, pour.".into(),
+            title: "make-coffee".into(),
+        }
+    }
+
+    /// Stub embed dispatcher that returns deterministic
+    /// vectors keyed by the first token of the input. The
+    /// vectors are 3-dim so we can craft known cosine results.
+    struct StubEmbed;
+
+    #[async_trait::async_trait]
+    impl SkillEmbedDispatcher for StubEmbed {
+        async fn embed(&self, _model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            let mut out = Vec::new();
+            for t in texts {
+                let v = if t.contains("deploy") || t.contains("staging") || t.contains("ship") {
+                    vec![1.0, 0.0, 0.0]
+                } else if t.contains("coffee") || t.contains("brew") {
+                    vec![0.0, 1.0, 0.0]
+                } else if t.contains("weather") {
+                    vec![0.0, 0.0, 1.0]
+                } else {
+                    vec![0.5, 0.5, 0.0] // ambiguous
+                };
+                out.push(v);
+            }
+            Ok(out)
+        }
+    }
+
+    struct FailingEmbed;
+
+    #[async_trait::async_trait]
+    impl SkillEmbedDispatcher for FailingEmbed {
+        async fn embed(&self, _model: &str, _texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            Err("embed unreachable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn matcher_with_none_dispatcher_falls_back_to_keyword_overlap() {
+        let cache = SkillsCache::from_vec(vec![deploy_skill(), coffee_skill()]);
+        let matcher = SkillMatcher::new(cache, None, "stub".into(), SKILL_MATCH_THRESHOLD);
+        // Strong keyword overlap on "deploy staging" — keyword
+        // matcher should fire.
+        let hint = matcher.matched_hint("please deploy staging now").await;
+        let hint = hint.expect("keyword matcher should find a hit");
+        assert!(hint.contains("## Skill: deploy-staging"));
+    }
+
+    #[tokio::test]
+    async fn matcher_with_stub_dispatcher_uses_embedding_similarity() {
+        let cache = SkillsCache::from_vec(vec![deploy_skill(), coffee_skill()]);
+        let matcher = SkillMatcher::new(
+            cache,
+            Some(Arc::new(StubEmbed)),
+            "stub".into(),
+            SKILL_MATCH_THRESHOLD,
+        );
+        // The stub maps "deploy" and "ship" to the same unit
+        // vector — cosine = 1.0 > threshold.
+        let hint = matcher.matched_hint("how do I ship to staging?").await;
+        let hint = hint.expect("embedding match should find deploy skill");
+        assert!(hint.contains("## Skill: deploy-staging"));
+    }
+
+    #[tokio::test]
+    async fn matcher_below_threshold_returns_none() {
+        let cache = SkillsCache::from_vec(vec![deploy_skill(), coffee_skill()]);
+        // Set a threshold of 1.5 — impossible to satisfy
+        // (cosine maxes at 1.0). Should always return None.
+        let matcher = SkillMatcher::new(cache, Some(Arc::new(StubEmbed)), "stub".into(), 1.5);
+        let hint = matcher.matched_hint("deploy staging now").await;
+        assert!(hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn matcher_falls_back_to_keyword_when_dispatcher_errors() {
+        let cache = SkillsCache::from_vec(vec![deploy_skill(), coffee_skill()]);
+        let matcher = SkillMatcher::new(
+            cache,
+            Some(Arc::new(FailingEmbed)),
+            "stub".into(),
+            SKILL_MATCH_THRESHOLD,
+        );
+        // The bulk-embed call fails; per-call embed never gets
+        // to run because skill_vectors is empty. Either way,
+        // the matcher should fall back to keyword overlap and
+        // still find a hit.
+        let hint = matcher.matched_hint("deploy staging now").await;
+        let hint = hint.expect("keyword fallback should kick in");
+        assert!(hint.contains("## Skill: deploy-staging"));
+    }
+
+    #[tokio::test]
+    async fn matcher_picks_highest_cosine_among_multiple_skills() {
+        let cache = SkillsCache::from_vec(vec![deploy_skill(), coffee_skill()]);
+        let matcher = SkillMatcher::new(
+            cache,
+            Some(Arc::new(StubEmbed)),
+            "stub".into(),
+            SKILL_MATCH_THRESHOLD,
+        );
+        // "brew espresso" → unit vector on the coffee axis.
+        let hint = matcher.matched_hint("can you brew espresso?").await;
+        let hint = hint.expect("should match the coffee skill");
+        assert!(hint.contains("## Skill: make-coffee"));
+    }
+
+    #[test]
+    fn cosine_helper_handles_edge_cases() {
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+        // Mismatched lengths → 0.
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), 0.0);
+        // Zero vectors → 0 (no divide-by-zero).
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
     }
 }
