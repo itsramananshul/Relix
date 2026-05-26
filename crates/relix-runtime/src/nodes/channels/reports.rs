@@ -174,12 +174,117 @@ pub trait ReportSource: Send + Sync {
 /// is a closure that takes the rendered text + returns Ok on
 /// success. The reporter calls every configured channel; one
 /// failure doesn't block the others.
-#[allow(dead_code)]
 pub type SendFn =
     Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 /// Period for the daily report in seconds (24 hours).
 pub const DAILY_PERIOD_SECS: i64 = 24 * 3600;
+
+/// Per-channel dispatcher. `name` is the channel slug (matches
+/// the operator's `[reports] channels = [...]` config). `send`
+/// is invoked with the rendered text for that channel — the
+/// reporter calls the channel-specific renderer based on the
+/// name (`telegram` / `discord` / `slack`).
+#[derive(Clone)]
+pub struct ChannelSender {
+    pub name: String,
+    pub send: SendFn,
+}
+
+/// Spawn the background reports loop. Returns the
+/// `JoinHandle` so callers (controller_runtime) can keep the
+/// task alive for the process lifetime. Drops the handle to
+/// detach.
+///
+/// Algorithm:
+/// 1. Parse the cron schedule once at spawn time. A malformed
+///    schedule logs a `tracing::error!` and the loop never
+///    fires (the rest of the controller still boots).
+/// 2. Compute the next fire instant via the existing
+///    `coordinator::cron::schedule::Schedule::next_after`.
+/// 3. Sleep until then, assemble the report from `source`,
+///    render per-channel, dispatch concurrently.
+/// 4. Loop forever; one channel failing doesn't block others.
+///
+/// Honest scope: missed-tick replay is NOT implemented — if
+/// the process is down across a fire window, the next
+/// scheduled time is what operators get. That matches the
+/// design intent in `docs/channel-node-architecture.md`.
+pub fn spawn_report_loop(
+    cfg: ReportsConfig,
+    source: Arc<dyn ReportSource>,
+    channels: Vec<ChannelSender>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run_report_loop(cfg, source, channels).await;
+    })
+}
+
+async fn run_report_loop(
+    cfg: ReportsConfig,
+    source: Arc<dyn ReportSource>,
+    channels: Vec<ChannelSender>,
+) {
+    if !cfg.enabled {
+        tracing::info!("reports: disabled; loop will not fire");
+        return;
+    }
+    let schedule = match crate::nodes::coordinator::cron::schedule::Schedule::parse(&cfg.schedule) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                schedule = %cfg.schedule,
+                error = %e,
+                "reports: malformed schedule expression; loop will not fire"
+            );
+            return;
+        }
+    };
+    if channels.is_empty() {
+        tracing::warn!(
+            "reports: enabled but no channels configured; loop will fire but messages \
+             go nowhere"
+        );
+    }
+    tracing::info!(
+        schedule = %cfg.schedule,
+        channels = ?channels.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        "reports: scheduler started"
+    );
+    loop {
+        let now = unix_secs();
+        let next = schedule.next_after(now);
+        let wait = (next - now).max(1) as u64;
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+
+        let report = source.assemble(DAILY_PERIOD_SECS).await;
+        for ch in &channels {
+            let rendered = match ch.name.as_str() {
+                "telegram" => report.render_telegram(),
+                "discord" => report.render_discord(),
+                "slack" => report.render_slack(),
+                other => {
+                    tracing::warn!(channel = other, "reports: unknown channel; skipping");
+                    continue;
+                }
+            };
+            let send = ch.send.clone();
+            let name = ch.name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = (send)(rendered).await {
+                    tracing::warn!(channel = %name, error = %e, "reports: dispatch failed");
+                }
+            });
+        }
+    }
+}
+
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -256,6 +361,46 @@ mod tests {
         assert!(!c.enabled);
         assert_eq!(c.schedule, "0 9 * * *");
         assert!(c.channels.is_empty());
+    }
+
+    #[test]
+    fn next_fire_calculation_uses_existing_schedule_parser() {
+        // Sanity that the spawn loop's schedule parser handles
+        // both 5-field cron and duration shorthand. The actual
+        // arithmetic lives in the cron module; this test just
+        // confirms reports honour both shapes.
+        let cron = crate::nodes::coordinator::cron::schedule::Schedule::parse("0 9 * * 1");
+        assert!(cron.is_ok(), "5-field cron must parse");
+        let dur = crate::nodes::coordinator::cron::schedule::Schedule::parse("30m");
+        assert!(dur.is_ok(), "duration shorthand must parse");
+        let dur = dur.unwrap();
+        // 30m == 1800s from `now`.
+        let now = 1_700_000_000;
+        let next = dur.next_after(now);
+        assert_eq!(next - now, 1800);
+    }
+
+    #[tokio::test]
+    async fn spawn_report_loop_returns_immediately_when_disabled() {
+        // `enabled = false` short-circuits — the spawned task
+        // should complete on its own without firing.
+        let cfg = ReportsConfig {
+            enabled: false,
+            schedule: "0 9 * * 1".into(),
+            channels: vec![],
+        };
+        struct DummySource;
+        #[async_trait::async_trait]
+        impl ReportSource for DummySource {
+            async fn assemble(&self, _: i64) -> SummaryReport {
+                sample_report()
+            }
+        }
+        let handle = spawn_report_loop(cfg, Arc::new(DummySource), Vec::new());
+        // Race against a generous deadline — the task must
+        // complete because `enabled = false` returns early.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(res.is_ok(), "disabled loop should exit immediately");
     }
 
     #[test]

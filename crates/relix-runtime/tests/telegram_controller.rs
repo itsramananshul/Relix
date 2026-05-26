@@ -539,9 +539,7 @@ async fn e2e_allowed_users_admits_user_on_the_list() {
         .collect();
     assert_eq!(
         texts,
-        vec![relix_runtime::nodes::channels::format_for_telegram_markdown_v2(
-            "authorised-reply"
-        )]
+        vec![relix_runtime::nodes::channels::format_for_telegram_markdown_v2("authorised-reply")]
     );
 }
 

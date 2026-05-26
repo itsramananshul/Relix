@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(
             sent[0].text,
-            crate::nodes::channels::format_for_telegram_markdown_v2(&unauthorised_message())
+crate::nodes::channels::format_for_telegram_markdown_v2(unauthorised_message())
         );
         // AI was not invoked.
         assert!(out.ai_chat_calls.lock().unwrap().is_empty());
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(
             sent[0].text,
-            crate::nodes::channels::format_for_telegram_markdown_v2(&brain_unreachable_message())
+crate::nodes::channels::format_for_telegram_markdown_v2(brain_unreachable_message())
         );
     }
 
@@ -699,7 +699,7 @@ mod tests {
         let sent = api.sent_messages();
         assert_eq!(
             sent[0].text,
-            crate::nodes::channels::format_for_telegram_markdown_v2(&brain_unreachable_message())
+crate::nodes::channels::format_for_telegram_markdown_v2(brain_unreachable_message())
         );
         // Task flipped to failed.
         let updates = out.task_updates.lock().unwrap();
