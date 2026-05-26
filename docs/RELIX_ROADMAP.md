@@ -4123,14 +4123,36 @@ Closing the gaps from STATE-OF-RELIX §10.2.
 | SOL list literal `[a, b, c]` + 6 `list_*` built-ins | DONE | `7986eba` |
 | SOL map literal `{ "k": v }` + 6 `map_*` built-ins | DONE | `7986eba` |
 | Sflow list / map literal parity with same built-in surface | DONE | `8aeaf6b` |
-| Cross-language parity doc | DONE | this commit (see `docs/sol-sflow-parity.md`) |
+| Sflow `for x in <list>` loop | DONE | `c489bfd` |
+| Nested list / map support — typed accessors in SOL + Sflow | DONE | `faada4a` |
+| Cross-language parity doc | DONE | `eadba5b` + this commit (`docs/sol-sflow-parity.md`) |
 
 What's still open in this space:
 
-- Sflow `for x in lst { … }` (today: `loop N times` + `list_get`).
-- Nested lists / maps (today: parseable, but built-ins flatten).
 - SOL `int` / `bool` types on `remote_call` boundary (today: `str` only).
 - Mid-flow pause / resume (still genuinely absent; see §6/§12).
+- Numeric typing for `list_len` / `map_len` in Sflow
+  (returns `"N"` as a string today; SOL returns a real `int`).
+
+## Tool-node Capability Expansion `[DONE — shipped May 2026]`
+
+| Feature | Status | Commits |
+|---|---|---|
+| Playwright backend `click` / `type_text` / `wait_for_selector` | DONE | `26e3ec9` |
+| MCP HTTP transport — POST JSON-RPC, auth header, retry/backoff | DONE | `db3515b` |
+| MCP HTTP boot-time tool discovery | DONE | `db3515b` |
+
+What's still open in this space:
+
+- MCP HTTP+SSE legacy transport (subscribe + streamed responses).
+  Streamable-HTTP variant ships today; HTTP+SSE deferred.
+- Bridge-level end-to-end streaming. Provider-native streaming is
+  real (OpenAI-compat + Anthropic). The bridge consumes the
+  materialised reply because the flow runner's `ChatFlowOutcome`
+  is synchronous; closing this requires either a streaming
+  primitive in the flow runner or a flow-runner bypass that
+  duplicates provider config on the bridge (security regression).
+  Tracked as SIMP-019.
 
 ## SOL Language Documentation `[IDEA — HIGH PRIORITY]`
 

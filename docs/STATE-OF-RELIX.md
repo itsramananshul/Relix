@@ -695,20 +695,34 @@ the plugin_host node), no streaming response shape (one-shot
 JSON request/reply only). The protocol leaves room for these
 without breaking compatibility.
 
-### 6.2 Playwright browser backend — scaffold
+### 6.2 Playwright browser backend — shipped
 
-`[tool.browser] backend = "playwright"` selects a scaffold that returns
-`BackendNotConnected` on every operation (`navigate` / `click` /
-`type_text` / `wait_for_selector` / `screenshot`). The headless_chrome
-and webdriver backends are real; playwright is not. The sidecar
-protocol is not designed.
+`[tool.browser] backend = "playwright"` selects the live driver
+(behind the `browser-playwright` Cargo feature). It lazy-spawns a
+Node.js sidecar that imports `playwright-core` and speaks
+newline-delimited JSON-RPC over stdio. Six trait methods are
+real today: `open_session`, `close_session`, `navigate`,
+`get_text`, `screenshot`, `list_sessions`, plus `click`,
+`type_text`, and `wait_for_selector` (F12). Operators without
+Node + playwright-core installed get a precise
+`BackendNotConnected` cause from the sidecar's startup error
+envelope — no fake success. The default backend is still
+`headless_chrome`; switching is a config-only change.
 
-### 6.3 MCP HTTP transport
+### 6.3 MCP HTTP transport — shipped
 
-`tool.mcp.invoke` over HTTP transport returns `RuntimeNotConnected`.
-Only stdio is implemented (lazy spawn, JSON-RPC over child process
-pipes). Operators can register HTTP MCP servers in config but cannot
-invoke them.
+`tool.mcp.invoke` over HTTP transport runs a live JSON-RPC POST
+against the configured endpoint (F13). The client speaks the
+Streamable-HTTP variant of MCP — one POST per request, JSON
+response. Auth header is forwarded when the server config
+sets `auth_header`. Transient failures (connect / 5xx / 429)
+retry with exponential backoff up to `reconnect_max` attempts
+(default 3). Boot-time discovery runs `tools/list` against
+every HTTP server and logs the discovered tool count; a server
+down at boot doesn't fail the tool node. The legacy HTTP+SSE
+variant (initialize once, subscribe to SSE for streamed
+responses) is NOT supported — operators who need that should
+continue with stdio for now.
 
 ### 6.4 OpenAI shim drops fields
 
@@ -718,11 +732,34 @@ ignores: `temperature`, `top_p`, `n`, `presence_penalty`,
 `response_format`, `seed`, `stop`, `stream_options`. The bridge sends
 only `model` + `messages` to the AI node. SIMP-020.
 
-### 6.5 Streaming is chunk-sliced, not provider-native
+### 6.5 Streaming — provider real, bridge bridge-level
 
-`POST /chat/stream` and `stream:true` slice the **already-materialised**
-reply into 24-byte SSE chunks. The AI provider's stream (if any) is
-consumed eagerly first. SIMP-019.
+Provider-side streaming is real today. The OpenAI-compatible
+provider (`openai_compat::OpenAICompatibleProvider::generate_reply_stream`)
+parses upstream `/v1/chat/completions` SSE frames and yields
+per-token `choices[0].delta.content` chunks. The Anthropic
+provider (`anthropic::AnthropicProvider::generate_reply_stream`)
+parses Messages-API SSE events and yields per-token
+`content_block_delta.text_delta` chunks. Both skip role-only,
+ping, and thinking-delta frames; both surface terminal
+`message_stop` / `[DONE]` as stream end.
+
+The BRIDGE still consumes the materialised reply first, then
+chunks it into SSE frames in `build_openai_sse`. That's
+because the bridge runs a SOL/Sflow flow to drive the chat —
+the flow runner's `ChatFlowOutcome` carries the complete
+`reply: String` and there is no streaming primitive in the SOL
+VM today (`remote_call` is sync, returns a single string).
+Wiring end-to-end real streaming requires either a streaming
+primitive in the flow runner (multi-file refactor) or a
+flow-runner bypass for `stream:true` requests that talks
+directly to the AI provider — which would duplicate API keys
+and provider config on the bridge, regressing the security
+model where keys live ONLY on the AI node.
+
+The provider-native code is the load-bearing part; closing
+the bridge-side gap is queued as a separate architectural
+decision (SIMP-019).
 
 ### 6.6 Manifests are not signed
 

@@ -16,7 +16,8 @@ where genuine gaps remain.
 | `map_get` / `_set` / `_has` / `_keys` / `_len` / `_del` | ✅ each = one dedicated `Inst::*` opcode | ✅ each = an arm in `eval_builtin` |
 | Immutable update semantics | ✅ all `*_set` / `*_push` / `*_del` return a fresh heap object | ✅ same — `eval_builtin` returns a fresh `SflowValue` |
 | Out-of-bounds / missing-key returns empty string | ✅ | ✅ |
-| `for x in lst { … }` iteration | ✅ via new `Inst::ListLen` / `Inst::ListGet` | ❌ — Sflow has no `for-in` construct; use `loop N times` + `list_get` |
+| `for x in lst { … }` iteration | ✅ via `Inst::ListLen` / `Inst::ListGet` | ✅ F9 — `for x in <list>` binds each element as `SflowValue::String` (loop var restored after `end`) |
+| Nested lists / maps | ✅ F11 — `Inst::ListGetList` / `Inst::MapGetMap` typed accessors; `ListJoin` recurses via `heap_display` | ✅ F11 — `SflowValue::List(Vec<SflowValue>)` / `Map(Vec<(String, SflowValue)>)`; `list_get_list` / `map_get_map` typed accessors |
 | Type tracking | ✅ `Type::List` / `Type::Map` in the analyzer; `let xs: list = …` checked | ❌ — Sflow has no `let` / type annotations |
 | Heterogeneous elements | ✅ values are raw `u64` heap refs | ⚠ — Sflow stores all elements as `String`; non-string values stringify on insert |
 
@@ -48,17 +49,14 @@ in Sflow. That is because Sflow has no `bool` type — every
 condition compares strings. The canonical Sflow idiom is
 `if list_contains(var.xs, "x") == "true" …`.
 
-### Sflow has no `for-in`
+### Both languages have `for-in` (F9)
 
-SOL ships `for x in lst { … }` with codegen routing to
-`Inst::ListLen` / `Inst::ListGet`. Sflow has no `for-in`
-construct (the parser would need a new statement form) so list
-iteration in Sflow is `loop N times` + `list_get(lst, "${loop.iter}")`.
-
-Closing this gap requires adding a new `Stmt::ForIn` variant
-to Sflow + executor support. Not done — the existing
-`loop N times` pattern is good enough for the common case
-(operator iterating a fixed-length list).
+`for x in <list>` works in both SOL and Sflow. SOL binds the
+loop variable as `str` (the list element); Sflow binds the
+typed `SflowValue` so a nested list inside a list-of-lists
+exposes each inner list to the body as a real list. Both
+languages honor the per-execution loop iteration cap and write
+`sol.loop_iter` chronicle events on each iteration.
 
 ### Sflow tolerates string-encoded lists / maps where SOL doesn't
 
@@ -75,20 +73,17 @@ in a list slot.
 
 ## Remaining gaps
 
-- **Sflow `for-in`** — needs a new statement form + executor
-  support. The existing `loop N times` idiom covers the common
-  case but lacks the symmetric ergonomics with SOL.
-- **Nested lists / maps** — neither language supports a list
-  of lists or a map of maps. The VM can carry the refs (heap
-  values are `u64`) but the built-ins flatten on read. Future
-  work: add `list_get_list(...)` / `map_get_map(...)` accessors
-  that return the typed inner value.
 - **Numeric typing for `list_len` / `map_len` / `list_get`
   index** — Sflow returns `"3"` as a string and the index
   parameter has to be a `"0"` string. SOL returns a real `int`.
   Future work: add a `to_int` / `to_str` pair of conversion
   built-ins in Sflow so flows can mix-and-match without
   string-parsing the count.
+- **`{}` map literal in SOL condition context** — SOL gates
+  map literal parsing on `can_struct`, so `if cond {}` reads
+  the brace as an if-body opener rather than an empty map.
+  This is intentional disambiguation, not a missing feature,
+  but operators should know.
 
 These gaps are documented as known limitations rather than
 silent divergences — operators authoring parity flows can read
