@@ -123,6 +123,103 @@ pub enum Ast {
     },
 }
 
+/// Expand `{{name}}` markers inside a string literal into a
+/// concatenation of `ExprString` + `ExprVar` chunks joined by
+/// `Token::Plus`. The result is identical to writing
+/// `"prefix " + name + " suffix"` by hand — no new VM opcode
+/// or runtime path is needed.
+///
+/// Rules:
+///
+/// - `{{ident}}` becomes `ExprVar(ident)` where `ident` is
+///   one or more `[A-Za-z0-9_]` chars. Whitespace inside the
+///   braces is trimmed.
+/// - `{{` without a closing `}}` is preserved verbatim so the
+///   operator sees the typo in their flow source.
+/// - `{{}}` (empty marker) is preserved verbatim for the same
+///   reason.
+/// - A string with no `{{...}}` markers returns the original
+///   `Ast::ExprString(s)` with zero allocation overhead.
+pub fn expand_string_interpolation(raw: &str) -> Ast {
+    if !raw.contains("{{") {
+        return Ast::ExprString(raw.to_string());
+    }
+    let mut chunks: Vec<Ast> = Vec::new();
+    let mut buf = String::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Look ahead for `{{` opener.
+        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            // Find the matching `}}`.
+            let body_start = i + 2;
+            let mut j = body_start;
+            let mut closer: Option<usize> = None;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b'}' && bytes[j + 1] == b'}' {
+                    closer = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            match closer {
+                Some(end) => {
+                    let name = std::str::from_utf8(&bytes[body_start..end])
+                        .unwrap_or("")
+                        .trim();
+                    let is_ident =
+                        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+                    if !is_ident {
+                        // Empty or non-identifier marker: keep
+                        // the original `{{...}}` text so the
+                        // operator sees what went wrong.
+                        let raw_marker = std::str::from_utf8(&bytes[i..end + 2]).unwrap_or("");
+                        buf.push_str(raw_marker);
+                        i = end + 2;
+                        continue;
+                    }
+                    // Flush buffered literal text.
+                    if !buf.is_empty() {
+                        chunks.push(Ast::ExprString(std::mem::take(&mut buf)));
+                    }
+                    chunks.push(Ast::ExprVar(name.to_string()));
+                    i = end + 2;
+                    continue;
+                }
+                None => {
+                    // Unterminated `{{` — preserve verbatim.
+                    let tail = std::str::from_utf8(&bytes[i..]).unwrap_or("");
+                    buf.push_str(tail);
+                    i = bytes.len();
+                    continue;
+                }
+            }
+        }
+        // Push one UTF-8 char into the literal buffer.
+        let ch = raw[i..].chars().next().unwrap();
+        let n = ch.len_utf8();
+        buf.push(ch);
+        i += n;
+    }
+    if !buf.is_empty() {
+        chunks.push(Ast::ExprString(buf));
+    }
+    if chunks.is_empty() {
+        return Ast::ExprString(String::new());
+    }
+    // Fold left into a concat chain: `a + b + c`.
+    let mut iter = chunks.into_iter();
+    let mut acc = iter.next().unwrap();
+    for next in iter {
+        acc = Ast::ExprBinary {
+            lhs: Box::new(acc),
+            rhs: Box::new(next),
+            op: Token::Plus,
+        };
+    }
+    acc
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     index: usize,
@@ -718,7 +815,7 @@ impl Parser {
             }
             TokenKind::String => {
                 if let Token::String(v) = self.advance() {
-                    Some(Ast::ExprString(v))
+                    Some(expand_string_interpolation(&v))
                 } else {
                     None
                 }
@@ -836,5 +933,148 @@ impl Parser {
             panic!("could not parse expression!");
         }
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_string(ast: &Ast, expected: &str) {
+        match ast {
+            Ast::ExprString(s) => assert_eq!(s, expected),
+            other => panic!("expected ExprString({expected:?}), got {other:?}"),
+        }
+    }
+
+    fn assert_var(ast: &Ast, expected: &str) {
+        match ast {
+            Ast::ExprVar(s) => assert_eq!(s, expected),
+            other => panic!("expected ExprVar({expected:?}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_string_without_markers_returns_plain_expr_string() {
+        match expand_string_interpolation("hello world") {
+            Ast::ExprString(s) => assert_eq!(s, "hello world"),
+            other => panic!("expected ExprString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_string_empty_returns_empty_string() {
+        match expand_string_interpolation("") {
+            Ast::ExprString(s) => assert_eq!(s, ""),
+            other => panic!("expected ExprString(\"\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_single_marker_at_start_expands_to_var_plus_suffix() {
+        let ast = expand_string_interpolation("{{name}} world");
+        match ast {
+            Ast::ExprBinary { lhs, rhs, op } => {
+                assert!(matches!(op, Token::Plus));
+                assert_var(&lhs, "name");
+                assert_string(&rhs, " world");
+            }
+            other => panic!("expected ExprBinary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_single_marker_at_end_expands_to_prefix_plus_var() {
+        let ast = expand_string_interpolation("hi {{name}}");
+        match ast {
+            Ast::ExprBinary { lhs, rhs, op } => {
+                assert!(matches!(op, Token::Plus));
+                assert_string(&lhs, "hi ");
+                assert_var(&rhs, "name");
+            }
+            other => panic!("expected ExprBinary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_marker_in_middle_expands_to_three_chunks() {
+        // `prefix + name + suffix` folds left:
+        //   ((prefix + name) + suffix)
+        let ast = expand_string_interpolation("hello {{name}} world");
+        match ast {
+            Ast::ExprBinary { lhs, rhs, op } => {
+                assert!(matches!(op, Token::Plus));
+                assert_string(&rhs, " world");
+                match *lhs {
+                    Ast::ExprBinary {
+                        lhs: l2,
+                        rhs: r2,
+                        op: op2,
+                    } => {
+                        assert!(matches!(op2, Token::Plus));
+                        assert_string(&l2, "hello ");
+                        assert_var(&r2, "name");
+                    }
+                    other => panic!("expected nested ExprBinary, got {other:?}"),
+                }
+            }
+            other => panic!("expected ExprBinary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_multiple_markers_chain_left_fold() {
+        let ast = expand_string_interpolation("{{a}}{{b}}");
+        // Two adjacent markers fold as `a + b`.
+        match ast {
+            Ast::ExprBinary { lhs, rhs, op } => {
+                assert!(matches!(op, Token::Plus));
+                assert_var(&lhs, "a");
+                assert_var(&rhs, "b");
+            }
+            other => panic!("expected ExprBinary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_whitespace_inside_braces_is_trimmed() {
+        let ast = expand_string_interpolation("{{  name  }}");
+        assert_var(&ast, "name");
+    }
+
+    #[test]
+    fn interp_unterminated_open_brace_preserved_verbatim() {
+        // Operator typo: missing closing `}}`. We keep the
+        // text so they see what went wrong.
+        match expand_string_interpolation("hi {{ no closer") {
+            Ast::ExprString(s) => assert_eq!(s, "hi {{ no closer"),
+            other => panic!("expected ExprString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_empty_marker_preserved_verbatim() {
+        match expand_string_interpolation("hello {{}} world") {
+            Ast::ExprString(s) => assert_eq!(s, "hello {{}} world"),
+            other => panic!("expected ExprString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_non_identifier_inside_braces_preserved_verbatim() {
+        // `{{1+2}}` is not a valid identifier — keep the
+        // literal text so the operator sees the typo. SOL
+        // doesn't try to be clever about expression
+        // interpolation.
+        match expand_string_interpolation("v={{1+2}}") {
+            Ast::ExprString(s) => assert_eq!(s, "v={{1+2}}"),
+            other => panic!("expected ExprString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interp_identifier_with_underscores_and_digits_works() {
+        let ast = expand_string_interpolation("{{user_id_42}}");
+        assert_var(&ast, "user_id_42");
     }
 }

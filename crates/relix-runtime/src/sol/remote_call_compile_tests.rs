@@ -103,3 +103,35 @@ fn codegen_is_deterministic() {
         "two compiles of the same source must produce identical bytecode"
     );
 }
+
+#[test]
+fn string_interpolation_lowers_to_concat_chain() {
+    // `"hi {{name}} bye"` should compile through the same
+    // path as `"hi " + name + " bye"`. The bytecode contains
+    // a PushVar (or LoadVar-shaped op) referencing `name`
+    // and ConcatStr opcodes joining the chunks.
+    let src = r#"
+        function start() {
+            let name: str = "world";
+            let s: str = "hi {{name}} bye";
+            print(s);
+        }
+    "#;
+    let bc = compile(src);
+    let dis = format!("{bc:?}");
+    // The literal chunks must appear as separate strings,
+    // not as the raw `hi {{name}} bye` blob.
+    assert!(
+        dis.contains("\"hi \""),
+        "expected prefix literal in bytecode: {dis}"
+    );
+    assert!(
+        dis.contains("\" bye\""),
+        "expected suffix literal in bytecode: {dis}"
+    );
+    // The raw marker text must NOT appear in any const slot.
+    assert!(
+        !dis.contains("{{name}}"),
+        "interpolation marker leaked into bytecode unexpanded: {dis}"
+    );
+}
