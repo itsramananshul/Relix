@@ -1,5 +1,6 @@
 //! Shared rich-message formatting helpers for the Telegram,
-//! Discord, and Slack channel controllers.
+//! Discord, and Slack channel controllers, plus the scheduled
+//! summary reporter ([`reports`]).
 //!
 //! Plain assistant text → platform-native markdown / Block Kit
 //! envelope. Each channel renders the same input differently:
@@ -17,6 +18,8 @@
 //! (` ```lang\ncode\n``` `) — the most common rich-content
 //! shape assistants emit — and renders them appropriately for
 //! each platform's syntax.
+
+pub mod reports;
 
 /// Discord's per-message limit. The Discord HTTP API rejects
 /// anything bigger with a 400. Real limit is 2000 but we leave
