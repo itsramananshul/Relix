@@ -281,6 +281,7 @@ pub fn register(
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
+    let memory_for_chat = memory_dispatcher.clone();
     let soul_for_chat = soul_cache.clone();
     let skills_for_chat = skills_cache.clone();
     let guardrail_for_chat = input_guardrail.clone();
@@ -291,7 +292,7 @@ pub fn register(
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let p = provider_for_chat.clone();
             let model = model_for_chat.clone();
-            let mem = memory_dispatcher.clone();
+            let mem = memory_for_chat.clone();
             let soul = soul_for_chat.clone();
             let sk = skills_for_chat.clone();
             let gr = guardrail_for_chat.clone();
@@ -299,6 +300,36 @@ pub fn register(
             let mesh = mesh_for_chat.clone();
             async move { handle_chat(p, model, mem, soul, sk, gr, td, mesh, ctx).await }
         })),
+    );
+    // RELIX-2 step 3: register the streaming variant. Shares
+    // the same provider + model + memory + soul + skills +
+    // guardrail as the unary path; differs ONLY in:
+    //   * uses `generate_reply_stream` instead of
+    //     `generate_reply`;
+    //   * skips the planner / tool dispatch / approval verdict
+    //     pipeline (streaming is "stream tokens, period");
+    //   * registered against the bridge's streaming dispatch
+    //     so a `/relix/rpc/stream/1` substream caller hits
+    //     this handler.
+    let provider_for_chat_stream = provider.clone();
+    let model_for_chat_stream = default_model.clone();
+    let mem_for_chat_stream = memory_dispatcher.clone();
+    let soul_for_chat_stream = soul_cache.clone();
+    let skills_for_chat_stream = skills_cache.clone();
+    let guardrail_for_chat_stream = input_guardrail.clone();
+    bridge.register_streaming(
+        "ai.chat.stream",
+        Arc::new(crate::dispatch::FnStreamingHandler(
+            move |ctx: InvocationCtx| {
+                let p = provider_for_chat_stream.clone();
+                let model = model_for_chat_stream.clone();
+                let mem = mem_for_chat_stream.clone();
+                let soul = soul_for_chat_stream.clone();
+                let sk = skills_for_chat_stream.clone();
+                let gr = guardrail_for_chat_stream.clone();
+                async move { handle_chat_stream(p, model, mem, soul, sk, gr, ctx).await }
+            },
+        )),
     );
     let provider_for_embed = provider.clone();
     bridge.register(
@@ -591,6 +622,241 @@ fn merge_history(auto: &str, caller: &str) -> String {
     }
     out.push_str(caller);
     out
+}
+
+#[allow(clippy::too_many_arguments)]
+/// RELIX-2 step 3: pre-flight common to `ai.chat` and
+/// `ai.chat.stream`. Parses the wire args, runs the input
+/// guardrail, fetches memory + RAG, applies SOUL persona +
+/// skill hints, and produces a [`ChatInput`] ready for the
+/// provider. Both the unary `generate_reply` and the streaming
+/// `generate_reply_stream` paths consume the same input.
+///
+/// Errors mirror the early-return shapes from the original
+/// `handle_chat` — invalid utf-8, missing session_id, guardrail
+/// rejection. Callers convert the `ErrorEnvelope` to whichever
+/// response shape their transport expects (unary
+/// `HandlerOutcome::Err`, streaming terminal `StreamFrame::Err`).
+struct ChatPreflight {
+    session_id: String,
+    input: ChatInput,
+    /// Approval token extracted from the request envelope.
+    /// Used by `handle_chat`'s post-flight policy verdict path;
+    /// the streaming variant ignores it (no planner runs).
+    approval_token: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_chat_preflight(
+    args: &[u8],
+    provider: &Arc<dyn ChatProvider>,
+    default_model: &str,
+    memory_dispatcher: &Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
+    soul_cache: &SoulCache,
+    skills_cache: &skills::SkillMatcher,
+    input_guardrail: &guardrails::InputGuardrail,
+    caller_subject_id: &str,
+) -> Result<ChatPreflight, ErrorEnvelope> {
+    let s = match std::str::from_utf8(args) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("ai.chat arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let mut parts = s.splitn(3, '|');
+    let session_id = parts.next().unwrap_or("");
+    let prompt = parts.next();
+    let history = parts.next().unwrap_or("");
+    let Some(prompt) = prompt else {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "ai.chat arg must be `session_id|prompt[|history]`".to_string(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    };
+    if session_id.is_empty() {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "ai.chat: session_id required".to_string(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+
+    // Input guardrail. Same posture as `handle_chat`.
+    let guardrail_result = input_guardrail.check(prompt);
+    if !guardrail_result.allowed {
+        let reason = guardrail_result
+            .reason
+            .unwrap_or_else(|| "input guardrail rejected prompt".to_string());
+        let preview: String = prompt.chars().take(80).collect();
+        tracing::warn!(
+            session_id,
+            preview = %preview,
+            reason = %reason,
+            "ai.chat: input guardrail blocked prompt"
+        );
+        return Err(ErrorEnvelope {
+            kind: error_kinds::SECURITY_DENIED,
+            cause: format!("ai.chat: {reason}"),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    if guardrail_result.pii_detected {
+        tracing::info!(
+            session_id,
+            categories = ?guardrail_result.categories,
+            "ai.chat: input guardrail redacted PII before model call"
+        );
+    }
+    let prompt: &str = &guardrail_result.text;
+
+    // Memory + RAG.
+    let (system_prompt, merged_history) = if let Some(disp) = memory_dispatcher.get() {
+        let agent_block = match disp.fetch(caller_subject_id).await {
+            Some((agent_mem, user_mem)) => {
+                memory_dispatcher::format_memory_block(&agent_mem, &user_mem)
+            }
+            None => None,
+        };
+        let rag_block = if disp.rag_enabled() {
+            embed_and_rag(provider.as_ref(), disp.as_ref(), caller_subject_id, prompt).await
+        } else {
+            None
+        };
+        let sys = combine_system_blocks(agent_block, rag_block);
+        let auto_history = disp.fetch_history(session_id).await.unwrap_or_default();
+        (sys, merge_history(&auto_history, history))
+    } else {
+        (None, history.to_string())
+    };
+
+    // SOUL persona.
+    let system_prompt = match soul_cache.current() {
+        Some(soul) => Some(soul.into_system_prompt(system_prompt.as_deref())),
+        None => system_prompt,
+    };
+
+    // Skill hint.
+    let system_prompt = match skills_cache.matched_hint(prompt).await {
+        Some(hint) => Some(match system_prompt {
+            Some(existing) => {
+                let mut combined = existing;
+                if !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push('\n');
+                combined.push_str(&hint);
+                combined
+            }
+            None => hint,
+        }),
+        None => system_prompt,
+    };
+
+    let approval_token = extract_approval_token(s);
+    let input = ChatInput {
+        session_id: session_id.to_string(),
+        prompt: prompt.to_string(),
+        history: merged_history,
+        model: default_model.to_string(),
+        system_prompt,
+        ..ChatInput::default()
+    };
+    Ok(ChatPreflight {
+        session_id: session_id.to_string(),
+        input,
+        approval_token,
+    })
+}
+
+/// RELIX-2 step 3: `ai.chat.stream` handler. Runs the same
+/// pre-flight as `ai.chat` (guardrails, memory + RAG, soul,
+/// skills) and then pipes tokens from
+/// [`ChatProvider::generate_reply_stream`] through the
+/// dispatcher's `HandlerStream`. Each Ok(chunk) becomes a
+/// `StreamFrame::Chunk` on the wire; a provider error
+/// terminates with `StreamFrame::Err`.
+///
+/// Semantic difference from `ai.chat`: the streaming variant
+/// does NOT run the planner / tool dispatch / approval
+/// verdict pipeline. Streaming is "stream tokens to the user,
+/// period." Operators that need inline tool execution use the
+/// unary `ai.chat`. The capability descriptor declares this
+/// explicitly so the dashboard surfaces the distinction.
+#[allow(clippy::too_many_arguments)]
+async fn handle_chat_stream(
+    provider: Arc<dyn ChatProvider>,
+    default_model: String,
+    memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
+    soul_cache: SoulCache,
+    skills_cache: skills::SkillMatcher,
+    input_guardrail: guardrails::InputGuardrail,
+    ctx: InvocationCtx,
+) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
+    let preflight = build_chat_preflight(
+        &ctx.args,
+        &provider,
+        &default_model,
+        &memory_dispatcher,
+        &soul_cache,
+        &skills_cache,
+        &input_guardrail,
+        &ctx.caller.subject_id.to_string(),
+    )
+    .await?;
+    // Drop fields we don't need downstream so the move closure
+    // captures the minimum.
+    let _session_id = preflight.session_id;
+    let _ = preflight.approval_token;
+    let input = preflight.input;
+
+    let provider_stream = provider.generate_reply_stream(input).await.map_err(|e| {
+        let (kind, retry_hint) = match &e {
+            ProviderError::Transient(_) => (error_kinds::RESPONDER_OVERLOADED, 1),
+            ProviderError::Permanent(_) => (error_kinds::RESPONDER_INTERNAL, 2),
+        };
+        let cause = match e {
+            ProviderError::Transient(c) | ProviderError::Permanent(c) => c,
+        };
+        ErrorEnvelope {
+            kind,
+            cause: format!("ai.chat.stream: {cause}"),
+            retry_hint,
+            retry_after: None,
+        }
+    })?;
+
+    // Adapt the provider's per-token `Result<String, ProviderError>`
+    // stream into the dispatcher's
+    // `Result<Vec<u8>, ErrorEnvelope>` shape. Per-chunk errors
+    // map to the same envelope shape as the upfront error
+    // above so a provider that bails mid-stream surfaces with
+    // a consistent kind.
+    use futures::StreamExt;
+    let mapped = provider_stream.map(|item| match item {
+        Ok(token) => Ok(token.into_bytes()),
+        Err(ProviderError::Transient(c)) => Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_OVERLOADED,
+            cause: format!("ai.chat.stream: {c}"),
+            retry_hint: 1,
+            retry_after: None,
+        }),
+        Err(ProviderError::Permanent(c)) => Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("ai.chat.stream: {c}"),
+            retry_hint: 2,
+            retry_after: None,
+        }),
+    });
+    Ok(Box::pin(mapped))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2296,5 +2562,176 @@ mod tests {
         let snap = dispatcher.gateway_snapshot();
         assert!(snap.contains("completed=1 failed=0"), "snap={snap}");
         assert!(snap.contains("args_len=30"), "snap={snap}");
+    }
+
+    // ───────────────────── RELIX-2 step 3 ────────────────────
+    //
+    // `ai.chat.stream` handler tests. These verify the
+    // pre-flight (guardrails, wire-arg parsing) reuses the
+    // shared `build_chat_preflight` helper, and that the
+    // streaming-shape errors / chunks are emitted in the
+    // expected sequence.
+
+    /// Provider whose streaming impl yields a fixed sequence
+    /// of chunks. Used to verify the AI node pipes provider
+    /// chunks through to the dispatcher's HandlerStream
+    /// without buffering.
+    struct ChunkedStreamProvider {
+        chunks: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for ChunkedStreamProvider {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Ok(provider::ChatOutput {
+                text: self.chunks.join(""),
+                provider: "chunked-stream",
+                model: String::new(),
+                usage: None,
+            })
+        }
+        fn provider_name(&self) -> &'static str {
+            "chunked-stream"
+        }
+        async fn generate_reply_stream(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatStream, ProviderError> {
+            let owned: Vec<String> = self.chunks.clone();
+            let s = futures::stream::iter(owned.into_iter().map(Ok));
+            Ok(Box::pin(s))
+        }
+    }
+
+    /// Provider whose `generate_reply_stream` returns Err
+    /// immediately — exercises the upfront-error path.
+    struct FailingStreamProvider;
+
+    #[async_trait::async_trait]
+    impl ChatProvider for FailingStreamProvider {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Err(ProviderError::Transient("test transient".into()))
+        }
+        fn provider_name(&self) -> &'static str {
+            "failing-stream"
+        }
+        async fn generate_reply_stream(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatStream, ProviderError> {
+            Err(ProviderError::Permanent(
+                "provider stream init failed".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_yields_provider_chunks_in_order() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(ChunkedStreamProvider {
+            chunks: vec!["alpha".into(), "beta".into(), "gamma".into()],
+        });
+        let stream = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            ctx(b"session-1|hello|"),
+        )
+        .await
+        .expect("preflight + provider stream init must succeed");
+        use futures::StreamExt;
+        let collected: Vec<String> = stream
+            .map(|item| match item {
+                Ok(bytes) => String::from_utf8(bytes).expect("utf-8 chunk"),
+                Err(e) => panic!("unexpected stream error: {}", e.cause),
+            })
+            .collect()
+            .await;
+        assert_eq!(collected, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_returns_invalid_args_when_prompt_missing() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(ChunkedStreamProvider {
+            chunks: vec!["should-not-reach".into()],
+        });
+        let outcome = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            ctx(b"only-session-id"),
+        )
+        .await;
+        match outcome {
+            Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            Ok(_) => panic!("expected upfront ErrorEnvelope, got a stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_returns_security_denied_when_guardrail_blocks() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(ChunkedStreamProvider {
+            chunks: vec!["should-not-reach".into()],
+        });
+        // Hidden-Unicode check is always-on regardless of
+        // config (see `hidden_unicode_reason` in
+        // guardrails::input). A zero-width space (U+200B) in
+        // the prompt triggers the block under any guardrail
+        // mode, including `permissive`. The streaming
+        // pre-flight must surface this as
+        // `error_kinds::SECURITY_DENIED` without ever
+        // invoking the provider.
+        let prompt = "session-1|hello\u{200B}world|";
+        let outcome = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            ctx(prompt.as_bytes()),
+        )
+        .await;
+        match outcome {
+            Err(e) => assert_eq!(e.kind, error_kinds::SECURITY_DENIED),
+            Ok(_) => panic!("expected guardrail-blocked ErrorEnvelope, got a stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_surfaces_provider_init_failure_as_upfront_error() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(FailingStreamProvider);
+        let outcome = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            ctx(b"session-1|hello|"),
+        )
+        .await;
+        match outcome {
+            Err(e) => {
+                assert_eq!(e.kind, error_kinds::RESPONDER_INTERNAL);
+                assert!(
+                    e.cause.contains("provider stream init failed"),
+                    "cause should propagate provider message: {}",
+                    e.cause
+                );
+            }
+            Ok(_) => panic!("expected upfront ErrorEnvelope when provider init fails"),
+        }
     }
 }

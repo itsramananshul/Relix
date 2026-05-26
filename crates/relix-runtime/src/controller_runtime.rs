@@ -3542,6 +3542,29 @@ fn register_node_type_handlers(
                 .with_environment_requirements([format!("provider:{provider_name}")])
                 .with_risk(relix_core::capability::RiskLevel::Medium),
         );
+        // RELIX-2 step 3: streaming variant of ai.chat. Same
+        // pre-flight (guardrails / memory / soul / skills) but
+        // pipes tokens from `generate_reply_stream` over the
+        // `/relix/rpc/stream/1` substream instead of returning
+        // a single response body. Operators needing inline
+        // tool dispatch / planner / approval verdicts use the
+        // unary `ai.chat` — the streaming variant skips that
+        // pipeline by design (it's pure token streaming, not
+        // an agentic planning surface).
+        manifest.add_capability(
+            CapabilityDescriptor::stream_out("ai.chat.stream")
+                .with_sensitivity([format!("provider:{provider_name}")])
+                .with_description(
+                    "Streaming chat completion. Same args + pre-flight as ai.chat \
+                     (guardrails, memory/RAG, soul, skills). Response is a sequence \
+                     of token chunks over a /relix/rpc/stream/1 substream, terminated \
+                     by End. Skips planner / tool dispatch / approval — use ai.chat \
+                     for those flows.",
+                )
+                .with_categories(["generate".into(), "ai".into(), "streaming".into()])
+                .with_environment_requirements([format!("provider:{provider_name}")])
+                .with_risk(relix_core::capability::RiskLevel::Medium),
+        );
         manifest.add_capability(
             CapabilityDescriptor::unary("ai.embed")
                 .with_sensitivity([format!("provider:{provider_name}")])
