@@ -1580,6 +1580,52 @@ impl TaskStore {
     /// the bridge can render the task_id alongside the
     /// event without a second query. Order is newest-first
     /// by event_id.
+    /// W5: pull every chat-turn chronicle event for a single
+    /// chat session.
+    ///
+    /// Looks for events whose `event_type` is `chat.user_turn`
+    /// or `chat.assistant_turn` AND whose payload begins with
+    /// `<session_id>|`. The pipe-delimited payload format is
+    /// `<session_id>|<role>|<timestamp_unix>|<content>`. Returns
+    /// the parsed turns sorted chronologically (oldest first).
+    pub fn query_chat_turns(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChatTurn>, CoordinatorError> {
+        let cap = limit.clamp(1, self.max_list);
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        let prefix = format!("{session_id}|");
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_type, payload, ts
+                 FROM task_events
+                 WHERE event_type IN ('chat.user_turn', 'chat.assistant_turn')
+                   AND payload LIKE ?1
+                 ORDER BY ts ASC, event_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(CoordinatorError::Db)?;
+        let pattern = format!("{prefix}%");
+        let rows = stmt
+            .query_map(params![pattern, cap as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(CoordinatorError::Db)?;
+        let mut out: Vec<ChatTurn> = Vec::new();
+        for r in rows {
+            let (event_type, payload, ts) = r.map_err(CoordinatorError::Db)?;
+            if let Some(turn) = parse_chat_turn_payload(session_id, &event_type, &payload, ts) {
+                out.push(turn);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn recent_events_cross_task(
         &self,
         since_event_id: i64,
@@ -4119,6 +4165,16 @@ pub fn register(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_event(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.session_export",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_session_export(&s, &ctx) }
             })),
         );
     }
@@ -6896,6 +6952,86 @@ fn parse_completed_signal(args: &[u8]) -> Option<(String, String)> {
         return None;
     }
     Some((task_id, status))
+}
+
+/// W5: one assembled chat turn — the unit returned by
+/// `task.session_export`. Carries enough for an operator
+/// transcript or downstream replay tooling without baking in
+/// chronicle event-id specifics.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatTurn {
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp_unix: i64,
+}
+
+/// Parse a `chat.user_turn` / `chat.assistant_turn` chronicle
+/// payload into a structured [`ChatTurn`].
+///
+/// Wire format: `<session_id>|<role>|<timestamp_unix>|<content>`.
+/// The `content` field is the rest-of-string (may contain `|`).
+/// The chronicle's row `ts` is used as a fallback when the
+/// payload's embedded timestamp is missing / unparseable.
+pub fn parse_chat_turn_payload(
+    expected_session_id: &str,
+    event_type: &str,
+    payload: &str,
+    row_ts: i64,
+) -> Option<ChatTurn> {
+    let mut it = payload.splitn(4, '|');
+    let session_id = it.next()?.to_string();
+    if session_id != expected_session_id {
+        return None;
+    }
+    let role = it.next()?.to_string();
+    let timestamp_unix = it
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(row_ts);
+    let content = it.next().unwrap_or("").to_string();
+    // Sanity: event_type and role must agree.
+    let role_lc = role.to_ascii_lowercase();
+    match (event_type, role_lc.as_str()) {
+        ("chat.user_turn", "user") => {}
+        ("chat.assistant_turn", "assistant") => {}
+        // Accept slight mismatch so older recorders can be
+        // replayed honestly — but log so a reader spots the
+        // skew.
+        _ => {
+            tracing::debug!(
+                event_type,
+                role = %role,
+                "chat-turn payload role does not match event_type"
+            );
+        }
+    }
+    Some(ChatTurn {
+        session_id,
+        role,
+        content,
+        timestamp_unix,
+    })
+}
+
+/// W5: `task.session_export` handler. Arg = `session_id`.
+/// Returns a JSON array of [`ChatTurn`] objects in
+/// chronological order.
+fn handle_session_export(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let session_id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("task.session_export utf8: {e}")),
+    };
+    if session_id.is_empty() {
+        return invalid("task.session_export: session_id required".to_string());
+    }
+    match store.query_chat_turns(session_id, 10_000) {
+        Ok(turns) => match serde_json::to_string(&turns) {
+            Ok(json) => HandlerOutcome::Ok(json.into_bytes()),
+            Err(e) => internal(format!("task.session_export json: {e}")),
+        },
+        Err(e) => internal(format!("task.session_export: {e}")),
+    }
 }
 
 /// Best-effort drift evaluation for a `running` task. Pulls
@@ -11659,6 +11795,115 @@ mod tests {
         assert_eq!(edges[1].edge_type, "retried_from");
         assert_eq!(edges[1].attempt_id, Some(attempts[2].attempt_id));
         assert_eq!(edges[1].related_attempt_id, Some(attempts[1].attempt_id));
+    }
+
+    // ── W5: task.session_export ──────────────────────────────────
+
+    fn seed_chat_turn(s: &TaskStore, task_id: &str, role: &str, content: &str, ts: i64) {
+        let event_type = if role == "user" {
+            "chat.user_turn"
+        } else {
+            "chat.assistant_turn"
+        };
+        // Wire format mirrors parse_chat_turn_payload.
+        let payload = format!("{}|{}|{}|{}", "sess-A", role, ts, content);
+        // We append via append_event but want the row `ts` to
+        // match; the column gets a server timestamp by default
+        // so we backfill via raw SQL to keep ordering tight.
+        s.append_event(task_id, event_type, &payload).unwrap();
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE task_events SET ts = ?1 \
+                 WHERE task_id = ?2 AND event_type = ?3 AND payload = ?4",
+                rusqlite::params![ts, task_id, event_type, payload],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn session_export_returns_all_turns_in_chronological_order_with_role_labels() {
+        let s = store();
+        let tid = mk(&s, "chat session", "chat.sol", "{}", "alice");
+        // Seed 5 turns with monotonically increasing ts.
+        seed_chat_turn(&s, &tid, "user", "hi", 1_700_000_001);
+        seed_chat_turn(&s, &tid, "assistant", "hello!", 1_700_000_002);
+        seed_chat_turn(&s, &tid, "user", "what time is it?", 1_700_000_003);
+        seed_chat_turn(&s, &tid, "assistant", "i don't know", 1_700_000_004);
+        seed_chat_turn(&s, &tid, "user", "ok thanks", 1_700_000_005);
+        let turns = s.query_chat_turns("sess-A", 100).unwrap();
+        assert_eq!(turns.len(), 5);
+        // Chronological.
+        for w in turns.windows(2) {
+            assert!(w[0].timestamp_unix <= w[1].timestamp_unix);
+        }
+        // Role labels in the expected sequence.
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "assistant", "user"]
+        );
+        // Content preserved verbatim.
+        assert_eq!(turns[0].content, "hi");
+        assert_eq!(turns[2].content, "what time is it?");
+    }
+
+    #[test]
+    fn session_export_returns_empty_for_unknown_session() {
+        let s = store();
+        let turns = s.query_chat_turns("nope-no-session", 100).unwrap();
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn session_export_handler_returns_json_array() {
+        let s = store();
+        let tid = mk(&s, "chat session", "chat.sol", "{}", "alice");
+        seed_chat_turn(&s, &tid, "user", "ping", 1_700_000_001);
+        let outcome = handle_session_export(
+            &s,
+            &InvocationCtx {
+                caller: relix_core::identity::VerifiedIdentity {
+                    subject_id: relix_core::types::NodeId::from_pubkey(b"x"),
+                    name: "x".into(),
+                    org_id: relix_core::types::NodeId::from_pubkey(b"o"),
+                    groups: vec![],
+                    role: "agent".into(),
+                    clearance: "internal".into(),
+                    bundle_id: [0; 32],
+                },
+                trace_id: relix_core::types::TraceId::new(),
+                request_id: relix_core::types::RequestId::new(),
+                args: b"sess-A".to_vec(),
+            },
+        );
+        match outcome {
+            HandlerOutcome::Ok(body) => {
+                let s = String::from_utf8(body).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                let arr = v.as_array().unwrap();
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0]["role"], "user");
+                assert_eq!(arr[0]["content"], "ping");
+                assert_eq!(arr[0]["session_id"], "sess-A");
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got err: {}", e.cause),
+        }
+    }
+
+    #[test]
+    fn parse_chat_turn_payload_handles_pipe_in_content() {
+        let turn = parse_chat_turn_payload(
+            "sess-A",
+            "chat.user_turn",
+            "sess-A|user|1700000001|hello | world | pipes",
+            0,
+        )
+        .unwrap();
+        assert_eq!(turn.role, "user");
+        assert_eq!(turn.content, "hello | world | pipes");
+        assert_eq!(turn.timestamp_unix, 1_700_000_001);
     }
 
     // ── W4: drift hook embedding wiring ──────────────────────────

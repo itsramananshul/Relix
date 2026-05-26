@@ -166,6 +166,16 @@ impl TaskRecorder {
         String::from_utf8(bytes).map_err(|e| format!("task.export utf8: {e}"))
     }
 
+    /// W5: `task.session_export` passthrough. Arg = `session_id`.
+    /// Returns the Coordinator's JSON-encoded
+    /// `Vec<ChatTurn>` body verbatim.
+    pub async fn session_export(&self, session_id: &str) -> Result<String, String> {
+        let bytes = self
+            .call("task.session_export", session_id.as_bytes())
+            .await?;
+        String::from_utf8(bytes).map_err(|e| format!("task.session_export utf8: {e}"))
+    }
+
     /// `task.compact_events` passthrough. Bridge supplies only
     /// the `dry-run` mode today — the destructive `delete` mode
     /// is gated by the chronicle-retention Step 3 design and

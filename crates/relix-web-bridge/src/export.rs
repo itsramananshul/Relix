@@ -97,15 +97,18 @@ pub async fn export(State(state): State<AppState>, Query(q): Query<ExportQuery>)
         }
     };
 
-    // The bridge doesn't open the coordinator's SQLite DB
-    // directly (cross-process / mesh-only access). Without a
-    // task.list filter by session_id today, the alpha returns
-    // a synthesised single-session export driven by the
-    // available bridge state — same shape, just with whatever
-    // metadata we *can* pull. Operators get a real export when
-    // the future `task.session_export` coordinator capability
-    // lands; the response shape is forward-compatible.
-    let sessions = synth_export(&state, &scope);
+    // W5: session= scope dispatches to the coordinator's
+    // `task.session_export` capability for real turn-by-turn
+    // history. agent= / all= still return the scaffold today;
+    // those layouts grow when the coordinator gains a
+    // session-by-agent lookup.
+    let sessions = match &scope {
+        ExportScope::Session(sid) => match fetch_real_session(&state, sid).await {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        },
+        _ => synth_export(&state, &scope),
+    };
 
     let format = q.format.as_deref().unwrap_or("json");
     match format {
@@ -151,6 +154,64 @@ enum ExportScope {
     Session(String),
     Agent(String),
     All,
+}
+
+/// W5: pull turn-by-turn history for `session_id` from the
+/// coordinator's `task.session_export` capability and project
+/// it into the canonical [`SessionExport`] shape.
+async fn fetch_real_session(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Vec<SessionExport>, Response> {
+    let Some(rec) = state.task_recorder.as_ref() else {
+        // No coordinator configured — be honest and surface a
+        // 503, not a fake stub.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no coordinator configured; session export unavailable\n",
+        )
+            .into_response());
+    };
+    let body = rec.session_export(session_id).await.map_err(|e| {
+        (StatusCode::BAD_GATEWAY, format!("coord call failed: {e}\n")).into_response()
+    })?;
+    #[derive(Deserialize)]
+    struct ChatTurnWire {
+        #[allow(dead_code)]
+        session_id: String,
+        role: String,
+        content: String,
+        timestamp_unix: i64,
+    }
+    let turns: Vec<ChatTurnWire> = serde_json::from_str(&body).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("coord task.session_export returned invalid JSON: {e}\n"),
+        )
+            .into_response()
+    })?;
+    let (start_time, end_time) = match (turns.first(), turns.last()) {
+        (Some(f), Some(l)) => (f.timestamp_unix, l.timestamp_unix),
+        _ => (0, 0),
+    };
+    let messages: Vec<SessionMessage> = turns
+        .into_iter()
+        .map(|t| SessionMessage {
+            timestamp: t.timestamp_unix,
+            role: t.role,
+            content: t.content,
+            token_count: 0,
+        })
+        .collect();
+    Ok(vec![SessionExport {
+        session_id: session_id.to_string(),
+        agent: String::new(),
+        start_time,
+        end_time,
+        messages,
+        tool_calls: Vec::new(),
+        cost_usd: 0.0,
+    }])
 }
 
 /// Synthesise a minimal session export from bridge-level state.
