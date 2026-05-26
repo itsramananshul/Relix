@@ -20,23 +20,53 @@
 //! response carries a structured error instead of silently
 //! dropping the call.
 
+use std::sync::Arc;
+
 use super::executor::StepResult;
 use super::planner::{ExecutionPlan, PlanStep};
 use crate::nodes::tool::dispatcher::{DispatchError, ToolDispatcher};
 
+/// Outbound mesh shim used by the tool runner to actually
+/// execute a planner-emitted ToolCall after the dispatcher
+/// admits it.
+///
+/// Implementations dial the configured tool peer (typically
+/// alias `"tool"`) over libp2p and return the responder's
+/// UTF-8 reply, or an operator-facing error string on
+/// transport / responder failure. The trait keeps the AI
+/// runtime decoupled from `MeshClient`: tests inject a stub,
+/// production wires the real client.
+#[async_trait::async_trait]
+pub trait ToolMeshDispatcher: Send + Sync {
+    /// Call `tool` with `resolved_args` and return the responder's
+    /// UTF-8 reply. Errors surface as the human-readable string
+    /// the [`DispatchError::HandlerFailed`] variant carries.
+    async fn call(&self, tool: &str, resolved_args: &str) -> Result<String, String>;
+}
+
 /// Walk every [`PlanStep::ToolCall`] in `plan` through
 /// `dispatcher`. Returns one [`StepResult`] per ToolCall in
 /// plan order. Non-ToolCall steps are skipped.
+///
+/// When `mesh` is `Some(...)` the dispatcher's handler closure
+/// dials the tool peer through the supplied
+/// [`ToolMeshDispatcher`] AFTER the broker + secret-resolve
+/// pre-checks. When `None`, the closure records an
+/// `admitted: ...` marker — useful while no outbound transport
+/// is wired but operator-honest about the fact that the call
+/// did not execute.
 pub async fn dispatch_planner_tool_calls(
     dispatcher: &ToolDispatcher,
     agent: &str,
     plan: &ExecutionPlan,
+    mesh: Option<Arc<dyn ToolMeshDispatcher>>,
 ) -> Vec<StepResult> {
     let mut results = Vec::new();
     for step in &plan.steps {
         if let PlanStep::ToolCall { tool, args } = step {
             let reversible = !is_irreversible_tool(tool);
             let tool_label = tool.clone();
+            let mesh_clone = mesh.clone();
             let outcome = dispatcher
                 .dispatch(
                     agent,
@@ -45,15 +75,33 @@ pub async fn dispatch_planner_tool_calls(
                     reversible,
                     None,
                     move |resolved_args| async move {
-                        // The AI controller owns admission. The
-                        // actual mesh hop to the tool node sits
-                        // on the tool-flow path. The handler
-                        // here records the admitted call so the
-                        // gateway has a recordable result.
-                        Ok(format!(
-                            "admitted: tool={tool_label} args_len={}",
-                            resolved_args.len()
-                        ))
+                        match mesh_clone.as_ref() {
+                            Some(m) => {
+                                // Real outbound dispatch. The
+                                // dispatcher already validated
+                                // identity / broker / secrets;
+                                // any responder-side error
+                                // surfaces back as
+                                // `HandlerFailed` and lands as
+                                // a structured error in the
+                                // chat response trailer.
+                                m.call(&tool_label, &resolved_args).await
+                            }
+                            None => {
+                                // No mesh wired — keep the
+                                // admit-only behaviour so the
+                                // dispatcher pipeline still
+                                // runs broker + secret + output
+                                // guard + gateway, and the
+                                // operator sees an honest
+                                // "admitted but not executed"
+                                // gateway entry.
+                                Ok(format!(
+                                    "admitted: tool={tool_label} args_len={}",
+                                    resolved_args.len()
+                                ))
+                            }
+                        }
                     },
                 )
                 .await;
@@ -170,7 +218,7 @@ mod tests {
     async fn tool_call_passing_broker_check_executes_and_is_recorded_in_gateway() {
         let dispatcher = ToolDispatcher::new(empty_secrets(), Arc::new(AgentAccessBroker::empty()));
         let plan = plan_with_tool("web.fetch", "https://example.com");
-        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan).await;
+        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan, None).await;
         assert_eq!(results.len(), 1);
         match &results[0] {
             StepResult::Ok { output } => {
@@ -195,7 +243,7 @@ mod tests {
         }]));
         let dispatcher = ToolDispatcher::new(empty_secrets(), broker);
         let plan = plan_with_tool("tool.terminal", "rm -rf /");
-        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan).await;
+        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan, None).await;
         assert_eq!(results.len(), 1);
         match &results[0] {
             StepResult::Err { reason } => {
@@ -221,7 +269,7 @@ mod tests {
             Arc::new(AgentAccessBroker::empty()),
         );
         let plan = plan_with_tool("web.fetch", "Authorization: Bearer {{secret:github_token}}");
-        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan).await;
+        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan, None).await;
         // Resolved args = `Authorization: Bearer ghp_real` = 30 chars.
         match &results[0] {
             StepResult::Ok { output } => {
@@ -241,7 +289,7 @@ mod tests {
             "web.fetch",
             "Authorization: Bearer {{secret:missing_token}}",
         );
-        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan).await;
+        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan, None).await;
         match &results[0] {
             StepResult::Err { reason } => {
                 let v: serde_json::Value =
@@ -271,7 +319,7 @@ mod tests {
             requires_approval: false,
             reversibility: Reversibility::Reversible,
         };
-        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan).await;
+        let results = dispatch_planner_tool_calls(&dispatcher, "alice", &plan, None).await;
         // No ToolCall steps → no results.
         assert!(results.is_empty());
     }
@@ -280,9 +328,84 @@ mod tests {
     async fn irreversible_tool_call_is_recorded_as_irreversible_in_gateway() {
         let dispatcher = ToolDispatcher::new(empty_secrets(), Arc::new(AgentAccessBroker::empty()));
         let plan = plan_with_tool("email.send", "to=ops");
-        let _ = dispatch_planner_tool_calls(&dispatcher, "alice", &plan).await;
+        let _ = dispatch_planner_tool_calls(&dispatcher, "alice", &plan, None).await;
         let snap = dispatcher.gateway_snapshot();
         assert!(snap.contains("IRREVERSIBLE"), "snap={snap}");
         assert!(snap.contains("email.send"));
+    }
+
+    /// Stub mesh dispatcher that records every call it receives
+    /// and returns a fixed reply. Lets the test confirm the
+    /// runner actually invokes the mesh hop after the
+    /// dispatcher admits the call.
+    struct StubMesh {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolMeshDispatcher for StubMesh {
+        async fn call(&self, tool: &str, args: &str) -> Result<String, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((tool.to_string(), args.to_string()));
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_calls_mesh_dispatcher_with_resolved_args_when_provided() {
+        let dispatcher = ToolDispatcher::new(
+            secrets_with(&[("github_token", "ghp_real")]),
+            Arc::new(AgentAccessBroker::empty()),
+        );
+        let plan = plan_with_tool("web.fetch", "Authorization: Bearer {{secret:github_token}}");
+        let mesh = Arc::new(StubMesh {
+            calls: std::sync::Mutex::new(Vec::new()),
+            reply: "https://example.com response body".into(),
+        });
+        let results =
+            dispatch_planner_tool_calls(&dispatcher, "alice", &plan, Some(mesh.clone())).await;
+        // The runner forwards to the mesh; the responder's
+        // reply lands as StepResult::Ok.
+        match &results[0] {
+            StepResult::Ok { output } => {
+                assert_eq!(output, "https://example.com response body");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // Confirm the mesh dispatcher actually got called AND
+        // with the secret-resolved args (not the placeholder).
+        let calls = mesh.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "web.fetch");
+        assert_eq!(calls[0].1, "Authorization: Bearer ghp_real");
+    }
+
+    struct FailingMesh;
+
+    #[async_trait::async_trait]
+    impl ToolMeshDispatcher for FailingMesh {
+        async fn call(&self, _tool: &str, _args: &str) -> Result<String, String> {
+            Err("simulated transport drop".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_surfaces_mesh_error_as_structured_handler_failed() {
+        let dispatcher = ToolDispatcher::new(empty_secrets(), Arc::new(AgentAccessBroker::empty()));
+        let plan = plan_with_tool("web.fetch", "https://example.com");
+        let results =
+            dispatch_planner_tool_calls(&dispatcher, "alice", &plan, Some(Arc::new(FailingMesh)))
+                .await;
+        match &results[0] {
+            StepResult::Err { reason } => {
+                let v: serde_json::Value = serde_json::from_str(reason).expect("structured error");
+                assert_eq!(v["kind"], "handler_failed");
+                assert!(v["cause"].as_str().unwrap().contains("transport drop"));
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
     }
 }

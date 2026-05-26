@@ -3345,6 +3345,17 @@ fn register_node_type_handlers(
                 secret_store,
                 access_broker.clone(),
             ));
+        // OnceCell for the outbound tool dispatcher used by
+        // the AI handler's planner ToolCall path. The
+        // controller's startup flow can later populate this
+        // cell with a real mesh-backed dispatcher; today the
+        // cell stays empty and the runner falls back to the
+        // admit-only path.
+        let tool_mesh_cell: std::sync::Arc<
+            tokio::sync::OnceCell<
+                std::sync::Arc<dyn crate::nodes::ai::execution::ToolMeshDispatcher>,
+            >,
+        > = std::sync::Arc::new(tokio::sync::OnceCell::new());
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
@@ -3354,6 +3365,7 @@ fn register_node_type_handlers(
             skill_matcher,
             input_guardrail,
             Some(tool_dispatcher),
+            tool_mesh_cell,
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when

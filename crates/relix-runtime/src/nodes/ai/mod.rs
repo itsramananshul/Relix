@@ -277,6 +277,7 @@ pub fn register(
     skills_cache: skills::SkillMatcher,
     input_guardrail: guardrails::InputGuardrail,
     tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
+    tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
@@ -284,6 +285,7 @@ pub fn register(
     let skills_for_chat = skills_cache.clone();
     let guardrail_for_chat = input_guardrail.clone();
     let dispatcher_for_chat = tool_dispatcher.clone();
+    let mesh_for_chat = tool_mesh.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -294,7 +296,8 @@ pub fn register(
             let sk = skills_for_chat.clone();
             let gr = guardrail_for_chat.clone();
             let td = dispatcher_for_chat.clone();
-            async move { handle_chat(p, model, mem, soul, sk, gr, td, ctx).await }
+            let mesh = mesh_for_chat.clone();
+            async move { handle_chat(p, model, mem, soul, sk, gr, td, mesh, ctx).await }
         })),
     );
     let provider_for_embed = provider.clone();
@@ -599,6 +602,7 @@ async fn handle_chat(
     skills_cache: skills::SkillMatcher,
     input_guardrail: guardrails::InputGuardrail,
     tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
+    tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -781,7 +785,9 @@ async fn handle_chat(
             let mut state = execution::ExecutionState::new(plan.clone());
             let tool_step_results: Vec<execution::StepResult> = match tool_dispatcher.as_ref() {
                 Some(disp) => {
-                    execution::dispatch_planner_tool_calls(disp, &ctx.caller.name, &plan).await
+                    let mesh = tool_mesh.get().cloned();
+                    execution::dispatch_planner_tool_calls(disp, &ctx.caller.name, &plan, mesh)
+                        .await
                 }
                 None => Vec::new(),
             };
@@ -1000,6 +1006,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1011,6 +1018,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1026,6 +1034,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -1052,6 +1061,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"only-session-id"),
         )
         .await;
@@ -1072,6 +1082,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"|hello|"),
         )
         .await;
@@ -1113,6 +1124,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1152,6 +1164,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1182,6 +1195,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1213,6 +1227,7 @@ mod tests {
             cache,
             guardrail,
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -1250,6 +1265,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1284,6 +1300,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1341,6 +1358,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -1379,6 +1397,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -1420,6 +1439,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1542,6 +1562,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1584,6 +1605,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1624,6 +1646,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1665,6 +1688,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1727,6 +1751,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1829,6 +1854,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2024,6 +2050,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -2055,6 +2082,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -2177,6 +2205,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -2211,6 +2240,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -2251,6 +2281,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
+            Arc::new(tokio::sync::OnceCell::new()),
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
