@@ -237,6 +237,25 @@ pub fn expand_string_interpolation(raw: &str) -> Ast {
     acc
 }
 
+/// Build a left-folded concat chain (`a + b + c + ...`) from
+/// the given chunks. Used by the `delegate` / `send` sugar
+/// lowerings to assemble the pipe-separated wire payload that
+/// the coordinator's `delegate.spawn` / `msg.send` capabilities
+/// expect, without introducing any new VM machinery. Panics
+/// when called with zero chunks (caller invariant).
+fn concat_chain(chunks: Vec<Ast>) -> Ast {
+    let mut iter = chunks.into_iter();
+    let mut acc = iter.next().expect("concat_chain: at least one chunk");
+    for next in iter {
+        acc = Ast::ExprBinary {
+            lhs: Box::new(acc),
+            rhs: Box::new(next),
+            op: Token::Plus,
+        };
+    }
+    acc
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     index: usize,
@@ -724,6 +743,135 @@ impl Parser {
         Some(Ast::DeclEnum { name, variants })
     }
 
+    /// Consume the next token if it is `Token::Ident(kw)`,
+    /// otherwise panic with `msg`. Used by the `delegate` and
+    /// `send` sugar forms to parse contextual sub-keywords
+    /// (`goal`, `from`, `to`, `subject`, `body`) without
+    /// promoting them to real keywords — they remain valid
+    /// identifiers everywhere else.
+    fn eat_kw(&mut self, kw: &str, msg: &str) {
+        let matched = matches!(&self.tokens[self.index], Token::Ident(s) if s == kw);
+        if !matched {
+            self.debtok(4);
+            panic!("{msg}");
+        }
+        self.index += 1;
+    }
+
+    /// Peek at the current token and return true iff it is
+    /// `Token::Ident(kw)`. Used by `primary()` to decide
+    /// whether `delegate` / `send` should be treated as their
+    /// sugar form or as a plain identifier.
+    fn peek_kw(&self, kw: &str) -> bool {
+        matches!(&self.tokens[self.index], Token::Ident(s) if s == kw)
+    }
+
+    /// Parse `delegate goal <goal_expr> from <parent_expr> to
+    /// <target_expr>` and lower it to a synthetic call to the
+    /// `remote_call("coord", "delegate.spawn", ...)` builtin.
+    /// The lowering builds the pipe-separated payload that the
+    /// coordinator's spawn handler expects:
+    /// `parent_task_id|goal|context|target_subject_id|depth`.
+    /// `context` is left empty and `depth` is hardcoded to `0`
+    /// — power users who need either field call `remote_call`
+    /// directly. The result has type `str` (the child task id)
+    /// because that is what the underlying capability returns.
+    fn delegate_sugar(&mut self) -> Ast {
+        // Caller has already consumed the `delegate` ident.
+        self.eat_kw("goal", "expected `goal` after `delegate`");
+        let old_can_struct = self.can_struct;
+        self.can_struct = false;
+        let goal_expr = self
+            .expression()
+            .expect("expected goal expression in `delegate goal ...`");
+        self.eat_kw(
+            "from",
+            "expected `from <parent_task_id>` after delegate goal",
+        );
+        let parent_expr = self
+            .expression()
+            .expect("expected parent_task_id expression in `delegate ... from ...`");
+        self.eat_kw(
+            "to",
+            "expected `to <target_subject_id>` after delegate parent",
+        );
+        let target_expr = self
+            .expression()
+            .expect("expected target_subject_id expression in `delegate ... to ...`");
+        self.can_struct = old_can_struct;
+
+        // Assemble parent | goal | <empty context> | target | 0.
+        let arg = concat_chain(vec![
+            parent_expr,
+            Ast::ExprString("|".to_string()),
+            goal_expr,
+            Ast::ExprString("||".to_string()),
+            target_expr,
+            Ast::ExprString("|0".to_string()),
+        ]);
+        Ast::ExprFuncCall {
+            name: "remote_call".to_string(),
+            args: vec![
+                Ast::ExprString("coord".to_string()),
+                Ast::ExprString("delegate.spawn".to_string()),
+                arg,
+            ],
+        }
+    }
+
+    /// Parse `send subject <subj_expr> body <body_expr> from
+    /// <from_expr> to <to_expr>` and lower it to a synthetic
+    /// call to `remote_call("coord", "msg.send", ...)`. The
+    /// lowering builds the pipe-separated payload:
+    /// `from|to|subject|body|thread_id|reply_to|ttl_secs|origin_surface`.
+    /// Optional fields (`thread_id`, `reply_to`, `ttl_secs`)
+    /// default to empty / `0`. The `origin_surface` is
+    /// hardcoded to `sol_flow` so the message store records
+    /// where it came from.
+    fn send_sugar(&mut self) -> Ast {
+        // Caller has already consumed the `send` ident.
+        self.eat_kw("subject", "expected `subject` after `send`");
+        let old_can_struct = self.can_struct;
+        self.can_struct = false;
+        let subject_expr = self
+            .expression()
+            .expect("expected subject expression in `send subject ...`");
+        self.eat_kw("body", "expected `body <body>` after send subject");
+        let body_expr = self
+            .expression()
+            .expect("expected body expression in `send ... body ...`");
+        self.eat_kw("from", "expected `from <from>` after send body");
+        let from_expr = self
+            .expression()
+            .expect("expected from expression in `send ... from ...`");
+        self.eat_kw("to", "expected `to <to>` after send from");
+        let to_expr = self
+            .expression()
+            .expect("expected to expression in `send ... to ...`");
+        self.can_struct = old_can_struct;
+
+        // Assemble from | to | subject | body | <empty thread_id>
+        // | <empty reply_to> | 0 ttl_secs | sol_flow origin.
+        let arg = concat_chain(vec![
+            from_expr,
+            Ast::ExprString("|".to_string()),
+            to_expr,
+            Ast::ExprString("|".to_string()),
+            subject_expr,
+            Ast::ExprString("|".to_string()),
+            body_expr,
+            Ast::ExprString("|||0|sol_flow".to_string()),
+        ]);
+        Ast::ExprFuncCall {
+            name: "remote_call".to_string(),
+            args: vec![
+                Ast::ExprString("coord".to_string()),
+                Ast::ExprString("msg.send".to_string()),
+                arg,
+            ],
+        }
+    }
+
     fn left_rec(
         &mut self,
         symbols: &[TokenKind],
@@ -898,6 +1046,17 @@ impl Parser {
                 } else {
                     unreachable!()
                 };
+
+                // Soft-keyword sugar: `delegate goal ...` and
+                // `send subject ...` lower to remote_call. Both
+                // require their first sub-keyword to disambiguate
+                // from a plain variable named `delegate` or `send`.
+                if name == "delegate" && self.peek_kw("goal") {
+                    return Some(self.delegate_sugar());
+                }
+                if name == "send" && self.peek_kw("subject") {
+                    return Some(self.send_sugar());
+                }
 
                 let next_kind = self.current().get_kind();
 
