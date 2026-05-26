@@ -1,22 +1,26 @@
 //! W2-MEMORY-CURATOR-3 — HTTP proxies for the memory curator
 //! surface.
 //!
-//! Two endpoints:
+//! Two endpoints, both wired end-to-end to the memory node's
+//! mesh capabilities (no placeholders, no "not yet readable"
+//! sentinels):
 //!
 //! - `POST /v1/memory/curate` — operator-triggered curation
 //!   for one subject_id. Proxies `memory.agent_curate` on the
 //!   memory node and returns the parsed pipe-delimited
 //!   summary as JSON.
 //!
-//! - `GET /v1/memory/curator/status` — read-only view of the
-//!   scheduler's last-run timing + summary. Proxies a new
-//!   memory-node capability (today: synthesized by the bridge
-//!   from the curate response since the runtime doesn't yet
-//!   expose `memory.curator_status` — that lands as a follow-
-//!   up). For now, the status endpoint returns 503 and a
-//!   clear "scheduler status not yet readable from the bridge"
-//!   message; manual curation through the same surface works
-//!   end-to-end.
+//! - `GET /v1/memory/curator/status` — proxies the memory
+//!   node's `memory.curator_status` capability and projects
+//!   the pipe-delimited body into the structured
+//!   [`StatusResponse`]. Tells the operator whether the
+//!   scheduler is enabled / configured, when it last ran,
+//!   what it did, and when the next tick is due.
+//!
+//! Both endpoints return 502 when the memory peer responds
+//! with an unparseable body and 503 when the bridge cannot
+//! resolve the alias — honest about transport-side failures
+//! rather than fabricating a synthesized reply.
 
 use axum::{
     Json,
