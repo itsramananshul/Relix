@@ -149,6 +149,29 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// W7-SEARCH — full-text search across chat-turn chronicle
+    /// events via the bridge's `/v1/memory/sessions/search`.
+    /// Operator-facing surface; agents call the same endpoint
+    /// indirectly via the tool node's `memory.session_search`
+    /// capability.
+    SessionSearch {
+        /// Bridge HTTP base URL.
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        /// Query string. Required.
+        #[arg(long)]
+        query: String,
+        /// Optional subject_id filter. Empty (the default)
+        /// searches across every session in the chronicle.
+        #[arg(long, default_value = "")]
+        subject_id: String,
+        /// Maximum hits to return. Server caps at 100.
+        #[arg(long, default_value_t = 20usize)]
+        limit: usize,
+        /// Raw JSON instead of the table view.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// W2-008i — one-shot snapshot of the bridge's
     /// observable state. Hits health, topology, dispatch
     /// stats, policy denials, and the recent events ring
@@ -759,6 +782,13 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             max,
             json,
         } => policy_denials(&bridge, &peer, max, json).await,
+        Cmd::SessionSearch {
+            bridge,
+            query,
+            subject_id,
+            limit,
+            json,
+        } => session_search(&bridge, &query, &subject_id, limit, json).await,
         Cmd::Smoke { bridge, provider } => smoke(&bridge, &provider).await,
         Cmd::Tail {
             bridge,
@@ -2263,6 +2293,102 @@ async fn policy_denials(
     Ok(())
 }
 
+/// W7-SEARCH: `relix-cli ops session-search` — hits the
+/// bridge's `GET /v1/memory/sessions/search` and renders the
+/// results as a table (timestamp, role, session_id short,
+/// content preview). `--json` dumps the raw response body.
+async fn session_search(
+    bridge: &str,
+    query: &str,
+    subject_id: &str,
+    limit: usize,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if query.trim().is_empty() {
+        return Err("query is required".into());
+    }
+    let limit = limit.min(100);
+    let mut url = format!(
+        "{}/v1/memory/sessions/search?q={}&limit={}",
+        bridge.trim_end_matches('/'),
+        urlencoding(query),
+        limit,
+    );
+    if !subject_id.is_empty() {
+        url.push_str(&format!("&subject_id={}", urlencoding(subject_id)));
+    }
+    let body = http_get(&url).await?;
+    if json {
+        print!("{body}");
+        if !body.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("decode session-search body: {e} (body={body})"))?;
+    let results = parsed
+        .get("results")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let total = parsed.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    if results.is_empty() {
+        println!("(no matches for {query:?}; total={total})");
+        return Ok(());
+    }
+    println!(
+        "{:<19}  {:<10}  {:<14}  preview",
+        "timestamp", "role", "session"
+    );
+    for r in &results {
+        let ts_unix = r
+            .get("timestamp_unix")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let role = r.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let session = r.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let content = r.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let session_short = if session.len() > 14 {
+            &session[..14]
+        } else {
+            session
+        };
+        let preview: String = content.chars().take(100).collect();
+        println!(
+            "{:<19}  {:<10}  {:<14}  {}",
+            format_unix_ts(ts_unix),
+            truncate(role, 10),
+            session_short,
+            preview,
+        );
+    }
+    println!("total={total}");
+    Ok(())
+}
+
+/// Render a unix timestamp as UTC `YYYY-MM-DD HH:MM:SS`. We
+/// stick to UTC (no local-offset lookup) so the output is
+/// deterministic regardless of the operator's TZ — the
+/// dashboard already renders the local-time variant.
+fn format_unix_ts(unix: i64) -> String {
+    if unix <= 0 {
+        return "—".to_string();
+    }
+    let Ok(odt) = time::OffsetDateTime::from_unix_timestamp(unix) else {
+        return format!("unix={unix}");
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        odt.year(),
+        odt.month() as u8,
+        odt.day(),
+        odt.hour(),
+        odt.minute(),
+        odt.second(),
+    )
+}
+
 /// W2-007e: minimal "Xs ago" / "Xm ago" / "Xh ago" formatter.
 fn format_age(secs: i64) -> String {
     if secs < 60 {
@@ -3462,6 +3588,26 @@ async fn plugin_disable_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_unix_ts_renders_utc_iso_like() {
+        // Unix epoch + 1 day = 1970-01-02 00:00:00.
+        assert_eq!(format_unix_ts(86_400), "1970-01-02 00:00:00");
+        // Sentinel for "no timestamp".
+        assert_eq!(format_unix_ts(0), "—");
+        assert_eq!(format_unix_ts(-1), "—");
+    }
+
+    #[test]
+    fn urlencoding_escapes_session_search_special_chars() {
+        // Spaces, ampersands, equals signs in a query must
+        // round-trip safely. The encoder follows the
+        // RFC-3986-unreserved set + we whitelist `/` and `,`
+        // for path-shaped values.
+        assert_eq!(urlencoding("hello world"), "hello%20world");
+        assert_eq!(urlencoding("a&b=c"), "a%26b%3Dc");
+        assert_eq!(urlencoding("simple"), "simple");
+    }
 
     #[test]
     fn parse_typical_health_body() {

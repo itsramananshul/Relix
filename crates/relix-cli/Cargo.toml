@@ -35,6 +35,7 @@ hex.workspace = true
 reqwest.workspace = true
 tar.workspace = true
 flate2.workspace = true
+time.workspace = true
 
 zeroize.workspace = true
 
