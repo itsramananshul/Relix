@@ -123,6 +123,7 @@ mod schema;
 mod secrets;
 mod secrets_available;
 mod security_headers;
+mod sessions_obs;
 mod slack;
 mod sol_validate;
 mod sse;
@@ -510,6 +511,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // JIT secret store inventory (NAMES ONLY).
         .route("/v1/secrets/available", get(secrets_available::available))
+        // Two-sink session debugger surfaces.
+        .route("/v1/sessions", get(sessions_obs::list))
+        .route("/v1/sessions/{id}", get(sessions_obs::show))
+        .route(
+            "/v1/sessions/{session_id}/content/{event_id}",
+            get(sessions_obs::content),
+        )
         // Agent access policies + recent call counts.
         .route("/v1/agents/access", get(agents_access::agents))
         // Tool registry — list + keyword search.

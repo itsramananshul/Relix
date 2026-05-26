@@ -18,8 +18,12 @@
 //! The session debugger, provenance registry, and optional
 //! OTel exporter land as separate commits + sub-modules.
 
+pub mod session_debugger;
 pub mod sinks;
 
+pub use session_debugger::{
+    STALL_WINDOW_SECS, SessionDebugger, SessionSummary, SessionTimeline, TimelineEvent,
+};
 pub use sinks::{
     ContentEvent, ContentSink, MetadataEvent, MetadataSink, ObservabilityContext, SinkError,
 };
