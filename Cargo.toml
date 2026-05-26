@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+# examples/plugins/web-lookup is intentionally NOT a workspace
+# member — it has its own [workspace] block in its Cargo.toml so
+# the Docker build context (which copies only `crates/`) can load
+# the main workspace cleanly without needing the examples tree.
+# See `examples/plugins/web-lookup/Cargo.toml`.
 members = [
     "crates/relix-core",
     "crates/relix-runtime",
@@ -11,8 +16,12 @@ members = [
     "crates/relix-discord",
     "crates/relix-slack",
     "crates/relix-plugin-sdk",
-    "examples/plugins/web-lookup",
 ]
+# Stop Cargo from auto-discovering examples/ as workspace members
+# now that web-lookup is out of the list. Otherwise the resolver
+# would try to load examples/plugins/web-lookup as a member and
+# the standalone-workspace block would conflict.
+exclude = ["examples"]
 
 # Shared metadata applied to every crate via `package.workspace = true`.
 [workspace.package]

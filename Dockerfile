@@ -79,6 +79,14 @@ WORKDIR /relix
 # Bridge HTTP port (loopback in dev, exposed in compose).
 EXPOSE 19791
 
+# Container-level liveness probe — orchestrators (docker compose,
+# Kubernetes via `livenessProbe.exec`, ECS) restart the container
+# when this exits non-zero three times in a row. /health is the
+# plaintext liveness route the bridge exposes specifically for
+# probes; it requires no auth (see docs/security.md).
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD curl -f http://localhost:19791/health || exit 1
+
 # Default to the bridge so `docker run relix` Just Works
 # once a bridge.toml is mounted in. Override the ENTRYPOINT
 # array (or pass `--config` plus a different binary) when

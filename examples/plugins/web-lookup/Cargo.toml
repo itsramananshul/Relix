@@ -1,12 +1,26 @@
+# Standalone example plugin. Pulled out of the root workspace so the
+# Docker build context (which only copies `crates/`) does not need
+# to ship `examples/`. The plugin still builds cleanly from this
+# directory via `cargo build`; the relix-plugin-sdk path dep
+# resolves up the repo tree as a sibling crate.
+
+[workspace]
+# Empty workspace block — every dependency below is a literal
+# version or a path, so we don't need an inherited workspace.deps
+# section. The presence of this block tells Cargo "stop walking
+# up", so a parent workspace (the main Relix one) does not absorb
+# this crate.
+members = []
+
 [package]
 name        = "relix-plugin-web-lookup"
 description = "Example Relix plugin — wraps an HTTP GET into a relix-plugin-v1 capability."
-edition.workspace      = true
-rust-version.workspace = true
-version.workspace      = true
-license.workspace      = true
-repository.workspace   = true
-authors.workspace      = true
+version     = "0.1.0"
+edition     = "2024"
+rust-version = "1.95"
+license      = "Apache-2.0"
+repository   = "https://github.com/itsramananshul/Relix"
+authors      = ["Anshul Raman <ramanal@mail.uc.edu>"]
 publish      = false
 
 [[bin]]
@@ -14,8 +28,15 @@ name = "relix-plugin-web-lookup"
 path = "src/main.rs"
 
 [dependencies]
+# Sibling-crate path dep — resolves to the SDK crate inside the
+# main Relix workspace. The dep is still useful as an example for
+# downstream plugin authors who vendor the SDK from crates.io.
 relix-plugin-sdk = { path = "../../../crates/relix-plugin-sdk", version = "0.1.0" }
-tokio            = { workspace = true, features = ["macros", "rt-multi-thread"] }
-reqwest.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+
+# Versions match the main workspace's pins. Adding new deps here
+# does NOT require updating the root Cargo.toml (this crate has
+# its own [workspace] above).
+tokio              = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

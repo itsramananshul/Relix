@@ -3272,17 +3272,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "relix-plugin-web-lookup"
-version = "0.1.0"
-dependencies = [
- "relix-plugin-sdk",
- "reqwest",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "relix-runtime"
 version = "0.1.0"
 dependencies = [
