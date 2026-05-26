@@ -224,15 +224,32 @@ as typed flow arguments — three characters are forbidden in user
 input. `relix-web-bridge::validate::validate_input` shows the exact
 rule.
 
-### Streaming is bridge-level chunking, not provider tokens (SIMP-019)
+### Streaming is provider-native at the AI node, bridge-chunked at the HTTP edge (SIMP-019, partial)
 
-`POST /chat/stream` and the `stream:true` variant of
-`/v1/chat/completions` slice the *already-materialised* reply into
-SSE chunks (`24` bytes by default, `chunk_delay_ms = 15`). The AI
-provider's stream (if any) is consumed eagerly into a buffer first;
-the bridge does not pass-through tokens. Open WebUI works correctly
-with this; latency-sensitive UIs will not. Provider-native streaming
-needs the durable yield model (Gate 2).
+Every active provider — `mock`, `openai`-compatible (OpenAI /
+OpenRouter / xAI / local), Anthropic, Gemini — now implements
+`ChatProvider::generate_reply_stream` against the provider's
+native streaming endpoint:
+
+- OpenAI-shape: `/chat/completions` with `stream: true`; parses
+  `data: {...}` SSE frames into `choices[0].delta.content` deltas.
+- Anthropic: `/v1/messages` with `stream: true`; parses
+  `content_block_delta` events with `delta.type = "text_delta"`.
+  Extended-thinking deltas are intentionally skipped (the
+  assistant-visible reply text only).
+- Gemini: `:streamGenerateContent?alt=sse`; emits the incremental
+  suffix over a "cumulative running total" wire shape.
+
+What still isn't end-to-end: the bridge's `POST /chat/stream` and
+the `stream:true` variant of `/v1/chat/completions` invoke the
+SOL chat flow via the mesh's request/response transport, which is
+single-shot today. The bridge therefore still receives a fully-
+materialised reply from the AI node and slices it into SSE
+chunks at the HTTP edge. Provider→bridge streaming pass-through
+needs a streaming `remote_call` primitive on the mesh transport
+(Gate 2 spec target). Operators who want per-token streaming
+today must call the AI node directly through a flow that returns
+the streamed text.
 
 ### OpenAI shim drops fields (SIMP-020)
 
