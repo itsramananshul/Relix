@@ -108,6 +108,7 @@ mod mcp;
 mod mcp_audit;
 mod memory_curator;
 mod memory_embed;
+mod memory_inspect;
 mod messaging;
 mod metrics;
 mod openai;
@@ -487,6 +488,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/memory/embed", post(memory_embed::embed))
         .route("/v1/memory/search", post(memory_embed::search))
         .route("/v1/memory/embed_all", post(memory_embed::embed_all))
+        // Four-layer memory inspector. Reads the layered store
+        // directly from `AppState::layered_memory` — set
+        // `[bridge] memory_db_path` to enable.
+        .route("/v1/memory/records", get(memory_inspect::list))
+        .route("/v1/memory/records/{id}", get(memory_inspect::show))
+        .route("/v1/memory/records/search", post(memory_inspect::search))
+        .route(
+            "/v1/memory/records/{id}/invalidate",
+            post(memory_inspect::invalidate),
+        )
+        .route("/v1/memory/stats", get(memory_inspect::stats))
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's

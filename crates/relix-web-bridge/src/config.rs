@@ -85,6 +85,21 @@ pub struct BridgeSection {
     /// `docs/security.md`.
     #[serde(default)]
     pub token_path: Option<PathBuf>,
+    /// Optional path to the layered memory store
+    /// (`memory.layered.db`). When configured, the bridge
+    /// opens the SQLite file directly and serves the
+    /// `/v1/memory/records/*` inspector endpoints from it.
+    /// When `None`, those endpoints return a clear
+    /// "not configured" 503 — the bridge does NOT auto-open
+    /// the file from a derived path because the bridge and
+    /// the memory controller may run on different hosts /
+    /// containers. Operators co-locating the two set this
+    /// explicitly. Read-only operations (list / show / stats)
+    /// are safe against a concurrently-writing memory node
+    /// thanks to WAL mode; `invalidate` flips `valid_to` and
+    /// is also WAL-safe.
+    #[serde(default)]
+    pub memory_db_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -258,6 +273,14 @@ pub struct AppState {
     /// gate. Shared with both the HTTP middleware and the
     /// WebSocket handler. See `crate::rate_limit`.
     pub rate_limits: crate::rate_limit::RateLimits,
+    /// Four-layer memory store backing the
+    /// `/v1/memory/records/*` inspector endpoints.
+    /// `Some` when `[bridge] memory_db_path` is configured AND
+    /// the SQLite open succeeded; `None` otherwise. Inspector
+    /// handlers return 503 on `None` with a clear message
+    /// telling the operator how to wire it.
+    pub layered_memory:
+        Option<std::sync::Arc<relix_runtime::nodes::memory::schema::LayeredMemoryStore>>,
 }
 
 impl AppState {
@@ -362,6 +385,7 @@ impl AppState {
         // shared Arc on the next line — the limiter owns its own
         // copy of just the budgets.
         let rate_limit_cfg = cfg.mesh.rate_limits.clone().unwrap_or_default();
+        let memory_db_path = cfg.bridge.memory_db_path.clone();
         Ok(Self {
             cfg: Arc::new(cfg),
             identity_bundle,
@@ -385,7 +409,29 @@ impl AppState {
             bridge_host,
             bridge_port,
             rate_limits: crate::rate_limit::RateLimits::new(rate_limit_cfg),
+            layered_memory: open_layered_memory(&memory_db_path),
         })
+    }
+}
+
+/// Open the four-layer memory store for the inspector
+/// endpoints. Returns `None` when the operator did not
+/// configure a path OR when the SQLite open failed; either
+/// way, inspector handlers serve a clear 503.
+fn open_layered_memory(
+    path: &Option<PathBuf>,
+) -> Option<std::sync::Arc<relix_runtime::nodes::memory::schema::LayeredMemoryStore>> {
+    let path = path.as_ref()?;
+    match relix_runtime::nodes::memory::schema::LayeredMemoryStore::open(path) {
+        Ok(s) => Some(std::sync::Arc::new(s)),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "memory inspector: failed to open layered store; inspector endpoints will return 503"
+            );
+            None
+        }
     }
 }
 

@@ -9,6 +9,7 @@ mod flow_run;
 mod fs;
 mod identity;
 mod mcp;
+mod memory_inspect;
 mod mesh;
 mod ops;
 mod os_secure;
@@ -224,6 +225,17 @@ enum Cmd {
         cmd: skills::Cmd,
     },
 
+    /// Inspect the four-layer memory store
+    /// (`memory.layered.db`). Subcommands: `list`, `show`,
+    /// `search`, `invalidate`, `stats`. Talks to the bridge's
+    /// `/v1/memory/records/*` and `/v1/memory/stats` endpoints
+    /// — requires the bridge to have `[bridge] memory_db_path`
+    /// configured.
+    Memory {
+        #[command(subcommand)]
+        cmd: memory_inspect::Cmd,
+    },
+
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,
@@ -287,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Export(args) => export::run(args).await,
         Cmd::Souls { cmd } => souls::run(cmd),
         Cmd::Skills { cmd } => skills::run(cmd),
+        Cmd::Memory { cmd } => memory_inspect::run(cmd).await,
         Cmd::FlowRun {
             flow,
             identity,
