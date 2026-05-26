@@ -183,6 +183,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut state = AppState::try_new(cfg.clone())?;
 
+    // W7: spawn the OTel flush loop on startup if the bridge's
+    // `[observability.otel]` block enabled the exporter. The
+    // exporter is shared with the ObservabilityContext via Arc;
+    // record_event buffers; the spawned loop ships every 5s.
+    if let Some(exporter) = state.otel_exporter.clone() {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let _ = exporter.flush().await;
+            }
+        });
+        tracing::info!("bridge observability: spawned OTLP flush loop (interval=5s)");
+    }
+
     // M10 + M11: discovery pass that *also* hands back a long-lived
     // MeshClient. The libp2p transport + dial cost is now paid once at
     // startup; every /chat thereafter reuses it.

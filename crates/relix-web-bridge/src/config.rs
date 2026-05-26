@@ -42,6 +42,38 @@ pub struct BridgeConfig {
     /// 5 concurrent WS sockets).
     #[serde(default)]
     pub mesh: MeshSection,
+    /// Optional observability wiring (W7). Absent / disabled means
+    /// the bridge's ObservabilityContext stays buffer-only and the
+    /// OTLP exporter never spawns. Same shape as the controller's
+    /// `[observability.otel]`.
+    #[serde(default)]
+    pub observability: Option<BridgeObservabilitySection>,
+}
+
+/// `[observability]` for the bridge. Carries the OTel block; future
+/// observability layers (Prom metrics, etc.) extend this struct.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct BridgeObservabilitySection {
+    #[serde(default)]
+    pub otel: Option<BridgeOtelSection>,
+}
+
+/// `[observability.otel]` — operator-friendly OTel config. Same
+/// shape as controller-side `OtelConfigToml`; duplicated here so
+/// the bridge keeps its config schema self-contained.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct BridgeOtelSection {
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP `/v1/traces` URL.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Event types to opt into export. Empty means nothing is
+    /// exported even when enabled.
+    #[serde(default)]
+    pub events: Vec<String>,
 }
 
 /// Bridge-level container for the `[mesh]` block. Only carries
@@ -304,6 +336,12 @@ pub struct AppState {
     /// short retention window. See
     /// `crates/relix-runtime/src/observability/sinks.rs`.
     pub observability: relix_runtime::observability::ObservabilityContext,
+    /// W7: optional OTLP exporter handle. Set when
+    /// `[observability.otel]` is enabled in bridge config and
+    /// the exporter was successfully built. `main.rs` consults
+    /// this Arc to spawn the periodic flush loop. `None` means
+    /// no OTel egress and no flush loop.
+    pub otel_exporter: Option<std::sync::Arc<relix_runtime::observability::OtelExporter>>,
     /// Four-layer memory store backing the
     /// `/v1/memory/records/*` inspector endpoints.
     /// `Some` when `[bridge] memory_db_path` is configured AND
@@ -417,7 +455,13 @@ impl AppState {
         // copy of just the budgets.
         let rate_limit_cfg = cfg.mesh.rate_limits.clone().unwrap_or_default();
         let memory_db_path = cfg.bridge.memory_db_path.clone();
-        Ok(Self {
+        // Snapshot the observability section before `cfg` is
+        // moved into the AppState literal. The W7 OTel exporter
+        // is built from this snapshot below so the producer
+        // (ObservabilityContext) and the flush handle share one
+        // Arc.
+        let observability_cfg = cfg.observability.clone();
+        let mut state = Self {
             cfg: Arc::new(cfg),
             identity_bundle,
             client_key,
@@ -448,10 +492,68 @@ impl AppState {
                 relix_runtime::nodes::execution::broker::AgentAccessBroker::empty(),
             ),
             tool_registry: crate::tools::empty_registry(),
-            observability: relix_runtime::observability::ObservabilityContext::in_memory(),
+            observability: {
+                // Placeholder; the real composition happens
+                // immediately after the AppState literal so the
+                // OTel exporter and ObservabilityContext share a
+                // single Arc.
+                relix_runtime::observability::ObservabilityContext::in_memory()
+            },
+            otel_exporter: None,
             layered_memory: open_layered_memory(&memory_db_path),
-        })
+        };
+
+        // W7: build the OTel exporter once and thread the SAME
+        // Arc into both `observability` (the producer-facing
+        // context) and `otel_exporter` (the handle main.rs uses
+        // to spawn the flush loop). Reusing one Arc means
+        // `record_event` and `flush` operate on the same buffer.
+        if let Some(exporter) = build_bridge_otel(&observability_cfg) {
+            let obs = std::mem::replace(
+                &mut state.observability,
+                relix_runtime::observability::ObservabilityContext::in_memory(),
+            );
+            state.observability = obs.with_otel(exporter.clone());
+            state.otel_exporter = Some(exporter);
+        }
+        Ok(state)
     }
+}
+
+/// Build an `Arc<OtelExporter>` from the bridge's optional
+/// observability section. Returns `None` unless the OTel block
+/// is enabled AND has an endpoint URL — same fail-safe posture
+/// as the controller-side `build_otel_config`.
+pub(crate) fn build_bridge_otel(
+    obs: &Option<BridgeObservabilitySection>,
+) -> Option<std::sync::Arc<relix_runtime::observability::OtelExporter>> {
+    let otel = obs.as_ref()?.otel.as_ref()?;
+    if !otel.enabled || otel.endpoint.is_none() {
+        return None;
+    }
+    let mut runtime_cfg = relix_runtime::observability::OtelConfig {
+        enabled: true,
+        endpoint_url: otel.endpoint.clone(),
+        ..relix_runtime::observability::OtelConfig::default()
+    };
+    if let Some(s) = otel.service_name.as_deref()
+        && !s.is_empty()
+    {
+        runtime_cfg.service_name = s.to_string();
+    }
+    let mut events = runtime_cfg.events.clone();
+    for e in &otel.events {
+        events = events.enable(e);
+    }
+    runtime_cfg.events = events;
+    tracing::info!(
+        endpoint = ?otel.endpoint,
+        events = ?otel.events,
+        "bridge observability: OTLP exporter enabled"
+    );
+    Some(std::sync::Arc::new(
+        relix_runtime::observability::OtelExporter::new(runtime_cfg),
+    ))
 }
 
 /// Open the four-layer memory store for the inspector
@@ -577,5 +679,165 @@ mod tests {
         assert_eq!(oa.default_model, "relix-mock");
         assert_eq!(oa.models.len(), 2);
         assert_eq!(oa.models[0].id, "relix-mock");
+    }
+
+    // ── W7: bridge-side OTel wiring ──────────────────────────────
+
+    #[test]
+    fn bridge_config_parses_observability_otel_section() {
+        let toml_str = r#"
+            [bridge]
+            listen_addr = "127.0.0.1:9100"
+
+            [identity]
+            bundle_path     = "dev-keys/bridge.aic"
+            client_key_path = "dev-keys/bridge.key"
+
+            [transport]
+            peers_path    = "configs/peers-chained.toml"
+            deadline_secs = 30
+
+            [flow]
+            template_path = "flows/chat_template.sol"
+
+            [observability.otel]
+            enabled = true
+            endpoint = "http://localhost:4318/v1/traces"
+            service_name = "relix-bridge"
+            events = ["model_call"]
+        "#;
+        let cfg: BridgeConfig = toml::from_str(toml_str).expect("parse");
+        let otel = cfg
+            .observability
+            .as_ref()
+            .and_then(|o| o.otel.as_ref())
+            .expect("otel section present");
+        assert!(otel.enabled);
+        assert_eq!(
+            otel.endpoint.as_deref(),
+            Some("http://localhost:4318/v1/traces")
+        );
+        assert_eq!(otel.events, vec!["model_call".to_string()]);
+    }
+
+    #[test]
+    fn build_bridge_otel_returns_none_when_disabled_or_no_endpoint() {
+        // Section missing → None.
+        assert!(super::build_bridge_otel(&None).is_none());
+        // Enabled but no endpoint → None (fail-safe).
+        let no_endpoint = BridgeObservabilitySection {
+            otel: Some(BridgeOtelSection {
+                enabled: true,
+                endpoint: None,
+                ..Default::default()
+            }),
+        };
+        assert!(super::build_bridge_otel(&Some(no_endpoint)).is_none());
+        // Endpoint present but disabled → None.
+        let disabled = BridgeObservabilitySection {
+            otel: Some(BridgeOtelSection {
+                enabled: false,
+                endpoint: Some("http://x".into()),
+                ..Default::default()
+            }),
+        };
+        assert!(super::build_bridge_otel(&Some(disabled)).is_none());
+    }
+
+    #[test]
+    fn build_bridge_otel_returns_exporter_when_enabled_and_endpoint_set() {
+        let section = BridgeObservabilitySection {
+            otel: Some(BridgeOtelSection {
+                enabled: true,
+                endpoint: Some("http://localhost:4318/v1/traces".into()),
+                service_name: Some("relix-bridge".into()),
+                events: vec!["model_call".into()],
+            }),
+        };
+        let exp =
+            super::build_bridge_otel(&Some(section)).expect("exporter built when enabled+endpoint");
+        let cfg = exp.config();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.service_name, "relix-bridge");
+        assert_eq!(
+            cfg.endpoint_url.as_deref(),
+            Some("http://localhost:4318/v1/traces")
+        );
+        assert!(cfg.events.is_enabled("model_call"));
+    }
+
+    #[tokio::test]
+    async fn observability_context_with_otel_buffers_then_flush_posts() {
+        // End-to-end at the AppState layer minus a real
+        // BridgeConfig file: build an ObservabilityContext via
+        // the same path AppState::try_new uses, push a chat
+        // metadata event, drain via flush(), and confirm the
+        // OTLP collector mock saw a POST. This proves the
+        // producer (ObservabilityContext::record_event) and
+        // the flush handle share one Arc.
+        use std::io::{Read, Write};
+        use std::sync::Arc as TestArc;
+        use std::sync::Mutex as TestMutex;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured: TestArc<TestMutex<Vec<u8>>> = TestArc::new(TestMutex::new(Vec::new()));
+        let cap_clone = captured.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if let Some(body_start) = buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+                    *cap_clone.lock().unwrap() = buf[body_start + 4..n].to_vec();
+                }
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let url = format!("http://{addr}/v1/traces");
+        let section = BridgeObservabilitySection {
+            otel: Some(BridgeOtelSection {
+                enabled: true,
+                endpoint: Some(url),
+                service_name: Some("relix-bridge".into()),
+                events: vec!["model_call".into()],
+            }),
+        };
+        let exporter = super::build_bridge_otel(&Some(section)).expect("exporter built");
+        let ctx = relix_runtime::observability::ObservabilityContext::in_memory()
+            .with_otel(exporter.clone());
+        // Producer-side: feed a model_call through record_event.
+        ctx.record_event(
+            relix_runtime::observability::MetadataEvent {
+                event_id: "ev-1".into(),
+                session_id: "sess-1".into(),
+                agent_id: "bridge".into(),
+                event_type: "model_call".into(),
+                timestamp_unix: 1_700_000_000,
+                latency_ms: Some(120),
+                token_count: None,
+                cost_cents: None,
+                error_type: None,
+                tool_name: None,
+                model_name: Some("gpt-test".into()),
+                success: true,
+            },
+            None,
+        );
+        // Flush → POST hits the mock.
+        let drained = exporter.flush().await;
+        assert_eq!(drained.len(), 1, "exporter must buffer the event");
+        // Wait a brief moment for the mock thread to record the body.
+        for _ in 0..20 {
+            if !captured.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let body = captured.lock().unwrap().clone();
+        assert!(!body.is_empty(), "OTLP mock did not receive a POST body");
+        let body_str = String::from_utf8(body).unwrap();
+        assert!(
+            body_str.contains("relix.model_call"),
+            "body missing span name: {body_str}"
+        );
     }
 }
