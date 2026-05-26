@@ -1659,6 +1659,134 @@ impl TaskStore {
         Ok(out)
     }
 
+    /// Full-text search across chat-turn chronicle events.
+    ///
+    /// Matches `chat.user_turn` / `chat.assistant_turn` rows whose
+    /// payload contains the query substring. When `subject_id` is
+    /// non-empty, restricts the join to tasks owned by that
+    /// subject; empty subject_id is the operator-only "search
+    /// everything" path. `limit` is clamped to `[1, 100]`; a 0
+    /// limit collapses to the default 20.
+    ///
+    /// Today the matcher is a `LIKE '%q%'` scan with `score = 1.0`
+    /// for every hit; SQLite FTS5 indexing of the chronicle is a
+    /// future optimization that doesn't change the return shape.
+    /// Results are returned oldest-first across both tasks; the
+    /// snippet carries up to 50 chars of content on each side of
+    /// the first match.
+    pub fn search_chat_turns(
+        &self,
+        subject_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionSearchHit>, CoordinatorError> {
+        let cap = if limit == 0 {
+            DEFAULT_SESSION_SEARCH_LIMIT
+        } else {
+            limit
+        }
+        .min(MAX_SESSION_SEARCH_LIMIT);
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|_| CoordinatorError::Lock)?;
+        // Body filters on event_type + payload; subject_id filter
+        // joins through `tasks.owner_subject_id`. Two paths so
+        // the join is only taken when it actually narrows.
+        let pattern = format!("%{trimmed}%");
+        let rows: Vec<(String, String, i64)> = if subject_id.is_empty() {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT te.event_type, te.payload, te.ts
+                     FROM task_events te
+                     WHERE te.event_type IN ('chat.user_turn', 'chat.assistant_turn')
+                       AND te.payload LIKE ?1
+                     ORDER BY te.ts ASC, te.event_id ASC
+                     LIMIT ?2",
+                )
+                .map_err(CoordinatorError::Db)?;
+            stmt.query_map(params![pattern, cap as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(CoordinatorError::Db)?
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT te.event_type, te.payload, te.ts
+                     FROM task_events te
+                     JOIN tasks t ON te.task_id = t.task_id
+                     WHERE te.event_type IN ('chat.user_turn', 'chat.assistant_turn')
+                       AND te.payload LIKE ?1
+                       AND t.owner_subject_id = ?2
+                     ORDER BY te.ts ASC, te.event_id ASC
+                     LIMIT ?3",
+                )
+                .map_err(CoordinatorError::Db)?;
+            stmt.query_map(params![pattern, subject_id, cap as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(CoordinatorError::Db)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(CoordinatorError::Db)?
+        };
+        let mut out: Vec<SessionSearchHit> = Vec::with_capacity(rows.len());
+        for (event_type, payload, ts) in rows {
+            // Re-parse the payload using the chat-turn parser
+            // (uses splitn(4,'|') so content can carry pipes).
+            // We don't know the session_id upfront; pull it from
+            // the payload's first field directly.
+            let Some((sess, rest_after_session)) = payload.split_once('|') else {
+                continue;
+            };
+            if let Some(turn) = parse_chat_turn_payload(sess, &event_type, &payload, ts)
+                && turn
+                    .content
+                    .to_ascii_lowercase()
+                    .contains(&trimmed.to_ascii_lowercase())
+            {
+                let snippet = build_match_snippet(&turn.content, trimmed);
+                let _ = rest_after_session;
+                out.push(SessionSearchHit {
+                    session_id: turn.session_id,
+                    role: turn.role,
+                    content: turn.content,
+                    timestamp_unix: turn.timestamp_unix,
+                    snippet,
+                    score: 1.0,
+                });
+            } else if let Some(turn) = parse_chat_turn_payload(sess, &event_type, &payload, ts) {
+                // The LIKE matched on the payload (which includes
+                // the session_id / role / ts prefix); the actual
+                // content body doesn't contain the query. We
+                // still emit a hit because the payload matched —
+                // operators searching for a session_id substring
+                // benefit, and matches on content are the common
+                // case so this branch is rarely taken in practice.
+                let snippet = build_match_snippet(&turn.content, trimmed);
+                out.push(SessionSearchHit {
+                    session_id: turn.session_id,
+                    role: turn.role,
+                    content: turn.content,
+                    timestamp_unix: turn.timestamp_unix,
+                    snippet,
+                    score: 1.0,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn recent_events_cross_task(
         &self,
         since_event_id: i64,
@@ -4212,6 +4340,16 @@ pub fn register(
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 async move { handle_session_export(&s, &ctx) }
+            })),
+        );
+    }
+    {
+        let s = store.clone();
+        bridge.register(
+            "task.session_search",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handle_session_search(&s, &ctx) }
             })),
         );
     }
@@ -7051,6 +7189,66 @@ pub fn parse_chat_turn_payload(
     })
 }
 
+/// Default + max limits for `task.session_search`. The
+/// search is operator-facing (and tool-callable for agents
+/// searching their own history); both caps are conservative
+/// so a misconfigured caller cannot DoS the coordinator.
+pub const DEFAULT_SESSION_SEARCH_LIMIT: usize = 20;
+pub const MAX_SESSION_SEARCH_LIMIT: usize = 100;
+
+/// One match returned by `task.session_search`. Wire-stable
+/// JSON shape; clients (the bridge proxy, the agent tool
+/// path, the dashboard) round-trip it via serde.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionSearchHit {
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp_unix: i64,
+    pub snippet: String,
+    /// `1.0` for the LIKE-fallback path; reserved for a real
+    /// BM25 score when an FTS5 chronicle index lands.
+    pub score: f32,
+}
+
+/// Build an operator-readable snippet for a search hit. Lands
+/// the first occurrence of `query` in `content` (case-insensitive)
+/// surrounded by up to 50 characters of context on each side.
+/// When the query is not found in `content` (e.g. the LIKE
+/// matched on the payload prefix), returns the first 110
+/// chars of content as a fallback so the row is still
+/// operator-readable.
+pub fn build_match_snippet(content: &str, query: &str) -> String {
+    if query.is_empty() {
+        return content.chars().take(110).collect();
+    }
+    let lc_content = content.to_ascii_lowercase();
+    let lc_query = query.to_ascii_lowercase();
+    let Some(byte_idx) = lc_content.find(&lc_query) else {
+        return content.chars().take(110).collect();
+    };
+    // Convert byte index to char index so the +/- 50 window
+    // is unicode-safe.
+    let mut chars_before_match = 0usize;
+    let mut byte_count = 0usize;
+    for c in content.chars() {
+        if byte_count >= byte_idx {
+            break;
+        }
+        byte_count += c.len_utf8();
+        chars_before_match += 1;
+    }
+    let start_char = chars_before_match.saturating_sub(50);
+    let match_char_len = lc_query.chars().count();
+    let end_char = chars_before_match + match_char_len + 50;
+    let chars: Vec<char> = content.chars().collect();
+    let end_char = end_char.min(chars.len());
+    let prefix = if start_char > 0 { "…" } else { "" };
+    let suffix = if end_char < chars.len() { "…" } else { "" };
+    let body: String = chars[start_char..end_char].iter().collect();
+    format!("{prefix}{body}{suffix}")
+}
+
 /// W5: `task.session_export` handler. Arg = `session_id`.
 /// Returns a JSON array of [`ChatTurn`] objects in
 /// chronological order.
@@ -7068,6 +7266,43 @@ fn handle_session_export(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutco
             Err(e) => internal(format!("task.session_export json: {e}")),
         },
         Err(e) => internal(format!("task.session_export: {e}")),
+    }
+}
+
+/// `task.session_search` handler.
+///
+/// Wire format (`splitn(3, '|')` so the query keeps its own
+/// internal pipes):
+///
+/// ```text
+/// <subject_id>|<query>|<limit>
+/// ```
+///
+/// Returns the same JSON shape as `task.session_export` but
+/// with [`SessionSearchHit`] entries (adds `snippet` + `score`).
+pub(crate) fn handle_session_search(store: &TaskStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid(format!("task.session_search utf8: {e}")),
+    };
+    let mut parts = s.splitn(3, '|');
+    let subject_id = parts.next().unwrap_or("").trim().to_string();
+    let query = parts.next().unwrap_or("").to_string();
+    let limit = parts
+        .next()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SESSION_SEARCH_LIMIT);
+    if query.trim().is_empty() {
+        return invalid("task.session_search: query required".to_string());
+    }
+    match store.search_chat_turns(&subject_id, &query, limit) {
+        Ok(hits) => match serde_json::to_string(&hits) {
+            Ok(json) => HandlerOutcome::Ok(json.into_bytes()),
+            Err(e) => internal(format!("task.session_search json: {e}")),
+        },
+        Err(e) => internal(format!("task.session_search: {e}")),
     }
 }
 
@@ -11927,6 +12162,244 @@ mod tests {
                 assert_eq!(arr[0]["session_id"], "sess-A");
             }
             HandlerOutcome::Err(e) => panic!("expected Ok, got err: {}", e.cause),
+        }
+    }
+
+    // ── task.session_search ──────────────────────────────────────
+
+    /// Seed a chat turn for an explicit session_id (the W5 helper
+    /// hard-codes `sess-A`). Used by the search-cross-session
+    /// tests.
+    fn seed_chat_turn_for(
+        s: &TaskStore,
+        task_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        ts: i64,
+    ) {
+        let event_type = if role == "user" {
+            "chat.user_turn"
+        } else {
+            "chat.assistant_turn"
+        };
+        let payload = format!("{session_id}|{role}|{ts}|{content}");
+        s.append_event(task_id, event_type, &payload).unwrap();
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE task_events SET ts = ?1 WHERE task_id = ?2 AND event_type = ?3 AND payload = ?4",
+            rusqlite::params![ts, task_id, event_type, payload],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn search_returns_single_match_with_session_id_role_timestamp_and_snippet() {
+        let s = store();
+        let tid = mk(&s, "chat session", "chat.sol", "{}", "alice");
+        seed_chat_turn_for(
+            &s,
+            &tid,
+            "sess-A",
+            "user",
+            "hello world today",
+            1_700_000_001,
+        );
+        seed_chat_turn_for(
+            &s,
+            &tid,
+            "sess-A",
+            "assistant",
+            "nothing matches",
+            1_700_000_002,
+        );
+        let hits = s.search_chat_turns("", "world", 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.session_id, "sess-A");
+        assert_eq!(h.role, "user");
+        assert_eq!(h.content, "hello world today");
+        assert_eq!(h.timestamp_unix, 1_700_000_001);
+        assert!(h.snippet.contains("world"), "snippet={}", h.snippet);
+        assert!((h.score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn search_returns_multiple_matches_in_timestamp_order() {
+        let s = store();
+        let tid = mk(&s, "chat session", "chat.sol", "{}", "alice");
+        seed_chat_turn_for(
+            &s,
+            &tid,
+            "sess-A",
+            "user",
+            "find me FOO once",
+            1_700_000_002,
+        );
+        seed_chat_turn_for(&s, &tid, "sess-B", "user", "FOO again here", 1_700_000_001);
+        seed_chat_turn_for(
+            &s,
+            &tid,
+            "sess-B",
+            "assistant",
+            "more FOO data",
+            1_700_000_003,
+        );
+        let hits = s.search_chat_turns("", "FOO", 20).unwrap();
+        assert_eq!(hits.len(), 3);
+        for w in hits.windows(2) {
+            assert!(w[0].timestamp_unix <= w[1].timestamp_unix);
+        }
+    }
+
+    #[test]
+    fn search_subject_id_filter_restricts_to_owner_subject() {
+        let s = store();
+        let tid_alice = mk(&s, "alice chat", "chat.sol", "{}", "alice");
+        let tid_bob = mk(&s, "bob chat", "chat.sol", "{}", "bob");
+        seed_chat_turn_for(
+            &s,
+            &tid_alice,
+            "sess-a",
+            "user",
+            "search target xyz",
+            1_700_000_001,
+        );
+        seed_chat_turn_for(
+            &s,
+            &tid_bob,
+            "sess-b",
+            "user",
+            "search target xyz",
+            1_700_000_002,
+        );
+        let alice_hits = s.search_chat_turns("alice", "xyz", 20).unwrap();
+        assert_eq!(alice_hits.len(), 1);
+        assert_eq!(alice_hits[0].session_id, "sess-a");
+        let bob_hits = s.search_chat_turns("bob", "xyz", 20).unwrap();
+        assert_eq!(bob_hits.len(), 1);
+        assert_eq!(bob_hits[0].session_id, "sess-b");
+        let all_hits = s.search_chat_turns("", "xyz", 20).unwrap();
+        assert_eq!(all_hits.len(), 2);
+    }
+
+    #[test]
+    fn search_limit_caps_at_max_session_search_limit() {
+        let s = store();
+        let tid = mk(&s, "chat", "chat.sol", "{}", "alice");
+        for i in 0..200 {
+            seed_chat_turn_for(
+                &s,
+                &tid,
+                "sess",
+                "user",
+                &format!("needle row {i}"),
+                1_700_000_000 + i as i64,
+            );
+        }
+        // Limit above MAX clamps to MAX.
+        let hits = s.search_chat_turns("", "needle", 5_000).unwrap();
+        assert_eq!(hits.len(), MAX_SESSION_SEARCH_LIMIT);
+        // Limit 0 collapses to DEFAULT.
+        let hits = s.search_chat_turns("", "needle", 0).unwrap();
+        assert_eq!(hits.len(), DEFAULT_SESSION_SEARCH_LIMIT);
+        // Explicit small limit respected.
+        let hits = s.search_chat_turns("", "needle", 7).unwrap();
+        assert_eq!(hits.len(), 7);
+    }
+
+    #[test]
+    fn search_no_matches_returns_empty_not_error() {
+        let s = store();
+        let tid = mk(&s, "chat", "chat.sol", "{}", "alice");
+        seed_chat_turn_for(&s, &tid, "sess", "user", "hello there", 1_700_000_001);
+        let hits = s.search_chat_turns("", "missing-token", 20).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_snippet_includes_surrounding_context_around_match() {
+        // Build a long-enough content body so the 50/50 window
+        // doesn't span the whole string. The snippet must
+        // contain the matched substring plus context on each
+        // side.
+        let prefix = "AAAA".repeat(40); // 160 chars before
+        let suffix = "BBBB".repeat(40); // 160 chars after
+        let content = format!("{prefix}NEEDLE{suffix}");
+        let snippet = build_match_snippet(&content, "needle");
+        assert!(snippet.contains("NEEDLE"), "snippet={snippet}");
+        // Trimmed on the prefix side, so first chars are NOT the
+        // original opening "AAAA".
+        assert!(snippet.starts_with('…'), "snippet={snippet}");
+        assert!(snippet.ends_with('…'), "snippet={snippet}");
+    }
+
+    #[test]
+    fn search_handler_returns_json_array_with_score_and_snippet() {
+        let s = store();
+        let tid = mk(&s, "chat", "chat.sol", "{}", "alice");
+        seed_chat_turn_for(
+            &s,
+            &tid,
+            "sess",
+            "user",
+            "operator queries needle here",
+            1_700_000_001,
+        );
+        let ctx = InvocationCtx {
+            caller: relix_core::identity::VerifiedIdentity {
+                subject_id: relix_core::types::NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: relix_core::types::NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "agent".into(),
+                clearance: "internal".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: relix_core::types::TraceId::new(),
+            request_id: relix_core::types::RequestId::new(),
+            args: b"|needle|5".to_vec(),
+        };
+        let outcome = handle_session_search(&s, &ctx);
+        match outcome {
+            HandlerOutcome::Ok(body) => {
+                let body = String::from_utf8(body).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let arr = v.as_array().unwrap();
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0]["session_id"], "sess");
+                assert_eq!(arr[0]["role"], "user");
+                assert!(arr[0]["snippet"].as_str().unwrap().contains("needle"));
+                let score = arr[0]["score"].as_f64().unwrap();
+                assert!((score - 1.0).abs() < 1e-6);
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got: {}", e.cause),
+        }
+    }
+
+    #[test]
+    fn search_handler_rejects_empty_query() {
+        let s = store();
+        let ctx = InvocationCtx {
+            caller: relix_core::identity::VerifiedIdentity {
+                subject_id: relix_core::types::NodeId::from_pubkey(b"x"),
+                name: "x".into(),
+                org_id: relix_core::types::NodeId::from_pubkey(b"o"),
+                groups: vec![],
+                role: "agent".into(),
+                clearance: "internal".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: relix_core::types::TraceId::new(),
+            request_id: relix_core::types::RequestId::new(),
+            args: b"||20".to_vec(),
+        };
+        let outcome = handle_session_search(&s, &ctx);
+        match outcome {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, relix_core::types::error_kinds::INVALID_ARGS);
+            }
+            HandlerOutcome::Ok(_) => panic!("expected Err on empty query"),
         }
     }
 
