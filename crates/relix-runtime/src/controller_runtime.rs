@@ -2729,6 +2729,27 @@ fn build_input_guardrail(cfg: &ControllerConfig) -> crate::nodes::ai::guardrails
     }
 }
 
+// Parse `[guardrails.drift]` from the top-level [guardrails]
+// section. Returns `Some(cfg)` only when `enabled = true`; an
+// absent / disabled config returns `None` so the coordinator's
+// drift hook short-circuits immediately.
+fn build_drift_config(cfg: &ControllerConfig) -> Option<crate::nodes::ai::guardrails::DriftConfig> {
+    use crate::nodes::ai::guardrails::DriftConfig;
+    let raw = cfg.guardrails.clone()?;
+    #[derive(serde::Deserialize, Default)]
+    struct GuardrailsBlock {
+        #[serde(default)]
+        drift: Option<DriftConfig>,
+    }
+    let parsed: GuardrailsBlock = raw
+        .try_into()
+        .map_err(|e: toml::de::Error| {
+            tracing::warn!(error = %e, "[guardrails] parse failed; drift hook disabled");
+        })
+        .ok()?;
+    parsed.drift.filter(|c| c.enabled)
+}
+
 // Open the four-layer LayeredMemoryStore when the operator opted
 // in via [memory.qdrant] OR an explicit layered_db_path. Returns
 // None when neither is configured — the layered surface is purely
@@ -3272,7 +3293,12 @@ fn register_node_type_handlers(
             },
             None => None,
         };
-        crate::nodes::coordinator::register(bridge, store.clone(), auto_skill_cfg);
+        // `[guardrails.drift]` is parsed on the coordinator
+        // boot path so the post-update hook can evaluate
+        // running tasks. Absent / disabled ⇒ `None` ⇒ hook
+        // stays dormant.
+        let drift_cfg = build_drift_config(cfg).map(std::sync::Arc::new);
+        crate::nodes::coordinator::register(bridge, store.clone(), auto_skill_cfg, drift_cfg);
         // Cron scheduler shares the coordinator's database.
         // Opens its own rusqlite connection against the same
         // file; SQLite handles cross-connection locking.

@@ -15,8 +15,10 @@
 //! layer; the operator should layer rate limits, policy
 //! admit rules, and audit trails alongside.
 
+pub mod drift;
 pub mod input;
 
+pub use drift::{ChronicleEvent, DriftAction, DriftConfig, DriftDetector};
 pub use input::{InputGuardrail, InputGuardrailResult, PiiPolicy};
 
 /// Stable category tags content classification can attach to

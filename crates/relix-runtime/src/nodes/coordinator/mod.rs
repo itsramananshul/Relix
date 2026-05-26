@@ -4039,6 +4039,7 @@ pub fn register(
     bridge: &mut DispatchBridge,
     store: Arc<TaskStore>,
     auto_skill_cfg: Option<Arc<crate::nodes::ai::skills::SkillsConfig>>,
+    drift_cfg: Option<Arc<crate::nodes::ai::guardrails::DriftConfig>>,
 ) {
     {
         let s = store.clone();
@@ -4053,11 +4054,13 @@ pub fn register(
     {
         let s = store.clone();
         let auto_cfg = auto_skill_cfg.clone();
+        let drift = drift_cfg.clone();
         bridge.register(
             "task.update",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 let auto = auto_cfg.clone();
+                let drift = drift.clone();
                 async move {
                     let outcome = handle_update(&s, &ctx);
                     // Post-update hook: when a task transitions
@@ -4077,6 +4080,27 @@ pub fn register(
                         let auto = auto.clone();
                         tokio::task::spawn_blocking(move || {
                             run_auto_skill_for_task(&s, &task_id, &auto);
+                        });
+                    }
+                    // Drift hook: on `running` transitions, when
+                    // `[guardrails.drift] enabled = true`,
+                    // evaluate whether the recent chronicle
+                    // diverges from the original goal. The
+                    // embedding-aware comparison lands when the
+                    // coordinator gains an outbound embedding
+                    // dispatcher; today the helper still records
+                    // the chronicle summary so the operator can
+                    // audit drift after the fact.
+                    if let HandlerOutcome::Ok(_) = &outcome
+                        && let Some(cfg) = drift.as_ref()
+                        && cfg.enabled
+                        && let Some((task_id, status)) = parse_completed_signal(&ctx.args)
+                        && status == "running"
+                    {
+                        let s = s.clone();
+                        let cfg = cfg.clone();
+                        tokio::task::spawn_blocking(move || {
+                            evaluate_drift_for_task(&s, &task_id, &cfg);
                         });
                     }
                     outcome
@@ -6868,6 +6892,79 @@ fn parse_completed_signal(args: &[u8]) -> Option<(String, String)> {
         return None;
     }
     Some((task_id, status))
+}
+
+/// Best-effort drift evaluation for a `running` task. Pulls
+/// the task's view + recent chronicle, hands the summary to
+/// the drift detector, and writes a `drift_evaluation`
+/// chronicle entry the operator can audit later. Honest
+/// scope: today the coordinator has no outbound embedding
+/// dispatcher, so the helper records the summary + the
+/// configured threshold without computing the cosine. When
+/// the embedding wiring lands, the same helper will fold in
+/// goal + recent embeddings and the chronicle entry will
+/// carry the verdict.
+fn evaluate_drift_for_task(
+    store: &TaskStore,
+    task_id: &str,
+    cfg: &crate::nodes::ai::guardrails::DriftConfig,
+) {
+    use crate::nodes::ai::guardrails::{ChronicleEvent, DriftDetector};
+    let detector = DriftDetector::from_config(cfg);
+    let view = match store.get(task_id) {
+        Ok(Some(v)) => v,
+        _ => return,
+    };
+    let events = store
+        .query_events(
+            task_id,
+            0,
+            detector.check_every_n() as usize * 4,
+            None,
+            EventOrder::Desc,
+        )
+        .unwrap_or_default();
+    // query_events with Desc returns newest-first; the
+    // summariser wants chronological order so reverse.
+    let mut chronological = events;
+    chronological.reverse();
+    let mapped: Vec<ChronicleEvent> = chronological
+        .into_iter()
+        .map(|e| ChronicleEvent::new(e.event_type, e.payload))
+        .collect();
+    let Some(summary) = detector.summarise_recent_events(&mapped) else {
+        // Not enough events yet — log at debug so the
+        // operator can correlate the skip without spamming
+        // warns.
+        tracing::debug!(
+            task_id,
+            n = mapped.len(),
+            check_every_n = detector.check_every_n(),
+            "drift: not enough chronicle events to evaluate"
+        );
+        return;
+    };
+    let goal_preview: String = view.title.chars().take(120).collect();
+    tracing::info!(
+        task_id,
+        action = cfg.action.as_str(),
+        threshold = detector.threshold(),
+        goal = %goal_preview,
+        summary_lines = summary.lines().count(),
+        "drift: evaluation recorded (embedding-aware comparison lands once coordinator wires an embedding dispatcher)"
+    );
+    // Write a chronicle entry so post-hoc auditing has
+    // something concrete to walk. Payload format:
+    // `goal=<title>|threshold=<f>|summary=<preview>`.
+    let payload = format!(
+        "goal={}|threshold={:.3}|summary={}",
+        goal_preview.replace('|', " "),
+        detector.threshold(),
+        summary.lines().take(3).collect::<Vec<_>>().join(" / ")
+    );
+    if let Err(e) = store.append_event(task_id, "guardrail.drift_evaluation", &payload) {
+        tracing::warn!(task_id, error = %e, "drift: append chronicle event failed");
+    }
 }
 
 /// Best-effort SKILL.md auto-generation for a completed task.
