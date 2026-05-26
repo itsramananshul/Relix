@@ -221,14 +221,45 @@ impl RelixConfig {
 /// `~/.relix/` — the operator data root. Honours `RELIX_HOME` first,
 /// then the user's home dir, falling back to `.relix` in CWD on the
 /// unusual systems where neither resolves.
+///
+/// We resolve the home dir from env vars directly rather than via
+/// the `dirs` crate so the workspace doesn't pull in `option-ext`
+/// (MPL-2.0), which trips `cargo deny`'s license allowlist. Every
+/// platform Relix supports surfaces the home dir through one of
+/// these standard variables.
 pub fn relix_home() -> PathBuf {
     if let Some(h) = std::env::var_os("RELIX_HOME") {
         return PathBuf::from(h);
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home_dir() {
         return home.join(".relix");
     }
     PathBuf::from(".relix")
+}
+
+/// Cross-platform stand-in for `dirs::home_dir`. Reads `$HOME` on
+/// POSIX; on Windows tries `%USERPROFILE%` first and falls back to
+/// `%HOMEDRIVE%%HOMEPATH%`. Returns `None` when nothing resolves —
+/// the caller falls back to a CWD-relative path.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(up) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(up));
+        }
+        match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+            (Some(d), Some(p)) => {
+                let mut s: std::ffi::OsString = d;
+                s.push(p);
+                Some(PathBuf::from(s))
+            }
+            _ => None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
 }
 
 /// Render an API key for display: keep the first 8 characters, then

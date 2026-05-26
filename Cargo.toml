@@ -48,7 +48,6 @@ hex        = "0.4"
 
 # Interactive CLI (used by `relix setup` wizard).
 crossterm = "0.28"
-dirs      = "5"
 
 # Errors
 thiserror = "1.0"

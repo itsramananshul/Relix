@@ -60,3 +60,22 @@ jobs:
         # test has already passed.
         continue-on-error: true
       - run: cargo test --workspace
+
+  deny:
+    # Supply-chain gate. License allowlist + advisory check + source
+    # allowlist. See deny.toml for the policy and the per-rule
+    # rationale. Runs once on Linux because the policy is platform-
+    # independent (license info comes from the lockfile, not the
+    # built artifact).
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Only license, advisory, source, ban checks — bans default
+          # is `warn` for multiple-versions, so the action picks that
+          # up from deny.toml automatically.
+          command: check
+          arg: --all-features
