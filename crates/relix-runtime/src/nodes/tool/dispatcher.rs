@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use super::super::execution::broker::{AccessDecision, AgentAccessBroker};
 use super::super::execution::gateway::{ActionGateway, GatewayAction};
 use super::super::execution::secrets::{SecretError, SecretStore};
+use super::contracts::ToolContract;
 
 /// Errors the dispatcher surfaces. Mirrors the shape of the
 /// `AccessDecision` variants so callers can pattern-match
@@ -29,9 +30,19 @@ use super::super::execution::secrets::{SecretError, SecretStore};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchError {
     AccessDenied(String),
-    RateLimited { retry_after_secs: u64 },
+    RateLimited {
+        retry_after_secs: u64,
+    },
     SecretMissing(String),
     HandlerFailed(String),
+    /// Args failed the contract's input-schema validation.
+    /// Carries the list of human-readable validation errors.
+    InvalidInput(Vec<String>),
+    /// Handler reply failed the contract's output-schema
+    /// validation. The handler ran (so the side effect may
+    /// have happened) — the dispatcher logs + surfaces the
+    /// reason so callers can decide whether to retry.
+    InvalidOutput(Vec<String>),
 }
 
 impl std::fmt::Display for DispatchError {
@@ -43,6 +54,8 @@ impl std::fmt::Display for DispatchError {
             }
             Self::SecretMissing(name) => write!(f, "secret '{name}' not found"),
             Self::HandlerFailed(c) => write!(f, "handler failed: {c}"),
+            Self::InvalidInput(errs) => write!(f, "invalid input: {}", errs.join("; ")),
+            Self::InvalidOutput(errs) => write!(f, "invalid output: {}", errs.join("; ")),
         }
     }
 }
@@ -127,6 +140,75 @@ impl ToolDispatcher {
                 Err(DispatchError::HandlerFailed(reason))
             }
         }
+    }
+
+    /// Schema-validated dispatch. Wraps [`Self::dispatch`]
+    /// with JSON parsing + input/output validation against
+    /// the supplied [`ToolContract`].
+    ///
+    /// Flow:
+    /// 1. Parse `args` as JSON. Non-JSON args → `InvalidInput`.
+    /// 2. Validate against `contract.input_schema`.
+    /// 3. Re-serialise the validated input as a string and
+    ///    pass it to `dispatch` (which runs the broker + secret
+    ///    + handler + gateway pipeline).
+    /// 4. Parse the handler reply as JSON.
+    /// 5. Validate against `contract.output_schema`.
+    /// 6. Return the original reply text on success.
+    pub async fn dispatch_with_contract<F, Fut>(
+        &self,
+        agent: &str,
+        contract: &ToolContract,
+        args: &str,
+        reversible: bool,
+        rollback_hint: Option<String>,
+        handler: F,
+    ) -> Result<String, DispatchError>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        let input_value: serde_json::Value = match serde_json::from_str(args) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(DispatchError::InvalidInput(vec![format!(
+                    "args are not valid JSON: {e}"
+                )]));
+            }
+        };
+        if let Err(errs) = contract.validate_input(&input_value) {
+            return Err(DispatchError::InvalidInput(errs));
+        }
+        let resolved_args = match serde_json::to_string(&input_value) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(DispatchError::InvalidInput(vec![format!(
+                    "re-serialise: {e}"
+                )]));
+            }
+        };
+        let reply = self
+            .dispatch(
+                agent,
+                &contract.tool_name,
+                &resolved_args,
+                reversible,
+                rollback_hint,
+                handler,
+            )
+            .await?;
+        let output_value: serde_json::Value = match serde_json::from_str(&reply) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(DispatchError::InvalidOutput(vec![format!(
+                    "handler reply is not valid JSON: {e}"
+                )]));
+            }
+        };
+        if let Err(errs) = contract.validate_output(&output_value) {
+            return Err(DispatchError::InvalidOutput(errs));
+        }
+        Ok(reply)
     }
 
     /// Render the current gateway state. Used by the
@@ -354,6 +436,65 @@ mod tests {
                 assert!(retry_after_secs <= 60);
             }
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_contract_validates_input_and_output() {
+        use super::super::contracts::fs_write_contract;
+        let store = store_with(&[]);
+        let broker = empty_broker();
+        let dispatcher = ToolDispatcher::new(store, broker);
+        let contract = fs_write_contract();
+        // Happy path: valid JSON, valid handler reply.
+        let out = dispatcher
+            .dispatch_with_contract(
+                "alice",
+                &contract,
+                r#"{"path":"/tmp/x","content":"hi"}"#,
+                true,
+                None,
+                |_| async { Ok(r#"{"ok":"wrote 2 bytes"}"#.into()) },
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("wrote 2 bytes"));
+        // Invalid input: missing `content`.
+        let err = dispatcher
+            .dispatch_with_contract(
+                "alice",
+                &contract,
+                r#"{"path":"/tmp/x"}"#,
+                true,
+                None,
+                |_| async { Ok("unreached".into()) },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            DispatchError::InvalidInput(errs) => {
+                assert!(errs.iter().any(|e| e.contains("content")));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        // Invalid output: handler returns a reply missing the
+        // `ok` field.
+        let err = dispatcher
+            .dispatch_with_contract(
+                "alice",
+                &contract,
+                r#"{"path":"/tmp/x","content":"hi"}"#,
+                true,
+                None,
+                |_| async { Ok(r#"{"something_else":1}"#.into()) },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            DispatchError::InvalidOutput(errs) => {
+                assert!(errs.iter().any(|e| e.contains("ok")));
+            }
+            other => panic!("expected InvalidOutput, got {other:?}"),
         }
     }
 

@@ -48,6 +48,7 @@
 
 pub mod audio;
 pub mod browser;
+pub mod contracts;
 pub mod dispatcher;
 pub mod fs;
 pub mod manifest;
