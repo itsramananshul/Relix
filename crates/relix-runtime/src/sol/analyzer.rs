@@ -474,6 +474,23 @@ impl Analyzer {
                     }
                     return Some(Type::String);
                 }
+                // F11: typed accessor — same shape as list_get
+                // but returns a `Type::List` and the runtime
+                // halts with `VM_ERROR_SENTINEL` when the
+                // element is not a list. Operators reach for
+                // this when they want to assert structure.
+                if name == "list_get_list" {
+                    if args.len() != 2 {
+                        panic!(
+                            "list_get_list(lst, idx) takes 2 arguments, got {}",
+                            args.len()
+                        );
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::List);
+                }
                 if name == "list_push" {
                     if args.len() != 2 {
                         panic!("list_push(lst, val) takes 2 arguments, got {}", args.len());
@@ -522,6 +539,19 @@ impl Analyzer {
                         self.check(arg);
                     }
                     return Some(Type::String);
+                }
+                // F11: typed accessor — same shape as map_get
+                // but returns a `Type::Map` and the runtime
+                // halts with `VM_ERROR_SENTINEL` when the
+                // value is not a map.
+                if name == "map_get_map" {
+                    if args.len() != 2 {
+                        panic!("map_get_map(m, k) takes 2 arguments, got {}", args.len());
+                    }
+                    for arg in args {
+                        self.check(arg);
+                    }
+                    return Some(Type::Map);
                 }
                 if name == "map_set" {
                     if args.len() != 3 {

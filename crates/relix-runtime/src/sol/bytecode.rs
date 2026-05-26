@@ -164,6 +164,21 @@ pub enum Inst {
     MapKeys,
     MapLen,
     MapDel,
+
+    // ---- F11: nested-typed accessors ----
+    //
+    // `ListGetList` is `ListGet` + a heap-object-type check:
+    // the popped element MUST resolve to a `HeapObject::List`,
+    // otherwise the VM halts with VM_ERROR_SENTINEL and a
+    // structured `last_error` cause. Same shape for
+    // `MapGetMap` against `HeapObject::Map`. Operators reach
+    // for these when they want a compile-time-style guarantee
+    // that the structure is what they expect — the failure
+    // surface mirrors what `remote_call` does on a transport
+    // failure, so existing `try / catch` flows can wrap the
+    // call and recover.
+    ListGetList,
+    MapGetMap,
 }
 
 pub struct Codegen {
@@ -650,11 +665,13 @@ impl Codegen {
                     name.as_str(),
                     "list_len"
                         | "list_get"
+                        | "list_get_list"
                         | "list_push"
                         | "list_contains"
                         | "list_join"
                         | "list_split"
                         | "map_get"
+                        | "map_get_map"
                         | "map_set"
                         | "map_has"
                         | "map_keys"
@@ -672,11 +689,13 @@ impl Codegen {
                     let op = match name.as_str() {
                         "list_len" => Inst::ListLen,
                         "list_get" => Inst::ListGet,
+                        "list_get_list" => Inst::ListGetList,
                         "list_push" => Inst::ListPush,
                         "list_contains" => Inst::ListContains,
                         "list_join" => Inst::ListJoin,
                         "list_split" => Inst::ListSplit,
                         "map_get" => Inst::MapGet,
+                        "map_get_map" => Inst::MapGetMap,
                         "map_set" => Inst::MapSet,
                         "map_has" => Inst::MapHas,
                         "map_keys" => Inst::MapKeys,
@@ -880,8 +899,10 @@ impl Codegen {
                     "list_len" | "map_len" => return Type::Integer,
                     "list_get" | "list_join" | "map_get" => return Type::String,
                     "list_contains" | "map_has" => return Type::Bool,
-                    "list_push" | "list_split" | "map_keys" => return Type::List,
-                    "map_set" | "map_del" => return Type::Map,
+                    "list_push" | "list_split" | "map_keys" | "list_get_list" => {
+                        return Type::List;
+                    }
+                    "map_set" | "map_del" | "map_get_map" => return Type::Map,
                     _ => {}
                 }
                 self.fn_returns.get(name).cloned().unwrap_or(Type::Integer)

@@ -35,6 +35,13 @@ use super::parser::{Atom, Catch, CatchKind, CmpOp, Condition, Expr, Program, Stm
 /// `${...}` interpolation, conditions) stringify the value
 /// deterministically.
 ///
+/// F11: list / map values themselves carry `SflowValue` so
+/// nested structures survive across `set` boundaries — a list
+/// of lists or a map of lists keeps its typed shape until it's
+/// pulled into a string context, at which point `to_display`
+/// recurses through the structure to produce a flat
+/// pipe-or-semicolon encoded preview.
+///
 /// Stringification format mirrors the encodings operators
 /// typically write by hand when wiring pipe-delimited capability
 /// payloads — pipe-separated for lists, `k=v;` for maps. This
@@ -44,21 +51,28 @@ use super::parser::{Atom, Catch, CatchKind, CmpOp, Condition, Expr, Program, Stm
 #[derive(Clone, Debug)]
 pub enum SflowValue {
     String(String),
-    List(Vec<String>),
-    Map(Vec<(String, String)>),
+    List(Vec<SflowValue>),
+    Map(Vec<(String, SflowValue)>),
 }
 
 impl SflowValue {
     /// Return the string representation used in step args,
     /// interpolation, conditions, and the chronicle log.
     /// Lists become `a|b|c`; maps become `k1=v1;k2=v2`.
+    /// Nested values recurse through `to_display`, producing
+    /// the same flat display the pre-F11 executor did for
+    /// single-level structures.
     pub fn to_display(&self) -> String {
         match self {
             SflowValue::String(s) => s.clone(),
-            SflowValue::List(items) => items.join("|"),
+            SflowValue::List(items) => items
+                .iter()
+                .map(SflowValue::to_display)
+                .collect::<Vec<_>>()
+                .join("|"),
             SflowValue::Map(pairs) => pairs
                 .iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                .map(|(k, v)| format!("{k}={}", v.to_display()))
                 .collect::<Vec<_>>()
                 .join(";"),
         }
@@ -512,12 +526,10 @@ impl Executor {
         state: &mut ExecState,
     ) -> Result<BlockFlow, RuntimeError> {
         let value = state.resolve_value(iter, line)?;
-        let items: Vec<String> = match value {
-            SflowValue::List(items) => items,
-            SflowValue::String(s) if s.is_empty() => Vec::new(),
-            SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
-            SflowValue::Map(pairs) => pairs.iter().map(|(k, v)| format!("{k}={v}")).collect(),
-        };
+        // F11: iterate over the typed items so a list-of-lists
+        // exposes each inner list to the loop body as a
+        // SflowValue::List rather than its stringified form.
+        let items = list_items_from(value);
         let cap = self.max_loop_iters;
         if items.len() as u64 > cap {
             self.chronicle.write(
@@ -534,7 +546,7 @@ impl Executor {
         // shape over a manual counter (`explicit_counter_loop`).
         for (idx, elem) in items.into_iter().take(cap as usize).enumerate() {
             let prev_loop = state.loop_iter.replace(idx as u64);
-            state.set_var(var_name, SflowValue::String(elem), line)?;
+            state.set_var(var_name, elem, line)?;
             self.chronicle
                 .write("sol.loop_iter", &format!("iter={idx} kind=for line={line}"));
             let res = self.exec_block(body, state);
@@ -684,16 +696,21 @@ impl ExecState {
                     .unwrap_or_default(),
             ),
             Expr::ListLit(elements) => {
-                let mut out: Vec<String> = Vec::with_capacity(elements.len());
+                // F11: preserve nested typed values. Resolving
+                // each element via `resolve_value` instead of
+                // `resolve` (which would stringify) keeps a
+                // list-of-lists or a list-of-maps usable by
+                // downstream builtins.
+                let mut out: Vec<SflowValue> = Vec::with_capacity(elements.len());
                 for e in elements {
-                    out.push(self.resolve(e, line)?);
+                    out.push(self.resolve_value(e, line)?);
                 }
                 SflowValue::List(out)
             }
             Expr::MapLit(pairs) => {
-                let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+                let mut out: Vec<(String, SflowValue)> = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
-                    let value = self.resolve(v, line)?;
+                    let value = self.resolve_value(v, line)?;
                     // De-dup keys with last-write-wins so the
                     // structure mirrors how `map_set` updates
                     // existing keys.
@@ -709,11 +726,12 @@ impl ExecState {
         })
     }
 
-    /// Evaluate a built-in call. Returns the typed result
-    /// (e.g. `list_len` is `SflowValue::String("3")` so that
-    /// `set count = list_len(var.xs)` works in string
-    /// contexts; an explicit integer type isn't needed because
-    /// Sflow has no `int` value form).
+    /// Evaluate a built-in call. Returns the typed result —
+    /// `list_get` / `map_get` preserve the stored
+    /// `SflowValue` (so a nested list survives across a
+    /// builtin call boundary), while numeric / boolean
+    /// results stringify since Sflow has no `int` / `bool`
+    /// type.
     fn eval_builtin(
         &self,
         name: &str,
@@ -724,12 +742,7 @@ impl ExecState {
             "list_len" => {
                 expect_arity(name, args, 1, line)?;
                 let v = self.resolve_value(&args[0], line)?;
-                let n = match v {
-                    SflowValue::List(items) => items.len(),
-                    SflowValue::String(s) if s.is_empty() => 0,
-                    SflowValue::String(s) => s.split('|').count(),
-                    SflowValue::Map(pairs) => pairs.len(),
-                };
+                let n = list_items_from(v).len();
                 Ok(SflowValue::String(n.to_string()))
             }
             "list_get" => {
@@ -742,33 +755,52 @@ impl ExecState {
                         format!("list_get index must be an integer, got `{idx_str}`"),
                     ));
                 };
-                let items: Vec<String> = match v {
-                    SflowValue::List(it) => it,
-                    SflowValue::String(s) if s.is_empty() => Vec::new(),
-                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
-                    SflowValue::Map(pairs) => {
-                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
-                    }
-                };
-                let s = if idx < 0 || (idx as usize) >= items.len() {
-                    String::new()
+                let items = list_items_from(v);
+                if idx < 0 || (idx as usize) >= items.len() {
+                    Ok(SflowValue::String(String::new()))
                 } else {
-                    items[idx as usize].clone()
+                    // F11: return the stored SflowValue so a
+                    // nested list / map survives the read.
+                    Ok(items.into_iter().nth(idx as usize).unwrap_or_default())
+                }
+            }
+            "list_get_list" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let idx_str = self.resolve(&args[1], line)?;
+                let Ok(idx) = idx_str.parse::<i64>() else {
+                    return Err(RuntimeError::local(
+                        line,
+                        format!("list_get_list index must be an integer, got `{idx_str}`"),
+                    ));
                 };
-                Ok(SflowValue::String(s))
+                let items = list_items_from(v);
+                if idx < 0 || (idx as usize) >= items.len() {
+                    return Err(RuntimeError::local(
+                        line,
+                        format!(
+                            "list_get_list: index {idx} out of bounds (len {})",
+                            items.len()
+                        ),
+                    ));
+                }
+                let elem = items.into_iter().nth(idx as usize).unwrap_or_default();
+                match elem {
+                    SflowValue::List(_) => Ok(elem),
+                    other => Err(RuntimeError::local(
+                        line,
+                        format!(
+                            "list_get_list: element at index {idx} is not a list (it's `{}`)",
+                            other.to_display()
+                        ),
+                    )),
+                }
             }
             "list_push" => {
                 expect_arity(name, args, 2, line)?;
                 let v = self.resolve_value(&args[0], line)?;
-                let val = self.resolve(&args[1], line)?;
-                let mut items: Vec<String> = match v {
-                    SflowValue::List(it) => it,
-                    SflowValue::String(s) if s.is_empty() => Vec::new(),
-                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
-                    SflowValue::Map(pairs) => {
-                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
-                    }
-                };
+                let val = self.resolve_value(&args[1], line)?;
+                let mut items = list_items_from(v);
                 items.push(val);
                 Ok(SflowValue::List(items))
             }
@@ -776,45 +808,30 @@ impl ExecState {
                 expect_arity(name, args, 2, line)?;
                 let v = self.resolve_value(&args[0], line)?;
                 let needle = self.resolve(&args[1], line)?;
-                let items: Vec<String> = match v {
-                    SflowValue::List(it) => it,
-                    SflowValue::String(s) if s.is_empty() => Vec::new(),
-                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
-                    SflowValue::Map(pairs) => {
-                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
-                    }
-                };
+                let items = list_items_from(v);
+                let present = items.iter().any(|x| x.to_display() == needle);
                 Ok(SflowValue::String(
-                    if items.iter().any(|x| x == &needle) {
-                        "true"
-                    } else {
-                        "false"
-                    }
-                    .to_string(),
+                    if present { "true" } else { "false" }.to_string(),
                 ))
             }
             "list_join" => {
                 expect_arity(name, args, 2, line)?;
                 let v = self.resolve_value(&args[0], line)?;
                 let sep = self.resolve(&args[1], line)?;
-                let items: Vec<String> = match v {
-                    SflowValue::List(it) => it,
-                    SflowValue::String(s) if s.is_empty() => Vec::new(),
-                    SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
-                    SflowValue::Map(pairs) => {
-                        pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
-                    }
-                };
-                Ok(SflowValue::String(items.join(&sep)))
+                let items = list_items_from(v);
+                let parts: Vec<String> = items.iter().map(SflowValue::to_display).collect();
+                Ok(SflowValue::String(parts.join(&sep)))
             }
             "list_split" => {
                 expect_arity(name, args, 2, line)?;
                 let src = self.resolve(&args[0], line)?;
                 let sep = self.resolve(&args[1], line)?;
-                let items: Vec<String> = if sep.is_empty() {
-                    vec![src.clone()]
+                let items: Vec<SflowValue> = if sep.is_empty() {
+                    vec![SflowValue::String(src)]
                 } else {
-                    src.split(&sep).map(str::to_string).collect()
+                    src.split(&sep)
+                        .map(|s| SflowValue::String(s.to_string()))
+                        .collect()
                 };
                 Ok(SflowValue::List(items))
             }
@@ -823,18 +840,39 @@ impl ExecState {
                 let v = self.resolve_value(&args[0], line)?;
                 let key = self.resolve(&args[1], line)?;
                 let pairs = map_pairs_from(v);
-                let s = pairs
+                Ok(pairs
                     .into_iter()
                     .find(|(k, _)| *k == key)
                     .map(|(_, v)| v)
-                    .unwrap_or_default();
-                Ok(SflowValue::String(s))
+                    .unwrap_or_default())
+            }
+            "map_get_map" => {
+                expect_arity(name, args, 2, line)?;
+                let v = self.resolve_value(&args[0], line)?;
+                let key = self.resolve(&args[1], line)?;
+                let pairs = map_pairs_from(v);
+                let Some(value) = pairs.into_iter().find(|(k, _)| *k == key).map(|(_, v)| v) else {
+                    return Err(RuntimeError::local(
+                        line,
+                        format!("map_get_map: key `{key}` not present"),
+                    ));
+                };
+                match value {
+                    SflowValue::Map(_) => Ok(value),
+                    other => Err(RuntimeError::local(
+                        line,
+                        format!(
+                            "map_get_map: value at `{key}` is not a map (it's `{}`)",
+                            other.to_display()
+                        ),
+                    )),
+                }
             }
             "map_set" => {
                 expect_arity(name, args, 3, line)?;
                 let v = self.resolve_value(&args[0], line)?;
                 let key = self.resolve(&args[1], line)?;
-                let val = self.resolve(&args[2], line)?;
+                let val = self.resolve_value(&args[2], line)?;
                 let mut pairs = map_pairs_from(v);
                 if let Some(existing) = pairs.iter_mut().find(|(k, _)| *k == key) {
                     existing.1 = val;
@@ -862,7 +900,10 @@ impl ExecState {
                 let v = self.resolve_value(&args[0], line)?;
                 let pairs = map_pairs_from(v);
                 Ok(SflowValue::List(
-                    pairs.into_iter().map(|(k, _)| k).collect(),
+                    pairs
+                        .into_iter()
+                        .map(|(k, _)| SflowValue::String(k))
+                        .collect(),
                 ))
             }
             "map_len" => {
@@ -1006,26 +1047,51 @@ impl ExecState {
     }
 }
 
-/// Coerce a SflowValue into the pair-list shape map built-ins
-/// expect. A `Map` returns its pairs directly; a `String` is
-/// parsed against the canonical `k1=v1;k2=v2` encoding (empty
-/// string → empty map; segments without `=` map to empty
-/// values). A `List` cannot be coerced into a map and returns
-/// an empty pair list — built-ins like `map_get` on a list var
-/// silently return `""` rather than panicking, matching the
-/// SOL behaviour of `map_get(list, "k") -> ""`.
-fn map_pairs_from(v: SflowValue) -> Vec<(String, String)> {
+/// F11: Coerce a SflowValue into the pair-list shape map
+/// built-ins expect. A `Map` returns its pairs directly; a
+/// `String` is parsed against the canonical `k1=v1;k2=v2`
+/// encoding with each value wrapped as `SflowValue::String`.
+/// Empty string → empty map; segments without `=` map to empty
+/// `SflowValue::String("")` values. A `List` cannot be coerced
+/// into a map and returns an empty pair list — built-ins like
+/// `map_get` on a list var silently return `""` rather than
+/// panicking, matching the SOL behaviour of `map_get(list, "k")
+/// -> ""`.
+fn map_pairs_from(v: SflowValue) -> Vec<(String, SflowValue)> {
     match v {
         SflowValue::Map(pairs) => pairs,
         SflowValue::String(s) if s.is_empty() => Vec::new(),
         SflowValue::String(s) => s
             .split(';')
             .map(|seg| match seg.split_once('=') {
-                Some((k, v)) => (k.to_string(), v.to_string()),
-                None => (seg.to_string(), String::new()),
+                Some((k, v)) => (k.to_string(), SflowValue::String(v.to_string())),
+                None => (seg.to_string(), SflowValue::String(String::new())),
             })
             .collect(),
         SflowValue::List(_) => Vec::new(),
+    }
+}
+
+/// F11: coerce a SflowValue into a `Vec<SflowValue>` for the
+/// list built-ins. A `List` returns its items directly. A
+/// non-empty `String` splits on `|` and wraps each segment as
+/// `SflowValue::String` (preserving the same coercion
+/// behaviour the pre-F11 executor had). An empty `String`
+/// returns an empty list. A `Map` lowers to a list of
+/// `k=v` strings — same posture as the previous executor for
+/// list_join over a map.
+fn list_items_from(v: SflowValue) -> Vec<SflowValue> {
+    match v {
+        SflowValue::List(items) => items,
+        SflowValue::String(s) if s.is_empty() => Vec::new(),
+        SflowValue::String(s) => s
+            .split('|')
+            .map(|seg| SflowValue::String(seg.to_string()))
+            .collect(),
+        SflowValue::Map(pairs) => pairs
+            .into_iter()
+            .map(|(k, v)| SflowValue::String(format!("{k}={}", v.to_display())))
+            .collect(),
     }
 }
 
@@ -1346,6 +1412,135 @@ mod tests {
         "#;
         let (outcome, _) = exec_no_dispatch(src);
         assert_eq!(outcome.result, "hi alice");
+    }
+
+    // ── F11: nested lists & maps ───────────────────────────
+
+    #[test]
+    fn nested_list_literal_preserves_inner_lists() {
+        let src = r#"
+            set xs = [["a", "b"], ["c", "d"]]
+            sol.set_result list_len(var.xs)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.result, "2");
+    }
+
+    #[test]
+    fn list_get_on_nested_returns_typed_inner_list() {
+        // The disambiguating signal: pull the inner list
+        // back out and check its length. If nested support
+        // is real, list_len on a list-of-three returns 3.
+        let src = r#"
+            set xs = [["a", "b"], ["c", "d", "e"]]
+            set inner1 = list_get(var.xs, "1")
+            sol.set_result list_len(var.inner1)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.result, "3");
+    }
+
+    #[test]
+    fn map_with_list_value_preserves_list_via_map_get() {
+        let src = r#"
+            set m = { "items": ["a", "b", "c"] }
+            set inner = map_get(var.m, "items")
+            sol.set_result list_len(var.inner)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "3");
+    }
+
+    #[test]
+    fn nested_map_preserves_inner_map_via_map_get() {
+        let src = r#"
+            set m = { "outer": { "inner": "v" } }
+            set inner = map_get(var.m, "outer")
+            sol.set_result map_get(var.inner, "inner")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "v");
+    }
+
+    #[test]
+    fn list_get_list_explicit_typed_accessor_succeeds() {
+        let src = r#"
+            set xs = [["a", "b"], ["c", "d"]]
+            set inner = list_get_list(var.xs, "0")
+            sol.set_result list_len(var.inner)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "2");
+    }
+
+    #[test]
+    fn list_get_list_on_string_element_returns_runtime_error() {
+        let src = r#"
+            set xs = ["scalar"]
+            set inner = list_get_list(var.xs, "0")
+            sol.set_result "should-not-reach"
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert!(outcome.error.is_some(), "expected runtime error");
+        let err = outcome.error.expect("error set");
+        assert!(
+            err.message.contains("not a list"),
+            "error must say 'not a list': {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn map_get_map_explicit_typed_accessor_succeeds() {
+        let src = r#"
+            set m = { "outer": { "inner": "v" } }
+            set inner = map_get_map(var.m, "outer")
+            sol.set_result map_get(var.inner, "inner")
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "v");
+    }
+
+    #[test]
+    fn map_get_map_on_string_value_returns_runtime_error() {
+        let src = r#"
+            set m = { "k": "string-val" }
+            set inner = map_get_map(var.m, "k")
+            sol.set_result "should-not-reach"
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert!(outcome.error.is_some());
+        let err = outcome.error.expect("error set");
+        assert!(
+            err.message.contains("not a map"),
+            "error must say 'not a map': {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn nested_list_display_format_is_flat_pipe_join() {
+        // A list-of-lists [["a", "b"], ["c"]] displays
+        // as "a|b|c" — the outer separator is `|` and
+        // the inner separator is also `|`, so the result
+        // is observationally a flat pipe-join.
+        let src = r#"
+            set xs = [["a", "b"], ["c"]]
+            sol.set_result "${var.xs}"
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "a|b|c");
     }
 
     // ── F9: for-in over lists ──────────────────────────────

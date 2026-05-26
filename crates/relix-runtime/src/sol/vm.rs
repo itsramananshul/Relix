@@ -744,24 +744,17 @@ impl VM {
             Inst::ListContains => {
                 let val_ref = self.pop() as usize;
                 let lst_ref = self.pop() as usize;
-                let needle = match self.heap.get(val_ref) {
-                    Some(HeapObject::String(s)) => s.clone(),
-                    _ => String::new(),
-                };
+                let needle = heap_display(&self.heap, val_ref as u64);
                 let items: Vec<u64> = match self.heap.get(lst_ref) {
                     Some(HeapObject::List(items)) => items.clone(),
                     Some(HeapObject::Array(items)) => items.clone(),
                     _ => Vec::new(),
                 };
-                let mut found = false;
-                for item_ref in items {
-                    if let Some(HeapObject::String(s)) = self.heap.get(item_ref as usize)
-                        && *s == needle
-                    {
-                        found = true;
-                        break;
-                    }
-                }
+                // F11: needle comparison goes through
+                // `heap_display` so a string can be matched
+                // against a nested list element that
+                // stringifies to the same value.
+                let found = items.iter().any(|r| heap_display(&self.heap, *r) == needle);
                 self.push(if found { 1 } else { 0 });
             }
             Inst::ListJoin => {
@@ -776,16 +769,109 @@ impl VM {
                     Some(HeapObject::Array(items)) => items.clone(),
                     _ => Vec::new(),
                 };
+                // F11: nested list / map elements stringify
+                // recursively. A list-of-lists [[a, b], [c, d]]
+                // joined with `,` yields `a|b,c|d` — the inner
+                // list uses the canonical pipe separator,
+                // matching Sflow's `SflowValue::to_display`.
                 let parts: Vec<String> = items
                     .into_iter()
-                    .map(|r| match self.heap.get(r as usize) {
-                        Some(HeapObject::String(s)) => s.clone(),
-                        _ => String::new(),
-                    })
+                    .map(|r| heap_display(&self.heap, r))
                     .collect();
                 let joined = parts.join(&sep);
                 self.heap.push(HeapObject::String(joined));
                 self.push((self.heap.len() - 1) as u64);
+            }
+            Inst::ListGetList => {
+                let idx_raw = self.pop() as i64;
+                let lst_ref = self.pop() as usize;
+                let element_ref: Option<u64> = match self.heap.get(lst_ref) {
+                    Some(HeapObject::List(items)) => {
+                        if idx_raw < 0 || (idx_raw as usize) >= items.len() {
+                            None
+                        } else {
+                            Some(items[idx_raw as usize])
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(elem) = element_ref else {
+                    self.last_error = Some(RemoteCallError::local(
+                        "<local>",
+                        "list_get_list",
+                        format!("list_get_list: index {idx_raw} out of bounds or not a list"),
+                    ));
+                    if let Some(sentinel) = self.try_dispatch_error() {
+                        return Some(sentinel);
+                    } else {
+                        // Re-route through error dispatch — if
+                        // there's no handler the VM already
+                        // halted; this branch is only reached
+                        // when a handler caught the error.
+                        return None;
+                    }
+                };
+                // Element must be a list.
+                match self.heap.get(elem as usize) {
+                    Some(HeapObject::List(_)) => {
+                        self.push(elem);
+                    }
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<local>",
+                            "list_get_list",
+                            format!("list_get_list: element at {idx_raw} is not a list"),
+                        ));
+                        if let Some(sentinel) = self.try_dispatch_error() {
+                            return Some(sentinel);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+            }
+            Inst::MapGetMap => {
+                let key_ref = self.pop() as usize;
+                let map_ref = self.pop() as usize;
+                let key = match self.heap.get(key_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                let val_ref: Option<u64> = match self.heap.get(map_ref) {
+                    Some(HeapObject::Map(pairs)) => {
+                        pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+                    }
+                    _ => None,
+                };
+                let Some(val) = val_ref else {
+                    self.last_error = Some(RemoteCallError::local(
+                        "<local>",
+                        "map_get_map",
+                        format!("map_get_map: key `{key}` not present"),
+                    ));
+                    if let Some(sentinel) = self.try_dispatch_error() {
+                        return Some(sentinel);
+                    } else {
+                        return None;
+                    }
+                };
+                match self.heap.get(val as usize) {
+                    Some(HeapObject::Map(_)) => {
+                        self.push(val);
+                    }
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<local>",
+                            "map_get_map",
+                            format!("map_get_map: value at `{key}` is not a map"),
+                        ));
+                        if let Some(sentinel) = self.try_dispatch_error() {
+                            return Some(sentinel);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
             }
             Inst::ListSplit => {
                 let sep_ref = self.pop() as usize;
@@ -936,6 +1022,30 @@ impl VM {
         self.stack.truncate(handler.stack_len_at_enter);
         self.inst_ptr = handler.catch_pc;
         None
+    }
+}
+
+/// F11: recursively stringify a heap ref. Strings yield their
+/// body verbatim. Lists join their elements with `|` (recursing
+/// through nested heap refs). Maps join `k=v` pairs with `;`
+/// (recursing the values). Anything else (Struct, Array) yields
+/// an empty string — those types don't have a documented
+/// display format and operators shouldn't be relying on it
+/// silently working.
+fn heap_display(heap: &[HeapObject], idx: u64) -> String {
+    match heap.get(idx as usize) {
+        Some(HeapObject::String(s)) => s.clone(),
+        Some(HeapObject::List(items)) => items
+            .iter()
+            .map(|r| heap_display(heap, *r))
+            .collect::<Vec<_>>()
+            .join("|"),
+        Some(HeapObject::Map(pairs)) => pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={}", heap_display(heap, *v)))
+            .collect::<Vec<_>>()
+            .join(";"),
+        _ => String::new(),
     }
 }
 

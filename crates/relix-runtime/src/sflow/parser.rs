@@ -1036,11 +1036,13 @@ pub fn is_builtin_name(s: &str) -> bool {
         s,
         "list_len"
             | "list_get"
+            | "list_get_list"
             | "list_push"
             | "list_contains"
             | "list_join"
             | "list_split"
             | "map_get"
+            | "map_get_map"
             | "map_set"
             | "map_has"
             | "map_keys"
