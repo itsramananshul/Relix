@@ -60,6 +60,7 @@ pub mod pdf;
 pub mod registry;
 pub mod sanitize;
 pub mod security;
+pub mod session_search_proxy;
 pub mod terminal;
 pub mod text_chunk;
 pub mod web_extract;
@@ -931,6 +932,7 @@ pub fn register(
     bridge: &mut DispatchBridge,
     backend: Arc<ToolBackend>,
     operator_channel: ask_human::OperatorChannelHandle,
+    memory_session_search: session_search_proxy::MemorySessionSearchProxyHandle,
 ) {
     let backend_for_handler = backend.clone();
     bridge.register(
@@ -966,6 +968,22 @@ pub fn register(
     // capabilities since it's stateless and decision-free.
     tracing::info!("tool node: registering tool.text.chunk (PH-PDF-CHUNK)");
     text_chunk::register(bridge);
+
+    // memory.session_search — proxy from the tool node to the
+    // memory peer so agents can search their own chat-turn
+    // history during task execution. Registered unconditionally
+    // (descriptor advertises in the manifest); the handler
+    // returns PEER_UNREACHABLE until [tool.memory_peer] is
+    // configured and the controller populates the proxy cell.
+    tracing::info!("tool node: registering memory.session_search (W7-SEARCH)");
+    let session_search_handle = memory_session_search.clone();
+    bridge.register(
+        session_search_proxy::descriptor().method_name.as_str(),
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let cell = session_search_handle.clone();
+            async move { session_search_proxy::handle(cell.as_ref(), &ctx).await }
+        })),
+    );
 
     // tool.ask_human — first-class "ask the operator" capability.
     // Registered unconditionally so planners + flows can call it
@@ -1305,6 +1323,7 @@ mod tests {
             &mut bridge,
             backend,
             std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
         );
         assert!(
             bridge.has_handler("tool.ask_human"),
@@ -1327,7 +1346,12 @@ mod tests {
         {
             panic!("channel OnceCell already set");
         }
-        register(&mut bridge, backend, channel);
+        register(
+            &mut bridge,
+            backend,
+            channel,
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        );
         let aic = aic_for(&org_root, "alice", &["chat-users"]);
         let args = br#"{"question":"deploy now?","timeout_secs":5}"#.to_vec();
         let envelope = crate::dispatch::build_request("tool.ask_human", args, aic, 30);
@@ -1346,6 +1370,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_session_search_is_registered_by_tool_register() {
+        let (mut bridge, _, _dir) = fresh_bridge_for_tool();
+        let backend = Arc::new(ToolBackend::new(ToolConfig::default()).unwrap());
+        register(
+            &mut bridge,
+            backend,
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        );
+        assert!(
+            bridge.has_handler("memory.session_search"),
+            "memory.session_search must be registered after tool::register"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_session_search_routes_through_proxy_cell_when_wired() {
+        use crate::transport::envelope::ResponseResult;
+        let (bridge, org_root, _dir) = fresh_bridge_for_tool();
+        let backend = Arc::new(ToolBackend::new(ToolConfig::default()).unwrap());
+        // Patch the cell with a stub that returns a canned JSON
+        // body so the bridge round-trip lands real data.
+        struct StubProxy;
+        #[async_trait::async_trait]
+        impl session_search_proxy::MemorySessionSearchProxy for StubProxy {
+            async fn call(&self, args: &str) -> Result<String, String> {
+                assert_eq!(args, "alice|needle|10");
+                Ok(
+                    r#"[{"session_id":"sess-A","role":"user","content":"hello needle"}]"#
+                        .to_string(),
+                )
+            }
+        }
+        let cell: session_search_proxy::MemorySessionSearchProxyHandle =
+            std::sync::Arc::new(tokio::sync::OnceCell::new());
+        cell.set(std::sync::Arc::new(StubProxy)
+            as std::sync::Arc<
+                dyn session_search_proxy::MemorySessionSearchProxy,
+            >)
+        .ok();
+        // Open a writable policy so the test's identity passes
+        // admission for memory.session_search.
+        let policy = relix_core::policy::PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "anyone_session_search"
+            method = "memory.session_search"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        // Re-create bridge with the open policy.
+        let _ = bridge; // discard the strict one
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let responder = SigningKey::generate(&mut OsRng);
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut bridge = crate::dispatch::DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        register(
+            &mut bridge,
+            backend,
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            cell,
+        );
+        let aic = aic_for(&org_root, "alice", &["chat-users"]);
+        let envelope = crate::dispatch::build_request(
+            "memory.session_search",
+            b"alice|needle|10".to_vec(),
+            aic,
+            30,
+        );
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = crate::dispatch::decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Ok(body) => {
+                let s = String::from_utf8(body.into_vec()).unwrap();
+                assert!(s.contains("sess-A"));
+                assert!(s.contains("hello needle"));
+            }
+            ResponseResult::Err(e) => panic!("unexpected err: kind={} cause={}", e.kind, e.cause),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn tool_ask_human_routes_through_mesh_to_handle_not_capability_not_found() {
         use crate::transport::envelope::ResponseResult;
         let (mut bridge, org_root, _dir) = fresh_bridge_for_tool();
@@ -1353,6 +1468,7 @@ mod tests {
         register(
             &mut bridge,
             backend,
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
             std::sync::Arc::new(tokio::sync::OnceCell::new()),
         );
         let aic = aic_for(&org_root, "alice", &["chat-users"]);

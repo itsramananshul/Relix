@@ -4877,7 +4877,14 @@ fn register_node_type_handlers(
         // honest-to-the-fact-that-no-operator-is-available.
         let operator_channel: crate::nodes::tool::ask_human::OperatorChannelHandle =
             std::sync::Arc::new(tokio::sync::OnceCell::new());
-        crate::nodes::tool::register(bridge, backend, operator_channel);
+        // Session-search proxy cell. Empty by default — the
+        // capability is registered + advertised, but the
+        // handler returns PEER_UNREACHABLE until a future
+        // [tool.memory_peer] config block populates the cell
+        // (parity with how the AI node dials its memory peer).
+        let session_search_handle: crate::nodes::tool::session_search_proxy::MemorySessionSearchProxyHandle =
+            std::sync::Arc::new(tokio::sync::OnceCell::new());
+        crate::nodes::tool::register(bridge, backend, operator_channel, session_search_handle);
         let desc = crate::nodes::tool::capability_descriptor();
         manifest.add_capability(desc.clone());
         // B1: tool.web_extract — pure HTML parser. Lives on the same
@@ -4909,6 +4916,10 @@ fn register_node_type_handlers(
         // channel is wired yet. The capability descriptor is
         // honest: risk=Medium, cost=Expensive, idempotency=AtMostOnce.
         manifest.add_capability(crate::nodes::tool::ask_human::AskHumanTool::descriptor());
+        // memory.session_search — proxy onto the memory peer.
+        // Advertised unconditionally; handler returns
+        // PEER_UNREACHABLE until [tool.memory_peer] wiring lands.
+        manifest.add_capability(crate::nodes::tool::session_search_proxy::descriptor());
         // B2: jailed filesystem subsystem. Only advertised when
         // `[tool.fs]` is configured -- node-type tool with no
         // `[tool.fs]` keeps fs out of the manifest.
