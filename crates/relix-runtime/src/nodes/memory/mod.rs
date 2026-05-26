@@ -75,6 +75,7 @@
 
 pub mod curator;
 pub mod embeddings;
+pub mod qdrant;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
