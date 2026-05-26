@@ -21,7 +21,8 @@
 //! - Permissions: a permission-denied on the replace step
 //!   surfaces a clear hint about elevated permissions.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Args;
@@ -211,14 +212,52 @@ pub async fn run(args: UpdateArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("aborted.");
         return Ok(());
     }
+    let Some(asset_name) = asset_name_for_current_platform() else {
+        eprintln!("error: unsupported platform for `relix update` self-replace.");
+        std::process::exit(2);
+    };
+    let Some(asset) = release.assets.iter().find(|a| a.name == asset_name) else {
+        eprintln!(
+            "error: release {} does not ship an asset named '{}'.",
+            release.tag_name, asset_name
+        );
+        std::process::exit(2);
+    };
+    let installed_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: cannot resolve current binary path: {e}");
+            std::process::exit(2);
+        }
+    };
+    let dir = installed_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let temp_name = format!(".relix-update-{}.tmp", std::process::id());
+    let temp_path = dir.join(temp_name);
     println!(
-        "binary replacement is not wired in this build — \
-         please download {} manually from the release page and replace \
-         your relix binary, OR re-run the install one-liner from the \
-         README. The version-check side of `relix update` is functional \
-         today; full self-replace lands in a follow-up.",
-        asset_name_for_current_platform().unwrap_or("the platform asset")
+        "downloading {} ({}) to {}...",
+        asset.name,
+        human_bytes(asset.size),
+        temp_path.display()
     );
+    if let Err(e) = download_to(&asset.browser_download_url, &temp_path).await {
+        // Leave the installed binary untouched.
+        let _ = std::fs::remove_file(&temp_path);
+        eprintln!("error: download failed: {e}");
+        std::process::exit(2);
+    }
+    println!("replacing {} ...", installed_path.display());
+    if let Err(e) = atomically_replace_binary(&installed_path, &temp_path) {
+        // Best-effort cleanup of the temp file on replace
+        // failure; the installed binary stays untouched per
+        // the replace function's contract.
+        let _ = std::fs::remove_file(&temp_path);
+        eprintln!("error: replace failed: {e}");
+        std::process::exit(2);
+    }
+    println!("relix update — done. Restart any running relix processes.");
     Ok(())
 }
 
@@ -265,12 +304,111 @@ fn confirm(prompt: &str) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
 
-/// Stub kept for symmetry with the future binary-replace path.
-/// Atomically replaces the current binary with `_new_path` —
-/// today returns `Ok(())` after logging the intention.
-#[allow(dead_code)]
-pub fn atomically_replace_binary(_new_path: &PathBuf) -> Result<(), String> {
-    Err("atomic binary replacement is not wired in this build".to_string())
+/// Atomically replace the binary at `installed_path` with the
+/// file at `new_path`.
+///
+/// On POSIX this is a single `rename()` — atomic when both
+/// paths live on the same filesystem, the common case. On
+/// Windows `std::fs::rename` calls `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` under the hood; that works for
+/// non-running targets but fails with `ERROR_ACCESS_DENIED`
+/// when the destination is the currently-executing `.exe`.
+///
+/// To survive the running-binary case the function attempts a
+/// direct rename first; on permission-denied it falls back to
+/// the standard Windows pattern: rename the existing binary to
+/// `<name>.old` (allowed even while running), then rename the
+/// new binary into the original path. If anything fails the
+/// `.old` rollback restores the installed binary so the
+/// operator does not end up with a broken install.
+pub fn atomically_replace_binary(installed_path: &Path, new_path: &Path) -> Result<(), String> {
+    if !new_path.exists() {
+        return Err(format!("new binary not found at {}", new_path.display()));
+    }
+    match std::fs::rename(new_path, installed_path) {
+        Ok(()) => return Ok(()),
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Fall through to the .old workaround for the
+            // running-.exe case. Other error kinds bubble.
+        }
+        Err(e) => {
+            return Err(format!(
+                "rename {} -> {} failed: {}",
+                new_path.display(),
+                installed_path.display(),
+                e
+            ));
+        }
+    }
+    let old_path = with_dot_old_suffix(installed_path);
+    let _ = std::fs::remove_file(&old_path);
+    std::fs::rename(installed_path, &old_path)
+        .map_err(|e| format!("rename installed -> {} failed: {}", old_path.display(), e))?;
+    if let Err(e) = std::fs::rename(new_path, installed_path) {
+        // Rollback so the operator isn't left binary-less.
+        if let Err(restore_err) = std::fs::rename(&old_path, installed_path) {
+            return Err(format!(
+                "rename new -> installed failed ({e}); rollback ALSO failed ({restore_err})"
+            ));
+        }
+        return Err(format!("rename new -> installed failed: {e}"));
+    }
+    Ok(())
+}
+
+/// Append `.old` to a path. Honest helper kept private so
+/// callers can't accidentally smuggle in a fancier suffix.
+fn with_dot_old_suffix(p: &Path) -> PathBuf {
+    let mut s: std::ffi::OsString = p.into();
+    s.push(".old");
+    PathBuf::from(s)
+}
+
+/// Download `url` to `dest`. The file is written atomically:
+/// bytes go to `<dest>.partial` first, then moved into place on
+/// successful completion. A network or HTTP error leaves no
+/// partial file behind so callers don't have to clean up.
+pub async fn download_to(url: &str, dest: &Path) -> Result<(), String> {
+    let partial = with_partial_suffix(dest);
+    let _ = std::fs::remove_file(&partial);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .user_agent(format!("relix-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("download {url}: HTTP {status}"));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read body from {url}: {e}"))?;
+    {
+        let mut f = std::fs::File::create(&partial)
+            .map_err(|e| format!("create {}: {e}", partial.display()))?;
+        f.write_all(&bytes)
+            .map_err(|e| format!("write {}: {e}", partial.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", partial.display()))?;
+    }
+    std::fs::rename(&partial, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        format!("rename {} -> {}: {e}", partial.display(), dest.display())
+    })?;
+    Ok(())
+}
+
+fn with_partial_suffix(p: &Path) -> PathBuf {
+    let mut s: std::ffi::OsString = p.into();
+    s.push(".partial");
+    PathBuf::from(s)
 }
 
 #[cfg(test)]
@@ -327,6 +465,118 @@ mod tests {
             assert!(name.starts_with("relix-"), "got {name}");
             assert!(name.ends_with(".tar.gz") || name.ends_with(".zip"));
         }
+    }
+
+    // ── W6: download + atomic replace ────────────────────────────
+
+    use std::io::{Read, Write};
+
+    /// Tiny single-request HTTP/1.1 server. Spawns a thread,
+    /// accepts one connection, returns `(status, body_bytes)`
+    /// on the wire. Returns the `127.0.0.1:<port>` URL prefix.
+    /// Used only in tests so the cost of a real HTTP mock crate
+    /// is avoided.
+    fn spawn_one_shot_http(status: u16, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let reason = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Unknown",
+                };
+                let header = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(&body);
+                let _ = sock.shutdown(std::net::Shutdown::Write);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn download_to_writes_response_body_to_dest() {
+        let url = spawn_one_shot_http(200, b"NEW_BINARY_CONTENTS".to_vec());
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("downloaded.bin");
+        download_to(&url, &dest).await.unwrap();
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(got, b"NEW_BINARY_CONTENTS");
+    }
+
+    #[tokio::test]
+    async fn download_to_does_not_leave_partial_file_on_http_error() {
+        let url = spawn_one_shot_http(404, b"not found".to_vec());
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("downloaded.bin");
+        let err = download_to(&url, &dest).await.unwrap_err();
+        assert!(err.contains("HTTP 404"), "err={err}");
+        // No leftover file at the destination OR at the .partial path.
+        assert!(
+            !dest.exists(),
+            "dest should not exist after failed download"
+        );
+        let partial = super::with_partial_suffix(&dest);
+        assert!(
+            !partial.exists(),
+            "partial should not exist after failed download"
+        );
+    }
+
+    #[test]
+    fn atomically_replace_binary_swaps_installed_with_new_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = tmp.path().join("relix-installed");
+        let new_path = tmp.path().join("relix-new");
+        std::fs::write(&installed, b"OLD_BINARY").unwrap();
+        std::fs::write(&new_path, b"NEW_BINARY").unwrap();
+        atomically_replace_binary(&installed, &new_path).unwrap();
+        let got = std::fs::read(&installed).unwrap();
+        assert_eq!(got, b"NEW_BINARY");
+        // The new_path file moved into installed, so its
+        // original location is now empty.
+        assert!(
+            !new_path.exists(),
+            "new_path should be consumed by the rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_download_leaves_installed_binary_untouched() {
+        // The orchestration: download_to fails → caller does
+        // NOT call atomically_replace_binary → installed file
+        // stays bit-for-bit identical.
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = tmp.path().join("relix-installed");
+        std::fs::write(&installed, b"ORIGINAL_BINARY").unwrap();
+        let original_bytes = std::fs::read(&installed).unwrap();
+        let url = spawn_one_shot_http(500, b"oops".to_vec());
+        let temp_download = tmp.path().join("relix-update.tmp");
+        let result = download_to(&url, &temp_download).await;
+        assert!(result.is_err(), "download must fail");
+        // Operator-facing contract: installed binary stays put.
+        let after = std::fs::read(&installed).unwrap();
+        assert_eq!(after, original_bytes);
+    }
+
+    #[test]
+    fn atomically_replace_returns_err_when_new_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = tmp.path().join("relix-installed");
+        let missing = tmp.path().join("does-not-exist");
+        std::fs::write(&installed, b"ORIGINAL").unwrap();
+        let err = atomically_replace_binary(&installed, &missing).unwrap_err();
+        assert!(err.contains("not found"), "err={err}");
+        // Installed must still be the original.
+        let after = std::fs::read(&installed).unwrap();
+        assert_eq!(after, b"ORIGINAL");
     }
 
     #[test]
