@@ -873,45 +873,72 @@ Mentioned throughout `docs/current-limitations.md` and in source comments:
 
 ## 8. THE AGENT EMPLOYEE PERMISSION MODEL
 
-**Status: shipped end-to-end.** All five phases land:
-agent profile store + admission gate + categorical
-permissions + approval flow + standing approvals. See
-[agent-permissions.md](agent-permissions.md).
+**Status: shipped end-to-end.** All five phases from the
+proposal land. The operator-facing handbook is
+[`agent-employee-model.md`](agent-employee-model.md); the
+deep-dive design + per-deny-reason vocabulary is
+[`agent-permissions.md`](agent-permissions.md); the original
+proposal stays at
+[`proposals/agent-employee-permissions.md`](proposals/agent-employee-permissions.md).
 
-The full proposal lives at `docs/proposals/agent-employee-permissions.md`.
+What's actually in the codebase today:
 
-What exists in code today that the proposal builds on:
+- **Agent profile store** — SQLite-backed
+  `agent_profiles` / `approval_requests` /
+  `standing_approvals` tables in
+  `crates/relix-runtime/src/nodes/coordinator/agent/store.rs`,
+  with full CRUD + token / standing lifecycle.
+- **Coordinator capabilities** — `agent.create / get / list /
+  update / delete`, `coord.approval.pending / decide`,
+  `agent.standing_approval.list / create / revoke` registered
+  in `nodes/coordinator/agent/handlers.rs`.
+- **Bridge HTTP routes** — `/v1/agents`, `/v1/agents/:id`,
+  `/v1/approvals`, `/v1/approvals/:id/decide`,
+  `/v1/agents/:id/standing-approvals`,
+  `/v1/standing-approvals/:id` in
+  `crates/relix-web-bridge/src/agent.rs`. Routes registered in
+  `main.rs:587–612`.
+- **Dispatch-pipeline integration** — `admission::agent_gate`
+  evaluates between identity validation and policy
+  (`dispatch/mod.rs:523`). The bridge's `AgentGateBindings`
+  carries the `AgentStoreHandle` + `on_require_approval`
+  closure that materialises pending rows when the gate
+  pauses a task.
+- **Envelope surface + approval_token fields** —
+  `RequestEnvelope.surface` and
+  `RequestEnvelope.approval_token` ride on every call
+  (`transport/envelope.rs:40–49`). Both are additive +
+  default `None` for backward compat.
+- **Telegram approval bridge** — `/approve <id>` and
+  `/reject <id> <reason>` slash commands in the operator
+  chat call the coord approval-decide bridge.
+  `operator_chat_id = 0` disables the notifier.
+- **Dashboard pages** — `#/agents` (create form + list +
+  detail + edit) and `#/approvals` (pending queue, decide
+  inline) live in `dashboard.html` under their
+  `<section data-page="agents">` /
+  `<section data-page="approvals">` blocks.
+- **Tests** — `admission/agent_gate.rs` covers status,
+  surface, risk ceiling, categorical allow / deny, standing
+  approval, approval token, expired token, and consumed
+  token paths. `nodes/telegram/controller.rs` covers
+  `/approve` and `/reject` operator-only gating + the
+  coord bridge dispatch path.
 
-- **`IdentityBundle`** with `subject_id`, `name`, `org_id`, `groups`,
-  `role`, `clearance`, and a reserved-but-unused `supervisors: Vec<String>` field.
-- **`VerifiedIdentity`** propagating identity into every dispatch.
-- **`PolicyEngine`** with two-stage admission (`[admit] groups` +
-  per-method `[[rules]]`). A `RequireApproval` variant is reserved in
-  source comments but not implemented.
-- **`CapabilityDescriptor`** with `categories: Vec<String>`,
-  `sensitivity_tags: Vec<String>`, `risk_level: RiskLevel`,
-  `environment_requirements: Vec<String>`. These are the building
-  blocks the proposal would consume for categorical permissions.
-- **`task.replayed_from` / `awaiting_input` task status** — the
-  proposal's pause-and-resume approval flow reuses these.
-- **W2-007 policy-hardening surface** — `node.policy.simulate` (W2-007a),
-  `node.policy.recent_denials` (W2-007d) — the proposal would
-  use these for the dashboard "agent profile" view.
+Honest limitations on top of the shipped surface:
 
-What is **not** in code:
-
-- No agent record type (the AIC bundle is the closest analogy)
-- No status field (active / suspended / disabled)
-- No categorical permission gating
-- No approval flow — `Decision::RequireApproval` does not exist
-- No `surface` field on request envelopes
-- No standing-approvals concept
-- No `/v1/agents` or `/v1/approvals` bridge routes
-- No `#/agents` or `#/approvals` dashboard pages
-
-The proposal's five-phase build order would be a multi-session
-implementation. Phase 1 (agent record + status / surface / risk-ceiling
-gates) is the smallest unit and is operator-observable on its own.
+- The `surface` field is operator-asserted — a compromised
+  bridge could fake it. The gate raises the cost of misuse
+  ("spoof the bundle AND the surface tag") without
+  pretending to be a cryptographic boundary. SIMP-002 +
+  surface-signing land in a later wave.
+- Approval expiry is a per-agent
+  `approval_timeout_secs` (default 86400). Multi-approver
+  (2-of-3) workflows are not in the alpha; single-approver
+  with reason field is what ships.
+- The dashboard does not push real-time approval
+  notifications (no SSE); operators poll the list page or
+  read the Telegram notifier output.
 
 ---
 
