@@ -36,6 +36,7 @@ futures.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 libp2p.workspace = true
+libp2p-stream.workspace = true
 
 # Codec / errors / time / serde
 serde.workspace = true
@@ -120,3 +121,4 @@ terminal-pty = ["dep:portable-pty"]
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-util.workspace = true

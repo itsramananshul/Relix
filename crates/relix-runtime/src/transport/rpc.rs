@@ -40,6 +40,13 @@ pub struct WireResponse {
 struct Behaviour {
     rpc: request_response::cbor::Behaviour<WireRequest, WireResponse>,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    /// RELIX-2 streaming substream. Independent of `rpc`: a
+    /// single libp2p connection multiplexes both protocols on
+    /// separate Yamux substreams. Capabilities marked
+    /// `stream_out` open a `/relix/rpc/stream/1` substream
+    /// (see [`super::stream`]) while everything else continues
+    /// using the unary cbor request_response path.
+    stream: libp2p_stream::Behaviour,
 }
 
 /// Inbound RPC event surfaced to the application loop.
@@ -86,12 +93,50 @@ impl Responder {
 pub struct Client {
     peer_id: PeerId,
     cmd_tx: mpsc::Sender<SwarmCommand>,
+    /// Control handle for the libp2p stream behaviour. Clone-
+    /// able and independent of the unary command channel —
+    /// stream open / accept calls talk directly to the
+    /// behaviour through its own internal channel.
+    stream_control: libp2p_stream::Control,
 }
 
 impl Client {
     /// Our peer id (= libp2p Ed25519 pubkey hash).
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// Borrow the streaming control for opening / accepting
+    /// `/relix/rpc/stream/1` substreams. Each call returns a
+    /// fresh clone — controls are cheap to clone and the
+    /// caller can pass it across awaits / threads freely.
+    pub fn stream_control(&self) -> libp2p_stream::Control {
+        self.stream_control.clone()
+    }
+
+    /// Open a new outbound streaming substream to `peer` using
+    /// the RELIX-2 protocol. Returns the raw libp2p stream;
+    /// callers wrap it with [`super::stream::StreamReader`] and
+    /// drive the framing helpers.
+    pub async fn open_stream(
+        &self,
+        peer: PeerId,
+    ) -> Result<libp2p::Stream, libp2p_stream::OpenStreamError> {
+        self.stream_control
+            .clone()
+            .open_stream(peer, super::stream::PROTOCOL)
+            .await
+    }
+
+    /// Register the [`super::stream::PROTOCOL`] for inbound
+    /// streams. Returns an `IncomingStreams` handle (a
+    /// `Stream<Item = (PeerId, libp2p::Stream)>`) the caller
+    /// drives forward. Registering twice for the same
+    /// protocol returns `AlreadyRegistered`.
+    pub fn accept_streams(
+        &self,
+    ) -> Result<libp2p_stream::IncomingStreams, libp2p_stream::AlreadyRegistered> {
+        self.stream_control.clone().accept(super::stream::PROTOCOL)
     }
 
     /// Issue an outbound RPC. Returns the encoded response envelope.
@@ -300,9 +345,20 @@ pub async fn new(
                 key.public().to_peer_id(),
                 kad::store::MemoryStore::new(key.public().to_peer_id()),
             ),
+            // RELIX-2 streaming substream. The behaviour stays
+            // dormant until a caller registers the
+            // `/relix/rpc/stream/1` protocol via the Control
+            // (responder side) or opens a stream via the
+            // Control (caller side).
+            stream: libp2p_stream::Behaviour::new(),
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
         .build();
+    // Extract a Control handle from the freshly-built stream
+    // behaviour BEFORE the swarm starts. The Control talks to
+    // the behaviour through an internal channel and stays
+    // valid for the swarm's lifetime; clones are cheap.
+    let stream_control = swarm.behaviour_mut().stream.new_control();
 
     let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse()?;
     swarm.listen_on(addr.clone())?;
@@ -314,6 +370,7 @@ pub async fn new(
     let client = Client {
         peer_id,
         cmd_tx: cmd_tx.clone(),
+        stream_control,
     };
     let event_loop = EventLoop {
         swarm,

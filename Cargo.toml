@@ -80,6 +80,18 @@ async-trait = "0.1"
 
 # libp2p (matched to OpenPrem INFRA reuse)
 libp2p = { version = "0.54", features = ["tokio", "cbor", "dns", "kad", "noise", "macros", "request-response", "tcp", "yamux"] }
+# Streaming substream protocol on top of the same libp2p
+# transport. Provides Behaviour + Control + IncomingStreams
+# for arbitrary stream-oriented protocols. The `0.4.0-alpha`
+# version label is libp2p's convention for crates that have
+# not yet promoted to 1.0; libp2p-swarm 0.47 (which libp2p
+# 0.54 depends on) is the matching baseline so the two crates
+# share a compatible swarm ABI.
+libp2p-stream = "=0.2.0-alpha"
+# Compat shim for bridging tokio AsyncRead/Write to the
+# futures AsyncRead/Write the libp2p Stream surface expects.
+# Needed in the transport::stream framing-helper tests.
+tokio-util = { version = "0.7", features = ["compat"] }
 
 # HTTP (AI node + web bridge + tool node)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
