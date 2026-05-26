@@ -10,6 +10,7 @@
 //! `{ "timeout": true }` reply so callers can branch
 //! deterministically.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use relix_core::capability::{
@@ -19,6 +20,67 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use serde::Deserialize;
 
 use crate::dispatch::HandlerOutcome;
+
+/// Operator-facing channel the `tool.ask_human` handler uses
+/// to post a question and await a reply.
+///
+/// Implementations bridge to the configured surface — a
+/// Telegram approval queue, the dashboard's intervention
+/// surface, or any future operator channel. The trait keeps
+/// the tool node decoupled from the concrete channel so a
+/// future wave can land each one without re-shaping the
+/// `tool.ask_human` handler.
+///
+/// Contract: `ask` posts `question` to the operator and
+/// returns `Some(reply)` when the operator answers within the
+/// timeout window, or `None` on timeout / no operator
+/// available. Implementations must NOT panic; transport
+/// errors fold into `None` so the handler returns
+/// `{"timeout": true}` to the caller.
+#[async_trait::async_trait]
+pub trait OperatorChannel: Send + Sync {
+    async fn ask(&self, question: String, timeout_secs: u64) -> Option<String>;
+}
+
+/// Channel that always replies with the configured string
+/// after a brief delay. Useful for tests, for the
+/// `RELIX_TEST_OPERATOR_REPLY` smoke path, and as a fixed
+/// canned reply when an operator opts into "auto-approve
+/// everything" mode for development.
+pub struct CannedReplyChannel {
+    pub reply: String,
+}
+
+#[async_trait::async_trait]
+impl OperatorChannel for CannedReplyChannel {
+    async fn ask(&self, _question: String, _timeout_secs: u64) -> Option<String> {
+        Some(self.reply.clone())
+    }
+}
+
+/// "No operator wired" stub. Always returns None so the
+/// handler surfaces `{"timeout": true}`. Same behaviour as
+/// the pre-W3 default but expressed as a real trait impl so
+/// the tool node's registration consults the OnceCell
+/// uniformly.
+pub struct NoOperatorChannel;
+
+#[async_trait::async_trait]
+impl OperatorChannel for NoOperatorChannel {
+    async fn ask(&self, _question: String, _timeout_secs: u64) -> Option<String> {
+        None
+    }
+}
+
+/// Process-wide handle for the tool node's operator channel.
+///
+/// Wrapped as `Arc<OnceCell<...>>` so the controller can
+/// populate it post-startup (after the channel-specific
+/// config + identity + transport are up). The
+/// `tool.ask_human` handler reads it on every call so an
+/// operator-channel wiring landing mid-process becomes
+/// effective immediately.
+pub type OperatorChannelHandle = Arc<tokio::sync::OnceCell<Arc<dyn OperatorChannel>>>;
 
 /// Default wait time for the operator's reply, seconds. Five
 /// minutes is the spec floor; operators can override per-

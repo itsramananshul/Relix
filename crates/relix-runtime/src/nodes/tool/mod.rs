@@ -927,7 +927,11 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
 /// Register tool capabilities on the dispatch bridge. Wires every
 /// `tool.*` capability the node exposes; today: `tool.web_fetch` (M9)
 /// and `tool.web_extract` (B1).
-pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
+pub fn register(
+    bridge: &mut DispatchBridge,
+    backend: Arc<ToolBackend>,
+    operator_channel: ask_human::OperatorChannelHandle,
+) {
     let backend_for_handler = backend.clone();
     bridge.register(
         "tool.web_fetch",
@@ -965,36 +969,37 @@ pub fn register(bridge: &mut DispatchBridge, backend: Arc<ToolBackend>) {
 
     // tool.ask_human — first-class "ask the operator" capability.
     // Registered unconditionally so planners + flows can call it
-    // from anywhere on the mesh. Until an operator channel lands,
-    // the sender closure is a fail-soft `None` (timeout) — the
-    // handler still returns `{"timeout": true}` JSON so callers
-    // can branch deterministically. When a real channel ships
-    // (Telegram approval queue, dashboard intervention), the
-    // closure swaps in here.
+    // from anywhere on the mesh. The W3 OperatorChannel handle
+    // is consulted on every call; when a channel is wired the
+    // closure forwards the question + awaits the reply. When
+    // unwired the handler surfaces `{"timeout": true}` to keep
+    // the deterministic operator-not-available contract.
     tracing::info!("tool node: registering tool.ask_human");
+    let operator_for_handler = operator_channel.clone();
     bridge.register(
         ask_human::AskHumanTool::descriptor().method_name.as_str(),
-        Arc::new(FnHandler(move |ctx: InvocationCtx| async move {
-            let args = match std::str::from_utf8(&ctx.args) {
-                Ok(s) => s.to_string(),
-                Err(e) => {
-                    return HandlerOutcome::Err(ErrorEnvelope {
-                        kind: error_kinds::INVALID_ARGS,
-                        cause: format!("tool.ask_human arg utf8: {e}"),
-                        retry_hint: 2,
-                        retry_after: None,
-                    });
-                }
-            };
-            ask_human::AskHumanTool::handle(&args, |_question, _timeout_secs| async move {
-                // No operator channel wired yet — the handler
-                // surfaces the `{"timeout": true}` reply so
-                // callers see a structured "no operator
-                // available" outcome rather than a mesh-level
-                // CapabilityNotFound.
-                None
-            })
-            .await
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let chan = operator_for_handler.clone();
+            async move {
+                let args = match std::str::from_utf8(&ctx.args) {
+                    Ok(s) => s.to_string(),
+                    Err(e) => {
+                        return HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::INVALID_ARGS,
+                            cause: format!("tool.ask_human arg utf8: {e}"),
+                            retry_hint: 2,
+                            retry_after: None,
+                        });
+                    }
+                };
+                ask_human::AskHumanTool::handle(&args, |question, timeout_secs| async move {
+                    match chan.get() {
+                        Some(c) => c.ask(question, timeout_secs).await,
+                        None => None,
+                    }
+                })
+                .await
+            }
         })),
     );
 
@@ -1296,7 +1301,11 @@ mod tests {
     async fn tool_ask_human_is_registered_by_tool_register() {
         let (mut bridge, _org_root, _dir) = fresh_bridge_for_tool();
         let backend = Arc::new(ToolBackend::new(ToolConfig::default()).unwrap());
-        register(&mut bridge, backend);
+        register(
+            &mut bridge,
+            backend,
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        );
         assert!(
             bridge.has_handler("tool.ask_human"),
             "tool.ask_human must be registered after tool::register"
@@ -1304,11 +1313,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_ask_human_returns_canned_reply_when_operator_channel_is_wired() {
+        use crate::transport::envelope::ResponseResult;
+        let (mut bridge, org_root, _dir) = fresh_bridge_for_tool();
+        let backend = Arc::new(ToolBackend::new(ToolConfig::default()).unwrap());
+        let channel: ask_human::OperatorChannelHandle =
+            std::sync::Arc::new(tokio::sync::OnceCell::new());
+        if channel
+            .set(std::sync::Arc::new(ask_human::CannedReplyChannel {
+                reply: "approved by stub operator".into(),
+            }))
+            .is_err()
+        {
+            panic!("channel OnceCell already set");
+        }
+        register(&mut bridge, backend, channel);
+        let aic = aic_for(&org_root, "alice", &["chat-users"]);
+        let args = br#"{"question":"deploy now?","timeout_secs":5}"#.to_vec();
+        let envelope = crate::dispatch::build_request("tool.ask_human", args, aic, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = crate::dispatch::decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Ok(body) => {
+                let s = String::from_utf8(body.into_vec()).unwrap();
+                assert!(
+                    s.contains("\"answer\":\"approved by stub operator\""),
+                    "expected canned reply, got {s}"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn tool_ask_human_routes_through_mesh_to_handle_not_capability_not_found() {
         use crate::transport::envelope::ResponseResult;
         let (mut bridge, org_root, _dir) = fresh_bridge_for_tool();
         let backend = Arc::new(ToolBackend::new(ToolConfig::default()).unwrap());
-        register(&mut bridge, backend);
+        register(
+            &mut bridge,
+            backend,
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        );
         let aic = aic_for(&org_root, "alice", &["chat-users"]);
         // The default stub sender returns None immediately, so
         // we pick `timeout_secs = 1` to keep the test fast. The

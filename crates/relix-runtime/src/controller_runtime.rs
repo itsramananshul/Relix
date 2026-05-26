@@ -4751,7 +4751,15 @@ fn register_node_type_handlers(
             None => crate::nodes::tool::ToolConfig::default(),
         };
         let backend = std::sync::Arc::new(crate::nodes::tool::ToolBackend::new(tool_cfg.clone())?);
-        crate::nodes::tool::register(bridge, backend);
+        // W3: operator channel for tool.ask_human. Allocated as
+        // an empty OnceCell; future controller-side wiring
+        // populates it with the configured channel (Telegram
+        // approval queue, dashboard intervention). When empty
+        // the ask_human handler returns `{"timeout": true}`
+        // honest-to-the-fact-that-no-operator-is-available.
+        let operator_channel: crate::nodes::tool::ask_human::OperatorChannelHandle =
+            std::sync::Arc::new(tokio::sync::OnceCell::new());
+        crate::nodes::tool::register(bridge, backend, operator_channel);
         let desc = crate::nodes::tool::capability_descriptor();
         manifest.add_capability(desc.clone());
         // B1: tool.web_extract — pure HTML parser. Lives on the same
