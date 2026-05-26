@@ -119,6 +119,25 @@ pub struct MemoryConfig {
     /// configured" error.
     #[serde(default)]
     pub embedding_peer: Option<EmbeddingPeerConfig>,
+    /// Optional Qdrant config. When set with a non-empty URL,
+    /// the memory node opens a [`schema::LayeredMemoryStore`]
+    /// alongside the existing Hermes-style store, ensures the
+    /// Qdrant collection, and serves `memory.records_search`
+    /// via Qdrant. When unset (or `url` empty), the four-layer
+    /// surface is still available but semantic search falls
+    /// back to SQLite text matching.
+    #[serde(default)]
+    pub qdrant: Option<qdrant::QdrantConfig>,
+    /// Optional embedder pipeline config. Spawns the
+    /// background `EmbeddingPipeline` when `enabled = true` and
+    /// the embedding dispatcher is wired.
+    #[serde(default)]
+    pub embedder: Option<embedder::EmbedderConfig>,
+    /// Optional override for the layered-store database. When
+    /// `None`, the layered store lives alongside the main
+    /// memory DB at `<db_path with ".layered.db" suffix>`.
+    #[serde(default)]
+    pub layered_db_path: Option<PathBuf>,
 }
 
 /// `[memory.embedding_peer]` — points at an AI peer that
@@ -540,6 +559,19 @@ impl MemoryStore {
     }
 }
 
+/// Side-channel context the four-layer memory surface holds.
+/// Threaded through `register()` as an `Option` so existing
+/// memory nodes that don't opt into the layered store keep
+/// their current behaviour exactly.
+#[derive(Clone)]
+pub struct LayeredContext {
+    pub store: Arc<schema::LayeredMemoryStore>,
+    pub qdrant: Option<Arc<qdrant::QdrantClient>>,
+    /// Score floor applied to Qdrant search results. Defaults
+    /// to 0.75 when no `[memory.embedder]` block tunes it.
+    pub score_threshold: f32,
+}
+
 /// Register all memory capabilities on the supplied dispatch bridge.
 ///
 /// `ai_cell` is the shared `OnceCell` populated by the memory
@@ -563,14 +595,17 @@ pub fn register(
     embedding_cell: Arc<tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>>,
     embedding_model: String,
     curator: Option<(Arc<tokio::sync::Mutex<CuratorState>>, Arc<CuratorConfig>)>,
+    layered: Option<LayeredContext>,
 ) {
     {
         let store = store.clone();
+        let layered = layered.clone();
         bridge.register(
             "memory.write_turn",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let store = store.clone();
-                async move { handle_write_turn(&store, &ctx) }
+                let layered = layered.clone();
+                async move { handle_write_turn(&store, layered.as_ref(), &ctx) }
             })),
         );
     }
@@ -678,11 +713,31 @@ pub fn register(
             })),
         );
     }
+    if let Some(ctx) = layered {
+        let layered = ctx.clone();
+        let embed_cell = embedding_cell.clone();
+        let model = embedding_model.clone();
+        bridge.register(
+            "memory.records_search",
+            Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                let layered = layered.clone();
+                let embed_cell = embed_cell.clone();
+                let model = model.clone();
+                async move {
+                    handle_records_search(&layered, embed_cell.as_ref(), &model, &ictx).await
+                }
+            })),
+        );
+    }
 }
 
 // ──────────────────────────── Handlers ──────────────────────────────────────
 
-fn handle_write_turn(store: &MemoryStore, ctx: &InvocationCtx) -> HandlerOutcome {
+fn handle_write_turn(
+    store: &MemoryStore,
+    layered: Option<&LayeredContext>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => {
@@ -701,9 +756,187 @@ fn handle_write_turn(store: &MemoryStore, ctx: &InvocationCtx) -> HandlerOutcome
         return invalid_args("memory.write_turn: session_id and role required".to_string());
     }
     match store.write_turn(session_id, role, body) {
-        Ok(()) => HandlerOutcome::Ok(b"ok\n".to_vec()),
+        Ok(()) => {
+            // Best-effort layered insert as a Raw record. The
+            // four-layer store carries a stable id, source =
+            // session, and the verbatim body; failures here are
+            // logged but never propagated to the existing
+            // memory.write_turn contract (callers depend on a
+            // 200/Ok outcome).
+            if let Some(layered) = layered {
+                let id = mint_record_id(session_id, role, body);
+                let mut record =
+                    schema::MemoryRecord::new_raw(id, body.to_string(), session_id.to_string());
+                record.tags = vec![format!("role:{role}")];
+                if let Err(e) = layered.store.insert(&record) {
+                    tracing::warn!(error = %e, "memory.write_turn: layered insert failed");
+                }
+            }
+            HandlerOutcome::Ok(b"ok\n".to_vec())
+        }
         Err(e) => internal(format!("memory.write_turn: {e}")),
     }
+}
+
+/// Stable record id minted from `session_id|role|body` via
+/// blake3. Same input → same id, so re-writes of the same turn
+/// upsert rather than create duplicates. Hex-encoded so the id
+/// is operator-readable in `sqlite3` dumps.
+fn mint_record_id(session_id: &str, role: &str, body: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(session_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(role.as_bytes());
+    hasher.update(b"|");
+    hasher.update(body.as_bytes());
+    // 16 hex chars (8 bytes) is plenty of collision resistance
+    // for per-controller memory ids without bloating the row.
+    hasher.finalize().to_hex().as_str()[..16].to_string()
+}
+
+/// `memory.records_search` handler. Wire: `query` or
+/// `query|N`. When Qdrant is configured, embeds the query via
+/// the embedding dispatcher and runs a vector search; falls
+/// back to SQLite `LIKE` against the `text` column when Qdrant
+/// is absent OR the embedding dispatcher isn't ready yet.
+///
+/// Output: tab-separated rows
+/// `id\tlayer\tsource\tscore\ttext\n` followed by `count=N\n`.
+/// `score` is `1.0` for SQLite fallback hits (we don't have a
+/// real similarity score) and Qdrant's cosine for vector hits.
+async fn handle_records_search(
+    layered: &LayeredContext,
+    embed_cell: &tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>,
+    model: &str,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let s = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s,
+        Err(e) => return invalid_args(format!("memory.records_search arg utf8: {e}")),
+    };
+    let (query, n) = match s.rsplit_once('|') {
+        Some((q, n_str)) if n_str.trim().parse::<usize>().is_ok() => {
+            (q, n_str.trim().parse::<usize>().unwrap_or(10))
+        }
+        _ => (s, 10),
+    };
+    if query.is_empty() {
+        return invalid_args("memory.records_search: query required".to_string());
+    }
+    let qdrant = layered.qdrant.clone();
+    let dispatcher = embed_cell.get().cloned();
+    let hits: Vec<(String, String, String, f32, String)> = match (qdrant, dispatcher) {
+        (Some(q), Some(d)) => {
+            // Semantic path: embed the query, then nearest-neighbor
+            // against Qdrant. The embedding dispatcher errors fold
+            // into a fallback so a transient AI-peer blip degrades
+            // gracefully to text search.
+            match d.embed(model, &[query]).await {
+                Ok(mut vectors) => {
+                    let Some(vec) = vectors.pop() else {
+                        return fallback_text_search(&layered.store, query, n);
+                    };
+                    match q.search(vec, n, layered.score_threshold, None).await {
+                        Ok(results) => results
+                            .into_iter()
+                            .map(|r| {
+                                let id = r
+                                    .payload
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let layer = r
+                                    .payload
+                                    .get("layer")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let source = r
+                                    .payload
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let text = r
+                                    .payload
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                (id, layer, source, r.score, text)
+                            })
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "memory.records_search: qdrant search failed; falling back to text"
+                            );
+                            return fallback_text_search(&layered.store, query, n);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "memory.records_search: embed failed; falling back to text"
+                    );
+                    return fallback_text_search(&layered.store, query, n);
+                }
+            }
+        }
+        _ => return fallback_text_search(&layered.store, query, n),
+    };
+    HandlerOutcome::Ok(render_records_search(&hits))
+}
+
+fn fallback_text_search(
+    store: &schema::LayeredMemoryStore,
+    query: &str,
+    n: usize,
+) -> HandlerOutcome {
+    let rows = match store.text_search(query, n) {
+        Ok(v) => v,
+        Err(e) => return internal(format!("memory.records_search text fallback: {e}")),
+    };
+    let hits: Vec<(String, String, String, f32, String)> = rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.id,
+                r.layer.as_str().to_string(),
+                r.source,
+                1.0_f32,
+                r.text,
+            )
+        })
+        .collect();
+    HandlerOutcome::Ok(render_records_search(&hits))
+}
+
+fn render_records_search(hits: &[(String, String, String, f32, String)]) -> Vec<u8> {
+    let mut body = String::new();
+    for (id, layer, source, score, text) in hits {
+        let clean: String = text
+            .chars()
+            .map(|c| match c {
+                '\n' | '\r' | '\t' => ' ',
+                other => other,
+            })
+            .collect();
+        body.push_str(id);
+        body.push('\t');
+        body.push_str(layer);
+        body.push('\t');
+        body.push_str(source);
+        body.push('\t');
+        body.push_str(&format!("{score:.6}"));
+        body.push('\t');
+        body.push_str(&clean);
+        body.push('\n');
+    }
+    body.push_str(&format!("count={}\n", hits.len()));
+    body.into_bytes()
 }
 
 fn handle_recent(store: &MemoryStore, ctx: &InvocationCtx) -> HandlerOutcome {
@@ -1394,9 +1627,9 @@ mod tests {
             args: args.to_vec(),
         };
 
-        let r = handle_write_turn(&store, &ctx(b"s1|user|hi"));
+        let r = handle_write_turn(&store, None, &ctx(b"s1|user|hi"));
         assert!(matches!(r, HandlerOutcome::Ok(_)));
-        let r = handle_write_turn(&store, &ctx(b"s1|assistant|hello back"));
+        let r = handle_write_turn(&store, None, &ctx(b"s1|assistant|hello back"));
         assert!(matches!(r, HandlerOutcome::Ok(_)));
 
         let r = handle_recent(&store, &ctx(b"s1"));
@@ -1703,7 +1936,7 @@ mod tests {
             args: args.to_vec(),
         };
         // Missing body field.
-        let r = handle_write_turn(&store, &ctx(b"only_session|only_role"));
+        let r = handle_write_turn(&store, None, &ctx(b"only_session|only_role"));
         match r {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
             HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
@@ -1969,5 +2202,164 @@ mod tests {
             HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
         };
         assert_eq!(body2, "ok|chunks_embedded=3\n");
+    }
+
+    // ── Layered four-layer wiring ─────────────────────────
+
+    fn handler_ctx_for(args: &[u8]) -> InvocationCtx {
+        use relix_core::types::{NodeId, RequestId, TraceId};
+        InvocationCtx {
+            caller: relix_core::identity::VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(b"alice"),
+                name: "alice".into(),
+                org_id: NodeId::from_pubkey(b"org"),
+                groups: vec!["chat-users".into()],
+                role: "agent".into(),
+                clearance: "internal".into(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId::new(),
+            args: args.to_vec(),
+        }
+    }
+
+    fn layered_ctx_no_qdrant() -> LayeredContext {
+        LayeredContext {
+            store: Arc::new(schema::LayeredMemoryStore::in_memory().unwrap()),
+            qdrant: None,
+            score_threshold: 0.5,
+        }
+    }
+
+    #[test]
+    fn write_turn_with_layered_context_mirrors_as_raw_record() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        let layered = layered_ctx_no_qdrant();
+        let r = handle_write_turn(
+            &store,
+            Some(&layered),
+            &handler_ctx_for(b"s1|user|hello there"),
+        );
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        // The turns table received the row.
+        let recent = store.recent_for_session("s1", 10).unwrap();
+        assert_eq!(recent.len(), 1);
+        // The layered store received a Raw record carrying the
+        // same body + a `role:user` tag.
+        let recs = layered
+            .store
+            .list(Some(schema::MemoryLayer::Raw), Some("s1"), 10, 0)
+            .unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].text, "hello there");
+        assert!(recs[0].tags.iter().any(|t| t == "role:user"));
+        assert!(recs[0].embedding.is_none());
+    }
+
+    #[tokio::test]
+    async fn records_search_falls_back_to_sqlite_text_when_no_qdrant() {
+        let layered = layered_ctx_no_qdrant();
+        let r1 = schema::MemoryRecord::new_raw("a", "deploy staging environment", "s1");
+        let r2 = schema::MemoryRecord::new_raw("b", "weather in tokyo", "s1");
+        layered.store.insert(&r1).unwrap();
+        layered.store.insert(&r2).unwrap();
+        let cell: tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>> =
+            tokio::sync::OnceCell::new();
+        let outcome =
+            handle_records_search(&layered, &cell, "stub-model", &handler_ctx_for(b"deploy|5"))
+                .await;
+        let body = match outcome {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("err: {}", e.cause),
+        };
+        assert!(
+            body.contains("\tdeploy staging environment\n"),
+            "got: {body}"
+        );
+        assert!(body.contains("count=1\n"));
+    }
+
+    #[tokio::test]
+    async fn records_search_uses_qdrant_when_configured_and_dispatcher_ready() {
+        // Mock Qdrant returning a canned search result.
+        use axum::Router;
+        use axum::routing::any;
+        let app = Router::new().fallback(any(
+            |req: axum::http::Request<axum::body::Body>| async move {
+                let path = req.uri().path().to_string();
+                if path.ends_with("/points/search") {
+                    axum::Json(serde_json::json!({
+                        "result": [
+                            {
+                                "id": 1,
+                                "score": 0.95,
+                                "payload": {
+                                    "id": "rec-1",
+                                    "layer": "raw",
+                                    "source": "s1",
+                                    "text": "from qdrant"
+                                }
+                            }
+                        ],
+                        "status": "ok",
+                        "time": 0.001,
+                    }))
+                } else {
+                    axum::Json(serde_json::json!({"result": true, "status": "ok"}))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let qclient = Arc::new(qdrant::QdrantClient::new(qdrant::QdrantConfig {
+            url: format!("http://{addr}"),
+            collection: "t".into(),
+            dim: 4,
+            api_key: None,
+        }));
+        let layered = LayeredContext {
+            store: Arc::new(schema::LayeredMemoryStore::in_memory().unwrap()),
+            qdrant: Some(qclient),
+            score_threshold: 0.5,
+        };
+
+        // Stub embedding dispatcher that returns a unit vector.
+        struct StubEmbed;
+        #[async_trait::async_trait]
+        impl EmbeddingDispatcher for StubEmbed {
+            async fn embed(
+                &self,
+                _model: &str,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+                Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+            }
+        }
+        let cell: tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>> =
+            tokio::sync::OnceCell::new();
+        cell.set(Arc::new(StubEmbed) as Arc<dyn EmbeddingDispatcher>)
+            .ok();
+        let outcome =
+            handle_records_search(&layered, &cell, "stub-model", &handler_ctx_for(b"anything"))
+                .await;
+        let body = match outcome {
+            HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
+            HandlerOutcome::Err(e) => panic!("err: {}", e.cause),
+        };
+        assert!(body.contains("from qdrant"), "got: {body}");
+        assert!(body.contains("rec-1\traw\ts1\t"), "got: {body}");
+        assert!(body.contains("count=1\n"));
+    }
+
+    #[test]
+    fn mint_record_id_is_deterministic_and_distinguishes_inputs() {
+        let a = mint_record_id("s1", "user", "hello");
+        let b = mint_record_id("s1", "user", "hello");
+        let c = mint_record_id("s1", "user", "world");
+        assert_eq!(a, b, "same inputs must yield the same id");
+        assert_ne!(a, c, "different bodies must yield different ids");
+        assert_eq!(a.len(), 16, "id is the first 16 hex chars of blake3");
     }
 }

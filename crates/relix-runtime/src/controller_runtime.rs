@@ -2696,6 +2696,57 @@ pub(crate) enum StartupWiring {
     },
 }
 
+// Open the four-layer LayeredMemoryStore when the operator opted
+// in via [memory.qdrant] OR an explicit layered_db_path. Returns
+// None when neither is configured — the layered surface is purely
+// additive infrastructure and absent config means it stays off.
+fn open_layered_memory(
+    mem_cfg: &crate::nodes::memory::MemoryConfig,
+) -> Result<Option<crate::nodes::memory::LayeredContext>, Box<dyn std::error::Error>> {
+    use crate::nodes::memory::schema::LayeredMemoryStore;
+    let want_qdrant = mem_cfg
+        .qdrant
+        .as_ref()
+        .is_some_and(|q| !q.url.trim().is_empty());
+    if !want_qdrant && mem_cfg.layered_db_path.is_none() {
+        return Ok(None);
+    }
+    let path = mem_cfg.layered_db_path.clone().unwrap_or_else(|| {
+        // Sidecar DB next to the primary memory.db: a
+        // `mem.db` becomes `mem.layered.db`. Keeps the two
+        // SQLite files on the same filesystem (so they
+        // share the same backup story) without colliding
+        // on the file name.
+        let mut p = mem_cfg.db_path.clone();
+        let stem = p.file_stem().map(|s| s.to_owned()).unwrap_or_default();
+        let new_name = format!("{}.layered.db", stem.to_string_lossy());
+        p.set_file_name(new_name);
+        p
+    });
+    let store = std::sync::Arc::new(
+        LayeredMemoryStore::open(&path).map_err(|e| format!("[memory] layered store open: {e}"))?,
+    );
+    let qdrant = mem_cfg
+        .qdrant
+        .as_ref()
+        .filter(|q| !q.url.trim().is_empty())
+        .map(|qcfg| {
+            std::sync::Arc::new(crate::nodes::memory::qdrant::QdrantClient::new(
+                qcfg.clone(),
+            ))
+        });
+    let score_threshold = mem_cfg
+        .embedder
+        .as_ref()
+        .map(|e| e.score_threshold)
+        .unwrap_or(0.75);
+    Ok(Some(crate::nodes::memory::LayeredContext {
+        store,
+        qdrant,
+        score_threshold,
+    }))
+}
+
 /// Register node-type-specific capabilities based on `[controller] node_type`.
 ///
 /// - `memory` → SQLite + FTS5 memory store (M7).
@@ -2756,6 +2807,19 @@ fn register_node_type_handlers(
             .as_ref()
             .map(|p| p.model.clone())
             .unwrap_or_else(|| "text-embedding-3-small".to_string());
+        // Four-layer memory store + Qdrant. Opens iff
+        // `[memory.qdrant]` is present with a non-empty URL OR
+        // the operator set an explicit layered_db_path. The
+        // store itself is cheap and additive; the Qdrant
+        // ensure_collection happens later (post-rpc) so the
+        // controller still boots when Qdrant is offline.
+        let layered_ctx = open_layered_memory(&mem_cfg)?;
+        if let Some(ctx) = &layered_ctx {
+            tracing::info!(
+                qdrant = ctx.qdrant.is_some(),
+                "memory node: layered store online (Raw records mirrored from memory.write_turn)"
+            );
+        }
         crate::nodes::memory::register(
             bridge,
             store.clone(),
@@ -2763,6 +2827,7 @@ fn register_node_type_handlers(
             embedding_cell.clone(),
             embedding_model,
             curator_handler_cfg,
+            layered_ctx.clone(),
         );
         // Spawn the curator scheduler iff [memory.curator] is
         // configured AND enabled. Discovery of the AI + coord
@@ -2800,6 +2865,69 @@ fn register_node_type_handlers(
                     cell: embedding_cell.clone(),
                     cfg: epeer,
                 });
+            }
+        }
+        // Background bring-up of the Qdrant collection + the
+        // embedding pipeline. Both are best-effort; failures
+        // log a warn and don't keep the memory node from
+        // starting. The pipeline's embed shim reads the
+        // embedding dispatcher cell on every tick, so a
+        // late-startup dispatcher just means the first few
+        // ticks log "not configured" and then it starts
+        // working — no second wiring path needed.
+        if let Some(layered) = &layered_ctx {
+            if let Some(q) = &layered.qdrant {
+                let q = q.clone();
+                tokio::spawn(async move {
+                    match q.ensure_collection().await {
+                        Ok(()) => {
+                            tracing::info!("memory node: qdrant collection ensured at startup")
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "memory node: qdrant ensure_collection failed; pipeline will retry on next upsert"
+                        ),
+                    }
+                });
+            }
+            if let Some(emb_cfg) = mem_cfg.embedder.clone()
+                && emb_cfg.enabled
+            {
+                let dispatcher_cell = embedding_cell.clone();
+                let dispatcher_model = mem_cfg
+                    .embedding_peer
+                    .as_ref()
+                    .map(|p| p.model.clone())
+                    .unwrap_or_else(|| "text-embedding-3-small".to_string());
+                let embed_fn: crate::nodes::memory::embedder::EmbedFn =
+                    std::sync::Arc::new(move |texts: Vec<String>| {
+                        let cell = dispatcher_cell.clone();
+                        let model = dispatcher_model.clone();
+                        Box::pin(async move {
+                            let dispatcher = cell
+                                .get()
+                                .cloned()
+                                .ok_or_else(|| "embedding dispatcher not configured".to_string())?;
+                            let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                            dispatcher
+                                .embed(&model, &refs)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                    });
+                let pipeline = crate::nodes::memory::embedder::EmbeddingPipeline::new(
+                    layered.store.clone(),
+                    layered.qdrant.clone(),
+                    embed_fn,
+                    emb_cfg.batch_size,
+                    emb_cfg.interval_secs,
+                );
+                pipeline.spawn();
+                tracing::info!(
+                    batch_size = emb_cfg.batch_size,
+                    interval_secs = emb_cfg.interval_secs,
+                    "memory node: embedding pipeline spawned"
+                );
             }
         }
         let memory_caps: &[(&str, &str, &[&str], &[&str])] = &[
