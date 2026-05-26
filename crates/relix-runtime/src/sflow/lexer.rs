@@ -25,6 +25,13 @@ pub enum Token {
     Times,
     While,
     Until,
+    /// `for <ident> in <value>` — list iteration. Distinct
+    /// from `loop N times` because the loop variable is bound
+    /// to the element at each iteration, not to the index.
+    For,
+    /// `in` — keyword between `for <ident>` and the iterable
+    /// expression. Only valid inside a `for` header.
+    In,
     Try,
     Catch,
     Rethrow,
@@ -277,6 +284,8 @@ pub fn tokenize(source: &str) -> Result<Vec<Lexed>, SflowError> {
                     "times" => Token::Times,
                     "while" => Token::While,
                     "until" => Token::Until,
+                    "for" => Token::For,
+                    "in" => Token::In,
                     "try" => Token::Try,
                     "catch" => Token::Catch,
                     "rethrow" => Token::Rethrow,

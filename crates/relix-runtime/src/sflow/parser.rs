@@ -68,6 +68,21 @@ pub enum Stmt {
         body: Vec<Stmt>,
         line: usize,
     },
+    /// F9: `for <ident> in <value_expr> … end`. Iterates the
+    /// list resolved from `iter`. Each iteration binds the
+    /// element (stringified via `SflowValue::to_display`) to
+    /// the loop variable. The variable is scoped to the body
+    /// — restored to its previous value (or removed if unset
+    /// before the loop) after `end`. Counts toward the
+    /// same per-flow `MAX_VARS` cap as `set` does, and the
+    /// per-block iteration cap applies the same way it does
+    /// to `loop N times` / `while`.
+    For {
+        var_name: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+        line: usize,
+    },
     /// `try … [catch <kind> …]+ end`.
     Try {
         body: Vec<Stmt>,
@@ -291,6 +306,7 @@ impl<'a> Parser<'a> {
             Some(Token::Loop) => self.parse_loop_times(line, depth),
             Some(Token::While) => self.parse_while(line, depth),
             Some(Token::Until) => self.parse_until(line, depth),
+            Some(Token::For) => self.parse_for(line, depth),
             Some(Token::Try) => self.parse_try(line, depth),
             Some(Token::Rethrow) => {
                 self.advance();
@@ -727,6 +743,48 @@ impl<'a> Parser<'a> {
         self.advance(); // end
         self.expect_newline("end")?;
         Ok(Stmt::While { cond, body, line })
+    }
+
+    fn parse_for(&mut self, line: usize, depth: usize) -> Result<Stmt, SflowError> {
+        ensure_depth(depth, line)?;
+        self.advance(); // `for`
+        let var_name = match self.advance() {
+            Some(Lexed {
+                token: Token::Ident(n),
+                ..
+            }) => {
+                validate_var_name(n, line, "for-loop variable name")?;
+                n.clone()
+            }
+            other => {
+                return Err(SflowError::new(
+                    line,
+                    format!("expected loop variable name after `for`, got {other:?}"),
+                ));
+            }
+        };
+        match self.advance() {
+            Some(Lexed {
+                token: Token::In, ..
+            }) => {}
+            other => {
+                return Err(SflowError::new(
+                    line,
+                    format!("expected `in` after `for {var_name}`, got {other:?}"),
+                ));
+            }
+        }
+        let iter = self.parse_value_expr(line)?;
+        self.expect_newline("for header")?;
+        let body = self.parse_block(depth + 1, &[Token::End])?;
+        self.advance(); // `end`
+        self.expect_newline("end")?;
+        Ok(Stmt::For {
+            var_name,
+            iter,
+            body,
+            line,
+        })
     }
 
     fn parse_until(&mut self, line: usize, depth: usize) -> Result<Stmt, SflowError> {

@@ -257,6 +257,12 @@ impl Executor {
             }
             Stmt::While { cond, body, line } => self.exec_while(cond, body, *line, state, false),
             Stmt::Until { cond, body, line } => self.exec_while(cond, body, *line, state, true),
+            Stmt::For {
+                var_name,
+                iter,
+                body,
+                line,
+            } => self.exec_for(var_name, iter, body, *line, state),
             Stmt::Try {
                 body,
                 catches,
@@ -484,6 +490,74 @@ impl Executor {
                 BlockFlow::Continue => {}
             }
             iter += 1;
+        }
+        Ok(BlockFlow::Continue)
+    }
+
+    /// F9: `for <ident> in <list> ... end`. Resolves the
+    /// iterable to a list of strings (a `SflowValue::List`
+    /// is iterated directly; a `String` is split on the
+    /// canonical `|` separator the same way `list_*` builtins
+    /// coerce). The loop variable is set once per iteration
+    /// to the current element; the prior binding for that
+    /// name (if any) is restored after the loop completes so
+    /// the var doesn't leak. Same per-block iteration cap as
+    /// `loop N times` / `while`; same `MAX_NESTING_DEPTH`.
+    fn exec_for(
+        &self,
+        var_name: &str,
+        iter: &Expr,
+        body: &[Stmt],
+        line: usize,
+        state: &mut ExecState,
+    ) -> Result<BlockFlow, RuntimeError> {
+        let value = state.resolve_value(iter, line)?;
+        let items: Vec<String> = match value {
+            SflowValue::List(items) => items,
+            SflowValue::String(s) if s.is_empty() => Vec::new(),
+            SflowValue::String(s) => s.split('|').map(str::to_string).collect(),
+            SflowValue::Map(pairs) => pairs.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        };
+        let cap = self.max_loop_iters;
+        if items.len() as u64 > cap {
+            self.chronicle.write(
+                "sol.loop_limit_hit",
+                &format!(
+                    "requested={n} cap={cap} kind=for line={line}",
+                    n = items.len()
+                ),
+            );
+        }
+        let prior = state.vars.remove(var_name);
+        // Cap iterations the same way `loop N times` /
+        // `while` do. `.take(cap)` is the clippy-preferred
+        // shape over a manual counter (`explicit_counter_loop`).
+        for (idx, elem) in items.into_iter().take(cap as usize).enumerate() {
+            let prev_loop = state.loop_iter.replace(idx as u64);
+            state.set_var(var_name, SflowValue::String(elem), line)?;
+            self.chronicle
+                .write("sol.loop_iter", &format!("iter={idx} kind=for line={line}"));
+            let res = self.exec_block(body, state);
+            state.loop_iter = prev_loop;
+            match res? {
+                BlockFlow::Return => {
+                    // Restore the prior binding even on a
+                    // return — the var still shouldn't leak
+                    // upward into the caller's scope.
+                    state.vars.remove(var_name);
+                    if let Some(p) = prior {
+                        state.vars.insert(var_name.to_string(), p);
+                    }
+                    return Ok(BlockFlow::Return);
+                }
+                BlockFlow::Continue => {}
+            }
+        }
+        // Restore the prior binding (or remove the loop var
+        // outright when it was unset before the loop).
+        state.vars.remove(var_name);
+        if let Some(p) = prior {
+            state.vars.insert(var_name.to_string(), p);
         }
         Ok(BlockFlow::Continue)
     }
@@ -1272,6 +1346,145 @@ mod tests {
         "#;
         let (outcome, _) = exec_no_dispatch(src);
         assert_eq!(outcome.result, "hi alice");
+    }
+
+    // ── F9: for-in over lists ──────────────────────────────
+
+    #[test]
+    fn for_in_list_literal_iterates_all_elements_in_order() {
+        let src = r#"
+            set acc = ""
+            for x in ["a", "b", "c"]
+              set acc = "${acc}${x}"
+            end
+            sol.set_result var.acc
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.result, "abc");
+    }
+
+    #[test]
+    fn for_in_iterates_list_stored_in_variable() {
+        let src = r#"
+            set items = ["alpha", "beta"]
+            set acc = ""
+            for it in var.items
+              set acc = "${acc}-${it}"
+            end
+            sol.set_result var.acc
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "-alpha-beta");
+    }
+
+    #[test]
+    fn for_in_over_pipe_string_splits_on_pipe() {
+        let src = r#"
+            set raw = "x|y|z"
+            set acc = ""
+            for el in var.raw
+              set acc = "${acc}.${el}"
+            end
+            sol.set_result var.acc
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, ".x.y.z");
+    }
+
+    #[test]
+    fn for_in_loop_variable_does_not_leak_after_end() {
+        // The loop var should NOT be visible after `end`.
+        // We bind a sentinel `it = "outer"` first, run a
+        // loop that overwrites `it`, then assert the outer
+        // value is restored.
+        let src = r#"
+            set it = "outer"
+            for it in ["inner-a", "inner-b"]
+              sol.log "inside"
+            end
+            sol.set_result var.it
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "outer");
+    }
+
+    #[test]
+    fn for_in_loop_variable_unset_when_no_prior_binding() {
+        // No prior `set it` — after the loop, `var.it`
+        // should be empty (the prior unset state).
+        let src = r#"
+            for it in ["a", "b"]
+              sol.log "noop"
+            end
+            sol.set_result var.it
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "");
+    }
+
+    #[test]
+    fn for_in_empty_list_runs_zero_iterations() {
+        let src = r#"
+            set acc = "untouched"
+            for el in []
+              set acc = "touched"
+            end
+            sol.set_result var.acc
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "untouched");
+    }
+
+    #[test]
+    fn for_in_nested_loops_work_within_max_nesting_depth() {
+        let src = r#"
+            set acc = ""
+            for outer in ["x", "y"]
+              for inner in ["1", "2"]
+                set acc = "${acc}${outer}${inner};"
+              end
+            end
+            sol.set_result var.acc
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "x1;x2;y1;y2;");
+    }
+
+    #[test]
+    fn for_in_interops_with_list_push_accumulator() {
+        let src = r#"
+            set acc = []
+            for el in ["a", "b", "c"]
+              set acc = list_push(var.acc, var.el)
+            end
+            sol.set_result list_len(var.acc)
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        assert_eq!(outcome.result, "3");
+    }
+
+    #[test]
+    fn for_in_with_return_inside_body_propagates() {
+        let src = r#"
+            for el in ["a", "b", "c"]
+              return var.el
+            end
+            sol.set_result "fell-through"
+            return
+        "#;
+        let (outcome, _) = exec_no_dispatch(src);
+        // Return inside the first iteration: result is the
+        // first element.
+        assert_eq!(outcome.result, "a");
     }
 
     #[test]
