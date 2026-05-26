@@ -100,6 +100,33 @@ pub struct AiConfig {
     /// outbound mesh capability.
     #[serde(default, rename = "memory_peer")]
     pub memory_peer: Option<AiMemoryPeerConfig>,
+    /// Optional `[ai.agent]` block carrying the agent's name and
+    /// soul (persona) file pointer. When set with `soul_path` OR
+    /// with `name` matching a discoverable file under
+    /// `~/.relix/souls/<name>.md` or `./souls/<name>.md`, the
+    /// AI node prepends the soul content to the system prompt
+    /// for every `ai.chat` call.
+    ///
+    /// Missing block means no soul is loaded — the existing
+    /// memory + RAG composition path is unchanged. See
+    /// [`crate::nodes::ai::soul`].
+    #[serde(default)]
+    pub agent: Option<AgentConfig>,
+}
+
+/// `[ai.agent]` config — operator-supplied persona pointer for
+/// this AI controller. Both fields are optional but at least one
+/// must be set for the loader to find a soul file.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct AgentConfig {
+    /// Agent slug. When `soul_path` is unset, the loader probes
+    /// `~/.relix/souls/<name>.md` and `./souls/<name>.md`.
+    #[serde(default)]
+    pub name: String,
+    /// Explicit path to the SOUL.md file. Wins over `name`-based
+    /// auto-discovery when set.
+    #[serde(default)]
+    pub soul_path: Option<std::path::PathBuf>,
 }
 
 impl Default for AiConfig {
@@ -109,6 +136,7 @@ impl Default for AiConfig {
             model: String::new(),
             providers: ProviderEntries::new(),
             memory_peer: None,
+            agent: None,
         }
     }
 }
@@ -242,16 +270,19 @@ pub fn register(
     provider: Arc<dyn ChatProvider>,
     default_model: String,
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
+    soul_cache: SoulCache,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
+    let soul_for_chat = soul_cache.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let p = provider_for_chat.clone();
             let model = model_for_chat.clone();
             let mem = memory_dispatcher.clone();
-            async move { handle_chat(p, model, mem, ctx).await }
+            let soul = soul_for_chat.clone();
+            async move { handle_chat(p, model, mem, soul, ctx).await }
         })),
     );
     let provider_for_embed = provider.clone();
@@ -384,6 +415,104 @@ async fn embed_and_rag(
     .await
 }
 
+/// Cache for the resolved SOUL.md content. Tracks the source
+/// file's last-modified timestamp so an operator who edits the
+/// soul file mid-run sees the change on the next `ai.chat`
+/// call without restarting the AI controller.
+///
+/// Cheap to clone (everything behind `Arc<Mutex<...>>`). One
+/// instance lives on the AI node's closure capture; every
+/// `handle_chat` call probes `current_content()` to get the
+/// freshest soul without paying the discovery cost when the
+/// file hasn't changed.
+#[derive(Clone, Debug)]
+pub struct SoulCache {
+    inner: Arc<std::sync::Mutex<SoulCacheInner>>,
+    explicit: Option<std::path::PathBuf>,
+    agent_name: String,
+}
+
+#[derive(Debug)]
+struct SoulCacheInner {
+    /// Last seen on-disk mtime, in unix seconds. `None` means
+    /// the cache has never seen the file (cold) OR the file is
+    /// missing.
+    last_mtime: Option<i64>,
+    /// Cached resolved soul. `None` when no soul file was
+    /// discovered on the last probe.
+    cached: Option<soul::Soul>,
+}
+
+impl SoulCache {
+    /// Permanent-no-op cache — `current()` always returns
+    /// `None`. Tests and the legacy code path that doesn't pass
+    /// an agent config use this; the AI handler skips the soul
+    /// prepend when the cache returns `None`.
+    pub fn no_op() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(SoulCacheInner {
+                last_mtime: None,
+                cached: None,
+            })),
+            explicit: None,
+            agent_name: String::new(),
+        }
+    }
+
+    /// Construct from the `[ai.agent]` config block. When the
+    /// block is absent (or both `name` and `soul_path` are
+    /// empty), the cache is a permanent no-op — every probe
+    /// returns `None` and the AI handler skips the prepend.
+    pub fn from_config(agent: Option<&AgentConfig>) -> Self {
+        let (explicit, agent_name) = match agent {
+            Some(a) => (a.soul_path.clone(), a.name.clone()),
+            None => (None, String::new()),
+        };
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(SoulCacheInner {
+                last_mtime: None,
+                cached: None,
+            })),
+            explicit,
+            agent_name,
+        }
+    }
+
+    /// Return the current soul content, reloading from disk when
+    /// the source file's mtime changed since the previous probe.
+    /// Returns `None` when no soul file is configured / discovered.
+    pub fn current(&self) -> Option<soul::Soul> {
+        // No agent + no explicit path → cache is a permanent
+        // no-op. Spelled out so the disk probe doesn't fire
+        // for controllers that don't use souls at all.
+        if self.explicit.is_none() && self.agent_name.is_empty() {
+            return None;
+        }
+        let candidates = soul::candidate_paths(&self.agent_name, self.explicit.as_deref());
+        let mut current_mtime: Option<i64> = None;
+        for c in &candidates {
+            if let Ok(meta) = std::fs::metadata(c)
+                && let Ok(modified) = meta.modified()
+                && let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                current_mtime = Some(d.as_secs() as i64);
+                break;
+            }
+        }
+        let mut guard = self.inner.lock().expect("soul cache lock");
+        // Fast path: file mtime unchanged AND we have a cached
+        // value — return the cached soul.
+        if guard.last_mtime == current_mtime && guard.cached.is_some() {
+            return guard.cached.clone();
+        }
+        // Reload. discover() walks the same candidate paths.
+        let fresh = soul::discover(&self.agent_name, self.explicit.as_deref());
+        guard.last_mtime = current_mtime;
+        guard.cached = fresh.clone();
+        fresh
+    }
+}
+
 /// Build the final `system_prompt` from the two optional blocks
 /// the dispatcher might produce. Agent / user memory comes
 /// first; RAG block sits after it. A single blank line separates
@@ -431,6 +560,7 @@ async fn handle_chat(
     provider: Arc<dyn ChatProvider>,
     default_model: String,
     memory_dispatcher: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>>,
+    soul_cache: SoulCache,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -498,6 +628,17 @@ async fn handle_chat(
         (sys, merge_history(&auto_history, history))
     } else {
         (None, history.to_string())
+    };
+    // SOUL.md persona prepend. Runs AFTER memory + RAG so the
+    // soul (operator-authored agent personality) sits at the
+    // TOP of the system prompt — the model reads the persona
+    // first, then the memory blocks, then the user message.
+    // The cache hides the disk probe on the hot path; the
+    // mtime check means an operator who edits the soul mid-run
+    // sees the change on the next call.
+    let system_prompt = match soul_cache.current() {
+        Some(soul) => Some(soul.into_system_prompt(system_prompt.as_deref())),
+        None => system_prompt,
     };
 
     let input = ChatInput {
@@ -622,8 +763,22 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_is_deterministic_with_and_without_history() {
         let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
-        let r1 = handle_chat(p.clone(), String::new(), empty_mem(), ctx(b"s1|hello|")).await;
-        let r2 = handle_chat(p.clone(), String::new(), empty_mem(), ctx(b"s1|hello|")).await;
+        let r1 = handle_chat(
+            p.clone(),
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            ctx(b"s1|hello|"),
+        )
+        .await;
+        let r2 = handle_chat(
+            p.clone(),
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            ctx(b"s1|hello|"),
+        )
+        .await;
         match (r1, r2) {
             (HandlerOutcome::Ok(a), HandlerOutcome::Ok(b)) => assert_eq!(a, b),
             _ => panic!("expected both ok"),
@@ -632,6 +787,7 @@ mod tests {
             p,
             String::new(),
             empty_mem(),
+            SoulCache::no_op(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -650,7 +806,14 @@ mod tests {
     #[tokio::test]
     async fn missing_prompt_rejected() {
         let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
-        let r = handle_chat(p, String::new(), empty_mem(), ctx(b"only-session-id")).await;
+        let r = handle_chat(
+            p,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            ctx(b"only-session-id"),
+        )
+        .await;
         match r {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
             HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
@@ -660,11 +823,112 @@ mod tests {
     #[tokio::test]
     async fn empty_session_rejected() {
         let p: Arc<dyn ChatProvider> = Arc::new(MockProvider);
-        let r = handle_chat(p, String::new(), empty_mem(), ctx(b"|hello|")).await;
+        let r = handle_chat(
+            p,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            ctx(b"|hello|"),
+        )
+        .await;
         match r {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
             HandlerOutcome::Ok(_) => panic!("expected invalid_args"),
         }
+    }
+
+    // ── SOUL.md wiring ──────────────────────────────────────
+
+    /// Make a SoulCache that resolves to a tempfile-backed soul
+    /// + return the TempFile guard so the caller controls its
+    ///   lifetime.
+    fn make_soul_cache_with_tempfile(body: &str) -> (tempfile::NamedTempFile, SoulCache) {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp.as_file(), "{body}").unwrap();
+        let agent = AgentConfig {
+            name: String::new(),
+            soul_path: Some(tmp.path().to_path_buf()),
+        };
+        let cache = SoulCache::from_config(Some(&agent));
+        (tmp, cache)
+    }
+
+    #[tokio::test]
+    async fn soul_content_prepended_to_system_prompt_when_cache_resolves() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let (_tmp, soul) = make_soul_cache_with_tempfile("# Alice\nFriendly and concise.");
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            empty_mem(),
+            soul,
+            ctx(b"s1|hi|"),
+        )
+        .await;
+        match r {
+            HandlerOutcome::Ok(_) => {}
+            HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
+        }
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        let sp = captured.system_prompt.expect("system_prompt set");
+        // Soul body lands at the top of the system prompt.
+        assert!(sp.contains("# Alice"), "soul header missing: {sp}");
+        assert!(
+            sp.contains("Friendly and concise."),
+            "soul body missing: {sp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn soul_prepends_in_front_of_memory_block() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
+            Arc::new(tokio::sync::OnceCell::new());
+        let stub: Arc<dyn MemoryFetcher> = Arc::new(StubFetcher {
+            agent: "AGENT-FACT".into(),
+            user: "USER-PREFERENCE".into(),
+        });
+        cell.set(stub).ok();
+        let (_tmp, soul) = make_soul_cache_with_tempfile("SOUL-PERSONA");
+        let r = handle_chat(rec_provider, String::new(), cell, soul, ctx(b"s1|hi|")).await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        let sp = captured.system_prompt.expect("system_prompt set");
+        // Soul comes first, then memory blocks. Find the
+        // indices and assert ordering.
+        let soul_pos = sp.find("SOUL-PERSONA").expect("soul body present");
+        let agent_pos = sp.find("AGENT-FACT").expect("agent memory present");
+        assert!(
+            soul_pos < agent_pos,
+            "soul must precede memory in prompt: {sp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn soul_cache_no_op_leaves_prompt_unchanged() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec_provider: Arc<dyn ChatProvider> = Arc::new(RecordingProvider {
+            last: recorded.clone(),
+        });
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            ctx(b"s1|hi|"),
+        )
+        .await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        let captured = recorded.lock().unwrap().clone().unwrap();
+        // No memory + no soul → no system prompt at all.
+        assert!(captured.system_prompt.is_none());
     }
 
     #[tokio::test]
@@ -680,7 +944,14 @@ mod tests {
             user: "prefers concise replies".into(),
         });
         cell.set(stub).ok();
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"s1|hello|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"s1|hello|"),
+        )
+        .await;
         match r {
             HandlerOutcome::Ok(_) => {}
             HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
@@ -704,7 +975,14 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new());
         let unavail: Arc<dyn MemoryFetcher> = Arc::new(UnavailableFetcher);
         cell.set(unavail).ok();
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"s1|hello|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"s1|hello|"),
+        )
+        .await;
         match r {
             HandlerOutcome::Ok(_) => {}
             HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
@@ -755,6 +1033,7 @@ mod tests {
             rec_provider,
             String::new(),
             cell,
+            SoulCache::no_op(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -789,6 +1068,7 @@ mod tests {
             rec_provider,
             String::new(),
             cell,
+            SoulCache::no_op(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -822,7 +1102,14 @@ mod tests {
             last_session_seen: std::sync::Mutex::new(None),
         });
         cell.set(stub).ok();
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"sess1|hi|"),
+        )
+        .await;
         assert!(matches!(r, HandlerOutcome::Ok(_)));
         let captured = recorded.lock().unwrap().clone().unwrap();
         assert!(
@@ -934,7 +1221,14 @@ mod tests {
             embedding_seen: Arc::new(std::sync::Mutex::new(None)),
         });
         cell.set(stub).ok();
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"sess1|hi|"),
+        )
+        .await;
         assert!(matches!(r, HandlerOutcome::Ok(_)));
         let captured = recorded.lock().unwrap().clone().unwrap();
         let sp = captured.system_prompt.expect("system_prompt present");
@@ -966,7 +1260,14 @@ mod tests {
             embedding_seen: Arc::new(std::sync::Mutex::new(None)),
         });
         cell.set(stub).ok();
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"sess1|hi|"),
+        )
+        .await;
         assert!(matches!(r, HandlerOutcome::Ok(_)));
         let captured = recorded.lock().unwrap().clone().unwrap();
         assert!(
@@ -996,7 +1297,14 @@ mod tests {
             embedding_seen: embedding_seen.clone(),
         });
         cell.set(stub).ok();
-        let r = handle_chat(provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        let r = handle_chat(
+            provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"sess1|hi|"),
+        )
+        .await;
         assert!(matches!(r, HandlerOutcome::Ok(_)));
         let captured = recorded.lock().unwrap().clone().unwrap();
         assert!(
@@ -1027,7 +1335,14 @@ mod tests {
             embedding_seen: embedding_seen.clone(),
         });
         cell.set(stub).ok();
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"sess1|hi|"),
+        )
+        .await;
         assert!(matches!(r, HandlerOutcome::Ok(_)));
         let captured = recorded.lock().unwrap().clone().unwrap();
         assert!(
@@ -1079,7 +1394,14 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new());
         let stub: Arc<dyn MemoryFetcher> = Arc::new(DualStub);
         cell.set(stub).ok();
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"sess1|hi|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"sess1|hi|"),
+        )
+        .await;
         assert!(matches!(r, HandlerOutcome::Ok(_)));
         let captured = recorded.lock().unwrap().clone().unwrap();
         let sp = captured.system_prompt.expect("system_prompt present");
@@ -1171,7 +1493,14 @@ mod tests {
         // section).
         let cell: Arc<tokio::sync::OnceCell<Arc<dyn MemoryFetcher>>> =
             Arc::new(tokio::sync::OnceCell::new());
-        let r = handle_chat(rec_provider, String::new(), cell, ctx(b"s1|hello|")).await;
+        let r = handle_chat(
+            rec_provider,
+            String::new(),
+            cell,
+            SoulCache::no_op(),
+            ctx(b"s1|hello|"),
+        )
+        .await;
         match r {
             HandlerOutcome::Ok(_) => {}
             HandlerOutcome::Err(e) => panic!("unexpected err: {}", e.cause),
@@ -1242,6 +1571,7 @@ mod tests {
             model: String::new(),
             providers: ProviderEntries::new(),
             memory_peer: None,
+            agent: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -1259,6 +1589,7 @@ mod tests {
             model: String::new(),
             providers: ProviderEntries::new(),
             memory_peer: None,
+            agent: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -1283,6 +1614,7 @@ mod tests {
             model: String::new(),
             providers,
             memory_peer: None,
+            agent: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -1307,6 +1639,7 @@ mod tests {
             model: String::new(),
             providers,
             memory_peer: None,
+            agent: None,
         };
         match build_provider(&cfg) {
             Ok(p) => assert_eq!(p.provider_name(), "local"),

@@ -224,7 +224,6 @@ enum Cmd {
         cmd: skills::Cmd,
     },
 
-
     /// Execute a SOL flow file against a real Relix mesh (M6).
     ///
     /// Compiles the flow, attaches a libp2p-backed `RemoteCallDispatcher`,

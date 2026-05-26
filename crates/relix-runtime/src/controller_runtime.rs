@@ -2904,11 +2904,21 @@ fn register_node_type_handlers(
         // memory injection.
         let memory_cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::ai::MemoryFetcher>>> =
             Arc::new(tokio::sync::OnceCell::new());
+        // SOUL.md cache. `AgentConfig::None` means the cache is
+        // a no-op (every `current()` returns None) so existing
+        // controllers without `[ai.agent]` keep their prompt
+        // composition unchanged. When operators set
+        // `[ai.agent] name = "alice"` (or `soul_path`), the
+        // cache resolves the soul once per call with mtime-
+        // tracked reload — file edits take effect on the next
+        // chat without a restart.
+        let soul_cache = crate::nodes::ai::SoulCache::from_config(ai_cfg.agent.as_ref());
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
             default_model.clone(),
             memory_cell.clone(),
+            soul_cache,
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
