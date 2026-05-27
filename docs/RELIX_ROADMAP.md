@@ -1377,17 +1377,55 @@ four shapes the major fine-tuning platforms expect.
 
 **Not shipped this session (documented gaps):**
 
-- **PII anonymization / opt-in redaction across the four
-  memory layers** — the original §7.15 SKIPPED note flagged
-  this as the multi-day part. The training records ship raw
-  prompts + responses; operators are expected to either (a)
-  filter by `agent` / `session_id` to scope exports to
-  consented sessions, or (b) post-process the JSONL with
-  their own PII redactor before handing it to a fine-tuning
-  vendor. Building a proper redaction pipeline (Layer 1
-  Working Memory + Layer 2 Episodic + Layer 3 Observations +
-  Layer 4 Living Model passes, plus an opt-in surface per
-  agent + a privacy review) is correctly its own session.
+- **PII anonymization for the training data pipeline** —
+  `[DONE — commits 711fdf5 + 9664e59 + cbc57ea]`. Shipped a
+  production PII detector + anonymizer for the training
+  pipeline. The detector is a lazy-compiled regex table with
+  ten types (EMAIL / PHONE / SSN / CREDIT_CARD (Luhn-
+  validated) / IP_ADDRESS (v4 + v6) / URL / NAME (stop-word-
+  filtered, sentence-start-skipped) / DATE_OF_BIRTH (with
+  context-word window) / ADDRESS (allowlisted street types) /
+  API_KEY (entropy gate). The anonymizer supports three
+  strategies (`redact` / `pseudonymize` / `allow`) with
+  per-type overrides; pseudonymize produces consistent fake
+  values within a document via blake3 hashing. The
+  `InteractionRecorder` anonymizes `system_prompt` +
+  `user_message` + `response` + every tool call's input +
+  output BEFORE persisting and flips a new `anonymized`
+  column; the `ExportEngine` re-anonymizes any row with
+  `anonymized = false` at export time AND writes the
+  redacted content back to `training.sqlite` so the
+  redaction is permanent. Per-agent opt-in lives at
+  `[agents.<name>.training]`: an agent can opt out entirely
+  (`enabled = false` drops records at the sink) or override
+  the global PII strategy (`pii_strategy = "..."`). Two new
+  coordinator capabilities — `training.pii_scan` (audit what
+  would be detected) and `training.anonymize_preview`
+  (preview what output looks like under a chosen strategy)
+  — plus two bridge endpoints
+  (`POST /v1/training/pii/{scan,preview}`) round out the
+  operator surface. The original "across the four memory
+  layers" framing is deferred: this session covers training
+  data only. Layer 1 Working Memory / Layer 2 Episodic /
+  Layer 3 Observations / Layer 4 Living Model passes
+  through their own data paths and are not currently routed
+  through this anonymizer — they're their own session of
+  work because their data shapes + retention policies +
+  consent boundaries don't match the training surface.
+  Tests added in this session: 32 PII unit (10 detector
+  positive-cases + their negative-case false-positive
+  guards, overlap dedup, sort, all three anonymizer
+  strategies, per-type overrides, config parsing) + 7
+  pipeline integration (record-time redact, disabled
+  pass-through, per-agent disable drops at sink boundary,
+  per-agent strategy override, export-time runs on
+  un-anonymized rows, export-time skips anonymized rows,
+  disabled export-time keeps raw text) + 3 bridge
+  mini-mesh scenarios (scan 200, scan empty-text 400,
+  preview 200). All quality gates green: cargo fmt --all,
+  cargo clippy --workspace --all-targets -- -D warnings,
+  cargo test --workspace (2168 runtime + 454 bridge + 238
+  CLI).
 - **Streaming-path tool calls** — the
   `ai.chat.stream` recorder writes `tool_calls: []` because
   the streaming variant doesn't run the planner / tool
