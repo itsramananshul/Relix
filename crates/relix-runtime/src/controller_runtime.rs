@@ -100,6 +100,13 @@ pub struct ControllerConfig {
     /// and existing deployments stay HTTP-egress-free.
     #[serde(default)]
     pub observability: Option<ObservabilitySection>,
+    /// `[metrics]` — RELIX-7.11 per-agent metrics + alert
+    /// thresholds + per-model price table. Absent / disabled
+    /// means the dispatch bridge runs without a metrics sink
+    /// and the existing `node.dispatch.stats` counters remain
+    /// the only data surface.
+    #[serde(default)]
+    pub metrics: Option<crate::metrics::MetricsConfig>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -284,6 +291,18 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // truth.
     let access_broker = build_access_broker(&cfg);
     bridge.set_access_broker(access_broker.clone());
+
+    // RELIX-7.11: build the metrics collector + spawn the drain
+    // + retention loops. Wires the sink onto the dispatch bridge
+    // so every dispatched call writes one row. When
+    // `[metrics] enabled = false` (or the section is absent),
+    // the bridge stays sink-less and the existing dispatch-stats
+    // counters remain the only data surface.
+    let metrics_bundle = build_metrics_bundle(&cfg, &data_dir)?;
+    if let Some(b) = metrics_bundle.as_ref() {
+        bridge.set_metrics_sink(b.sink.clone(), cfg.controller.name.clone());
+    }
+
     register_builtins(&mut bridge, &cfg, manifest.clone());
     // Router role short-circuits: it doesn't run the per-node-type
     // capability surface (memory/ai/tool/...) — it runs the four
@@ -318,6 +337,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             manifest.clone(),
             access_broker.clone(),
             &mut startup_wiring,
+            metrics_bundle.as_ref(),
         )?;
         None
     };
@@ -3311,6 +3331,101 @@ pub(crate) fn build_otel_config(
     Some(runtime_cfg)
 }
 
+/// RELIX-7.11 — boot-time bundle of every piece the metrics
+/// subsystem needs. Built once in `run()` so the bridge wiring,
+/// the coordinator capability registration, and the alert
+/// engine all see the same store + query handle + price table.
+pub(crate) struct MetricsBundle {
+    pub sink: std::sync::Arc<dyn crate::metrics::MetricsSink>,
+    pub query: crate::metrics::MetricsQuery,
+    pub alert_engine: crate::metrics::AlertEngine,
+    pub alert_interval_secs: u64,
+}
+
+/// Open the metrics store, spawn the drain + retention loops,
+/// and return everything the caller needs to wire the sink onto
+/// the dispatch bridge + register coordinator caps.
+///
+/// Returns `Ok(None)` when `[metrics] enabled = false` (or the
+/// section is absent) — the bridge boots without a sink and the
+/// dispatch path stays counter-only.
+pub(crate) fn build_metrics_bundle(
+    cfg: &ControllerConfig,
+    data_dir: &std::path::Path,
+) -> Result<Option<MetricsBundle>, Box<dyn std::error::Error>> {
+    let m_cfg = match cfg.metrics.clone() {
+        Some(c) if c.enabled => c,
+        _ => return Ok(None),
+    };
+    let db_path = m_cfg
+        .db_path
+        .clone()
+        .unwrap_or_else(|| crate::metrics::default_metrics_path(data_dir));
+    let store = crate::metrics::MetricsStore::open(&db_path)
+        .map_err(|e| format!("[metrics] open {}: {e}", db_path.display()))?;
+    let prices = m_cfg.prices.clone().into_table();
+    let (collector, handles) = crate::metrics::MetricsCollector::new(store.clone(), prices);
+    let _spawned = handles.spawn(crate::metrics::RetentionConfig {
+        retention_days: m_cfg.retention_days,
+        sweep_interval: std::time::Duration::from_secs(
+            m_cfg.retention_sweep_interval_secs.max(60),
+        ),
+    });
+    let query = crate::metrics::MetricsQuery::new(store.clone());
+    let alert_engine =
+        crate::metrics::AlertEngine::new(query.clone(), m_cfg.thresholds.clone());
+    tracing::info!(
+        db = %db_path.display(),
+        retention_days = m_cfg.retention_days,
+        alert_interval_secs = m_cfg.alert_interval_secs,
+        "metrics: collector + query + alert engine online"
+    );
+    Ok(Some(MetricsBundle {
+        sink: std::sync::Arc::new(collector),
+        query,
+        alert_engine,
+        alert_interval_secs: m_cfg.alert_interval_secs,
+    }))
+}
+
+/// Static descriptor list for the six metrics capabilities
+/// registered on the coordinator. Used for manifest entry +
+/// future dashboard rendering.
+pub(crate) fn metrics_capability_descriptors() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "metrics.agents",
+            "List every agent with metrics in the last N hours, with a per-agent summary. \
+             Args: optional JSON { hours }; default 24.",
+        ),
+        (
+            "metrics.agent_summary",
+            "Per-agent summary (invocations / success rate / P50/P95/P99 latency / total tokens / \
+             total cost / common error) over the last N hours. Args: JSON { agent, hours? }.",
+        ),
+        (
+            "metrics.method_breakdown",
+            "Per-method breakdown (same fields as agent_summary, grouped by method) for an agent. \
+             Args: JSON { agent, method?, hours? }.",
+        ),
+        (
+            "metrics.timeseries",
+            "Bucketed time-series for an agent. Args: JSON { agent, hours?, bucket_minutes? }; \
+             default hours=24, bucket_minutes=5.",
+        ),
+        (
+            "metrics.alerts_active",
+            "Snapshot of currently-active alerts with severity, triggered_at, agent, kind, \
+             threshold, and actual value.",
+        ),
+        (
+            "metrics.cost_report",
+            "Cost breakdown by (agent, method) over the last N hours. Sorted by total cost \
+             descending. Args: optional JSON { hours }.",
+        ),
+    ]
+}
+
 /// W2: build an `AgentAccessBroker` from the controller's
 /// `[[execution.agents]]` config. Absent / empty config
 /// produces an empty broker — `check()` returns Allow for
@@ -3417,6 +3532,7 @@ fn register_node_type_handlers(
     manifest: ManifestProvider,
     access_broker: std::sync::Arc<crate::nodes::execution::broker::AgentAccessBroker>,
     out: &mut Vec<StartupWiring>,
+    metrics: Option<&MetricsBundle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
 
@@ -4227,6 +4343,45 @@ fn register_node_type_handlers(
             chronicle = %workflow_chronicle_path.display(),
             "coordinator node: registered workflow.run / list / status / validate"
         );
+
+        // ── RELIX-7.11 metrics caps. Registered on the
+        // coordinator so bridge /v1/metrics/* proxies have a
+        // single peer to talk to. The metrics store + query
+        // engine + alert engine live in the metrics bundle the
+        // controller built at startup; absent bundle means
+        // metrics caps stay unregistered and the bridge returns
+        // 503 for the operator.
+        if let Some(b) = metrics.as_ref() {
+            let alert_engine = b.alert_engine.clone();
+            crate::metrics::coordinator::register(bridge, b.query.clone(), Some(alert_engine.clone()));
+            for (method, doc) in metrics_capability_descriptors() {
+                manifest.add_capability(
+                    CapabilityDescriptor::unary(*method)
+                        .with_description(*doc)
+                        .with_categories(["metrics".into(), "read".into()]),
+                );
+            }
+            // Spawn the alert-engine evaluation loop. Drops
+            // the JoinHandle — the loop runs for the lifetime
+            // of the controller.
+            let interval = std::time::Duration::from_secs(
+                b.alert_interval_secs.max(5),
+            );
+            let _alert_handle = alert_engine.spawn(
+                interval,
+                crate::metrics::alert::AlertSink::new(
+                    crate::metrics::alert::LoggingAlertSink,
+                ),
+            );
+            tracing::info!(
+                interval_secs = b.alert_interval_secs,
+                "coordinator node: registered metrics.* capabilities + spawned alert engine"
+            );
+        } else {
+            tracing::info!(
+                "coordinator: [metrics] disabled — metrics.* capabilities not registered"
+            );
+        }
 
         // ── Delegation — optional [coordinator.delegation] section.
         let delegation_cfg_value = cfg
