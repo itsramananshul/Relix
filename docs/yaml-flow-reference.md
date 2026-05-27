@@ -55,7 +55,92 @@ Fields:
 |---|---|---|
 | `name` | yes | SOL identifier (letters / digits / underscore; must start with a letter or underscore). |
 | `type` | yes | One of: `int`, `str`, `bool`, `float`, `list`, `map`. |
-| `value` | yes | Initial value as a string. For `str` it is emitted as a quoted SOL string literal (so `{{name}}` interpolation works). For other scalar types the string is emitted verbatim — write `5` for an int, `true` for a bool, `["a", "b"]` for a list. |
+| `value` | yes | Initial value. Shape depends on the declared type — see below. |
+
+#### Scalar values (`int` / `str` / `bool` / `float`)
+
+For scalar types, `value` is a scalar (string, number, or
+bool). The YAML form is emitted as a SOL literal of the
+matching shape:
+
+```yaml
+- let: { name: greeting, type: str, value: "hello" }
+- let: { name: count, type: int, value: 5 }
+- let: { name: ok, type: bool, value: true }
+```
+
+A scalar value with a shape that doesn't match the declared
+type is a clear schema error — passing a sequence for
+`type: str` reports:
+
+```
+at line 4, column 14 (step 1): let.value is a YAML sequence
+but let.type is `str` — use `type: list` for sequence values
+```
+
+#### Native list and map literals
+
+For `type: list`, `value` can be a native YAML sequence:
+
+```yaml
+- let:
+    name: items
+    type: list
+    value:
+      - alpha
+      - beta
+      - gamma
+```
+
+Nested lists work too:
+
+```yaml
+- let:
+    name: pairs
+    type: list
+    value:
+      - - a
+        - b
+      - - c
+        - d
+```
+
+For `type: map`, `value` can be a native YAML mapping:
+
+```yaml
+- let:
+    name: config
+    type: map
+    value:
+      model: gpt-4o
+      temp: "0.2"
+```
+
+Nested maps work too:
+
+```yaml
+- let:
+    name: tree
+    type: map
+    value:
+      outer:
+        inner_k: v
+      other:
+        another: "1"
+```
+
+The lowerer recursively translates the YAML structure into
+SOL literal syntax — the example above emits
+`tree = {"outer": {"inner_k": "v"}, "other": {"another": "1"}};`.
+String map keys are required (YAML allows non-string keys
+via implicit typing; SOL's map literal only accepts string
+keys).
+
+A legacy escape hatch is preserved for backwards
+compatibility: a `string` value for `type: list` / `type: map`
+is treated as a literal SOL list / map and emitted verbatim
+(e.g. `value: '["a", "b", "c"]'`). Operators authoring new
+flows should use the native YAML syntax instead.
 
 Multiple `let` steps with the same name and same type are
 allowed — they read as overwriting the variable.
@@ -175,6 +260,13 @@ referencing it after the loop is not supported.
 
 ### `try` — error handling
 
+The `catch` field accepts either a **single catch clause**
+(shorthand for one-handler flows) or a **sequence of clauses**
+(the multi-catch form). The lowered SOL emits one
+`} catch <kind> { ... }` block per clause, in source order.
+
+#### Single-catch shorthand
+
 ```yaml
 - try:
     steps:
@@ -192,12 +284,49 @@ referencing it after the loop is not supported.
             value: "fallback"
 ```
 
+#### Multi-catch with kind dispatch
+
+```yaml
+- try:
+    steps:
+      - call:
+          peer: ai
+          method: ai.chat
+          arg: "{{session}}|{{message}}|"
+          assign: reply
+    catch:
+      - kind: timeout
+        steps:
+          - let:
+              name: reply
+              type: str
+              value: "timed out, try again"
+      - kind: policy_denied
+        steps:
+          - let:
+              name: reply
+              type: str
+              value: "not allowed"
+      - kind: any
+        steps:
+          - let:
+              name: reply
+              type: str
+              value: "error"
+```
+
+**First matching clause wins.** The classified kind of the
+failure is compared against each `catch.kind` in source
+order. `any` matches every failure unconditionally — put it
+last (as a catch-all fallback) or omit it (so unmatched
+failures propagate to an outer `try` or halt the VM).
+
 Fields:
 
 | Field | Required | Notes |
 |---|---|---|
 | `steps` | yes | Body to wrap. |
-| `catch` | yes | Catch clause (`kind` + `steps`). At least one catch is required. |
+| `catch` | yes | A single mapping (single-catch shorthand) OR a sequence of mappings (multi-catch). At least one clause is required. |
 
 `catch.kind` values match SOL exactly:
 
@@ -212,10 +341,6 @@ Fields:
 Failures that route to a `try` handler: `call` / `stream`
 failures, `list_get_list` / `map_get_map` runtime errors. Other
 SOL errors (stack underflow, etc.) are bugs and panic the host.
-
-The YAML format currently supports a single `catch` per `try`.
-Flows that need multiple kinds either dispatch inside the catch
-on `{{error_kind}}` (via a string comparison) or drop to SOL.
 
 ## Variable scoping
 
@@ -273,11 +398,6 @@ limitations are deliberate:
   branch.
 - **No first-class functions**. Top-level helper functions
   cannot be declared in YAML; if you need them, use SOL.
-- **Single catch per try**. Multi-catch flows drop to SOL.
-- **List / map literals are SOL syntax**. A `let` with
-  `type: list` takes its `value` as `'["a", "b", "c"]'`
-  (SOL list syntax embedded in the YAML string). Native YAML
-  sequences as `value` are not yet supported.
 - **No iteration cap**. Unlike Sflow, SOL has no built-in
   bound on counted or while loops; a runaway `loop` with a
   large `times` runs until the host kills it.
@@ -287,17 +407,181 @@ runtime a pure SOL VM.
 
 ## Errors
 
-Three categories, each surfaced with an actionable message:
+Four categories, each surfaced with an actionable message
+and the exact source position of the offending node:
 
 | Error | Trigger | Locator |
 |---|---|---|
-| `YamlFlowError::Parse` | YAML itself is malformed (unbalanced bracket, bad indentation, missing colon). | Line and column from `serde_yaml`. |
-| `YamlFlowError::Semantic` | YAML parses but violates the schema — unknown step name, missing required field, conflicting variable types, `catch.kind` outside the recognised set, `let.type` outside the supported scalar set, etc. | 1-based step path (`step 2 → catch.step 1`). |
-| `YamlFlowError::Lower` | The YAML frontend emitted SOL the compiler rejected. This is a frontend bug; the error includes the SOL error AND the lowered source so the issue can be reproduced from the failure. | n/a — this is for developers, not operators. |
+| `YamlFlowError::Parse` | YAML itself is malformed (unbalanced bracket, bad indentation, missing colon). | Line and column from `saphyr`. |
+| `YamlFlowError::Semantic` | YAML parses but violates the schema — unknown step name, missing required field, conflicting variable types, `catch.kind` outside the recognised set, `let.type` outside the supported scalar set, value shape mismatch, etc. | Real line + column of the offending node, from the saphyr-annotated tree. **Nested errors report the nested node's line, not the outer step.** |
+| `YamlFlowError::Lower` | The YAML frontend emitted SOL the compiler rejected. This is a frontend bug; the error includes the SOL error, the lowered source, AND the path of the last successfully-lowered step so the bug can be reproduced. | Step path of the last lowered step. |
+| `YamlFlowError::Io` | File read failure (only via `compile_path`). Carries the file path the bridge / CLI tried to open. | n/a (file-level). |
+
+A typical Semantic error message:
+
+```
+at line 14, column 9 (step 2 → catch.step 1): missing required field `value`
+```
+
+Line and column are 1-based and point at the offending YAML
+node — for a nested step inside `try → catch → steps`, the
+line is the line of that nested step's dash, not the outer
+`try`'s line.
 
 `relix-cli flow-run my-flow.yml` and the bridge's
-`POST /v1/sol/validate` both surface these errors with the
+`POST /v1/yaml/validate` both surface these errors with the
 locator on the first line of the message.
+
+## The `POST /v1/yaml/validate` endpoint
+
+The bridge exposes a parse-only validator for YAML flows.
+The dashboard editor calls it to surface inline errors
+before a flow is deployed.
+
+Request:
+
+```http
+POST /v1/yaml/validate
+Content-Type: application/json
+
+{ "source": "<yaml flow text>" }
+```
+
+Successful response (HTTP 200):
+
+```json
+{ "status": "ok" }
+```
+
+Error response (HTTP 400):
+
+```json
+{
+  "status": "error",
+  "message": "at line 14, column 9 (step 2 → catch.step 1): missing required field `value`",
+  "line": 14,
+  "column": 9
+}
+```
+
+`message` is the full `YamlFlowError` Display rendering;
+`line` / `column` come from the underlying error variant.
+Both fields are omitted when zero, so a `Lower` or `Io`
+error returns `status: error` with `message` only.
+
+Curl example:
+
+```sh
+curl -s -X POST http://127.0.0.1:9100/v1/yaml/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"steps:\n  - let:\n      name: x\n      type: str\n"}' \
+| jq
+# {
+#   "status": "error",
+#   "message": "at line 2, column 5 (step 1): missing required field `value`",
+#   "line": 2,
+#   "column": 5
+# }
+```
+
+The dashboard validator panel auto-routes between
+`/v1/sol/validate` and `/v1/yaml/validate` based on the
+language dropdown — and, as a convenience, when the editor
+content starts with `steps:` it switches to the YAML route
+even if the dropdown is left on the default.
+
+## The `relix flow yaml` CLI scaffold
+
+```
+relix-cli flow yaml [--template <name>]
+```
+
+Prints a minimal working YAML flow template to stdout.
+Pipe into a file and edit. Four templates ship:
+
+### `chat` (default)
+
+The simplest case — a single `remote_call` returning the
+reply. Used when `--template` is omitted.
+
+```
+$ relix-cli flow yaml > my.yml
+$ head -20 my.yml
+# Minimal Relix YAML flow — chat scaffold.
+#
+# Pipe into a file: relix-cli flow yaml > my.yml
+# Run:               relix-cli flow-run --flow my.yml ...
+# Full reference:    docs/yaml-flow-reference.md
+
+steps:
+  - let:
+      name: session
+      type: str
+      value: "demo-session"
+  - let:
+      name: message
+      type: str
+      value: "hello"
+
+  - call:
+      peer: ai
+      method: ai.chat
+      arg: "{{session}}|{{message}}|"
+      assign: reply
+
+  - result: "{{reply}}"
+```
+
+### `--template stream`
+
+Same shape as `chat` but uses the `stream:` step so the
+host's chunk observer (e.g. the bridge's SSE response)
+gets per-chunk callbacks while the VM is still running.
+
+### `--template try`
+
+Wraps the call in a multi-catch with `timeout` /
+`policy_denied` / `any` clauses so the error-handling
+pattern is right there to edit:
+
+```yaml
+  - try:
+      steps:
+        - call:
+            peer: ai
+            method: ai.chat
+            arg: "{{session}}|{{message}}|"
+            assign: reply
+      catch:
+        - kind: timeout
+          steps:
+            - let: { name: reply, type: str, value: "timed out, try again" }
+        - kind: policy_denied
+          steps:
+            - let: { name: reply, type: str, value: "not allowed" }
+        - kind: any
+          steps:
+            - let: { name: reply, type: str, value: "error" }
+```
+
+### `--template loop`
+
+Counted loop calling a peer N times:
+
+```yaml
+  - loop:
+      times: 3
+      steps:
+        - call:
+            peer: ai
+            method: ai.chat
+            arg: "demo|tick|"
+            assign: reply
+```
+
+All four templates compile through `compile_source` without
+error, so a developer copying any of them sees a working
+flow on the first run.
 
 ## Worked example — chat with retry
 
