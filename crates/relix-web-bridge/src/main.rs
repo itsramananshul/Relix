@@ -100,6 +100,9 @@ mod dashboard;
 mod delegate;
 mod discord;
 mod dispatch_stats;
+mod email;
+#[cfg(test)]
+mod email_mini_mesh_test;
 mod export;
 mod flow;
 mod fs_audit;
@@ -563,6 +566,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/discord/messages/recent", get(discord::messages_recent))
         .route("/v1/slack/status", get(slack::status))
         .route("/v1/slack/messages/recent", get(slack::messages_recent))
+        // RELIX-7.7: email-channel surface. Send + status are
+        // mutating; the bridge mints a JSON envelope and ships
+        // it to the configured email peer (default alias
+        // `email`).
+        .route("/v1/email/send", post(email::send))
+        .route("/v1/email/send_template", post(email::send_template))
+        .route("/v1/email/status", get(email::status))
         .route("/v1/plugins", get(plugins::list))
         .route("/v1/plugins/:plugin_id", get(plugins::status))
         .route("/v1/plugins/:plugin_id/reload", post(plugins::reload))
