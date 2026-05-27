@@ -1404,28 +1404,57 @@ four shapes the major fine-tuning platforms expect.
   (preview what output looks like under a chosen strategy)
   — plus two bridge endpoints
   (`POST /v1/training/pii/{scan,preview}`) round out the
-  operator surface. The original "across the four memory
-  layers" framing is deferred: this session covers training
-  data only. Layer 1 Working Memory / Layer 2 Episodic /
-  Layer 3 Observations / Layer 4 Living Model passes
-  through their own data paths and are not currently routed
-  through this anonymizer — they're their own session of
-  work because their data shapes + retention policies +
-  consent boundaries don't match the training surface.
-  Tests added in this session: 32 PII unit (10 detector
-  positive-cases + their negative-case false-positive
-  guards, overlap dedup, sort, all three anonymizer
-  strategies, per-type overrides, config parsing) + 7
-  pipeline integration (record-time redact, disabled
-  pass-through, per-agent disable drops at sink boundary,
-  per-agent strategy override, export-time runs on
-  un-anonymized rows, export-time skips anonymized rows,
-  disabled export-time keeps raw text) + 3 bridge
-  mini-mesh scenarios (scan 200, scan empty-text 400,
-  preview 200). All quality gates green: cargo fmt --all,
-  cargo clippy --workspace --all-targets -- -D warnings,
-  cargo test --workspace (2168 runtime + 454 bridge + 238
-  CLI).
+  operator surface for training data.
+- **PII anonymization across all four memory layers**
+  `[DONE — commits 049f43b + 982e75d]`. Extends the same
+  PiiDetector + PiiAnonymizer to the four-layer
+  `memory_records` pipeline + the underlying turns table.
+  New `[memory.pii]` config block (reuses the same
+  `PiiConfig` schema as `[training.pii]`). Enforcement
+  points:
+    - **Layer 1 Raw** (`memory.write_turn`): body is
+      scrubbed BEFORE the turns table write AND before the
+      layered store insert. Both `memory.recent_for_session`
+      and the AI handler's auto-fetched history see only
+      the redacted form. Every downstream layer derives
+      from this anonymized starting point.
+    - **Layer 2 Semantic** (`EmbeddingPipeline` defensive
+      pre-embed): every pending record's text is anonymized
+      again BEFORE handed to `ai_embed_fn` AND the
+      redacted text is written back via the new
+      `LayeredMemoryStore::update_text` helper. The Qdrant
+      payload's `text` field is always anonymized.
+    - **Layer 3 Observation** + **Layer 4 Model**
+      (`LayerPromoter`): each LLM-summarised output text is
+      anonymized BEFORE insert, so even an LLM that
+      hallucinates a value can't smuggle PII into
+      Observation / Model rows.
+  Two new coordinator capabilities
+  (`memory.pii_scan` + `memory.anonymize_preview`) +
+  two bridge endpoints
+  (`POST /v1/memory/pii/{scan,preview}`) mirror the
+  training surface. The caps are registered
+  unconditionally even when `[memory.pii]` is disabled, so
+  operators can audit / preview before flipping it on.
+  Defaults to `enabled = false` so existing deployments
+  see byte-identical behaviour until they opt in. RAG
+  trade-off documented: anonymization at storage time
+  reduces recall on PII-keyed queries — operators choosing
+  to enable `[memory.pii]` make that explicit privacy
+  trade.
+  Tests added this commit: 5 memory-layer integration
+  cases (turns + Layer 1 redact on write_turn, disabled
+  pass-through, pii_scan handler returns spans, pii_scan
+  rejects empty text, anonymize_preview explicit strategy
+  + unknown-strategy reject) + 2 bridge tests (one
+  `bad_request_returns_400` + one mini-mesh integration
+  test with four scenarios). All quality gates green:
+  cargo fmt --all, cargo clippy --workspace --all-targets
+  -- -D warnings, cargo test --workspace (2174 runtime +
+  456 bridge + 238 CLI). The `[memory.pii]` config block
+  AND the training `[training.pii]` block can be configured
+  independently — operators who need different strategies
+  per data domain do that with two TOML blocks.
 - **Streaming-path tool calls** — the
   `ai.chat.stream` recorder writes `tool_calls: []` because
   the streaming variant doesn't run the planner / tool
