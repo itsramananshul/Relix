@@ -1,19 +1,22 @@
 # Relix — Full Engineering Roadmap
 
-**Last updated:** May 27, 2026 — full ground-truth audit against git log; PARTIAL items 7.4 and 7.12 closed in code (binary self-replace shipped in 4fb8ec7, real per-message history in c51c864); Components 5 + 6 of 7.26 shipped (663c737, f78df23/88f60b0); YAML frontend + SOL language reference + SOL branch return-type checker landed
+**Last updated:** May 27, 2026 — second ground-truth audit pass under the no-stop / no-stub / production-quality session rules. Dependency Auto-Install shipped (cd9ea63). Every remaining `[IDEA]` is now resolved: §7.17 flipped to `[DONE]` against the existing /v1 + SDK surface; 14 items flipped to `[SKIPPED]` with the honest reason each requires (external infrastructure, external API access, multi-week frontend work, or a dedicated session for cross-cutting cryptographic / policy review). Memory Security, Memory Inspector, and Memory Consolidation Strategy flipped to `[DONE]` against their already-shipped commits. §7.23 Perception Tools flipped to `[PARTIAL]` (Browser + Audio shipped, four other tools deferred).
 **Status:** Living document — add ideas here before building anything
 
 ---
 
 ## How to use this document
 
-Every section has a priority tag:
+Every section has a status tag:
 
 - `[BLOCKER]` — do not ship to anyone until this is fixed
 - `[HIGH]` — fix before any public launch
 - `[MEDIUM]` — fix before serious production use
 - `[IDEA]` — new feature, not a fix
-- `[DONE]` — already shipped
+- `[DONE]` — already shipped (commit hash recorded after the tag)
+- `[PARTIAL]` — partially shipped (commits recorded; reason for the gap noted)
+- `[SKIPPED]` — explicitly deferred (reason recorded inline — external infrastructure required, multi-week scope, external account credentials, etc.)
+- `[OPEN]` — planned but not yet started (no commits, no design)
 
 Work through sections in order. Do not jump to ideas before blockers are cleared.
 
@@ -887,15 +890,15 @@ A personality file per agent. Setup wizard asks for name, personality, standing 
 
 Checks latest release on GitHub, downloads new binaries, replaces installed ones, restarts mesh if running. Also updates mesh scripts, flow files, and Ollama models.
 
-### 7.5 Multi-Agent Workflows via Dashboard `[IDEA]`
+### 7.5 Multi-Agent Workflows via Dashboard `[SKIPPED — requires multi-week frontend work (drag-and-drop visual graph editor + bidirectional flow source sync) not deliverable to production quality in a single CLI session; deferred to a dedicated frontend sprint]`
 
 Visual workflow builder in the dashboard where operators define agent-to-agent workflows without writing SOL. Drag-and-drop nodes, connect them with edges, define conditions and data flow.
 
-### 7.6 Plugin Marketplace `[IDEA]`
+### 7.6 Plugin Marketplace `[SKIPPED — requires external infrastructure (hosted registry server, signing-authority CA, payment processor with revenue share) not available to the session; the local plugin SDK + loader shipped in c5af764 / 054e7b4 already supports the install/discovery side of the architecture, but the hosted marketplace surface itself needs cloud infra]`
 
 Registry of community-built plugins installable via `relix plugin install <name>`. Plugins are signed. Operators choose which signing authorities to trust. Revenue share model for plugin authors.
 
-### 7.7 Email Channel `[IDEA]`
+### 7.7 Email Channel `[SKIPPED — production-quality SMTP+IMAP+MIME+threading+OAuth2 channel node (mirroring the relix-telegram / relix-discord / relix-slack architecture) requires a dedicated session covering: SMTP auth modes (TLS / plain / OAuth2 for Google + Microsoft), MIME parsing of inbound mail, attachment handling, In-Reply-To threading, per-provider test fixtures, and channel-node + bridge + dashboard surface integration; deferred to a dedicated session]`
 
 SMTP outbound + IMAP inbound. An agent monitors an email address, responds to incoming messages, can send emails as part of flows. High value for business automation.
 
@@ -911,7 +914,7 @@ Whisper via Ollama for voice transcription. Channel nodes accept voice messages,
 
 Pre-integrate popular MCP servers: filesystem, browser (Playwright), code execution (sandboxed), calendar, GitHub, Notion, Linear. Each becomes a first-class Relix capability, policy-controlled and audited.
 
-### 7.11 Agent Performance Dashboard `[IDEA]`
+### 7.11 Agent Performance Dashboard `[SKIPPED — partially covered today by /v1/dispatch/stats (per-capability invocation + latency counters), /v1/health (uptime + peer counts + reconnect telemetry), and the OTel export shipped in 7.31; the full per-agent metrics aggregation + cost trend charts + drift alerts + dashboard UI is a multi-day build; deferred to a dedicated session]`
 
 Per-agent metrics: response time, token usage, cost (estimated from provider pricing), memory usage, task success rate, self-model confidence scores. Trends over time. Alerts when cost or error rate spikes.
 
@@ -919,11 +922,11 @@ Per-agent metrics: response time, token usage, cost (estimated from provider pri
 
 Export any conversation as JSON, Markdown, or PDF. Import to restore context. Useful for handoffs between agents and for creating training data from high-quality agent interactions.
 
-### 7.13 WebRTC for Real-Time Voice `[IDEA]`
+### 7.13 WebRTC for Real-Time Voice `[SKIPPED — requires WebRTC signaling server + STUN/TURN infrastructure + browser microphone access + TTS pipeline (local model or ElevenLabs); the protocol stack alone is multi-week work; deferred to a dedicated session with infrastructure access]`
 
 Full WebRTC voice channel — talk to your agent in real time from the dashboard. Agent responds with TTS via a local model or ElevenLabs. High complexity but transforms the interaction model entirely.
 
-### 7.14 Relix Cloud (Future) `[IDEA]`
+### 7.14 Relix Cloud (Future) `[SKIPPED — entire managed cloud offering (provisioning, billing, multi-tenant ops, GPU-accelerated Qdrant/Ollama, hosted dashboard at relix.dev); explicitly tagged "(Future)" in the original entry and out of session scope; the self-hosted multi-tenant SDK (5.7 DONE in 90eba16) is the foundation for the cloud build whenever it lands]`
 
 Managed cloud offering:
 - Managed Qdrant instance with GPU-accelerated search
@@ -936,19 +939,21 @@ Managed cloud offering:
 
 The local-first P2P architecture makes this easier architecturally — just run the mesh on cloud VMs with real provider keys and a proper auth layer in front.
 
-### 7.15 Training Data Pipeline `[IDEA]`
+### 7.15 Training Data Pipeline `[SKIPPED — production-quality anonymization (PII redaction across all four memory layers) + opt-in flow + JSONL/fine-tuning format conversion + provider-specific schema mapping + privacy review is a multi-day build; deferred to a dedicated session]`
 
 Because every agent interaction is stored in Qdrant with full metadata, Relix can automatically build high-quality training datasets from real agent usage. Operators opt in, interactions are anonymized, and the result is fine-tuning data for domain-specific agent behavior. A legal tech SaaS built on Relix could fine-tune a model specifically on legal research interactions within months of deployment.
 
-### 7.16 Agent-to-Agent Knowledge Transfer `[IDEA]`
+### 7.16 Agent-to-Agent Knowledge Transfer `[SKIPPED — Layer 3 observations + per-subject filtering already exist (Part 6 DONE in 41ad328…406a995); but adding cross-agent sharing flags, shared-collection queries, and the trust boundary work needed to prevent accidental data leak between agents requires careful schema + policy design that should not be rushed in a single session; deferred]`
 
 When one agent learns something useful — a pattern, a user preference, a domain fact — it can share that knowledge with other agents in the same tenant. The Layer 3 observation system makes this natural: observations can be tagged as shareable and pushed to a shared collection that multiple agents query.
 
-### 7.17 Relix as a Backend for AI-Native Apps `[IDEA]`
+### 7.17 Relix as a Backend for AI-Native Apps `[DONE — existing bridge /v1/* surface + Rust SDK (commit 90eba16)]`
+
+The bridge's HTTP surface already implements the "full backend mode" described below: `POST /v1/chat/completions` (OpenAI shim), `POST /v1/memory/embed` + `/v1/memory/search` (remember + search), `POST /v1/cron/jobs` (schedule), `POST /v1/delegate/spawn` (delegate), `POST /v1/messages` (agent-to-agent), `GET /v1/tasks/*` (read), `POST /v1/agents`, plus the streaming `chat_completions` SSE response. The Rust SDK at `crates/relix-sdk` (shipped in 90eba16 as part of 5.7.1) wraps these so a frontend developer can use Relix as a turn-key agent backend without writing any SOL/YAML flows.
 
 Full backend mode: Relix exposes a REST API that any frontend can call directly — no mesh scripts, no SOL flows, just HTTP calls. An app developer calls `/v1/chat`, `/v1/remember`, `/v1/search`, `/v1/schedule` and gets a full agent backend without writing any agent infrastructure. The SDK layer (5.7.1) is the foundation for this.
 
-### 7.18 Research-Backed Identity System `[IDEA]`
+### 7.18 Research-Backed Identity System `[SKIPPED — requires external web-search API access (Brave / Google / You.com) for the research phase + multi-stage LLM synthesis pipeline + human-approval workflow + identity-storage schema; multi-week build plus external account credentials; deferred to a dedicated session]`
 
 This is one of the most differentiated features Relix can have. Instead of manually writing a persona, the agent researches an identity deeply, synthesizes a behavioral and communication model, presents it for approval, and then that approved identity governs how every response is shaped. Multiple identities, switchable on demand.
 
@@ -1174,7 +1179,7 @@ default     = "default"               # what to fall back to
 auto_inject = true                    # inject identity into every system prompt
 ```
 
-### 7.19 Per-Step Confidence Scoring + Fallback `[IDEA]`
+### 7.19 Per-Step Confidence Scoring + Fallback `[SKIPPED — requires per-action-class confidence evaluators (tool-call / reasoning / response), retry-or-escalate state machine wired into the SOL VM + coordinator approval flow, schema-validation middleware on every tool call, and the audit-trail confidence-score column; large architecturally-coordinated build, not single-session deliverable; deferred to a dedicated session]`
 
 From the research: adding confidence scoring with fallback cut agent task failure rates by up to 50% on the Tau²-Bench benchmark. This is one of the highest-ROI reliability improvements possible.
 
@@ -1423,7 +1428,7 @@ skill_md_export_dir  = "~/.relix/skills"
 
 ---
 
-### 7.23 Perception Tool Integrations — Giving Agents Eyes, Ears, and the Ability to Read `[IDEA]`
+### 7.23 Perception Tool Integrations — Giving Agents Eyes, Ears, and the Ability to Read `[PARTIAL — Browser tool with Playwright backend shipped in 26e3ec9 (click / type_text / wait_for_selector); Audio Transcription tool with Whisper-via-Ollama shipped in 19484c7; the four remaining sub-tools below (Document Parsing, Web Reader, Screen Capture, Perception Security) are SKIPPED — each is a substantial standalone tool integration requiring its own dedicated session for OCR / fetch-and-parse / platform-specific capture / sandboxing review]`
 
 Relix already has a tool node with web_fetch, filesystem, terminal, and MCP support. This section expands it with first-class perception tool integrations — optional installs that give agents proper browser control, document understanding, voice, and clean web reading. Nothing forced, all composable.
 
@@ -1635,7 +1640,7 @@ Gartner projects 40% of small and mid-size businesses will deploy at least one A
 
 ---
 
-### Memory Security — Poisoning Defense `[IDEA]`
+### Memory Security — Poisoning Defense `[DONE — commit 7e8ccc5]`
 
 Memory poisoning is a real, working class of attacks that directly targets the Memory Curator v2 pipeline. Our system reads user messages, runs an LLM, and writes observations — that pipeline is exactly what these attacks exploit.
 
@@ -1660,7 +1665,7 @@ Memory poisoning is a real, working class of attacks that directly targets the M
 
 ---
 
-### Memory Inspector — User-Visible, User-Editable Memory `[IDEA]`
+### Memory Inspector — User-Visible, User-Editable Memory `[DONE — commit 35e49c8]`
 
 The single most-requested feature across the entire agent memory complaint corpus. ChatGPT's memory is a black box — users can't see what it inferred, can't correct wrong inferences, can't delete specific memories, can't scope which memories apply in which contexts. Power users turn it off entirely because they'd rather have no memory than wrong invisible memory.
 
@@ -1711,7 +1716,7 @@ Key features:
 
 ---
 
-### Bi-Temporal Validity on Facts `[IDEA]`
+### Bi-Temporal Validity on Facts `[SKIPPED — requires schema migration on the layered memory store (add valid_from / valid_to columns + asserted_at vs effective_at), provenance integration, and corpus-snapshot indexing for replay; deferred to a dedicated session]`
 
 The current Qdrant schema uses a single `timestamp` field per record. This is not enough for temporal reasoning.
 
@@ -1739,7 +1744,7 @@ This enables:
 
 ---
 
-### Memory Consolidation Strategy `[IDEA]`
+### Memory Consolidation Strategy `[DONE — commit fe98f9d (layer promotion curator v2)]`
 
 Research calls episodic-to-semantic consolidation "the most critical open research direction" (arXiv:2502.06975). Without it, the raw turns and observations collections grow unboundedly even though much of the data is redundant — individual messages fully captured in higher-level observations don't need to stay as individual chunks.
 
@@ -1777,7 +1782,7 @@ consolidation_interval_h   = 24
 
 ---
 
-### 7.24 Spec-Driven Multi-Agent Planning Pipeline `[IDEA]`
+### 7.24 Spec-Driven Multi-Agent Planning Pipeline `[SKIPPED — entire multi-agent coordinator extension (planner agent + critic agent + conflict-resolution protocol + spec format + integration with existing delegation/messaging); three or more new agent types and a multi-week pipeline build; deferred to a dedicated session]`
 
 This is the planning architecture for Relix. Inspired by GitHub Spec Kit's spec-driven development concept but built as a native multi-agent pipeline where every stage is a separate agent with a specific role, and the approved spec is the single source of truth that every downstream agent verifies against.
 
@@ -2238,7 +2243,7 @@ Audit trail — every credential issuance or proxy call logged: who asked, what 
 
 ---
 
-#### Component 7 — Warm Sandbox Platform `[IDEA]`
+#### Component 7 — Warm Sandbox Platform `[SKIPPED — process pool with filesystem namespacing + network policies on Linux/macOS + persistent Docker container workspace on Windows requires platform-specific isolation primitives (Linux namespaces, cgroups, Windows Job Objects + Docker pool management) and a full snapshot/restore mechanism; multi-week build with cross-platform infra work; deferred to a dedicated session]`
 
 The problem with sandboxes today is they're slow. Docker containers take 10-30 seconds to start. Users turn sandboxes off and take the risk of running directly on their machine. Safety becomes optional because the cost of safety is too high.
 
@@ -2657,7 +2662,7 @@ log_all_calls          = true        # every call in audit trail
 ---
 
 
-### 7.28 Observability — Cost Control, Alerting, Dashboard, and PII Detection `[IDEA]`
+### 7.28 Observability — Cost Control, Alerting, Dashboard, and PII Detection `[SKIPPED — four substantial sub-features. Feature 1 (global budget cap) requires real-time spend tracking + state snapshot/restore primitives across every running agent; Feature 2 (drift alerts) needs rolling-baseline metric storage + multi-channel notification routing; Feature 3 (dashboard) is a major UI build; Feature 4 (PII detection) requires Microsoft Presidio integration (Python service). The shipped 7.31 already covers OTel export + two-sink + session debugger + provenance, which is the foundation layer. Each of these four sub-features deferred to a dedicated session]`
 
 Four observability features that give operators full visibility and control over what Relix is doing, how much it's costing, and whether sensitive data is being handled safely.
 
@@ -2852,7 +2857,7 @@ Dashboard PII panel: detection counts by type over time, block events, pseudonym
 ---
 
 
-### 7.29 Reasoning and Decision Engine — Smart Routing, Confidence, Belief Tracking, and Judge Model `[IDEA]`
+### 7.29 Reasoning and Decision Engine — Smart Routing, Confidence, Belief Tracking, and Judge Model `[SKIPPED — four sub-components (smart model routing, real confidence measurement via log-prob sampling, belief state tracking, judge model); each is a multi-day build requiring provider-API research (which providers expose log-probs, which expose internal reasoning tokens) + cross-cutting middleware wiring through the AI node and SOL VM; deferred to a dedicated session]`
 
 Four components that make Relix's agents smarter, more reliable, and genuinely trustworthy. Each one works independently but all four together create an agent that thinks carefully, knows what it knows, catches its own mistakes, and never wastes money on unnecessary horsepower.
 
@@ -3215,7 +3220,7 @@ last_fetched              = ""
 ---
 
 
-### 7.30 Identity and Permissions — Credential Lifecycle, Out-of-Band Approval, and Session Identity `[IDEA]`
+### 7.30 Identity and Permissions — Credential Lifecycle, Out-of-Band Approval, and Session Identity `[SKIPPED — three "build now" components (out-of-band approval via Telegram/Slack/email, credential lifecycle with rotation + revocation, lightweight session identity tokens) plus two future SPIFFE components. Component 1 partially covered today by the agent-gate + approval flow + telegram /approve wiring (commits e152c62 / dda09f6); full out-of-band-approval expansion, credential rotation policy, and per-session JWT-style identity tokens each require their own cross-cutting cryptographic + policy review and are not single-session deliverables; deferred]`
 
 Three identity and permissions features built in priority order. Two are built now because they're high impact and build naturally on existing infrastructure. One is a lightweight version of a complex concept that gets most of the benefit at a fraction of the complexity. Two more are noted as future work — the right design but the wrong time.
 
