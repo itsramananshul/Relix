@@ -53,6 +53,7 @@ pub async fn run(
         capability_cache: None,
         mesh_client: None,
         trace_id: None,
+        chunk_observer: None,
     };
     let result = FlowRunner::new(opts).run().await?;
 

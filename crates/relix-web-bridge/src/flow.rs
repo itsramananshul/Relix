@@ -125,6 +125,7 @@ pub async fn execute_chat_flow(
         capability_cache: Some(state.manifest_cache.clone()),
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
+        chunk_observer: None,
     };
 
     finalize_flow_run(
@@ -334,6 +335,7 @@ pub async fn execute_chat_with_tool_flow(
         capability_cache: Some(state.manifest_cache.clone()),
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
+        chunk_observer: None,
     };
 
     finalize_flow_run(
@@ -429,6 +431,90 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// RELIX-2 step 5: streaming variant of [`execute_chat_flow`].
+/// Drives the same SOL flow pipeline but the rendered template
+/// MUST use `remote_call_stream("ai", "ai.chat.stream", ...)`
+/// so the flow opens a streaming substream against the AI
+/// node. `on_chunk` fires for each chunk the AI provider
+/// streams; the bridge's HTTP handler wires this to an SSE
+/// channel that ships tokens to the client as they arrive.
+///
+/// The final returned `FlowOutcome` carries the concatenated
+/// body (same shape as the unary path) so downstream
+/// observability (memory recording, task ledger update,
+/// chronicle event for chat.assistant_turn) sees the complete
+/// turn — the streaming benefit is purely in WHEN the client
+/// observes the tokens, not in WHETHER the final body is
+/// captured.
+pub async fn execute_chat_flow_streaming(
+    state: &AppState,
+    session_id: &str,
+    message: &str,
+    streaming_template: &str,
+    on_chunk: relix_runtime::flow_runner::ChunkObserver,
+) -> Result<FlowOutcome, FlowExecError> {
+    validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
+
+    let task_id = create_task_fail_soft(
+        state.task_recorder.as_ref(),
+        "chat",
+        "flows/chat_template_streaming.sol",
+        &chat_params_json(session_id, message),
+    )
+    .await;
+    let trace_id = TraceId::new();
+    let trace_hex = trace_id.to_string();
+    if let (Some(rec), Some(tid)) = (state.task_recorder.as_ref(), task_id.as_ref()) {
+        rec.event(tid, "flow.started", "flows/chat_template_streaming.sol")
+            .await;
+        rec.start_running(tid, &trace_hex).await;
+        rec.event(tid, "capability.invoked", "method=ai.chat.stream peer=ai")
+            .await;
+    }
+    record_chat_turn(
+        state.task_recorder.as_ref(),
+        task_id.as_ref(),
+        "chat.user_turn",
+        session_id,
+        "user",
+        message,
+    )
+    .await;
+
+    let rendered = streaming_template
+        .replace("{{SESSION}}", session_id)
+        .replace("{{MESSAGE}}", message);
+    let tmp = tempfile::Builder::new()
+        .prefix("relix-bridge-chat-stream-")
+        .suffix(".sol")
+        .tempfile()
+        .map_err(|e| FlowExecError::Internal(format!("tempfile: {e}")))?;
+    std::fs::write(tmp.path(), rendered.as_bytes())
+        .map_err(|e| FlowExecError::Internal(format!("write tempfile: {e}")))?;
+    let flow_path: PathBuf = tmp.path().to_path_buf();
+
+    let opts = FlowRunOptions {
+        flow_path,
+        identity_bundle: state.identity_bundle.clone(),
+        client_key: state.client_key,
+        peers: state.peers.clone(),
+        data_dir: state.cfg.transport.data_dir.clone(),
+        deadline_secs: state.cfg.transport.deadline_secs,
+        capability_cache: Some(state.manifest_cache.clone()),
+        mesh_client: state.mesh_client.clone(),
+        trace_id: Some(trace_id),
+        chunk_observer: Some(on_chunk),
+    };
+
+    finalize_flow_run(
+        FlowRunner::new(opts).run().await,
+        state.task_recorder.as_ref(),
+        task_id,
+        Some(session_id.to_string()),
+    )
+    .await
 }
 
 /// Truncate a string at `n` characters (not bytes), appending an

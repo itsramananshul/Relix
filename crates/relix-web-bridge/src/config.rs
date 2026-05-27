@@ -170,6 +170,16 @@ pub struct FlowSection {
     /// shim never auto-routes to it.
     #[serde(default)]
     pub tool_template_path: Option<PathBuf>,
+    /// RELIX-2 step 5: optional streaming-chat template. Same placeholders
+    /// as `template_path` (`{{SESSION}}` + `{{MESSAGE}}`); the template
+    /// MUST use `remote_call_stream("ai", "ai.chat.stream", ...)` so the
+    /// flow opens a streaming substream. When set AND the request has
+    /// `stream: true`, the bridge wires a chunk observer that ships
+    /// tokens to the SSE response BEFORE the SOL VM finishes. When
+    /// unset, `stream: true` falls back to the legacy chunk-sliced path
+    /// (no behaviour change for existing installs).
+    #[serde(default)]
+    pub streaming_template_path: Option<PathBuf>,
 }
 
 /// Bridge-level SSE knobs. See `docs/streaming-and-openai-shim.md`.
@@ -240,6 +250,14 @@ pub struct AppState {
     /// set. `None` ⇒ `/chat_with_tool` returns 404 and the OpenAI shim
     /// never auto-routes to the tool flow.
     pub tool_template: Option<String>,
+    /// RELIX-2 step 5: pre-validated streaming-chat template
+    /// when `[flow] streaming_template_path` is set. `None` ⇒
+    /// `POST /v1/chat/completions stream:true` falls back to
+    /// the legacy chunk-sliced path (consumes the full reply
+    /// first, then splits into SSE chunks). When set, the
+    /// bridge wires a chunk observer that pipes tokens
+    /// through the SOL VM directly to the SSE response.
+    pub streaming_template: Option<String>,
     /// Capability discovery cache populated at bridge startup (M10). Empty
     /// when discovery failed; the bridge stays up and static aliases continue
     /// to work. Read by `/v1/models` and (optionally) by the flow runner's
@@ -398,6 +416,37 @@ impl AppState {
             None
         };
 
+        // RELIX-2 step 5: optional streaming template. Must
+        // call `remote_call_stream("ai", "ai.chat.stream", ...)`
+        // — the bridge enforces a sanity check on the source
+        // so operators that set the config without using the
+        // streaming opcode see a startup error instead of a
+        // silent fallback at request time.
+        let streaming_template = if let Some(path) = cfg.flow.streaming_template_path.as_ref() {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                BridgeError::Config(format!(
+                    "read streaming flow template {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if !text.contains("{{SESSION}}") || !text.contains("{{MESSAGE}}") {
+                return Err(BridgeError::Config(
+                    "streaming flow template must contain {{SESSION}} and {{MESSAGE}} placeholders"
+                        .to_string(),
+                ));
+            }
+            if !text.contains("remote_call_stream") {
+                return Err(BridgeError::Config(
+                    "streaming flow template must invoke `remote_call_stream` — otherwise the \
+                     chunk observer never fires and stream:true is no better than the unary path"
+                        .to_string(),
+                ));
+            }
+            Some(text)
+        } else {
+            None
+        };
+
         // Resolve the secrets file path. Default location is
         // `<data_dir>/bridge-secrets.toml` when `data_dir` is
         // set, falling back to `bridge-secrets.toml` in the
@@ -468,6 +517,7 @@ impl AppState {
             peers,
             template,
             tool_template,
+            streaming_template,
             manifest_cache: Arc::new(ManifestCache::new()),
             mesh_client: None,
             task_recorder: None,

@@ -253,6 +253,31 @@ pub async fn chat_completions(
         None
     };
 
+    // RELIX-2 step 5: when `stream:true` AND the operator has
+    // configured `[flow] streaming_template_path`, take the
+    // true end-to-end streaming path — the SOL VM pipes
+    // tokens to a chunk observer that forwards them to the
+    // SSE response as they arrive from the AI provider. The
+    // tool-flow URL detection is intentionally skipped for the
+    // streaming path: `ai.chat.stream` doesn't run the planner
+    // / tool dispatcher (semantic carved out in step 3), so a
+    // URL-in-message in the streaming case is just streamed
+    // verbatim like any other prompt.
+    if req.stream
+        && tool_url.is_none()
+        && let Some(streaming_template) = state.streaming_template.clone()
+    {
+        return chat_completions_streaming(
+            state,
+            translated,
+            req,
+            streaming_template,
+            model_label,
+            observability_start,
+        )
+        .await;
+    }
+
     let outcome = match tool_url.as_deref() {
         Some(url) => {
             execute_chat_with_tool_flow(&state, &translated.session_id, &translated.prompt, url)
@@ -363,6 +388,202 @@ pub async fn chat_completions(
             .insert("x-relix-provider", provider_header);
         Ok(http)
     }
+}
+
+/// RELIX-2 step 5: end-to-end streaming variant of
+/// [`chat_completions`]. Drives `execute_chat_flow_streaming`
+/// with a chunk observer that forwards each token from the SOL
+/// VM's `remote_call_stream` opcode into a tokio mpsc channel.
+/// The SSE response reads from that channel and emits one
+/// OpenAI-compatible `chat.completion.chunk` frame per token,
+/// terminating with the standard `[DONE]` sentinel after the
+/// flow completes.
+///
+/// Crucial property: the SSE response is opened BEFORE the flow
+/// runs. HTTP clients see the first chunk as soon as the AI
+/// provider's stream yields the first token — not after the
+/// VM has finished collecting. Provenance + observability
+/// records are written AFTER the flow completes (inside the
+/// SSE stream's tail), so the audit trail matches the unary
+/// path exactly.
+async fn chat_completions_streaming(
+    state: AppState,
+    translated: TranslatedChatRequest,
+    req: ChatCompletionRequest,
+    streaming_template: String,
+    model_label: String,
+    observability_start: std::time::Instant,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    use crate::flow::execute_chat_flow_streaming;
+    use axum::response::sse::Event;
+    use std::sync::Arc;
+
+    // Channel for tokens. Unbounded so the AI provider's
+    // chunk arrival never blocks the SOL VM thread; bounded
+    // would risk a deadlock when the SSE consumer is slow.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let tx_for_observer = tx.clone();
+    let on_chunk: relix_runtime::flow_runner::ChunkObserver = Arc::new(move |bytes: &[u8]| {
+        let _ = tx_for_observer.send(bytes.to_vec());
+    });
+
+    let state_for_flow = state.clone();
+    let session_id = translated.session_id.clone();
+    let prompt = translated.prompt.clone();
+    let flow_handle = tokio::spawn(async move {
+        let outcome = execute_chat_flow_streaming(
+            &state_for_flow,
+            &session_id,
+            &prompt,
+            &streaming_template,
+            on_chunk,
+        )
+        .await;
+        // Close the channel so the SSE stream exits its
+        // recv-loop and emits the finish frame.
+        drop(tx);
+        outcome
+    });
+
+    // W8: SHA-256 of the system prompt for the provenance
+    // snapshot. Captured BEFORE the SSE stream so the closure
+    // doesn't have to clone `req.messages`.
+    let system_prompt_text: String = req
+        .messages
+        .iter()
+        .find(|m| m.role.eq_ignore_ascii_case("system"))
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let system_prompt_hash = sha256_hex(&system_prompt_text);
+
+    let provider_hint = provider_hint_for_model(&state, &model_label);
+    let model_header =
+        HeaderValue::from_str(&model_label).unwrap_or_else(|_| HeaderValue::from_static("relix"));
+    let provider_header =
+        HeaderValue::from_str(&provider_hint).unwrap_or_else(|_| HeaderValue::from_static("mesh"));
+
+    // The SSE id is a placeholder for the role frame; we
+    // patch the real flow_id into the final relix-metadata
+    // frame once the spawned flow completes.
+    let pending_id = format!("chatcmpl-pending-{}", unix_now());
+    let model_for_stream = model_label.clone();
+    let session_for_stream = translated.session_id.clone();
+    let prompt_for_obs = translated.prompt.clone();
+    let state_for_tail = state.clone();
+
+    let sse_stream = async_stream::stream! {
+        let created = unix_now();
+        // Role marker.
+        let role_chunk = serde_json::json!({
+            "id": pending_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_for_stream,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": null,
+            }],
+        });
+        yield Ok::<_, Infallible>(Event::default().data(role_chunk.to_string()));
+
+        // Token chunks as they arrive. Tracks the full body
+        // for the observability + provenance records.
+        let mut accumulated: String = String::new();
+        while let Some(bytes) = rx.recv().await {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            accumulated.push_str(&text);
+            let content_chunk = serde_json::json!({
+                "id": pending_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_for_stream,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text},
+                    "finish_reason": null,
+                }],
+            });
+            yield Ok(Event::default().data(content_chunk.to_string()));
+        }
+
+        // Channel closed → flow finished. Await the outcome
+        // so we can stamp the real flow_id / trace_id on the
+        // final relix-metadata frame AND write provenance /
+        // observability.
+        let outcome = match flow_handle.await {
+            Ok(Ok(o)) => Some(o),
+            Ok(Err(_)) => None,
+            Err(_) => None,
+        };
+
+        let (real_flow_id, real_trace_id, real_flow_log, real_task_id) = match &outcome {
+            Some(o) => (
+                o.flow_id.clone(),
+                o.trace_id.clone(),
+                o.flow_log_path.clone(),
+                o.task_id.clone(),
+            ),
+            None => (String::new(), String::new(), String::new(), None),
+        };
+
+        // Final finish frame + relix metadata.
+        let finish_chunk = serde_json::json!({
+            "id": format!("chatcmpl-{}", real_flow_id),
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_for_stream,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+            "relix": {
+                "flow_id": real_flow_id,
+                "trace_id": real_trace_id,
+                "flow_log": real_flow_log,
+                "session_id": session_for_stream,
+                "task_id": real_task_id,
+            },
+        });
+        yield Ok(Event::default().data(finish_chunk.to_string()));
+
+        // Two-sink observability + provenance — same shape as
+        // the unary path. Writes AFTER the stream has
+        // emitted the full body so the audit reflects what
+        // the client actually received.
+        if let Some(o) = outcome.as_ref() {
+            record_chat_observability(
+                &state_for_tail,
+                &session_for_stream,
+                &o.trace_id,
+                &prompt_for_obs,
+                &accumulated,
+                &model_for_stream,
+                observability_start.elapsed().as_millis() as u64,
+            );
+            record_chat_provenance(
+                &state_for_tail,
+                &session_for_stream,
+                &o.trace_id,
+                &model_for_stream,
+                &system_prompt_hash,
+            );
+        }
+
+        // OpenAI clients (and Open WebUI) look for the
+        // literal `[DONE]`.
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    let mut resp = Sse::new(sse_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    resp.headers_mut()
+        .insert("x-relix-model", model_header.clone());
+    resp.headers_mut()
+        .insert("x-relix-provider", provider_header.clone());
+    Ok(resp)
 }
 
 /// Best-effort provider attribution for a resolved model label.

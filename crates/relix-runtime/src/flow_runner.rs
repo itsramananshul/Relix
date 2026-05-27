@@ -124,7 +124,25 @@ pub struct FlowRunOptions {
     /// providing it here keeps the two in sync. `None` means the
     /// runner generates its own.
     pub trace_id: Option<TraceId>,
+    /// RELIX-2 step 5: optional chunk observer. Wired by the
+    /// web bridge when serving a `stream: true` chat request.
+    /// Each chunk yielded by a `remote_call_stream` opcode
+    /// fires the callback synchronously, in arrival order,
+    /// BEFORE the VM has finished collecting the concatenated
+    /// result. The bridge uses this to ship tokens to an SSE
+    /// HTTP response while the SOL flow is still running.
+    /// `None` (default) means no observer — `remote_call_stream`
+    /// still works but per-chunk callbacks are no-ops.
+    pub chunk_observer: Option<ChunkObserver>,
 }
+
+/// RELIX-2 step 5: callback the bridge supplies via
+/// [`FlowRunOptions::chunk_observer`]. Aliased so the
+/// type signature stays out of clippy's
+/// `type_complexity` warning at every call site and the
+/// `[Arc<dyn Fn(&[u8]) + Send + Sync>]` shape lives in
+/// one place.
+pub type ChunkObserver = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// What `FlowRunner::run` returns to the caller (and `relix-cli flow-run`
 /// prints).
@@ -231,7 +249,12 @@ impl FlowRunner {
         let (vm_exit, last_err, final_string) = if is_sflow {
             run_sflow(&opts.flow_path, dispatcher.clone(), event_log.clone()).await?
         } else {
-            run_sol(&opts.flow_path, dispatcher.clone()).await?
+            run_sol(
+                &opts.flow_path,
+                dispatcher.clone(),
+                opts.chunk_observer.clone(),
+            )
+            .await?
         };
 
         // 7. Terminal event.
@@ -270,10 +293,15 @@ impl FlowRunner {
 async fn run_sol(
     flow_path: &Path,
     dispatcher: Arc<dyn RemoteCallDispatcher>,
+    chunk_observer: Option<ChunkObserver>,
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
     let bytecode = compile_sol(flow_path)?;
     let vm_result = tokio::task::spawn_blocking(move || {
-        let mut vm = VM::from(&bytecode).with_dispatcher(dispatcher);
+        let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
+        if let Some(observer) = chunk_observer {
+            vm_builder = vm_builder.with_chunk_observer(observer);
+        }
+        let mut vm = vm_builder;
         let exit = vm.run();
         let last_err = vm.last_error().cloned();
         let final_string = if exit == VM_ERROR_SENTINEL {
@@ -360,6 +388,54 @@ struct RealDispatcher {
     /// `relix-cli flow-run` path), we keep the original direct
     /// `Client::call(peer_id, ..)` flow.
     mesh: Option<Arc<MeshClient>>,
+}
+
+impl RealDispatcher {
+    /// RELIX-2 step 5: resolve a peer alias to a libp2p
+    /// PeerId. Shared between `remote_call` (unary) and
+    /// `remote_call_stream` (streaming). Returns the resolved
+    /// alias + peer id, or a structured error.
+    fn resolve_peer(
+        &self,
+        peer_alias: &str,
+        method: &str,
+    ) -> Result<(String, PeerId), RemoteCallError> {
+        let resolved_alias: String = if let Some(method_target) =
+            peer_alias.strip_prefix("capability:")
+        {
+            let cache = match self.capability_cache.as_ref() {
+                Some(c) => c,
+                None => {
+                    return Err(RemoteCallError::local(
+                        peer_alias,
+                        method,
+                        "capability resolution requires a populated ManifestCache (host not wired)"
+                            .to_string(),
+                    ));
+                }
+            };
+            match cache.find_alias_for_method(method_target) {
+                Some(a) => a,
+                None => {
+                    return Err(RemoteCallError::local(
+                        peer_alias,
+                        method,
+                        format!("no peer in manifest cache advertises method '{method_target}'"),
+                    ));
+                }
+            }
+        } else {
+            peer_alias.to_string()
+        };
+        let Some(peer_id) = self.peer_ids.get(&resolved_alias).copied() else {
+            return Err(RemoteCallError::local(
+                peer_alias,
+                method,
+                format!("unknown peer alias '{resolved_alias}' (not in [peers] config)"),
+            ));
+        };
+        Ok((resolved_alias, peer_id))
+    }
 }
 
 impl RemoteCallDispatcher for RealDispatcher {
@@ -506,6 +582,159 @@ impl RemoteCallDispatcher for RealDispatcher {
         }
 
         outcome
+    }
+
+    /// RELIX-2 step 5: streaming variant. Opens a
+    /// `/relix/rpc/stream/1` substream against the resolved
+    /// peer, writes the same RELIX-1 RequestEnvelope the
+    /// unary path uses, then reads `StreamFrame`s until the
+    /// remote sends `End` or `Err`. Each `Chunk` is reported
+    /// to `on_chunk` synchronously AND appended to the
+    /// concatenated body the VM ultimately receives.
+    ///
+    /// Per-call event-log entries match the unary path:
+    /// `RemoteCallIssued` before the dial, then either
+    /// `RemoteCallCompleted` or `RemoteCallFailed` once the
+    /// stream terminates.
+    fn remote_call_stream(
+        &self,
+        peer_alias: &str,
+        method: &str,
+        arg: &[u8],
+        on_chunk: &dyn Fn(&[u8]),
+    ) -> RemoteCallResult {
+        let (resolved_alias, peer_id) = self.resolve_peer(peer_alias, method)?;
+        let peer_alias = resolved_alias.as_str();
+
+        let envelope_bytes = build_request(
+            method.to_string(),
+            arg.to_vec(),
+            self.identity.clone(),
+            self.deadline_secs,
+        );
+        let request_id = peek_request_id(&envelope_bytes);
+
+        // RemoteCallIssued — log-before-act. Marked as a
+        // streaming call in the payload so the per-flow log
+        // reader can tell the two paths apart.
+        let issued =
+            encode_remote_call_issued_payload(peer_alias, method, arg, self.trace_id, request_id);
+        if let Err(e) = append_log(&self.event_log, EventType::RemoteCallIssued, issued) {
+            return Err(RemoteCallError::local(
+                peer_alias,
+                method,
+                format!("event log append (issued): {e}"),
+            ));
+        }
+
+        let started_at = std::time::Instant::now();
+        let client = self.client.clone();
+        let outer_timeout = Duration::from_secs((self.deadline_secs + 5) as u64);
+        let peer_alias_owned = peer_alias.to_string();
+        let method_owned = method.to_string();
+
+        // Drive the substream protocol synchronously from
+        // this blocking thread. block_on is safe here — the
+        // dispatcher always runs inside `spawn_blocking`.
+        let stream_result: RemoteCallResult = self.handle.block_on(async move {
+            use crate::transport::stream::{StreamFrame, StreamReader, write_request_envelope};
+
+            let opened =
+                tokio::time::timeout(outer_timeout, async { client.open_stream(peer_id).await })
+                    .await;
+            let mut raw_stream = match opened {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    return Err(RemoteCallError::local(
+                        peer_alias_owned.clone(),
+                        method_owned.clone(),
+                        format!("stream open: {e}"),
+                    ));
+                }
+                Err(_) => {
+                    return Err(RemoteCallError::local(
+                        peer_alias_owned.clone(),
+                        method_owned.clone(),
+                        "outbound stream open timed out at dispatcher",
+                    ));
+                }
+            };
+            if let Err(e) = write_request_envelope(&mut raw_stream, &envelope_bytes).await {
+                return Err(RemoteCallError::local(
+                    peer_alias_owned.clone(),
+                    method_owned.clone(),
+                    format!("stream write envelope: {e}"),
+                ));
+            }
+            let mut reader = StreamReader::new(raw_stream);
+            let mut concatenated: Vec<u8> = Vec::new();
+            loop {
+                let frame = tokio::time::timeout(outer_timeout, reader.next_frame()).await;
+                match frame {
+                    Ok(Ok(Some(StreamFrame::Header { .. }))) => {
+                        // Header carries audit-correlation
+                        // metadata; the unary path doesn't
+                        // surface it to the VM so we don't
+                        // either. Just continue to chunks.
+                        continue;
+                    }
+                    Ok(Ok(Some(StreamFrame::Chunk(bytes)))) => {
+                        on_chunk(bytes.as_ref());
+                        concatenated.extend_from_slice(bytes.as_ref());
+                    }
+                    Ok(Ok(Some(StreamFrame::End))) => break,
+                    Ok(Ok(Some(StreamFrame::Err { kind, cause }))) => {
+                        return Err(RemoteCallError {
+                            kind,
+                            peer: peer_alias_owned.clone(),
+                            method: method_owned.clone(),
+                            cause,
+                        });
+                    }
+                    Ok(Ok(None)) => {
+                        // EOF without an explicit
+                        // terminator — treat as graceful
+                        // close.
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        return Err(RemoteCallError::local(
+                            peer_alias_owned.clone(),
+                            method_owned.clone(),
+                            format!("stream frame read: {e}"),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(RemoteCallError::local(
+                            peer_alias_owned.clone(),
+                            method_owned.clone(),
+                            "stream frame read timed out",
+                        ));
+                    }
+                }
+            }
+            Ok(concatenated)
+        });
+
+        let latency_ms = started_at.elapsed().as_millis() as u64;
+
+        // Per-call terminal event.
+        match &stream_result {
+            Ok(body) => {
+                let completed = encode_remote_call_completed_payload(
+                    peer_alias, method, request_id, latency_ms, body,
+                );
+                let _ = append_log(&self.event_log, EventType::RemoteCallCompleted, completed);
+            }
+            Err(err) => {
+                let failed = encode_remote_call_failed_payload(
+                    peer_alias, method, request_id, latency_ms, err,
+                );
+                let _ = append_log(&self.event_log, EventType::RemoteCallFailed, failed);
+            }
+        }
+
+        stream_result
     }
 }
 
