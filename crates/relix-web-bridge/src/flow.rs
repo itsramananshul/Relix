@@ -14,7 +14,7 @@
 //!      JSON / SSE / OpenAI handlers all project the same underlying
 //!      flow result.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::AppState;
 use crate::task_recorder::{TaskRecorder, make_title};
@@ -22,6 +22,27 @@ use crate::validate::{validate_input, validate_url};
 use relix_core::types::TraceId;
 use relix_runtime::flow_runner::{FlowRunOptions, FlowRunner, FlowRunnerError};
 use relix_runtime::nodes::coordinator::FailureClass;
+
+/// Pick the tempfile suffix that matches the configured
+/// template's on-disk extension. The bridge writes the rendered
+/// template to a tempfile; the FlowRunner dispatches on the
+/// extension (`.sol` / `.yml` / `.yaml` / `.sflow`), so the
+/// tempfile suffix must round-trip the original choice.
+/// Defaults to `.sol` when the path has no extension or an
+/// extension the FlowRunner doesn't recognise.
+fn tempfile_suffix_for(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("yml") => ".yml",
+        Some("yaml") => ".yaml",
+        Some("sflow") => ".sflow",
+        _ => ".sol",
+    }
+}
 
 /// Successful end-to-end chat flow.
 #[derive(Debug, Clone)]
@@ -108,7 +129,7 @@ pub async fn execute_chat_flow(
 
     let tmp = tempfile::Builder::new()
         .prefix("relix-bridge-chat-")
-        .suffix(".sol")
+        .suffix(tempfile_suffix_for(&state.cfg.flow.template_path))
         .tempfile()
         .map_err(|e| FlowExecError::Internal(format!("tempfile: {e}")))?;
     std::fs::write(tmp.path(), rendered.as_bytes())
@@ -317,9 +338,16 @@ pub async fn execute_chat_with_tool_flow(
         .replace("{{MESSAGE}}", message)
         .replace("{{TOOL_URL}}", url);
 
+    let tool_template_suffix = state
+        .cfg
+        .flow
+        .tool_template_path
+        .as_deref()
+        .map(tempfile_suffix_for)
+        .unwrap_or(".sol");
     let tmp = tempfile::Builder::new()
         .prefix("relix-bridge-chat-tool-")
-        .suffix(".sol")
+        .suffix(tool_template_suffix)
         .tempfile()
         .map_err(|e| FlowExecError::Internal(format!("tempfile: {e}")))?;
     std::fs::write(tmp.path(), rendered.as_bytes())
@@ -489,9 +517,16 @@ pub async fn execute_chat_flow_streaming(
     let rendered = streaming_template
         .replace("{{SESSION}}", session_id)
         .replace("{{MESSAGE}}", message);
+    let stream_template_suffix = state
+        .cfg
+        .flow
+        .streaming_template_path
+        .as_deref()
+        .map(tempfile_suffix_for)
+        .unwrap_or(".sol");
     let tmp = tempfile::Builder::new()
         .prefix("relix-bridge-chat-stream-")
-        .suffix(".sol")
+        .suffix(stream_template_suffix)
         .tempfile()
         .map_err(|e| FlowExecError::Internal(format!("tempfile: {e}")))?;
     std::fs::write(tmp.path(), rendered.as_bytes())

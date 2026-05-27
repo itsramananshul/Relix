@@ -27,5 +27,6 @@ pub mod plugin;
 pub mod sflow;
 pub mod sol;
 pub mod transport;
+pub mod yaml_flow;
 
 pub use relix_core;

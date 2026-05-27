@@ -59,6 +59,7 @@ serde_bytes = "0.11"
 serde_json = "1.0"
 ciborium   = "0.2"
 toml       = "0.8"
+serde_yaml = "0.9"
 hex        = "0.4"
 
 # Interactive CLI (used by `relix setup` wizard).

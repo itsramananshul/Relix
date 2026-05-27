@@ -435,9 +435,26 @@ impl AppState {
                         .to_string(),
                 ));
             }
-            if !text.contains("remote_call_stream") {
+            // The template MUST exercise the streaming
+            // dispatcher. SOL templates do this via the
+            // `remote_call_stream` builtin; YAML templates
+            // (`.yml` / `.yaml`) use the `stream:` step which
+            // lowers to the same opcode. Either marker
+            // satisfies the check.
+            let is_yaml = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"))
+                .unwrap_or(false);
+            let invokes_stream = if is_yaml {
+                text.contains("stream:")
+            } else {
+                text.contains("remote_call_stream")
+            };
+            if !invokes_stream {
                 return Err(BridgeError::Config(
-                    "streaming flow template must invoke `remote_call_stream` — otherwise the \
+                    "streaming flow template must invoke the streaming dispatcher — \
+                     SOL: `remote_call_stream(...)`, YAML: `stream:` step — otherwise the \
                      chunk observer never fires and stream:true is no better than the unary path"
                         .to_string(),
                 ));

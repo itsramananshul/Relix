@@ -1,0 +1,39 @@
+# flows/chat_template_streaming.yml — streaming chat (YAML edition).
+#
+# Byte-equivalent in behaviour to flows/chat_template_streaming.sol.
+# The only difference vs chat_template.yml is the AI step: this one
+# uses `stream:` (lowering to `remote_call_stream`) so the bridge can
+# pipe tokens to an SSE response BEFORE the VM finishes collecting
+# the body.
+#
+# Substitution markers (replaced by the bridge before the flow runs):
+#   {{SESSION}}   →  session_id from POST /chat JSON
+#   {{MESSAGE}}   →  message    from POST /chat JSON
+
+steps:
+  - let:
+      name: user_msg
+      type: str
+      value: "{{MESSAGE}}"
+
+  # Persist user turn first.
+  - call:
+      peer: memory
+      method: memory.write_turn
+      arg: "{{SESSION}}|user|{{user_msg}}"
+
+  # Streaming AI call — chunks flow back through the bridge's chunk
+  # observer to the SSE response while the VM is still running.
+  - stream:
+      peer: ai
+      method: ai.chat.stream
+      arg: "{{SESSION}}|{{user_msg}}|"
+      assign: reply
+
+  # Persist assistant turn (full body, post-stream).
+  - call:
+      peer: memory
+      method: memory.write_turn
+      arg: "{{SESSION}}|assistant|{{reply}}"
+
+  - result: "{{reply}}"

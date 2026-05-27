@@ -1,0 +1,45 @@
+# flows/chat_template.yml — bridge-rendered chat flow (YAML edition).
+#
+# This file is byte-equivalent in behaviour to flows/chat_template.sol —
+# the YAML frontend lowers it to the same SOL bytecode the .sol file
+# produces. Operators can pick whichever syntax they prefer; the bridge
+# detects the extension and dispatches accordingly.
+#
+# Substitution markers (replaced by the bridge before the flow runs):
+#   {{SESSION}}   →  session_id from POST /chat JSON
+#   {{MESSAGE}}   →  message    from POST /chat JSON
+#
+# Variables declared inside the flow ({{user_msg}}, {{reply}}) are
+# resolved by the SOL interpolator after the bridge has substituted
+# the render-time markers.
+
+steps:
+  # Capture the user message into a local so the wire payloads stay
+  # readable.
+  - let:
+      name: user_msg
+      type: str
+      value: "{{MESSAGE}}"
+
+  # Persist user turn first — the AI node's auto-fetch picks this up
+  # on the next step.
+  - call:
+      peer: memory
+      method: memory.write_turn
+      arg: "{{SESSION}}|user|{{user_msg}}"
+
+  # AI call. Wire format is `session_id|prompt|history`; we leave
+  # history empty so the AI node fills it in from memory.
+  - call:
+      peer: ai
+      method: ai.chat
+      arg: "{{SESSION}}|{{user_msg}}|"
+      assign: reply
+
+  # Persist assistant turn.
+  - call:
+      peer: memory
+      method: memory.write_turn
+      arg: "{{SESSION}}|assistant|{{reply}}"
+
+  - result: "{{reply}}"

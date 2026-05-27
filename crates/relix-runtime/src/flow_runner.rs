@@ -260,24 +260,38 @@ impl FlowRunner {
         });
 
         // 6. Dispatch on file extension. `.sflow` runs the AST-walking
-        //    executor; everything else (default `.sol`) compiles to the
-        //    SOL bytecode and runs the VM.
-        let is_sflow = opts
+        //    executor. `.yml` / `.yaml` flows go through the YAML
+        //    frontend (`crate::yaml_flow`) which lowers to SOL source
+        //    text before falling into the SOL pipeline — same VM,
+        //    same opcodes, same dispatcher, same chunk observer.
+        //    Everything else (default `.sol`) compiles to the SOL
+        //    bytecode directly and runs the VM.
+        let ext = opts
             .flow_path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("sflow"))
-            .unwrap_or(false);
+            .map(|e| e.to_ascii_lowercase());
 
-        let (vm_exit, last_err, final_string) = if is_sflow {
-            run_sflow(&opts.flow_path, dispatcher.clone(), event_log.clone()).await?
-        } else {
-            run_sol(
-                &opts.flow_path,
-                dispatcher.clone(),
-                opts.chunk_observer.clone(),
-            )
-            .await?
+        let (vm_exit, last_err, final_string) = match ext.as_deref() {
+            Some("sflow") => {
+                run_sflow(&opts.flow_path, dispatcher.clone(), event_log.clone()).await?
+            }
+            Some("yml") | Some("yaml") => {
+                run_yaml(
+                    &opts.flow_path,
+                    dispatcher.clone(),
+                    opts.chunk_observer.clone(),
+                )
+                .await?
+            }
+            _ => {
+                run_sol(
+                    &opts.flow_path,
+                    dispatcher.clone(),
+                    opts.chunk_observer.clone(),
+                )
+                .await?
+            }
         };
 
         // 7. Terminal event.
@@ -319,6 +333,38 @@ async fn run_sol(
     chunk_observer: Option<ChunkObserver>,
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
     let bytecode = compile_sol(flow_path)?;
+    let vm_result = tokio::task::spawn_blocking(move || {
+        let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
+        if let Some(observer) = chunk_observer {
+            vm_builder = vm_builder.with_chunk_observer(observer);
+        }
+        let mut vm = vm_builder;
+        let exit = vm.run();
+        let last_err = vm.last_error().cloned();
+        let final_string = if exit == VM_ERROR_SENTINEL {
+            None
+        } else {
+            vm.heap_string(exit).map(|s| s.to_string())
+        };
+        (exit, last_err, final_string)
+    })
+    .await
+    .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))?;
+    Ok(vm_result)
+}
+
+/// Run a `.yml` / `.yaml` flow through the YAML frontend.
+/// The frontend lowers to SOL source text and hands off to the
+/// existing SOL compile pipeline, so YAML flows execute on the
+/// exact same VM as `.sol` flows. Chunk observers and cancel
+/// signals work identically.
+async fn run_yaml(
+    flow_path: &Path,
+    dispatcher: Arc<dyn RemoteCallDispatcher>,
+    chunk_observer: Option<ChunkObserver>,
+) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
+    let bytecode = crate::yaml_flow::compile_path(flow_path)
+        .map_err(|e| FlowRunnerError::Config(format!("yaml flow {}: {e}", flow_path.display())))?;
     let vm_result = tokio::task::spawn_blocking(move || {
         let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
         if let Some(observer) = chunk_observer {
