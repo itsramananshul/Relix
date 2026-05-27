@@ -4405,6 +4405,22 @@ fn register_node_type_handlers(
                     svc_inner =
                         svc_inner.with_mesh(local_node_name.clone(), signer, late_dispatcher);
                 }
+                // RELIX-7.16 GAP 4: build the AutoShareTask
+                // FIRST so we can grab its lifetime stats
+                // handle, install it on the service that the
+                // dispatch bridge sees, and STILL spawn the
+                // same task. The handle is Arc-backed so
+                // service-side reads and task-side writes
+                // share storage.
+                let autoshare_cfg =
+                    crate::knowledge::AutoShareConfig::from_knowledge_config(&knowledge_cfg);
+                let task = crate::knowledge::AutoShareTask::new(
+                    svc_inner.clone(),
+                    layered.store.clone(),
+                    autoshare_cfg,
+                );
+                let lifetime_stats = task.lifetime_stats();
+                svc_inner = svc_inner.with_autoshare_stats(lifetime_stats);
                 let svc = Arc::new(svc_inner);
                 crate::knowledge::register(bridge, svc.clone());
                 for (method, doc) in crate::knowledge::knowledge_capability_descriptors() {
@@ -4438,13 +4454,6 @@ fn register_node_type_handlers(
                 // — the task runs for the process lifetime;
                 // shutdown happens when tokio's runtime tears
                 // down.
-                let autoshare_cfg =
-                    crate::knowledge::AutoShareConfig::from_knowledge_config(&knowledge_cfg);
-                let task = crate::knowledge::AutoShareTask::new(
-                    (*svc).clone(),
-                    layered.store.clone(),
-                    autoshare_cfg,
-                );
                 let _handle = task.spawn();
                 tracing::info!(
                     groups = knowledge_cfg.groups.len(),

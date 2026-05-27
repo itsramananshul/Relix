@@ -37,7 +37,9 @@ pub mod remote;
 pub mod service;
 pub mod trust;
 
-pub use autoshare::{AutoShareConfig, AutoShareTask};
+pub use autoshare::{
+    AutoShareConfig, AutoShareLifetimeStats, AutoShareTask, AutoShareTickStats, LifetimeCounters,
+};
 pub use chronicle::{KnowledgeEvent, KnowledgeEventKind};
 pub use config::{KnowledgeConfig, MemberNodeRoute, SharingGroup, sharing_group_descriptors};
 pub use coordinator::{knowledge_capability_descriptors, register};

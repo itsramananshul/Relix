@@ -126,6 +126,27 @@ pub struct KnowledgeConfig {
     /// only enforces against operator-stamped tags.
     #[serde(default)]
     pub quality_scorer: super::quality_scorer::MemoryQualityScorerConfig,
+    /// RELIX-7.16 GAP 4: per-tick propagation budget. The
+    /// `AutoShareTask` stops attempting new propagations once
+    /// it's attempted this many in a single tick — the rest
+    /// resume on the next tick (the round-robin cursor
+    /// guarantees no agent is starved). `None` disables the
+    /// budget so operators get the pre-7.16 unbounded
+    /// behaviour; defaults to 200 — large enough that a
+    /// healthy cluster never trips it but small enough that
+    /// a misconfigured floor can't spend the whole tick
+    /// pumping rejections.
+    #[serde(default = "default_auto_share_per_tick_budget")]
+    pub auto_share_per_tick_budget: Option<u32>,
+    /// RELIX-7.16 GAP 4: per-agent propagation cap WITHIN a
+    /// single tick. Once the task attempts this many
+    /// (target, observation) pairs for one source agent it
+    /// rotates to the next; the round-robin cursor resumes
+    /// at the same agent on the next tick. `None` disables
+    /// the per-agent cap; defaults to 50 — keeps any one
+    /// chatty agent from monopolising the budget.
+    #[serde(default = "default_auto_share_per_agent_limit")]
+    pub auto_share_per_agent_limit: Option<u32>,
 }
 
 fn default_auto_share_interval() -> u64 {
@@ -133,6 +154,12 @@ fn default_auto_share_interval() -> u64 {
 }
 fn default_observation_cap() -> Option<u32> {
     Some(10_000)
+}
+fn default_auto_share_per_tick_budget() -> Option<u32> {
+    Some(200)
+}
+fn default_auto_share_per_agent_limit() -> Option<u32> {
+    Some(50)
 }
 
 impl KnowledgeConfig {
@@ -315,6 +342,21 @@ pub fn sharing_group_descriptors() -> &'static [(&'static str, &'static str)] {
              the structured `RejectReason` on signature \
              mismatch or trust-check failure.",
         ),
+        (
+            "knowledge.autoshare_stats",
+            "RELIX-7.16 GAP 4: snapshot the AutoShareTask's \
+             lifetime counters. No args. Returns JSON \
+             `{total_ticks, total_propagated, \
+             total_budget_exhausted_ticks, total_rejected, \
+             total_per_agent_limit_hits, last_tick_stats:{\
+             agents_scanned, observations_eligible, \
+             propagations_attempted, propagations_accepted, \
+             propagations_rejected, budget_exhausted, \
+             per_agent_limit_hit_agents}}`. Counters are \
+             monotonic; operators use them to confirm the \
+             backpressure budget is being honored and that \
+             auto-share isn't starving any one source agent.",
+        ),
     ]
 }
 
@@ -329,6 +371,8 @@ mod tests {
             auto_share_interval_secs: default_auto_share_interval(),
             max_observations_per_agent: default_observation_cap(),
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         }
     }
 

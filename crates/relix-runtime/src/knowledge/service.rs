@@ -201,6 +201,12 @@ pub struct KnowledgeService {
     /// and pre-mesh boots — every cross-node target gets an
     /// `Unreachable` rejection.
     remote: Option<Arc<dyn RemoteKnowledgeDispatcher>>,
+    /// RELIX-7.16 GAP 4: handle on the AutoShareTask's
+    /// lifetime counters. `None` when no AutoShareTask was
+    /// spawned (groups list empty); the
+    /// `knowledge.autoshare_stats` cap returns zeros in that
+    /// case.
+    autoshare_stats: Option<super::autoshare::AutoShareLifetimeStats>,
 }
 
 impl KnowledgeService {
@@ -214,6 +220,7 @@ impl KnowledgeService {
             local_node: None,
             signing_key: None,
             remote: None,
+            autoshare_stats: None,
         })
     }
 
@@ -231,6 +238,7 @@ impl KnowledgeService {
             local_node: None,
             signing_key: None,
             remote: None,
+            autoshare_stats: None,
         }
     }
 
@@ -267,6 +275,19 @@ impl KnowledgeService {
     /// behaviour: every target routes locally).
     pub fn local_node(&self) -> Option<&str> {
         self.local_node.as_deref()
+    }
+
+    /// RELIX-7.16 GAP 4: install the lifetime stats handle.
+    /// The handle is shared with the `AutoShareTask` so
+    /// `knowledge.autoshare_stats` returns the same counters
+    /// the task updates on every tick.
+    pub fn with_autoshare_stats(mut self, stats: super::autoshare::AutoShareLifetimeStats) -> Self {
+        self.autoshare_stats = Some(stats);
+        self
+    }
+
+    pub fn autoshare_stats(&self) -> Option<&super::autoshare::AutoShareLifetimeStats> {
+        self.autoshare_stats.as_ref()
     }
 
     /// Pure accessor for the configured groups (used by the
@@ -913,6 +934,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         let _ = policy; // reserved for future policy-on-source-row tests
@@ -1069,6 +1092,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         store.insert(&obs("a1", "alice", "fact one", true)).unwrap();
@@ -1164,6 +1189,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         store.insert(&obs("a1", "alice", "fact one", true)).unwrap();
@@ -1299,6 +1326,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         store
@@ -1332,6 +1361,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store, &cfg).unwrap();
         let r = svc
@@ -1413,6 +1444,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let (svc, _) = mesh_service(store.clone(), &cfg, "node-1");
         store.insert(&obs("a1", "alice", "fact", true)).unwrap();
@@ -1456,6 +1489,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         // Remote-side service (no mesh; it accepts inbound).
         let remote_svc = Arc::new(
@@ -1529,6 +1564,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let dispatcher: Arc<dyn RemoteKnowledgeDispatcher> =
             Arc::new(InMemoryRemoteDispatcher::new().with_unreachable("node-down"));
@@ -1581,6 +1618,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         // Note: with_local_node only — no mesh.
         let svc = KnowledgeService::new(store.clone(), &cfg)
@@ -1622,6 +1661,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store.clone(), &cfg)
             .unwrap()
@@ -1652,6 +1693,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store.clone(), &cfg)
             .unwrap()

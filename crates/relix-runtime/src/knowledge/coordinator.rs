@@ -88,12 +88,22 @@ pub fn register(bridge: &mut DispatchBridge, service: Arc<KnowledgeService>) {
         );
     }
     {
-        let svc = service;
+        let svc = service.clone();
         bridge.register(
             "knowledge.accept_shared",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let svc = svc.clone();
                 async move { handle_accept_shared(&svc, &ctx) }
+            })),
+        );
+    }
+    {
+        let svc = service;
+        bridge.register(
+            "knowledge.autoshare_stats",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let svc = svc.clone();
+                async move { handle_autoshare_stats(&svc).await }
             })),
         );
     }
@@ -224,6 +234,18 @@ fn handle_recall(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome 
     }
 }
 
+/// RELIX-7.16 GAP 4: snapshot the AutoShareTask's lifetime
+/// counters. When the task wasn't spawned (no groups
+/// configured) the cap returns a zero-filled snapshot so the
+/// surface is stable for operator tooling.
+async fn handle_autoshare_stats(svc: &KnowledgeService) -> HandlerOutcome {
+    let snap = match svc.autoshare_stats() {
+        Some(s) => s.snapshot().await,
+        None => crate::knowledge::autoshare::LifetimeCounters::default(),
+    };
+    ok_json(&snap)
+}
+
 /// RELIX-7.16 GAP 3: handle inbound `knowledge.accept_shared`
 /// from a remote memory node. Args is the JSON-encoded
 /// [`SignedSharePayload`]. The receiver runs full signature
@@ -348,6 +370,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = Arc::new(KnowledgeService::new(store.clone(), &cfg).unwrap());
         store.insert(&observation("a1", "alice", true)).unwrap();
@@ -408,6 +432,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store, &cfg).unwrap();
         let ctx =
@@ -432,6 +458,8 @@ mod tests {
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
         };
         let svc = KnowledgeService::new(store, &cfg).unwrap();
         let HandlerOutcome::Ok(body) = handle_groups(&svc) else {
