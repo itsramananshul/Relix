@@ -34,6 +34,8 @@ pub mod vm;
 pub mod dispatcher;
 
 #[cfg(test)]
+mod branch_return_tests;
+#[cfg(test)]
 mod language_reference_examples;
 #[cfg(test)]
 mod list_map_tests;

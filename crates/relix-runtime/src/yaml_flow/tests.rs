@@ -929,6 +929,10 @@ fn try_with_empty_catch_sequence_is_semantic_error() {
 
 #[test]
 fn let_with_native_yaml_sequence_compiles_to_sol_list_literal() {
+    // Note: the trailing `result:` returns a string, not the
+    // list itself — SOL functions are declared `-> str` here
+    // and the analyzer's branch return-type checker now
+    // rejects a `return xs` (type list) at this site.
     let yaml = r#"
         steps:
           - let:
@@ -938,7 +942,7 @@ fn let_with_native_yaml_sequence_compiles_to_sol_list_literal() {
                 - alpha
                 - beta
                 - gamma
-          - result: "{{xs}}"
+          - result: "done"
     "#;
     let sol = lower(yaml);
     assert!(

@@ -20,6 +20,14 @@ pub struct Analyzer {
     tts: Vec<TypeTableId>,
     can_break: bool,
     can_return: bool,
+    /// Declared return type of the function being analyzed.
+    /// Set on entry to a `DeclFunc`, restored on exit. Used
+    /// by `ExprReturn` to validate every return statement —
+    /// including the ones buried inside `if` / `else` /
+    /// `while` / `for` / `try` / `catch` bodies — against the
+    /// function's signature. `None` outside any function
+    /// (top-level walk before the body is entered).
+    return_type: Option<Type>,
 }
 
 impl Analyzer {
@@ -29,6 +37,7 @@ impl Analyzer {
             tts: Vec::new(),
             can_break: false,
             can_return: false,
+            return_type: None,
         }
     }
 
@@ -95,7 +104,7 @@ impl Analyzer {
     fn check(&mut self, node: &mut Ast) -> Option<Type> {
         match node {
             Ast::DeclFunc {
-                name: _,
+                name,
                 params,
                 ret,
                 body,
@@ -108,31 +117,52 @@ impl Analyzer {
                 // Already registered in run() pass 1 — no need for add_entry
 
                 *scope = self.new_table();
-                for (name, kind) in params {
+                for (pname, kind) in params {
                     self.add_entry(
-                        name.to_owned(),
+                        pname.to_owned(),
                         Symbol::Variable {
                             kind: Box::from(kind.clone()),
                         },
                     );
                 }
 
-                let old = self.can_return;
+                // Branch return-type checker. Two pieces:
+                //
+                //   1. Every `ExprReturn` in the body
+                //      (including ones buried inside if /
+                //      else / while / for / try / catch) is
+                //      type-checked against the declared
+                //      return type via
+                //      `Analyzer::return_type`.
+                //   2. After the body is analysed, a
+                //      conservative `block_always_returns`
+                //      walk asserts the function guarantees a
+                //      return on every path. `Void` functions
+                //      are exempt — falling off the end is a
+                //      valid no-value exit there.
+                //
+                // The coverage walk is intentionally
+                // permissive: a `while` / `for` body that
+                // returns doesn't count (the loop might not
+                // execute), and a `try` is treated as
+                // returning only when the try body and every
+                // catch body both return. We don't try to
+                // prove exhaustive coverage past `if/else`
+                // and `try` — that's a much harder problem
+                // and the user spec calls for conservative.
+                let old_can_return = self.can_return;
+                let old_return_type = self.return_type.take();
                 self.can_return = true;
-                // TODO: actually do branch checking please
+                self.return_type = Some(ret.clone());
                 self.check(body);
-                // let ret_type = match self.check(*body) {
-                //     Some(ty) => ty,
-                //     None => {
-                //
-                //         panic!("function `{name}` has diverging types throughout its branches");
-                //     }
-                // };
-                // if type_eq(ret_type.clone(), ret.clone()).is_err() {
-                //
-                //     panic!("return type of function `{name}` ({ret:?}) does not match its body ({ret_type:?})");
-                // }
-                self.can_return = old;
+                if !matches!(ret, Type::Void) && !block_always_returns(body) {
+                    panic!(
+                        "function `{name}` is declared as returning `{ret:?}` but its body \
+                         does not guarantee a return on all paths"
+                    );
+                }
+                self.can_return = old_can_return;
+                self.return_type = old_return_type;
 
                 self.pop_table();
                 Some(*function_type)
@@ -701,10 +731,25 @@ impl Analyzer {
                 if !self.can_return {
                     panic!("illegal return statement");
                 }
-                match val {
-                    Some(v) => Some(self.check(&mut *v)?),
-                    None => Some(Type::Void),
+                let actual = match val {
+                    Some(v) => self.check(&mut *v)?,
+                    None => Type::Void,
+                };
+                // Validate against the enclosing function's
+                // declared return type. The check fires for
+                // returns at any depth — top-level and
+                // anything nested in if / else / while / for
+                // / try / catch — because `return_type` stays
+                // set for the whole DeclFunc body walk.
+                if let Some(expected) = self.return_type.clone()
+                    && type_eq(actual.clone(), expected.clone()).is_err()
+                {
+                    panic!(
+                        "return type mismatch: function declared as returning `{expected:?}` \
+                         but this return produces `{actual:?}`"
+                    );
                 }
+                Some(actual)
             }
             Ast::ExprInteger(_) => Some(Type::Integer),
             Ast::ExprFloat(_) => Some(Type::Float),
@@ -746,5 +791,52 @@ impl Analyzer {
             // Ast::ExprStructInit { name, fields } => {}
             x => todo!("{x:?}"),
         }
+    }
+}
+
+/// Conservative return-coverage check for a function body.
+/// Returns `true` when every static control-flow path through
+/// `node` reaches a `return` (or diverging `rethrow`); `false`
+/// when at least one path falls through.
+///
+/// The check fires only the cases the user can be sure of:
+///
+/// * A `Block` always-returns if any statement in it
+///   always-returns (execution stops at the first return; any
+///   later statements are dead).
+/// * A `return` always-returns. A `rethrow` always-diverges,
+///   which is equivalent for this analysis (the function
+///   never falls through past it).
+/// * An `if` with an `else` always-returns iff BOTH branches
+///   always-return. An `if` without an `else` does not — the
+///   `false` path falls through.
+/// * A `try` always-returns iff the body returns AND every
+///   catch body returns. This is a permissive approximation:
+///   an uncaught failure leaves the function via the
+///   error path, which is not a normal return, but for return
+///   coverage we treat it the same as the catch path.
+/// * `while` / `for` bodies do NOT count — the loop may
+///   execute zero iterations, and we don't try to prove
+///   otherwise.
+/// * Anything else (lets, expression statements, calls,
+///   prints, imports, struct / enum decls) does not count
+///   as returning.
+fn block_always_returns(node: &Ast) -> bool {
+    match node {
+        Ast::Block { block, .. } => block.iter().any(block_always_returns),
+        Ast::ExprReturn { .. } => true,
+        Ast::StmtRethrow => true,
+        Ast::StmtIf {
+            body,
+            alt: Some(else_branch),
+            ..
+        } => block_always_returns(body) && block_always_returns(else_branch),
+        Ast::StmtTry { body, catches } => {
+            block_always_returns(body)
+                && catches
+                    .iter()
+                    .all(|(_kind, catch_body)| block_always_returns(catch_body))
+        }
+        _ => false,
     }
 }
