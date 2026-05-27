@@ -1250,9 +1250,151 @@ Managed cloud offering:
 
 The local-first P2P architecture makes this easier architecturally — just run the mesh on cloud VMs with real provider keys and a proper auth layer in front.
 
-### 7.15 Training Data Pipeline `[SKIPPED — production-quality anonymization (PII redaction across all four memory layers) + opt-in flow + JSONL/fine-tuning format conversion + provider-specific schema mapping + privacy review is a multi-day build; deferred to a dedicated session]`
+### 7.15 Training Data Pipeline `[DONE — commits 3eed2cd + 0320e32]`
 
-Because every agent interaction is stored in Qdrant with full metadata, Relix can automatically build high-quality training datasets from real agent usage. Operators opt in, interactions are anonymized, and the result is fine-tuning data for domain-specific agent behavior. A legal tech SaaS built on Relix could fine-tune a model specifically on legal research interactions within months of deployment.
+Because every agent interaction that flows through the
+coordinator is recordable as training data, Relix can build
+high-quality fine-tuning datasets from real agent usage.
+Operators opt in via `[training] enabled = true`, every
+`ai.chat` / `ai.chat.stream` turn lands on a row in
+`training.sqlite`, a background scorer assigns a deterministic
+quality score, and operators export curated subsets in the
+four shapes the major fine-tuning platforms expect.
+
+**Shipped this session:**
+
+- **InteractionRecorder + `training.sqlite`** (`3eed2cd`):
+  new `crates/relix-runtime/src/training/` module (eight
+  files). `InteractionRecord` schema mirrors the spec one-for-
+  one (interaction_id PK + session_id / agent / model /
+  provider / system_prompt / user_message / response /
+  tool_calls_json / prompt_tokens / completion_tokens /
+  token_count / latency_ms / success / error_kind /
+  recorded_at / quality_score / exported / export_set), five
+  indexes back the query paths. `InteractionRecorder` is a
+  non-blocking sink: unbounded mpsc + drain task batching up
+  to 100 rows / 100ms, daily retention loop pruning past the
+  configured `retention_days` (default 90). AI handler wiring:
+  `nodes/ai/mod.rs::register` gained an
+  `interaction_sink: Option<Arc<dyn InteractionSink>>` param;
+  both `handle_chat` (records on every outcome path with the
+  planner's tool-call results mapped to `ToolCallRecord`s)
+  and `handle_chat_stream` (accumulates text chunks + Usage
+  frame, records one record at stream close, tool calls
+  empty by design — streaming bypasses the planner) emit one
+  record per turn.
+
+- **QualityScorer + background loop** (`3eed2cd`):
+  deterministic, byte-level only (no ML, no provider calls).
+  Five sub-scores **multiplied** so failure on any one
+  dimension reasonably penalises the whole: success
+  (1.0 / 0.0 — failed interactions score 0.0 regardless of
+  other dimensions), response length (band curve favouring
+  50–500 approx-tokens), latency (1.0 ≤ 2s, 0.3 ≥ 10s,
+  linear interpolation between), tool success rate, and
+  coherence (terminator + repeated-tri-gram heuristic).
+  `spawn_scorer_loop(store, cfg)` polls unscored rows every
+  30s in batches of 50.
+
+- **ExportEngine** (`3eed2cd`): four output formats —
+  `openai` (JSONL `messages: [system, user, assistant]`,
+  optionally with tool-call traces appended to the assistant
+  content), `anthropic` (JSONL legacy
+  `prompt: "\n\nHuman: ...\n\nAssistant:"` /
+  `completion: " ...\n\nHuman:"`), `generic` (JSONL with
+  every field), and `raw_json` (pretty-printed single JSON
+  array). Filter envelope (`ExportFilters`) deserialises
+  directly from `training.export` args: `min_quality_score`
+  defaults to 0.7 per spec, `max_interactions` triggers a
+  `quality_score DESC` sort so the highest-scoring rows ship
+  first, `include_tool_calls` defaults to true. Output
+  filename is `training_export_<set>_<unix_ms>.<ext>`;
+  zero-match exports create no file and return
+  `exported_count = 0`; successful exports stamp every row
+  with `exported = 1` + `export_set = <name>` in one
+  transaction.
+
+- **Coordinator capabilities** (`3eed2cd`): six unary +
+  JSON-encoded — `training.list_interactions` (paginated
+  summaries with filters: agent / session_id / model /
+  min_quality_score / date_from / date_to / exported),
+  `training.get_interaction` (full record by id),
+  `training.export` (runs the engine + persists the export
+  flag), `training.score_interaction` (force-rescore one row),
+  `training.stats` (total / exported / average score / 10-
+  bucket distribution + unscored / by_agent / by_model
+  ordered desc), `training.delete_interaction` (hard delete).
+  `controller_runtime.rs` gained `TrainingBundle` +
+  `build_training_bundle` (parallel to the metrics bundle), a
+  new `[training]` `ControllerConfig` field, and the
+  coordinator branch registers the six caps with categories
+  tags (`training, read` for list/get/stats,
+  `training, mutate` for score/delete,
+  `training, export, mutate` for export).
+
+- **Bridge HTTP endpoints** (`0320e32`):
+  `crates/relix-web-bridge/src/training.rs` — six routes
+  proxying onto the coordinator caps. Error mapping mirrors
+  `/v1/metrics/*`: INVALID_ARGS → 400, peer alias missing →
+  404, "no interaction with id ..." (responder shape) → 404
+  (the dispatch layer doesn't carry a NOT_FOUND kind so the
+  bridge sniffs the cause text — same idiom the empty-window
+  metrics surfaces use). End-to-end mini-mesh test
+  (`training_mini_mesh_test.rs`, 575 lines) boots a fake
+  coordinator with canned responders for every cap, dials
+  via `discover_and_pin`, mounts every route, and drives
+  reqwest requests through nine scenarios:
+  stats 200 / list 200 / get 200 / get-ghost 404 /
+  score 200 / export-bad-format 400 /
+  export-valid 200 / delete 200 / delete-ghost 404.
+
+- **CLI** (`0320e32`): `relix training {stats, list, show,
+  export, delete}`. `stats` renders a formatted aggregate
+  table with Unicode-bar score histogram + top agents +
+  top models. `list` is a sortable table newest-first.
+  `show` dumps the full record (system_prompt + user_message
+  + response + tool calls). `export` POSTs with format /
+  set_name / output_dir / min_quality_score / agent /
+  session_id / max / include_tool_calls. Every subcommand
+  accepts `--bridge <url>` (default
+  `http://127.0.0.1:19791`); read-paths accept `--raw` to
+  dump JSON.
+
+**Tests (+58 across the workspace)**
+
+- relix-runtime: 53 new (types 4 + store 12 + recorder 8 +
+  scorer 13 + exporter 11 + coordinator 2 + config 3).
+- relix-web-bridge: 3 new (`bad_request_returns_400`,
+  `list_query_defaults`, `training_mini_mesh_all_endpoints`).
+- relix-cli: 2 new (urlencode round-trip + spaces/slashes).
+
+**Quality gates**
+
+- `cargo fmt --all` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace`: 2129 runtime + 454 bridge +
+  238 CLI + every other crate green. Zero failures.
+
+**Not shipped this session (documented gaps):**
+
+- **PII anonymization / opt-in redaction across the four
+  memory layers** — the original §7.15 SKIPPED note flagged
+  this as the multi-day part. The training records ship raw
+  prompts + responses; operators are expected to either (a)
+  filter by `agent` / `session_id` to scope exports to
+  consented sessions, or (b) post-process the JSONL with
+  their own PII redactor before handing it to a fine-tuning
+  vendor. Building a proper redaction pipeline (Layer 1
+  Working Memory + Layer 2 Episodic + Layer 3 Observations +
+  Layer 4 Living Model passes, plus an opt-in surface per
+  agent + a privacy review) is correctly its own session.
+- **Streaming-path tool calls** — the
+  `ai.chat.stream` recorder writes `tool_calls: []` because
+  the streaming variant doesn't run the planner / tool
+  dispatch / approval pipeline (spec invariant from §6.5).
+  This is a design choice on the streaming surface, not a
+  limitation of the training pipeline; agents that want tool
+  use in training data run via unary `ai.chat`.
 
 ### 7.16 Agent-to-Agent Knowledge Transfer `[SKIPPED — Layer 3 observations + per-subject filtering already exist (Part 6 DONE in 41ad328…406a995); but adding cross-agent sharing flags, shared-collection queries, and the trust boundary work needed to prevent accidental data leak between agents requires careful schema + policy design that should not be rushed in a single session; deferred]`
 
