@@ -3367,13 +3367,10 @@ pub(crate) fn build_metrics_bundle(
     let (collector, handles) = crate::metrics::MetricsCollector::new(store.clone(), prices);
     let _spawned = handles.spawn(crate::metrics::RetentionConfig {
         retention_days: m_cfg.retention_days,
-        sweep_interval: std::time::Duration::from_secs(
-            m_cfg.retention_sweep_interval_secs.max(60),
-        ),
+        sweep_interval: std::time::Duration::from_secs(m_cfg.retention_sweep_interval_secs.max(60)),
     });
     let query = crate::metrics::MetricsQuery::new(store.clone());
-    let alert_engine =
-        crate::metrics::AlertEngine::new(query.clone(), m_cfg.thresholds.clone());
+    let alert_engine = crate::metrics::AlertEngine::new(query.clone(), m_cfg.thresholds.clone());
     tracing::info!(
         db = %db_path.display(),
         retention_days = m_cfg.retention_days,
@@ -3910,6 +3907,7 @@ fn register_node_type_handlers(
             input_guardrail,
             Some(tool_dispatcher),
             tool_mesh_cell,
+            metrics.map(|b| b.sink.clone()),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
@@ -4353,7 +4351,11 @@ fn register_node_type_handlers(
         // 503 for the operator.
         if let Some(b) = metrics.as_ref() {
             let alert_engine = b.alert_engine.clone();
-            crate::metrics::coordinator::register(bridge, b.query.clone(), Some(alert_engine.clone()));
+            crate::metrics::coordinator::register(
+                bridge,
+                b.query.clone(),
+                Some(alert_engine.clone()),
+            );
             for (method, doc) in metrics_capability_descriptors() {
                 manifest.add_capability(
                     CapabilityDescriptor::unary(*method)
@@ -4364,14 +4366,10 @@ fn register_node_type_handlers(
             // Spawn the alert-engine evaluation loop. Drops
             // the JoinHandle — the loop runs for the lifetime
             // of the controller.
-            let interval = std::time::Duration::from_secs(
-                b.alert_interval_secs.max(5),
-            );
+            let interval = std::time::Duration::from_secs(b.alert_interval_secs.max(5));
             let _alert_handle = alert_engine.spawn(
                 interval,
-                crate::metrics::alert::AlertSink::new(
-                    crate::metrics::alert::LoggingAlertSink,
-                ),
+                crate::metrics::alert::AlertSink::new(crate::metrics::alert::LoggingAlertSink),
             );
             tracing::info!(
                 interval_secs = b.alert_interval_secs,

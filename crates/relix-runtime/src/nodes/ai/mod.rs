@@ -267,6 +267,14 @@ fn entry_or_err(
 /// `ai.chat` proceeds without memory injection. The cell stays
 /// shared across all chat invocations, so the dispatcher is
 /// constructed exactly once per controller process.
+///
+/// `metrics_sink` is the RELIX-7.11 AI-side enrichment hook.
+/// When the operator has enabled `[metrics]` on this controller
+/// the runtime builds a `MetricsCollector` whose
+/// `attach_ai_usage` joins per-call token usage onto the metric
+/// row the dispatch bridge records. `None` keeps the AI node
+/// running in pre-7.11 mode — every metric column except
+/// `token_count` + `cost_micros` populates regardless.
 #[allow(clippy::too_many_arguments)]
 pub fn register(
     bridge: &mut DispatchBridge,
@@ -278,6 +286,7 @@ pub fn register(
     input_guardrail: guardrails::InputGuardrail,
     tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
     tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
+    metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
@@ -287,6 +296,7 @@ pub fn register(
     let guardrail_for_chat = input_guardrail.clone();
     let dispatcher_for_chat = tool_dispatcher.clone();
     let mesh_for_chat = tool_mesh.clone();
+    let metrics_for_chat = metrics_sink.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -298,7 +308,8 @@ pub fn register(
             let gr = guardrail_for_chat.clone();
             let td = dispatcher_for_chat.clone();
             let mesh = mesh_for_chat.clone();
-            async move { handle_chat(p, model, mem, soul, sk, gr, td, mesh, ctx).await }
+            let metrics = metrics_for_chat.clone();
+            async move { handle_chat(p, model, mem, soul, sk, gr, td, mesh, metrics, ctx).await }
         })),
     );
     // RELIX-2 step 3: register the streaming variant. Shares
@@ -869,6 +880,7 @@ async fn handle_chat(
     input_guardrail: guardrails::InputGuardrail,
     tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
     tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
+    metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
@@ -1025,6 +1037,23 @@ async fn handle_chat(
     let approval_token = extract_approval_token(s);
     match provider.generate_reply(input).await {
         Ok(output) => {
+            // RELIX-7.11: hand the provider-reported token usage
+            // to the metrics collector. The dispatch bridge
+            // records the metric row AFTER this handler returns;
+            // the collector's join cache pulls this hint out by
+            // request_id and merges it into the row before
+            // persisting. Silently no-op when no provider usage
+            // is available (mock provider, providers that don't
+            // ship usage on errors), or when no metrics sink is
+            // wired.
+            if let (Some(sink), Some(usage)) = (metrics_sink.as_ref(), output.usage.as_ref()) {
+                sink.attach_ai_usage(crate::metrics::AiUsageHint {
+                    request_id: ctx.request_id,
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    model: output.model.clone(),
+                });
+            }
             let plan = execution::Planner::parse_response(&output.text);
             let policy = execution::PolicyEngine::default_policy();
             let initial_verdict = policy.evaluate(&plan);
@@ -1273,6 +1302,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1285,6 +1315,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1301,6 +1332,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -1328,6 +1360,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"only-session-id"),
         )
         .await;
@@ -1349,6 +1382,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"|hello|"),
         )
         .await;
@@ -1391,6 +1425,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1431,6 +1466,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1462,6 +1498,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1494,6 +1531,7 @@ mod tests {
             guardrail,
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -1532,6 +1570,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1567,6 +1606,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1625,6 +1665,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -1664,6 +1705,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -1706,6 +1748,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1829,6 +1872,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1872,6 +1916,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1913,6 +1958,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1955,6 +2001,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2018,6 +2065,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2121,6 +2169,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2317,6 +2366,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -2349,6 +2399,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -2472,6 +2523,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -2507,6 +2559,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -2548,6 +2601,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
@@ -2733,5 +2787,203 @@ mod tests {
             }
             Ok(_) => panic!("expected upfront ErrorEnvelope when provider init fails"),
         }
+    }
+
+    // ── RELIX-7.11 GAP 1: AI handler → metrics sink ───────
+
+    /// Stub `MetricsSink` that records every `attach_ai_usage`
+    /// call into a shared `Mutex` so the GAP-1 tests can assert
+    /// what arrived.
+    #[derive(Default)]
+    struct RecordingMetricsSink {
+        hints: std::sync::Mutex<Vec<crate::metrics::AiUsageHint>>,
+    }
+
+    impl crate::metrics::MetricsSink for RecordingMetricsSink {
+        fn record_invocation(&self, _: crate::metrics::InvocationMetric) {
+            // The dispatch bridge owns this path; the AI handler
+            // tests only exercise the AI-side enrichment hook.
+        }
+        fn attach_ai_usage(&self, hint: crate::metrics::AiUsageHint) {
+            self.hints.lock().unwrap().push(hint);
+        }
+    }
+
+    /// Provider that ships a fixed `ChatOutput` carrying token
+    /// usage. Used to verify the AI handler forwards usage to
+    /// the metrics sink.
+    struct ProviderWithUsage {
+        text: String,
+        model: &'static str,
+        usage: provider::TokenUsage,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for ProviderWithUsage {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Ok(provider::ChatOutput {
+                text: self.text.clone(),
+                provider: "test-with-usage",
+                model: self.model.to_string(),
+                usage: Some(self.usage),
+            })
+        }
+        fn provider_name(&self) -> &'static str {
+            "test-with-usage"
+        }
+    }
+
+    /// Same shape as `ProviderWithUsage` but ships
+    /// `usage: None`.
+    struct ProviderNoUsage {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for ProviderNoUsage {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Ok(provider::ChatOutput {
+                text: self.text.clone(),
+                provider: "test-no-usage",
+                model: "doesnt-matter".to_string(),
+                usage: None,
+            })
+        }
+        fn provider_name(&self) -> &'static str {
+            "test-no-usage"
+        }
+    }
+
+    fn ctx_with_request_id(args: &[u8], rid: RequestId) -> InvocationCtx {
+        let mut c = ctx(args);
+        c.request_id = rid;
+        c
+    }
+
+    #[tokio::test]
+    async fn ai_handler_forwards_token_usage_to_metrics_sink() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(ProviderWithUsage {
+            text: "hello back".into(),
+            model: "gpt-4o-mini",
+            usage: provider::TokenUsage {
+                prompt_tokens: 50,
+                completion_tokens: 17,
+                total_tokens: 67,
+            },
+        });
+        let sink = Arc::new(RecordingMetricsSink::default());
+        let sink_dyn: Arc<dyn crate::metrics::MetricsSink> = sink.clone();
+        let rid = RequestId([7u8; 16]);
+        let outcome = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            None,
+            Arc::new(tokio::sync::OnceCell::new()),
+            Some(sink_dyn),
+            ctx_with_request_id(b"sess1|please respond|", rid),
+        )
+        .await;
+        assert!(matches!(outcome, HandlerOutcome::Ok(_)));
+        let hints = sink.hints.lock().unwrap();
+        assert_eq!(hints.len(), 1, "expected exactly one usage hint");
+        let h = &hints[0];
+        assert_eq!(h.request_id, rid, "request_id must thread through ctx");
+        assert_eq!(h.prompt_tokens, 50);
+        assert_eq!(h.completion_tokens, 17);
+        assert_eq!(h.model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn ai_handler_skips_attach_when_provider_omits_usage() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(ProviderNoUsage { text: "ack".into() });
+        let sink = Arc::new(RecordingMetricsSink::default());
+        let sink_dyn: Arc<dyn crate::metrics::MetricsSink> = sink.clone();
+        let outcome = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            None,
+            Arc::new(tokio::sync::OnceCell::new()),
+            Some(sink_dyn),
+            ctx(b"sess2|hi|"),
+        )
+        .await;
+        assert!(matches!(outcome, HandlerOutcome::Ok(_)));
+        let hints = sink.hints.lock().unwrap();
+        assert!(
+            hints.is_empty(),
+            "no provider usage → no attach_ai_usage call (got {} hints)",
+            hints.len()
+        );
+    }
+
+    /// End-to-end through the collector — verifies the usage
+    /// hint actually lands on the dispatch row when both the
+    /// handler attaches and the dispatch records.
+    #[tokio::test]
+    async fn ai_usage_round_trips_through_collector_to_store() {
+        use crate::metrics::{
+            AiUsageHint, InvocationMetric, MetricsCollector, MetricsSink, MetricsStore, PriceTable,
+            RetentionConfig,
+        };
+        let store = MetricsStore::in_memory().unwrap();
+        let prices = PriceTable::with_defaults();
+        let (col, handles) = MetricsCollector::new(store.clone(), prices);
+        let _spawned = handles.spawn(RetentionConfig {
+            retention_days: 30,
+            sweep_interval: std::time::Duration::from_secs(3600),
+        });
+        let rid = RequestId([42u8; 16]);
+        // Simulate the AI handler: attach usage before the
+        // dispatch records.
+        col.attach_ai_usage(AiUsageHint {
+            request_id: rid,
+            prompt_tokens: 100,
+            completion_tokens: 200,
+            model: "gpt-4o-mini".into(),
+        });
+        // Simulate the dispatch hot path: record the metric.
+        col.record_invocation(InvocationMetric {
+            agent_name: "alice".into(),
+            peer_alias: "ai".into(),
+            method: "ai.chat".into(),
+            timestamp_ms: 1_700_000_000_000,
+            latency_ms: 12,
+            success: true,
+            error_kind: None,
+            token_count: None,
+            cost_micros: None,
+            input_bytes: 32,
+            output_bytes: 64,
+            model: None,
+            request_id: Some(rid),
+        });
+        // Let the drain loop flush.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let (tokens, cost, model): (Option<i64>, Option<i64>, Option<String>) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT token_count, cost_micros, model FROM metrics_invocations",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(tokens, Some(300));
+        assert!(cost.unwrap() > 0);
+        assert_eq!(model.as_deref(), Some("gpt-4o-mini"));
     }
 }
