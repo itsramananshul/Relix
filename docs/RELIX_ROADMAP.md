@@ -1488,9 +1488,126 @@ four shapes the major fine-tuning platforms expect.
   limitation of the training pipeline; agents that want tool
   use in training data run via unary `ai.chat`.
 
-### 7.16 Agent-to-Agent Knowledge Transfer `[SKIPPED — Layer 3 observations + per-subject filtering already exist (Part 6 DONE in 41ad328…406a995); but adding cross-agent sharing flags, shared-collection queries, and the trust boundary work needed to prevent accidental data leak between agents requires careful schema + policy design that should not be rushed in a single session; deferred]`
+### 7.16 Agent-to-Agent Knowledge Transfer `[DONE — commits 3089b51 + 51141e5]`
 
-When one agent learns something useful — a pattern, a user preference, a domain fact — it can share that knowledge with other agents in the same tenant. The Layer 3 observation system makes this natural: observations can be tagged as shareable and pushed to a shared collection that multiple agents query.
+When one agent learns something useful — a pattern, a user preference, a domain fact — it can share that knowledge with other agents in the same deployment. Built ON TOP of the existing Layer 3 observation surface — no replacement, no duplicate storage. Operators flag observations `shareable = true` + pick a `share_policy`; the new `KnowledgeService` copies them between agents through a trust-checker gate.
+
+**Shipped this session:**
+
+- **Schema migration (commit 3089b51)**: four new columns on
+  `memory_records` (`shareable INTEGER`, `shared_with TEXT`,
+  `shared_by TEXT`, `share_policy TEXT DEFAULT 'none'`) +
+  two new indexes. Backwards-compat ALTER guarded by a
+  `column_exists` PRAGMA probe — pre-7.16 databases pick up
+  the new columns on open with safe defaults. The promoter
+  inherits `shareable` + `share_policy` through the
+  Raw → Semantic → Observation → Model chain so an operator
+  flag at the source carries forward.
+- **`SharePolicy` enum**: `None` (default — never shared) /
+  `Explicit` (operator must call `knowledge.share`) /
+  `Auto` (background task propagates on next tick).
+- **`[[knowledge.groups]]` config** (commit 3089b51):
+  operators define sharing groups with `name` / `members` /
+  `auto_share_layers` / `min_quality_score`. An agent can
+  be in multiple groups. The `GroupResolver` caches a
+  per-agent → groups index so dispatch is one map lookup.
+  Validation rejects duplicate names + empty names at boot.
+- **`TrustChecker`** (commit 3089b51): pre-insert gate. Eight
+  layered checks, fail-fast with a structured
+  `RejectReason`:
+  1. Group membership (sender + receiver must share a
+     group).
+  2. Layer guard (only Layer 3 observations are shareable
+     today; Raw / Semantic / Model reject).
+  3. Shareable flag (`shareable=false` rejects).
+  4. Invalidation (`valid_to.is_some()` rejects).
+  5. Ownership (record's `source` must match claimed
+     sender — operators cannot repackage another agent's
+     observations).
+  6. Memory-guard poison detection (prompt injection
+     patterns reject before SQL).
+  7. Quality floor (when the matched group sets
+     `min_quality_score`, records below the floor or
+     without a `quality:<f>` tag reject).
+  8. Observation-count cap (`max_observations_per_agent`,
+     default 10,000). When accepting would exceed the cap,
+     the receiver's lowest-quality existing observations
+     are invalidated first.
+- **Five coordinator capabilities** (commit 3089b51,
+  registered on the memory node where the data lives):
+  - `knowledge.share { source_agent, target_agents,
+    observation_ids, message? }` → `{ shared_count,
+    rejection_count, rejections, created_ids, events }`.
+    Copy ids are `blake3(source_id|target)` so re-shares
+    are idempotent. Source row's `shared_with` accrues
+    each target name.
+  - `knowledge.list_shared { agent, shared_by?, date_from?,
+    date_to?, min_quality_score? }` → `Vec<ListSharedRow>`.
+    Lists observations the agent has RECEIVED (rows with
+    `shared_by IS NOT NULL` AND `source = agent`).
+  - `knowledge.group_broadcast { caller_agent, group,
+    observation_ids, message? }` → `{ group, per_target }`.
+    Validates the caller is a member of the group; copies
+    to every OTHER member.
+  - `knowledge.groups` → `Vec<SharingGroup>` (the resolved
+    config).
+  - `knowledge.revoke { observation_ids }` →
+    `{ revoked_count, missing_ids, events }`. Soft-deletes
+    each received copy (sets `valid_to = now`). The source
+    observation on the originating agent is unaffected.
+    Operators trying to revoke non-copy rows get them
+    listed in `missing_ids` with a tracing warn.
+- **AutoShareTask** (commit 3089b51): periodic
+  `tokio::task` that runs every
+  `[knowledge] auto_share_interval_secs` (default 60s).
+  Walks every group's members, finds Layer 3 observations
+  with `share_policy = Auto` newer than the per-agent
+  cursor, propagates each via `KnowledgeService::share`.
+  Per-agent cursor advances after the tick completes so a
+  crash mid-tick retries on the next pass (idempotent copy
+  ids absorb the duplicate).
+- **Chronicle events** (commit 3089b51): `KnowledgeEvent`
+  with five kinds (`shared`, `auto_shared`,
+  `group_broadcast`, `revoked`, `rejected`). Every service
+  call returns the event list so the dispatch glue can
+  relay them to the coordinator chronicle. Rejected
+  events carry the structured rejection reason for
+  audit.
+- **Bridge endpoints** (commit 51141e5): five routes — `POST
+  /v1/knowledge/share`, `GET /v1/knowledge/shared/:agent`,
+  `POST /v1/knowledge/broadcast`, `GET /v1/knowledge/groups`,
+  `POST /v1/knowledge/revoke`. Default peer alias is
+  `memory`; every POST body accepts an optional `peer`
+  override. Validates required fields BEFORE dialing the
+  mesh.
+- **CLI** (commit 51141e5): `relix knowledge {groups,
+  share, broadcast, shared, revoke}` with the documented
+  flag shapes. `--from`, `--to`, `--ids` accept comma-
+  separated lists. Read paths accept `--raw` for verbatim
+  JSON dump.
+
+**Tests added this session (+49):** 4 schema migration cases
+(round-trip, defaults, persisted share fields, pre-7.16
+migration, idempotent re-open), 8 config cases (resolver,
+share_path, multi-group membership, duplicate-name reject,
+empty-name reject, auto_layers, full TOML parse,
+has_active_groups), 9 trust-checker cases (every reject
+reason + accept + cap eviction), 11 service cases (share /
+list / broadcast / revoke happy + rejection + idempotency),
+6 AutoShareTask cases (Auto propagates, None / Explicit
+skipped, poison rejects, cursor advances, layer filter), 2
+chronicle cases (event shape + skip-on-none), 4 coordinator
+dispatch cases (caps register, descriptors cover every cap,
+empty-targets reject, groups handler returns config), 2
+bridge cases (bad_request + 6-scenario mini-mesh), 3 CLI
+cases (split_csv + urlencode round-trip).
+
+**Quality gates green:**
+- `cargo fmt --all` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`
+  clean.
+- `cargo test --workspace`: runtime 2228 (+47), bridge 456
+  (+2), CLI 240 (+2), every other crate green. Zero failures.
 
 ### 7.17 Relix as a Backend for AI-Native Apps `[DONE — existing bridge /v1/* surface + Rust SDK (commit 90eba16)]`
 
