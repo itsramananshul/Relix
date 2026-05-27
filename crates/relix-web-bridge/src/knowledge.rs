@@ -211,6 +211,37 @@ pub async fn revoke(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RecallRequest {
+    pub source_agent: String,
+    pub source_observation_ids: Vec<String>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+/// `POST /v1/knowledge/recall` — RELIX-7.16 GAP 2.
+pub async fn recall(
+    State(state): State<AppState>,
+    Json(req): Json<RecallRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.source_agent.trim().is_empty() {
+        return bad_request("source_agent is required");
+    }
+    if req.source_observation_ids.is_empty() {
+        return bad_request("source_observation_ids must list at least one id");
+    }
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = serde_json::json!({
+        "source_agent": req.source_agent,
+        "source_observation_ids": req.source_observation_ids,
+    });
+    match call_peer_json(&state, &peer, "knowledge.recall", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────
 
 fn bad_request(msg: &str) -> axum::response::Response {

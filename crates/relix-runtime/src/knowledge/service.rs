@@ -126,6 +126,40 @@ pub struct RevokeResult {
     pub events: Vec<KnowledgeEvent>,
 }
 
+/// Result of [`KnowledgeService::recall`]. Per-target
+/// breakdown so operators see exactly which receivers had
+/// their copy revoked.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecallResult {
+    /// Number of source observation ids the call processed
+    /// (each one walked + per-target revoked).
+    pub source_ids_processed: u64,
+    /// Total receiver copies invalidated across every target.
+    pub total_copies_revoked: u64,
+    /// Per `(target_agent, count)` breakdown.
+    pub per_target: Vec<RecallTargetSummary>,
+    /// Source ids that resolved to no row on the source agent
+    /// — operators see exactly which inputs were skipped.
+    pub missing_source_ids: Vec<String>,
+    /// Source ids that were rejected because the caller is
+    /// not the owning agent.
+    pub unauthorised_source_ids: Vec<String>,
+    pub events: Vec<KnowledgeEvent>,
+}
+
+/// One `(target_agent, copies_revoked)` row in
+/// [`RecallResult::per_target`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecallTargetSummary {
+    pub target_agent: String,
+    pub copies_revoked: u64,
+    /// Receiver copy ids that the call expected to exist (via
+    /// the source's `shared_with` list) but were already
+    /// revoked / hard-deleted. Empty in the steady state.
+    #[serde(default)]
+    pub missing_copy_ids: Vec<String>,
+}
+
 /// Errors the service surfaces to the dispatch glue.
 #[derive(Debug, thiserror::Error)]
 pub enum ShareError {
@@ -223,7 +257,18 @@ impl KnowledgeService {
                     Ok(ok) => {
                         let copy = build_copy(&record, target, req.message.as_deref());
                         self.store.insert(&copy)?;
-                        self.append_shared_with(&record, target)?;
+                        // RELIX-7.16 GAP 2 invariant: re-read the
+                        // CURRENT source row before appending so
+                        // multiple targets in one share call
+                        // accumulate correctly. The previous
+                        // append-from-loop-snapshot path lost the
+                        // earlier target's entry when N>1 targets
+                        // shared a single observation.
+                        let fresh = self
+                            .store
+                            .get(&record.id)?
+                            .unwrap_or_else(|| record.clone());
+                        self.append_shared_with(&fresh, target)?;
                         out.shared_count += 1;
                         out.created_ids.push(copy.id.clone());
                         out.events.push(KnowledgeEvent::shared(
@@ -414,6 +459,102 @@ impl KnowledgeService {
                 vec![id.clone()],
             ));
             out.revoked_count += 1;
+        }
+        Ok(out)
+    }
+
+    /// Implementation of `knowledge.recall`. Walks every
+    /// source-side observation id, reads its `shared_with`
+    /// list, computes the deterministic copy id at each
+    /// receiver (`mint_copy_id(source_id, receiver)`),
+    /// soft-deletes the copy via `LayeredMemoryStore::invalidate`,
+    /// and writes one chronicle event per revocation.
+    ///
+    /// The SOURCE observation is NOT touched — operators
+    /// keep their original record and `shared_with` list
+    /// intact. Only the receiver copies are invalidated.
+    ///
+    /// Trust: the caller must be the source agent. Each
+    /// source observation whose `source` column doesn't
+    /// match `caller_agent` lands in
+    /// [`RecallResult::unauthorised_source_ids`] and is
+    /// skipped — operators see exactly which inputs were
+    /// rejected and why.
+    pub fn recall(
+        &self,
+        caller_agent: &str,
+        source_observation_ids: &[String],
+    ) -> Result<RecallResult, ShareError> {
+        if caller_agent.trim().is_empty() {
+            return Err(ShareError::InvalidArgs("source_agent is required".into()));
+        }
+        if source_observation_ids.is_empty() {
+            return Err(ShareError::InvalidArgs(
+                "source_observation_ids must list at least one id".into(),
+            ));
+        }
+        let mut out = RecallResult::default();
+        let now = unix_now();
+        // Accumulate per-target counts into a BTreeMap so the
+        // output order is stable across runs (operators
+        // diffing CLI output get deterministic results).
+        let mut per_target: std::collections::BTreeMap<String, (u64, Vec<String>)> =
+            std::collections::BTreeMap::new();
+        for source_id in source_observation_ids {
+            let rec = match self.store.get(source_id)? {
+                Some(r) => r,
+                None => {
+                    out.missing_source_ids.push(source_id.clone());
+                    continue;
+                }
+            };
+            // Ownership gate: caller must be the source.
+            if rec.source != caller_agent {
+                out.unauthorised_source_ids.push(source_id.clone());
+                continue;
+            }
+            out.source_ids_processed += 1;
+            for target in rec.shared_with.iter() {
+                let copy_id = mint_copy_id(source_id, target);
+                let entry = per_target
+                    .entry(target.clone())
+                    .or_insert_with(|| (0, Vec::new()));
+                let copy = match self.store.get(&copy_id)? {
+                    Some(c) => c,
+                    None => {
+                        entry.1.push(copy_id);
+                        continue;
+                    }
+                };
+                if copy.valid_to.is_some() {
+                    // Already revoked; still emit the chronicle
+                    // event so the audit trail records the
+                    // operator intent.
+                    entry.0 += 1;
+                    out.total_copies_revoked += 1;
+                    out.events.push(KnowledgeEvent::revoked(
+                        Some(caller_agent.to_string()),
+                        Some(target.clone()),
+                        vec![copy.id.clone()],
+                    ));
+                    continue;
+                }
+                self.store.invalidate(&copy.id, now)?;
+                entry.0 += 1;
+                out.total_copies_revoked += 1;
+                out.events.push(KnowledgeEvent::revoked(
+                    Some(caller_agent.to_string()),
+                    Some(target.clone()),
+                    vec![copy.id.clone()],
+                ));
+            }
+        }
+        for (target_agent, (copies_revoked, missing_copy_ids)) in per_target {
+            out.per_target.push(RecallTargetSummary {
+                target_agent,
+                copies_revoked,
+                missing_copy_ids,
+            });
         }
         Ok(out)
     }
@@ -685,6 +826,181 @@ mod tests {
         // in missing_ids with a tracing warn.
         assert_eq!(r.revoked_count, 0);
         assert_eq!(r.missing_ids, vec!["source".to_string()]);
+    }
+
+    // ── RELIX-7.16 GAP 2: knowledge.recall ─────────────────
+
+    #[test]
+    fn recall_revokes_every_copy_of_a_source_observation_across_all_receivers() {
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into(), "carol".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
+        store.insert(&obs("a1", "alice", "fact one", true)).unwrap();
+        svc.share(&ShareRequest {
+            source_agent: "alice".into(),
+            target_agents: vec!["bob".into(), "carol".into()],
+            observation_ids: vec!["a1".into()],
+            message: None,
+        })
+        .unwrap();
+        let bob_copy = mint_copy_id("a1", "bob");
+        let carol_copy = mint_copy_id("a1", "carol");
+        // Pre-recall: both copies are valid.
+        assert!(store.get(&bob_copy).unwrap().unwrap().valid_to.is_none());
+        assert!(store.get(&carol_copy).unwrap().unwrap().valid_to.is_none());
+        let r = svc.recall("alice", &["a1".into()]).unwrap();
+        assert_eq!(r.source_ids_processed, 1);
+        assert_eq!(r.total_copies_revoked, 2);
+        // Per-target rows are sorted: bob, carol.
+        let names: Vec<&str> = r
+            .per_target
+            .iter()
+            .map(|t| t.target_agent.as_str())
+            .collect();
+        assert_eq!(names, vec!["bob", "carol"]);
+        // Both copies are now invalidated.
+        assert!(store.get(&bob_copy).unwrap().unwrap().valid_to.is_some());
+        assert!(store.get(&carol_copy).unwrap().unwrap().valid_to.is_some());
+        // Source row is UNTOUCHED.
+        let src = store.get("a1").unwrap().unwrap();
+        assert!(src.valid_to.is_none(), "source must survive recall");
+        // Chronicle events: one per (target, copy).
+        assert_eq!(r.events.len(), 2);
+    }
+
+    #[test]
+    fn recall_rejects_when_caller_is_not_the_source_agent() {
+        let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
+        store.insert(&obs("a1", "alice", "fact", true)).unwrap();
+        svc.share(&ShareRequest {
+            source_agent: "alice".into(),
+            target_agents: vec!["bob".into()],
+            observation_ids: vec!["a1".into()],
+            message: None,
+        })
+        .unwrap();
+        // Mallory tries to recall alice's observation.
+        let r = svc.recall("mallory", &["a1".into()]).unwrap();
+        assert_eq!(r.total_copies_revoked, 0);
+        assert_eq!(r.unauthorised_source_ids, vec!["a1".to_string()]);
+        // The copy on bob's side is UNTOUCHED.
+        let copy = store.get(&mint_copy_id("a1", "bob")).unwrap().unwrap();
+        assert!(copy.valid_to.is_none());
+    }
+
+    #[test]
+    fn recall_returns_zero_for_source_with_no_shared_with_entries() {
+        let (svc, store) = service(&["alice"], SharePolicy::Explicit);
+        // Source observation exists but was never shared.
+        store
+            .insert(&obs("a1", "alice", "private fact", true))
+            .unwrap();
+        let r = svc.recall("alice", &["a1".into()]).unwrap();
+        assert_eq!(r.source_ids_processed, 1);
+        assert_eq!(r.total_copies_revoked, 0);
+        assert!(r.per_target.is_empty());
+        assert!(r.missing_source_ids.is_empty());
+        assert!(r.unauthorised_source_ids.is_empty());
+    }
+
+    #[test]
+    fn recall_lists_missing_source_ids_separately_from_unauthorised() {
+        let (svc, _store) = service(&["alice"], SharePolicy::Explicit);
+        let r = svc.recall("alice", &["ghost".into()]).unwrap();
+        assert_eq!(r.total_copies_revoked, 0);
+        assert_eq!(r.missing_source_ids, vec!["ghost".to_string()]);
+        assert!(r.unauthorised_source_ids.is_empty());
+    }
+
+    #[test]
+    fn recall_per_target_breakdown_carries_correct_counts() {
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into(), "carol".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
+        store.insert(&obs("a1", "alice", "fact one", true)).unwrap();
+        store.insert(&obs("a2", "alice", "fact two", true)).unwrap();
+        // Share a1 to both bob and carol; share a2 only to bob.
+        svc.share(&ShareRequest {
+            source_agent: "alice".into(),
+            target_agents: vec!["bob".into(), "carol".into()],
+            observation_ids: vec!["a1".into()],
+            message: None,
+        })
+        .unwrap();
+        svc.share(&ShareRequest {
+            source_agent: "alice".into(),
+            target_agents: vec!["bob".into()],
+            observation_ids: vec!["a2".into()],
+            message: None,
+        })
+        .unwrap();
+        let r = svc.recall("alice", &["a1".into(), "a2".into()]).unwrap();
+        assert_eq!(r.source_ids_processed, 2);
+        // bob has two revocations (a1 + a2), carol has one (a1).
+        let bob = r
+            .per_target
+            .iter()
+            .find(|t| t.target_agent == "bob")
+            .unwrap();
+        assert_eq!(bob.copies_revoked, 2);
+        let carol = r
+            .per_target
+            .iter()
+            .find(|t| t.target_agent == "carol")
+            .unwrap();
+        assert_eq!(carol.copies_revoked, 1);
+    }
+
+    #[test]
+    fn recall_writes_chronicle_events_for_every_copy() {
+        let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
+        store.insert(&obs("a1", "alice", "fact", true)).unwrap();
+        svc.share(&ShareRequest {
+            source_agent: "alice".into(),
+            target_agents: vec!["bob".into()],
+            observation_ids: vec!["a1".into()],
+            message: None,
+        })
+        .unwrap();
+        let r = svc.recall("alice", &["a1".into()]).unwrap();
+        assert_eq!(r.events.len(), 1);
+        let ev = &r.events[0];
+        assert_eq!(ev.event_type(), "knowledge.revoked");
+        assert_eq!(ev.source_agent.as_deref(), Some("alice"));
+        assert_eq!(ev.target_agent.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn recall_returns_invalid_args_on_empty_inputs() {
+        let (svc, _store) = service(&["alice"], SharePolicy::Explicit);
+        assert!(matches!(
+            svc.recall("", &["a".into()]),
+            Err(ShareError::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            svc.recall("alice", &[]),
+            Err(ShareError::InvalidArgs(_))
+        ));
     }
 
     #[test]

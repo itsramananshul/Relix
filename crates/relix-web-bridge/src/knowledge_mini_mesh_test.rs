@@ -143,6 +143,11 @@ async fn knowledge_mini_mesh_all_endpoints() {
         name = "ops_revoke"
         method = "knowledge.revoke"
         allow_groups = ["operators"]
+
+        [[rules]]
+        name = "ops_recall"
+        method = "knowledge.recall"
+        allow_groups = ["operators"]
         "#,
     );
 
@@ -198,12 +203,29 @@ async fn knowledge_mini_mesh_all_endpoints() {
             "recorded_at": 1_700_000_000_i64
         }]
     });
+    let recall_response = serde_json::json!({
+        "source_ids_processed": 1,
+        "total_copies_revoked": 2,
+        "per_target": [
+            { "target_agent": "bob", "copies_revoked": 1, "missing_copy_ids": [] },
+            { "target_agent": "carol", "copies_revoked": 1, "missing_copy_ids": [] }
+        ],
+        "missing_source_ids": [],
+        "unauthorised_source_ids": [],
+        "events": [
+            { "kind": "revoked", "source_agent": "alice", "target_agent": "bob",
+              "observation_ids": ["copy-bob"], "recorded_at": 1_700_000_000_i64 },
+            { "kind": "revoked", "source_agent": "alice", "target_agent": "carol",
+              "observation_ids": ["copy-carol"], "recorded_at": 1_700_000_000_i64 }
+        ]
+    });
 
     let share_arc = Arc::new(share_response.clone());
     let list_arc = Arc::new(list_shared_response.clone());
     let groups_arc = Arc::new(groups_response.clone());
     let broadcast_arc = Arc::new(broadcast_response.clone());
     let revoke_arc = Arc::new(revoke_response.clone());
+    let recall_arc = Arc::new(recall_response.clone());
 
     dispatch.register(
         "knowledge.share",
@@ -249,6 +271,16 @@ async fn knowledge_mini_mesh_all_endpoints() {
         "knowledge.revoke",
         Arc::new(FnHandler({
             let r = revoke_arc.clone();
+            move |_ctx: InvocationCtx| {
+                let r = r.clone();
+                async move { HandlerOutcome::Ok(serde_json::to_vec(&*r).unwrap_or_default()) }
+            }
+        })),
+    );
+    dispatch.register(
+        "knowledge.recall",
+        Arc::new(FnHandler({
+            let r = recall_arc.clone();
             move |_ctx: InvocationCtx| {
                 let r = r.clone();
                 async move { HandlerOutcome::Ok(serde_json::to_vec(&*r).unwrap_or_default()) }
@@ -347,6 +379,7 @@ addr = "{}"
         .route("/v1/knowledge/broadcast", post(crate::knowledge::broadcast))
         .route("/v1/knowledge/groups", get(crate::knowledge::groups))
         .route("/v1/knowledge/revoke", post(crate::knowledge::revoke))
+        .route("/v1/knowledge/recall", post(crate::knowledge::recall))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = listener.local_addr().unwrap();
@@ -447,4 +480,52 @@ addr = "{}"
     assert_eq!(resp.status().as_u16(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body, revoke_response);
+
+    // 7. POST /v1/knowledge/recall → 200 + per_target breakdown
+    let url = format!("http://{}/v1/knowledge/recall", bound);
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({
+                "source_agent": "alice",
+                "source_observation_ids": ["obs-1"]
+            }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, recall_response);
+
+    // 8. POST /v1/knowledge/recall with empty source_agent → 400
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({
+                "source_agent": "",
+                "source_observation_ids": ["obs-1"]
+            }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+
+    // 9. POST /v1/knowledge/recall with empty ids → 400
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({
+                "source_agent": "alice",
+                "source_observation_ids": []
+            }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
 }

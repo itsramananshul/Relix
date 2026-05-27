@@ -548,6 +548,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/knowledge/broadcast", post(knowledge::broadcast))
         .route("/v1/knowledge/groups", get(knowledge::groups))
         .route("/v1/knowledge/revoke", post(knowledge::revoke))
+        .route("/v1/knowledge/recall", post(knowledge::recall))
         // Four-layer memory inspector. Reads the layered store
         // directly from `AppState::layered_memory` — set
         // `[bridge] memory_db_path` to enable.

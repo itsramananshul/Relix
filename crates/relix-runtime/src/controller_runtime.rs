@@ -4235,6 +4235,7 @@ fn register_node_type_handlers(
                             &["mutate", "memory", "knowledge"]
                         }
                         "knowledge.revoke" => &["mutate", "memory", "knowledge"],
+                        "knowledge.recall" => &["mutate", "memory", "knowledge"],
                         _ => &["read", "memory", "knowledge"],
                     };
                     manifest.add_capability(

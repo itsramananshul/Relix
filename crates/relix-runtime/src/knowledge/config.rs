@@ -254,6 +254,21 @@ pub fn sharing_group_descriptors() -> &'static [(&'static str, &'static str)] {
              written to the chronicle. Returns \
              `{revoked_count, missing_ids:[..]}`.",
         ),
+        (
+            "knowledge.recall",
+            "RELIX-7.16 GAP 2: recall SOURCE observations across \
+             every receiver they were shared with. Args JSON: \
+             `{source_agent, source_observation_ids:[..]}`. \
+             For each source id the service reads its \
+             `shared_with` list, computes the deterministic copy \
+             id at each receiver, soft-deletes that copy, and \
+             writes a chronicle event. The source record itself \
+             is unaffected. Trust gate: the caller must be the \
+             source agent (the record's `source` column must \
+             match). Returns `{source_ids_processed, \
+             total_copies_revoked, per_target:[..], \
+             missing_source_ids:[..], unauthorised_source_ids:[..]}`.",
+        ),
     ]
 }
 

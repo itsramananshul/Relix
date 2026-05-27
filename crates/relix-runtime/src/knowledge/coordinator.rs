@@ -67,12 +67,22 @@ pub fn register(bridge: &mut DispatchBridge, service: Arc<KnowledgeService>) {
         );
     }
     {
-        let svc = service;
+        let svc = service.clone();
         bridge.register(
             "knowledge.revoke",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let svc = svc.clone();
                 async move { handle_revoke(&svc, &ctx) }
+            })),
+        );
+    }
+    {
+        let svc = service;
+        bridge.register(
+            "knowledge.recall",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let svc = svc.clone();
+                async move { handle_recall(&svc, &ctx) }
             })),
         );
     }
@@ -168,6 +178,32 @@ fn handle_revoke(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome 
         return invalid("observation_ids must list at least one id");
     }
     match svc.revoke(&args.observation_ids) {
+        Ok(res) => ok_json(&res),
+        Err(ShareError::InvalidArgs(m)) => invalid(&m),
+        Err(e) => internal(&e),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RecallArgs {
+    #[serde(default)]
+    source_agent: String,
+    #[serde(default)]
+    source_observation_ids: Vec<String>,
+}
+
+fn handle_recall(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome {
+    let args: RecallArgs = match decode(ctx) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    if args.source_agent.trim().is_empty() {
+        return invalid("source_agent is required");
+    }
+    if args.source_observation_ids.is_empty() {
+        return invalid("source_observation_ids must list at least one id");
+    }
+    match svc.recall(&args.source_agent, &args.source_observation_ids) {
         Ok(res) => ok_json(&res),
         Err(ShareError::InvalidArgs(m)) => invalid(&m),
         Err(e) => internal(&e),

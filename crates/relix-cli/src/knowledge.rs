@@ -91,6 +91,23 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// RELIX-7.16 GAP 2: recall SOURCE observations across
+    /// every receiver they were shared with. The source
+    /// observation itself is not deleted — only the copies on
+    /// the receivers.
+    Recall {
+        /// The source agent — must match each observation's
+        /// `source` column.
+        #[arg(long)]
+        from: String,
+        /// Comma-separated list of SOURCE observation ids.
+        #[arg(long)]
+        ids: String,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -144,6 +161,15 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Revoke { ids, bridge, raw } => {
             let observation_ids = split_csv(&ids);
             revoke(&bridge, &observation_ids, raw).await
+        }
+        Cmd::Recall {
+            from,
+            ids,
+            bridge,
+            raw,
+        } => {
+            let observation_ids = split_csv(&ids);
+            recall(&bridge, &from, &observation_ids, raw).await
         }
     }
 }
@@ -375,6 +401,72 @@ async fn revoke(bridge: &str, ids: &[String], raw: bool) -> Result<(), Box<dyn s
                 if let Some(s) = m.as_str() {
                     println!("  ? {s}");
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn recall(
+    bridge: &str,
+    from: &str,
+    ids: &[String],
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if from.trim().is_empty() {
+        return Err("--from is required".into());
+    }
+    if ids.is_empty() {
+        return Err("--ids must list at least one source observation id".into());
+    }
+    let url = format!("{}/v1/knowledge/recall", bridge.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "source_agent": from,
+        "source_observation_ids": ids,
+    });
+    let resp = http_post_json(&url, &body).await?;
+    if raw {
+        println!("{resp}");
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&resp).map_err(|e| format!("decode: {e}"))?;
+    let processed = v
+        .get("source_ids_processed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = v
+        .get("total_copies_revoked")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    println!("source_ids_processed:  {processed}");
+    println!("total_copies_revoked:  {total}");
+    if let Some(targets) = v.get("per_target").and_then(Value::as_array)
+        && !targets.is_empty()
+    {
+        println!("per_target:");
+        for t in targets {
+            let agent = t.get("target_agent").and_then(Value::as_str).unwrap_or("?");
+            let revoked = t.get("copies_revoked").and_then(Value::as_u64).unwrap_or(0);
+            println!("  {agent}: {revoked}");
+        }
+    }
+    if let Some(missing) = v.get("missing_source_ids").and_then(Value::as_array)
+        && !missing.is_empty()
+    {
+        println!("missing_source_ids:");
+        for id in missing {
+            if let Some(s) = id.as_str() {
+                println!("  ? {s}");
+            }
+        }
+    }
+    if let Some(unauth) = v.get("unauthorised_source_ids").and_then(Value::as_array)
+        && !unauth.is_empty()
+    {
+        println!("unauthorised_source_ids (caller is not the source agent):");
+        for id in unauth {
+            if let Some(s) = id.as_str() {
+                println!("  ✗ {s}");
             }
         }
     }
