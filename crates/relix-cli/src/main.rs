@@ -15,6 +15,7 @@ mod install;
 mod mcp;
 mod memory_inspect;
 mod mesh;
+mod metrics;
 mod ops;
 mod os_secure;
 mod ping;
@@ -110,6 +111,17 @@ enum Cmd {
     Email {
         #[command(subcommand)]
         cmd: email::Cmd,
+    },
+    /// RELIX-7.11 agent performance metrics surface.
+    /// `metrics summary [--agent X] [--hours N]` — tabular view.
+    /// `metrics alerts` — active alerts with severity badges.
+    /// `metrics cost [--hours N]` — cost by (agent, method).
+    /// `metrics timeseries --agent X [--hours 6] [--bucket 5]` —
+    /// ASCII sparkline of invocation rate. Talks to the local
+    /// bridge over HTTP (default `http://127.0.0.1:19791`).
+    Metrics {
+        #[command(subcommand)]
+        cmd: metrics::Cmd,
     },
     /// Operate the Router Node — mesh observability + health
     /// control plane. Each subcommand dials the router peer
@@ -333,6 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Topology { cmd } => topology::run(cmd).await,
         Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Email { cmd } => email::run(cmd).await,
+        Cmd::Metrics { cmd } => metrics::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,
