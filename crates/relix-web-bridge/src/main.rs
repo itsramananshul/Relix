@@ -113,6 +113,9 @@ mod flow;
 mod fs_audit;
 mod guardrails;
 mod intervention_audit;
+mod knowledge;
+#[cfg(test)]
+mod knowledge_mini_mesh_test;
 mod lifecycle;
 mod mcp;
 mod mcp_audit;
@@ -539,6 +542,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/memory/pii/bulk_anonymize",
             post(memory_pii::bulk_anonymize),
         )
+        // RELIX-7.16 knowledge transfer.
+        .route("/v1/knowledge/share", post(knowledge::share))
+        .route("/v1/knowledge/shared/:agent", get(knowledge::list_shared))
+        .route("/v1/knowledge/broadcast", post(knowledge::broadcast))
+        .route("/v1/knowledge/groups", get(knowledge::groups))
+        .route("/v1/knowledge/revoke", post(knowledge::revoke))
         // Four-layer memory inspector. Reads the layered store
         // directly from `AppState::layered_memory` — set
         // `[bridge] memory_db_path` to enable.

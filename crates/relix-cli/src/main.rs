@@ -12,6 +12,7 @@ mod flow_run;
 mod fs;
 mod identity;
 mod install;
+mod knowledge;
 mod mcp;
 mod memory_inspect;
 mod mesh;
@@ -137,6 +138,21 @@ enum Cmd {
     Training {
         #[command(subcommand)]
         cmd: training::Cmd,
+    },
+    /// RELIX-7.16 agent-to-agent knowledge transfer.
+    /// `knowledge groups` lists configured sharing groups.
+    /// `knowledge share --from X --to A,B --ids id1,id2`
+    /// copies observations from one agent to one or more.
+    /// `knowledge broadcast --group G --caller X --ids id1,id2`
+    /// broadcasts to a group.
+    /// `knowledge shared --agent X` lists what an agent received.
+    /// `knowledge revoke --ids id1,id2` soft-deletes a received
+    /// observation.
+    /// Talks to the local bridge over HTTP (default
+    /// `http://127.0.0.1:19791`).
+    Knowledge {
+        #[command(subcommand)]
+        cmd: knowledge::Cmd,
     },
     /// Operate the Router Node — mesh observability + health
     /// control plane. Each subcommand dials the router peer
@@ -362,6 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Email { cmd } => email::run(cmd).await,
         Cmd::Metrics { cmd } => metrics::run(cmd).await,
         Cmd::Training { cmd } => training::run(cmd).await,
+        Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,
