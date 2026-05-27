@@ -33,13 +33,22 @@ use crate::config::{ChannelsConfig, MeshConfig, ProviderConfig, RelixConfig, mas
 
 /// Top-level entry from `main.rs` for both `relix setup` and
 /// `relix reconfigure`.
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Load the existing config before we touch the terminal so we can
     // pre-fill the wizard. A missing file is the install-time case
     // and is fine; a real I/O / parse error is also non-fatal here —
     // we just start from defaults and the operator overwrites
     // whatever was broken.
     let prior = RelixConfig::load_default().ok().flatten();
+
+    // Pre-flight: surface missing dependencies BEFORE we
+    // enter raw mode and start the wizard pages. This prints
+    // the dep table + optional install prompts via plain
+    // stdio. `status_for_setup` never panics and always
+    // returns — a missing Docker / Ollama / Qdrant just
+    // leaves the wizard's confirmation page with the
+    // [MISSING] rows so the operator can fix afterwards.
+    let dep_statuses = crate::install::status_for_setup().await;
 
     let _raw = RawGuard::new()?;
     let final_cfg = run_wizard(prior.as_ref())?;
@@ -61,12 +70,35 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let verb = if prior.is_some() { "Updated" } else { "Saved" };
     println!();
     println!("{verb} configuration at {}", path.display());
+
+    // Echo the dependency snapshot we captured before the
+    // wizard, so the closing screen reminds the operator of
+    // anything still missing. Operators who declined the
+    // pre-flight install or whose auto-install failed see
+    // exactly which dep(s) they still need to handle.
+    let missing: Vec<&crate::install::DependencyStatus> =
+        dep_statuses.iter().filter(|s| !s.found).collect();
+    if !missing.is_empty() {
+        println!();
+        println!("Outstanding dependencies — install before `relix boot`:");
+        for m in &missing {
+            println!(
+                "  [MISSING] {:<14}{}",
+                m.dependency.label(),
+                crate::install::manual_url(m.dependency)
+            );
+        }
+    }
+
     println!();
     println!("Next steps:");
     println!("  relix boot        # start the mesh now");
     println!("  relix stop        # stop it");
     println!("  relix status      # check on it later");
     println!("  relix reconfigure # re-run this wizard");
+    if !missing.is_empty() {
+        println!("  relix install --fix    # auto-install remaining dependencies");
+    }
     println!();
     Ok(())
 }

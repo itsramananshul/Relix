@@ -10,6 +10,7 @@ mod flow;
 mod flow_run;
 mod fs;
 mod identity;
+mod install;
 mod mcp;
 mod memory_inspect;
 mod mesh;
@@ -218,6 +219,17 @@ enum Cmd {
     /// download + replace if a newer version exists.
     Update(update::UpdateArgs),
 
+    /// Dependency auto-install. `relix install` (or
+    /// `relix install --check`) prints a table of every
+    /// dependency Relix needs (Docker, Ollama, Qdrant) with
+    /// version + status. `relix install --fix` runs the
+    /// platform-appropriate installer for every missing
+    /// dependency after one confirmation prompt. Continues
+    /// past individual failures so a missing Docker doesn't
+    /// stop Ollama from installing. The `setup` wizard also
+    /// runs this check before its first config page.
+    Install(install::InstallArgs),
+
     /// Export conversation history from Relix in JSON / Markdown / CSV.
     ///
     /// Specify exactly one scope: `--session <id>`, `--agent <name>`,
@@ -316,11 +328,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             method,
             client_key,
         } => ping::run(&peer, &identity, &method, &client_key).await,
-        Cmd::Setup => setup::run(),
+        Cmd::Setup => setup::run().await,
         Cmd::Boot(args) => mesh::boot(args).await,
         Cmd::Stop => mesh::stop(),
         Cmd::Status(args) => mesh::status(args).await,
         Cmd::Update(args) => update::run(args).await,
+        Cmd::Install(args) => install::run(args).await,
         Cmd::Export(args) => export::run(args).await,
         Cmd::Souls { cmd } => souls::run(cmd),
         Cmd::Skills { cmd } => skills::run(cmd),
