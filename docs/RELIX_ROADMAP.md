@@ -909,9 +909,102 @@ Programmable agent-to-agent coordination via a typed
 
 Registry of community-built plugins installable via `relix plugin install <name>`. Plugins are signed. Operators choose which signing authorities to trust. Revenue share model for plugin authors.
 
-### 7.7 Email Channel `[SKIPPED — production-quality SMTP+IMAP+MIME+threading+OAuth2 channel node (mirroring the relix-telegram / relix-discord / relix-slack architecture) requires a dedicated session covering: SMTP auth modes (TLS / plain / OAuth2 for Google + Microsoft), MIME parsing of inbound mail, attachment handling, In-Reply-To threading, per-provider test fixtures, and channel-node + bridge + dashboard surface integration; deferred to a dedicated session]`
+### 7.7 Email Channel `[DONE — commits 86ed0cc + 82788d5 + 4731b56 + 518be37]`
 
 SMTP outbound + IMAP inbound. An agent monitors an email address, responds to incoming messages, can send emails as part of flows. High value for business automation.
+
+Production email channel that mirrors the telegram / discord / slack
+architecture exactly, plus the protocol-specific surface email needs:
+
+- **Foundation (commit 86ed0cc)**: `crates/relix-runtime/src/nodes/email/` —
+  `smtp.rs` (lettre 0.11 with STARTTLS / TLS / unauthenticated relay,
+  plain + XOAUTH2 auth, connection pooling, retry-with-backoff at
+  1s/2s/4s for transient SMTP failures, permanent 5xx no-retry,
+  full MIME via lettre's builder for plain / HTML alternatives /
+  attachments via multipart/mixed / inline images via
+  multipart/related with Content-ID, threading via
+  Message-ID / In-Reply-To / References / X-Mailer: Relix);
+  `imap.rs` (async-imap 0.11 over TLS:993, plain + XOAUTH2,
+  IDLE for push notification with 60s polling fallback,
+  UNSEEN-only processing, mail-parser MIME decode with
+  attachments to per-UID temp dirs, In-Reply-To / References
+  thread detection, size-limit rejection above
+  `imap_max_message_bytes`, Spam / Junk folder refusal, mark
+  `\Seen` + optional move-to-processed-folder); `dkim.rs`
+  (RFC 6376 RSA-SHA256 / relaxed-relaxed with PKCS#1 + PKCS#8
+  PEM key loading; never fails to send when DKIM is broken —
+  logs a warning and ships unsigned); `config.rs`
+  (`[email]` TOML schema with smtp_* / dkim_* / imap_* /
+  oauth2_* / messages_ring_capacity / allowed_senders /
+  [email.memory_peer] / [email.ai_peer] / [email.coord_peer];
+  env-var secret indirection; partial-OAuth2 rejection);
+  `state.rs` + `ring.rs` + `controller.rs` + `client.rs` +
+  `commands.rs` (same shape as the slack channel); registers
+  `email.status`, `email.messages_recent`, `email.send`,
+  `email.send_template` capabilities. Built-in templates:
+  welcome / reset_password / task_completed / task_failed. 92
+  unit tests across config / dkim / smtp / imap / state / ring
+  / commands / controller.
+- **Controller runtime wiring (commit 82788d5)**:
+  `ControllerConfig::email: Option<toml::Value>`,
+  `StartupWiring::Email`, `populate_email_outbound_cell`, and
+  the `node_type = "email"` dispatch branch. Email-channel
+  outbound (memory + ai + coord) is dialled post-startup
+  through `discover_and_pin`; the IMAP listener spawns the
+  moment the controller boots. Outbound capabilities are
+  registered on the manifest with appropriate category +
+  sensitivity tags. Inbound emails route through the
+  coordinator's `task.create` / `task.event` /
+  `task.update_status` flow with `origin_surface = "email"`,
+  identical to the other channels.
+- **Bridge HTTP endpoints (commit 4731b56)**:
+  `POST /v1/email/send` (validates `to` non-empty, `subject`
+  set, one of `body`/`html` present; 400 with clear error on
+  missing fields), `POST /v1/email/send_template` (validates
+  `template_name` + `to`), `GET /v1/email/status` (projects
+  the pipe-delim status body into typed JSON). Error mapping:
+  INVALID_ARGS → 400, peer alias missing → 404, responder
+  fault → 502, mesh not ready → 503. End-to-end mini-mesh
+  integration test boots a fake email peer with canned
+  `email.send` / `email.send_template` / `email.status`
+  handlers, dials via `discover_and_pin`, mounts the three
+  routes on an ephemeral axum listener, and asserts the five
+  required scenarios (send 200 + Message-ID; missing `to` 400;
+  missing `subject` 400; send_template 200 + Message-ID +
+  template name; status 200 + parsed JSON). 8 unit tests + 1
+  integration test.
+- **CLI (commit 518be37)**: `relix email send --to <addr>
+  --subject <s> --body <text>` (one-off send with optional
+  --html / --cc / --bcc / --reply-to / --in-reply-to / --peer
+  / --raw; exits 2 on failure), `relix email status`
+  (pretty-prints SMTP + IMAP connection state, last
+  send/poll/message timestamps, any pending error strings),
+  `relix email test` (self-test: discovers `smtp_from` from
+  `/v1/email/status` and sends a probe email to that address).
+  Every subcommand accepts `--bridge <url>` and `--raw`.
+
+Quality gates: `cargo fmt --all`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --workspace` all
+pass. The runtime crate alone runs 1958 unit + integration
+tests; the email module contributes 92.
+
+**Not shipped this session (documented gaps):**
+
+- **Dashboard panel for the email channel** — like every other
+  channel, the email node ships `email.status` /
+  `email.messages_recent` as read-only capabilities the
+  bridge proxies for the dashboard, but the actual
+  dashboard tile rendering them sits in the same multi-week
+  dashboard-redesign work the slack / discord / telegram tiles
+  are part of. The capability surface is ready when the
+  dashboard work picks it up.
+- **Subject-line / sender-based agent routing rules** — the
+  controller currently routes every inbound email through the
+  canonical chat flow with the thread session_id. Per-subject /
+  per-sender routing rules require a coordinator-side router
+  hook that doesn't exist as a channel-agnostic primitive yet;
+  the foundation in this session is the right place to wire it
+  when the routing layer lands.
 
 ### 7.8 Scheduled Reports `[DONE — commits 6a2d13a + 2a34b50]`
 
