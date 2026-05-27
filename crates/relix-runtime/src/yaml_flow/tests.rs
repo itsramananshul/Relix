@@ -718,6 +718,196 @@ fn missing_required_field_returns_clear_semantic_error() {
     }
 }
 
+// ────────────────────── §multi-catch try ─────────────────────
+
+#[test]
+fn try_with_multi_catch_sequence_compiles_and_dispatches_in_order() {
+    // The dispatcher fires policy_denied; we expect the
+    // matching catch to run (NOT the timeout catch, NOT the
+    // any fallback).
+    let yaml = r#"
+        steps:
+          - try:
+              steps:
+                - call:
+                    peer: ai
+                    method: ai.chat
+                    arg: "x"
+                    assign: reply
+              catch:
+                - kind: timeout
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "timed out, try again"
+                - kind: policy_denied
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "not allowed"
+                - kind: any
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "other failure"
+          - result: "{{reply}}"
+    "#;
+    let sol = lower(yaml);
+    // All three catch clauses should appear in the lowered
+    // SOL in source order.
+    assert!(
+        sol.contains("} catch timeout {"),
+        "missing timeout catch in:\n{sol}"
+    );
+    assert!(
+        sol.contains("} catch policy_denied {"),
+        "missing policy_denied catch in:\n{sol}"
+    );
+    assert!(
+        sol.contains("} catch any {"),
+        "missing any catch in:\n{sol}"
+    );
+
+    let disp = ScriptedDispatcher::new(vec![Err(RemoteCallError {
+        kind: relix_core::types::error_kinds::POLICY_DENIED,
+        peer: "ai".into(),
+        method: "ai.chat".into(),
+        cause: "nope".into(),
+    })]);
+    let (v, vm) = run_with(yaml, disp);
+    assert_str(&vm, v, "not allowed");
+}
+
+#[test]
+fn try_with_multi_catch_timeout_clause_runs_on_timeout_error() {
+    let yaml = r#"
+        steps:
+          - try:
+              steps:
+                - call:
+                    peer: ai
+                    method: ai.chat
+                    arg: "x"
+                    assign: reply
+              catch:
+                - kind: timeout
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "timed out"
+                - kind: any
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "other"
+          - result: "{{reply}}"
+    "#;
+    let disp = ScriptedDispatcher::new(vec![Err(RemoteCallError {
+        kind: relix_core::types::error_kinds::TIMEOUT,
+        peer: "ai".into(),
+        method: "ai.chat".into(),
+        cause: "slow".into(),
+    })]);
+    let (v, vm) = run_with(yaml, disp);
+    assert_str(&vm, v, "timed out");
+}
+
+#[test]
+fn try_with_multi_catch_any_clause_runs_on_unmatched_error() {
+    let yaml = r#"
+        steps:
+          - try:
+              steps:
+                - call:
+                    peer: ai
+                    method: ai.chat
+                    arg: "x"
+                    assign: reply
+              catch:
+                - kind: timeout
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "timed out"
+                - kind: policy_denied
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "denied"
+                - kind: any
+                  steps:
+                    - let:
+                        name: reply
+                        type: str
+                        value: "other"
+          - result: "{{reply}}"
+    "#;
+    // RESPONDER_INTERNAL classifies as `responder_error` —
+    // which neither timeout nor policy_denied match, so the
+    // any clause fires.
+    let disp = ScriptedDispatcher::new(vec![Err(RemoteCallError {
+        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+        peer: "ai".into(),
+        method: "ai.chat".into(),
+        cause: "boom".into(),
+    })]);
+    let (v, vm) = run_with(yaml, disp);
+    assert_str(&vm, v, "other");
+}
+
+#[test]
+fn try_with_single_catch_mapping_form_still_compiles_and_runs() {
+    // Backwards compatibility: the original single-catch
+    // shorthand (`catch:` is a mapping, not a sequence) must
+    // keep working.
+    let yaml = r#"
+        steps:
+          - try:
+              steps:
+                - call:
+                    peer: ai
+                    method: ai.chat
+                    arg: "x"
+                    assign: reply
+              catch:
+                kind: any
+                steps:
+                  - let:
+                      name: reply
+                      type: str
+                      value: "fallback"
+          - result: "{{reply}}"
+    "#;
+    let disp = ScriptedDispatcher::new(vec![Err(RemoteCallError::local("ai", "ai.chat", "boom"))]);
+    let (v, vm) = run_with(yaml, disp);
+    assert_str(&vm, v, "fallback");
+}
+
+#[test]
+fn try_with_empty_catch_sequence_is_semantic_error() {
+    let yaml = r#"
+        steps:
+          - try:
+              steps:
+                - print: "x"
+              catch: []
+    "#;
+    let err = compile_source(yaml).unwrap_err();
+    match err {
+        YamlFlowError::Semantic { ref message, .. } => {
+            assert!(message.contains("at least one"), "{message}");
+        }
+        other => panic!("expected Semantic error for empty catch sequence, got {other:?}"),
+    }
+}
+
 // ────────────────────── §native list / map literals ─────────
 
 #[test]

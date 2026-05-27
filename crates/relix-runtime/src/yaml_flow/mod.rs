@@ -158,14 +158,21 @@ pub struct LoopStep {
     pub steps: Vec<YamlStep>,
 }
 
-/// `try` step config.
+/// `try` step config. Carries one OR many catch clauses —
+/// SOL supports multiple catches per try, and the YAML format
+/// now does too. The `catch:` field accepts either a single
+/// mapping (single-catch shorthand, kept for backwards
+/// compatibility) or a sequence of mappings (multi-catch
+/// form), each with its own `kind` and `steps`.
 #[derive(Debug)]
 pub struct TryStep {
     pub steps: Vec<YamlStep>,
-    pub catch: CatchStep,
+    /// Catch clauses in source order. Always at least one —
+    /// `parse_try` rejects an empty list.
+    pub catches: Vec<CatchStep>,
 }
 
-/// `try.catch` config.
+/// One catch clause inside a `try`.
 #[derive(Debug)]
 pub struct CatchStep {
     pub kind: String,
@@ -300,7 +307,14 @@ fn collect_steps(
             }
             YamlStep::Try(s) => {
                 collect_steps(&s.steps, &sp.named("try"), decls, seen)?;
-                collect_steps(&s.catch.steps, &sp.named("catch"), decls, seen)?;
+                for (clause_index, c) in s.catches.iter().enumerate() {
+                    let label = if s.catches.len() == 1 {
+                        sp.named("catch")
+                    } else {
+                        sp.named(&format!("catch[{}]", clause_index))
+                    };
+                    collect_steps(&c.steps, &label, decls, seen)?;
+                }
             }
             YamlStep::Result(_) | YamlStep::Print(_) => {}
         }
@@ -532,18 +546,56 @@ fn parse_try(value: &Value, path: &StepPath) -> Result<TryStep, YamlFlowError> {
                 path: path.render(),
                 message: "try step missing required field `catch`".to_string(),
             })?;
-    let catch_map = expect_mapping(catch_value, path, "catch body")?;
-    deny_unknown_fields(catch_map, path, "catch", &["kind", "steps"])?;
-    let kind = required_string(catch_map, "kind", path)?;
-    let catch_steps_seq = required_sequence(catch_map, "steps", path)?;
-    let catch_steps = parse_step_list(&catch_steps_seq, &path.named("catch"))?;
-    Ok(TryStep {
-        steps,
-        catch: CatchStep {
-            kind,
-            steps: catch_steps,
-        },
-    })
+    // `catch` accepts either a single mapping (single-catch
+    // shorthand) or a sequence of mappings (multi-catch).
+    // The multi-catch form lets operators handle timeout
+    // differently from policy_denied, etc., without dropping
+    // to SOL.
+    let catches = match catch_value {
+        Value::Mapping(_) => vec![parse_catch_clause(catch_value, path, 0)?],
+        Value::Sequence(seq) => {
+            if seq.is_empty() {
+                return Err(YamlFlowError::Semantic {
+                    path: path.render(),
+                    message: "try.catch sequence must contain at least one clause".to_string(),
+                });
+            }
+            seq.iter()
+                .enumerate()
+                .map(|(i, v)| parse_catch_clause(v, path, i))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        _ => {
+            return Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message:
+                    "try.catch must be a mapping (single catch) or a sequence of mappings (multi-catch)"
+                        .to_string(),
+            });
+        }
+    };
+    Ok(TryStep { steps, catches })
+}
+
+fn parse_catch_clause(
+    value: &Value,
+    parent: &StepPath,
+    clause_index: usize,
+) -> Result<CatchStep, YamlFlowError> {
+    let label = if clause_index == 0 && matches!(value, Value::Mapping(_)) {
+        // Single-catch shorthand path — keep the locator as
+        // simply `catch` so the message looks the same as
+        // pre-multi-catch flows.
+        parent.named("catch")
+    } else {
+        parent.named(&format!("catch[{}]", clause_index))
+    };
+    let map = expect_mapping(value, &label, "catch clause")?;
+    deny_unknown_fields(map, &label, "catch", &["kind", "steps"])?;
+    let kind = required_string(map, "kind", &label)?;
+    let steps_seq = required_sequence(map, "steps", &label)?;
+    let steps = parse_step_list(&steps_seq, &label)?;
+    Ok(CatchStep { kind, steps })
 }
 
 // ──────────────────────────── parsing helpers ──────────────────
@@ -918,19 +970,40 @@ impl Lowerer {
     }
 
     fn lower_try(&mut self, s: &TryStep, path: &StepPath) -> Result<(), YamlFlowError> {
-        validate_catch_kind(&s.catch.kind, path)?;
+        if s.catches.is_empty() {
+            // Defensive — `parse_try` enforces non-empty
+            // already; this guards against future direct
+            // AST construction.
+            return Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message: "try step has no catch clauses".to_string(),
+            });
+        }
+        for c in &s.catches {
+            validate_catch_kind(&c.kind, path)?;
+        }
         self.indented("try {\n");
         self.indent += 1;
         for (i, step) in s.steps.iter().enumerate() {
             self.lower_step(step, &path.named("try").child(i))?;
         }
         self.indent -= 1;
-        self.indented(&format!("}} catch {} {{\n", s.catch.kind));
-        self.indent += 1;
-        for (i, step) in s.catch.steps.iter().enumerate() {
-            self.lower_step(step, &path.named("catch").child(i))?;
+        // Emit one SOL `catch <kind> { ... }` per clause, in
+        // source order. The SOL parser accepts the
+        // `} catch ... {` chain — see sol/parser.rs:try_stmt.
+        for (clause_index, catch) in s.catches.iter().enumerate() {
+            let catch_path = if s.catches.len() == 1 {
+                path.named("catch")
+            } else {
+                path.named(&format!("catch[{}]", clause_index))
+            };
+            self.indented(&format!("}} catch {} {{\n", catch.kind));
+            self.indent += 1;
+            for (i, step) in catch.steps.iter().enumerate() {
+                self.lower_step(step, &catch_path.child(i))?;
+            }
+            self.indent -= 1;
         }
-        self.indent -= 1;
         self.indented("}\n");
         Ok(())
     }
