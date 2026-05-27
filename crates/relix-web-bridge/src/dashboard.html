@@ -3080,6 +3080,7 @@
               <select id="sol-lang">
                 <option value="sflow">Sflow (.sflow)</option>
                 <option value="sol">SOL (.sol)</option>
+                <option value="yaml">YAML (.yml / .yaml)</option>
               </select>
             </label>
             <button id="sol-validate-btn" class="btn-primary">Validate</button>
@@ -10946,10 +10947,47 @@ async function solValidate() {
   const $host = document.getElementById('sol-result-host');
   if (!$src || !$lang || !$card || !$host) return;
   const source = $src.value;
-  const kind = $lang.value || 'sflow';
+  let kind = $lang.value || 'sflow';
+  // Auto-detect YAML by leading `steps:` so an operator who
+  // pastes a YAML flow without changing the dropdown still
+  // hits the right validator. The dropdown remains the source
+  // of truth — this only flips when the operator left it on
+  // the default sflow choice.
+  if (kind !== 'yaml' && /^[\s\n]*steps\s*:/.test(source)) {
+    kind = 'yaml';
+  }
   $card.style.display = '';
   $host.innerHTML = '<em>validating…</em>';
   try {
+    // Two-endpoint pattern:
+    //
+    //   * `/v1/sol/validate` accepts `{source, kind}` where
+    //     `kind` is `sflow` or `sol`, and returns
+    //     `{valid, errors: [{line, message}]}`.
+    //   * `/v1/yaml/validate` accepts `{source}` only, and
+    //     returns `{status: "ok"|"error", message?, line?,
+    //     column?}`.
+    //
+    // The shapes differ because the validators landed at
+    // different times. The dashboard normalises both into
+    // the table layout below — operators see one consistent
+    // error display regardless of language.
+    if (kind === 'yaml') {
+      const r = await fetch('/v1/yaml/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source }),
+      });
+      const body = await r.json();
+      if (r.ok && body.status === 'ok') {
+        $host.innerHTML = '<div class="status-good">Valid YAML. No errors.</div>';
+        return;
+      }
+      const line = body.line && body.line > 0 ? ('line ' + body.line + (body.column ? ', col ' + body.column : '')) : '—';
+      const message = body.message || ('HTTP ' + r.status);
+      $host.innerHTML = '<table class="grid"><thead><tr><th>Location</th><th>Message</th></tr></thead><tbody><tr><td><span class="id">' + escapeHtml(line) + '</span></td><td>' + escapeHtml(message) + '</td></tr></tbody></table>';
+      return;
+    }
     const r = await fetch('/v1/sol/validate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
