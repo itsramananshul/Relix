@@ -6,6 +6,7 @@ mod config;
 mod doctor;
 mod eval;
 mod export;
+mod flow;
 mod flow_run;
 mod fs;
 mod identity;
@@ -147,6 +148,14 @@ enum Cmd {
     Sol {
         #[command(subcommand)]
         cmd: sol::Cmd,
+    },
+    /// Workflow scaffolding helpers.
+    /// `flow yaml` prints a minimal YAML flow template to
+    /// stdout — pipe it into a file, edit peer/method/arg,
+    /// then run with `relix-cli flow-run`.
+    Flow {
+        #[command(subcommand)]
+        cmd: flow::Cmd,
     },
     /// W2-008a: one-command environment health check. Hits
     /// the bridge's `/v1/health` and prints an opinionated
@@ -294,6 +303,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Web { cmd } => web::run(cmd).await,
         Cmd::Browser { cmd } => browser::run(cmd).await,
         Cmd::Sol { cmd } => sol::run(cmd).await,
+        Cmd::Flow { cmd } => {
+            flow::run(cmd);
+            Ok(())
+        }
         Cmd::Doctor(args) => doctor::run(args).await,
         Cmd::Eval { cmd } => eval::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
