@@ -1233,6 +1233,36 @@ fn lower_error_message_includes_step_context() {
 // ────────────────────── §nested step line numbers ──────────
 
 #[test]
+fn flow_style_yaml_missing_field_reports_real_line_number() {
+    // Inline flow-style YAML with a `let` step missing the
+    // required `value` field. saphyr's marker on the inline
+    // mapping (plus the first-child fallback in node_pos) must
+    // still produce a real line/column — flow-style isn't a
+    // dead zone.
+    let yaml = "steps: [{let: {name: x, type: str}}]\n";
+    let err = compile_source(yaml).unwrap_err();
+    match err {
+        YamlFlowError::Semantic {
+            ref message,
+            line,
+            column,
+            ..
+        } => {
+            assert!(
+                message.contains("value"),
+                "expected message to name the missing field: {message}"
+            );
+            assert!(
+                line > 0,
+                "flow-style YAML missing-field must carry a real line, got {line}"
+            );
+            assert!(column > 0, "expected positive column, got {column}");
+        }
+        other => panic!("expected Semantic error for missing field, got {other:?}"),
+    }
+}
+
+#[test]
 fn flow_style_yaml_unknown_step_reports_real_line_number() {
     // Inline flow-style YAML — a single line with a `bonk`
     // step. saphyr's marker info on scalar keys means we
