@@ -205,7 +205,9 @@ After `irm ... | iex` or `curl ... | bash`:
 
 ---
 
-### Dependency Auto-Install (Next Install Update) `[IDEA]`
+### Dependency Auto-Install (Next Install Update) `[DONE — commit cd9ea63]`
+
+Shipped: `relix install --check` / `--fix` subcommands + setup-wizard pre-flight. Detects Docker / Ollama / Qdrant per-platform, installs missing deps via official installer URLs (Windows / macOS) or shell scripts (Linux). Qdrant auto-started in a `relix-qdrant` Docker container. Hard timeouts: 120 s network / 300 s subprocess. 16 unit tests pin every parser + URL + render. Git is NOT auto-installed (universally pre-installed; not in spec for this module).
 
 The install script should be a complete setup. If something Relix needs is not on the user's machine, the script checks, asks permission for big installs, and handles it automatically instead of failing with an error or telling the user to go figure it out.
 
