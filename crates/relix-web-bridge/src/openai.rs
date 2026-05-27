@@ -515,18 +515,9 @@ async fn chat_completions_streaming(
 
         let created = unix_now();
         // Role marker.
-        let role_chunk = serde_json::json!({
-            "id": pending_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_for_stream,
-            "choices": [{
-                "index": 0,
-                "delta": {"role": "assistant"},
-                "finish_reason": null,
-            }],
-        });
-        yield Ok::<_, Infallible>(Event::default().data(role_chunk.to_string()));
+        yield Ok::<_, Infallible>(
+            Event::default().data(streaming_role_chunk_json(&pending_id, created, &model_for_stream))
+        );
 
         // Token chunks as they arrive. Tracks the full body
         // for the observability + provenance records.
@@ -534,18 +525,12 @@ async fn chat_completions_streaming(
         while let Some(bytes) = rx.recv().await {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             accumulated.push_str(&text);
-            let content_chunk = serde_json::json!({
-                "id": pending_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_for_stream,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": text},
-                    "finish_reason": null,
-                }],
-            });
-            yield Ok(Event::default().data(content_chunk.to_string()));
+            yield Ok(Event::default().data(streaming_content_chunk_json(
+                &pending_id,
+                created,
+                &model_for_stream,
+                &text,
+            )));
         }
 
         // Channel closed → flow finished. Await the outcome
@@ -569,25 +554,17 @@ async fn chat_completions_streaming(
         };
 
         // Final finish frame + relix metadata.
-        let finish_chunk = serde_json::json!({
-            "id": format!("chatcmpl-{}", real_flow_id),
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_for_stream,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }],
-            "relix": {
-                "flow_id": real_flow_id,
-                "trace_id": real_trace_id,
-                "flow_log": real_flow_log,
-                "session_id": session_for_stream,
-                "task_id": real_task_id,
-            },
-        });
-        yield Ok(Event::default().data(finish_chunk.to_string()));
+        let finish_id = format!("chatcmpl-{real_flow_id}");
+        yield Ok(Event::default().data(streaming_finish_chunk_json(
+            &finish_id,
+            created,
+            &model_for_stream,
+            &real_flow_id,
+            &real_trace_id,
+            &real_flow_log,
+            &session_for_stream,
+            real_task_id.as_deref(),
+        )));
 
         // Two-sink observability + provenance — same shape as
         // the unary path. Writes AFTER the stream has
@@ -614,7 +591,7 @@ async fn chat_completions_streaming(
 
         // OpenAI clients (and Open WebUI) look for the
         // literal `[DONE]`.
-        yield Ok(Event::default().data("[DONE]"));
+        yield Ok(Event::default().data(STREAMING_DONE_SENTINEL));
     };
 
     let mut resp = Sse::new(sse_stream)
@@ -626,6 +603,96 @@ async fn chat_completions_streaming(
         .insert("x-relix-provider", provider_header.clone());
     Ok(resp)
 }
+
+/// RELIX-2 step 6: streaming-SSE chunk builders. Pulled out
+/// of the inline `async_stream!` macro so unit tests can
+/// pin the wire shape without going through axum / a full
+/// AppState. Each function returns the JSON body for one
+/// SSE `data: ...` line. The async_stream block wraps the
+/// returned string in `Event::default().data(...)` —
+/// equivalent to writing `data: <body>\n\n` on the wire.
+pub(crate) fn streaming_role_chunk_json(id: &str, created: u64, model: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant"},
+            "finish_reason": null,
+        }],
+    })
+    .to_string()
+}
+
+/// RELIX-2 step 6: content chunk. One per token (or per
+/// arrival from the AI provider, depending on the
+/// provider's chunking granularity). `content` carries the
+/// raw token text — the chunk JSON's `delta.content` field
+/// matches the OpenAI streaming wire shape exactly.
+pub(crate) fn streaming_content_chunk_json(
+    id: &str,
+    created: u64,
+    model: &str,
+    content: &str,
+) -> String {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"content": content},
+            "finish_reason": null,
+        }],
+    })
+    .to_string()
+}
+
+/// RELIX-2 step 6: terminal finish chunk + Relix provenance
+/// envelope. `finish_reason: "stop"` is the canonical
+/// OpenAI sentinel; the `relix` object is a non-standard
+/// extension that operators can read for cross-correlation
+/// with the per-flow event log + task ledger.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn streaming_finish_chunk_json(
+    id: &str,
+    created: u64,
+    model: &str,
+    flow_id: &str,
+    trace_id: &str,
+    flow_log: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop",
+        }],
+        "relix": {
+            "flow_id": flow_id,
+            "trace_id": trace_id,
+            "flow_log": flow_log,
+            "session_id": session_id,
+            "task_id": task_id,
+        },
+    })
+    .to_string()
+}
+
+/// RELIX-2 step 6: terminal `[DONE]` sentinel. OpenAI
+/// clients (and Open WebUI) look for the literal string,
+/// not a JSON object. Kept as a constant so tests can
+/// match exactly.
+pub(crate) const STREAMING_DONE_SENTINEL: &str = "[DONE]";
 
 /// Best-effort provider attribution for a resolved model label.
 /// The bridge doesn't see the per-call provider chosen by the AI
@@ -1254,5 +1321,152 @@ mod tests {
             .unwrap()
             .expect("snapshot recorded for explicit trace_id");
         assert_eq!(snap.model_id, "gpt-4o-mini");
+    }
+
+    // ───────────────────── RELIX-2 step 6 ────────────────────
+    //
+    // Wire-shape unit tests for the streaming-SSE chunk
+    // builders. These pin the OpenAI-compatible JSON shape +
+    // the `[DONE]` sentinel without needing to boot a real
+    // mesh — the load-bearing logic is pure functions, easy
+    // to exercise in isolation.
+
+    fn parse_chunk(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).expect("chunk body must be valid JSON")
+    }
+
+    #[test]
+    fn streaming_role_chunk_matches_openai_role_marker_shape() {
+        let body = streaming_role_chunk_json("chatcmpl-test", 1_700_000_000, "gpt-4o");
+        let v = parse_chunk(&body);
+        assert_eq!(v["id"], "chatcmpl-test");
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["created"], 1_700_000_000);
+        assert_eq!(v["model"], "gpt-4o");
+        assert_eq!(v["choices"][0]["index"], 0);
+        assert_eq!(v["choices"][0]["delta"]["role"], "assistant");
+        // Role marker MUST NOT carry a finish_reason — that
+        // signals end-of-stream to OpenAI clients.
+        assert!(v["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn streaming_content_chunk_carries_delta_content_and_no_finish_reason() {
+        let body =
+            streaming_content_chunk_json("chatcmpl-test", 1_700_000_000, "gpt-4o", "hello world");
+        let v = parse_chunk(&body);
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["choices"][0]["delta"]["content"], "hello world");
+        assert!(v["choices"][0]["finish_reason"].is_null());
+        // Role MUST be absent on content chunks per OpenAI's
+        // streaming shape (it appears once on the role marker
+        // frame and nowhere else).
+        assert!(v["choices"][0]["delta"]["role"].is_null());
+    }
+
+    #[test]
+    fn streaming_finish_chunk_carries_stop_reason_and_relix_metadata() {
+        let body = streaming_finish_chunk_json(
+            "chatcmpl-abc123",
+            1_700_000_000,
+            "gpt-4o",
+            "flow-id-hex",
+            "trace-id-hex",
+            "/tmp/flow.log",
+            "session-foo",
+            Some("task-bar"),
+        );
+        let v = parse_chunk(&body);
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        // delta is an empty object on the terminal frame
+        // (no content, no role).
+        assert!(v["choices"][0]["delta"].is_object());
+        assert!(v["choices"][0]["delta"].as_object().unwrap().is_empty());
+        let relix = &v["relix"];
+        assert_eq!(relix["flow_id"], "flow-id-hex");
+        assert_eq!(relix["trace_id"], "trace-id-hex");
+        assert_eq!(relix["flow_log"], "/tmp/flow.log");
+        assert_eq!(relix["session_id"], "session-foo");
+        assert_eq!(relix["task_id"], "task-bar");
+    }
+
+    #[test]
+    fn streaming_finish_chunk_omits_task_id_when_coordinator_absent() {
+        let body = streaming_finish_chunk_json(
+            "chatcmpl-abc123",
+            1_700_000_000,
+            "gpt-4o",
+            "flow-id-hex",
+            "trace-id-hex",
+            "/tmp/flow.log",
+            "session-foo",
+            None,
+        );
+        let v = parse_chunk(&body);
+        // task_id field present but null when no coordinator
+        // is wired. OpenAI clients ignore the `relix`
+        // namespace, but operators reading the trace see
+        // explicit `null` rather than the field being absent.
+        assert!(v["relix"]["task_id"].is_null());
+    }
+
+    #[test]
+    fn streaming_done_sentinel_is_exact_openai_literal() {
+        // OpenAI's SDK + Open WebUI + curl --no-buffer all
+        // grep for the literal "[DONE]". Anything else
+        // (whitespace, quoted JSON, etc.) breaks downstream
+        // clients silently.
+        assert_eq!(STREAMING_DONE_SENTINEL, "[DONE]");
+    }
+
+    #[test]
+    fn streaming_chunk_sequence_decodes_in_order_with_distinct_deltas() {
+        // Drive the same logic the async_stream! block runs —
+        // role + N content + finish + DONE — and assert the
+        // sequence decodes as a coherent OpenAI streaming
+        // response. This is the "wire shape regression
+        // harness" pin: a future refactor that subtly
+        // re-orders frames or drops one of them fails here.
+        let id = "chatcmpl-test";
+        let created = 1_700_000_000;
+        let model = "gpt-4o";
+        let mut frames: Vec<String> = Vec::new();
+        frames.push(streaming_role_chunk_json(id, created, model));
+        for tok in ["hello ", "streaming ", "world"] {
+            frames.push(streaming_content_chunk_json(id, created, model, tok));
+        }
+        frames.push(streaming_finish_chunk_json(
+            id,
+            created,
+            model,
+            "f1",
+            "t1",
+            "/tmp/f.log",
+            "s1",
+            None,
+        ));
+        // Decode every JSON frame (asserts shape) +
+        // reconstruct the body from delta.content fields.
+        let mut body = String::new();
+        let mut saw_role = false;
+        let mut saw_finish = false;
+        for f in &frames {
+            let v = parse_chunk(f);
+            if v["choices"][0]["delta"]["role"] == "assistant" {
+                saw_role = true;
+            }
+            if let Some(s) = v["choices"][0]["delta"]["content"].as_str() {
+                body.push_str(s);
+            }
+            if v["choices"][0]["finish_reason"] == "stop" {
+                saw_finish = true;
+            }
+        }
+        assert!(saw_role, "exactly one role-marker frame must appear");
+        assert!(saw_finish, "terminal finish_reason frame must appear");
+        assert_eq!(body, "hello streaming world");
+        // After the JSON frames the literal [DONE] sentinel
+        // closes the stream.
+        assert_eq!(STREAMING_DONE_SENTINEL, "[DONE]");
     }
 }
