@@ -845,9 +845,29 @@ dialectic_model          = "openrouter/anthropic/claude-3-5-haiku"
 
 ## Part 7 — Additional Ideas (Not Yet Fully Designed)
 
-### 7.1 Real Provider-Native Streaming `[DONE — commit b56ed25]`
+### 7.1 Real Provider-Native Streaming `[DONE — end-to-end shipped May 2026]`
 
-The `ChatProvider` trait already has `generate_reply_stream`. The missing piece is propagating the stream through the libp2p request/response boundary which is currently synchronous. Real streaming means tokens flow from the provider through the mesh to the client as they're generated.
+Provider-native streaming was real on the AI node side
+since `b56ed25` (per-token SSE parsing in
+`openai_compat::OpenAICompatibleProvider::generate_reply_stream`
++ `anthropic::AnthropicProvider::generate_reply_stream`),
+but the bridge was still chunk-slicing the materialised
+reply until step 1–6 of the RELIX-2 streaming roadmap.
+End-to-end is now real:
+
+| Layer | Commit |
+|---|---|
+| 1. libp2p `/relix/rpc/stream/1` substream protocol | `4b58550` |
+| 2. `StreamingHandler` trait + admission-gated `handle_inbound_stream` | `4775f9d` |
+| 3. `ai.chat.stream` capability with full pre-flight | `36db12a` |
+| 4. SOL VM `Inst::RemoteCallStream` opcode + parser | `80afd1f` |
+| 5. Bridge HTTP streaming (`chat_completions_streaming`) + `[flow] streaming_template_path` config | `9f3d791` |
+| 5b. Client-disconnect cancellation (`CancelSignal` + `CancelGuard`) | `639d785` |
+| 6. Wire-shape unit tests + extracted chunk builders | `26a8660` |
+
+Opt-in by a single bridge config line; see
+`docs/STATE-OF-RELIX.md` §6.5 for the architecture, test
+coverage, and remaining queued work. Closes SIMP-019.
 
 ### 7.2 Telegram/Discord/Slack — Rich Message Support `[DONE — commit a689ad8]`
 

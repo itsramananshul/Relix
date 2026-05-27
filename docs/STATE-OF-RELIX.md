@@ -732,34 +732,132 @@ ignores: `temperature`, `top_p`, `n`, `presence_penalty`,
 `response_format`, `seed`, `stop`, `stream_options`. The bridge sends
 only `model` + `messages` to the AI node. SIMP-020.
 
-### 6.5 Streaming — provider real, bridge bridge-level
+### 6.5 Streaming — end-to-end real (opt-in)
 
-Provider-side streaming is real today. The OpenAI-compatible
-provider (`openai_compat::OpenAICompatibleProvider::generate_reply_stream`)
-parses upstream `/v1/chat/completions` SSE frames and yields
-per-token `choices[0].delta.content` chunks. The Anthropic
-provider (`anthropic::AnthropicProvider::generate_reply_stream`)
-parses Messages-API SSE events and yields per-token
-`content_block_delta.text_delta` chunks. Both skip role-only,
-ping, and thinking-delta frames; both surface terminal
-`message_stop` / `[DONE]` as stream end.
+End-to-end token streaming is real and shipped, opt-in by a
+single bridge config line. Tokens flow from the AI provider's
+SSE response, through the mesh's libp2p streaming substream,
+through the SOL VM's `remote_call_stream` opcode, through a
+chunk-observer callback, into the bridge's SSE response, out
+to the HTTP client — all live, with no intermediate
+materialisation. The same admission pipeline runs (identity →
+agent gate → policy → access broker → audit) and the same
+audit / chronicle / task-ledger events fire as the unary
+path.
 
-The BRIDGE still consumes the materialised reply first, then
-chunks it into SSE frames in `build_openai_sse`. That's
-because the bridge runs a SOL/Sflow flow to drive the chat —
-the flow runner's `ChatFlowOutcome` carries the complete
-`reply: String` and there is no streaming primitive in the SOL
-VM today (`remote_call` is sync, returns a single string).
-Wiring end-to-end real streaming requires either a streaming
-primitive in the flow runner (multi-file refactor) or a
-flow-runner bypass for `stream:true` requests that talks
-directly to the AI provider — which would duplicate API keys
-and provider config on the bridge, regressing the security
-model where keys live ONLY on the AI node.
+Architecture (commits `4b58550` → `26a8660`):
 
-The provider-native code is the load-bearing part; closing
-the bridge-side gap is queued as a separate architectural
-decision (SIMP-019).
+  * **Transport:** `transport::stream` adds a real libp2p
+    substream protocol `/relix/rpc/stream/1` with a
+    `StreamFrame` enum (Header / Chunk / End / Err) over
+    length-prefixed CBOR framing. Yamux multiplexing means
+    one TCP connection multiplexes both `/relix/rpc/1`
+    (unary) and `/relix/rpc/stream/1` (streaming) over the
+    same Noise XK session.
+
+  * **Dispatch:** `DispatchBridge::handle_inbound_stream` +
+    `StreamingHandler` trait + `register_streaming(method,
+    handler)`. Mirrors the unary admission flow
+    step-for-step but routes the response through a
+    `StreamWriter` instead of a unary
+    `ResponseEnvelope`. Admission rejection writes a single
+    terminal `StreamFrame::Err`; admission success writes a
+    Header frame, invokes the handler, pipes its chunks to
+    Chunk frames, terminates with End or Err.
+
+  * **AI node:** `ai.chat.stream` capability registered via
+    `bridge.register_streaming`. Shares the FULL pre-flight
+    with `ai.chat` (input guardrail, memory + RAG, SOUL
+    persona, skill hints) — extracted into a shared
+    `build_chat_preflight` helper so the two paths can
+    never drift. Differs by calling
+    `provider.generate_reply_stream` and adapting the
+    per-token stream to the dispatcher's `HandlerStream`.
+    The streaming variant intentionally SKIPS the planner /
+    tool dispatch / approval verdict pipeline — operators
+    needing inline tool execution use the unary `ai.chat`.
+
+  * **SOL VM:** `Inst::RemoteCallStream` opcode +
+    `remote_call_stream(peer, method, arg)` parser
+    recognition. Same stack contract as `Inst::RemoteCall`;
+    the VM still produces a single concatenated heap-string
+    so SOL flows stay synchronous from the author's
+    perspective. The chunk observer fires per-chunk so the
+    web bridge can ship tokens to the HTTP client BEFORE
+    the VM has finished collecting.
+
+  * **Flow runner:** `FlowRunOptions.chunk_observer` +
+    `FlowRunOptions.cancel_signal`. The
+    `ChunkObserver` callback type is wired into
+    `VM::with_chunk_observer`; the cancel signal is wired
+    into `RealDispatcher::remote_call_stream`'s
+    frame-read `tokio::select!` so an in-flight stream
+    aborts cleanly when the bridge cancels.
+
+  * **Bridge:** `[flow] streaming_template_path` config
+    field (validated at startup — the template MUST invoke
+    `remote_call_stream` or the bridge refuses to boot).
+    `flows/chat_template_streaming.sol` ships alongside
+    the unary template. When `stream:true` AND the
+    streaming template is configured,
+    `chat_completions_streaming` runs the flow in a tokio
+    task, the SOL VM's chunks land in an unbounded channel,
+    and the SSE response reads from the channel via
+    `async_stream::stream!`. A `CancelGuard` inside the
+    SSE future fires `notify_one` on the cancel signal
+    when the HTTP client drops — the dispatcher aborts,
+    the flow writes `task.failed` audit events, no
+    orphaned upstream connection.
+
+  * **Wire shape pins:** `streaming_role_chunk_json` /
+    `streaming_content_chunk_json` /
+    `streaming_finish_chunk_json` are pure functions with
+    6 wire-shape regression tests (`openai::tests::streaming_*`).
+    The `[DONE]` sentinel is a `pub(crate) const` so
+    drift breaks tests immediately.
+
+Operators enable end-to-end streaming with one config line:
+
+```toml
+[flow]
+template_path = "flows/chat_template.sol"
+streaming_template_path = "flows/chat_template_streaming.sol"
+```
+
+When `streaming_template_path` is unset, `stream:true` falls
+back to the legacy chunk-sliced path so existing deployments
+behave byte-identically. The non-streaming `stream:false`
+path is unchanged regardless of config.
+
+Test coverage:
+
+  * Transport: 8 integration tests
+    (`tests/transport_stream.rs`) including multi-chunk
+    round-trip, caller-drop cancellation, admission +
+    streaming end-to-end (5 admission paths), real-
+    dispatcher cancel-signal-honours mid-stream.
+  * AI handler: 4 unit tests for `handle_chat_stream`
+    (happy path, invalid args, guardrail block, provider
+    init failure).
+  * VM: 5 tests for `Inst::RemoteCallStream` (concatenation,
+    per-chunk observer firing, default-impl fallback,
+    failure → sentinel) + 1 compile-pipeline test.
+  * Bridge: 6 wire-shape unit tests for the SSE chunk
+    builders (role / content / finish / DONE sentinel /
+    full sequence + task_id-null when no coordinator).
+
+Remaining work (queued, not shipping):
+
+  * Full mini-mesh integration test that boots a real
+    coordinator + AI node + bridge HTTP server in-process
+    and sends an actual POST `/v1/chat/completions
+    stream:true` request. The wire-shape tests pin every
+    load-bearing piece; the full-mesh assertion is more
+    about catching plumbing regressions (config, dial,
+    identity bundles) than wire format. Tracked but not a
+    blocker.
+
+This closes SIMP-019.
 
 ### 6.6 Manifests are not signed
 
