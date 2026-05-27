@@ -117,12 +117,18 @@ pub enum YamlStep {
     Try(TryStep),
 }
 
-/// `let` step config.
+/// `let` step config. The `value` is held as a raw
+/// [`serde_yaml::Value`] so it can carry a native YAML sequence
+/// (for `type: list`), a native YAML mapping (for `type: map`),
+/// or a scalar (for the four scalar types). The lowerer
+/// validates the value shape against the declared type and
+/// recursively stringifies nested structures into SOL literal
+/// syntax.
 #[derive(Debug)]
 pub struct LetStep {
     pub name: String,
     pub var_type: String,
-    pub value: String,
+    pub value: Value,
 }
 
 /// `call` / `stream` step config.
@@ -416,10 +422,17 @@ fn parse_step(value: &Value, path: &StepPath) -> Result<YamlStep, YamlFlowError>
 fn parse_let(value: &Value, path: &StepPath) -> Result<LetStep, YamlFlowError> {
     let map = expect_mapping(value, path, "let body")?;
     deny_unknown_fields(map, path, "let", &["name", "type", "value"])?;
+    let value_node = map
+        .get(Value::String("value".into()))
+        .cloned()
+        .ok_or_else(|| YamlFlowError::Semantic {
+            path: path.render(),
+            message: "missing required field `value`".to_string(),
+        })?;
     Ok(LetStep {
         name: required_string(map, "name", path)?,
         var_type: required_string(map, "type", path)?,
-        value: required_string(map, "value", path)?,
+        value: value_node,
     })
 }
 
@@ -761,14 +774,7 @@ impl Lowerer {
     fn lower_let(&mut self, s: &LetStep, path: &StepPath) -> Result<(), YamlFlowError> {
         validate_ident(&s.name, "let.name", path)?;
         let ty = validate_let_type(&s.var_type, path)?;
-        // For `str` we emit a string literal; for other scalar
-        // types we emit the value verbatim so the SOL parser
-        // gets `int` / `bool` / `float` literals (or a `list` /
-        // `map` literal the operator wrote in SOL syntax).
-        let rhs = match ty {
-            LetType::Str => sol_string_literal(&s.value, path)?,
-            _ => s.value.clone(),
-        };
+        let rhs = lower_let_value(&ty, &s.value, path)?;
         // Every name introduced by `let` or `call.assign` is
         // hoisted to the function's outer scope by
         // `collect_hoisted_decls`. So the FIRST encounter at
@@ -1027,6 +1033,161 @@ fn validate_catch_kind(kind: &str, path: &StepPath) -> Result<(), YamlFlowError>
             ),
         }),
     }
+}
+
+/// Lower the `value` of a `let` step into SOL source according
+/// to the declared `type`. Native YAML sequences and mappings
+/// are accepted directly for `list` / `map` types and
+/// recursively stringified into SOL literal syntax. Scalars are
+/// emitted verbatim (for int / bool / float) or as a SOL string
+/// literal (for str). A value shape that doesn't match the
+/// declared type surfaces a clear semantic error.
+fn lower_let_value(ty: &LetType, value: &Value, path: &StepPath) -> Result<String, YamlFlowError> {
+    match ty {
+        LetType::Str => match value {
+            Value::String(s) => sol_string_literal(s, path),
+            Value::Number(n) => sol_string_literal(&n.to_string(), path),
+            Value::Bool(b) => sol_string_literal(&b.to_string(), path),
+            Value::Null => sol_string_literal("", path),
+            Value::Sequence(_) => Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message:
+                    "let.value is a YAML sequence but let.type is `str` — use `type: list` for sequence values"
+                        .to_string(),
+            }),
+            Value::Mapping(_) => Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message:
+                    "let.value is a YAML mapping but let.type is `str` — use `type: map` for mapping values"
+                        .to_string(),
+            }),
+            Value::Tagged(t) => lower_let_value(ty, &t.value, path),
+        },
+        LetType::Int | LetType::Float => require_scalar_unquoted(value, ty, path),
+        LetType::Bool => require_scalar_unquoted(value, ty, path),
+        LetType::List => match value {
+            // Native YAML sequence — recursively stringify
+            // into a SOL `[a, b, c]` literal.
+            Value::Sequence(_) => yaml_to_sol_list_or_map(value, path),
+            // Backwards-compatible: a quoted string carrying
+            // the SOL list literal verbatim. Still supported
+            // so flows authored before native lists worked
+            // keep compiling.
+            Value::String(s) => Ok(s.clone()),
+            Value::Mapping(_) => Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message:
+                    "let.value is a YAML mapping but let.type is `list` — use `type: map` for mapping values"
+                        .to_string(),
+            }),
+            Value::Number(_) | Value::Bool(_) | Value::Null => Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message:
+                    "let.value must be a sequence for type `list` (or a SOL list literal as a string)"
+                        .to_string(),
+            }),
+            Value::Tagged(t) => lower_let_value(ty, &t.value, path),
+        },
+        LetType::Map => match value {
+            Value::Mapping(_) => yaml_to_sol_list_or_map(value, path),
+            Value::String(s) => Ok(s.clone()),
+            Value::Sequence(_) => Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message:
+                    "let.value is a YAML sequence but let.type is `map` — use `type: list` for sequence values"
+                        .to_string(),
+            }),
+            Value::Number(_) | Value::Bool(_) | Value::Null => Err(YamlFlowError::Semantic {
+                path: path.render(),
+                message:
+                    "let.value must be a mapping for type `map` (or a SOL map literal as a string)"
+                        .to_string(),
+            }),
+            Value::Tagged(t) => lower_let_value(ty, &t.value, path),
+        },
+    }
+}
+
+fn require_scalar_unquoted(
+    value: &Value,
+    ty: &LetType,
+    path: &StepPath,
+) -> Result<String, YamlFlowError> {
+    match value {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Sequence(_) => Err(YamlFlowError::Semantic {
+            path: path.render(),
+            message: format!(
+                "let.value is a YAML sequence but let.type is `{}` — use `type: list` for sequence values",
+                ty.as_sol()
+            ),
+        }),
+        Value::Mapping(_) => Err(YamlFlowError::Semantic {
+            path: path.render(),
+            message: format!(
+                "let.value is a YAML mapping but let.type is `{}` — use `type: map` for mapping values",
+                ty.as_sol()
+            ),
+        }),
+        Value::Null => Err(YamlFlowError::Semantic {
+            path: path.render(),
+            message: format!("let.value for type `{}` cannot be null", ty.as_sol()),
+        }),
+        Value::Tagged(t) => require_scalar_unquoted(&t.value, ty, path),
+    }
+}
+
+/// Recursively turn a YAML `Value` into the SOL expression that
+/// produces the same logical value. Strings become SOL string
+/// literals, numbers / bools / null stay verbatim, sequences
+/// become `[a, b, c]` SOL lists, and mappings become
+/// `{"k": v, ...}` SOL maps. Nested lists and maps are handled
+/// by the recursion.
+fn yaml_to_sol_expr(value: &Value, path: &StepPath) -> Result<String, YamlFlowError> {
+    match value {
+        Value::String(s) => sol_string_literal(s, path),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => sol_string_literal("", path),
+        Value::Sequence(seq) => {
+            let mut parts = Vec::with_capacity(seq.len());
+            for v in seq {
+                parts.push(yaml_to_sol_expr(v, path)?);
+            }
+            Ok(format!("[{}]", parts.join(", ")))
+        }
+        Value::Mapping(m) => {
+            let mut parts = Vec::with_capacity(m.len());
+            for (k, v) in m {
+                let key_str = match k {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => {
+                        return Err(YamlFlowError::Semantic {
+                            path: path.render(),
+                            message: "map keys must be scalar strings (SOL map literals only accept string-literal keys)"
+                                .to_string(),
+                        });
+                    }
+                };
+                let key_lit = sol_string_literal(&key_str, path)?;
+                let val_expr = yaml_to_sol_expr(v, path)?;
+                parts.push(format!("{key_lit}: {val_expr}"));
+            }
+            Ok(format!("{{{}}}", parts.join(", ")))
+        }
+        Value::Tagged(t) => yaml_to_sol_expr(&t.value, path),
+    }
+}
+
+/// Shim: the public entry point exposed to the lowerer for
+/// list / map values. Identical to `yaml_to_sol_expr` but
+/// named for clarity at the call site.
+fn yaml_to_sol_list_or_map(value: &Value, path: &StepPath) -> Result<String, YamlFlowError> {
+    yaml_to_sol_expr(value, path)
 }
 
 /// SOL strings have no escape sequences (SIMP-016). A literal
