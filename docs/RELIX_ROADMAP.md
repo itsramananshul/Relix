@@ -865,7 +865,7 @@ End-to-end is now real:
 | 5b. Client-disconnect cancellation (`CancelSignal` + `CancelGuard`) | `639d785` |
 | 6. Wire-shape unit tests + extracted chunk builders | `26a8660` |
 | 7. STATE-OF-RELIX §6.5 + roadmap entry rewrite | `8fca08e` |
-| 8. Mini-mesh integration test (real AI peer + libp2p + AppState + axum + reqwest stream:true) | TBD |
+| 8. Mini-mesh integration test (real AI peer + libp2p + AppState + axum + reqwest stream:true) | `cc4195f` |
 
 Opt-in by a single bridge config line; see
 `docs/STATE-OF-RELIX.md` §6.5 for the architecture and
