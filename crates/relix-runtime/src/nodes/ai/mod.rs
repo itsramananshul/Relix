@@ -287,6 +287,7 @@ pub fn register(
     tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
     tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
+    interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
@@ -297,6 +298,8 @@ pub fn register(
     let dispatcher_for_chat = tool_dispatcher.clone();
     let mesh_for_chat = tool_mesh.clone();
     let metrics_for_chat = metrics_sink.clone();
+    let provider_name_for_chat: String = provider.provider_name().to_string();
+    let interaction_for_chat = interaction_sink.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -309,7 +312,25 @@ pub fn register(
             let td = dispatcher_for_chat.clone();
             let mesh = mesh_for_chat.clone();
             let metrics = metrics_for_chat.clone();
-            async move { handle_chat(p, model, mem, soul, sk, gr, td, mesh, metrics, ctx).await }
+            let provider_name = provider_name_for_chat.clone();
+            let training = interaction_for_chat.clone();
+            async move {
+                handle_chat(
+                    p,
+                    model,
+                    mem,
+                    soul,
+                    sk,
+                    gr,
+                    td,
+                    mesh,
+                    metrics,
+                    training,
+                    provider_name,
+                    ctx,
+                )
+                .await
+            }
         })),
     );
     // RELIX-2 step 3: register the streaming variant. Shares
@@ -329,6 +350,8 @@ pub fn register(
     let skills_for_chat_stream = skills_cache.clone();
     let guardrail_for_chat_stream = input_guardrail.clone();
     let metrics_for_chat_stream = metrics_sink.clone();
+    let interaction_for_chat_stream = interaction_sink.clone();
+    let provider_name_for_chat_stream: String = provider.provider_name().to_string();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -340,7 +363,23 @@ pub fn register(
                 let sk = skills_for_chat_stream.clone();
                 let gr = guardrail_for_chat_stream.clone();
                 let metrics = metrics_for_chat_stream.clone();
-                async move { handle_chat_stream(p, model, mem, soul, sk, gr, metrics, ctx).await }
+                let training = interaction_for_chat_stream.clone();
+                let provider_name = provider_name_for_chat_stream.clone();
+                async move {
+                    handle_chat_stream(
+                        p,
+                        model,
+                        mem,
+                        soul,
+                        sk,
+                        gr,
+                        metrics,
+                        training,
+                        provider_name,
+                        ctx,
+                    )
+                    .await
+                }
             },
         )),
     );
@@ -813,8 +852,11 @@ async fn handle_chat_stream(
     skills_cache: skills::SkillMatcher,
     input_guardrail: guardrails::InputGuardrail,
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
+    interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
+    provider_name: String,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
+    let stream_started_at = std::time::Instant::now();
     let preflight = build_chat_preflight(
         &ctx.args,
         &provider,
@@ -826,11 +868,21 @@ async fn handle_chat_stream(
         &ctx.caller.subject_id.to_string(),
     )
     .await?;
-    // Drop fields we don't need downstream so the move closure
-    // captures the minimum.
-    let _session_id = preflight.session_id;
+    let session_id = preflight.session_id.clone();
     let _ = preflight.approval_token;
     let input = preflight.input;
+    // Snapshot fields the training-record build path needs
+    // BEFORE we move `input` into `generate_reply_stream`. The
+    // streaming path doesn't run the planner so there are no
+    // tool calls to record.
+    let training_system_prompt = input.system_prompt.clone().unwrap_or_default();
+    let training_user_message = input.prompt.clone();
+    let training_model = if input.model.is_empty() {
+        default_model.clone()
+    } else {
+        input.model.clone()
+    };
+    let training_agent = ctx.caller.name.clone();
 
     let provider_stream = provider.generate_reply_stream(input).await.map_err(|e| {
         let (kind, retry_hint) = match &e {
@@ -857,12 +909,18 @@ async fn handle_chat_stream(
     // RELIX-7.11 collector's join cache can merge them onto the
     // dispatch row.
     let request_id = ctx.request_id;
+    let training_session = session_id.clone();
     let mapped = async_stream::stream! {
         use futures::StreamExt;
         let mut s = std::pin::pin!(provider_stream);
+        let mut accumulated_text = String::new();
+        let mut accumulated_usage: Option<(u32, u32, String)> = None;
+        let mut stream_error: Option<String> = None;
+        let mut stream_error_kind: Option<&'static str> = None;
         while let Some(item) = s.next().await {
             match item {
                 Ok(StreamingChunk::Text(t)) => {
+                    accumulated_text.push_str(&t);
                     yield Ok(t.into_bytes());
                 }
                 Ok(StreamingChunk::Usage(u)) => {
@@ -874,10 +932,13 @@ async fn handle_chat_stream(
                             model: u.model.clone(),
                         });
                     }
+                    accumulated_usage = Some((u.prompt_tokens, u.completion_tokens, u.model));
                     // Don't forward Usage to the wire — it's
                     // observation metadata, not assistant text.
                 }
                 Err(ProviderError::Transient(c)) => {
+                    stream_error = Some(c.clone());
+                    stream_error_kind = Some("RESPONDER_OVERLOADED");
                     yield Err(ErrorEnvelope {
                         kind: error_kinds::RESPONDER_OVERLOADED,
                         cause: format!("ai.chat.stream: {c}"),
@@ -886,6 +947,8 @@ async fn handle_chat_stream(
                     });
                 }
                 Err(ProviderError::Permanent(c)) => {
+                    stream_error = Some(c.clone());
+                    stream_error_kind = Some("RESPONDER_INTERNAL");
                     yield Err(ErrorEnvelope {
                         kind: error_kinds::RESPONDER_INTERNAL,
                         cause: format!("ai.chat.stream: {c}"),
@@ -894,6 +957,39 @@ async fn handle_chat_stream(
                     });
                 }
             }
+        }
+        // RELIX-7.15: record one training interaction at stream
+        // close. Success iff we never observed a stream error;
+        // tool calls are always empty (streaming path bypasses
+        // the planner). The model name comes from the Usage
+        // frame when present, else falls back to the requested
+        // model.
+        if let Some(sink) = interaction_sink.as_ref() {
+            let (prompt_tokens, completion_tokens, model_used) = match accumulated_usage {
+                Some((p, c, m)) => (Some(p), Some(c), if m.is_empty() { training_model.clone() } else { m }),
+                None => (None, None, training_model.clone()),
+            };
+            let success = stream_error.is_none();
+            let rec = crate::training::InteractionRecord::new(
+                crate::training::InteractionId::from_request(&request_id),
+                training_session.clone(),
+                training_agent.clone(),
+                model_used,
+                provider_name.clone(),
+                training_system_prompt.clone(),
+                training_user_message.clone(),
+                accumulated_text.clone(),
+                vec![],
+                prompt_tokens,
+                completion_tokens,
+                stream_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                success,
+                stream_error_kind.map(|k| k.to_string()).or_else(|| {
+                    stream_error.as_ref().map(|_| "RESPONDER_INTERNAL".to_string())
+                }),
+                0,
+            );
+            sink.record_interaction(rec);
         }
     };
     Ok(Box::pin(mapped))
@@ -910,8 +1006,11 @@ async fn handle_chat(
     tool_dispatcher: Option<Arc<crate::nodes::tool::dispatcher::ToolDispatcher>>,
     tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
+    interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
+    provider_name: String,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
+    let chat_started_at = std::time::Instant::now();
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
         Err(e) => {
@@ -1064,6 +1163,20 @@ async fn handle_chat(
     // registry; today its presence is the operator's
     // co-signed signal.
     let approval_token = extract_approval_token(s);
+    // RELIX-7.15: snapshot fields used by the training record
+    // BEFORE we move `input` into `generate_reply`. Bound here
+    // so both the Ok branch and the Err branches can emit a
+    // record with the same context.
+    let training_system_prompt = input.system_prompt.clone().unwrap_or_default();
+    let training_user_message = input.prompt.clone();
+    let training_session = session_id.to_string();
+    let training_agent = ctx.caller.name.clone();
+    // `input.model` already holds the resolved model — the
+    // upstream code populated it from either the caller's
+    // override or this node's default. Use it as the fallback
+    // for the training record when the provider doesn't echo
+    // back a model.
+    let training_model_default = input.model.clone();
     match provider.generate_reply(input).await {
         Ok(output) => {
             // RELIX-7.11: hand the provider-reported token usage
@@ -1183,8 +1296,50 @@ async fn handle_chat(
                 }
                 b
             };
-            match verdict {
-                execution::PolicyVerdict::Approved => HandlerOutcome::Ok(body_text.into_bytes()),
+            // RELIX-7.15: build & emit one training record from
+            // the planner's tool-call results + the provider's
+            // response text + token usage. Tool calls reflect
+            // dispatcher outcomes (success/failure + step
+            // latency) so the operator gets full agent
+            // observability per turn.
+            let tool_records: Vec<crate::training::ToolCallRecord> = tool_step_results
+                .iter()
+                .filter_map(|sr| match sr {
+                    execution::StepResult::Ok { output: out } => {
+                        Some(crate::training::ToolCallRecord {
+                            tool: "tool.invoke".into(),
+                            input: String::new(),
+                            output: out.clone(),
+                            success: true,
+                            latency_ms: 0,
+                            error_kind: None,
+                        })
+                    }
+                    execution::StepResult::Err { reason } => {
+                        Some(crate::training::ToolCallRecord {
+                            tool: "tool.invoke".into(),
+                            input: String::new(),
+                            output: String::new(),
+                            success: false,
+                            latency_ms: 0,
+                            error_kind: Some(reason.clone()),
+                        })
+                    }
+                    execution::StepResult::Skipped { .. } => None,
+                })
+                .collect();
+            let (prompt_tokens, completion_tokens, model_used) = match output.usage.as_ref() {
+                Some(u) => (
+                    Some(u.prompt_tokens),
+                    Some(u.completion_tokens),
+                    output.model.clone(),
+                ),
+                None => (None, None, output.model.clone()),
+            };
+            let inner_outcome = match verdict {
+                execution::PolicyVerdict::Approved => {
+                    HandlerOutcome::Ok(body_text.clone().into_bytes())
+                }
                 execution::PolicyVerdict::RequiresApproval { reason } => {
                     let body = format!("[approval-required] {reason}\n{body_text}");
                     tracing::info!(
@@ -1208,20 +1363,94 @@ async fn handle_chat(
                         retry_after: None,
                     })
                 }
+            };
+            if let Some(sink) = interaction_sink.as_ref() {
+                let success = matches!(inner_outcome, HandlerOutcome::Ok(_));
+                let error_kind = match &inner_outcome {
+                    HandlerOutcome::Err(env) => {
+                        Some(crate::dispatch::error_kind_to_str(env.kind).to_string())
+                    }
+                    _ => None,
+                };
+                let rec = crate::training::InteractionRecord::new(
+                    crate::training::InteractionId::from_request(&ctx.request_id),
+                    training_session.clone(),
+                    training_agent.clone(),
+                    model_used,
+                    provider_name.clone(),
+                    training_system_prompt.clone(),
+                    training_user_message.clone(),
+                    output.text.clone(),
+                    tool_records,
+                    prompt_tokens,
+                    completion_tokens,
+                    chat_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    success,
+                    error_kind,
+                    0,
+                );
+                sink.record_interaction(rec);
             }
+            inner_outcome
         }
-        Err(ProviderError::Transient(c)) => HandlerOutcome::Err(ErrorEnvelope {
-            kind: error_kinds::RESPONDER_OVERLOADED,
-            cause: format!("ai.chat: {c}"),
-            retry_hint: 1,
-            retry_after: None,
-        }),
-        Err(ProviderError::Permanent(c)) => HandlerOutcome::Err(ErrorEnvelope {
-            kind: error_kinds::RESPONDER_INTERNAL,
-            cause: format!("ai.chat: {c}"),
-            retry_hint: 2,
-            retry_after: None,
-        }),
+        Err(ProviderError::Transient(c)) => {
+            let env = ErrorEnvelope {
+                kind: error_kinds::RESPONDER_OVERLOADED,
+                cause: format!("ai.chat: {c}"),
+                retry_hint: 1,
+                retry_after: None,
+            };
+            if let Some(sink) = interaction_sink.as_ref() {
+                let rec = crate::training::InteractionRecord::new(
+                    crate::training::InteractionId::from_request(&ctx.request_id),
+                    training_session.clone(),
+                    training_agent.clone(),
+                    training_model_default.clone(),
+                    provider_name.clone(),
+                    training_system_prompt.clone(),
+                    training_user_message.clone(),
+                    String::new(),
+                    vec![],
+                    None,
+                    None,
+                    chat_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    false,
+                    Some(crate::dispatch::error_kind_to_str(env.kind).to_string()),
+                    0,
+                );
+                sink.record_interaction(rec);
+            }
+            HandlerOutcome::Err(env)
+        }
+        Err(ProviderError::Permanent(c)) => {
+            let env = ErrorEnvelope {
+                kind: error_kinds::RESPONDER_INTERNAL,
+                cause: format!("ai.chat: {c}"),
+                retry_hint: 2,
+                retry_after: None,
+            };
+            if let Some(sink) = interaction_sink.as_ref() {
+                let rec = crate::training::InteractionRecord::new(
+                    crate::training::InteractionId::from_request(&ctx.request_id),
+                    training_session.clone(),
+                    training_agent.clone(),
+                    training_model_default.clone(),
+                    provider_name.clone(),
+                    training_system_prompt.clone(),
+                    training_user_message.clone(),
+                    String::new(),
+                    vec![],
+                    None,
+                    None,
+                    chat_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    false,
+                    Some(crate::dispatch::error_kind_to_str(env.kind).to_string()),
+                    0,
+                );
+                sink.record_interaction(rec);
+            }
+            HandlerOutcome::Err(env)
+        }
     }
 }
 
@@ -1332,6 +1561,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1345,6 +1576,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1362,6 +1595,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -1390,6 +1625,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -1412,6 +1649,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"|hello|"),
         )
         .await;
@@ -1455,6 +1694,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1496,6 +1737,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1528,6 +1771,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1561,6 +1806,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -1600,6 +1847,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1636,6 +1885,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1695,6 +1946,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -1735,6 +1988,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -1778,6 +2033,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1902,6 +2159,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1946,6 +2205,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -1988,6 +2249,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2031,6 +2294,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2095,6 +2360,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2199,6 +2466,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2396,6 +2665,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -2429,6 +2700,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -2553,6 +2826,8 @@ mod tests {
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -2589,6 +2864,8 @@ mod tests {
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -2631,6 +2908,8 @@ mod tests {
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
@@ -2731,6 +3010,8 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"session-1|hello|"),
         )
         .await
@@ -2759,6 +3040,8 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -2790,6 +3073,8 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            None,
+            "mock".to_string(),
             ctx(prompt.as_bytes()),
         )
         .await;
@@ -2810,6 +3095,8 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             None,
+            None,
+            "mock".to_string(),
             ctx(b"session-1|hello|"),
         )
         .await;
@@ -2927,6 +3214,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             Some(sink_dyn),
+            None,
+            "mock".to_string(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
         .await;
@@ -2955,6 +3244,8 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             Some(sink_dyn),
+            None,
+            "mock".to_string(),
             ctx(b"sess2|hi|"),
         )
         .await;
@@ -3120,6 +3411,8 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             Some(sink_dyn),
+            None,
+            "mock".to_string(),
             ctx_with_request_id(b"sess1|please reply|", rid),
         )
         .await
@@ -3158,6 +3451,8 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             Some(sink_dyn),
+            None,
+            "mock".to_string(),
             ctx(b"sess2|hi|"),
         )
         .await
@@ -3199,6 +3494,8 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             Some(col_dyn.clone()),
+            None,
+            "mock".to_string(),
             ctx_with_request_id(b"sess|hi|", rid),
         )
         .await

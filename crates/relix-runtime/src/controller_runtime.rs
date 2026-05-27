@@ -107,6 +107,12 @@ pub struct ControllerConfig {
     /// the only data surface.
     #[serde(default)]
     pub metrics: Option<crate::metrics::MetricsConfig>,
+    /// `[training]` — RELIX-7.15 training data pipeline. Absent
+    /// / disabled keeps the AI handler running without an
+    /// interaction sink — no `training.sqlite` file is opened
+    /// and the six `training.*` capabilities stay unregistered.
+    #[serde(default)]
+    pub training: Option<crate::training::TrainingConfig>,
     /// `[routing]` — RELIX-7.7 / 7.11 GAP 2 channel routing
     /// rules. Validated at coordinator boot against `[peers]`.
     /// Absent means every inbound channel message falls back
@@ -308,6 +314,11 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(b) = metrics_bundle.as_ref() {
         bridge.set_metrics_sink(b.sink.clone(), cfg.controller.name.clone());
     }
+    // RELIX-7.15: training-data pipeline. Returns Ok(None) when
+    // the `[training]` section is absent / disabled — the AI
+    // handler then runs with `interaction_sink = None` and
+    // every other code path stays untouched.
+    let training_bundle = build_training_bundle(&cfg, &data_dir)?;
 
     register_builtins(&mut bridge, &cfg, manifest.clone());
     // Router role short-circuits: it doesn't run the per-node-type
@@ -344,6 +355,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             access_broker.clone(),
             &mut startup_wiring,
             metrics_bundle.as_ref(),
+            training_bundle.as_ref(),
         )?;
         None
     };
@@ -3466,6 +3478,75 @@ pub(crate) struct MetricsBundle {
     pub alert_mesh_cell: crate::metrics::AlertMeshCell,
 }
 
+/// RELIX-7.15: training-data pipeline bundle. Returned by
+/// [`build_training_bundle`] and consumed by both the AI node
+/// (to attach the recorder sink) and the coordinator node (to
+/// register the six `training.*` capabilities).
+pub(crate) struct TrainingBundle {
+    pub sink: std::sync::Arc<dyn crate::training::InteractionSink>,
+    pub store: crate::training::TrainingStore,
+    pub export_dir: std::path::PathBuf,
+}
+
+/// Open the training store, spawn the drain + retention +
+/// scorer loops, and return the bundle the AI handler +
+/// coordinator both need.
+///
+/// Returns `Ok(None)` when `[training] enabled = false` (or
+/// the section is absent) — the AI handler then runs without
+/// an interaction sink and the `training.*` capabilities stay
+/// unregistered.
+pub(crate) fn build_training_bundle(
+    cfg: &ControllerConfig,
+    data_dir: &std::path::Path,
+) -> Result<Option<TrainingBundle>, Box<dyn std::error::Error>> {
+    let t_cfg = match cfg.training.clone() {
+        Some(c) if c.enabled => c,
+        _ => return Ok(None),
+    };
+    let db_path = t_cfg
+        .db_path
+        .clone()
+        .unwrap_or_else(|| crate::training::default_training_path(data_dir));
+    let store = crate::training::TrainingStore::open(&db_path)
+        .map_err(|e| format!("[training] open {}: {e}", db_path.display()))?;
+    let (recorder, handles) = crate::training::InteractionRecorder::new(store.clone());
+    let _spawned = handles.spawn(crate::training::RetentionConfig {
+        retention_days: t_cfg.retention_days,
+        sweep_interval: std::time::Duration::from_secs(t_cfg.retention_sweep_interval_secs.max(60)),
+    });
+    if t_cfg.scorer_enabled {
+        let _scorer = crate::training::spawn_scorer_loop(
+            store.clone(),
+            crate::training::ScorerConfig {
+                interval: std::time::Duration::from_secs(t_cfg.scorer_interval_secs.max(5)),
+                batch_size: t_cfg.scorer_batch_size,
+            },
+        );
+        tracing::info!(
+            interval_secs = t_cfg.scorer_interval_secs,
+            batch_size = t_cfg.scorer_batch_size,
+            "training: background quality scorer spawned"
+        );
+    }
+    let export_dir = t_cfg
+        .export_dir
+        .clone()
+        .unwrap_or_else(|| crate::training::default_export_dir(data_dir));
+    tracing::info!(
+        db = %db_path.display(),
+        retention_days = t_cfg.retention_days,
+        scorer_enabled = t_cfg.scorer_enabled,
+        export_dir = %export_dir.display(),
+        "training: recorder + retention online"
+    );
+    Ok(Some(TrainingBundle {
+        sink: std::sync::Arc::new(recorder),
+        store,
+        export_dir,
+    }))
+}
+
 /// Open the metrics store, spawn the drain + retention loops,
 /// and return everything the caller needs to wire the sink onto
 /// the dispatch bridge + register coordinator caps.
@@ -3676,6 +3757,7 @@ fn register_node_type_handlers(
     access_broker: std::sync::Arc<crate::nodes::execution::broker::AgentAccessBroker>,
     out: &mut Vec<StartupWiring>,
     metrics: Option<&MetricsBundle>,
+    training: Option<&TrainingBundle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
 
@@ -4054,6 +4136,7 @@ fn register_node_type_handlers(
             Some(tool_dispatcher),
             tool_mesh_cell,
             metrics.map(|b| b.sink.clone()),
+            training.map(|b| b.sink.clone()),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
@@ -4598,6 +4681,39 @@ fn register_node_type_handlers(
         } else {
             tracing::info!(
                 "coordinator: [metrics] disabled — metrics.* capabilities not registered"
+            );
+        }
+
+        // ── RELIX-7.15: training data pipeline. Six unary
+        // capabilities on the coordinator backed by the
+        // bundle's TrainingStore + ExportEngine. The bundle
+        // already spawned the drain / retention / scorer
+        // loops; here we just register the dispatch handlers.
+        if let Some(b) = training.as_ref() {
+            crate::training::register(bridge, b.store.clone(), b.export_dir.clone());
+            for (method, doc) in crate::training::training_capability_descriptors() {
+                let categories: &[&str] = match *method {
+                    "training.list_interactions" => &["training", "read"],
+                    "training.get_interaction" => &["training", "read"],
+                    "training.export" => &["training", "export", "mutate"],
+                    "training.score_interaction" => &["training", "mutate"],
+                    "training.stats" => &["training", "read"],
+                    "training.delete_interaction" => &["training", "mutate"],
+                    _ => &["training"],
+                };
+                manifest.add_capability(
+                    CapabilityDescriptor::unary(*method)
+                        .with_description(*doc)
+                        .with_categories(categories.iter().map(|s| (*s).into())),
+                );
+            }
+            tracing::info!(
+                export_dir = %b.export_dir.display(),
+                "coordinator node: registered training.* capabilities"
+            );
+        } else {
+            tracing::info!(
+                "coordinator: [training] disabled — training.* capabilities not registered"
             );
         }
 

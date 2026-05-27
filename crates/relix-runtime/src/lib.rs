@@ -27,6 +27,7 @@ pub mod observability;
 pub mod plugin;
 pub mod sflow;
 pub mod sol;
+pub mod training;
 pub mod transport;
 pub mod workflow;
 pub mod yaml_flow;
