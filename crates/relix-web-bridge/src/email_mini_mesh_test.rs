@@ -270,10 +270,7 @@ addr = "{}"
     // ─── 4. Mount the email routes on an ephemeral listener ───
     let app = Router::new()
         .route("/v1/email/send", post(crate::email::send))
-        .route(
-            "/v1/email/send_template",
-            post(crate::email::send_template),
-        )
+        .route("/v1/email/send_template", post(crate::email::send_template))
         .route("/v1/email/status", get(crate::email::status))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -329,11 +326,7 @@ addr = "{}"
     .await
     .expect("POST /v1/email/send (missing to) returned within 15s")
     .expect("POST succeeded");
-    assert_eq!(
-        resp.status().as_u16(),
-        400,
-        "missing to expected 400"
-    );
+    assert_eq!(resp.status().as_u16(), 400, "missing to expected 400");
     let body_bytes = resp.bytes().await.expect("missing-to body");
     let parsed: Value = serde_json::from_slice(&body_bytes).expect("missing-to JSON");
     let err_str = parsed
@@ -363,11 +356,7 @@ addr = "{}"
     .await
     .expect("POST /v1/email/send (missing subject) returned within 15s")
     .expect("POST succeeded");
-    assert_eq!(
-        resp.status().as_u16(),
-        400,
-        "missing subject expected 400"
-    );
+    assert_eq!(resp.status().as_u16(), 400, "missing subject expected 400");
 
     // ─── 8. POST /v1/email/send_template → 200 + Message-ID + template name ───
     let url = format!("http://{}/v1/email/send_template", bound);
@@ -408,8 +397,14 @@ addr = "{}"
     assert_eq!(resp.status().as_u16(), 200, "status expected 200");
     let body_bytes = resp.bytes().await.expect("status body");
     let parsed: Value = serde_json::from_slice(&body_bytes).expect("status JSON");
-    assert_eq!(parsed.get("smtp").and_then(Value::as_str), Some("connected"));
-    assert_eq!(parsed.get("imap").and_then(Value::as_str), Some("connected"));
+    assert_eq!(
+        parsed.get("smtp").and_then(Value::as_str),
+        Some("connected")
+    );
+    assert_eq!(
+        parsed.get("imap").and_then(Value::as_str),
+        Some("connected")
+    );
     assert_eq!(
         parsed.get("from").and_then(Value::as_str),
         Some("Relix <bot@example.com>")
@@ -420,5 +415,10 @@ addr = "{}"
         parsed.get("last_send_at").and_then(Value::as_i64),
         Some(1_700_000_000)
     );
-    assert!(parsed.get("smtp_error").map(|v| v.is_null()).unwrap_or(false));
+    assert!(
+        parsed
+            .get("smtp_error")
+            .map(|v| v.is_null())
+            .unwrap_or(false)
+    );
 }

@@ -21,6 +21,7 @@ pub mod db;
 pub mod dispatch;
 pub mod flow_runner;
 pub mod manifest;
+pub mod metrics;
 pub mod nodes;
 pub mod observability;
 pub mod plugin;

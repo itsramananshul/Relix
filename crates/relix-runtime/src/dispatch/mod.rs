@@ -239,6 +239,23 @@ pub struct DispatchBridge {
     /// broker) means the broker is permissive — useful for
     /// nodes / deployments that don't run agent policies.
     access_broker: Option<Arc<crate::nodes::execution::broker::AgentAccessBroker>>,
+    /// RELIX-7.11: per-invocation metrics sink. When set, the
+    /// dispatch pipeline records one row per dispatched call
+    /// (success OR handler-error) with agent name, method,
+    /// latency, sizes, and error kind. Policy-denied /
+    /// unknown-method outcomes are NOT recorded — the
+    /// dispatch-stats counters above already cover those.
+    ///
+    /// Wired by the controller startup via
+    /// [`Self::set_metrics_sink`]. `None` keeps the bridge in
+    /// counter-only mode (the dispatch-stats path keeps
+    /// running unconditionally).
+    metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
+    /// RELIX-7.11: peer alias the bridge runs on. Carried in
+    /// every recorded metric so cross-peer dashboards can
+    /// disambiguate (the agent name is the *caller's*
+    /// identity; this is the responder's friendly name).
+    peer_alias: String,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -361,7 +378,66 @@ impl DispatchBridge {
             policy_denials: Arc::new(PolicyDenialRing::default()),
             agent_gate: None,
             access_broker: None,
+            metrics_sink: None,
+            peer_alias: String::new(),
         })
+    }
+
+    /// RELIX-7.11: wire the per-invocation metrics sink + the
+    /// peer alias the recorded rows carry. Idempotent — calling
+    /// twice with a fresh sink replaces the previous wiring.
+    pub fn set_metrics_sink(
+        &mut self,
+        sink: Arc<dyn crate::metrics::MetricsSink>,
+        peer_alias: impl Into<String>,
+    ) {
+        self.metrics_sink = Some(sink);
+        self.peer_alias = peer_alias.into();
+    }
+
+    /// Cheap-clone handle to the metrics sink. Used by handlers
+    /// (most notably `ai.chat`) that want to attach a token
+    /// usage hint via [`crate::metrics::MetricsSink::attach_ai_usage`]
+    /// before returning.
+    pub fn metrics_sink_handle(&self) -> Option<Arc<dyn crate::metrics::MetricsSink>> {
+        self.metrics_sink.clone()
+    }
+
+    /// RELIX-7.11: helper. Records one invocation through the
+    /// configured metrics sink. Called from the dispatch hot
+    /// path after the handler returns. No-op when no sink is
+    /// wired.
+    #[allow(clippy::too_many_arguments)]
+    fn record_metric(
+        &self,
+        method: &str,
+        agent_name: &str,
+        request_id: relix_core::types::RequestId,
+        latency_ms: u64,
+        success: bool,
+        error_kind: Option<&str>,
+        input_bytes: usize,
+        output_bytes: usize,
+    ) {
+        let Some(sink) = self.metrics_sink.as_ref() else {
+            return;
+        };
+        let metric = crate::metrics::InvocationMetric {
+            agent_name: agent_name.to_string(),
+            peer_alias: self.peer_alias.clone(),
+            method: method.to_string(),
+            timestamp_ms: unix_now_ms(),
+            latency_ms,
+            success,
+            error_kind: error_kind.map(|s| s.to_string()),
+            token_count: None,
+            cost_micros: None,
+            input_bytes,
+            output_bytes,
+            model: None,
+            request_id: Some(request_id),
+        };
+        sink.record_invocation(metric);
     }
 
     /// Wire the agent-employee gate. Called by the coordinator
@@ -814,6 +890,28 @@ impl DispatchBridge {
             StatBucket::Err
         };
         self.bump_stats_with_latency(&req.method, bucket, now, Some(elapsed_ms));
+        // RELIX-7.11: per-invocation metric row. Dispatched
+        // outcomes only — denied / unknown_method already get
+        // dispatch-stats counters above. The sink is
+        // non-blocking; never adds latency to the hot path.
+        let output_bytes = match &result {
+            ResponseResult::Ok(b) => b.len(),
+            _ => 0,
+        };
+        let err_kind_str: Option<&str> = match &result {
+            ResponseResult::Err(e) => Some(error_kind_to_str(e.kind)),
+            _ => None,
+        };
+        self.record_metric(
+            &req.method,
+            &verified.name,
+            req.rid,
+            elapsed_ms,
+            matches!(status, AuditStatus::Ok),
+            err_kind_str,
+            req.args.len(),
+            output_bytes,
+        );
         let aid = self
             .write_audit(
                 &req,
@@ -1374,6 +1472,49 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Millisecond-resolution unix timestamp — used by RELIX-7.11
+/// per-invocation metrics rows. Saturates at `i64::MAX`.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// Map a numeric `error_kinds::*` constant back to its symbolic
+/// name. Used by the metrics layer when persisting a row so the
+/// dashboard / aggregation queries don't need a separate
+/// translation table.
+pub(crate) fn error_kind_to_str(kind: u32) -> &'static str {
+    use relix_core::types::error_kinds as k;
+    match kind {
+        k::TRANSPORT => "TRANSPORT",
+        k::TIMEOUT => "TIMEOUT",
+        k::PEER_UNREACHABLE => "PEER_UNREACHABLE",
+        k::UNKNOWN_METHOD => "UNKNOWN_METHOD",
+        k::INVALID_ARGS => "INVALID_ARGS",
+        k::POLICY_DENIED => "POLICY_DENIED",
+        k::IDENTITY_INVALID => "IDENTITY_INVALID",
+        k::CREDENTIAL_EXPIRED => "CREDENTIAL_EXPIRED",
+        k::CAPABILITY_DEPRECATED => "CAPABILITY_DEPRECATED",
+        k::CAPABILITY_REMOVED => "CAPABILITY_REMOVED",
+        k::RESPONDER_INTERNAL => "RESPONDER_INTERNAL",
+        k::RESPONDER_OVERLOADED => "RESPONDER_OVERLOADED",
+        k::REPLAY_REJECTED => "REPLAY_REJECTED",
+        k::VERSION_MISMATCH => "VERSION_MISMATCH",
+        k::APPROVAL_TIMEOUT => "APPROVAL_TIMEOUT",
+        k::APPROVAL_DENIED => "APPROVAL_DENIED",
+        k::CANCELLED => "CANCELLED",
+        k::MANIFEST_STALE => "MANIFEST_STALE",
+        k::APPROVAL_REQUIRED => "APPROVAL_REQUIRED",
+        // Higher kinds (gate-token / security-denied / etc.)
+        // and unknown values: surface the numeric code so an
+        // operator can still spot trends. Static strs only —
+        // metrics rows hold owned Strings so we leak nothing.
+        _ => "OTHER",
+    }
 }
 
 fn encode_error_response(

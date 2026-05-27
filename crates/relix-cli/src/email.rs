@@ -130,11 +130,7 @@ struct SendBody {
     peer: Option<String>,
 }
 
-async fn send(
-    bridge: &str,
-    req: SendBody,
-    raw: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn send(bridge: &str, req: SendBody, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
     if req.to.is_empty() {
         return Err("at least one --to address is required".into());
     }
@@ -222,7 +218,10 @@ async fn test(
     if status.is_success() {
         let parsed: SendResponse = serde_json::from_str(&body)
             .map_err(|e| format!("decode send response: {e} (body={body})"))?;
-        println!("ok\n  message_id : {}\n  to         : {to_addr}", parsed.message_id);
+        println!(
+            "ok\n  message_id : {}\n  to         : {to_addr}",
+            parsed.message_id
+        );
         Ok(())
     } else {
         let err: BridgeErr = serde_json::from_str(&body)

@@ -59,7 +59,10 @@ pub struct ApiError {
 ///   "peer": "email"
 /// }
 /// ```
-pub async fn send(State(state): State<AppState>, Json(req): Json<SendRequest>) -> axum::response::Response {
+pub async fn send(
+    State(state): State<AppState>,
+    Json(req): Json<SendRequest>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     if req.to.is_empty() {
         return (
