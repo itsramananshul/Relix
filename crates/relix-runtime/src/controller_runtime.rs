@@ -107,6 +107,12 @@ pub struct ControllerConfig {
     /// the only data surface.
     #[serde(default)]
     pub metrics: Option<crate::metrics::MetricsConfig>,
+    /// `[routing]` — RELIX-7.7 / 7.11 GAP 2 channel routing
+    /// rules. Validated at coordinator boot against `[peers]`.
+    /// Absent means every inbound channel message falls back
+    /// to the legacy fixed `("ai", "ai.chat")` target.
+    #[serde(default)]
+    pub routing: Option<crate::nodes::coordinator::routing::RoutingConfig>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -4340,6 +4346,49 @@ fn register_node_type_handlers(
             workflows_dir = %workflows_dir.display(),
             chronicle = %workflow_chronicle_path.display(),
             "coordinator node: registered workflow.run / list / status / validate"
+        );
+
+        // ── RELIX-7.7 / 7.11 GAP 2: channel routing. Build the
+        // router from `[routing]` validated against `[peers]`,
+        // register `routing.resolve` + `routing.list`. Absent
+        // config means an empty router → channels fall back to
+        // the static `("ai", "ai.chat")` target.
+        let routing_rules = cfg
+            .routing
+            .as_ref()
+            .map(|r| r.rules.clone())
+            .unwrap_or_default();
+        let known_peers: std::collections::BTreeSet<String> = cfg.peers.keys().cloned().collect();
+        let router = if routing_rules.is_empty() {
+            crate::nodes::coordinator::routing::ChannelRouter::empty()
+        } else {
+            crate::nodes::coordinator::routing::ChannelRouter::new(routing_rules, &known_peers)
+                .map_err(|e| format!("[routing] validation: {e}"))?
+        };
+        crate::nodes::coordinator::routing::register(bridge, router.clone());
+        for (method, doc) in [
+            (
+                "routing.resolve",
+                "RELIX-7.7/7.11 GAP 2: resolve an inbound channel message to a target \
+                 agent + capability. Args: JSON \
+                 {channel, sender, subject?, content?}. Returns \
+                 {decision: {target_agent, capability, matched_rule?}, rules_evaluated}.",
+            ),
+            (
+                "routing.list",
+                "Return every routing rule currently configured on this coordinator as \
+                 JSON. Operator inspection surface.",
+            ),
+        ] {
+            manifest.add_capability(
+                CapabilityDescriptor::unary(method)
+                    .with_description(doc)
+                    .with_categories(["routing".into(), "read".into()]),
+            );
+        }
+        tracing::info!(
+            rules = router.rules().len(),
+            "coordinator node: registered routing.resolve / routing.list"
         );
 
         // ── RELIX-7.11 metrics caps. Registered on the

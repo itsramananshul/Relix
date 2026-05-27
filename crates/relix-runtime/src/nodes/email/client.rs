@@ -20,6 +20,35 @@ pub trait EmailOutbound: Send + Sync + 'static {
     async fn memory_agent_read(&self, subject_id: &str) -> (String, String);
     async fn memory_agent_clear(&self, subject_id: &str);
     async fn ai_chat(&self, session_id: &str, prompt: &str, history: &str) -> Option<String>;
+    /// RELIX-7.7 GAP 2 — dispatch the chat call to a specific
+    /// peer + capability. The default impl just calls
+    /// `ai_chat` against the static AI peer; production
+    /// `EmailOutboundClient` overrides to send the JSON
+    /// envelope at any `(peer, capability)` pair.
+    async fn dispatch_chat(
+        &self,
+        _peer: &str,
+        _capability: &str,
+        session_id: &str,
+        prompt: &str,
+        history: &str,
+    ) -> Option<String> {
+        self.ai_chat(session_id, prompt, history).await
+    }
+    /// RELIX-7.7 GAP 2 — ask the coordinator's `routing.resolve`
+    /// capability where to send this message. Returns `None`
+    /// when no rule matches or the coordinator is unreachable;
+    /// the caller falls back to the static `(ai, ai.chat)`
+    /// dispatch.
+    async fn routing_resolve(
+        &self,
+        _channel: &str,
+        _sender: &str,
+        _subject: &str,
+        _content: &str,
+    ) -> Option<(String, String)> {
+        None
+    }
     async fn task_create(
         &self,
         title: &str,
@@ -221,6 +250,71 @@ impl EmailOutbound for EmailOutboundClient {
                 None
             }
         }
+    }
+
+    async fn dispatch_chat(
+        &self,
+        peer: &str,
+        capability: &str,
+        session_id: &str,
+        prompt: &str,
+        history: &str,
+    ) -> Option<String> {
+        let arg = format!("{session_id}|{prompt}|{history}");
+        match self
+            .call_text(peer, capability, self.ai_deadline_secs, arg.into_bytes())
+            .await
+        {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(
+                    peer = peer,
+                    capability = capability,
+                    error = %e,
+                    "email: dispatch_chat failed"
+                );
+                None
+            }
+        }
+    }
+
+    async fn routing_resolve(
+        &self,
+        channel: &str,
+        sender: &str,
+        subject: &str,
+        content: &str,
+    ) -> Option<(String, String)> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "sender": sender,
+            "subject": subject,
+            "content": content,
+        });
+        let bytes = serde_json::to_vec(&body).ok()?;
+        let resp = match self
+            .call_text(
+                &self.coord_alias,
+                "routing.resolve",
+                self.coord_deadline_secs,
+                bytes,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "email: routing.resolve unreachable");
+                return None;
+            }
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&resp).ok()?;
+        let decision = parsed.get("decision")?;
+        if decision.is_null() {
+            return None;
+        }
+        let target = decision.get("target_agent")?.as_str()?.to_string();
+        let cap = decision.get("capability")?.as_str()?.to_string();
+        Some((target, cap))
     }
 
     async fn task_create(

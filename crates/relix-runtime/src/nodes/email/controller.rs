@@ -241,7 +241,31 @@ async fn run_chat_flow(
         .await;
     }
 
-    let reply = match out.ai_chat(session_id, text, &history_text).await {
+    // RELIX-7.7 GAP 2: consult the coordinator's routing rules
+    // before dispatching. When no rule matches (or the router
+    // is unreachable), fall back to the static `(ai, ai.chat)`
+    // target so existing single-agent deployments behave
+    // identically. Subject + sender + a short content preview
+    // are all the router needs.
+    let preview: String = text.chars().take(200).collect();
+    let routed = out
+        .routing_resolve("email", &email.from, &email.subject, &preview)
+        .await;
+    let reply = match routed {
+        Some((peer, capability)) => {
+            tracing::info!(
+                from = %email.from,
+                subject = %email.subject,
+                target_peer = %peer,
+                capability = %capability,
+                "email: routed via ChannelRouter"
+            );
+            out.dispatch_chat(&peer, &capability, session_id, text, &history_text)
+                .await
+        }
+        None => out.ai_chat(session_id, text, &history_text).await,
+    };
+    let reply = match reply {
         Some(r) if !r.trim().is_empty() => r,
         _ => {
             if let Some(t) = task_id.as_deref() {

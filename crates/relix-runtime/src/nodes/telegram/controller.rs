@@ -382,7 +382,29 @@ async fn run_chat_flow(
         .await;
     }
 
-    let reply = match out.ai_chat(&session_id, text, &history_text).await {
+    // RELIX-7.7 GAP 2: consult the coordinator's routing
+    // rules. Telegram has no subject concept so we pass an
+    // empty string; the router silently skips subject_match for
+    // telegram (`ChannelType::has_subject` returns false).
+    let preview: String = text.chars().take(200).collect();
+    let routed = out
+        .routing_resolve("telegram", &format!("@{}", msg.username), "", &preview)
+        .await;
+    let reply = match routed {
+        Some((peer, capability)) => {
+            tracing::info!(
+                chat_id = msg.chat_id,
+                from = %msg.username,
+                target_peer = %peer,
+                capability = %capability,
+                "telegram: routed via ChannelRouter"
+            );
+            out.dispatch_chat(&peer, &capability, &session_id, text, &history_text)
+                .await
+        }
+        None => out.ai_chat(&session_id, text, &history_text).await,
+    };
+    let reply = match reply {
         Some(r) if !r.trim().is_empty() => r,
         _ => {
             if let Some(t) = task_id.as_deref() {

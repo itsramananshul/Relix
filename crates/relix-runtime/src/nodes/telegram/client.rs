@@ -30,6 +30,32 @@ pub trait TelegramOutbound: Send + Sync + 'static {
     async fn memory_agent_read(&self, subject_id: &str) -> (String, String);
     async fn memory_agent_clear(&self, subject_id: &str);
     async fn ai_chat(&self, session_id: &str, prompt: &str, history: &str) -> Option<String>;
+    /// RELIX-7.7 GAP 2 — dispatch the chat call to an
+    /// explicit (peer, capability). Defaults to the static
+    /// `ai_chat` path so test stubs don't need to override.
+    async fn dispatch_chat(
+        &self,
+        _peer: &str,
+        _capability: &str,
+        session_id: &str,
+        prompt: &str,
+        history: &str,
+    ) -> Option<String> {
+        self.ai_chat(session_id, prompt, history).await
+    }
+    /// RELIX-7.7 GAP 2 — ask the coordinator's
+    /// `routing.resolve` for the right (peer, capability).
+    /// `None` means "no rule matched", in which case the
+    /// caller falls back to `(ai, ai.chat)`.
+    async fn routing_resolve(
+        &self,
+        _channel: &str,
+        _sender: &str,
+        _subject: &str,
+        _content: &str,
+    ) -> Option<(String, String)> {
+        None
+    }
     async fn task_create(
         &self,
         title: &str,
@@ -302,6 +328,77 @@ impl TelegramOutboundClient {
         }
     }
 
+    /// RELIX-7.7 GAP 2 — dispatch the chat envelope to an
+    /// explicit `(peer, capability)`. Used after a
+    /// `routing.resolve` call.
+    pub async fn dispatch_chat(
+        &self,
+        peer: &str,
+        capability: &str,
+        session_id: &str,
+        prompt: &str,
+        history: &str,
+    ) -> Option<String> {
+        let arg = format!("{session_id}|{prompt}|{history}");
+        match self
+            .call_text(peer, capability, self.ai_deadline_secs, arg.into_bytes())
+            .await
+        {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(
+                    peer = peer,
+                    capability = capability,
+                    error = %e,
+                    "telegram: dispatch_chat failed"
+                );
+                None
+            }
+        }
+    }
+
+    /// RELIX-7.7 GAP 2 — call the coordinator's
+    /// `routing.resolve` capability. Returns `(target, cap)` on
+    /// a match, `None` otherwise.
+    pub async fn routing_resolve(
+        &self,
+        channel: &str,
+        sender: &str,
+        subject: &str,
+        content: &str,
+    ) -> Option<(String, String)> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "sender": sender,
+            "subject": subject,
+            "content": content,
+        });
+        let bytes = serde_json::to_vec(&body).ok()?;
+        let resp = match self
+            .call_text(
+                &self.coord_alias,
+                "routing.resolve",
+                self.coord_deadline_secs,
+                bytes,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "telegram: routing.resolve unreachable");
+                return None;
+            }
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&resp).ok()?;
+        let decision = parsed.get("decision")?;
+        if decision.is_null() {
+            return None;
+        }
+        let target = decision.get("target_agent")?.as_str()?.to_string();
+        let cap = decision.get("capability")?.as_str()?.to_string();
+        Some((target, cap))
+    }
+
     // ── task.* ───────────────────────────────────────────
 
     /// `task.create` — returns the new `task_id` on success.
@@ -481,6 +578,26 @@ impl TelegramOutbound for TelegramOutboundClient {
     }
     async fn ai_chat(&self, session_id: &str, prompt: &str, history: &str) -> Option<String> {
         TelegramOutboundClient::ai_chat(self, session_id, prompt, history).await
+    }
+    async fn dispatch_chat(
+        &self,
+        peer: &str,
+        capability: &str,
+        session_id: &str,
+        prompt: &str,
+        history: &str,
+    ) -> Option<String> {
+        TelegramOutboundClient::dispatch_chat(self, peer, capability, session_id, prompt, history)
+            .await
+    }
+    async fn routing_resolve(
+        &self,
+        channel: &str,
+        sender: &str,
+        subject: &str,
+        content: &str,
+    ) -> Option<(String, String)> {
+        TelegramOutboundClient::routing_resolve(self, channel, sender, subject, content).await
     }
     async fn task_create(
         &self,

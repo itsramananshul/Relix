@@ -225,7 +225,28 @@ async fn run_chat_flow(
         .await;
     }
 
-    let reply = match out.ai_chat(&session_id, text, &history_text).await {
+    // RELIX-7.7 GAP 2: consult the coordinator's routing
+    // rules. Subject for Discord is the channel id (the
+    // closest thing Discord has to a per-thread topic).
+    let preview: String = text.chars().take(200).collect();
+    let routed = out
+        .routing_resolve("discord", &msg.username, &msg.channel_id, &preview)
+        .await;
+    let reply = match routed {
+        Some((peer, capability)) => {
+            tracing::info!(
+                channel_id = %msg.channel_id,
+                from = %msg.username,
+                target_peer = %peer,
+                capability = %capability,
+                "discord: routed via ChannelRouter"
+            );
+            out.dispatch_chat(&peer, &capability, &session_id, text, &history_text)
+                .await
+        }
+        None => out.ai_chat(&session_id, text, &history_text).await,
+    };
+    let reply = match reply {
         Some(r) if !r.trim().is_empty() => r,
         _ => {
             if let Some(t) = task_id.as_deref() {
