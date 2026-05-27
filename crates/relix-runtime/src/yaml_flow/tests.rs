@@ -17,14 +17,19 @@ use std::sync::{Arc, Mutex};
 use crate::sol::dispatcher::{RemoteCallDispatcher, RemoteCallError, RemoteCallResult};
 use crate::sol::vm::{VM, VM_ERROR_SENTINEL};
 
+use saphyr::{LoadableYamlNode, MarkedYamlOwned};
+
 use super::{YamlFlow, YamlFlowError, compile_source, lower_to_sol, parse_flow};
 
 // ────────────────────── helpers ──────────────────────────────
 
 fn parse(yaml: &str) -> YamlFlow {
-    let value: serde_yaml::Value = serde_yaml::from_str(yaml)
-        .unwrap_or_else(|e| panic!("yaml parse failed: {e}\nyaml:\n{yaml}"));
-    parse_flow(&value).unwrap_or_else(|e| panic!("schema validation failed: {e}\nyaml:\n{yaml}"))
+    let docs = MarkedYamlOwned::load_from_str(yaml)
+        .unwrap_or_else(|e| panic!("yaml parse failed: {e:?}\nyaml:\n{yaml}"));
+    let root = docs
+        .first()
+        .unwrap_or_else(|| panic!("yaml load returned no documents\nyaml:\n{yaml}"));
+    parse_flow(root).unwrap_or_else(|e| panic!("schema validation failed: {e}\nyaml:\n{yaml}"))
 }
 
 fn lower(yaml: &str) -> String {
@@ -1152,6 +1157,76 @@ fn native_yaml_map_via_map_get_returns_correct_value() {
     // No assertion on heap layout (private to VM) — the
     // dedicated SOL tests already prove HeapObject::Map
     // construction.
+}
+
+// ────────────────────── §nested step line numbers ──────────
+
+#[test]
+fn flow_style_yaml_unknown_step_reports_real_line_number() {
+    // Inline flow-style YAML — a single line with a `bonk`
+    // step. saphyr's marker info on scalar keys means we
+    // still get a real line number, not (0, 0).
+    let yaml = "steps: [{bonk: {foo: bar}}]\n";
+    let err = compile_source(yaml).unwrap_err();
+    match err {
+        YamlFlowError::Semantic {
+            ref message,
+            line,
+            column,
+            ..
+        } => {
+            assert!(
+                message.contains("bonk"),
+                "expected message to name the bad step type: {message}"
+            );
+            assert!(
+                line > 0,
+                "flow-style YAML must still carry a real line, got {line}"
+            );
+            assert!(column > 0, "expected a positive column, got {column}");
+        }
+        other => panic!("expected Semantic error for unknown step type, got {other:?}"),
+    }
+}
+
+#[test]
+fn deeply_nested_error_reports_inner_line_not_outer_step() {
+    // step 2 (the try) starts at one line; the bad step
+    // inside catch.steps lives several lines later. With
+    // saphyr's per-node spans, the error must report the
+    // line of the inner bad step, not the try line.
+    let yaml = "\
+steps:
+  - let:
+      name: ok
+      type: str
+      value: hi
+  - try:
+      steps:
+        - print: outer
+      catch:
+        - kind: any
+          steps:
+            - bonk:
+                foo: bar
+";
+    let err = compile_source(yaml).unwrap_err();
+    let (line, message) = match err {
+        YamlFlowError::Semantic {
+            line, ref message, ..
+        } => (line, message.clone()),
+        other => panic!("expected Semantic error, got {other:?}"),
+    };
+    assert!(message.contains("bonk"), "{message}");
+    // The `bonk:` step's tag scalar lives on line 12 of the
+    // source above. We assert the line is >= 10 (where the
+    // catch starts) rather than the line of the outer try
+    // (line 6) — saphyr should give us at least the catch
+    // block's depth.
+    assert!(
+        line >= 10,
+        "expected inner step's line (>=10), not the outer try's line; got {line}"
+    );
 }
 
 // ────────────────────── §chat template equivalence ──────────
