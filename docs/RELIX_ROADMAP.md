@@ -1,6 +1,6 @@
 # Relix — Full Engineering Roadmap
 
-**Last updated:** May 25, 2026 — Wave 1 done, v0.1.5 released, Gemini implemented, Docker fixed, cargo deny fixed
+**Last updated:** May 27, 2026 — full ground-truth audit against git log; PARTIAL items 7.4 and 7.12 closed in code (binary self-replace shipped in 4fb8ec7, real per-message history in c51c864); Components 5 + 6 of 7.26 shipped (663c737, f78df23/88f60b0); YAML frontend + SOL language reference + SOL branch return-type checker landed
 **Status:** Living document — add ideas here before building anything
 
 ---
@@ -881,7 +881,7 @@ test coverage. Closes SIMP-019.
 
 A personality file per agent. Setup wizard asks for name, personality, standing instructions. Gets injected into every system prompt. Stored at `~/.relix/agents/{name}/soul.md`. Pairs naturally with the Layer 4 self-model — the persona is the intended identity, the self-model is the observed reality.
 
-### 7.4 `relix update` Self-Upgrade Command `[PARTIAL — version check done, binary self-replace NOT wired]`
+### 7.4 `relix update` Self-Upgrade Command `[DONE — original scaffold 7d3a401, binary download + atomic self-replace 4fb8ec7, .tar.gz archive extraction 0435419]`
 
 Checks latest release on GitHub, downloads new binaries, replaces installed ones, restarts mesh if running. Also updates mesh scripts, flow files, and Ollama models.
 
@@ -913,7 +913,7 @@ Pre-integrate popular MCP servers: filesystem, browser (Playwright), code execut
 
 Per-agent metrics: response time, token usage, cost (estimated from provider pricing), memory usage, task success rate, self-model confidence scores. Trends over time. Alerts when cost or error rate spikes.
 
-### 7.12 Conversation Export + Import `[PARTIAL — bridge endpoint scaffolded, not real per-message history]`
+### 7.12 Conversation Export + Import `[DONE — coordinator scaffold 700ca11, real per-message history c51c864]`
 
 Export any conversation as JSON, Markdown, or PDF. Import to restore context. Useful for handoffs between agents and for creating training data from high-quality agent interactions.
 
@@ -2136,7 +2136,7 @@ never_expose_to_model = true  # raw secrets never in model context
 
 ---
 
-#### Component 5 — Transactional Action Gateway `[IDEA]`
+#### Component 5 — Transactional Action Gateway `[DONE — commit 663c737]`
 
 The most important missing primitive in agentic AI. When an agent calls a third-party API, sends an email, writes to a database, or deploys something — there's currently no concept of preview before commit, no idempotency, no rollback. One retry and the customer gets charged twice. One failed deployment and you need a manual rollback.
 
@@ -2186,7 +2186,7 @@ This is like database transactions but for any real-world action. BEGIN → clas
 
 ---
 
-#### Component 6 — Agent Access Broker `[IDEA]`
+#### Component 6 — Agent Access Broker `[DONE — execution-layer scaffold f78df23, wired into capability dispatch 88f60b0]`
 
 A dedicated service that manages every tool's permissions and credentials. Sits between the policy engine and the executor. The executor never calls tools directly — always goes through the access broker.
 
