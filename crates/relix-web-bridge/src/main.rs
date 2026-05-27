@@ -139,6 +139,9 @@ mod term_audit;
 mod tools;
 mod topology;
 mod validate;
+mod workflows;
+#[cfg(test)]
+mod workflows_mini_mesh_test;
 mod ws;
 mod yaml_validate;
 
@@ -579,6 +582,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(cron::get_one).patch(cron::update).delete(cron::delete),
         )
         .route("/v1/cron/jobs/:job_id/trigger", post(cron::trigger))
+        // Workflow engine (RELIX-7.5). Four proxies onto the
+        // coordinator's `workflow.*` capabilities. POST /run
+        // executes by name (returns the full execution record,
+        // or a `text/event-stream` carrying a single `result`
+        // event when the body sets `stream: true`); GET /
+        // enumerates the catalog; GET /:name/status/:id fetches
+        // a past execution; POST /validate type-checks a source
+        // string.
+        .route("/v1/workflows", get(workflows::list))
+        .route("/v1/workflows/run", post(workflows::run))
+        .route("/v1/workflows/validate", post(workflows::validate))
+        .route(
+            "/v1/workflows/:name/status/:execution_id",
+            get(workflows::status),
+        )
         // PH-DELEGATE-BRIDGE: delegation surface. Four proxies onto
         // the coordinator's `delegate.*` capabilities. POST /spawn
         // creates the child task; GET /result polls its state;
