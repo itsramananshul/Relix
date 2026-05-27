@@ -220,6 +220,21 @@ impl LayeredMemoryStore {
         Ok(())
     }
 
+    /// Replace the `text` column for an existing record. Used
+    /// by the RELIX-7.15 PII defense-in-depth pass in the
+    /// embedding pipeline: when the anonymizer is enabled and
+    /// a row arrived via a bypass path, the pipeline scrubs
+    /// the text in-place BEFORE handing it to the embed
+    /// function so the Qdrant payload never carries raw PII.
+    pub fn update_text(&self, id: &str, text: &str) -> Result<(), LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        conn.execute(
+            "UPDATE memory_records SET text = ?1 WHERE id = ?2",
+            params![text, id],
+        )?;
+        Ok(())
+    }
+
     /// Fetch one record by id. `Ok(None)` when the row is
     /// absent; never raises.
     pub fn get(&self, id: &str) -> Result<Option<MemoryRecord>, LayeredMemoryError> {

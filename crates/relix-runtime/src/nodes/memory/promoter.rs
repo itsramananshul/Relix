@@ -90,14 +90,50 @@ pub struct LayerPromoter {
     store: Arc<LayeredMemoryStore>,
     ai_fn: PromoterAiFn,
     batch_size: usize,
+    /// RELIX-7.15 PII defense-in-depth: every promoted-record
+    /// text is anonymized BEFORE insert. The Layer 1 source
+    /// records are already anonymized by the recorder, but
+    /// the LLM-driven `Semantic → Observation` and
+    /// `Observation → Model` stages might hallucinate a value
+    /// the source never carried; this pass catches that.
+    anonymizer: Arc<crate::training::PiiAnonymizer>,
 }
 
 impl LayerPromoter {
+    /// Construct a promoter with anonymization disabled.
+    /// Existing callers + tests keep this shape.
     pub fn new(store: Arc<LayeredMemoryStore>, ai_fn: PromoterAiFn, batch_size: usize) -> Self {
+        Self::new_with_anonymizer(
+            store,
+            ai_fn,
+            batch_size,
+            Arc::new(crate::training::PiiAnonymizer::disabled()),
+        )
+    }
+
+    /// Construct a promoter with an explicit anonymizer.
+    pub fn new_with_anonymizer(
+        store: Arc<LayeredMemoryStore>,
+        ai_fn: PromoterAiFn,
+        batch_size: usize,
+        anonymizer: Arc<crate::training::PiiAnonymizer>,
+    ) -> Self {
         Self {
             store,
             ai_fn,
             batch_size: batch_size.max(1),
+            anonymizer,
+        }
+    }
+
+    /// Anonymize `text` iff the per-promoter anonymizer is
+    /// enabled. Returns a copy in either case — the caller
+    /// always owns the resulting string.
+    fn anon(&self, text: &str) -> String {
+        if self.anonymizer.enabled() {
+            self.anonymizer.anonymize(text)
+        } else {
+            text.to_string()
         }
     }
 
@@ -174,7 +210,7 @@ impl LayerPromoter {
                 let sem = build_promoted_record(
                     &survivor,
                     MemoryLayer::Semantic,
-                    survivor.text.clone(),
+                    self.anon(&survivor.text),
                     &source,
                 );
                 if let Err(e) = self.store.insert(&sem) {
@@ -245,7 +281,8 @@ impl LayerPromoter {
                 }
                 let parent_id = group.first().map(|r| r.id.as_str()).unwrap_or("");
                 let id = mint_promoted_id(parent_id, MemoryLayer::Observation, i);
-                let mut record = MemoryRecord::new_raw(id, obs_text.clone(), source.clone());
+                let scrubbed = self.anon(obs_text);
+                let mut record = MemoryRecord::new_raw(id, scrubbed, source.clone());
                 record.layer = MemoryLayer::Observation;
                 record.created_at = now;
                 record.observed_at = now;
@@ -325,7 +362,8 @@ impl LayerPromoter {
             {
                 tracing::warn!(error = %e, source = %source, "promoter: invalidate prior Model failed");
             }
-            let mut record = MemoryRecord::new_raw(id, reply, source.clone());
+            let scrubbed_reply = self.anon(&reply);
+            let mut record = MemoryRecord::new_raw(id, scrubbed_reply, source.clone());
             record.layer = MemoryLayer::Model;
             record.created_at = now;
             record.observed_at = now;

@@ -3836,10 +3836,17 @@ fn open_layered_memory(
         .as_ref()
         .map(|e| e.score_threshold)
         .unwrap_or(0.75);
+    // RELIX-7.15 memory PII: build the anonymizer once and
+    // share it with the layered surface. The recorder at
+    // memory.write_turn AND the defensive promoter / embedder
+    // passes all read from this same instance, so operators
+    // get consistent redaction across every layer.
+    let anonymizer = std::sync::Arc::new(crate::training::PiiAnonymizer::from_config(&mem_cfg.pii));
     Ok(Some(crate::nodes::memory::LayeredContext {
         store,
         qdrant,
         score_threshold,
+        anonymizer,
     }))
 }
 
@@ -3919,6 +3926,20 @@ fn register_node_type_handlers(
                 "memory node: layered store online (Raw records mirrored from memory.write_turn)"
             );
         }
+        // RELIX-7.15 memory PII: derive the per-node anonymizer.
+        // The layered surface already builds one inside
+        // open_layered_memory; if the layered store is disabled
+        // we still need an anonymizer for the turns-table
+        // path. Both end up reading the same `[memory.pii]`
+        // config so the recorder + the embedder defensive
+        // pass + the promoter pass + the manifest caps all
+        // agree.
+        let memory_anonymizer = layered_ctx
+            .as_ref()
+            .map(|ctx| ctx.anonymizer.clone())
+            .unwrap_or_else(|| {
+                std::sync::Arc::new(crate::training::PiiAnonymizer::from_config(&mem_cfg.pii))
+            });
         crate::nodes::memory::register(
             bridge,
             store.clone(),
@@ -3928,6 +3949,7 @@ fn register_node_type_handlers(
             curator_handler_cfg,
             layered_ctx.clone(),
             curator_coord_cell.clone(),
+            memory_anonymizer.clone(),
         );
         // Spawn the curator scheduler iff [memory.curator] is
         // configured AND enabled. Discovery of the AI + coord
@@ -4015,13 +4037,15 @@ fn register_node_type_handlers(
                                 .map_err(|e| e.to_string())
                         })
                     });
-                let pipeline = crate::nodes::memory::embedder::EmbeddingPipeline::new(
-                    layered.store.clone(),
-                    layered.qdrant.clone(),
-                    embed_fn,
-                    emb_cfg.batch_size,
-                    emb_cfg.interval_secs,
-                );
+                let pipeline =
+                    crate::nodes::memory::embedder::EmbeddingPipeline::new_with_anonymizer(
+                        layered.store.clone(),
+                        layered.qdrant.clone(),
+                        embed_fn,
+                        emb_cfg.batch_size,
+                        emb_cfg.interval_secs,
+                        layered.anonymizer.clone(),
+                    );
                 pipeline.spawn();
                 tracing::info!(
                     batch_size = emb_cfg.batch_size,
@@ -4118,6 +4142,27 @@ fn register_node_type_handlers(
                  total_chars_saved). Returns pipe-delimited \
                  key=value pairs. Pure read.",
                 &["read", "memory", "curator", "status"],
+                &["reads:internal"],
+            ),
+            (
+                "memory.pii_scan",
+                "RELIX-7.15: detect PII spans in arbitrary text. \
+                 Args JSON `{text}`. Returns `{spans, count}`. \
+                 Operators use this to audit what PII would be \
+                 detected in a sample BEFORE flipping \
+                 `[memory.pii] enabled = true`.",
+                &["read", "memory", "pii"],
+                &["reads:internal"],
+            ),
+            (
+                "memory.anonymize_preview",
+                "RELIX-7.15: preview what the memory PII \
+                 anonymizer would output. Args JSON \
+                 `{text, strategy?}`. `strategy` (`redact` / \
+                 `pseudonymize` / `allow`) overrides the global \
+                 `[memory.pii] strategy` for the preview only. \
+                 Returns `{anonymized, spans}`.",
+                &["read", "memory", "pii"],
                 &["reads:internal"],
             ),
         ];

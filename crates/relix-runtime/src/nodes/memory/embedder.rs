@@ -95,9 +95,20 @@ pub struct EmbeddingPipeline {
     ai_embed_fn: EmbedFn,
     batch_size: usize,
     interval: Duration,
+    /// RELIX-7.15 PII anonymizer applied to every pending
+    /// record's text BEFORE it's handed to the embed function
+    /// AND before it lands on the Qdrant payload. The
+    /// recorder already anonymizes at write_turn time so this
+    /// is a defense-in-depth pass — any record that landed in
+    /// the store via a code path that bypassed the recorder
+    /// still gets scrubbed here, and the embed call NEVER
+    /// sees a raw PII value when `[memory.pii]` is enabled.
+    anonymizer: Arc<crate::training::PiiAnonymizer>,
 }
 
 impl EmbeddingPipeline {
+    /// Construct a pipeline with PII anonymization disabled.
+    /// Existing callers + tests keep this shape.
     pub fn new(
         store: Arc<LayeredMemoryStore>,
         qdrant: Option<Arc<QdrantClient>>,
@@ -105,12 +116,34 @@ impl EmbeddingPipeline {
         batch_size: usize,
         interval_secs: u64,
     ) -> Self {
+        Self::new_with_anonymizer(
+            store,
+            qdrant,
+            ai_embed_fn,
+            batch_size,
+            interval_secs,
+            Arc::new(crate::training::PiiAnonymizer::disabled()),
+        )
+    }
+
+    /// Construct a pipeline with an explicit anonymizer. Used
+    /// by the controller-runtime when `[memory.pii] enabled =
+    /// true` so the defensive pass is wired through.
+    pub fn new_with_anonymizer(
+        store: Arc<LayeredMemoryStore>,
+        qdrant: Option<Arc<QdrantClient>>,
+        ai_embed_fn: EmbedFn,
+        batch_size: usize,
+        interval_secs: u64,
+        anonymizer: Arc<crate::training::PiiAnonymizer>,
+    ) -> Self {
         Self {
             store,
             qdrant,
             ai_embed_fn,
             batch_size: batch_size.max(1),
             interval: Duration::from_secs(interval_secs.max(1)),
+            anonymizer,
         }
     }
 
@@ -152,7 +185,7 @@ async fn run_loop(p: EmbeddingPipeline) {
 }
 
 async fn run_tick(p: &EmbeddingPipeline) -> usize {
-    let pending = match p.store.fetch_pending_embeddings(p.batch_size) {
+    let mut pending = match p.store.fetch_pending_embeddings(p.batch_size) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "memory embedder: fetch_pending failed");
@@ -161,6 +194,30 @@ async fn run_tick(p: &EmbeddingPipeline) -> usize {
     };
     if pending.is_empty() {
         return 0;
+    }
+    // RELIX-7.15 PII defense-in-depth: anonymize every
+    // pending record's text BEFORE handing it to the embed
+    // function. If a pending row arrived via a bypass path
+    // (operator-written, migration import, etc.) we scrub it
+    // here AND rewrite the on-disk row so the Qdrant payload
+    // emitted below carries the anonymized text. When the
+    // anonymizer is disabled (`enabled = false`) this loop is
+    // a no-op.
+    if p.anonymizer.enabled() {
+        for r in pending.iter_mut() {
+            let scrubbed = p.anonymizer.anonymize(&r.text);
+            if scrubbed != r.text {
+                if let Err(e) = p.store.update_text(&r.id, &scrubbed) {
+                    tracing::warn!(
+                        error = %e,
+                        record_id = %r.id,
+                        "memory embedder: pre-embed anonymize update_text failed"
+                    );
+                } else {
+                    r.text = scrubbed;
+                }
+            }
+        }
     }
     let texts: Vec<String> = pending.iter().map(|r| r.text.clone()).collect();
     let vectors = match (p.ai_embed_fn)(texts).await {
