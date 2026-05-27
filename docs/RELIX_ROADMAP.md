@@ -1488,7 +1488,7 @@ four shapes the major fine-tuning platforms expect.
   limitation of the training pipeline; agents that want tool
   use in training data run via unary `ai.chat`.
 
-### 7.16 Agent-to-Agent Knowledge Transfer `[DONE — commits 3089b51 + 51141e5]`
+### 7.16 Agent-to-Agent Knowledge Transfer `[DONE — commits 3089b51 + 51141e5 + c91f526 + 272b143 + 3fbbfcf + a452027]`
 
 When one agent learns something useful — a pattern, a user preference, a domain fact — it can share that knowledge with other agents in the same deployment. Built ON TOP of the existing Layer 3 observation surface — no replacement, no duplicate storage. Operators flag observations `shareable = true` + pick a `share_policy`; the new `KnowledgeService` copies them between agents through a trust-checker gate.
 
@@ -1608,6 +1608,68 @@ cases (split_csv + urlencode round-trip).
   clean.
 - `cargo test --workspace`: runtime 2228 (+47), bridge 456
   (+2), CLI 240 (+2), every other crate green. Zero failures.
+
+**Gaps closed in follow-up session (commits c91f526, 272b143, 3fbbfcf, a452027):**
+
+- **GAP 1 — MemoryQualityScorer (commit c91f526)**: a periodic
+  `tokio::task` that auto-stamps `quality:<f>` tags on every
+  Layer 3 observation missing one. Mirrors the §7.15 training
+  QualityScorer's `baseline * length * coherence` formula so
+  operators see consistent scores across surfaces. Configurable
+  via `[knowledge.quality_scorer]` (`enabled`, `interval_secs`,
+  `batch_size`, `baseline`). New `LayeredMemoryStore::
+  fetch_unscored_observations(limit)` method backs the loop.
+  +12 tests including a `tokio::time::pause/advance` background-
+  loop test.
+
+- **GAP 2 — `knowledge.recall` (commit 272b143)**: new cap +
+  bridge endpoint + CLI subcommand. Walks each source
+  observation's `shared_with`, computes `mint_copy_id(source_id,
+  target)` per receiver, soft-deletes every copy in one call.
+  Trust gate: caller must match the source row's `source`
+  column. Per-target breakdown, chronicle events, missing /
+  unauthorised id lists. Bug-fixed `share()` to re-read the live
+  source row between targets so multi-target shares accumulate
+  `shared_with` correctly. +7 tests.
+
+- **GAP 3 — Mesh-routed sharing (commit 3fbbfcf)**: per-member
+  node routing via `[[knowledge.groups.member_nodes]]`; targets
+  pinned to a non-local node route through a new
+  `knowledge.accept_shared` cap. `SignedSharePayload` carries
+  the record + an ed25519 signature over a canonical
+  length-prefixed byte sequence; receivers verify the signature
+  with the pubkey carried in the payload before running the
+  local `TrustChecker`. New `RejectReason::InvalidSignature` +
+  `RejectReason::Unreachable`. `RemoteKnowledgeDispatcher`
+  trait + `MeshKnowledgeDispatcher` (libp2p), `MeshKnowledgeRouter`
+  (per-node dispatch), `LateBoundDispatcher` (post-rpc-startup
+  wiring), `InMemoryRemoteDispatcher` (tests),
+  `NullRemoteDispatcher` (default). `share()` + `group_broadcast()`
+  are now async. New `StartupWiring::KnowledgeMesh` populates
+  the dispatcher cell from `[peers]` post-rpc::Client setup.
+  `MemoryRecord` gained `Serialize`/`Deserialize` for the
+  signed wire payload. +6 tests.
+
+- **GAP 4 — AutoShareTask backpressure (commit a452027)**:
+  per-tick budget + per-source-agent limit + persistent
+  round-robin agent cursor + lifetime counters surfaced by a
+  new `knowledge.autoshare_stats` cap. Two new config fields
+  (`auto_share_per_tick_budget` default 200,
+  `auto_share_per_agent_limit` default 50). `AutoShareTickStats`
+  carries `budget_exhausted` + `per_agent_limit_hit_agents`;
+  `AutoShareLifetimeStats` accumulates `total_ticks` /
+  `total_propagated` / `total_rejected` /
+  `total_budget_exhausted_ticks` / `total_per_agent_limit_hits`
+  + the last tick's stats inline. Cursor advances past every
+  agent that got a chance to attempt at least one share so no
+  agent is starved on tight budgets. +6 tests.
+
+**Updated quality gates (after all four gaps):**
+- `cargo fmt --all` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`
+  clean.
+- `cargo test --workspace`: runtime 2265 (+37 over GAP 0
+  foundation), every other crate green. Zero failures.
 
 ### 7.17 Relix as a Backend for AI-Native Apps `[DONE — existing bridge /v1/* surface + Rust SDK (commit 90eba16)]`
 
