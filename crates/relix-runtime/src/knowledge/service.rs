@@ -30,6 +30,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::nodes::memory::schema::{
@@ -38,6 +39,7 @@ use crate::nodes::memory::schema::{
 
 use super::chronicle::KnowledgeEvent;
 use super::config::{GroupResolver, KnowledgeConfig, SharingGroup};
+use super::remote::{RemoteKnowledgeDispatcher, RemoteShareError, SignedSharePayload};
 use super::trust::{RejectReason, TrustChecker};
 
 /// One pending share operation, parsed from the
@@ -167,6 +169,12 @@ pub enum ShareError {
     Store(#[from] LayeredMemoryError),
     #[error("knowledge: {0}")]
     InvalidArgs(String),
+    /// RELIX-7.16 GAP 3: structured rejection bubbled up from
+    /// `accept_shared` so the cap handler can map it to a
+    /// chronicle event + ShareResult.rejection without losing
+    /// the typed reason.
+    #[error("knowledge: rejected: {0:?}")]
+    Rejected(RejectReason),
 }
 
 /// The knowledge-transfer service. Cheap to clone (every
@@ -176,6 +184,23 @@ pub struct KnowledgeService {
     store: Arc<LayeredMemoryStore>,
     resolver: Arc<GroupResolver>,
     trust: TrustChecker,
+    /// RELIX-7.16 GAP 3: name of the LOCAL memory node (the
+    /// `[controller] name` from the controller's TOML).
+    /// Targets pinned to this node — or to no node — route
+    /// locally; targets pinned to a different node route via
+    /// the remote dispatcher.
+    local_node: Option<Arc<str>>,
+    /// RELIX-7.16 GAP 3: ed25519 signer used to sign every
+    /// outbound `knowledge.accept_shared` payload. Operators
+    /// must wire this for cross-node sharing to work; absence
+    /// causes remote shares to reject with
+    /// `RejectReason::Unreachable { detail: "no signer" }`.
+    signing_key: Option<Arc<SigningKey>>,
+    /// RELIX-7.16 GAP 3: the mesh dispatcher used to deliver
+    /// signed payloads to remote nodes. `None` in unit tests
+    /// and pre-mesh boots — every cross-node target gets an
+    /// `Unreachable` rejection.
+    remote: Option<Arc<dyn RemoteKnowledgeDispatcher>>,
 }
 
 impl KnowledgeService {
@@ -186,6 +211,9 @@ impl KnowledgeService {
             store,
             resolver,
             trust,
+            local_node: None,
+            signing_key: None,
+            remote: None,
         })
     }
 
@@ -200,7 +228,45 @@ impl KnowledgeService {
             store,
             resolver,
             trust,
+            local_node: None,
+            signing_key: None,
+            remote: None,
         }
+    }
+
+    /// RELIX-7.16 GAP 3: attach mesh routing. `local_node` is
+    /// the friendly name of the controller's own memory node;
+    /// `signing_key` signs outbound payloads; `dispatcher`
+    /// delivers them. Returns a NEW service (cheap — every
+    /// other field is Arc-backed).
+    pub fn with_mesh(
+        mut self,
+        local_node: impl Into<String>,
+        signing_key: Arc<SigningKey>,
+        dispatcher: Arc<dyn RemoteKnowledgeDispatcher>,
+    ) -> Self {
+        self.local_node = Some(Arc::from(local_node.into()));
+        self.signing_key = Some(signing_key);
+        self.remote = Some(dispatcher);
+        self
+    }
+
+    /// RELIX-7.16 GAP 3: variant of `with_mesh` that only
+    /// installs the local node name (used by the remote-side
+    /// `accept_shared` handler when no outbound dispatch is
+    /// needed). Set the local node name even when there's no
+    /// mesh dispatcher so the service can short-circuit
+    /// "node == local" routing.
+    pub fn with_local_node(mut self, local_node: impl Into<String>) -> Self {
+        self.local_node = Some(Arc::from(local_node.into()));
+        self
+    }
+
+    /// Accessor for the local node name. Returns `None` when
+    /// the service hasn't been wired with one (pre-7.16
+    /// behaviour: every target routes locally).
+    pub fn local_node(&self) -> Option<&str> {
+        self.local_node.as_deref()
     }
 
     /// Pure accessor for the configured groups (used by the
@@ -213,7 +279,17 @@ impl KnowledgeService {
     /// observation in `req.observation_ids` to each agent in
     /// `req.target_agents`. Trust checker runs per (record,
     /// target) pair.
-    pub fn share(&self, req: &ShareRequest) -> Result<ShareResult, ShareError> {
+    ///
+    /// RELIX-7.16 GAP 3: per-target routing. For each
+    /// (target, matched_group) the service consults
+    /// [`SharingGroup::node_for_agent`]: targets on the local
+    /// node (or with no node pin) take the in-process local
+    /// path; targets on a remote node dispatch a signed
+    /// `knowledge.accept_shared` payload via
+    /// [`RemoteKnowledgeDispatcher`]. The source row's
+    /// `shared_with` is updated regardless of routing — it
+    /// always lives on the source node.
+    pub async fn share(&self, req: &ShareRequest) -> Result<ShareResult, ShareError> {
         if req.source_agent.trim().is_empty() {
             return Err(ShareError::InvalidArgs("source_agent is required".into()));
         }
@@ -253,32 +329,8 @@ impl KnowledgeService {
                 }
             };
             for target in &req.target_agents {
-                match self.trust.check_accept(&req.source_agent, target, &record) {
-                    Ok(ok) => {
-                        let copy = build_copy(&record, target, req.message.as_deref());
-                        self.store.insert(&copy)?;
-                        // RELIX-7.16 GAP 2 invariant: re-read the
-                        // CURRENT source row before appending so
-                        // multiple targets in one share call
-                        // accumulate correctly. The previous
-                        // append-from-loop-snapshot path lost the
-                        // earlier target's entry when N>1 targets
-                        // shared a single observation.
-                        let fresh = self
-                            .store
-                            .get(&record.id)?
-                            .unwrap_or_else(|| record.clone());
-                        self.append_shared_with(&fresh, target)?;
-                        out.shared_count += 1;
-                        out.created_ids.push(copy.id.clone());
-                        out.events.push(KnowledgeEvent::shared(
-                            req.source_agent.clone(),
-                            target.clone(),
-                            vec![record.id.clone()],
-                            req.message.clone(),
-                            Some(ok.matched_group),
-                        ));
-                    }
+                let ok = match self.trust.check_accept(&req.source_agent, target, &record) {
+                    Ok(ok) => ok,
                     Err(reason) => {
                         out.events.push(KnowledgeEvent::rejected(
                             req.source_agent.clone(),
@@ -293,18 +345,190 @@ impl KnowledgeService {
                             reason,
                         });
                         out.rejection_count += 1;
+                        continue;
                     }
+                };
+                // Decide routing. Local when no group routing
+                // is configured, the routed node matches our
+                // local_node, or no local_node is configured
+                // (pre-7.16 behaviour preserved).
+                let target_node = self
+                    .resolver
+                    .get(&ok.matched_group)
+                    .and_then(|g| g.node_for_agent(target))
+                    .map(str::to_string);
+                let route_remote = match (&self.local_node, &target_node) {
+                    (Some(local), Some(node)) => node.as_str() != local.as_ref(),
+                    _ => false,
+                };
+                if route_remote {
+                    let node = target_node.expect("checked above");
+                    match self
+                        .dispatch_remote(
+                            &req.source_agent,
+                            target,
+                            &record,
+                            req.message.as_deref(),
+                            &node,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            // Source row's shared_with is the
+                            // source of truth for who has a
+                            // copy; touch even though the copy
+                            // lives on the remote node.
+                            let fresh = self
+                                .store
+                                .get(&record.id)?
+                                .unwrap_or_else(|| record.clone());
+                            self.append_shared_with(&fresh, target)?;
+                            let copy_id = mint_copy_id(&record.id, target);
+                            out.shared_count += 1;
+                            out.created_ids.push(copy_id);
+                            out.events.push(KnowledgeEvent::shared(
+                                req.source_agent.clone(),
+                                target.clone(),
+                                vec![record.id.clone()],
+                                req.message.clone(),
+                                Some(ok.matched_group),
+                            ));
+                        }
+                        Err(reason) => {
+                            out.events.push(KnowledgeEvent::rejected(
+                                req.source_agent.clone(),
+                                target.clone(),
+                                vec![record.id.clone()],
+                                reason.kind().to_string(),
+                                None,
+                            ));
+                            out.rejections.push(ShareRejection {
+                                observation_id: record.id.clone(),
+                                target_agent: target.clone(),
+                                reason,
+                            });
+                            out.rejection_count += 1;
+                        }
+                    }
+                } else {
+                    let copy = build_copy(&record, target, req.message.as_deref());
+                    self.store.insert(&copy)?;
+                    // RELIX-7.16 GAP 2 invariant: re-read the
+                    // CURRENT source row before appending so
+                    // multiple targets in one share call
+                    // accumulate correctly. The previous
+                    // append-from-loop-snapshot path lost the
+                    // earlier target's entry when N>1 targets
+                    // shared a single observation.
+                    let fresh = self
+                        .store
+                        .get(&record.id)?
+                        .unwrap_or_else(|| record.clone());
+                    self.append_shared_with(&fresh, target)?;
+                    out.shared_count += 1;
+                    out.created_ids.push(copy.id.clone());
+                    out.events.push(KnowledgeEvent::shared(
+                        req.source_agent.clone(),
+                        target.clone(),
+                        vec![record.id.clone()],
+                        req.message.clone(),
+                        Some(ok.matched_group),
+                    ));
                 }
             }
         }
         Ok(out)
     }
 
+    /// RELIX-7.16 GAP 3 helper: sign + dispatch ONE share to a
+    /// remote node. Returns Ok on receiver-side accept and a
+    /// typed [`RejectReason`] otherwise. The local side has
+    /// already passed the trust check for `(source, target,
+    /// record)` — the remote runs its own check too because
+    /// its config may carry tighter group / quality
+    /// constraints.
+    async fn dispatch_remote(
+        &self,
+        source_agent: &str,
+        target: &str,
+        record: &MemoryRecord,
+        message: Option<&str>,
+        node: &str,
+    ) -> Result<(), RejectReason> {
+        let Some(signer) = self.signing_key.as_ref() else {
+            return Err(RejectReason::Unreachable {
+                node: node.to_string(),
+                detail: "local node has no signing key configured".into(),
+            });
+        };
+        let Some(dispatcher) = self.remote.as_ref() else {
+            return Err(RejectReason::Unreachable {
+                node: node.to_string(),
+                detail: "no remote dispatcher configured".into(),
+            });
+        };
+        let local_node = self.local_node.as_deref().unwrap_or("<unset>").to_string();
+        let payload = SignedSharePayload::sign(
+            signer.as_ref(),
+            local_node,
+            source_agent.to_string(),
+            target.to_string(),
+            record.clone(),
+            message.map(|s| s.to_string()),
+        );
+        match dispatcher.accept_shared(node.to_string(), payload).await {
+            Ok(()) => Ok(()),
+            Err(RemoteShareError::Unreachable { node, detail }) => {
+                Err(RejectReason::Unreachable { node, detail })
+            }
+            Err(RemoteShareError::Rejected { reason, .. }) => Err(reason),
+            Err(RemoteShareError::Transport(detail)) => Err(RejectReason::Unreachable {
+                node: node.to_string(),
+                detail,
+            }),
+        }
+    }
+
+    /// RELIX-7.16 GAP 3 — receiver-side accept of a signed
+    /// `knowledge.accept_shared` payload.
+    ///
+    /// Flow:
+    /// 1. Verify the ed25519 signature against the payload's
+    ///    self-declared pubkey. Failure → `InvalidSignature`.
+    /// 2. Run the local `TrustChecker` against the destination
+    ///    store: group membership, layer guard, ownership,
+    ///    poison detection, quality floor, observation-count
+    ///    cap. Failure → bubbled-up `RejectReason`.
+    /// 3. Build the receiver's deterministic copy and insert
+    ///    it locally.
+    ///
+    /// The source row's `shared_with` is NOT touched here —
+    /// that's the source-node responsibility, updated when
+    /// `share()` returns Ok on the sender side.
+    pub fn accept_shared(&self, payload: SignedSharePayload) -> Result<(), ShareError> {
+        payload.verify().map_err(ShareError::Rejected)?;
+        let _ok = self
+            .trust
+            .check_accept(
+                &payload.source_agent,
+                &payload.target_agent,
+                &payload.record,
+            )
+            .map_err(ShareError::Rejected)?;
+        let copy = build_copy(
+            &payload.record,
+            &payload.target_agent,
+            payload.message.as_deref(),
+        );
+        self.store.insert(&copy)?;
+        Ok(())
+    }
+
     /// Implementation of `knowledge.group_broadcast`. Every
     /// other member of `group` receives every record in
     /// `observation_ids` (subject to trust checks). The
     /// caller must be a member of the group.
-    pub fn group_broadcast(
+    pub async fn group_broadcast(
         &self,
         caller_agent: &str,
         group_name: &str,
@@ -340,7 +564,7 @@ impl KnowledgeService {
                 observation_ids: observation_ids.to_vec(),
                 message: message.map(|s| s.to_string()),
             };
-            let res = self.share(&req)?;
+            let res = self.share(&req).await?;
             per_target.push((target, res));
         }
         Ok(BroadcastResult {
@@ -684,6 +908,7 @@ mod tests {
                 members: members.iter().map(|s| (*s).into()).collect(),
                 auto_share_layers: vec!["observation".into()],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
@@ -694,8 +919,8 @@ mod tests {
         (svc, store)
     }
 
-    #[test]
-    fn share_copies_observation_to_target_with_shared_by_set() {
+    #[tokio::test]
+    async fn share_copies_observation_to_target_with_shared_by_set() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store
             .insert(&obs("a1", "alice", "user prefers Helvetica", true))
@@ -706,7 +931,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: Some("worth keeping".into()),
         };
-        let res = svc.share(&req).unwrap();
+        let res = svc.share(&req).await.unwrap();
         assert_eq!(res.shared_count, 1);
         assert_eq!(res.rejection_count, 0);
         assert_eq!(res.created_ids.len(), 1);
@@ -724,8 +949,8 @@ mod tests {
         assert_eq!(source_after.shared_with, vec!["bob".to_string()]);
     }
 
-    #[test]
-    fn share_rejects_target_outside_group_with_structured_reason() {
+    #[tokio::test]
+    async fn share_rejects_target_outside_group_with_structured_reason() {
         let (svc, store) = service(&["alice"], SharePolicy::Explicit);
         store.insert(&obs("a1", "alice", "fact", true)).unwrap();
         let req = ShareRequest {
@@ -734,7 +959,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         };
-        let res = svc.share(&req).unwrap();
+        let res = svc.share(&req).await.unwrap();
         assert_eq!(res.shared_count, 0);
         assert_eq!(res.rejection_count, 1);
         assert!(matches!(
@@ -743,8 +968,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn share_rejects_poisoned_observation() {
+    #[tokio::test]
+    async fn share_rejects_poisoned_observation() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store
             .insert(&obs(
@@ -760,7 +985,7 @@ mod tests {
             observation_ids: vec!["poison".into()],
             message: None,
         };
-        let res = svc.share(&req).unwrap();
+        let res = svc.share(&req).await.unwrap();
         assert_eq!(res.shared_count, 0);
         assert!(matches!(
             res.rejections[0].reason,
@@ -768,8 +993,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn share_is_idempotent_on_repeat_call() {
+    #[tokio::test]
+    async fn share_is_idempotent_on_repeat_call() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store.insert(&obs("a1", "alice", "fact", true)).unwrap();
         let req = ShareRequest {
@@ -778,16 +1003,16 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         };
-        let r1 = svc.share(&req).unwrap();
-        let r2 = svc.share(&req).unwrap();
+        let r1 = svc.share(&req).await.unwrap();
+        let r2 = svc.share(&req).await.unwrap();
         assert_eq!(r1.created_ids, r2.created_ids, "ids must match across runs");
         // shared_with stays unique.
         let src = store.get("a1").unwrap().unwrap();
         assert_eq!(src.shared_with, vec!["bob".to_string()]);
     }
 
-    #[test]
-    fn revoke_invalidates_only_the_receiving_copy() {
+    #[tokio::test]
+    async fn revoke_invalidates_only_the_receiving_copy() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store.insert(&obs("a1", "alice", "fact", true)).unwrap();
         let req = ShareRequest {
@@ -796,7 +1021,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         };
-        let res = svc.share(&req).unwrap();
+        let res = svc.share(&req).await.unwrap();
         let copy_id = &res.created_ids[0];
         let r = svc.revoke(std::slice::from_ref(copy_id)).unwrap();
         assert_eq!(r.revoked_count, 1);
@@ -830,8 +1055,8 @@ mod tests {
 
     // ── RELIX-7.16 GAP 2: knowledge.recall ─────────────────
 
-    #[test]
-    fn recall_revokes_every_copy_of_a_source_observation_across_all_receivers() {
+    #[tokio::test]
+    async fn recall_revokes_every_copy_of_a_source_observation_across_all_receivers() {
         let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
         let cfg = KnowledgeConfig {
             groups: vec![SharingGroup {
@@ -839,6 +1064,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into(), "carol".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
@@ -852,6 +1078,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         })
+        .await
         .unwrap();
         let bob_copy = mint_copy_id("a1", "bob");
         let carol_copy = mint_copy_id("a1", "carol");
@@ -878,8 +1105,8 @@ mod tests {
         assert_eq!(r.events.len(), 2);
     }
 
-    #[test]
-    fn recall_rejects_when_caller_is_not_the_source_agent() {
+    #[tokio::test]
+    async fn recall_rejects_when_caller_is_not_the_source_agent() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store.insert(&obs("a1", "alice", "fact", true)).unwrap();
         svc.share(&ShareRequest {
@@ -888,6 +1115,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         })
+        .await
         .unwrap();
         // Mallory tries to recall alice's observation.
         let r = svc.recall("mallory", &["a1".into()]).unwrap();
@@ -922,8 +1150,8 @@ mod tests {
         assert!(r.unauthorised_source_ids.is_empty());
     }
 
-    #[test]
-    fn recall_per_target_breakdown_carries_correct_counts() {
+    #[tokio::test]
+    async fn recall_per_target_breakdown_carries_correct_counts() {
         let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
         let cfg = KnowledgeConfig {
             groups: vec![SharingGroup {
@@ -931,6 +1159,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into(), "carol".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
@@ -946,6 +1175,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         })
+        .await
         .unwrap();
         svc.share(&ShareRequest {
             source_agent: "alice".into(),
@@ -953,6 +1183,7 @@ mod tests {
             observation_ids: vec!["a2".into()],
             message: None,
         })
+        .await
         .unwrap();
         let r = svc.recall("alice", &["a1".into(), "a2".into()]).unwrap();
         assert_eq!(r.source_ids_processed, 2);
@@ -971,8 +1202,8 @@ mod tests {
         assert_eq!(carol.copies_revoked, 1);
     }
 
-    #[test]
-    fn recall_writes_chronicle_events_for_every_copy() {
+    #[tokio::test]
+    async fn recall_writes_chronicle_events_for_every_copy() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store.insert(&obs("a1", "alice", "fact", true)).unwrap();
         svc.share(&ShareRequest {
@@ -981,6 +1212,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         })
+        .await
         .unwrap();
         let r = svc.recall("alice", &["a1".into()]).unwrap();
         assert_eq!(r.events.len(), 1);
@@ -1003,8 +1235,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn list_shared_returns_received_copies_for_agent() {
+    #[tokio::test]
+    async fn list_shared_returns_received_copies_for_agent() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store.insert(&obs("a1", "alice", "fact one", true)).unwrap();
         store.insert(&obs("a2", "alice", "fact two", true)).unwrap();
@@ -1014,6 +1246,7 @@ mod tests {
             observation_ids: vec!["a1".into(), "a2".into()],
             message: Some("first batch".into()),
         })
+        .await
         .unwrap();
         let rows = svc
             .list_shared(&ListSharedFilter {
@@ -1029,8 +1262,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_shared_filters_by_shared_by_and_date_range() {
+    #[tokio::test]
+    async fn list_shared_filters_by_shared_by_and_date_range() {
         let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
         store.insert(&obs("a1", "alice", "f1", true)).unwrap();
         svc.share(&ShareRequest {
@@ -1039,6 +1272,7 @@ mod tests {
             observation_ids: vec!["a1".into()],
             message: None,
         })
+        .await
         .unwrap();
         // Filter by a different sharer → empty.
         let rows = svc
@@ -1051,8 +1285,8 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    #[test]
-    fn group_broadcast_propagates_to_every_other_member() {
+    #[tokio::test]
+    async fn group_broadcast_propagates_to_every_other_member() {
         let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
         let cfg = KnowledgeConfig {
             groups: vec![SharingGroup {
@@ -1060,6 +1294,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into(), "carol".into()],
                 auto_share_layers: vec!["observation".into()],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
@@ -1071,6 +1306,7 @@ mod tests {
             .unwrap();
         let res = svc
             .group_broadcast("alice", "trio", &["a1".into()], Some("FYI"))
+            .await
             .unwrap();
         assert_eq!(res.group, "trio");
         let receivers: Vec<&str> = res.per_target.iter().map(|(t, _)| t.as_str()).collect();
@@ -1082,8 +1318,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn group_broadcast_rejects_non_members() {
+    #[tokio::test]
+    async fn group_broadcast_rejects_non_members() {
         let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
         let cfg = KnowledgeConfig {
             groups: vec![SharingGroup {
@@ -1091,18 +1327,21 @@ mod tests {
                 members: vec!["alice".into(), "bob".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
             quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store, &cfg).unwrap();
-        let r = svc.group_broadcast("mallory", "trio", &["x".into()], None);
+        let r = svc
+            .group_broadcast("mallory", "trio", &["x".into()], None)
+            .await;
         assert!(matches!(r, Err(ShareError::InvalidArgs(_))));
     }
 
-    #[test]
-    fn share_returns_invalid_args_on_empty_inputs() {
+    #[tokio::test]
+    async fn share_returns_invalid_args_on_empty_inputs() {
         let (svc, _store) = service(&["alice", "bob"], SharePolicy::Explicit);
         assert!(matches!(
             svc.share(&ShareRequest {
@@ -1110,7 +1349,8 @@ mod tests {
                 target_agents: vec!["bob".into()],
                 observation_ids: vec!["a".into()],
                 message: None,
-            }),
+            })
+            .await,
             Err(ShareError::InvalidArgs(_))
         ));
         assert!(matches!(
@@ -1119,7 +1359,8 @@ mod tests {
                 target_agents: vec![],
                 observation_ids: vec!["a".into()],
                 message: None,
-            }),
+            })
+            .await,
             Err(ShareError::InvalidArgs(_))
         ));
         assert!(matches!(
@@ -1128,8 +1369,308 @@ mod tests {
                 target_agents: vec!["bob".into()],
                 observation_ids: vec![],
                 message: None,
-            }),
+            })
+            .await,
             Err(ShareError::InvalidArgs(_))
         ));
+    }
+
+    // ── RELIX-7.16 GAP 3: mesh-routed sharing ───────────────
+
+    fn mesh_service(
+        store: Arc<LayeredMemoryStore>,
+        cfg: &KnowledgeConfig,
+        local_node: &str,
+    ) -> (KnowledgeService, Arc<ed25519_dalek::SigningKey>) {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let signer = Arc::new(SigningKey::generate(&mut OsRng));
+        let svc = KnowledgeService::new(store, cfg).unwrap();
+        (svc.with_local_node(local_node), signer)
+    }
+
+    #[tokio::test]
+    async fn share_routes_local_target_through_in_process_store_when_node_matches_local() {
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+                member_nodes: vec![
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "alice".into(),
+                        node: "node-1".into(),
+                    },
+                    // bob explicitly pinned to the SAME local node
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "bob".into(),
+                        node: "node-1".into(),
+                    },
+                ],
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        let (svc, _) = mesh_service(store.clone(), &cfg, "node-1");
+        store.insert(&obs("a1", "alice", "fact", true)).unwrap();
+        let res = svc
+            .share(&ShareRequest {
+                source_agent: "alice".into(),
+                target_agents: vec!["bob".into()],
+                observation_ids: vec!["a1".into()],
+                message: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.shared_count, 1);
+        // Copy is local because bob's pin == local_node.
+        let copy_id = mint_copy_id("a1", "bob");
+        assert!(store.get(&copy_id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn share_dispatches_signed_payload_when_target_pinned_to_remote_node() {
+        use crate::knowledge::remote::InMemoryRemoteDispatcher;
+        let local_store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let remote_store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+                member_nodes: vec![
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "alice".into(),
+                        node: "node-1".into(),
+                    },
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "bob".into(),
+                        node: "node-2".into(),
+                    },
+                ],
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        // Remote-side service (no mesh; it accepts inbound).
+        let remote_svc = Arc::new(
+            KnowledgeService::new(remote_store.clone(), &cfg)
+                .unwrap()
+                .with_local_node("node-2"),
+        );
+        let dispatcher: Arc<dyn RemoteKnowledgeDispatcher> =
+            Arc::new(InMemoryRemoteDispatcher::new().with_node("node-2", remote_svc.clone()));
+        let signer = Arc::new(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng));
+        let local_svc = KnowledgeService::new(local_store.clone(), &cfg)
+            .unwrap()
+            .with_mesh("node-1", signer, dispatcher);
+        // Seed alice's source row on the LOCAL store only.
+        local_store
+            .insert(&obs("a1", "alice", "remote fact", true))
+            .unwrap();
+        let res = local_svc
+            .share(&ShareRequest {
+                source_agent: "alice".into(),
+                target_agents: vec!["bob".into()],
+                observation_ids: vec!["a1".into()],
+                message: Some("via mesh".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            res.shared_count, 1,
+            "remote dispatch should succeed: {res:?}"
+        );
+        assert_eq!(res.rejection_count, 0);
+        // Local store has NO copy (no local write).
+        let copy_id = mint_copy_id("a1", "bob");
+        assert!(
+            local_store.get(&copy_id).unwrap().is_none(),
+            "local store must not hold a copy when bob lives on a remote node"
+        );
+        // Remote store HAS the copy.
+        let copy = remote_store
+            .get(&copy_id)
+            .unwrap()
+            .expect("remote store has the dispatched copy");
+        assert_eq!(copy.shared_by.as_deref(), Some("alice"));
+        // Local source row's shared_with still accrues bob — the
+        // source-of-truth lives on the source node.
+        let src = local_store.get("a1").unwrap().unwrap();
+        assert_eq!(src.shared_with, vec!["bob".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn share_to_unreachable_remote_node_rejects_with_unreachable_reason() {
+        use crate::knowledge::remote::InMemoryRemoteDispatcher;
+        let local_store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+                member_nodes: vec![
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "alice".into(),
+                        node: "node-1".into(),
+                    },
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "bob".into(),
+                        node: "node-down".into(),
+                    },
+                ],
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        let dispatcher: Arc<dyn RemoteKnowledgeDispatcher> =
+            Arc::new(InMemoryRemoteDispatcher::new().with_unreachable("node-down"));
+        let signer = Arc::new(ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng));
+        let svc = KnowledgeService::new(local_store.clone(), &cfg)
+            .unwrap()
+            .with_mesh("node-1", signer, dispatcher);
+        local_store
+            .insert(&obs("a1", "alice", "fact", true))
+            .unwrap();
+        let res = svc
+            .share(&ShareRequest {
+                source_agent: "alice".into(),
+                target_agents: vec!["bob".into()],
+                observation_ids: vec!["a1".into()],
+                message: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.shared_count, 0);
+        assert_eq!(res.rejection_count, 1);
+        match &res.rejections[0].reason {
+            RejectReason::Unreachable { node, .. } => assert_eq!(node, "node-down"),
+            o => panic!("expected Unreachable, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn share_to_remote_without_signing_key_rejects_with_unreachable_no_signer() {
+        // local node has neither signing key nor dispatcher; any
+        // remote target pin must yield Unreachable.
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+                member_nodes: vec![
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "alice".into(),
+                        node: "node-1".into(),
+                    },
+                    crate::knowledge::config::MemberNodeRoute {
+                        agent: "bob".into(),
+                        node: "node-2".into(),
+                    },
+                ],
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        // Note: with_local_node only — no mesh.
+        let svc = KnowledgeService::new(store.clone(), &cfg)
+            .unwrap()
+            .with_local_node("node-1");
+        store.insert(&obs("a1", "alice", "fact", true)).unwrap();
+        let res = svc
+            .share(&ShareRequest {
+                source_agent: "alice".into(),
+                target_agents: vec!["bob".into()],
+                observation_ids: vec!["a1".into()],
+                message: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.rejection_count, 1);
+        match &res.rejections[0].reason {
+            RejectReason::Unreachable { node, detail } => {
+                assert_eq!(node, "node-2");
+                assert!(detail.to_lowercase().contains("signing"));
+            }
+            o => panic!("expected Unreachable, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_shared_rejects_payload_with_tampered_record_text() {
+        // Build a signed payload then tamper with the record
+        // text. The receiver must refuse via InvalidSignature.
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+                member_nodes: Vec::new(),
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        let svc = KnowledgeService::new(store.clone(), &cfg)
+            .unwrap()
+            .with_local_node("node-2");
+        let signer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let record = obs("a1", "alice", "fact", true);
+        let mut payload = crate::knowledge::remote::SignedSharePayload::sign(
+            &signer, "node-1", "alice", "bob", record, None,
+        );
+        payload.record.text = "TAMPERED".into();
+        match svc.accept_shared(payload).unwrap_err() {
+            ShareError::Rejected(RejectReason::InvalidSignature { .. }) => {}
+            o => panic!("expected InvalidSignature, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_shared_inserts_copy_then_idempotent_on_retry() {
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let cfg = KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+                member_nodes: Vec::new(),
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+        };
+        let svc = KnowledgeService::new(store.clone(), &cfg)
+            .unwrap()
+            .with_local_node("node-2");
+        let signer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let record = obs("a1", "alice", "fact", true);
+        let payload = crate::knowledge::remote::SignedSharePayload::sign(
+            &signer,
+            "node-1",
+            "alice",
+            "bob",
+            record,
+            Some("hi".into()),
+        );
+        svc.accept_shared(payload.clone()).unwrap();
+        svc.accept_shared(payload).unwrap();
+        let copy = store.get(&mint_copy_id("a1", "bob")).unwrap().unwrap();
+        assert_eq!(copy.shared_by.as_deref(), Some("alice"));
+        assert_eq!(copy.source, "bob");
+        assert!(copy.tags.iter().any(|t| t == "share_note:hi"));
     }
 }

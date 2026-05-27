@@ -190,7 +190,7 @@ async fn run_tick(task: &AutoShareTask) -> AutoShareTickStats {
                     observation_ids: vec![r.id.clone()],
                     message: None,
                 };
-                match task.service.share(&req) {
+                match task.service.share(&req).await {
                     Ok(res) => {
                         stats.propagations_accepted += res.shared_count as u32;
                         stats.propagations_rejected += res.rejection_count as u32;
@@ -247,6 +247,7 @@ mod tests {
                 members: members.iter().map(|s| (*s).into()).collect(),
                 auto_share_layers: vec!["observation".into()],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
@@ -342,6 +343,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into()],
                 auto_share_layers: vec![], // explicitly empty
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,

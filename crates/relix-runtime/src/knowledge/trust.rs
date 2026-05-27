@@ -67,6 +67,17 @@ pub enum RejectReason {
     /// sender. Operators can't smuggle another agent's
     /// observations through their own knowledge.share call.
     NotOwnedBySender { claimed: String, actual: String },
+    /// RELIX-7.16 GAP 3: the application-layer signature on
+    /// the incoming `knowledge.accept_shared` payload didn't
+    /// verify against the claimed source-node public key. The
+    /// receiver rejects the observation outright; nothing
+    /// lands on disk.
+    InvalidSignature { detail: String },
+    /// RELIX-7.16 GAP 3: a remote target's memory node was
+    /// unreachable (mesh dispatcher returned an error or the
+    /// node isn't wired). The target's copy is rejected
+    /// without blocking other targets in the same share.
+    Unreachable { node: String, detail: String },
 }
 
 impl RejectReason {
@@ -80,6 +91,8 @@ impl RejectReason {
             Self::UnknownId { .. } => "unknown_id",
             Self::WrongLayer { .. } => "wrong_layer",
             Self::NotOwnedBySender { .. } => "not_owned_by_sender",
+            Self::InvalidSignature { .. } => "invalid_signature",
+            Self::Unreachable { .. } => "unreachable",
         }
     }
 }
@@ -279,6 +292,7 @@ mod tests {
                 members: members.iter().map(|s| (*s).into()).collect(),
                 auto_share_layers: vec!["observation".into()],
                 min_quality_score: floor,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: cap,
@@ -402,6 +416,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: Some(3),

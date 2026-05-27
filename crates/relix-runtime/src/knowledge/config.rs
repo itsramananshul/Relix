@@ -51,6 +51,25 @@ pub struct SharingGroup {
     /// means the trust checker doesn't enforce a floor.
     #[serde(default)]
     pub min_quality_score: Option<f32>,
+    /// RELIX-7.16 GAP 3: optional per-member node routing.
+    /// When set, each entry pins a member agent to the memory
+    /// node where the agent's observations live. The
+    /// `KnowledgeService` consults this map when sharing —
+    /// targets pinned to a remote node receive their copy via
+    /// the `knowledge.accept_shared` mesh capability instead
+    /// of a local-store write. Empty list (default) routes
+    /// every member to the LOCAL store, preserving pre-7.16
+    /// behaviour byte-for-byte.
+    #[serde(default)]
+    pub member_nodes: Vec<MemberNodeRoute>,
+}
+
+/// One row in [`SharingGroup::member_nodes`] — `agent` lives
+/// on `node`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MemberNodeRoute {
+    pub agent: String,
+    pub node: String,
 }
 
 impl SharingGroup {
@@ -67,6 +86,16 @@ impl SharingGroup {
             .iter()
             .filter_map(|s| MemoryLayer::parse(s.trim()))
             .collect()
+    }
+
+    /// RELIX-7.16 GAP 3: node lookup for `agent`. Returns
+    /// `None` when the member has no `member_nodes` entry —
+    /// the service then routes locally.
+    pub fn node_for_agent(&self, agent: &str) -> Option<&str> {
+        self.member_nodes
+            .iter()
+            .find(|r| r.agent == agent)
+            .map(|r| r.node.as_str())
     }
 }
 
@@ -269,6 +298,23 @@ pub fn sharing_group_descriptors() -> &'static [(&'static str, &'static str)] {
              total_copies_revoked, per_target:[..], \
              missing_source_ids:[..], unauthorised_source_ids:[..]}`.",
         ),
+        (
+            "knowledge.accept_shared",
+            "RELIX-7.16 GAP 3: receive a signed observation \
+             payload from a remote memory node and accept it \
+             into the local layered store. Args JSON: the \
+             `SignedSharePayload` carrying \
+             `{source_node, source_agent, target_agent, \
+             record, message?, signature, source_pubkey}`. \
+             The receiver verifies the ed25519 signature \
+             against the carried pubkey, runs the local \
+             `TrustChecker`, builds the deterministic copy id \
+             via `mint_copy_id(record.id, target_agent)`, and \
+             inserts the copy. Returns `{copy_id, target_agent}` \
+             on success; rejects with `INVALID_ARGS` carrying \
+             the structured `RejectReason` on signature \
+             mismatch or trust-check failure.",
+        ),
     ]
 }
 
@@ -302,6 +348,7 @@ mod tests {
             members: vec!["alice".into(), "bob".into()],
             auto_share_layers: vec!["observation".into()],
             min_quality_score: Some(0.7),
+            member_nodes: Vec::new(),
         }]);
         let r = cfg.resolve().unwrap();
         let g = r.share_path("alice", "bob").expect("common group");
@@ -317,12 +364,14 @@ mod tests {
                 members: vec!["alice".into(), "bob".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             },
             SharingGroup {
                 name: "ops".into(),
                 members: vec!["alice".into(), "carol".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             },
         ]);
         let r = cfg.resolve().unwrap();
@@ -367,6 +416,7 @@ mod tests {
             members: vec![],
             auto_share_layers: vec!["observation".into(), "model".into(), "bogus".into()],
             min_quality_score: None,
+            member_nodes: Vec::new(),
         };
         let layers = g.auto_layers();
         assert!(layers.contains(&MemoryLayer::Observation));
@@ -410,6 +460,7 @@ mod tests {
             members: vec![],
             auto_share_layers: vec![],
             min_quality_score: None,
+            member_nodes: Vec::new(),
         }]);
         assert!(!cfg.has_active_groups());
         let cfg = cfg_with(vec![SharingGroup {
@@ -417,6 +468,7 @@ mod tests {
             members: vec!["a".into()],
             auto_share_layers: vec![],
             min_quality_score: None,
+            member_nodes: Vec::new(),
         }]);
         assert!(cfg.has_active_groups());
     }

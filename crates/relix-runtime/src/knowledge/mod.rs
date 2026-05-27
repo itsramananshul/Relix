@@ -33,19 +33,24 @@ pub mod chronicle;
 pub mod config;
 pub mod coordinator;
 pub mod quality_scorer;
+pub mod remote;
 pub mod service;
 pub mod trust;
 
 pub use autoshare::{AutoShareConfig, AutoShareTask};
 pub use chronicle::{KnowledgeEvent, KnowledgeEventKind};
-pub use config::{KnowledgeConfig, SharingGroup, sharing_group_descriptors};
+pub use config::{KnowledgeConfig, MemberNodeRoute, SharingGroup, sharing_group_descriptors};
 pub use coordinator::{knowledge_capability_descriptors, register};
 pub use quality_scorer::{
     MemoryQualityScorer, MemoryQualityScorerConfig, ScoreBreakdown as MemoryScoreBreakdown,
     format_quality_tag, score_one_batch as score_one_memory_batch, spawn_memory_quality_scorer,
 };
+pub use remote::{
+    InMemoryRemoteDispatcher, LateBoundDispatcher, MeshKnowledgeDispatcher, MeshKnowledgeRouter,
+    NullRemoteDispatcher, RemoteKnowledgeDispatcher, RemoteShareError, SignedSharePayload,
+};
 pub use service::{
-    BroadcastResult, KnowledgeService, ListSharedFilter, ListSharedRow, RevokeResult, ShareError,
-    ShareRejection, ShareRequest, ShareResult,
+    BroadcastResult, KnowledgeService, ListSharedFilter, ListSharedRow, RecallResult,
+    RecallTargetSummary, RevokeResult, ShareError, ShareRejection, ShareRequest, ShareResult,
 };
 pub use trust::{RejectReason, TrustChecker};

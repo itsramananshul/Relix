@@ -126,7 +126,7 @@ impl SharePolicy {
 /// [`MemoryRecord::new_raw`] convenience constructor returns a
 /// record with these defaults so existing call sites compile
 /// unchanged.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub id: String,
     pub layer: MemoryLayer,

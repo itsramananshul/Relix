@@ -676,6 +676,16 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     populate_alert_mesh_cell(cell, peers, key_path, deadline_secs).await;
                 });
             }
+            StartupWiring::KnowledgeMesh {
+                cell,
+                peers,
+                deadline_secs,
+            } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_knowledge_mesh_cell(cell, peers, key_path, deadline_secs).await;
+                });
+            }
         }
     }
 
@@ -2880,6 +2890,109 @@ async fn populate_workflow_dispatcher_cell(
     }
 }
 
+/// RELIX-7.16 GAP 3: build one
+/// `MeshKnowledgeDispatcher` per configured peer and publish a
+/// `MeshKnowledgeRouter` into `cell` so cross-node shares stop
+/// rejecting with `Unreachable`. Peer alias === node name in
+/// `[[knowledge.groups.member_nodes]]`, so the mapping is
+/// 1:1 from `[peers]`. Silent failure — when the identity
+/// bundle or key file is missing the mesh stays disabled and
+/// cross-node shares continue to reject.
+async fn populate_knowledge_mesh_cell(
+    cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::knowledge::RemoteKnowledgeDispatcher>>>,
+    peers: std::collections::BTreeMap<String, PeerConfig>,
+    key_path: std::path::PathBuf,
+    deadline_secs: i64,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+    if peers.is_empty() {
+        tracing::info!("knowledge mesh: no [peers] configured; cross-node shares disabled");
+        return;
+    }
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "knowledge mesh: identity bundle missing; cross-node shares disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "knowledge mesh: bundle decode failed");
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        _ => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "knowledge mesh: client key missing / wrong length"
+            );
+            return;
+        }
+    };
+    let mut peers_map = std::collections::HashMap::new();
+    for (alias, peer_cfg) in &peers {
+        peers_map.insert(
+            alias.clone(),
+            PeerEntry {
+                addr: format!("/ip4/127.0.0.1/tcp/{}", peer_cfg.port),
+            },
+        );
+    }
+    let peers_file = PeersFile { peers: peers_map };
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!("knowledge mesh: discover_and_pin returned None; disabled");
+            return;
+        }
+    };
+    let mut by_node: std::collections::BTreeMap<
+        String,
+        Arc<crate::knowledge::MeshKnowledgeDispatcher>,
+    > = std::collections::BTreeMap::new();
+    for alias in peers.keys() {
+        let d = Arc::new(crate::knowledge::MeshKnowledgeDispatcher::new(
+            mesh.clone(),
+            alias.clone(),
+            bundle.clone(),
+            deadline_secs,
+        ));
+        by_node.insert(alias.clone(), d);
+    }
+    let router: Arc<dyn crate::knowledge::RemoteKnowledgeDispatcher> =
+        Arc::new(crate::knowledge::MeshKnowledgeRouter::new(by_node));
+    if cell.set(router).is_err() {
+        tracing::warn!("knowledge mesh: cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            peer_count = peers.len(),
+            "knowledge mesh: online (RELIX-7.16 GAP 3)"
+        );
+    }
+}
+
 /// RELIX-7.11 GAP 3: populate the alert-fan-out cell with an
 /// `AlertMeshContext` once the rpc::Client is up. The
 /// MultiChannelAlertSink reads from the cell on every alert; an
@@ -3415,6 +3528,20 @@ pub(crate) enum StartupWiring {
     /// capabilities.
     CoordAlertMesh {
         cell: crate::metrics::AlertMeshCell,
+        peers: std::collections::BTreeMap<String, PeerConfig>,
+        deadline_secs: i64,
+    },
+    /// RELIX-7.16 GAP 3: knowledge-mesh dispatcher wiring. The
+    /// `KnowledgeService` was constructed with a
+    /// [`crate::knowledge::LateBoundDispatcher`] wrapping
+    /// `cell`; this wiring builds one
+    /// [`crate::knowledge::MeshKnowledgeDispatcher`] per
+    /// configured peer (peer alias === node name) and publishes
+    /// a [`crate::knowledge::MeshKnowledgeRouter`] into the
+    /// cell. Until populated, cross-node shares reject with
+    /// `Unreachable { detail: "dispatcher not yet wired" }`.
+    KnowledgeMesh {
+        cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::knowledge::RemoteKnowledgeDispatcher>>>,
         peers: std::collections::BTreeMap<String, PeerConfig>,
         deadline_secs: i64,
     },
@@ -4228,6 +4355,57 @@ fn register_node_type_handlers(
                         return Err(format!("[knowledge] {e}").into());
                     }
                 };
+                // RELIX-7.16 GAP 3: attach local node name + the
+                // shared MeshKnowledgeDispatcher cell BEFORE the
+                // service is shared with the dispatch bridge. The
+                // dispatcher is late-bound by a `StartupWiring`
+                // entry below — until that fires, cross-node
+                // shares reject with `Unreachable`.
+                let local_node_name = cfg.controller.name.clone();
+                let mesh_cell: Arc<
+                    tokio::sync::OnceCell<Arc<dyn crate::knowledge::RemoteKnowledgeDispatcher>>,
+                > = Arc::new(tokio::sync::OnceCell::new());
+                let late_dispatcher: Arc<dyn crate::knowledge::RemoteKnowledgeDispatcher> =
+                    Arc::new(crate::knowledge::remote::LateBoundDispatcher::new(
+                        mesh_cell.clone(),
+                    ));
+                // Load the ed25519 signing key from the identity
+                // key file so outbound `knowledge.accept_shared`
+                // payloads are authenticated by the source node's
+                // own key. If the key file is missing / malformed
+                // we fall back to local-only sharing — a warn is
+                // logged below.
+                let signing_key_bytes: Option<[u8; 32]> =
+                    match std::fs::read(&cfg.identity.key_path) {
+                        Ok(b) if b.len() == 32 => {
+                            let mut k = [0u8; 32];
+                            k.copy_from_slice(&b);
+                            Some(k)
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                key_path = %cfg.identity.key_path.display(),
+                                "knowledge: identity key not 32 bytes; mesh-routed shares disabled"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                key_path = %cfg.identity.key_path.display(),
+                                error = %e,
+                                "knowledge: identity key unreadable; mesh-routed shares disabled"
+                            );
+                            None
+                        }
+                    };
+                let mut svc_inner = (*svc).clone();
+                svc_inner = svc_inner.with_local_node(local_node_name.clone());
+                if let Some(key_bytes) = signing_key_bytes {
+                    let signer = Arc::new(ed25519_dalek::SigningKey::from_bytes(&key_bytes));
+                    svc_inner =
+                        svc_inner.with_mesh(local_node_name.clone(), signer, late_dispatcher);
+                }
+                let svc = Arc::new(svc_inner);
                 crate::knowledge::register(bridge, svc.clone());
                 for (method, doc) in crate::knowledge::knowledge_capability_descriptors() {
                     let cats: &[&str] = match *method {
@@ -4236,6 +4414,7 @@ fn register_node_type_handlers(
                         }
                         "knowledge.revoke" => &["mutate", "memory", "knowledge"],
                         "knowledge.recall" => &["mutate", "memory", "knowledge"],
+                        "knowledge.accept_shared" => &["mutate", "memory", "knowledge"],
                         _ => &["read", "memory", "knowledge"],
                     };
                     manifest.add_capability(
@@ -4244,6 +4423,17 @@ fn register_node_type_handlers(
                             .with_categories(cats.iter().map(|s| (*s).into())),
                     );
                 }
+                // Park the mesh cell + the peers map on a
+                // StartupWiring entry so the run() loop can wire
+                // it after the rpc::Client is up. The remote
+                // dispatcher is keyed by node name; we map each
+                // configured peer (peers.toml entry) to its
+                // own MeshClient at fire time.
+                out.push(StartupWiring::KnowledgeMesh {
+                    cell: mesh_cell,
+                    peers: cfg.peers.clone(),
+                    deadline_secs: 30,
+                });
                 // Spawn the AutoShareTask. The handle is dropped
                 // — the task runs for the process lifetime;
                 // shutdown happens when tokio's runtime tears

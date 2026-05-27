@@ -22,6 +22,7 @@ use serde::Deserialize;
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 use super::config::sharing_group_descriptors;
+use super::remote::SignedSharePayload;
 use super::service::{KnowledgeService, ListSharedFilter, ShareError, ShareRequest};
 
 /// Wire every `knowledge.*` cap onto `bridge`.
@@ -32,7 +33,7 @@ pub fn register(bridge: &mut DispatchBridge, service: Arc<KnowledgeService>) {
             "knowledge.share",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let svc = svc.clone();
-                async move { handle_share(&svc, &ctx) }
+                async move { handle_share(&svc, &ctx).await }
             })),
         );
     }
@@ -52,7 +53,7 @@ pub fn register(bridge: &mut DispatchBridge, service: Arc<KnowledgeService>) {
             "knowledge.group_broadcast",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let svc = svc.clone();
-                async move { handle_group_broadcast(&svc, &ctx) }
+                async move { handle_group_broadcast(&svc, &ctx).await }
             })),
         );
     }
@@ -77,12 +78,22 @@ pub fn register(bridge: &mut DispatchBridge, service: Arc<KnowledgeService>) {
         );
     }
     {
-        let svc = service;
+        let svc = service.clone();
         bridge.register(
             "knowledge.recall",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let svc = svc.clone();
                 async move { handle_recall(&svc, &ctx) }
+            })),
+        );
+    }
+    {
+        let svc = service;
+        bridge.register(
+            "knowledge.accept_shared",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let svc = svc.clone();
+                async move { handle_accept_shared(&svc, &ctx) }
             })),
         );
     }
@@ -96,12 +107,12 @@ pub fn knowledge_capability_descriptors() -> &'static [(&'static str, &'static s
     sharing_group_descriptors()
 }
 
-fn handle_share(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome {
+async fn handle_share(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome {
     let req: ShareRequest = match decode(ctx) {
         Ok(r) => r,
         Err(out) => return out,
     };
-    match svc.share(&req) {
+    match svc.share(&req).await {
         Ok(res) => ok_json(&res),
         Err(ShareError::InvalidArgs(m)) => invalid(&m),
         Err(e) => internal(&e),
@@ -132,7 +143,7 @@ struct BroadcastArgs {
     message: Option<String>,
 }
 
-fn handle_group_broadcast(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome {
+async fn handle_group_broadcast(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome {
     let args: BroadcastArgs = match decode(ctx) {
         Ok(a) => a,
         Err(out) => return out,
@@ -146,12 +157,15 @@ fn handle_group_broadcast(svc: &KnowledgeService, ctx: &InvocationCtx) -> Handle
     if args.observation_ids.is_empty() {
         return invalid("observation_ids must list at least one id");
     }
-    match svc.group_broadcast(
-        &args.caller_agent,
-        &args.group,
-        &args.observation_ids,
-        args.message.as_deref(),
-    ) {
+    match svc
+        .group_broadcast(
+            &args.caller_agent,
+            &args.group,
+            &args.observation_ids,
+            args.message.as_deref(),
+        )
+        .await
+    {
         Ok(res) => ok_json(&res),
         Err(ShareError::InvalidArgs(m)) => invalid(&m),
         Err(e) => internal(&e),
@@ -206,6 +220,42 @@ fn handle_recall(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome 
     match svc.recall(&args.source_agent, &args.source_observation_ids) {
         Ok(res) => ok_json(&res),
         Err(ShareError::InvalidArgs(m)) => invalid(&m),
+        Err(e) => internal(&e),
+    }
+}
+
+/// RELIX-7.16 GAP 3: handle inbound `knowledge.accept_shared`
+/// from a remote memory node. Args is the JSON-encoded
+/// [`SignedSharePayload`]. The receiver runs full signature
+/// verification + the local `TrustChecker` before any row
+/// touches SQLite. On success, returns the deterministic
+/// receiver-side copy id so callers can correlate.
+fn handle_accept_shared(svc: &KnowledgeService, ctx: &InvocationCtx) -> HandlerOutcome {
+    if ctx.args.is_empty() {
+        return invalid("knowledge.accept_shared: payload is required");
+    }
+    let payload: SignedSharePayload = match serde_json::from_slice(&ctx.args) {
+        Ok(p) => p,
+        Err(e) => return invalid(&format!("decode payload: {e}")),
+    };
+    let source_id = payload.record.id.clone();
+    let target_agent = payload.target_agent.clone();
+    match svc.accept_shared(payload) {
+        Ok(()) => {
+            let copy_id = crate::knowledge::service::mint_copy_id(&source_id, &target_agent);
+            let body = serde_json::json!({
+                "copy_id": copy_id,
+                "target_agent": target_agent,
+            });
+            ok_json(&body)
+        }
+        Err(ShareError::InvalidArgs(m)) => invalid(&m),
+        Err(ShareError::Rejected(reason)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!("knowledge.accept_shared: rejected: {reason:?}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
         Err(e) => internal(&e),
     }
 }
@@ -293,6 +343,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
@@ -343,8 +394,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn handle_share_returns_invalid_args_on_empty_targets() {
+    #[tokio::test]
+    async fn handle_share_returns_invalid_args_on_empty_targets() {
         let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
         let cfg = KnowledgeConfig {
             groups: vec![SharingGroup {
@@ -352,6 +403,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into()],
                 auto_share_layers: vec![],
                 min_quality_score: None,
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
@@ -360,7 +412,7 @@ mod tests {
         let svc = KnowledgeService::new(store, &cfg).unwrap();
         let ctx =
             ctx_with(br#"{"source_agent":"alice","target_agents":[],"observation_ids":["a"]}"#);
-        match handle_share(&svc, &ctx) {
+        match handle_share(&svc, &ctx).await {
             HandlerOutcome::Err(env) => assert_eq!(env.kind, error_kinds::INVALID_ARGS),
             _ => panic!("expected INVALID_ARGS"),
         }
@@ -375,6 +427,7 @@ mod tests {
                 members: vec!["alice".into(), "bob".into()],
                 auto_share_layers: vec!["observation".into()],
                 min_quality_score: Some(0.7),
+                member_nodes: Vec::new(),
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
