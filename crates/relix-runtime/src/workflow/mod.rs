@@ -34,19 +34,26 @@
 //! into an auditable record.
 
 pub mod ast;
+pub mod chronicle;
+pub mod coordinator;
 pub mod dispatcher;
 pub mod executor;
+pub mod mesh_dispatcher;
 pub mod parser;
+pub mod store;
 pub mod validator;
 
 #[cfg(test)]
 mod tests;
 
 pub use ast::{AgentSpec, Edge, EdgeCondition, FlowGraph, Workflow};
+pub use chronicle::{ChronicleError, ExecutionRecord, StepRecord, WorkflowChronicle};
 pub use dispatcher::{DispatchError, DispatchResult, WorkflowDispatcher};
 pub use executor::{
     ExecutionId, ExecutionStatus, ExecutionStep, ExecutionTrace, WorkflowExecutor, WorkflowResult,
     execute,
 };
+pub use mesh_dispatcher::{MeshWorkflowDispatcher, WorkflowDispatcherCell};
 pub use parser::{ParseError, parse_str};
+pub use store::{StoreError, WorkflowEntry, WorkflowStore};
 pub use validator::{ValidationError, validate};

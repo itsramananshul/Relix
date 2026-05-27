@@ -283,7 +283,13 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // Router role short-circuits: it doesn't run the per-node-type
     // capability surface (memory/ai/tool/...) — it runs the four
     // router.* capabilities and the reaper background loops.
-    let mut startup_wiring: Option<StartupWiring> = None;
+    // Post-startup wiring registry. Each entry is one
+    // dispatcher cell + config the run() loop must populate
+    // AFTER the rpc::Client + bridge are up. A single node
+    // (e.g. the coordinator) may register multiple hooks
+    // here — drift embedder AND workflow dispatcher both
+    // wire late from the same boot.
+    let mut startup_wiring: Vec<StartupWiring> = Vec::new();
     let router_state = if cfg.controller.role == "router" {
         tracing::info!(
             role = "router",
@@ -468,95 +474,110 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Post-startup wiring (AI memory injection). Spawns a small
-    // discovery task that builds a MeshClient pointing at the
-    // memory peer and populates the `OnceCell` the ai.chat
-    // handler already captured. Failure is non-fatal — the AI
-    // node still serves chat, just without memory injection.
-    match startup_wiring.take() {
-        Some(StartupWiring::AiMemory {
-            cell,
-            cfg: Some(memcfg),
-        }) => {
-            let key_path = cfg.identity.key_path.clone();
-            tokio::spawn(async move {
-                populate_ai_memory_cell(cell, memcfg, key_path).await;
-            });
-        }
-        Some(StartupWiring::MemoryCurator {
-            ai_cell,
-            coord_cell,
-            state,
-            cfg: ccfg,
-            embedding_cell,
-            embedding_cfg,
-        }) => {
-            let interval_secs = ccfg.interval_secs;
-            if let Some(aipeer) = ccfg.ai_peer.clone() {
-                let key_path = cfg.identity.key_path.clone();
-                let state_for_ai = state.clone();
-                tokio::spawn(async move {
-                    populate_memory_curator_cell(
-                        ai_cell,
-                        state_for_ai,
-                        aipeer,
-                        key_path,
-                        interval_secs,
-                    )
-                    .await;
-                });
-            } else {
-                tracing::info!("memory curator: no [memory.curator.ai_peer]; AI dispatcher unset");
-            }
-            if let Some(coordpeer) = ccfg.coord_peer.clone() {
+    // Post-startup wiring. Each entry registered by
+    // `register_node_type_handlers` spawns its own
+    // discovery / dial / cell-populate background task here.
+    // Failures inside any one task are non-fatal — the
+    // capability the cell backs simply stays in its
+    // "not-yet-wired" state.
+    for wiring in startup_wiring.drain(..) {
+        match wiring {
+            StartupWiring::AiMemory {
+                cell,
+                cfg: Some(memcfg),
+            } => {
                 let key_path = cfg.identity.key_path.clone();
                 tokio::spawn(async move {
-                    populate_memory_curator_coord_cell(coord_cell, coordpeer, key_path).await;
+                    populate_ai_memory_cell(cell, memcfg, key_path).await;
                 });
-            } else {
-                tracing::info!(
-                    "memory curator: no [memory.curator.coord_peer]; chronicle events disabled"
-                );
             }
-            if let (Some(cell), Some(epeer)) = (embedding_cell, embedding_cfg) {
+            StartupWiring::AiMemory { cfg: None, .. } => {}
+            StartupWiring::MemoryCurator {
+                ai_cell,
+                coord_cell,
+                state,
+                cfg: ccfg,
+                embedding_cell,
+                embedding_cfg,
+            } => {
+                let interval_secs = ccfg.interval_secs;
+                if let Some(aipeer) = ccfg.ai_peer.clone() {
+                    let key_path = cfg.identity.key_path.clone();
+                    let state_for_ai = state.clone();
+                    tokio::spawn(async move {
+                        populate_memory_curator_cell(
+                            ai_cell,
+                            state_for_ai,
+                            aipeer,
+                            key_path,
+                            interval_secs,
+                        )
+                        .await;
+                    });
+                } else {
+                    tracing::info!(
+                        "memory curator: no [memory.curator.ai_peer]; AI dispatcher unset"
+                    );
+                }
+                if let Some(coordpeer) = ccfg.coord_peer.clone() {
+                    let key_path = cfg.identity.key_path.clone();
+                    tokio::spawn(async move {
+                        populate_memory_curator_coord_cell(coord_cell, coordpeer, key_path).await;
+                    });
+                } else {
+                    tracing::info!(
+                        "memory curator: no [memory.curator.coord_peer]; chronicle events disabled"
+                    );
+                }
+                if let (Some(cell), Some(epeer)) = (embedding_cell, embedding_cfg) {
+                    let key_path = cfg.identity.key_path.clone();
+                    tokio::spawn(async move {
+                        populate_memory_embedding_cell(cell, epeer, key_path).await;
+                    });
+                }
+                let _ = state;
+            }
+            StartupWiring::MemoryEmbedding { cell, cfg: epeer } => {
                 let key_path = cfg.identity.key_path.clone();
                 tokio::spawn(async move {
                     populate_memory_embedding_cell(cell, epeer, key_path).await;
                 });
             }
-            let _ = state;
+            StartupWiring::Telegram { cell, cfg: tg_cfg } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_telegram_outbound_cell(cell, tg_cfg, key_path).await;
+                });
+            }
+            StartupWiring::Discord { cell, cfg: dc_cfg } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_discord_outbound_cell(cell, dc_cfg, key_path).await;
+                });
+            }
+            StartupWiring::Slack { cell, cfg: sl_cfg } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_slack_outbound_cell(cell, sl_cfg, key_path).await;
+                });
+            }
+            StartupWiring::CoordDriftEmbed { cell, cfg: ai_cfg } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_drift_embedder_cell(cell, ai_cfg, key_path).await;
+                });
+            }
+            StartupWiring::CoordWorkflowDispatcher {
+                cell,
+                peers,
+                deadline_secs,
+            } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_workflow_dispatcher_cell(cell, peers, key_path, deadline_secs).await;
+                });
+            }
         }
-        Some(StartupWiring::MemoryEmbedding { cell, cfg: epeer }) => {
-            let key_path = cfg.identity.key_path.clone();
-            tokio::spawn(async move {
-                populate_memory_embedding_cell(cell, epeer, key_path).await;
-            });
-        }
-        Some(StartupWiring::Telegram { cell, cfg: tg_cfg }) => {
-            let key_path = cfg.identity.key_path.clone();
-            tokio::spawn(async move {
-                populate_telegram_outbound_cell(cell, tg_cfg, key_path).await;
-            });
-        }
-        Some(StartupWiring::Discord { cell, cfg: dc_cfg }) => {
-            let key_path = cfg.identity.key_path.clone();
-            tokio::spawn(async move {
-                populate_discord_outbound_cell(cell, dc_cfg, key_path).await;
-            });
-        }
-        Some(StartupWiring::Slack { cell, cfg: sl_cfg }) => {
-            let key_path = cfg.identity.key_path.clone();
-            tokio::spawn(async move {
-                populate_slack_outbound_cell(cell, sl_cfg, key_path).await;
-            });
-        }
-        Some(StartupWiring::CoordDriftEmbed { cell, cfg: ai_cfg }) => {
-            let key_path = cfg.identity.key_path.clone();
-            tokio::spawn(async move {
-                populate_drift_embedder_cell(cell, ai_cfg, key_path).await;
-            });
-        }
-        _ => {}
     }
 
     tracing::info!("controller online; awaiting inbound RPCs");
@@ -2543,6 +2564,99 @@ async fn populate_drift_embedder_cell(
     }
 }
 
+/// Build a `MeshWorkflowDispatcher` pointed at every configured
+/// peer and publish it into the coordinator's workflow
+/// dispatcher cell. Failure (missing identity bundle, no
+/// peers, discovery timeout) is non-fatal — the cell stays
+/// empty and `workflow.run` returns a "dispatcher not ready"
+/// error instead of panicking.
+async fn populate_workflow_dispatcher_cell(
+    cell: crate::workflow::WorkflowDispatcherCell,
+    peers: std::collections::BTreeMap<String, PeerConfig>,
+    key_path: std::path::PathBuf,
+    deadline_secs: i64,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+    if peers.is_empty() {
+        tracing::info!(
+            "workflow dispatcher: no [peers] configured; mesh dispatcher disabled (workflow.run will return a clear error)"
+        );
+        return;
+    }
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "workflow dispatcher: identity bundle missing; dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "workflow dispatcher: bundle decode failed");
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        _ => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "workflow dispatcher: client key missing / wrong length"
+            );
+            return;
+        }
+    };
+    let mut peers_map = std::collections::HashMap::new();
+    for (alias, peer_cfg) in &peers {
+        peers_map.insert(
+            alias.clone(),
+            PeerEntry {
+                addr: format!("/ip4/127.0.0.1/tcp/{}", peer_cfg.port),
+            },
+        );
+    }
+    let peers_file = PeersFile { peers: peers_map };
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "workflow dispatcher: discover_and_pin returned None; dispatcher disabled"
+            );
+            return;
+        }
+    };
+    let dispatcher: std::sync::Arc<dyn crate::workflow::WorkflowDispatcher> = std::sync::Arc::new(
+        crate::workflow::MeshWorkflowDispatcher::new(mesh, bundle, deadline_secs),
+    );
+    if cell.set(dispatcher).is_err() {
+        tracing::warn!("workflow dispatcher: cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            peer_count = peers.len(),
+            "coordinator: workflow dispatcher online (RELIX-7.5)"
+        );
+    }
+}
+
 /// Mirrors `populate_memory_curator_cell` — same identity-bundle
 /// + client-key + discover_and_pin pattern.
 async fn populate_memory_embedding_cell(
@@ -2955,6 +3069,17 @@ pub(crate) enum StartupWiring {
         cell: crate::nodes::slack::SlackOutboundClientCell,
         cfg: crate::nodes::slack::SlackNodeConfig,
     },
+    /// Coordinator workflow dispatcher wiring (RELIX-7.5).
+    /// The cell was already passed into the workflow
+    /// capability handlers; the run() loop dials every
+    /// configured peer and publishes a
+    /// `MeshWorkflowDispatcher` into the cell so
+    /// `workflow.run` can dispatch agent steps over the mesh.
+    CoordWorkflowDispatcher {
+        cell: crate::workflow::WorkflowDispatcherCell,
+        peers: std::collections::BTreeMap<String, PeerConfig>,
+        deadline_secs: i64,
+    },
 }
 
 // Parse `[guardrails]` from the top-level TOML section into
@@ -3142,7 +3267,7 @@ fn register_node_type_handlers(
     cfg: &ControllerConfig,
     manifest: ManifestProvider,
     access_broker: std::sync::Arc<crate::nodes::execution::broker::AgentAccessBroker>,
-    out: &mut Option<StartupWiring>,
+    out: &mut Vec<StartupWiring>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
 
@@ -3232,7 +3357,7 @@ fn register_node_type_handlers(
                     "memory node: [memory.curator] enabled = false; scheduler not spawned"
                 );
             }
-            *out = Some(StartupWiring::MemoryCurator {
+            out.push(StartupWiring::MemoryCurator {
                 ai_cell: curator_ai_cell,
                 coord_cell: curator_coord_cell,
                 state: curator_state,
@@ -3246,7 +3371,7 @@ fn register_node_type_handlers(
         } else {
             tracing::info!("memory node: no [memory.curator] section; curator scheduler disabled");
             if let Some(epeer) = mem_cfg.embedding_peer.clone() {
-                *out = Some(StartupWiring::MemoryEmbedding {
+                out.push(StartupWiring::MemoryEmbedding {
                     cell: embedding_cell.clone(),
                     cfg: epeer,
                 });
@@ -3524,7 +3649,7 @@ fn register_node_type_handlers(
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
         // ai_cfg.memory_peer is configured.
-        *out = Some(StartupWiring::AiMemory {
+        out.push(StartupWiring::AiMemory {
             cell: memory_cell,
             cfg: ai_cfg.memory_peer.clone(),
         });
@@ -3707,7 +3832,7 @@ fn register_node_type_handlers(
         if drift_cfg.as_ref().is_some_and(|c| c.enabled)
             && let Some(ai_peer_cfg) = coord_cfg.ai_peer.clone()
         {
-            *out = Some(StartupWiring::CoordDriftEmbed {
+            out.push(StartupWiring::CoordDriftEmbed {
                 cell: drift_embedder_cell_for_startup,
                 cfg: ai_peer_cfg,
             });
@@ -3835,6 +3960,97 @@ fn register_node_type_handlers(
         tracing::info!(
             db = %coord_cfg.db_path.display(),
             "coordinator node: registered cron.create / list / get / update / delete / trigger"
+        );
+
+        // ── Workflow engine — RELIX-7.5.
+        //
+        // Workflows live in `<data_dir>/workflows/*.workflow`
+        // (override via `RELIX_WORKFLOWS_DIR`). The chronicle
+        // is a separate sqlite file in the same data dir so
+        // workflow lifecycle doesn't entangle with the
+        // coordinator's task-schema migrations.
+        let workflows_dir = std::env::var("RELIX_WORKFLOWS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                coord_cfg
+                    .db_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("workflows")
+            });
+        let workflow_store = crate::workflow::WorkflowStore::new(workflows_dir.clone());
+        let workflow_chronicle_path = coord_cfg
+            .db_path
+            .parent()
+            .map(crate::workflow::chronicle::default_chronicle_path)
+            .unwrap_or_else(|| std::path::PathBuf::from("workflows.sqlite"));
+        let workflow_chronicle = crate::workflow::WorkflowChronicle::open(&workflow_chronicle_path)
+            .map_err(|e| format!("workflow chronicle open: {e}"))?;
+        let workflow_dispatcher_cell: crate::workflow::WorkflowDispatcherCell =
+            Arc::new(tokio::sync::OnceCell::new());
+        let known_peers: std::collections::BTreeSet<String> = cfg.peers.keys().cloned().collect();
+        crate::workflow::coordinator::register(
+            bridge,
+            workflow_store.clone(),
+            workflow_chronicle.clone(),
+            workflow_dispatcher_cell.clone(),
+            Arc::new(known_peers),
+        );
+        let workflow_caps: &[(&str, &str, &[&str])] = &[
+            (
+                "workflow.run",
+                "Execute a workflow by name. Arg JSON: \
+                 {\"name\": \"<workflow>\", \"input\": \"<text>\"}. \
+                 Returns the full execution record.",
+                &["workflow", "execute"],
+            ),
+            (
+                "workflow.list",
+                "Enumerate every workflow file found in the \
+                 workflows directory (returns name + description + version).",
+                &["workflow", "read"],
+            ),
+            (
+                "workflow.status",
+                "Fetch a past execution by id. Arg JSON: \
+                 {\"execution_id\": \"<hex>\"}.",
+                &["workflow", "read"],
+            ),
+            (
+                "workflow.validate",
+                "Parse + validate a workflow source string. \
+                 Arg JSON: {\"source\": \"<yaml>\"}. \
+                 Returns {ok, error?} without touching the catalog.",
+                &["workflow", "read"],
+            ),
+        ];
+        for (method, doc, cats) in workflow_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        // Post-startup wiring: dial every peer + publish a
+        // MeshWorkflowDispatcher into the cell. Done outside
+        // this boot path so the rpc::Client can finish coming
+        // up first.
+        if !cfg.peers.is_empty() {
+            out.push(StartupWiring::CoordWorkflowDispatcher {
+                cell: workflow_dispatcher_cell,
+                peers: cfg.peers.clone(),
+                deadline_secs: coord_cfg
+                    .ai_peer
+                    .as_ref()
+                    .map(|c| c.deadline_secs)
+                    .unwrap_or(30),
+            });
+        } else {
+            tracing::info!("coordinator: no [peers] configured; workflow dispatcher disabled");
+        }
+        tracing::info!(
+            workflows_dir = %workflows_dir.display(),
+            chronicle = %workflow_chronicle_path.display(),
+            "coordinator node: registered workflow.run / list / status / validate"
         );
 
         // ── Delegation — optional [coordinator.delegation] section.
@@ -4494,7 +4710,7 @@ fn register_node_type_handlers(
         // can dial memory + ai + coord and publish the
         // outbound client into the cell.
         let tg_cfg_for_wiring = tg_cfg.clone();
-        *out = Some(StartupWiring::Telegram {
+        out.push(StartupWiring::Telegram {
             cell: out_cell,
             cfg: tg_cfg_for_wiring,
         });
@@ -4570,7 +4786,7 @@ fn register_node_type_handlers(
             .await;
         });
         let dc_cfg_for_wiring = dc_cfg.clone();
-        *out = Some(StartupWiring::Discord {
+        out.push(StartupWiring::Discord {
             cell: out_cell,
             cfg: dc_cfg_for_wiring,
         });
@@ -4646,7 +4862,7 @@ fn register_node_type_handlers(
             .await;
         });
         let sl_cfg_for_wiring = sl_cfg.clone();
-        *out = Some(StartupWiring::Slack {
+        out.push(StartupWiring::Slack {
             cell: out_cell,
             cfg: sl_cfg_for_wiring,
         });
