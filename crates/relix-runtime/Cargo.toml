@@ -57,6 +57,44 @@ bytes.workspace = true
 # the sflow executor pulls it in, keeping the workspace dep list focused.
 regex = "1"
 
+# RELIX-7.7 — production email channel.
+#
+# `lettre` is the production SMTP client (STARTTLS / TLS / plain on
+# 25/465/587, plain + OAuth2 auth, builder for MIME messages with
+# attachments and inline images, connection pooling with the `pool`
+# feature). Uses rustls-tls to match the workspace's reqwest posture
+# and avoid pulling openssl in.
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "pool",
+    "tokio1",
+    "tokio1-rustls-tls",
+    "hostname",
+] }
+# `async-imap` is the production IMAP client — runtime-tokio,
+# supports IDLE for push-style inbox notification with a 60s polling
+# fallback when the server doesn't advertise IDLE.
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+# `async-native-tls` is async-imap's recommended TLS bridge. Pinned
+# to a version compatible with async-imap 0.11.
+async-native-tls = { version = "0.5", default-features = false, features = ["runtime-tokio"] }
+# `mail-parser` parses inbound MIME into typed parts (text, html,
+# attachments, inline images, headers including In-Reply-To /
+# References for thread detection).
+mail-parser = "0.11"
+# `rsa` + `sha2` + `base64` implement RFC 6376 DKIM-RSA-SHA256
+# signing using simple/relaxed canonicalisation. Optional path —
+# the email node falls back to unsigned delivery when DKIM is not
+# configured or the key cannot be parsed (never fails the send).
+rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sha2"] }
+# `sha2` is also needed by the workspace's other crates; the
+# email DKIM signer uses it for the RSA-SHA256 message digest.
+sha2.workspace = true
+# `async-trait` already in deps above. base64 already in deps above.
+# Globally-unique Message-ID generation.
+uuid = { version = "1", default-features = false, features = ["v4"] }
+
 # Node implementations (memory / ai / tool / web_bridge are modules of this crate)
 rusqlite.workspace = true
 reqwest.workspace = true
