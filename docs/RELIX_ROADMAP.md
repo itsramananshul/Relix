@@ -4044,31 +4044,31 @@ pii_block_threshold        = 0.99
 
 ---
 
-## Wiring Gaps — Must Close Before Phase 2 Complete `[OPEN]`
+## Wiring Gaps — Must Close Before Phase 2 Complete `[DONE — omnibus commit c18bde2]`
 
-These items have code shipped and tests passing but are NOT connected to the actual call paths. Phase 2 is not done until these are closed.
+These items had code shipped and tests passing but were NOT connected to the actual call paths. All eight were closed in commit `c18bde2` (with per-gap commits also listed on each subsection header). The per-W bodies below preserve the original gap descriptions for historical context — read each header for the shipped commit.
 
-### W1 — Tool Dispatcher Not Wired Into handle_chat `[OPEN]`
+### W1 — Tool Dispatcher Not Wired Into handle_chat `[DONE — commit 32bd9d6]`
 `ToolDispatcher` exists and is tested. When the execution planner produces `ToolCall` steps in `handle_chat`, they pass through without hitting the dispatcher. The broker check, secret resolution, output guard, and gateway recording do NOT run on real tool calls yet. Fix: wire `ToolDispatcher` into the `handle_chat` ToolCall step execution path.
 
-### W2 — Agent Access Broker Not Wired Into Capability Dispatch `[OPEN]`
+### W2 — Agent Access Broker Not Wired Into Capability Dispatch `[DONE — commit 88f60b0]`
 `AgentAccessBroker` exists on `AppState` with empty policies and is NOT checked before any capability handler fires. `[[execution.agents]]` config is not parsed in `controller_runtime`. Fix: wire the broker into the capability dispatch bridge before handler execution, and parse agent policies from config.
 
-### W3 — ask_human Not Registered In Tool Node `[OPEN]`
+### W3 — ask_human Not Registered In Tool Node `[DONE — commit 8f2b6b9]`
 `AskHumanTool::descriptor()` and `AskHumanTool::handle()` exist. The tool is NOT registered in the tool node's capability registration in `tool/mod.rs`. Fix: add `ask_human` to the capability registration block.
 
-### W4 — Drift Detection Embedding Comparison Not Wired `[OPEN]`
+### W4 — Drift Detection Embedding Comparison Not Wired `[DONE — commit 1d0b57d, dispatcher build d3ffb39]`
 The drift hook fires and writes `guardrail.drift_evaluation` chronicle entries but does NOT actually compare goal embedding to recent activity embedding. The coordinator has no outbound embedding dispatcher. Fix: wire an embedding dispatcher into the coordinator's drift hook so the cosine comparison actually runs.
 
-### W5 — Conversation Export Not Real Per-Message History `[OPEN]`
+### W5 — Conversation Export Not Real Per-Message History `[DONE — commit c51c864]`
 `GET /v1/sessions/export` returns a scaffolded single-session shape. It does NOT pull real per-message history from chronicle events. Fix: implement `task.session_export` coordinator capability that assembles real turn-by-turn history from chronicle events.
 
-### W6 — relix update Binary Self-Replace Not Wired `[OPEN]`
+### W6 — relix update Binary Self-Replace Not Wired `[DONE — commit c18bde2]`
 
-### W7 — OTel Real OTLP Transport Not Wired `[OPEN]`
+### W7 — OTel Real OTLP Transport Not Wired `[DONE — commit 7b7de6f, bridge wiring 8330639]`
 `OtelExporter` builds and buffers spans but flush does NOT send real OTLP wire format. Config is not parsed from `controller_runtime`. Fix: implement OTLP JSON/protobuf HTTP POST, parse `[observability.otel]` from config, spawn the exporter.
 
-### W8 — Provenance Not Recorded On Every Chat Call `[OPEN]`
+### W8 — Provenance Not Recorded On Every Chat Call `[DONE — commit 917a70e]`
 `ProvenanceRegistry` is on `AppState` but `record_chat_observability` in `openai.rs` does NOT write a provenance snapshot. Fix: after every `/v1/chat/completions` call, record a `ProvenanceSnapshot` with model_id, system_prompt_hash from the request body.
 
 `relix update` shows version diff and prompts the user. Binary download and atomic self-replace (write temp file, rename) are scaffolded but not executed. Fix: implement the download + rename step in `update.rs`.
