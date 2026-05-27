@@ -146,6 +146,9 @@ mod tenant;
 mod term_audit;
 mod tools;
 mod topology;
+mod training;
+#[cfg(test)]
+mod training_mini_mesh_test;
 mod validate;
 mod workflows;
 #[cfg(test)]
@@ -595,6 +598,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/metrics/alerts", get(agent_metrics::alerts))
         .route("/v1/metrics/cost", get(agent_metrics::cost))
+        // RELIX-7.15: training data pipeline. Six routes onto
+        // the coordinator's `training.*` capabilities.
+        .route(
+            "/v1/training/interactions",
+            get(training::list_interactions),
+        )
+        .route(
+            "/v1/training/interactions/:id",
+            get(training::get_interaction).delete(training::delete_interaction),
+        )
+        .route("/v1/training/export", post(training::export))
+        .route("/v1/training/score/:id", post(training::score_interaction))
+        .route("/v1/training/stats", get(training::stats))
         .route("/v1/plugins", get(plugins::list))
         .route("/v1/plugins/:plugin_id", get(plugins::status))
         .route("/v1/plugins/:plugin_id/reload", post(plugins::reload))

@@ -27,6 +27,7 @@ mod souls;
 mod task;
 mod terminal;
 mod topology;
+mod training;
 mod update;
 mod web;
 mod workflow;
@@ -122,6 +123,20 @@ enum Cmd {
     Metrics {
         #[command(subcommand)]
         cmd: metrics::Cmd,
+    },
+    /// RELIX-7.15 training data pipeline surface.
+    /// `training stats` — aggregate counters + score histogram.
+    /// `training list [--agent X] [--min-quality 0.7] [--limit 20]`
+    /// — recent interactions.
+    /// `training show <id>` — full record.
+    /// `training export --format openai --set-name <name> --output <dir>`
+    /// — runs an export.
+    /// `training delete <id>` — hard-deletes one interaction.
+    /// Talks to the local bridge over HTTP (default
+    /// `http://127.0.0.1:19791`).
+    Training {
+        #[command(subcommand)]
+        cmd: training::Cmd,
     },
     /// Operate the Router Node — mesh observability + health
     /// control plane. Each subcommand dials the router peer
@@ -346,6 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Email { cmd } => email::run(cmd).await,
         Cmd::Metrics { cmd } => metrics::run(cmd).await,
+        Cmd::Training { cmd } => training::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,
