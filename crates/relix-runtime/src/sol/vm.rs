@@ -70,6 +70,17 @@ pub struct VM {
     /// `Inst::TryEnter`, popped by `Inst::TryExit` (clean
     /// finish) or by the error dispatch (failure).
     try_handlers: Vec<TryHandler>,
+    /// RELIX-2 step 4: optional chunk observer wired by the
+    /// host BEFORE the VM runs. When set, `Inst::RemoteCallStream`
+    /// passes this callback into the dispatcher's
+    /// [`RemoteCallDispatcher::remote_call_stream`] call —
+    /// each chunk fires the callback synchronously, in
+    /// arrival order, BEFORE the VM has finished collecting
+    /// the concatenated result. The web bridge uses this to
+    /// pipe tokens into an SSE stream while the SOL flow is
+    /// still running. None = no observer (a no-op closure is
+    /// passed instead).
+    chunk_observer: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 }
 
 impl VM {
@@ -85,6 +96,7 @@ impl VM {
             dispatcher: None,
             last_error: None,
             try_handlers: Vec::new(),
+            chunk_observer: None,
         }
     }
 
@@ -99,6 +111,16 @@ impl VM {
     /// `Inst::RemoteCall`. Builder-style.
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn RemoteCallDispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// RELIX-2 step 4: attach a chunk observer. Invoked once
+    /// per chunk during `Inst::RemoteCallStream` evaluation,
+    /// in arrival order. The web bridge uses this to ship
+    /// tokens to an HTTP SSE response BEFORE the VM finishes
+    /// collecting the concatenated result. Builder-style.
+    pub fn with_chunk_observer(mut self, observer: Arc<dyn Fn(&[u8]) + Send + Sync>) -> Self {
+        self.chunk_observer = Some(observer);
         self
     }
 
@@ -598,6 +620,101 @@ impl VM {
                 };
 
                 match dispatcher.remote_call(&peer_str, &method_str, arg_str.as_bytes()) {
+                    Ok(body) => {
+                        let response = String::from_utf8(body).unwrap_or_else(|e| {
+                            format!("<binary response: {} bytes; {}>", e.as_bytes().len(), e)
+                        });
+                        self.heap.push(HeapObject::String(response));
+                        self.push((self.heap.len() - 1) as u64);
+                        self.last_error = None;
+                    }
+                    Err(e) => {
+                        self.last_error = Some(e);
+                        if let Some(sentinel) = self.try_dispatch_error() {
+                            return Some(sentinel);
+                        }
+                    }
+                }
+            }
+
+            // RELIX-2 step 4: streaming variant of RemoteCall.
+            // Same stack contract — pops arg / method / peer
+            // in reverse-push order, pushes a heap-string ref
+            // to the concatenated response body. The
+            // difference vs `Inst::RemoteCall` is which
+            // dispatcher method is invoked
+            // (`remote_call_stream`) and the optional
+            // chunk-observer callback wired by the host.
+            // Each chunk fires the observer in arrival order
+            // BEFORE the VM has finished collecting — the
+            // web bridge uses this to ship tokens to SSE
+            // while the SOL flow is still running.
+            Inst::RemoteCallStream => {
+                let arg_ref = self.pop() as usize;
+                let method_ref = self.pop() as usize;
+                let peer_ref = self.pop() as usize;
+
+                let arg_str = match self.heap.get(arg_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<unresolved>",
+                            "<unresolved>",
+                            "remote_call_stream: arg is not a heap string",
+                        ));
+                        self.done = true;
+                        return Some(VM_ERROR_SENTINEL);
+                    }
+                };
+                let method_str = match self.heap.get(method_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<unresolved>",
+                            "<unresolved>",
+                            "remote_call_stream: method is not a heap string",
+                        ));
+                        self.done = true;
+                        return Some(VM_ERROR_SENTINEL);
+                    }
+                };
+                let peer_str = match self.heap.get(peer_ref) {
+                    Some(HeapObject::String(s)) => s.clone(),
+                    _ => {
+                        self.last_error = Some(RemoteCallError::local(
+                            "<unresolved>",
+                            method_str.clone(),
+                            "remote_call_stream: peer is not a heap string",
+                        ));
+                        self.done = true;
+                        return Some(VM_ERROR_SENTINEL);
+                    }
+                };
+
+                let Some(dispatcher) = self.dispatcher.clone() else {
+                    self.last_error = Some(RemoteCallError::local(
+                        peer_str,
+                        method_str,
+                        "no RemoteCallDispatcher attached to VM",
+                    ));
+                    self.done = true;
+                    return Some(VM_ERROR_SENTINEL);
+                };
+
+                // Pass the chunk observer to the dispatcher.
+                // When unset, supply a no-op so the dispatcher's
+                // default impl can still call it once.
+                let observer = self.chunk_observer.clone();
+                let noop: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(|_| {});
+                let on_chunk_arc = observer.unwrap_or(noop);
+                let on_chunk = |bytes: &[u8]| on_chunk_arc(bytes);
+
+                match dispatcher.remote_call_stream(
+                    &peer_str,
+                    &method_str,
+                    arg_str.as_bytes(),
+                    &on_chunk,
+                ) {
                     Ok(body) => {
                         let response = String::from_utf8(body).unwrap_or_else(|e| {
                             format!("<binary response: {} bytes; {}>", e.as_bytes().len(), e)

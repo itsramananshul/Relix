@@ -416,10 +416,15 @@ impl Analyzer {
                 // is a built-in known to the codegen (emits Inst::RemoteCall). Validate
                 // arity and arg types so a SOL author gets a real error message instead
                 // of the generic "undefined function" panic.
-                if name == "remote_call" {
+                //
+                // RELIX-2 step 4 adds the streaming variant
+                // `remote_call_stream(peer, method, arg) -> str`. Same shape
+                // as `remote_call` — codegen emits a different opcode but the
+                // type / arity contract is identical.
+                if name == "remote_call" || name == "remote_call_stream" {
                     if args.len() != 3 {
                         panic!(
-                            "remote_call expects 3 arguments (peer, method, arg) but received {}",
+                            "{name} expects 3 arguments (peer, method, arg) but received {}",
                             args.len()
                         );
                     }
@@ -427,7 +432,7 @@ impl Analyzer {
                         let arg_type = self.check(arg)?;
                         if type_eq(arg_type.clone(), Type::String).is_err() {
                             panic!(
-                                "remote_call expected str in position {i} but was passed {:?}",
+                                "{name} expected str in position {i} but was passed {:?}",
                                 arg_type
                             );
                         }

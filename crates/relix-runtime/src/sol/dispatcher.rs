@@ -34,6 +34,41 @@ pub trait RemoteCallDispatcher: Send + Sync {
     /// Returns the response body bytes on success, or a structured error
     /// the VM surfaces via `last_error()`.
     fn remote_call(&self, peer_alias: &str, method: &str, arg: &[u8]) -> RemoteCallResult;
+
+    /// RELIX-2 step 4: streaming variant. Dispatches a
+    /// `/relix/rpc/stream/1` substream call against `peer_alias`
+    /// + `method` with `arg` as the request envelope payload.
+    /// The streaming substream returns a sequence of Chunk
+    /// frames; this method collects them all into a single
+    /// `Vec<u8>` (concatenated bytes, in arrival order) AND
+    /// invokes `on_chunk` for each chunk as it arrives.
+    ///
+    /// The return-value contract matches `remote_call` (final
+    /// concatenated body or structured error) so the SOL VM's
+    /// `Inst::RemoteCallStream` opcode produces a single
+    /// heap-string ref — SOL flows stay synchronous from the
+    /// author's perspective. The `on_chunk` callback exists
+    /// for external observers (the web bridge's SSE response)
+    /// that want to ship tokens to the HTTP client as they
+    /// arrive, before the VM has finished collecting.
+    ///
+    /// Default impl falls back to [`Self::remote_call`] and
+    /// reports the whole body as a single chunk. Streaming-
+    /// capable dispatchers (e.g. the controller-runtime's
+    /// `RealDispatcher` once step 5 wires libp2p streaming)
+    /// override this to drive the substream protocol
+    /// directly.
+    fn remote_call_stream(
+        &self,
+        peer_alias: &str,
+        method: &str,
+        arg: &[u8],
+        on_chunk: &dyn Fn(&[u8]),
+    ) -> RemoteCallResult {
+        let body = self.remote_call(peer_alias, method, arg)?;
+        on_chunk(&body);
+        Ok(body)
+    }
 }
 
 /// Structured error returned by a dispatcher. Carries enough for the VM and

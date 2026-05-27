@@ -104,6 +104,19 @@ pub enum Inst {
     // See `crate::sol::dispatcher` and `docs/sol-runtime-analysis.md`.
     RemoteCall,
 
+    // RELIX-2 step 4: streaming variant of RemoteCall. Same
+    // stack contract (pops peer / method / arg heap-string
+    // refs in reverse-push order, pushes a heap-string ref
+    // to the concatenated response body). At the VM layer
+    // the only difference is which dispatcher method is
+    // invoked: `remote_call_stream` instead of `remote_call`.
+    // The VM still produces a single concatenated result so
+    // SOL flows remain synchronous from the author's
+    // perspective. External observers (web bridge SSE) hook
+    // the per-chunk callback via [`VM::with_chunk_observer`]
+    // to ship tokens to HTTP clients before the VM finishes.
+    RemoteCallStream,
+
     // ---- F2 (try / catch / rethrow) ----
     //
     // TryEnter pushes a handler onto the VM's try-handler stack.
@@ -655,6 +668,17 @@ impl Codegen {
                         self.compile(insts, arg);
                     }
                     insts.push(Inst::RemoteCall);
+                } else if name == "remote_call_stream" {
+                    // RELIX-2 step 4: streaming variant. Same
+                    // stack contract as remote_call — three
+                    // string args pushed in source order,
+                    // then a single RemoteCallStream opcode.
+                    // The analyzer has already validated
+                    // arity + arg types.
+                    for arg in args {
+                        self.compile(insts, arg);
+                    }
+                    insts.push(Inst::RemoteCallStream);
                 } else if name == "error_kind" {
                     insts.push(Inst::LoadErrorKind);
                 } else if name == "error_cause" {
@@ -885,6 +909,11 @@ impl Codegen {
             Ast::ExprFuncCall { name, .. } => {
                 // Relix M6: `remote_call` is a known builtin that returns String.
                 if name == "remote_call" {
+                    return Type::String;
+                }
+                // RELIX-2 step 4: streaming variant also
+                // returns String (concatenated chunks).
+                if name == "remote_call_stream" {
                     return Type::String;
                 }
                 // F2 built-ins exposing the current error inside a catch.

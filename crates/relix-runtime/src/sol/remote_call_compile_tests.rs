@@ -71,6 +71,40 @@ fn remote_call_compiles_to_remote_call_opcode() {
 }
 
 #[test]
+fn remote_call_stream_compiles_to_dedicated_opcode() {
+    // RELIX-2 step 4: `remote_call_stream("peer", "method", "arg")`
+    // must compile to a single Inst::RemoteCallStream opcode
+    // with the three string args pushed in source order. The
+    // analyzer types the return as `str`, identical to
+    // remote_call.
+    let src = r#"
+        function start() {
+            let x: str = remote_call_stream("ai", "ai.chat.stream", "hello");
+            print(x);
+        }
+    "#;
+    let bc = compile(src);
+    let dis = format!("{bc:?}");
+    assert!(
+        dis.contains("RemoteCallStream"),
+        "expected RemoteCallStream opcode in bytecode, got: {dis}"
+    );
+    let stream_count = bc
+        .iter()
+        .filter(|i| matches!(i, Inst::RemoteCallStream))
+        .count();
+    assert_eq!(
+        stream_count, 1,
+        "expected exactly one RemoteCallStream opcode"
+    );
+    let unary_count = bc.iter().filter(|i| matches!(i, Inst::RemoteCall)).count();
+    assert_eq!(
+        unary_count, 0,
+        "remote_call_stream must NOT emit the unary RemoteCall opcode"
+    );
+}
+
+#[test]
 fn chained_remote_calls_emit_multiple_opcodes() {
     let src = r#"
         function start() {

@@ -295,3 +295,150 @@ fn try_catch_handles_nested_failure_inside_inner_try() {
         "outer catch should have pushed 99 after inner rethrow"
     );
 }
+
+// ── RELIX-2 step 4: remote_call_stream ─────────────────────
+
+/// Dispatcher that records calls AND splits the configured
+/// response into multiple chunks, invoking the on_chunk
+/// callback for each. Tests inspect the recorded chunks to
+/// verify the observer fires in arrival order and the final
+/// concatenated result lands on the VM stack.
+struct ChunkingDispatcher {
+    log: Mutex<Vec<(String, String, Vec<u8>)>>,
+    chunks: Vec<Vec<u8>>,
+}
+
+impl ChunkingDispatcher {
+    fn with_chunks(chunks: Vec<&str>) -> Arc<Self> {
+        Arc::new(Self {
+            log: Mutex::new(Vec::new()),
+            chunks: chunks.into_iter().map(|s| s.as_bytes().to_vec()).collect(),
+        })
+    }
+    fn calls(&self) -> Vec<(String, String, Vec<u8>)> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+impl RemoteCallDispatcher for ChunkingDispatcher {
+    fn remote_call(&self, peer: &str, method: &str, arg: &[u8]) -> RemoteCallResult {
+        // Concatenated body — fallback path tests this.
+        let mut all = Vec::new();
+        for c in &self.chunks {
+            all.extend_from_slice(c);
+        }
+        self.log
+            .lock()
+            .unwrap()
+            .push((peer.to_string(), method.to_string(), arg.to_vec()));
+        Ok(all)
+    }
+    fn remote_call_stream(
+        &self,
+        peer: &str,
+        method: &str,
+        arg: &[u8],
+        on_chunk: &dyn Fn(&[u8]),
+    ) -> RemoteCallResult {
+        self.log
+            .lock()
+            .unwrap()
+            .push((peer.to_string(), method.to_string(), arg.to_vec()));
+        let mut all = Vec::new();
+        for chunk in &self.chunks {
+            on_chunk(chunk);
+            all.extend_from_slice(chunk);
+        }
+        Ok(all)
+    }
+}
+
+fn program_pushing_stream(peer: &str, method: &str, arg: &str) -> Vec<Inst> {
+    vec![
+        Inst::PushConst(Ast::ExprString(peer.to_string())),
+        Inst::PushConst(Ast::ExprString(method.to_string())),
+        Inst::PushConst(Ast::ExprString(arg.to_string())),
+        Inst::RemoteCallStream,
+    ]
+}
+
+#[test]
+fn remote_call_stream_concatenates_chunks_into_single_heap_string() {
+    let disp = ChunkingDispatcher::with_chunks(vec!["alpha", "beta", "gamma"]);
+    let mut vm = VM::from(&program_pushing_stream("ai", "ai.chat.stream", "hi"))
+        .with_dispatcher(disp.clone());
+    let final_value = vm.run();
+    assert_ne!(final_value, VM_ERROR_SENTINEL);
+    let s = vm.heap_string(final_value).expect("heap string");
+    assert_eq!(s, "alphabetagamma");
+    assert_eq!(disp.calls().len(), 1);
+    assert_eq!(disp.calls()[0].0, "ai");
+    assert_eq!(disp.calls()[0].1, "ai.chat.stream");
+}
+
+#[test]
+fn remote_call_stream_invokes_observer_per_chunk_in_arrival_order() {
+    let disp = ChunkingDispatcher::with_chunks(vec!["chunk-0", "chunk-1", "chunk-2"]);
+    let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_cb = observed.clone();
+    let observer: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
+        observed_for_cb
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(bytes).into_owned());
+    });
+    let mut vm = VM::from(&program_pushing_stream("ai", "ai.chat.stream", "hi"))
+        .with_dispatcher(disp.clone())
+        .with_chunk_observer(observer);
+    let final_value = vm.run();
+    assert_ne!(final_value, VM_ERROR_SENTINEL);
+    let collected = observed.lock().unwrap().clone();
+    assert_eq!(
+        collected,
+        vec![
+            "chunk-0".to_string(),
+            "chunk-1".to_string(),
+            "chunk-2".to_string()
+        ]
+    );
+}
+
+#[test]
+fn remote_call_stream_falls_back_to_remote_call_for_default_dispatcher() {
+    // Default impl of remote_call_stream calls remote_call
+    // and reports the whole body as a single chunk. The
+    // existing `StubDispatcher` only overrides remote_call,
+    // so calling RemoteCallStream against it exercises the
+    // default impl in the trait.
+    let disp = StubDispatcher::ok("the-full-response");
+    let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_cb = observed.clone();
+    let observer: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
+        observed_for_cb
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(bytes).into_owned());
+    });
+    let mut vm = VM::from(&program_pushing_stream("memory", "memory.search", "q"))
+        .with_dispatcher(disp.clone())
+        .with_chunk_observer(observer);
+    let final_value = vm.run();
+    assert_ne!(final_value, VM_ERROR_SENTINEL);
+    let s = vm.heap_string(final_value).expect("heap string");
+    assert_eq!(s, "the-full-response");
+    // Default impl invokes on_chunk once with the full body.
+    let collected = observed.lock().unwrap().clone();
+    assert_eq!(collected, vec!["the-full-response".to_string()]);
+}
+
+#[test]
+fn remote_call_stream_failure_halts_vm_with_sentinel() {
+    let disp = StubDispatcher::err(6, "policy denied");
+    let mut vm = VM::from(&program_pushing_stream("ai", "ai.chat.stream", "hi"))
+        .with_dispatcher(disp.clone());
+    let final_value = vm.run();
+    assert_eq!(final_value, VM_ERROR_SENTINEL);
+    let err = vm.last_error().expect("last_error must be set on failure");
+    assert_eq!(err.kind, 6);
+    assert_eq!(err.cause, "policy denied");
+}
