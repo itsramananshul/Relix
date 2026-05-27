@@ -611,6 +611,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/training/export", post(training::export))
         .route("/v1/training/score/:id", post(training::score_interaction))
         .route("/v1/training/stats", get(training::stats))
+        // RELIX-7.15 PII: scan + preview endpoints.
+        .route("/v1/training/pii/scan", post(training::pii_scan))
+        .route("/v1/training/pii/preview", post(training::pii_preview))
         .route("/v1/plugins", get(plugins::list))
         .route("/v1/plugins/:plugin_id", get(plugins::status))
         .route("/v1/plugins/:plugin_id/reload", post(plugins::reload))

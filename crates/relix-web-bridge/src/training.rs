@@ -1,6 +1,6 @@
 //! RELIX-7.15 — HTTP proxies for the training data pipeline.
 //!
-//! Six endpoints, each a thin forwarder onto a `training.*`
+//! Eight endpoints, each a thin forwarder onto a `training.*`
 //! coordinator capability:
 //!
 //! - `GET    /v1/training/interactions`        — `training.list_interactions`
@@ -9,6 +9,8 @@
 //! - `POST   /v1/training/score/:id`           — `training.score_interaction`
 //! - `GET    /v1/training/stats`               — `training.stats`
 //! - `DELETE /v1/training/interactions/:id`    — `training.delete_interaction`
+//! - `POST   /v1/training/pii/scan`            — `training.pii_scan`
+//! - `POST   /v1/training/pii/preview`         — `training.anonymize_preview`
 //!
 //! Error mapping mirrors `/v1/metrics/*`:
 //! - `INVALID_ARGS` → 400.
@@ -255,6 +257,69 @@ pub async fn delete_interaction(
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "interaction_id": id });
     match call_peer_json(&state, &peer, "training.delete_interaction", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+// ── RELIX-7.15 PII endpoints ─────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PiiScanRequest {
+    pub text: String,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+/// `POST /v1/training/pii/scan`
+pub async fn pii_scan(
+    State(state): State<AppState>,
+    Json(req): Json<PiiScanRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.text.is_empty() {
+        return bad_request("text is required");
+    }
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = serde_json::json!({ "text": req.text });
+    match call_peer_json(&state, &peer, "training.pii_scan", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PiiPreviewRequest {
+    pub text: String,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+/// `POST /v1/training/pii/preview`
+pub async fn pii_preview(
+    State(state): State<AppState>,
+    Json(req): Json<PiiPreviewRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.text.is_empty() {
+        return bad_request("text is required");
+    }
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let mut body = serde_json::Map::new();
+    body.insert("text".into(), Value::from(req.text));
+    if let Some(s) = req.strategy {
+        body.insert("strategy".into(), Value::from(s));
+    }
+    match call_peer_json(
+        &state,
+        &peer,
+        "training.anonymize_preview",
+        &Value::Object(body),
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }

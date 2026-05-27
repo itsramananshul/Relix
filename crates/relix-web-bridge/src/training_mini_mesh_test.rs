@@ -154,6 +154,16 @@ async fn training_mini_mesh_all_endpoints() {
         name = "ops_delete"
         method = "training.delete_interaction"
         allow_groups = ["operators"]
+
+        [[rules]]
+        name = "ops_pii_scan"
+        method = "training.pii_scan"
+        allow_groups = ["operators"]
+
+        [[rules]]
+        name = "ops_pii_preview"
+        method = "training.anonymize_preview"
+        allow_groups = ["operators"]
         "#,
     );
 
@@ -228,6 +238,19 @@ async fn training_mini_mesh_all_endpoints() {
         "interaction_id": "abcd1234",
         "deleted": true
     });
+    // RELIX-7.15 PII canned responses.
+    let pii_scan_response = serde_json::json!({
+        "spans": [
+            { "pii_type": "EMAIL", "start": 14, "end": 31, "matched_text": "alice@example.com" }
+        ],
+        "count": 1
+    });
+    let pii_preview_response = serde_json::json!({
+        "anonymized": "Contact me at [EMAIL]",
+        "spans": [
+            { "pii_type": "EMAIL", "start": 14, "end": 31, "matched_text": "alice@example.com" }
+        ]
+    });
 
     let stats_arc = Arc::new(stats_response.clone());
     let list_arc = Arc::new(list_response.clone());
@@ -235,6 +258,8 @@ async fn training_mini_mesh_all_endpoints() {
     let score_arc = Arc::new(score_response.clone());
     let export_arc = Arc::new(export_response.clone());
     let delete_arc = Arc::new(delete_response.clone());
+    let pii_scan_arc = Arc::new(pii_scan_response.clone());
+    let pii_preview_arc = Arc::new(pii_preview_response.clone());
 
     dispatch.register(
         "training.list_interactions",
@@ -329,6 +354,26 @@ async fn training_mini_mesh_all_endpoints() {
                         })
                     }
                 }
+            }
+        })),
+    );
+    dispatch.register(
+        "training.pii_scan",
+        Arc::new(FnHandler({
+            let r = pii_scan_arc.clone();
+            move |_ctx: InvocationCtx| {
+                let r = r.clone();
+                async move { HandlerOutcome::Ok(serde_json::to_vec(&*r).unwrap_or_default()) }
+            }
+        })),
+    );
+    dispatch.register(
+        "training.anonymize_preview",
+        Arc::new(FnHandler({
+            let r = pii_preview_arc.clone();
+            move |_ctx: InvocationCtx| {
+                let r = r.clone();
+                async move { HandlerOutcome::Ok(serde_json::to_vec(&*r).unwrap_or_default()) }
             }
         })),
     );
@@ -432,6 +477,11 @@ addr = "{}"
             post(crate::training::score_interaction),
         )
         .route("/v1/training/stats", get(crate::training::stats))
+        .route("/v1/training/pii/scan", post(crate::training::pii_scan))
+        .route(
+            "/v1/training/pii/preview",
+            post(crate::training::pii_preview),
+        )
         // Cover the GET DELETE on the same path with explicit
         // delete-only fallback (axum needs the trailing
         // `.delete(...)` in the same `.route` for verb routing;
@@ -572,4 +622,55 @@ addr = "{}"
     assert_eq!(resp.status().as_u16(), 404);
     let body: Value = resp.json().await.unwrap();
     assert!(body.get("error").and_then(Value::as_str).is_some());
+
+    // ─── 13. POST /v1/training/pii/scan → 200 + spans ───
+    let url = format!("http://{}/v1/training/pii/scan", bound);
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({ "text": "Contact me at alice@example.com" }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, pii_scan_response);
+
+    // ─── 14. POST /v1/training/pii/scan missing text → 400 ───
+    let url = format!("http://{}/v1/training/pii/scan", bound);
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({ "text": "" }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+
+    // ─── 15. POST /v1/training/pii/preview → 200 + anonymized ───
+    let url = format!("http://{}/v1/training/pii/preview", bound);
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({
+                "text": "Contact me at alice@example.com",
+                "strategy": "redact"
+            }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, pii_preview_response);
+    // The placeholder must end up in the anonymized field.
+    assert_eq!(
+        body.get("anonymized").and_then(Value::as_str),
+        Some("Contact me at [EMAIL]")
+    );
 }
