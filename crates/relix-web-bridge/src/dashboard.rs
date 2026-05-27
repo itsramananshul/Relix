@@ -37,11 +37,63 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// The static HTML page. Inline CSS + JS deliberately — keeps
-/// the bridge a single binary with no resource directory to
-/// ship. At request time we split this into HTML + JS to
-/// satisfy `script-src 'self'`.
-const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+/// The static HTML page baked into the binary. Inline CSS +
+/// JS deliberately — keeps the bridge a single binary with no
+/// resource directory to ship. At request time we split this
+/// into HTML + JS to satisfy `script-src 'self'`.
+const DASHBOARD_HTML_EMBEDDED: &str = include_str!("dashboard.html");
+
+/// Resolve the dashboard HTML source for this process.
+///
+/// Order of precedence:
+/// 1. `RELIX_DASHBOARD_PATH=/some/file.html` reads the file
+///    at boot (operators can hot-swap the UI without rebuilding).
+///    A missing or unreadable file logs a warning and falls
+///    back to the embedded copy.
+/// 2. Otherwise the [`include_str!`]-baked copy.
+///
+/// Resolution happens once per process via [`OnceLock`] so
+/// the env-var change requires a bridge restart — matches the
+/// rest of the bridge's configuration posture.
+fn dashboard_html_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| {
+            let env_value = std::env::var("RELIX_DASHBOARD_PATH").ok();
+            resolve_dashboard_source(env_value.as_deref())
+        })
+        .as_str()
+}
+
+/// Pure resolver — takes the env-var value as an `Option<&str>`
+/// so tests can exercise both the file-found and file-missing
+/// branches without mutating process env (`std::env::set_var`
+/// is unsafe in Rust 2024 and the test harness forbids unsafe).
+fn resolve_dashboard_source(env_value: Option<&str>) -> String {
+    match env_value {
+        Some(path) if !path.trim().is_empty() => match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                tracing::info!(
+                    dashboard.source = "file",
+                    dashboard.path = %path,
+                    dashboard.bytes = contents.len(),
+                    "dashboard: loaded HTML from RELIX_DASHBOARD_PATH"
+                );
+                contents
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dashboard.source = "embedded",
+                    dashboard.path = %path,
+                    error = %e,
+                    "dashboard: RELIX_DASHBOARD_PATH unreadable — falling back to embedded copy"
+                );
+                DASHBOARD_HTML_EMBEDDED.to_string()
+            }
+        },
+        _ => DASHBOARD_HTML_EMBEDDED.to_string(),
+    }
+}
 
 /// Result of the one-time split. `.0` is the modified HTML
 /// (script tag rewritten), `.1` is the bare JS body without
@@ -49,6 +101,7 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 fn split_assets() -> &'static (String, String) {
     static SPLIT: OnceLock<(String, String)> = OnceLock::new();
     SPLIT.get_or_init(|| {
+        let source = dashboard_html_source();
         // The dashboard's single inline script block sits
         // between `<script>\n` and `\n</script>` on a line of
         // its own. If a future edit alters that exact shape
@@ -56,19 +109,19 @@ fn split_assets() -> &'static (String, String) {
         // extraction, no /assets/dashboard.js).
         let start_tag = "<script>\n";
         let end_tag = "</script>";
-        let Some(s) = DASHBOARD_HTML.find(start_tag) else {
-            return (DASHBOARD_HTML.to_string(), String::new());
+        let Some(s) = source.find(start_tag) else {
+            return (source.to_string(), String::new());
         };
         let after = s + start_tag.len();
-        let Some(e_rel) = DASHBOARD_HTML[after..].find(end_tag) else {
-            return (DASHBOARD_HTML.to_string(), String::new());
+        let Some(e_rel) = source[after..].find(end_tag) else {
+            return (source.to_string(), String::new());
         };
         let e = after + e_rel;
-        let js = DASHBOARD_HTML[after..e].to_string();
-        let mut html = String::with_capacity(DASHBOARD_HTML.len());
-        html.push_str(&DASHBOARD_HTML[..s]);
+        let js = source[after..e].to_string();
+        let mut html = String::with_capacity(source.len());
+        html.push_str(&source[..s]);
         html.push_str("<script src=\"/assets/dashboard.js\" defer></script>");
-        html.push_str(&DASHBOARD_HTML[e + end_tag.len()..]);
+        html.push_str(&source[e + end_tag.len()..]);
         (html, js)
     })
 }
@@ -272,5 +325,126 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("data-page=\"providers\""));
+    }
+
+    // ── RELIX-7.11 GAP 3 — agent observability landmarks + env override ──
+
+    #[tokio::test]
+    async fn page_includes_agent_observability_panels() {
+        // The four GAP-3 panels (Agent summary, Active alerts,
+        // Cost breakdown, Per-agent trend) must each register a
+        // host element + manual refresh button + last-refresh
+        // slot in the dashboard HTML. A future edit that drops
+        // one of these IDs breaks the per-panel refresh /
+        // teardown wiring. JS-side landmarks
+        // (AGENT_OBS_INTERVALS_MS, _SPARK_GLYPHS,
+        // relixBridgeBase, endpoint URLs) live in the
+        // /assets/dashboard.js body and are asserted by
+        // `script_asset_carries_agent_observability_logic`.
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for id in ["agents-host", "alerts-host", "cost-host", "trend-host"] {
+            assert!(
+                body.contains(&format!(r#"id="{id}""#)),
+                "missing GAP-3 panel host id={id:?}"
+            );
+        }
+        for prefix in ["agents", "alerts", "cost", "trend"] {
+            assert!(
+                body.contains(&format!(r#"id="{prefix}-refresh-btn""#)),
+                "missing per-panel refresh button for {prefix}"
+            );
+            assert!(
+                body.contains(&format!(r#"id="{prefix}-last-refresh""#)),
+                "missing per-panel last-refresh slot for {prefix}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn script_asset_carries_agent_observability_logic() {
+        // The JS that drives the four GAP-3 panels lives in
+        // /assets/dashboard.js (extracted out for CSP). Every
+        // load-bearing JS landmark is asserted here so a future
+        // refactor of the script body fails fast.
+        let resp = script_asset().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("AGENT_OBS_INTERVALS_MS"),
+            "missing per-panel polling cadence map"
+        );
+        assert!(
+            body.contains("relixBridgeBase"),
+            "missing localStorage.relixBridgeBase override"
+        );
+        assert!(
+            body.contains("_SPARK_GLYPHS"),
+            "missing sparkline glyph table"
+        );
+        for ep in [
+            "/v1/metrics/agents",
+            "/v1/metrics/alerts",
+            "/v1/metrics/cost",
+            "/timeseries",
+        ] {
+            assert!(
+                body.contains(ep),
+                "script asset does not reference {ep:?} — panel will not load"
+            );
+        }
+        // Per-panel loaders + teardown helper.
+        for fname in [
+            "loadAgentsPanel",
+            "loadAlertsPanel",
+            "loadCostPanel",
+            "loadTrendPanel",
+            "teardownAgentObservability",
+        ] {
+            assert!(
+                body.contains(fname),
+                "missing JS function {fname} in script asset"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_dashboard_source_uses_embedded_when_env_unset() {
+        let out = resolve_dashboard_source(None);
+        assert_eq!(out, DASHBOARD_HTML_EMBEDDED);
+    }
+
+    #[test]
+    fn resolve_dashboard_source_uses_embedded_when_env_empty() {
+        let out = resolve_dashboard_source(Some(""));
+        assert_eq!(out, DASHBOARD_HTML_EMBEDDED);
+        let out_ws = resolve_dashboard_source(Some("   "));
+        assert_eq!(out_ws, DASHBOARD_HTML_EMBEDDED);
+    }
+
+    #[test]
+    fn resolve_dashboard_source_serves_alternate_file_when_env_set() {
+        // Write a recognisable HTML file to a tempfile and
+        // verify the resolver reads it instead of returning the
+        // embedded copy. Marker chosen so it cannot collide with
+        // any real dashboard string.
+        let tmp =
+            std::env::temp_dir().join(format!("relix_dashboard_test_{}.html", std::process::id()));
+        let marker = "<!-- RELIX_TEST_MARKER_ZZZ -->";
+        std::fs::write(&tmp, marker).expect("write tempfile");
+        let out = resolve_dashboard_source(Some(tmp.to_str().unwrap()));
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(out, marker, "resolver did not read the env-pointed file");
+    }
+
+    #[test]
+    fn resolve_dashboard_source_falls_back_when_file_missing() {
+        // Pointing at a path that does not exist must not panic
+        // — it logs a warning and returns the embedded copy.
+        let bogus = std::env::temp_dir().join("relix_dashboard_does_not_exist_zzz.html");
+        let _ = std::fs::remove_file(&bogus); // ensure absent
+        let out = resolve_dashboard_source(Some(bogus.to_str().unwrap()));
+        assert_eq!(out, DASHBOARD_HTML_EMBEDDED);
     }
 }

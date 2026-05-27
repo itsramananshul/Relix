@@ -2598,6 +2598,98 @@
         capability first. A spike in max relative to mean is a
         signal of a tail-latency outlier worth investigating.
       </p>
+
+      <!-- ── RELIX-7.11 GAP 3 — agent observability ────────────── -->
+      <h2 style="margin-top: 28px;">Agent observability</h2>
+      <p class="page-subtitle">
+        Per-agent metrics + active alerts + cost breakdown,
+        proxied through the bridge from the coordinator's
+        <code>metrics.*</code> capabilities. Each panel polls on
+        its own cadence (Agents 30s, Alerts 15s, Cost 60s,
+        Trend 30s) and can be refreshed manually. Bridge base
+        URL override lives in <code>localStorage.relixBridgeBase</code>
+        so screen-shared dashboards can target a non-default
+        bridge without rebuilding.
+      </p>
+      <div class="row" style="margin-bottom: 8px; gap: 6px; flex-wrap: wrap;">
+        <label for="agent-metrics-peer" class="meta">coordinator peer:</label>
+        <input
+          type="text"
+          id="agent-metrics-peer"
+          value="coordinator"
+          placeholder="coordinator"
+          autocomplete="off"
+          spellcheck="false"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 160px;"
+        />
+        <label for="agent-metrics-hours" class="meta">window (h):</label>
+        <input
+          type="number"
+          id="agent-metrics-hours"
+          value="24"
+          min="1"
+          max="720"
+          style="background: var(--bg-1); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px; width: 70px;"
+        />
+        <button class="chip" id="agent-metrics-refresh-all-btn">refresh all</button>
+        <span class="meta" id="agent-metrics-status"></span>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>Agent summary</h3>
+          <span class="meta">
+            <span id="agents-last-refresh">never</span>
+            &nbsp;·&nbsp;<button class="chip" id="agents-refresh-btn">refresh</button>
+          </span>
+        </div>
+        <div class="card-body dense" id="agents-host" data-panel="agents">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>Active alerts</h3>
+          <span class="meta">
+            <span id="alerts-last-refresh">never</span>
+            &nbsp;·&nbsp;<button class="chip" id="alerts-refresh-btn">refresh</button>
+          </span>
+        </div>
+        <div class="card-body" id="alerts-host" data-panel="alerts">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>Cost breakdown</h3>
+          <span class="meta">
+            <span id="cost-last-refresh">never</span>
+            &nbsp;·&nbsp;<button class="chip" id="cost-refresh-btn">refresh</button>
+          </span>
+        </div>
+        <div class="card-body dense" id="cost-host" data-panel="cost">
+          <div class="loading">loading…</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h3>Per-agent trend</h3>
+          <span class="meta">
+            <span id="trend-last-refresh">never</span>
+            &nbsp;·&nbsp;<button class="chip" id="trend-refresh-btn">refresh</button>
+          </span>
+        </div>
+        <div class="card-body dense" id="trend-host" data-panel="trend">
+          <div class="empty" style="padding: 10px 14px;">
+            no agents yet — click an agent row in the Agent summary
+            table above (or wait for one to be reported) to see
+            its 5-minute-bucket invocation sparkline.
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- ── #/memory (W2-MEMORY-3) ─────────────────────────────── -->
@@ -3615,6 +3707,11 @@ function showRoute(name) {
   if (currentRoute === 'metrics' && name !== 'metrics' && metricsAutoRefreshTimer) {
     clearInterval(metricsAutoRefreshTimer);
     metricsAutoRefreshTimer = null;
+  }
+  // RELIX-7.11 GAP 3: tear down the per-panel agent-observability
+  // pollers so we don't keep hitting /v1/metrics/* while invisible.
+  if (currentRoute === 'metrics' && name !== 'metrics') {
+    teardownAgentObservability();
   }
   currentRoute = name;
   // Toggle sections
@@ -9177,6 +9274,8 @@ function initMetrics() {
       applyMetricsAutoRefresh(parseInt($auto.value, 10) || 0);
     });
   }
+  // RELIX-7.11 GAP 3: wire the agent-observability panels.
+  initAgentObservability();
 }
 
 function applyMetricsAutoRefresh(seconds) {
@@ -9208,6 +9307,9 @@ function enterMetrics() {
   if ($auto) {
     applyMetricsAutoRefresh(parseInt($auto.value, 10) || 0);
   }
+  // RELIX-7.11 GAP 3: start the agent-observability panels
+  // and their per-panel polling cadences.
+  enterAgentObservability();
 }
 
 function currentMetricsPeer() {
@@ -9303,6 +9405,455 @@ async function loadMetrics() {
       + escapeHtml(String(e)) + '</div>';
     if ($status) $status.textContent = 'failed';
     if ($summary) $summary.textContent = '';
+  }
+}
+
+/* RELIX-7.11 GAP 3 — agent-observability panels.
+   Four cards in the Metrics page (Agent summary 30s,
+   Active alerts 15s, Cost breakdown 60s, Per-agent trend
+   30s). Each panel polls on its own setInterval that gets
+   torn down by teardownAgentObservability() when the
+   operator navigates away from /metrics.
+
+   Bridge base URL is read once per fetch from
+   localStorage.relixBridgeBase. An empty / missing value
+   means "same origin" (the default) — operators who run
+   the bridge under one host and view the dashboard from
+   another can drop the override in via DevTools without
+   reloading. */
+const AGENT_OBS_INTERVALS_MS = {
+  agents: 30_000,
+  alerts: 15_000,
+  cost:   60_000,
+  trend:  30_000,
+};
+const _agentObsTimers = { agents: null, alerts: null, cost: null, trend: null };
+let _agentObsWired = false;
+let _agentObsSelectedAgent = null;
+
+function _bridgeBase() {
+  try {
+    const v = (localStorage.getItem('relixBridgeBase') || '').trim();
+    if (!v) return '';
+    // Strip trailing slash so callers can safely prepend.
+    return v.replace(/\/+$/, '');
+  } catch (_) {
+    return '';
+  }
+}
+
+function _agentObsPeer() {
+  const $p = document.getElementById('agent-metrics-peer');
+  const v = $p ? ($p.value || '').trim() : '';
+  return v || 'coordinator';
+}
+
+function _agentObsHours() {
+  const $h = document.getElementById('agent-metrics-hours');
+  const n = $h ? parseInt($h.value || '24', 10) : 24;
+  if (!Number.isFinite(n) || n < 1) return 24;
+  return Math.min(720, Math.max(1, n));
+}
+
+function _agentObsQS(extra) {
+  const parts = [];
+  parts.push('peer=' + encodeURIComponent(_agentObsPeer()));
+  parts.push('hours=' + encodeURIComponent(String(_agentObsHours())));
+  if (extra) {
+    for (const k of Object.keys(extra)) {
+      parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k])));
+    }
+  }
+  return '?' + parts.join('&');
+}
+
+async function _agentObsFetchJson(path) {
+  const url = _bridgeBase() + path;
+  const r = await fetch(url, { headers: { 'accept': 'application/json' } });
+  if (!r.ok) {
+    let detail = 'HTTP ' + r.status;
+    try {
+      const body = await r.json();
+      if (body && body.error) detail += ' — ' + body.error;
+    } catch (_) {}
+    const err = new Error(detail);
+    err.status = r.status;
+    throw err;
+  }
+  return r.json();
+}
+
+function _stampPanelRefresh(panel) {
+  const $el = document.getElementById(panel + '-last-refresh');
+  if (!$el) return;
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  $el.textContent = hh + ':' + mm + ':' + ss;
+}
+
+function _setPanelStatus(msg) {
+  const $s = document.getElementById('agent-metrics-status');
+  if ($s) $s.textContent = msg || '';
+}
+
+function initAgentObservability() {
+  if (_agentObsWired) return;
+  const wire = (btnId, handler) => {
+    const $b = document.getElementById(btnId);
+    if ($b) $b.addEventListener('click', handler);
+  };
+  wire('agents-refresh-btn', () => loadAgentsPanel());
+  wire('alerts-refresh-btn', () => loadAlertsPanel());
+  wire('cost-refresh-btn',   () => loadCostPanel());
+  wire('trend-refresh-btn',  () => loadTrendPanel());
+  wire('agent-metrics-refresh-all-btn', () => {
+    loadAgentsPanel();
+    loadAlertsPanel();
+    loadCostPanel();
+    loadTrendPanel();
+  });
+  const $peer = document.getElementById('agent-metrics-peer');
+  const $hrs  = document.getElementById('agent-metrics-hours');
+  for (const $in of [$peer, $hrs].filter(Boolean)) {
+    $in.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        loadAgentsPanel();
+        loadAlertsPanel();
+        loadCostPanel();
+        loadTrendPanel();
+      }
+    });
+  }
+  _agentObsWired = true;
+}
+
+function enterAgentObservability() {
+  // Kick an immediate load for each panel, then install
+  // per-panel intervals at the spec'd cadences.
+  loadAgentsPanel();
+  loadAlertsPanel();
+  loadCostPanel();
+  loadTrendPanel();
+  // Tear any leftover timers first (defensive — should be
+  // null after teardownAgentObservability, but a hot-reload
+  // of the JS could leave one behind).
+  teardownAgentObservability();
+  _agentObsTimers.agents = setInterval(() => {
+    if (currentRoute !== 'metrics') { teardownAgentObservability(); return; }
+    loadAgentsPanel();
+  }, AGENT_OBS_INTERVALS_MS.agents);
+  _agentObsTimers.alerts = setInterval(() => {
+    if (currentRoute !== 'metrics') { teardownAgentObservability(); return; }
+    loadAlertsPanel();
+  }, AGENT_OBS_INTERVALS_MS.alerts);
+  _agentObsTimers.cost = setInterval(() => {
+    if (currentRoute !== 'metrics') { teardownAgentObservability(); return; }
+    loadCostPanel();
+  }, AGENT_OBS_INTERVALS_MS.cost);
+  _agentObsTimers.trend = setInterval(() => {
+    if (currentRoute !== 'metrics') { teardownAgentObservability(); return; }
+    loadTrendPanel();
+  }, AGENT_OBS_INTERVALS_MS.trend);
+}
+
+function teardownAgentObservability() {
+  for (const k of Object.keys(_agentObsTimers)) {
+    if (_agentObsTimers[k]) {
+      clearInterval(_agentObsTimers[k]);
+      _agentObsTimers[k] = null;
+    }
+  }
+}
+
+// ── Panel 1: Agent summary table ─────────────────────────────
+async function loadAgentsPanel() {
+  const $host = document.getElementById('agents-host');
+  if (!$host) return;
+  if ($host.childElementCount === 0 || $host.querySelector('.loading')) {
+    $host.innerHTML = '<div class="loading">loading…</div>';
+  }
+  try {
+    const list = await _agentObsFetchJson('/v1/metrics/agents' + _agentObsQS());
+    const arr = Array.isArray(list) ? list.slice() : (list.agents || []);
+    // Best-effort sort: invocations desc, then mean_latency_ms desc.
+    arr.sort((a, b) => {
+      const ai = (a.invocations || 0), bi = (b.invocations || 0);
+      if (ai !== bi) return bi - ai;
+      return (b.mean_latency_ms || 0) - (a.mean_latency_ms || 0);
+    });
+    if (arr.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no agents in the last ' + _agentObsHours() + 'h window'
+        + '</div>';
+      _stampPanelRefresh('agents');
+      return;
+    }
+    // Capture the row click target so the Trend panel can
+    // hook into "which agent did the operator click."
+    const rows = arr.map(a => {
+      const name = a.agent || a.name || '(unknown)';
+      const inv = a.invocations || 0;
+      const errs = a.errors || 0;
+      const meanMs = a.mean_latency_ms || 0;
+      const p95Ms = a.p95_latency_ms || 0;
+      const tokens = a.total_tokens || 0;
+      const costUsd = a.cost_usd || 0;
+      const errRatePct = inv > 0 ? (errs * 100 / inv) : 0;
+      const errCls = errRatePct === 0 ? 'ok'
+        : errRatePct < 5 ? 'warn'
+        : 'danger';
+      const selected = (_agentObsSelectedAgent === name) ? ' style="background: var(--bg-1);"' : '';
+      return '<tr data-agent="' + escapeHtml(name) + '"'
+        + ' class="agent-row" role="button" tabindex="0"' + selected + '>'
+        + '<td><code>' + escapeHtml(name) + '</code></td>'
+        + '<td>' + inv + '</td>'
+        + '<td><span class="badge ' + errCls + '">'
+        + errs + ' (' + errRatePct.toFixed(1) + '%)</span></td>'
+        + '<td>' + meanMs.toFixed(0) + ' ms</td>'
+        + '<td>' + p95Ms.toFixed(0) + ' ms</td>'
+        + '<td>' + tokens.toLocaleString() + '</td>'
+        + '<td>$' + costUsd.toFixed(4) + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>agent</th>'
+      + '<th>invocations</th>'
+      + '<th>errors</th>'
+      + '<th>mean</th>'
+      + '<th>p95</th>'
+      + '<th>tokens</th>'
+      + '<th>cost</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    // Wire row click → set selected agent + reload trend.
+    for (const $tr of $host.querySelectorAll('tr.agent-row')) {
+      const handler = () => {
+        _agentObsSelectedAgent = $tr.dataset.agent;
+        loadTrendPanel();
+        // Repaint to highlight the active row.
+        loadAgentsPanel();
+      };
+      $tr.addEventListener('click', handler);
+      $tr.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          handler();
+        }
+      });
+    }
+    // Auto-pin the first row if nothing is selected yet so
+    // the trend panel has something to show on first load.
+    if (!_agentObsSelectedAgent && arr.length > 0) {
+      _agentObsSelectedAgent = arr[0].agent || arr[0].name;
+      loadTrendPanel();
+    }
+    _stampPanelRefresh('agents');
+    _setPanelStatus('');
+  } catch (e) {
+    $host.innerHTML = '<div class="error" style="padding: 10px 14px;">load failed: '
+      + escapeHtml(String(e && e.message ? e.message : e)) + '</div>';
+    _setPanelStatus('agents: ' + (e && e.message ? e.message : 'failed'));
+  }
+}
+
+// ── Panel 2: Active alerts with severity badges ──────────────
+async function loadAlertsPanel() {
+  const $host = document.getElementById('alerts-host');
+  if (!$host) return;
+  if ($host.childElementCount === 0 || $host.querySelector('.loading')) {
+    $host.innerHTML = '<div class="loading">loading…</div>';
+  }
+  try {
+    const body = await _agentObsFetchJson('/v1/metrics/alerts' + _agentObsQS());
+    const arr = Array.isArray(body) ? body : (body.alerts || []);
+    if (arr.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no active alerts'
+        + '</div>';
+      _stampPanelRefresh('alerts');
+      return;
+    }
+    // Sort by severity desc, then triggered_at desc.
+    const sevOrder = { critical: 3, error: 3, high: 2, warning: 1, warn: 1, info: 0 };
+    arr.sort((a, b) => {
+      const sa = sevOrder[(a.severity || '').toLowerCase()] || 0;
+      const sb = sevOrder[(b.severity || '').toLowerCase()] || 0;
+      if (sa !== sb) return sb - sa;
+      return String(b.triggered_at || '').localeCompare(String(a.triggered_at || ''));
+    });
+    const rows = arr.map(al => {
+      const sev = (al.severity || 'info').toLowerCase();
+      const sevCls = (sev === 'critical' || sev === 'error') ? 'danger'
+        : (sev === 'high' || sev === 'warning' || sev === 'warn') ? 'warn'
+        : 'ok';
+      const rule = al.rule || al.name || '(unnamed rule)';
+      const agent = al.agent || '*';
+      const method = al.method || '*';
+      const reason = al.reason || al.message || '';
+      const tt = al.triggered_at || al.fired_at || '';
+      return '<tr>'
+        + '<td><span class="badge ' + sevCls + '">' + escapeHtml(sev) + '</span></td>'
+        + '<td><code>' + escapeHtml(rule) + '</code></td>'
+        + '<td><code>' + escapeHtml(agent) + '</code></td>'
+        + '<td><code>' + escapeHtml(method) + '</code></td>'
+        + '<td>' + escapeHtml(reason) + '</td>'
+        + '<td class="meta">' + escapeHtml(tt) + '</td>'
+        + '</tr>';
+    }).join('');
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>severity</th><th>rule</th><th>agent</th><th>method</th>'
+      + '<th>reason</th><th>triggered</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    _stampPanelRefresh('alerts');
+  } catch (e) {
+    $host.innerHTML = '<div class="error" style="padding: 10px 14px;">load failed: '
+      + escapeHtml(String(e && e.message ? e.message : e)) + '</div>';
+  }
+}
+
+// ── Panel 3: Cost breakdown — ASCII bar chart ────────────────
+async function loadCostPanel() {
+  const $host = document.getElementById('cost-host');
+  if (!$host) return;
+  if ($host.childElementCount === 0 || $host.querySelector('.loading')) {
+    $host.innerHTML = '<div class="loading">loading…</div>';
+  }
+  try {
+    const body = await _agentObsFetchJson('/v1/metrics/cost' + _agentObsQS());
+    const arr = Array.isArray(body) ? body : (body.rows || body.agents || []);
+    if (arr.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no cost data in the last ' + _agentObsHours() + 'h window'
+        + '</div>';
+      _stampPanelRefresh('cost');
+      return;
+    }
+    // Sort by cost desc.
+    const sorted = arr.slice().sort((a, b) => (b.cost_usd || 0) - (a.cost_usd || 0));
+    const top = sorted.slice(0, 15);
+    const maxCost = top.reduce((m, r) => Math.max(m, r.cost_usd || 0), 0) || 1;
+    const totalCost = sorted.reduce((s, r) => s + (r.cost_usd || 0), 0);
+    const totalTokens = sorted.reduce((s, r) => s + (r.total_tokens || 0), 0);
+    const barWidth = 30; // characters
+    const bars = top.map(r => {
+      const cost = r.cost_usd || 0;
+      const tokens = r.total_tokens || 0;
+      const pct = cost / maxCost;
+      const filled = Math.round(pct * barWidth);
+      const bar = '█'.repeat(filled) + '░'.repeat(barWidth - filled);
+      const label = (r.agent || r.name || '(unknown)').padEnd(20).slice(0, 20);
+      return '<tr>'
+        + '<td><code>' + escapeHtml(label) + '</code></td>'
+        + '<td><code style="color: var(--accent);">' + bar + '</code></td>'
+        + '<td>$' + cost.toFixed(4) + '</td>'
+        + '<td>' + tokens.toLocaleString() + '</td>'
+        + '</tr>';
+    }).join('');
+    const more = sorted.length > top.length
+      ? '<p class="meta" style="padding: 6px 14px 0;">'
+        + (sorted.length - top.length) + ' more agent(s) not shown</p>'
+      : '';
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>agent</th><th>cost (bar)</th><th>USD</th><th>tokens</th>'
+      + '</tr></thead><tbody>' + bars + '</tbody></table>'
+      + '<p class="meta" style="padding: 6px 14px 0;">'
+      + 'total: $' + totalCost.toFixed(4)
+      + ' across ' + totalTokens.toLocaleString() + ' tokens'
+      + '</p>' + more;
+    _stampPanelRefresh('cost');
+  } catch (e) {
+    $host.innerHTML = '<div class="error" style="padding: 10px 14px;">load failed: '
+      + escapeHtml(String(e && e.message ? e.message : e)) + '</div>';
+  }
+}
+
+// ── Panel 4: Per-agent trend sparklines (Unicode blocks) ────
+const _SPARK_GLYPHS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+function _renderUnicodeSparkline(values) {
+  if (!values || values.length === 0) return '';
+  const max = values.reduce((m, v) => Math.max(m, v), 0);
+  if (max === 0) {
+    return _SPARK_GLYPHS[0].repeat(values.length);
+  }
+  return values.map(v => {
+    const idx = Math.min(_SPARK_GLYPHS.length - 1,
+      Math.max(0, Math.round((v / max) * (_SPARK_GLYPHS.length - 1))));
+    return _SPARK_GLYPHS[idx];
+  }).join('');
+}
+
+async function loadTrendPanel() {
+  const $host = document.getElementById('trend-host');
+  if (!$host) return;
+  const agent = _agentObsSelectedAgent;
+  if (!agent) {
+    $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+      + 'click a row in the Agent summary table to see its trend'
+      + '</div>';
+    return;
+  }
+  if ($host.childElementCount === 0 || $host.querySelector('.loading')) {
+    $host.innerHTML = '<div class="loading">loading…</div>';
+  }
+  try {
+    const path = '/v1/metrics/agents/' + encodeURIComponent(agent)
+      + '/timeseries' + _agentObsQS({ bucket_minutes: 5 });
+    let buckets = [];
+    try {
+      const body = await _agentObsFetchJson(path);
+      buckets = Array.isArray(body) ? body : (body.buckets || []);
+    } catch (e) {
+      // 404 just means "no data yet" — render an empty state
+      // and stay green.
+      if (e && e.status === 404) {
+        $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+          + 'no timeseries data for <code>' + escapeHtml(agent) + '</code>'
+          + ' in the last ' + _agentObsHours() + 'h'
+          + '</div>';
+        _stampPanelRefresh('trend');
+        return;
+      }
+      throw e;
+    }
+    if (buckets.length === 0) {
+      $host.innerHTML = '<div class="empty" style="padding: 10px 14px;">'
+        + 'no buckets returned for <code>' + escapeHtml(agent) + '</code>'
+        + '</div>';
+      _stampPanelRefresh('trend');
+      return;
+    }
+    const inv = buckets.map(b => b.invocations || 0);
+    const lat = buckets.map(b => b.mean_latency_ms || 0);
+    const err = buckets.map(b => b.errors || 0);
+    const sparkInv = _renderUnicodeSparkline(inv);
+    const sparkLat = _renderUnicodeSparkline(lat);
+    const sparkErr = _renderUnicodeSparkline(err);
+    const sumInv = inv.reduce((a, b) => a + b, 0);
+    const sumErr = err.reduce((a, b) => a + b, 0);
+    const maxLat = Math.max.apply(null, lat);
+    $host.innerHTML = '<table class="data"><thead><tr>'
+      + '<th>signal</th><th>sparkline (' + buckets.length + ' × 5min)</th><th>total / peak</th>'
+      + '</tr></thead><tbody>'
+      + '<tr><td>invocations</td>'
+      + '<td><code style="color: var(--accent); font-size: 14px;">' + sparkInv + '</code></td>'
+      + '<td>Σ ' + sumInv.toLocaleString() + '</td></tr>'
+      + '<tr><td>mean latency</td>'
+      + '<td><code style="color: var(--accent); font-size: 14px;">' + sparkLat + '</code></td>'
+      + '<td>peak ' + maxLat.toFixed(0) + ' ms</td></tr>'
+      + '<tr><td>errors</td>'
+      + '<td><code style="color: ' + (sumErr > 0 ? 'var(--danger)' : 'var(--accent)') + '; font-size: 14px;">'
+      + sparkErr + '</code></td>'
+      + '<td>Σ ' + sumErr + '</td></tr>'
+      + '</tbody></table>'
+      + '<p class="meta" style="padding: 6px 14px 0;">'
+      + 'showing <code>' + escapeHtml(agent) + '</code>'
+      + ' — newest bucket on the right</p>';
+    _stampPanelRefresh('trend');
+  } catch (e) {
+    $host.innerHTML = '<div class="error" style="padding: 10px 14px;">load failed: '
+      + escapeHtml(String(e && e.message ? e.message : e)) + '</div>';
   }
 }
 
