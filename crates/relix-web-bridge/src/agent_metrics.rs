@@ -162,7 +162,10 @@ pub async fn agent_timeseries(
     // surface — the dashboard shouldn't render an empty chart.
     let any_invocations = v
         .as_array()
-        .map(|a| a.iter().any(|b| b.get("invocations").and_then(Value::as_u64).unwrap_or(0) > 0))
+        .map(|a| {
+            a.iter()
+                .any(|b| b.get("invocations").and_then(Value::as_u64).unwrap_or(0) > 0)
+        })
         .unwrap_or(false);
     if !any_invocations {
         return (
@@ -183,7 +186,14 @@ pub async fn alerts(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
-    match call_peer_json(&state, &peer, "metrics.alerts_active", &serde_json::json!({})).await {
+    match call_peer_json(
+        &state,
+        &peer,
+        "metrics.alerts_active",
+        &serde_json::json!({}),
+    )
+    .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -344,8 +354,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let bytes = rt
-            .block_on(async move { to_bytes(body, 64_000).await.unwrap() });
+        let bytes = rt.block_on(async move { to_bytes(body, 64_000).await.unwrap() });
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             parsed.get("error").and_then(serde_json::Value::as_str),

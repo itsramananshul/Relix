@@ -90,6 +90,8 @@ mod agent_metrics;
 #[cfg(test)]
 mod agent_metrics_mini_mesh_test;
 mod agents_access;
+#[cfg(test)]
+mod alert_dispatch_mini_mesh_test;
 mod auth;
 mod blocklist;
 mod browser_captures;

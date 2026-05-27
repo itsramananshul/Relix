@@ -32,6 +32,9 @@ pub mod state;
 
 use std::sync::Arc;
 
+use relix_core::types::{ErrorEnvelope, error_kinds};
+use relix_slack::{OutgoingMessage, SlackApi};
+
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 pub use client::{SlackOutboundClient, SlackOutboundClientCell};
@@ -85,13 +88,19 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     cleaned.chars().take(max_chars).collect()
 }
 
-/// Register the read-only capabilities on a controller with
-/// `node_type = "slack"`.
+/// Register `slack.status`, `slack.messages_recent`, and
+/// `slack.send` on a controller with `node_type = "slack"`.
+///
+/// `slack.send` accepts JSON `{ "channel": "<id-or-name>",
+/// "text": "..." }` and posts via `chat.postMessage`. Slack
+/// accepts both channel ids (`C…`) and channel names
+/// (`#ops-alerts`) on the wire.
 pub fn register(
     bridge: &mut DispatchBridge,
     state: Arc<ChannelState>,
     ring: Arc<MessageRing>,
     channel_id: String,
+    api: Arc<dyn SlackApi>,
 ) {
     {
         let state = state.clone();
@@ -127,6 +136,85 @@ pub fn register(
                 }
             })),
         );
+    }
+    {
+        let api = api.clone();
+        bridge.register(
+            "slack.send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let api = api.clone();
+                async move { handle_send(api, ctx.args).await }
+            })),
+        );
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SendArgs {
+    /// Slack channel id (`C…`) or name (`#ops-alerts`).
+    channel: String,
+    /// Message body.
+    text: String,
+}
+
+async fn handle_send(api: Arc<dyn SlackApi>, args: Vec<u8>) -> HandlerOutcome {
+    let parsed: SendArgs = match serde_json::from_slice(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("slack.send: args must be JSON {{channel, text}}: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    if parsed.channel.trim().is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "slack.send: channel must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    if parsed.text.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "slack.send: text must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    // Render CommonMark-ish text into Slack mrkdwn so a coordinator
+    // alert / report that ships `**bold**` doesn't show literal
+    // asterisks in the Slack client.
+    let rendered = crate::nodes::channels::format_for_slack_mrkdwn(&parsed.text);
+    let msg = OutgoingMessage {
+        channel_id: parsed.channel,
+        // No thread reference on outbound coordinator messages.
+        thread_ts: String::new(),
+        text: rendered,
+    };
+    match api.chat_post_message(&msg).await {
+        Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),
+        Err(relix_slack::SlackApiError::Transient(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_OVERLOADED,
+            cause: format!("slack.send: {c}"),
+            retry_hint: 1,
+            retry_after: None,
+        }),
+        Err(relix_slack::SlackApiError::ClientError(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("slack.send: {c}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+        Err(relix_slack::SlackApiError::MissingCredentials) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: "slack.send: bot credentials missing".into(),
+            retry_hint: 0,
+            retry_after: None,
+        }),
     }
 }
 
@@ -199,5 +287,56 @@ mod tests {
         let body = render_recent_body(&ring, 5);
         let preview = body.split('\t').nth(4).unwrap().trim_end_matches('\n');
         assert_eq!(preview.chars().count(), 100);
+    }
+
+    // ── slack.send capability tests ──────────────────────
+
+    #[tokio::test]
+    async fn slack_send_dispatches_to_mock_with_channel_and_text() {
+        let api = std::sync::Arc::new(relix_slack::mock::MockSlackApi::new());
+        let dyn_api: std::sync::Arc<dyn SlackApi> = api.clone();
+        let args = serde_json::json!({"channel": "#ops-alerts", "text": "hello"})
+            .to_string()
+            .into_bytes();
+        match handle_send(dyn_api, args).await {
+            HandlerOutcome::Ok(b) => {
+                assert_eq!(b, b"{\"ok\":true}".to_vec());
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got Err: {e:?}"),
+        }
+        let sent = api.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].channel_id, "#ops-alerts");
+        assert_eq!(sent[0].text, "hello");
+        assert!(sent[0].thread_ts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slack_send_rejects_empty_channel() {
+        let api: std::sync::Arc<dyn SlackApi> =
+            std::sync::Arc::new(relix_slack::mock::MockSlackApi::new());
+        let args = serde_json::json!({"channel": "", "text": "hi"})
+            .to_string()
+            .into_bytes();
+        match handle_send(api, args).await {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slack_send_returns_responder_internal_on_api_failure() {
+        let api = std::sync::Arc::new(relix_slack::mock::MockSlackApi::new());
+        api.fail_next_send(relix_slack::SlackApiError::ClientError(
+            "missing_scope".into(),
+        ));
+        let dyn_api: std::sync::Arc<dyn SlackApi> = api;
+        let args = serde_json::json!({"channel": "C1", "text": "x"})
+            .to_string()
+            .into_bytes();
+        match handle_send(dyn_api, args).await {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::RESPONDER_INTERNAL),
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
+        }
     }
 }

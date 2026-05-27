@@ -41,6 +41,9 @@ pub mod state;
 
 use std::sync::Arc;
 
+use relix_core::types::{ErrorEnvelope, error_kinds};
+use relix_telegram::{BotApi, OutgoingMessage};
+
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 pub use client::{TelegramOutboundClient, TelegramOutboundClientCell};
@@ -101,11 +104,27 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     cleaned.chars().take(max_chars).collect()
 }
 
-/// Register the read-only capabilities on a controller with
-/// `node_type = "telegram"`. Capabilities are intentionally
-/// read-only — outbound message delivery is the long-polling
-/// loop's responsibility, not an inbound RPC surface.
-pub fn register(bridge: &mut DispatchBridge, state: Arc<ChannelState>, ring: Arc<MessageRing>) {
+/// Register `telegram.status`, `telegram.messages_recent`, and
+/// `telegram.send` on a controller with `node_type = "telegram"`.
+///
+/// The first two are read-only and project state the long-poll
+/// loop already maintains.
+///
+/// `telegram.send` is the RELIX-7.11/§7.7 outbound capability the
+/// coordinator (and the alert-fan-out sink) call when they
+/// need to push a message to a Telegram chat from outside the
+/// long-poll loop. It accepts JSON `{ "chat_id": "<id>", "text": "..." }`
+/// (`chat_id` is a string so callers can pass either Telegram's
+/// numeric ids or `@channelusername` forms; the handler parses
+/// integers itself). On success it returns the JSON body
+/// `{ "ok": true }`; on failure it returns a structured
+/// `ErrorEnvelope` with the right kind.
+pub fn register(
+    bridge: &mut DispatchBridge,
+    state: Arc<ChannelState>,
+    ring: Arc<MessageRing>,
+    api: Arc<dyn BotApi>,
+) {
     {
         let state = state.clone();
         bridge.register(
@@ -138,6 +157,94 @@ pub fn register(bridge: &mut DispatchBridge, state: Arc<ChannelState>, ring: Arc
                 }
             })),
         );
+    }
+    {
+        let api = api.clone();
+        bridge.register(
+            "telegram.send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let api = api.clone();
+                async move { handle_send(api, ctx.args).await }
+            })),
+        );
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SendArgs {
+    /// Telegram chat id as a string. Numeric ids parse to
+    /// `i64`; `@channelusername` ids fail with INVALID_ARGS
+    /// (the Bot API accepts those but our wire shape is
+    /// numeric for now to keep the handler small).
+    chat_id: String,
+    /// Message body.
+    text: String,
+}
+
+async fn handle_send(api: Arc<dyn BotApi>, args: Vec<u8>) -> HandlerOutcome {
+    let parsed: SendArgs = match serde_json::from_slice(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("telegram.send: args must be JSON {{chat_id, text}}: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    if parsed.text.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "telegram.send: text must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    let chat_id: i64 = match parsed.chat_id.trim().parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!(
+                    "telegram.send: chat_id must be a numeric Telegram chat id, got {:?}",
+                    parsed.chat_id
+                ),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    let msg = OutgoingMessage {
+        chat_id,
+        // No threading context for outbound coordinator
+        // messages — 0 means "top-level message".
+        reply_to_message_id: 0,
+        text: parsed.text,
+        parse_mode: None,
+    };
+    match api.send_message(&msg).await {
+        Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),
+        Err(relix_telegram::BotApiError::Transient(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_OVERLOADED,
+            cause: format!("telegram.send: {c}"),
+            retry_hint: 1,
+            retry_after: None,
+        }),
+        Err(relix_telegram::BotApiError::ClientError(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("telegram.send: {c}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+        Err(relix_telegram::BotApiError::MissingCredentials) => {
+            HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::RESPONDER_INTERNAL,
+                cause: "telegram.send: bot credentials missing".into(),
+                retry_hint: 0,
+                retry_after: None,
+            })
+        }
     }
 }
 
@@ -240,5 +347,67 @@ mod tests {
         let ring = MessageRing::new(200);
         let body = render_recent_body(&ring, 20);
         assert!(body.is_empty());
+    }
+
+    // ── telegram.send capability tests ───────────────────
+
+    #[tokio::test]
+    async fn telegram_send_dispatches_to_mock_with_chat_id_and_text() {
+        let api = std::sync::Arc::new(relix_telegram::mock::MockBotApi::new());
+        let dyn_api: std::sync::Arc<dyn BotApi> = api.clone();
+        let args = serde_json::json!({"chat_id": "12345", "text": "hello chat"})
+            .to_string()
+            .into_bytes();
+        match handle_send(dyn_api, args).await {
+            HandlerOutcome::Ok(b) => {
+                assert_eq!(b, b"{\"ok\":true}".to_vec());
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got Err: {e:?}"),
+        }
+        let sent = api.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].chat_id, 12345);
+        assert_eq!(sent[0].text, "hello chat");
+        assert_eq!(sent[0].reply_to_message_id, 0);
+    }
+
+    #[tokio::test]
+    async fn telegram_send_rejects_non_numeric_chat_id() {
+        let api: std::sync::Arc<dyn BotApi> =
+            std::sync::Arc::new(relix_telegram::mock::MockBotApi::new());
+        let args = serde_json::json!({"chat_id": "@channelusername", "text": "hi"})
+            .to_string()
+            .into_bytes();
+        match handle_send(api, args).await {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_send_rejects_empty_text() {
+        let api: std::sync::Arc<dyn BotApi> =
+            std::sync::Arc::new(relix_telegram::mock::MockBotApi::new());
+        let args = serde_json::json!({"chat_id": "1", "text": ""})
+            .to_string()
+            .into_bytes();
+        match handle_send(api, args).await {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_send_returns_responder_internal_on_api_failure() {
+        let api = std::sync::Arc::new(relix_telegram::mock::MockBotApi::new());
+        api.fail_next_send(relix_telegram::BotApiError::ClientError("bad token".into()));
+        let dyn_api: std::sync::Arc<dyn BotApi> = api;
+        let args = serde_json::json!({"chat_id": "1", "text": "x"})
+            .to_string()
+            .into_bytes();
+        match handle_send(dyn_api, args).await {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::RESPONDER_INTERNAL),
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
+        }
     }
 }

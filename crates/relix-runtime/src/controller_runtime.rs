@@ -5233,19 +5233,22 @@ fn register_node_type_handlers(
         let notifier = Arc::new(crate::nodes::telegram::NotifierState::default());
         let out_cell: crate::nodes::telegram::TelegramOutboundClientCell =
             Arc::new(tokio::sync::OnceCell::new());
-        crate::nodes::telegram::register(bridge, state.clone(), ring.clone());
+        // Build the live bot API once and share it between the
+        // long-poll loop AND the `telegram.send` capability.
+        let api: Arc<dyn relix_telegram::BotApi> = Arc::new(relix_telegram::LiveBotApi::new(token));
+        crate::nodes::telegram::register(bridge, state.clone(), ring.clone(), api.clone());
         // Spawn the long-poll loop now. The loop checks the
         // out_cell on every tick and gracefully degrades when
         // the mesh client isn't wired yet (sends a fallback
         // reply rather than crashing).
-        let api = relix_telegram::LiveBotApi::new(token);
+        let api_for_loop = api.clone();
         let state_for_loop = state.clone();
         let ring_for_loop = ring.clone();
         let cfg_for_loop = Arc::new(tg_cfg.clone());
         let out_for_loop = out_cell.clone();
         tokio::spawn(async move {
-            crate::nodes::telegram::run_telegram_controller_with_api(
-                api,
+            crate::nodes::telegram::run_telegram_controller(
+                api_for_loop,
                 out_for_loop,
                 state_for_loop,
                 ring_for_loop,
@@ -5277,6 +5280,15 @@ fn register_node_type_handlers(
                  widget.",
                 &["read", "telegram", "messages"],
                 &["reads:internal"],
+            ),
+            (
+                "telegram.send",
+                "Send a Telegram message from outside the long-poll loop. \
+                 Args: JSON {chat_id (string, numeric), text}. Returns \
+                 {ok:true} on success. Used by the alert fan-out + any \
+                 coordinator code that needs to push a message.",
+                &["write", "telegram", "send"],
+                &["sends:external"],
             ),
         ];
         for (method, doc, cats, sensitivities) in telegram_caps {
@@ -5312,20 +5324,23 @@ fn register_node_type_handlers(
         ));
         let out_cell: crate::nodes::discord::DiscordOutboundClientCell =
             Arc::new(tokio::sync::OnceCell::new());
+        let api: Arc<dyn relix_discord::DiscordApi> =
+            Arc::new(relix_discord::LiveDiscordApi::new(token));
         crate::nodes::discord::register(
             bridge,
             state.clone(),
             ring.clone(),
             dc_cfg.channel_id.clone(),
+            api.clone(),
         );
-        let api = relix_discord::LiveDiscordApi::new(token);
+        let api_for_loop = api.clone();
         let state_for_loop = state.clone();
         let ring_for_loop = ring.clone();
         let cfg_for_loop = Arc::new(dc_cfg.clone());
         let out_for_loop = out_cell.clone();
         tokio::spawn(async move {
-            crate::nodes::discord::run_discord_controller_with_api(
-                api,
+            crate::nodes::discord::run_discord_controller(
+                api_for_loop,
                 out_for_loop,
                 state_for_loop,
                 ring_for_loop,
@@ -5353,6 +5368,15 @@ fn register_node_type_handlers(
                  widget.",
                 &["read", "discord", "messages"],
                 &["reads:internal"],
+            ),
+            (
+                "discord.send",
+                "Send a Discord message from outside the inbound polling \
+                 loop. Args: JSON {channel_id (snowflake string), text}. \
+                 Returns {ok:true} on success. Used by the alert fan-out \
+                 + any coordinator code that needs to push a message.",
+                &["write", "discord", "send"],
+                &["sends:external"],
             ),
         ];
         for (method, doc, cats, sensitivities) in discord_caps {
@@ -5388,20 +5412,22 @@ fn register_node_type_handlers(
         ));
         let out_cell: crate::nodes::slack::SlackOutboundClientCell =
             Arc::new(tokio::sync::OnceCell::new());
+        let api: Arc<dyn relix_slack::SlackApi> = Arc::new(relix_slack::LiveSlackApi::new(token));
         crate::nodes::slack::register(
             bridge,
             state.clone(),
             ring.clone(),
             sl_cfg.channel_id.clone(),
+            api.clone(),
         );
-        let api = relix_slack::LiveSlackApi::new(token);
+        let api_for_loop = api.clone();
         let state_for_loop = state.clone();
         let ring_for_loop = ring.clone();
         let cfg_for_loop = Arc::new(sl_cfg.clone());
         let out_for_loop = out_cell.clone();
         tokio::spawn(async move {
-            crate::nodes::slack::run_slack_controller_with_api(
-                api,
+            crate::nodes::slack::run_slack_controller(
+                api_for_loop,
                 out_for_loop,
                 state_for_loop,
                 ring_for_loop,
@@ -5429,6 +5455,15 @@ fn register_node_type_handlers(
                  widget.",
                 &["read", "slack", "messages"],
                 &["reads:internal"],
+            ),
+            (
+                "slack.send",
+                "Send a Slack message from outside the polling loop. \
+                 Args: JSON {channel (id or #name), text}. Returns \
+                 {ok:true} on success. Used by the alert fan-out + any \
+                 coordinator code that needs to push a message.",
+                &["write", "slack", "send"],
+                &["sends:external"],
             ),
         ];
         for (method, doc, cats, sensitivities) in slack_caps {

@@ -27,6 +27,9 @@ pub mod state;
 
 use std::sync::Arc;
 
+use relix_core::types::{ErrorEnvelope, error_kinds};
+use relix_discord::{DiscordApi, OutgoingMessage};
+
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 pub use client::{DiscordOutboundClient, DiscordOutboundClientCell};
@@ -87,13 +90,21 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
     cleaned.chars().take(max_chars).collect()
 }
 
-/// Register the read-only capabilities on a controller with
-/// `node_type = "discord"`. Mirrors `nodes::telegram::register`.
+/// Register `discord.status`, `discord.messages_recent`, and
+/// `discord.send` on a controller with `node_type = "discord"`.
+///
+/// `discord.send` accepts JSON `{ "channel_id": "<snowflake>",
+/// "text": "..." }` and posts the message via the bot API. Used
+/// by the alert fan-out + any other coordinator code that needs
+/// to push from outside the inbound polling loop. Returns
+/// `{ "ok": true }` on success; structured `ErrorEnvelope` on
+/// failure.
 pub fn register(
     bridge: &mut DispatchBridge,
     state: Arc<ChannelState>,
     ring: Arc<MessageRing>,
     channel_id: String,
+    api: Arc<dyn DiscordApi>,
 ) {
     {
         let state = state.clone();
@@ -129,6 +140,83 @@ pub fn register(
                 }
             })),
         );
+    }
+    {
+        let api = api.clone();
+        bridge.register(
+            "discord.send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let api = api.clone();
+                async move { handle_send(api, ctx.args).await }
+            })),
+        );
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SendArgs {
+    /// Discord channel snowflake id.
+    channel_id: String,
+    /// Message body.
+    text: String,
+}
+
+async fn handle_send(api: Arc<dyn DiscordApi>, args: Vec<u8>) -> HandlerOutcome {
+    let parsed: SendArgs = match serde_json::from_slice(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("discord.send: args must be JSON {{channel_id, text}}: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    if parsed.channel_id.trim().is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "discord.send: channel_id must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    if parsed.text.is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "discord.send: text must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    let msg = OutgoingMessage {
+        channel_id: parsed.channel_id,
+        // No reply reference for outbound coordinator messages.
+        reply_to_message_id: String::new(),
+        content: parsed.text,
+    };
+    match api.send_message(&msg).await {
+        Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),
+        Err(relix_discord::DiscordApiError::Transient(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_OVERLOADED,
+            cause: format!("discord.send: {c}"),
+            retry_hint: 1,
+            retry_after: None,
+        }),
+        Err(relix_discord::DiscordApiError::ClientError(c)) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("discord.send: {c}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+        Err(relix_discord::DiscordApiError::MissingCredentials) => {
+            HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::RESPONDER_INTERNAL,
+                cause: "discord.send: bot credentials missing".into(),
+                retry_hint: 0,
+                retry_after: None,
+            })
+        }
     }
 }
 
@@ -198,5 +286,54 @@ mod tests {
         let body = render_recent_body(&ring, 5);
         let preview = body.split('\t').nth(4).unwrap().trim_end_matches('\n');
         assert_eq!(preview.chars().count(), 100);
+    }
+
+    // ── discord.send capability tests ────────────────────
+
+    #[tokio::test]
+    async fn discord_send_dispatches_to_mock_with_channel_id_and_text() {
+        let api = std::sync::Arc::new(relix_discord::mock::MockDiscordApi::new());
+        let dyn_api: std::sync::Arc<dyn DiscordApi> = api.clone();
+        let args = serde_json::json!({"channel_id": "C99", "text": "hello"})
+            .to_string()
+            .into_bytes();
+        match handle_send(dyn_api, args).await {
+            HandlerOutcome::Ok(b) => {
+                assert_eq!(b, b"{\"ok\":true}".to_vec());
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got Err: {e:?}"),
+        }
+        let sent = api.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].channel_id, "C99");
+        assert_eq!(sent[0].content, "hello");
+        assert!(sent[0].reply_to_message_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_send_rejects_empty_channel_id() {
+        let api: std::sync::Arc<dyn DiscordApi> =
+            std::sync::Arc::new(relix_discord::mock::MockDiscordApi::new());
+        let args = serde_json::json!({"channel_id": "", "text": "hi"})
+            .to_string()
+            .into_bytes();
+        match handle_send(api, args).await {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_send_returns_responder_internal_on_api_failure() {
+        let api = std::sync::Arc::new(relix_discord::mock::MockDiscordApi::new());
+        api.fail_next_send(relix_discord::DiscordApiError::ClientError("403".into()));
+        let dyn_api: std::sync::Arc<dyn DiscordApi> = api;
+        let args = serde_json::json!({"channel_id": "C1", "text": "x"})
+            .to_string()
+            .into_bytes();
+        match handle_send(dyn_api, args).await {
+            HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::RESPONDER_INTERNAL),
+            HandlerOutcome::Ok(_) => panic!("expected Err"),
+        }
     }
 }

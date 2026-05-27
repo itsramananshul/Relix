@@ -70,6 +70,19 @@ pub struct AlertTarget {
     /// templated string built from the alert.
     #[serde(default)]
     pub subject: Option<String>,
+    /// Telegram-only: the chat id to post into. Numeric Telegram
+    /// chat id passed as a string so the operator's TOML stays
+    /// readable. Required when `channel == "telegram"`.
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    /// Discord-only: the channel snowflake id. Required when
+    /// `channel == "discord"`.
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// Slack-only: the destination channel id (`C…`) or name
+    /// (`#ops-alerts`). Required when `channel == "slack"`.
+    #[serde(default, alias = "slack_channel")]
+    pub slack_channel: Option<String>,
 }
 
 /// Mesh client + caller identity bundle handed to the
@@ -198,11 +211,14 @@ impl AlertDeliver for MultiChannelAlertSink {
     }
 }
 
-async fn dispatch_to_target(
-    ctx: &AlertMeshContext,
+/// Project a target + alert body into `(capability_method,
+/// json_bytes)` ready for the mesh dispatch. Pulled out of
+/// `dispatch_to_target` so unit tests can verify the wire shape
+/// per channel without standing up a libp2p stack.
+pub(crate) fn encode_dispatch(
     target: &AlertTarget,
     body: &str,
-) -> Result<(), String> {
+) -> Result<(&'static str, Vec<u8>), String> {
     let channel = target.channel.trim().to_ascii_lowercase();
     match channel.as_str() {
         "email" => {
@@ -220,24 +236,55 @@ async fn dispatch_to_target(
                 "body": body,
             });
             let arg_bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
-            call_unary(ctx, &target.peer, "email.send", arg_bytes).await
+            Ok(("email.send", arg_bytes))
         }
-        "telegram" | "discord" | "slack" => {
-            // These channels don't expose an outbound `*.send`
-            // capability the coordinator can call directly
-            // today (they're inbound-only with per-channel
-            // outbound clients used by the channel's own
-            // controller). Log honestly and continue — the
-            // chronicle sink still records the event.
-            tracing::warn!(
-                channel = %channel,
-                peer = %target.peer,
-                "alert delivery: {channel} channel currently has no inbound `*.send` capability; alert chronicled but not dispatched"
-            );
-            Ok(())
+        "telegram" => {
+            let chat_id = target
+                .chat_id
+                .as_deref()
+                .ok_or_else(|| "telegram target missing `chat_id` field".to_string())?;
+            let args = serde_json::json!({
+                "chat_id": chat_id,
+                "text": body,
+            });
+            let arg_bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
+            Ok(("telegram.send", arg_bytes))
+        }
+        "discord" => {
+            let channel_id = target
+                .channel_id
+                .as_deref()
+                .ok_or_else(|| "discord target missing `channel_id` field".to_string())?;
+            let args = serde_json::json!({
+                "channel_id": channel_id,
+                "text": body,
+            });
+            let arg_bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
+            Ok(("discord.send", arg_bytes))
+        }
+        "slack" => {
+            let slack_channel = target
+                .slack_channel
+                .as_deref()
+                .ok_or_else(|| "slack target missing `slack_channel` field".to_string())?;
+            let args = serde_json::json!({
+                "channel": slack_channel,
+                "text": body,
+            });
+            let arg_bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
+            Ok(("slack.send", arg_bytes))
         }
         other => Err(format!("unknown channel: {other}")),
     }
+}
+
+async fn dispatch_to_target(
+    ctx: &AlertMeshContext,
+    target: &AlertTarget,
+    body: &str,
+) -> Result<(), String> {
+    let (method, arg_bytes) = encode_dispatch(target, body)?;
+    call_unary(ctx, &target.peer, method, arg_bytes).await
 }
 
 async fn call_unary(
@@ -635,6 +682,9 @@ mod tests {
                 peer: "email-peer".into(),
                 to: Some("ops@example.com".into()),
                 subject: None,
+                chat_id: None,
+                channel_id: None,
+                slack_channel: None,
             }],
         );
         sink.deliver(&AlertEvent::Fired(fired(
@@ -758,5 +808,169 @@ mod tests {
         // 123 ms past 1_700_000_000s
         let s = iso_ms(1_700_000_000_123);
         assert_eq!(s, "2023-11-14T22:13:20.123Z");
+    }
+
+    // ── per-channel dispatch encoding tests ──────────────
+
+    fn target(
+        channel: &str,
+        peer: &str,
+        to: Option<&str>,
+        chat_id: Option<&str>,
+        channel_id: Option<&str>,
+        slack_channel: Option<&str>,
+    ) -> AlertTarget {
+        AlertTarget {
+            channel: channel.into(),
+            peer: peer.into(),
+            to: to.map(|s| s.to_string()),
+            subject: None,
+            chat_id: chat_id.map(|s| s.to_string()),
+            channel_id: channel_id.map(|s| s.to_string()),
+            slack_channel: slack_channel.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn encode_dispatch_email_uses_email_send_with_to_subject_body() {
+        let t = target(
+            "email",
+            "email-peer",
+            Some("ops@example.com"),
+            None,
+            None,
+            None,
+        );
+        let (method, bytes) = encode_dispatch(&t, "BODY").unwrap();
+        assert_eq!(method, "email.send");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["body"], "BODY");
+        assert_eq!(v["subject"], "Relix alert");
+        assert_eq!(v["to"][0], "ops@example.com");
+    }
+
+    #[test]
+    fn encode_dispatch_telegram_uses_telegram_send_with_chat_id_and_text() {
+        let t = target("telegram", "tg-peer", None, Some("99988"), None, None);
+        let (method, bytes) = encode_dispatch(&t, "alert body").unwrap();
+        assert_eq!(method, "telegram.send");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["chat_id"], "99988");
+        assert_eq!(v["text"], "alert body");
+    }
+
+    #[test]
+    fn encode_dispatch_telegram_without_chat_id_fails() {
+        let t = target("telegram", "tg-peer", None, None, None, None);
+        match encode_dispatch(&t, "x") {
+            Err(e) => assert!(e.contains("chat_id")),
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn encode_dispatch_discord_uses_discord_send_with_channel_id_and_text() {
+        let t = target("discord", "dc-peer", None, None, Some("C77777"), None);
+        let (method, bytes) = encode_dispatch(&t, "alert body").unwrap();
+        assert_eq!(method, "discord.send");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["channel_id"], "C77777");
+        assert_eq!(v["text"], "alert body");
+    }
+
+    #[test]
+    fn encode_dispatch_discord_without_channel_id_fails() {
+        let t = target("discord", "dc-peer", None, None, None, None);
+        match encode_dispatch(&t, "x") {
+            Err(e) => assert!(e.contains("channel_id")),
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn encode_dispatch_slack_uses_slack_send_with_channel_and_text() {
+        let t = target("slack", "sl-peer", None, None, None, Some("#ops-alerts"));
+        let (method, bytes) = encode_dispatch(&t, "alert body").unwrap();
+        assert_eq!(method, "slack.send");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["channel"], "#ops-alerts");
+        assert_eq!(v["text"], "alert body");
+    }
+
+    #[test]
+    fn encode_dispatch_slack_without_channel_fails() {
+        let t = target("slack", "sl-peer", None, None, None, None);
+        match encode_dispatch(&t, "x") {
+            Err(e) => assert!(e.contains("slack_channel")),
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn encode_dispatch_unknown_channel_fails() {
+        let t = target("smoke", "p", None, None, None, None);
+        assert!(encode_dispatch(&t, "x").is_err());
+    }
+
+    /// Channel-target config parses correctly from operator TOML.
+    /// Aliases the spec's `slack_channel` field through serde so
+    /// operator config stays readable.
+    #[test]
+    fn alert_target_parses_each_channel_shape_from_toml() {
+        // `r##"…"##` because the `"#ops"` literal below contains
+        // the `"#` raw-string-delimiter pair, which would
+        // prematurely close a single-hash `r#"…"#` block.
+        let toml_text = r##"
+            [[targets]]
+            channel = "telegram"
+            peer = "tg-peer"
+            chat_id = "12345"
+
+            [[targets]]
+            channel = "discord"
+            peer = "dc-peer"
+            channel_id = "C77"
+
+            [[targets]]
+            channel = "slack"
+            peer = "sl-peer"
+            slack_channel = "#ops"
+
+            [[targets]]
+            channel = "email"
+            peer = "em-peer"
+            to = "ops@example.com"
+        "##;
+        let cfg: AlertDeliveryConfig = toml::from_str(toml_text).unwrap();
+        assert_eq!(cfg.targets.len(), 4);
+        assert_eq!(cfg.targets[0].chat_id.as_deref(), Some("12345"));
+        assert_eq!(cfg.targets[1].channel_id.as_deref(), Some("C77"));
+        assert_eq!(cfg.targets[2].slack_channel.as_deref(), Some("#ops"));
+        assert_eq!(cfg.targets[3].to.as_deref(), Some("ops@example.com"));
+    }
+
+    /// MultiChannelAlertSink fans out to every target's
+    /// per-target tokio task. With the cell unpopulated, every
+    /// task short-circuits → no panics, no blocking. Verifies the
+    /// "one bad target doesn't take down the others" guarantee.
+    #[tokio::test]
+    async fn fan_out_with_mixed_targets_doesnt_panic_when_mesh_absent() {
+        let cell: AlertMeshCell = Arc::new(tokio::sync::OnceCell::new());
+        let sink = MultiChannelAlertSink::new(
+            cell,
+            vec![
+                target("telegram", "tg", None, Some("1"), None, None),
+                target("discord", "dc", None, None, Some("C1"), None),
+                target("slack", "sl", None, None, None, Some("#x")),
+                target("email", "em", Some("a@b"), None, None, None),
+            ],
+        );
+        sink.deliver(&AlertEvent::Fired(fired(
+            "alice",
+            AlertSeverity::Warning,
+            1_700_000_000_000,
+        )));
+        // Give spawned tasks one tick.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
