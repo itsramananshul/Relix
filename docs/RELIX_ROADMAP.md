@@ -4176,9 +4176,26 @@ What's still open in this space:
   duplicates provider config on the bridge (security regression).
   Tracked as SIMP-019.
 
-## SOL Language Documentation `[IDEA — HIGH PRIORITY]`
+## SOL Language Documentation `[DONE — docs/sol-language-reference.md]`
 
-SOL (Structured Operations Language) is the workflow definition language Relix uses internally. Right now it exists only in source code with no external documentation. Anyone who wants to write a workflow has to read the compiler source to understand the syntax.
+A formal SOL language reference ships at
+[`docs/sol-language-reference.md`](sol-language-reference.md). It
+covers every keyword, every construct, every built-in — types,
+variables, operators, string interpolation, control flow, functions,
+`remote_call` / `remote_call_stream`, list and map built-ins, try /
+catch / rethrow, `delegate` / `send` sugar, execution model,
+VM_ERROR_SENTINEL semantics, and the honest scope statements (no
+loop cap, no break / continue, no first-class functions, etc.).
+
+Every code example in the reference is compiled and executed by the
+test at
+`crates/relix-runtime/src/sol/language_reference_examples.rs` — 55
+tests, one per documented behaviour. If the reference drifts from the
+compiler, the test breaks first.
+
+The original gap statement is preserved below for historical context.
+
+### What was built (and what was deferred)
 
 ### What needs to be built
 
