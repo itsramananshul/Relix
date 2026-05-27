@@ -285,6 +285,7 @@ mod tests {
             quality_score: None,
             exported: false,
             export_set: None,
+            anonymized: false,
         }
     }
 

@@ -122,10 +122,43 @@ pub struct ControllerConfig {
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
+    /// `[agents.<name>]` — per-agent operator preferences.
+    /// Today it carries the RELIX-7.15 per-agent training
+    /// opt-in + PII strategy override. Empty / absent means
+    /// every agent inherits the global behaviour.
+    #[serde(default)]
+    pub agents: std::collections::BTreeMap<String, AgentSection>,
     /// SOL session declarations (M6).
     #[serde(default)]
     #[allow(dead_code)]
     pub session: std::collections::BTreeMap<String, SessionConfig>,
+}
+
+/// `[agents.<name>]` config section. Operators add one of
+/// these for any agent whose default training behaviour they
+/// want to change.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AgentSection {
+    /// `[agents.<name>.training]` — RELIX-7.15 training opt-in
+    /// + per-agent PII strategy.
+    #[serde(default)]
+    pub training: Option<AgentTrainingSection>,
+}
+
+/// `[agents.<name>.training]` — per-agent training config.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AgentTrainingSection {
+    /// `false` drops every interaction from this agent at the
+    /// recorder's sink boundary. `None` inherits the global
+    /// recorder behaviour.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// One of `"redact"`, `"pseudonymize"`, `"allow"`. When set,
+    /// overrides the global `[training.pii] strategy` for this
+    /// agent. The global per-type `overrides` table still
+    /// applies on top of the per-agent strategy.
+    #[serde(default)]
+    pub pii_strategy: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3486,6 +3519,11 @@ pub(crate) struct TrainingBundle {
     pub sink: std::sync::Arc<dyn crate::training::InteractionSink>,
     pub store: crate::training::TrainingStore,
     pub export_dir: std::path::PathBuf,
+    /// RELIX-7.15 PII anonymizer applied by the recorder at
+    /// record time AND by the export engine as a safety net
+    /// for any row that was recorded before
+    /// `[training.pii] enabled = true` got flipped on.
+    pub anonymizer: std::sync::Arc<crate::training::PiiAnonymizer>,
 }
 
 /// Open the training store, spawn the drain + retention +
@@ -3510,7 +3548,20 @@ pub(crate) fn build_training_bundle(
         .unwrap_or_else(|| crate::training::default_training_path(data_dir));
     let store = crate::training::TrainingStore::open(&db_path)
         .map_err(|e| format!("[training] open {}: {e}", db_path.display()))?;
-    let (recorder, handles) = crate::training::InteractionRecorder::new(store.clone());
+    // RELIX-7.15 PII: build the anonymizer + per-agent
+    // policies before constructing the recorder so both the
+    // record-time and the export-time paths share the same
+    // resolved instances. Operators opt in via
+    // `[training.pii] enabled = true`; the default
+    // configuration leaves anonymization OFF for backwards
+    // compatibility with pre-PII deployments.
+    let anonymizer = std::sync::Arc::new(crate::training::PiiAnonymizer::from_config(&t_cfg.pii));
+    let agent_policies = std::sync::Arc::new(build_agent_training_policies(cfg, &t_cfg.pii));
+    let (recorder, handles) = crate::training::InteractionRecorder::new_with(
+        store.clone(),
+        anonymizer.clone(),
+        agent_policies,
+    );
     let _spawned = handles.spawn(crate::training::RetentionConfig {
         retention_days: t_cfg.retention_days,
         sweep_interval: std::time::Duration::from_secs(t_cfg.retention_sweep_interval_secs.max(60)),
@@ -3538,13 +3589,62 @@ pub(crate) fn build_training_bundle(
         retention_days = t_cfg.retention_days,
         scorer_enabled = t_cfg.scorer_enabled,
         export_dir = %export_dir.display(),
+        pii_enabled = t_cfg.pii.enabled,
+        pii_strategy = %t_cfg.pii.strategy.as_str(),
         "training: recorder + retention online"
     );
     Ok(Some(TrainingBundle {
         sink: std::sync::Arc::new(recorder),
         store,
         export_dir,
+        anonymizer,
     }))
+}
+
+/// Build the per-agent training policies map from the
+/// top-level `[agents.<name>.training]` config blocks. Agents
+/// without a block inherit the global behaviour (training
+/// enabled, global PII anonymizer). The global `[training.pii]`
+/// config is passed in so per-agent overrides can re-use the
+/// global type-overrides table as a baseline.
+fn build_agent_training_policies(
+    cfg: &ControllerConfig,
+    pii: &crate::training::PiiConfig,
+) -> crate::training::AgentTrainingPolicies {
+    let mut policies = crate::training::AgentTrainingPolicies::empty();
+    for (name, agent_cfg) in &cfg.agents {
+        let Some(training_cfg) = agent_cfg.training.as_ref() else {
+            continue;
+        };
+        if let Some(enabled) = training_cfg.enabled {
+            policies.enabled.insert(name.clone(), enabled);
+        }
+        if let Some(strategy_str) = training_cfg.pii_strategy.as_ref() {
+            let Some(strategy) = crate::training::PiiStrategy::parse(strategy_str) else {
+                tracing::warn!(
+                    agent = %name,
+                    strategy = %strategy_str,
+                    "[agents.<name>.training.pii_strategy]: unknown strategy; agent inherits global"
+                );
+                continue;
+            };
+            // Build a per-agent PiiConfig that inherits the
+            // global `overrides` table but uses the per-agent
+            // strategy as the default. PII is always considered
+            // ENABLED when the operator wrote a per-agent
+            // strategy — otherwise the override has no effect.
+            let per_agent = crate::training::PiiConfig {
+                enabled: true,
+                strategy,
+                overrides: pii.overrides.clone(),
+            };
+            policies.anonymizers.insert(
+                name.clone(),
+                std::sync::Arc::new(crate::training::PiiAnonymizer::from_config(&per_agent)),
+            );
+        }
+    }
+    policies
 }
 
 /// Open the metrics store, spawn the drain + retention loops,
@@ -4690,7 +4790,12 @@ fn register_node_type_handlers(
         // already spawned the drain / retention / scorer
         // loops; here we just register the dispatch handlers.
         if let Some(b) = training.as_ref() {
-            crate::training::register(bridge, b.store.clone(), b.export_dir.clone());
+            crate::training::register(
+                bridge,
+                b.store.clone(),
+                b.export_dir.clone(),
+                b.anonymizer.clone(),
+            );
             for (method, doc) in crate::training::training_capability_descriptors() {
                 let categories: &[&str] = match *method {
                     "training.list_interactions" => &["training", "read"],
@@ -4699,6 +4804,8 @@ fn register_node_type_handlers(
                     "training.score_interaction" => &["training", "mutate"],
                     "training.stats" => &["training", "read"],
                     "training.delete_interaction" => &["training", "mutate"],
+                    "training.pii_scan" => &["training", "pii", "read"],
+                    "training.anonymize_preview" => &["training", "pii", "read"],
                     _ => &["training"],
                 };
                 manifest.add_capability(

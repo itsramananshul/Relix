@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use super::pii::PiiAnonymizer;
 use super::store::TrainingStore;
-use super::types::InteractionRecord;
+use super::types::{InteractionRecord, ToolCallRecord};
 
 /// Trait the AI handler holds. Stripped down so non-recording
 /// builds can use [`NullInteractionSink`] without dragging in
@@ -35,22 +36,94 @@ pub trait InteractionSink: Send + Sync {
 
 /// Production sink — non-blocking mpsc producer in front of the
 /// shared drain task. Cheap to clone.
+///
+/// The recorder holds an `Arc<PiiAnonymizer>` so the record-time
+/// anonymization pass is a single Arc deref + an optional regex
+/// scan on the hot path. When the anonymizer is disabled (the
+/// default), `record_interaction` is byte-identical to the
+/// pre-PII recorder shape.
+///
+/// Per-agent training opt-in lives on
+/// [`AgentTrainingPolicies`]: an `Arc<BTreeMap<agent,
+/// AgentTrainingPolicy>>` the recorder consults before
+/// persisting. Agents whose policy says `enabled = false` are
+/// dropped at the sink boundary (no row in `training.sqlite`,
+/// no mpsc send, no drain-task work). Agents with a
+/// `pii_strategy` override pre-bind a per-agent anonymizer that
+/// the recorder uses instead of the global one.
 #[derive(Clone)]
 pub struct InteractionRecorder {
     tx: mpsc::UnboundedSender<InteractionRecord>,
     store: TrainingStore,
+    anonymizer: Arc<PiiAnonymizer>,
+    agent_policies: Arc<AgentTrainingPolicies>,
 }
 
 pub const BATCH_INTERVAL_MS: u64 = 100;
 pub const BATCH_SIZE: usize = 100;
 
+/// Per-agent training opt-in + PII strategy overrides.
+///
+/// Keyed by `agent` (the friendly name on the caller's
+/// `IdentityBundle.name`). An empty map / `enabled=true`
+/// policy means the agent inherits the global behaviour.
+#[derive(Clone, Debug, Default)]
+pub struct AgentTrainingPolicies {
+    /// `enabled` defaults to `true` so an agent with no
+    /// explicit entry is recorded as before. An explicit
+    /// `enabled=false` entry skips the agent at the sink
+    /// boundary.
+    pub enabled: std::collections::BTreeMap<String, bool>,
+    /// Pre-resolved per-agent anonymizers. Built from the
+    /// global PII config + an agent-specific `pii_strategy`
+    /// override; cached as `Arc<PiiAnonymizer>` so the hot
+    /// path is a single map lookup.
+    pub anonymizers: std::collections::BTreeMap<String, Arc<PiiAnonymizer>>,
+}
+
+impl AgentTrainingPolicies {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Returns `false` only when the agent has an explicit
+    /// `enabled = false` entry. Unknown agents are enabled
+    /// by default.
+    pub fn enabled_for(&self, agent: &str) -> bool {
+        self.enabled.get(agent).copied().unwrap_or(true)
+    }
+
+    pub fn anonymizer_for(&self, agent: &str) -> Option<Arc<PiiAnonymizer>> {
+        self.anonymizers.get(agent).cloned()
+    }
+}
+
 impl InteractionRecorder {
+    /// Construct a recorder with a disabled anonymizer + empty
+    /// per-agent policies. Mirrors the pre-7.15-PII shape so
+    /// existing tests + callers continue to compile.
     pub fn new(store: TrainingStore) -> (Self, RecorderWorkerHandles) {
+        Self::new_with(
+            store,
+            Arc::new(PiiAnonymizer::disabled()),
+            Arc::new(AgentTrainingPolicies::empty()),
+        )
+    }
+
+    /// Full constructor — operators wire this from the
+    /// controller-runtime training bundle.
+    pub fn new_with(
+        store: TrainingStore,
+        anonymizer: Arc<PiiAnonymizer>,
+        agent_policies: Arc<AgentTrainingPolicies>,
+    ) -> (Self, RecorderWorkerHandles) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
                 tx,
                 store: store.clone(),
+                anonymizer,
+                agent_policies,
             },
             RecorderWorkerHandles {
                 store,
@@ -66,8 +139,24 @@ impl InteractionRecorder {
 
 impl InteractionSink for InteractionRecorder {
     fn record_interaction(&self, mut rec: InteractionRecord) {
+        // Per-agent opt-in: drop the record entirely if the
+        // operator has explicitly opted this agent OUT of
+        // training capture. We do this BEFORE anonymization so
+        // disabled agents pay zero CPU cost on the hot path.
+        if !self.agent_policies.enabled_for(&rec.agent) {
+            return;
+        }
         if rec.recorded_at == 0 {
             rec.recorded_at = now_ms();
+        }
+        // Choose the effective anonymizer: a per-agent
+        // override wins, otherwise the global one applies.
+        let active = self
+            .agent_policies
+            .anonymizer_for(&rec.agent)
+            .unwrap_or_else(|| self.anonymizer.clone());
+        if active.enabled() {
+            apply_anonymizer(&mut rec, &active);
         }
         if self.tx.send(rec).is_err() {
             tracing::warn!(
@@ -75,6 +164,51 @@ impl InteractionSink for InteractionRecorder {
             );
         }
     }
+}
+
+/// Run the anonymizer over every field that may contain raw
+/// user content (system_prompt + user_message + response + each
+/// tool call's input + output) and flip `rec.anonymized` to
+/// true. Idempotent on already-anonymized records (running
+/// twice has no observable effect because the anonymizer's
+/// placeholders / pseudonyms aren't themselves valid PII).
+pub fn apply_anonymizer(rec: &mut InteractionRecord, anon: &PiiAnonymizer) {
+    if !anon.enabled() {
+        return;
+    }
+    rec.system_prompt = anon.anonymize(&rec.system_prompt);
+    rec.user_message = anon.anonymize(&rec.user_message);
+    rec.response = anon.anonymize(&rec.response);
+    for c in rec.tool_calls.iter_mut() {
+        c.input = anon.anonymize(&c.input);
+        c.output = anon.anonymize(&c.output);
+    }
+    rec.anonymized = true;
+}
+
+/// Helper for the export engine + tests: anonymize the
+/// fields of a record in-place without setting `anonymized =
+/// true` on the original (the caller decides whether to mark
+/// or not). Returns a copy.
+pub fn anonymize_record(rec: &InteractionRecord, anon: &PiiAnonymizer) -> InteractionRecord {
+    let mut copy = rec.clone();
+    if anon.enabled() {
+        copy.system_prompt = anon.anonymize(&copy.system_prompt);
+        copy.user_message = anon.anonymize(&copy.user_message);
+        copy.response = anon.anonymize(&copy.response);
+        let tcs: Vec<ToolCallRecord> = copy
+            .tool_calls
+            .into_iter()
+            .map(|mut c| {
+                c.input = anon.anonymize(&c.input);
+                c.output = anon.anonymize(&c.output);
+                c
+            })
+            .collect();
+        copy.tool_calls = tcs;
+        copy.anonymized = true;
+    }
+    copy
 }
 
 /// Owned worker handles returned by
@@ -217,7 +351,8 @@ impl InteractionSink for CollectingInteractionSink {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{InteractionId, InteractionRecord};
+    use super::super::pii::{PiiConfig, PiiStrategy};
+    use super::super::types::{InteractionId, InteractionRecord, ToolCallRecord};
     use super::*;
 
     fn record(id: &str, agent: &str, ts: i64) -> InteractionRecord {
@@ -241,6 +376,7 @@ mod tests {
             quality_score: None,
             exported: false,
             export_set: None,
+            anonymized: false,
         }
     }
 
@@ -334,5 +470,131 @@ mod tests {
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].interaction_id.as_str(), "a");
         assert_eq!(g[1].interaction_id.as_str(), "b");
+    }
+
+    // ── RELIX-7.15 PII integration ─────────────────────────
+
+    fn pii_record_with_email_in_user_message(id: &str) -> InteractionRecord {
+        let mut r = record(id, "alice", 100);
+        r.system_prompt = "you are alice".into();
+        r.user_message = "please email alice@example.com".into();
+        r.response = "ok, will email alice@example.com".into();
+        r.tool_calls = vec![ToolCallRecord {
+            tool: "email.send".into(),
+            input: "to: alice@example.com".into(),
+            output: "sent: alice@example.com".into(),
+            success: true,
+            latency_ms: 5,
+            error_kind: None,
+        }];
+        r
+    }
+
+    fn redact_anon() -> Arc<PiiAnonymizer> {
+        Arc::new(PiiAnonymizer::from_config(&PiiConfig {
+            enabled: true,
+            strategy: PiiStrategy::Redact,
+            overrides: Default::default(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn anonymized_recorder_strips_pii_before_persisting() {
+        let store = TrainingStore::in_memory().unwrap();
+        let policies = Arc::new(AgentTrainingPolicies::empty());
+        let (rec, handles) = InteractionRecorder::new_with(store.clone(), redact_anon(), policies);
+        let _h = handles.spawn(RetentionConfig::default());
+        rec.record_interaction(pii_record_with_email_in_user_message("redacted-1"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = store.get("redacted-1").unwrap().unwrap();
+        // Email must NOT survive on any of the redacted fields.
+        for field in [
+            &got.system_prompt,
+            &got.user_message,
+            &got.response,
+            &got.tool_calls[0].input,
+            &got.tool_calls[0].output,
+        ] {
+            assert!(
+                !field.contains("alice@example.com"),
+                "raw PII survived: {field:?}",
+            );
+        }
+        // user_message + response carried the email — both
+        // must now contain the placeholder.
+        assert!(got.user_message.contains("[EMAIL]"));
+        assert!(got.response.contains("[EMAIL]"));
+        // Recorder must flip the `anonymized` flag so the
+        // export engine knows not to re-run.
+        assert!(got.anonymized, "recorder must flip anonymized = true");
+        drop(rec);
+    }
+
+    #[tokio::test]
+    async fn anonymization_disabled_keeps_raw_text_and_unset_flag() {
+        let store = TrainingStore::in_memory().unwrap();
+        let (rec, handles) = InteractionRecorder::new(store.clone());
+        let _h = handles.spawn(RetentionConfig::default());
+        rec.record_interaction(pii_record_with_email_in_user_message("plain-1"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = store.get("plain-1").unwrap().unwrap();
+        assert!(got.user_message.contains("alice@example.com"));
+        assert!(!got.anonymized, "no anonymizer → no flag flip");
+        drop(rec);
+    }
+
+    #[tokio::test]
+    async fn agent_with_training_disabled_drops_records_at_sink_boundary() {
+        let store = TrainingStore::in_memory().unwrap();
+        let mut policies = AgentTrainingPolicies::empty();
+        policies.enabled.insert("public-agent".into(), false);
+        let (rec, handles) = InteractionRecorder::new_with(
+            store.clone(),
+            Arc::new(PiiAnonymizer::disabled()),
+            Arc::new(policies),
+        );
+        let _h = handles.spawn(RetentionConfig::default());
+        rec.record_interaction(record("kept", "work-agent", 100));
+        rec.record_interaction(record("dropped", "public-agent", 200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(store.get("kept").unwrap().is_some());
+        assert!(
+            store.get("dropped").unwrap().is_none(),
+            "disabled agent must not produce a row"
+        );
+        drop(rec);
+    }
+
+    #[tokio::test]
+    async fn per_agent_pii_strategy_overrides_global_strategy() {
+        let store = TrainingStore::in_memory().unwrap();
+        // Global anonymizer is the disabled instance; only
+        // the `work-agent` policy carries a real one.
+        let mut policies = AgentTrainingPolicies::empty();
+        policies
+            .anonymizers
+            .insert("work-agent".into(), redact_anon());
+        let (rec, handles) = InteractionRecorder::new_with(
+            store.clone(),
+            Arc::new(PiiAnonymizer::disabled()),
+            Arc::new(policies),
+        );
+        let _h = handles.spawn(RetentionConfig::default());
+        let mut scoped_rec = pii_record_with_email_in_user_message("scoped");
+        scoped_rec.agent = "work-agent".into();
+        rec.record_interaction(scoped_rec);
+        let mut unscoped_rec = pii_record_with_email_in_user_message("unscoped");
+        unscoped_rec.agent = "other-agent".into();
+        rec.record_interaction(unscoped_rec);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let scoped = store.get("scoped").unwrap().unwrap();
+        let unscoped = store.get("unscoped").unwrap().unwrap();
+        // work-agent → per-agent anonymizer redacts.
+        assert!(scoped.user_message.contains("[EMAIL]"));
+        assert!(scoped.anonymized);
+        // other-agent → global anonymizer is disabled → raw.
+        assert!(unscoped.user_message.contains("alice@example.com"));
+        assert!(!unscoped.anonymized);
+        drop(rec);
     }
 }

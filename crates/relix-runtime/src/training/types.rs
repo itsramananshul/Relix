@@ -105,6 +105,14 @@ pub struct InteractionRecord {
     pub exported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_set: Option<String>,
+    /// RELIX-7.15 PII step: `true` when the recorder applied
+    /// the PII anonymizer to `system_prompt` / `user_message` /
+    /// `response` / `tool_calls` BEFORE persisting this row.
+    /// `false` rows are anonymized at export time as a safety
+    /// net (covers rows recorded before anonymization was
+    /// enabled). The default for backwards-compat is `false`.
+    #[serde(default)]
+    pub anonymized: bool,
 }
 
 impl InteractionRecord {
@@ -154,6 +162,7 @@ impl InteractionRecord {
             quality_score: None,
             exported: false,
             export_set: None,
+            anonymized: false,
         }
     }
 }
@@ -215,6 +224,11 @@ pub struct InteractionSummary {
     /// want to eyeball "what was this?" without pulling the
     /// whole record.
     pub user_preview: String,
+    /// Mirrors [`InteractionRecord::anonymized`] so list
+    /// consumers can render the per-row redaction state without
+    /// pulling the full record body.
+    #[serde(default)]
+    pub anonymized: bool,
 }
 
 #[cfg(test)]

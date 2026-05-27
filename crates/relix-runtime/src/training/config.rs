@@ -19,6 +19,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use super::pii::PiiConfig;
+
 /// Default location for the training database next to a
 /// controller's data dir. Mirrors `default_metrics_path`.
 pub fn default_training_path(data_dir: &std::path::Path) -> PathBuf {
@@ -51,6 +53,11 @@ pub struct TrainingConfig {
     pub export_dir: Option<PathBuf>,
     #[serde(default = "default_min_quality_score")]
     pub min_quality_score: f32,
+    /// `[training.pii]` — RELIX-7.15 PII anonymization layer.
+    /// Absent / disabled means recorder + exporter run without
+    /// the redaction pass, matching the pre-PII pipeline shape.
+    #[serde(default)]
+    pub pii: PiiConfig,
 }
 
 impl Default for TrainingConfig {
@@ -65,6 +72,7 @@ impl Default for TrainingConfig {
             scorer_batch_size: default_scorer_batch_size(),
             export_dir: None,
             min_quality_score: default_min_quality_score(),
+            pii: PiiConfig::default(),
         }
     }
 }

@@ -32,8 +32,9 @@ pub use coordinator::{register, training_capability_descriptors};
 pub use exporter::{ExportEngine, ExportError, ExportFilters, ExportFormat, ExportResult};
 pub use pii::{PiiAnonymizer, PiiConfig, PiiDetector, PiiSpan, PiiStrategy, PiiType};
 pub use recorder::{
-    CollectingInteractionSink, InteractionRecorder, InteractionSink, NullInteractionSink,
-    RecorderWorkerHandles, RetentionConfig, SpawnedRecorder,
+    AgentTrainingPolicies, CollectingInteractionSink, InteractionRecorder, InteractionSink,
+    NullInteractionSink, RecorderWorkerHandles, RetentionConfig, SpawnedRecorder, anonymize_record,
+    apply_anonymizer,
 };
 pub use scorer::{
     QualityScorer, ScoreBreakdown, ScorerConfig, score_one, score_one_batch, spawn_scorer_loop,

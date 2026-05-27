@@ -1,6 +1,6 @@
 //! RELIX-7.15 — coordinator-side capability registration.
 //!
-//! Six capabilities, all unary, all JSON-encoded:
+//! Eight capabilities, all unary, all JSON-encoded:
 //!
 //! - `training.list_interactions`
 //! - `training.get_interaction`
@@ -8,6 +8,8 @@
 //! - `training.score_interaction`
 //! - `training.stats`
 //! - `training.delete_interaction`
+//! - `training.pii_scan`           — RELIX-7.15 PII step
+//! - `training.anonymize_preview`  — RELIX-7.15 PII step
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,18 +18,28 @@ use relix_core::types::{ErrorEnvelope, error_kinds};
 use serde::Deserialize;
 
 use super::exporter::{ExportEngine, ExportFilters, ExportFormat};
+use super::pii::{PiiAnonymizer, PiiConfig, PiiDetector, PiiStrategy};
 use super::scorer;
 use super::store::{ListFilters, TrainingStore};
 use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
-/// Wire every training capability onto `bridge`.
-pub fn register(bridge: &mut DispatchBridge, store: TrainingStore, export_dir: PathBuf) {
+/// Wire every training capability onto `bridge`. `anonymizer`
+/// is the global PII anonymizer the export engine uses for
+/// the safety-net pass.
+pub fn register(
+    bridge: &mut DispatchBridge,
+    store: TrainingStore,
+    export_dir: PathBuf,
+    anonymizer: Arc<PiiAnonymizer>,
+) {
     register_list_interactions(bridge, store.clone());
     register_get_interaction(bridge, store.clone());
     register_score_interaction(bridge, store.clone());
     register_stats(bridge, store.clone());
     register_delete_interaction(bridge, store.clone());
-    register_export(bridge, store, export_dir);
+    register_pii_scan(bridge);
+    register_anonymize_preview(bridge, anonymizer.clone());
+    register_export(bridge, store, export_dir, anonymizer);
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -196,12 +208,18 @@ struct ExportArgs {
     filters: ExportFilters,
 }
 
-fn register_export(bridge: &mut DispatchBridge, store: TrainingStore, default_output_dir: PathBuf) {
+fn register_export(
+    bridge: &mut DispatchBridge,
+    store: TrainingStore,
+    default_output_dir: PathBuf,
+    anonymizer: Arc<PiiAnonymizer>,
+) {
     bridge.register(
         "training.export",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
             let store = store.clone();
             let default_output_dir = default_output_dir.clone();
+            let anonymizer = anonymizer.clone();
             async move {
                 let args = match decode::<ExportArgs>(&ctx.args) {
                     Ok(a) => a,
@@ -221,13 +239,91 @@ fn register_export(bridge: &mut DispatchBridge, store: TrainingStore, default_ou
                     .as_deref()
                     .map(PathBuf::from)
                     .unwrap_or(default_output_dir);
-                let engine = ExportEngine::new(store, out_dir);
+                let engine = ExportEngine::new(store, out_dir).with_anonymizer(anonymizer);
                 let now = super::recorder::now_ms();
                 match engine.export(format, &args.filters, &args.export_set, now) {
                     Ok(res) => ok_json(&res),
                     Err(super::exporter::ExportError::InvalidArgs(m)) => invalid(&m),
                     Err(e) => internal(&e),
                 }
+            }
+        })),
+    );
+}
+
+// ── RELIX-7.15 PII capabilities ──────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct PiiScanArgs {
+    #[serde(default)]
+    text: String,
+}
+
+fn register_pii_scan(bridge: &mut DispatchBridge) {
+    bridge.register(
+        "training.pii_scan",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| async move {
+            let args = match decode::<PiiScanArgs>(&ctx.args) {
+                Ok(a) => a,
+                Err(out) => return out,
+            };
+            if args.text.is_empty() {
+                return invalid("text is required");
+            }
+            let spans = PiiDetector.scan(&args.text);
+            ok_json(&serde_json::json!({
+                "spans": spans,
+                "count": spans.len() as u64,
+            }))
+        })),
+    );
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AnonymizePreviewArgs {
+    #[serde(default)]
+    text: String,
+    /// Override the global strategy for this preview only.
+    /// Accepts `"redact"` / `"pseudonymize"` / `"allow"`.
+    /// `None` keeps the global anonymizer.
+    #[serde(default)]
+    strategy: Option<String>,
+}
+
+fn register_anonymize_preview(bridge: &mut DispatchBridge, default_anonymizer: Arc<PiiAnonymizer>) {
+    bridge.register(
+        "training.anonymize_preview",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let default_anonymizer = default_anonymizer.clone();
+            async move {
+                let args = match decode::<AnonymizePreviewArgs>(&ctx.args) {
+                    Ok(a) => a,
+                    Err(out) => return out,
+                };
+                if args.text.is_empty() {
+                    return invalid("text is required");
+                }
+                let anonymizer: Arc<PiiAnonymizer> = match args.strategy.as_deref() {
+                    None => default_anonymizer,
+                    Some(s) => {
+                        let Some(strategy) = PiiStrategy::parse(s) else {
+                            return invalid(&format!(
+                                "unknown strategy {s:?}; expected redact / pseudonymize / allow"
+                            ));
+                        };
+                        Arc::new(PiiAnonymizer::from_config(&PiiConfig {
+                            enabled: true,
+                            strategy,
+                            overrides: Default::default(),
+                        }))
+                    }
+                };
+                let spans = PiiDetector.scan(&args.text);
+                let anonymized = anonymizer.apply(&args.text, &spans);
+                ok_json(&serde_json::json!({
+                    "anonymized": anonymized,
+                    "spans": spans,
+                }))
             }
         })),
     );
@@ -281,8 +377,10 @@ fn internal<E: std::fmt::Display>(e: &E) -> HandlerOutcome {
     })
 }
 
-/// Static descriptor list for the six capabilities. Mirrors
-/// `metrics_capability_descriptors` in `controller_runtime`.
+/// Static descriptor list for the eight capabilities (six
+/// from the original surface + two RELIX-7.15 PII additions).
+/// Mirrors `metrics_capability_descriptors` in
+/// `controller_runtime`.
 pub fn training_capability_descriptors() -> &'static [(&'static str, &'static str)] {
     &[
         (
@@ -303,7 +401,8 @@ pub fn training_capability_descriptors() -> &'static [(&'static str, &'static st
             "Materialise an export file. Args: JSON \
              { format, export_set, output_dir?, min_quality_score?, agent?, session_id?, \
                date_from?, date_to?, max_interactions?, include_tool_calls? }. \
-             Returns { matched_count, exported_count, output_path?, total_tokens }.",
+             Returns { matched_count, exported_count, output_path?, total_tokens, \
+             anonymized_at_export }.",
         ),
         (
             "training.score_interaction",
@@ -320,6 +419,20 @@ pub fn training_capability_descriptors() -> &'static [(&'static str, &'static st
             "training.delete_interaction",
             "Hard-delete an interaction. Args: JSON { interaction_id }. \
              Returns { interaction_id, deleted: true } on success.",
+        ),
+        (
+            "training.pii_scan",
+            "Detect PII spans in arbitrary text. Args: JSON \
+             { text }. Returns { spans: [{ pii_type, start, end, matched_text }], count }. \
+             Operators use this to audit what PII would be detected before enabling the \
+             record-time anonymizer.",
+        ),
+        (
+            "training.anonymize_preview",
+            "Preview what the PII anonymizer would output. Args: JSON \
+             { text, strategy? }. `strategy` is optional and overrides the global \
+             `[training.pii] strategy` for the preview only (one of redact / pseudonymize / \
+             allow). Returns { anonymized, spans }.",
         ),
     ]
 }
@@ -374,13 +487,18 @@ mod tests {
         let (mut bridge, dir) = fresh_bridge();
         let store = TrainingStore::in_memory().unwrap();
         store.insert(&sample("a")).unwrap();
-        register(&mut bridge, store, dir.path().to_path_buf());
+        register(
+            &mut bridge,
+            store,
+            dir.path().to_path_buf(),
+            Arc::new(PiiAnonymizer::disabled()),
+        );
         // Capability registration alone should not panic.
         let _snapshot = bridge.capability_stats_snapshot();
     }
 
     #[test]
-    fn descriptors_cover_six_methods() {
+    fn descriptors_cover_every_capability() {
         let methods: Vec<&str> = training_capability_descriptors()
             .iter()
             .map(|(m, _)| *m)
@@ -392,6 +510,8 @@ mod tests {
             "training.score_interaction",
             "training.stats",
             "training.delete_interaction",
+            "training.pii_scan",
+            "training.anonymize_preview",
         ] {
             assert!(
                 methods.contains(&expected),

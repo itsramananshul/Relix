@@ -18,9 +18,12 @@
 //! returns `exported_count = 0`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use super::pii::PiiAnonymizer;
+use super::recorder::anonymize_record;
 use super::store::{ListFilters, TrainingStore, TrainingStoreError};
 use super::types::{InteractionId, InteractionRecord};
 
@@ -118,6 +121,14 @@ pub struct ExportResult {
     pub total_tokens: u64,
     pub format: ExportFormat,
     pub export_set: String,
+    /// RELIX-7.15 PII step: number of rows the engine
+    /// anonymized at export time (their `anonymized = false`
+    /// state was flipped to `true` and the redacted content
+    /// written back to `training.sqlite`). Always `0` when the
+    /// engine's anonymizer is disabled OR every matched row
+    /// was already anonymized by the recorder.
+    #[serde(default)]
+    pub anonymized_at_export: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,14 +146,31 @@ pub enum ExportError {
 pub struct ExportEngine {
     store: TrainingStore,
     output_dir: PathBuf,
+    /// Safety-net anonymizer. Applied at export time to every
+    /// row whose `anonymized = false` (i.e. recorded before
+    /// `[training.pii]` was enabled). When the anonymizer is
+    /// disabled this is a pass-through and rows render
+    /// verbatim.
+    anonymizer: Arc<PiiAnonymizer>,
 }
 
 impl ExportEngine {
+    /// Cons. PII anonymization defaults OFF — call
+    /// [`with_anonymizer`](Self::with_anonymizer) to wire the
+    /// safety-net pass on.
     pub fn new(store: TrainingStore, output_dir: impl Into<PathBuf>) -> Self {
         Self {
             store,
             output_dir: output_dir.into(),
+            anonymizer: Arc::new(PiiAnonymizer::disabled()),
         }
+    }
+
+    /// Replace the anonymizer the engine applies at export
+    /// time to un-anonymized rows.
+    pub fn with_anonymizer(mut self, anonymizer: Arc<PiiAnonymizer>) -> Self {
+        self.anonymizer = anonymizer;
+        self
     }
 
     /// Run an export. `now_unix_ms` is taken as a parameter so
@@ -168,11 +196,11 @@ impl ExportEngine {
             exported: None,
             require_scored: true,
         };
-        let rows = self
+        let raw_rows = self
             .store
             .list_for_export(&list_filters, filters.max_interactions)?;
-        let matched_count = rows.len() as u64;
-        if rows.is_empty() {
+        let matched_count = raw_rows.len() as u64;
+        if raw_rows.is_empty() {
             return Ok(ExportResult {
                 matched_count: 0,
                 exported_count: 0,
@@ -180,7 +208,39 @@ impl ExportEngine {
                 total_tokens: 0,
                 format,
                 export_set: export_set.to_string(),
+                anonymized_at_export: 0,
             });
+        }
+
+        // RELIX-7.15 PII safety net: every row whose
+        // `anonymized = false` runs through the export-time
+        // anonymizer before rendering. We also write the
+        // anonymized content back to the database so the
+        // redaction is permanent — operators auditing the
+        // store after an export can no longer see the raw
+        // values. Rows whose `anonymized = true` (recorder
+        // already redacted them) pass through unchanged.
+        let mut anonymized_at_export: u64 = 0;
+        let mut rows: Vec<InteractionRecord> = Vec::with_capacity(raw_rows.len());
+        for r in raw_rows {
+            if r.anonymized || !self.anonymizer.enabled() {
+                rows.push(r);
+                continue;
+            }
+            let scrubbed = anonymize_record(&r, &self.anonymizer);
+            // Persist the redaction so the next export pass
+            // (and any operator inspection of training.sqlite)
+            // sees the anonymized values instead of the raw
+            // ones.
+            self.store.store_anonymized_content(
+                scrubbed.interaction_id.as_str(),
+                &scrubbed.system_prompt,
+                &scrubbed.user_message,
+                &scrubbed.response,
+                &scrubbed.tool_calls,
+            )?;
+            anonymized_at_export += 1;
+            rows.push(scrubbed);
         }
 
         let total_tokens: u64 = rows.iter().map(|r| r.token_count.unwrap_or(0) as u64).sum();
@@ -206,6 +266,7 @@ impl ExportEngine {
             total_tokens,
             format,
             export_set: export_set.to_string(),
+            anonymized_at_export,
         })
     }
 }
@@ -674,5 +735,117 @@ mod tests {
             Some(ExportFormat::RawJson)
         );
         assert_eq!(ExportFormat::from_str_loose("unknown"), None);
+    }
+
+    // ── RELIX-7.15 PII export integration ──────────────────
+
+    fn pii_record_for_export(id: &str, score: f32, anonymized: bool) -> InteractionRecord {
+        let mut r = record(id, "alice", "Reply scheduled to alice@example.com.", score);
+        r.system_prompt = "you are alice".into();
+        r.user_message = "email me at alice@example.com".into();
+        r.response = "Reply scheduled to alice@example.com.".into();
+        r.anonymized = anonymized;
+        r
+    }
+
+    fn redact_anon_arc() -> std::sync::Arc<super::PiiAnonymizer> {
+        std::sync::Arc::new(super::PiiAnonymizer::from_config(
+            &super::super::pii::PiiConfig {
+                enabled: true,
+                strategy: super::super::pii::PiiStrategy::Redact,
+                overrides: Default::default(),
+            },
+        ))
+    }
+
+    #[test]
+    fn export_time_anonymization_runs_on_un_anonymized_rows() {
+        let store = TrainingStore::in_memory().unwrap();
+        store
+            .insert(&pii_record_for_export("raw", 0.9, false))
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let eng = ExportEngine::new(store.clone(), dir.path().to_path_buf())
+            .with_anonymizer(redact_anon_arc());
+        let res = eng
+            .export(
+                ExportFormat::Generic,
+                &ExportFilters {
+                    min_quality_score: 0.0,
+                    ..ExportFilters::default()
+                },
+                "set-x",
+                1_700_000_000_100,
+            )
+            .unwrap();
+        assert_eq!(res.matched_count, 1);
+        assert_eq!(res.anonymized_at_export, 1);
+        // The output JSONL contains the placeholder, not the
+        // raw email.
+        let body = std::fs::read_to_string(res.output_path.unwrap()).unwrap();
+        assert!(body.contains("[EMAIL]"));
+        assert!(!body.contains("alice@example.com"));
+        // And the row is rewritten on-disk so the next
+        // operator who reads training.sqlite sees the
+        // anonymized values.
+        let got = store.get("raw").unwrap().unwrap();
+        assert!(got.user_message.contains("[EMAIL]"));
+        assert!(got.anonymized);
+    }
+
+    #[test]
+    fn export_time_anonymization_skips_already_anonymized_rows() {
+        let store = TrainingStore::in_memory().unwrap();
+        // Pretend this row was already anonymized by the
+        // recorder: `anonymized = true`, prompts already
+        // contain placeholders, no raw PII present.
+        let mut pre = pii_record_for_export("pre", 0.9, true);
+        pre.user_message = "email me at [EMAIL]".into();
+        pre.response = "Reply scheduled to [EMAIL].".into();
+        store.insert(&pre).unwrap();
+        let dir = TempDir::new().unwrap();
+        let eng = ExportEngine::new(store.clone(), dir.path().to_path_buf())
+            .with_anonymizer(redact_anon_arc());
+        let res = eng
+            .export(
+                ExportFormat::Generic,
+                &ExportFilters {
+                    min_quality_score: 0.0,
+                    ..ExportFilters::default()
+                },
+                "set-y",
+                1_700_000_000_101,
+            )
+            .unwrap();
+        assert_eq!(res.matched_count, 1);
+        // Already-anonymized rows MUST NOT be touched again.
+        assert_eq!(res.anonymized_at_export, 0);
+    }
+
+    #[test]
+    fn export_with_disabled_anonymizer_keeps_raw_text() {
+        let store = TrainingStore::in_memory().unwrap();
+        store
+            .insert(&pii_record_for_export("raw2", 0.9, false))
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let eng = ExportEngine::new(store.clone(), dir.path().to_path_buf());
+        let res = eng
+            .export(
+                ExportFormat::Generic,
+                &ExportFilters {
+                    min_quality_score: 0.0,
+                    ..ExportFilters::default()
+                },
+                "set-z",
+                1_700_000_000_102,
+            )
+            .unwrap();
+        assert_eq!(res.anonymized_at_export, 0);
+        let body = std::fs::read_to_string(res.output_path.unwrap()).unwrap();
+        assert!(body.contains("alice@example.com"));
+        // Row stays un-anonymized.
+        let got = store.get("raw2").unwrap().unwrap();
+        assert!(!got.anonymized);
     }
 }

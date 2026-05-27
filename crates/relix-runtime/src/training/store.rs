@@ -143,7 +143,8 @@ impl TrainingStore {
             "SELECT interaction_id, session_id, agent, model, provider, \
                     system_prompt, user_message, response, tool_calls_json, \
                     token_count, prompt_tokens, completion_tokens, latency_ms, \
-                    success, error_kind, recorded_at, quality_score, exported, export_set \
+                    success, error_kind, recorded_at, quality_score, exported, export_set, \
+                    anonymized \
              FROM training_interactions WHERE interaction_id = ?1",
         )?;
         let row = stmt
@@ -174,6 +175,39 @@ impl TrainingStore {
         let n = conn.execute(
             "UPDATE training_interactions SET quality_score = ?1 WHERE interaction_id = ?2",
             params![score.map(|s| s as f64), interaction_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Replace `system_prompt` / `user_message` / `response` /
+    /// `tool_calls_json` and flip `anonymized = 1` for one
+    /// interaction. Used by the export engine's safety-net
+    /// path: rows recorded before anonymization was enabled
+    /// get anonymized on first export, then the on-disk row is
+    /// rewritten so the redaction is permanent.
+    pub fn store_anonymized_content(
+        &self,
+        interaction_id: &str,
+        system_prompt: &str,
+        user_message: &str,
+        response: &str,
+        tool_calls: &[ToolCallRecord],
+    ) -> Result<bool, TrainingStoreError> {
+        let tool_calls_json = serde_json::to_string(tool_calls)
+            .map_err(|e| TrainingStoreError::Encode(e.to_string()))?;
+        let conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
+        let n = conn.execute(
+            "UPDATE training_interactions \
+             SET system_prompt = ?1, user_message = ?2, response = ?3, \
+                 tool_calls_json = ?4, anonymized = 1 \
+             WHERE interaction_id = ?5",
+            params![
+                system_prompt,
+                user_message,
+                response,
+                tool_calls_json,
+                interaction_id,
+            ],
         )?;
         Ok(n > 0)
     }
@@ -220,7 +254,7 @@ impl TrainingStore {
         let sql = format!(
             "SELECT interaction_id, session_id, agent, model, provider, \
                     user_message, latency_ms, success, error_kind, token_count, \
-                    recorded_at, quality_score, exported, export_set \
+                    recorded_at, quality_score, exported, export_set, anonymized \
              FROM training_interactions {where_clause} \
              ORDER BY recorded_at DESC LIMIT ?{lim} OFFSET ?{off}",
             lim = params_vec.len() + 1,
@@ -246,7 +280,8 @@ impl TrainingStore {
             "SELECT interaction_id, session_id, agent, model, provider, \
                     system_prompt, user_message, response, tool_calls_json, \
                     token_count, prompt_tokens, completion_tokens, latency_ms, \
-                    success, error_kind, recorded_at, quality_score, exported, export_set \
+                    success, error_kind, recorded_at, quality_score, exported, export_set, \
+                    anonymized \
              FROM training_interactions \
              WHERE quality_score IS NULL \
              ORDER BY recorded_at ASC LIMIT ?1",
@@ -282,7 +317,8 @@ impl TrainingStore {
             "SELECT interaction_id, session_id, agent, model, provider, \
                     system_prompt, user_message, response, tool_calls_json, \
                     token_count, prompt_tokens, completion_tokens, latency_ms, \
-                    success, error_kind, recorded_at, quality_score, exported, export_set \
+                    success, error_kind, recorded_at, quality_score, exported, export_set, \
+                    anonymized \
              FROM training_interactions {where_clause} {order} {limit_clause}",
         );
         let conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
@@ -375,8 +411,8 @@ fn insert_one(conn: &Connection, rec: &InteractionRecord) -> Result<(), Training
          (interaction_id, session_id, agent, model, provider, \
           system_prompt, user_message, response, tool_calls_json, \
           token_count, prompt_tokens, completion_tokens, latency_ms, \
-          success, error_kind, recorded_at, quality_score, exported, export_set) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+          success, error_kind, recorded_at, quality_score, exported, export_set, anonymized) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             rec.interaction_id.as_str(),
             rec.session_id,
@@ -397,6 +433,7 @@ fn insert_one(conn: &Connection, rec: &InteractionRecord) -> Result<(), Training
             rec.quality_score.map(|v| v as f64),
             rec.exported as i32,
             rec.export_set,
+            rec.anonymized as i32,
         ],
     )?;
     Ok(())
@@ -427,6 +464,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<InteractionRecord>
         quality_score: row.get::<_, Option<f64>>(16)?.map(|v| v as f32),
         exported: row.get::<_, i32>(17)? != 0,
         export_set: row.get(18)?,
+        anonymized: row.get::<_, i32>(19)? != 0,
     })
 }
 
@@ -449,6 +487,7 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<InteractionSummar
         exported: row.get::<_, i32>(12)? != 0,
         export_set: row.get(13)?,
         user_preview,
+        anonymized: row.get::<_, i32>(14)? != 0,
     })
 }
 
@@ -540,7 +579,8 @@ fn init_schema(conn: &Connection) -> Result<(), TrainingStoreError> {
              recorded_at       INTEGER NOT NULL,\
              quality_score     REAL,\
              exported          INTEGER NOT NULL DEFAULT 0,\
-             export_set        TEXT\
+             export_set        TEXT,\
+             anonymized        INTEGER NOT NULL DEFAULT 0\
          );\
          CREATE INDEX IF NOT EXISTS training_interactions_session \
              ON training_interactions(session_id);\
@@ -551,9 +591,37 @@ fn init_schema(conn: &Connection) -> Result<(), TrainingStoreError> {
          CREATE INDEX IF NOT EXISTS training_interactions_score \
              ON training_interactions(quality_score);\
          CREATE INDEX IF NOT EXISTS training_interactions_export \
-             ON training_interactions(exported, quality_score DESC);",
+             ON training_interactions(exported, quality_score DESC);\
+         CREATE INDEX IF NOT EXISTS training_interactions_anonymized \
+             ON training_interactions(anonymized);",
     )?;
+    // Backwards-compat: if a pre-7.15-PII database (no
+    // `anonymized` column) opens against this build, the
+    // CREATE TABLE IF NOT EXISTS above is a no-op and we
+    // need to add the column in place. SQLite has no
+    // `ADD COLUMN IF NOT EXISTS`, so we probe `PRAGMA
+    // table_info` first.
+    if !column_exists(conn, "training_interactions", "anonymized")? {
+        conn.execute_batch(
+            "ALTER TABLE training_interactions \
+             ADD COLUMN anonymized INTEGER NOT NULL DEFAULT 0;\
+             CREATE INDEX IF NOT EXISTS training_interactions_anonymized \
+                 ON training_interactions(anonymized);",
+        )?;
+    }
     Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, TrainingStoreError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for r in rows {
+        let name = r?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Default location for the training database next to the rest
@@ -598,6 +666,7 @@ mod tests {
             quality_score: None,
             exported: false,
             export_set: None,
+            anonymized: false,
         }
     }
 
