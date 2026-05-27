@@ -1,18 +1,24 @@
 //! `relix-cli flow ...` — workflow scaffolding helpers.
 //!
-//! Today only `flow yaml` is supported: it prints a minimal
-//! YAML flow template to stdout. Developers can pipe it into
-//! a file, edit peer/method/arg, and run it through
-//! `relix-cli flow-run` without ever opening a tutorial.
+//! `flow yaml [--template <name>]` prints a minimal YAML
+//! flow template to stdout. Four templates ship:
 //!
-//! The template is intentionally tiny — a single
-//! `remote_call` returning the response. It covers the
-//! 80% case (call one peer, get a reply, return it) and
-//! exposes the keys an operator will need to extend it
-//! (more steps, `assign`, `stream`, `try` etc. all live in
-//! `docs/yaml-flow-reference.md`).
+//! - `chat` (default) — single `remote_call` returning the
+//!   reply. The 80% case operators reach for first.
+//! - `stream` — same shape but uses `stream:` so the
+//!   operator gets a streaming flow without re-reading the
+//!   reference.
+//! - `try` — wraps a `call` in a three-clause multi-catch
+//!   (`timeout` / `policy_denied` / `any`) so the error
+//!   handling pattern is right there.
+//! - `loop` — counted loop calling a peer N times.
+//!
+//! All four templates compile through
+//! `relix_runtime::yaml_flow::compile_source` without error
+//! — a developer copying any of them sees a working flow on
+//! their first run.
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
@@ -20,24 +26,47 @@ pub enum Cmd {
     /// Pipe into a file (e.g. `relix flow yaml > my.yml`),
     /// edit the peer/method/arg, then run it through
     /// `relix-cli flow-run --flow my.yml ...`.
-    Yaml,
+    ///
+    /// `--template <name>` picks which scaffold to emit:
+    /// `chat` (default), `stream`, `try`, `loop`.
+    Yaml {
+        /// Which template to scaffold.
+        #[arg(long, value_enum, default_value_t = TemplateKind::Chat)]
+        template: TemplateKind,
+    },
 }
 
-/// Minimal YAML flow template — single remote_call + result
-/// pattern an operator can adapt in under five minutes.
-/// Uses local `let` steps to seed the session id and the
-/// user message so the scaffold compiles AND runs without
-/// any external substitution. Operators editing this for a
-/// bridge-rendered template just replace the seeded values
-/// with `{{SESSION}}` / `{{MESSAGE}}` placeholders (the
-/// bridge does the string substitution before the flow
-/// hits the compiler — see `flows/chat_template.yml`).
-const YAML_TEMPLATE: &str = "# Minimal Relix YAML flow. Fill in your peer + method + arg.
+/// Catalog of YAML scaffolds. Names are stable — operators
+/// will script against them. Add new entries at the END so
+/// existing automation keeps working.
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum TemplateKind {
+    /// Single `remote_call` returning the reply.
+    Chat,
+    /// Streaming variant using `stream:`.
+    Stream,
+    /// `try` with multi-catch error handling.
+    Try,
+    /// Counted loop calling a peer N times.
+    Loop,
+}
+
+impl TemplateKind {
+    pub fn body(self) -> &'static str {
+        match self {
+            TemplateKind::Chat => CHAT_TEMPLATE,
+            TemplateKind::Stream => STREAM_TEMPLATE,
+            TemplateKind::Try => TRY_TEMPLATE,
+            TemplateKind::Loop => LOOP_TEMPLATE,
+        }
+    }
+}
+
+const CHAT_TEMPLATE: &str = "# Minimal Relix YAML flow — chat scaffold.
 #
-# Steps execute top-down. `call` runs a unary capability;
-# `stream` is the streaming variant; `assign:` binds the
-# response to a variable. See docs/yaml-flow-reference.md
-# for the full surface (let, if, loop, try, catch, ...).
+# Pipe into a file: relix-cli flow yaml > my.yml
+# Run:               relix-cli flow-run --flow my.yml ...
+# Full reference:    docs/yaml-flow-reference.md
 
 steps:
   - let:
@@ -58,9 +87,111 @@ steps:
   - result: \"{{reply}}\"
 ";
 
+const STREAM_TEMPLATE: &str = "# Relix YAML flow — streaming scaffold.
+#
+# `stream:` lowers to remote_call_stream — chunks flow back
+# through the host's chunk observer (the bridge's SSE
+# response, for example) while the VM is still running.
+
+steps:
+  - let:
+      name: session
+      type: str
+      value: \"demo-session\"
+  - let:
+      name: message
+      type: str
+      value: \"hello\"
+
+  - stream:
+      peer: ai
+      method: ai.chat.stream
+      arg: \"{{session}}|{{message}}|\"
+      assign: reply
+
+  - result: \"{{reply}}\"
+";
+
+const TRY_TEMPLATE: &str = "# Relix YAML flow — error-handling scaffold.
+#
+# Multi-catch: timeout / policy_denied / any. First matching
+# clause wins. Inside a catch, error_kind() and error_cause()
+# expose the current failure.
+
+steps:
+  - let:
+      name: session
+      type: str
+      value: \"demo-session\"
+  - let:
+      name: message
+      type: str
+      value: \"hello\"
+  - let:
+      name: reply
+      type: str
+      value: \"\"
+
+  - try:
+      steps:
+        - call:
+            peer: ai
+            method: ai.chat
+            arg: \"{{session}}|{{message}}|\"
+            assign: reply
+      catch:
+        - kind: timeout
+          steps:
+            - let:
+                name: reply
+                type: str
+                value: \"timed out, try again\"
+        - kind: policy_denied
+          steps:
+            - let:
+                name: reply
+                type: str
+                value: \"not allowed\"
+        - kind: any
+          steps:
+            - let:
+                name: reply
+                type: str
+                value: \"error\"
+
+  - result: \"{{reply}}\"
+";
+
+const LOOP_TEMPLATE: &str = "# Relix YAML flow — counted-loop scaffold.
+#
+# Calls a peer N times, collecting each reply into a list.
+# Adapt the body to do whatever per-iteration work you need.
+
+steps:
+  - let:
+      name: results
+      type: list
+      value: []
+  - let:
+      name: reply
+      type: str
+      value: \"\"
+
+  - loop:
+      times: 3
+      steps:
+        - call:
+            peer: ai
+            method: ai.chat
+            arg: \"demo|tick|\"
+            assign: reply
+
+  - result: \"{{reply}}\"
+";
+
 pub fn run(cmd: Cmd) {
     match cmd {
-        Cmd::Yaml => print!("{YAML_TEMPLATE}"),
+        Cmd::Yaml { template } => print!("{}", template.body()),
     }
 }
 
@@ -68,37 +199,104 @@ pub fn run(cmd: Cmd) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn yaml_template_compiles_through_yaml_frontend() {
-        // The scaffold output MUST be a valid YAML flow.
-        // Anything the operator gets here should run through
-        // the compiler cleanly so they don't hit a parse
-        // error on their very first edit-cycle.
-        let bc = relix_runtime::yaml_flow::compile_source(YAML_TEMPLATE)
-            .unwrap_or_else(|e| panic!("scaffold YAML failed to compile: {e}"));
-        assert!(!bc.is_empty(), "scaffold must produce non-empty bytecode");
+    fn assert_compiles(template: TemplateKind) {
+        let body = template.body();
+        relix_runtime::yaml_flow::compile_source(body)
+            .unwrap_or_else(|e| panic!("scaffold {template:?} failed to compile: {e}\n{body}"));
     }
 
     #[test]
-    fn yaml_template_contains_the_required_keys() {
-        // Smoke check: every operator-facing field that
-        // distinguishes a real YAML flow must be in the
-        // emitted text. Catches accidental template
-        // truncation.
-        assert!(YAML_TEMPLATE.contains("steps:"));
-        assert!(YAML_TEMPLATE.contains("- call:"));
-        assert!(YAML_TEMPLATE.contains("peer:"));
-        assert!(YAML_TEMPLATE.contains("method:"));
-        assert!(YAML_TEMPLATE.contains("arg:"));
-        assert!(YAML_TEMPLATE.contains("assign:"));
-        assert!(YAML_TEMPLATE.contains("- result:"));
+    fn chat_template_compiles_through_yaml_frontend() {
+        assert_compiles(TemplateKind::Chat);
     }
 
     #[test]
-    fn yaml_template_starts_with_a_comment_so_operators_see_the_intent() {
+    fn stream_template_compiles_through_yaml_frontend() {
+        assert_compiles(TemplateKind::Stream);
+    }
+
+    #[test]
+    fn try_template_compiles_through_yaml_frontend() {
+        assert_compiles(TemplateKind::Try);
+    }
+
+    #[test]
+    fn loop_template_compiles_through_yaml_frontend() {
+        assert_compiles(TemplateKind::Loop);
+    }
+
+    #[test]
+    fn chat_template_contains_the_required_keys() {
+        let body = TemplateKind::Chat.body();
+        for key in &[
+            "steps:",
+            "- call:",
+            "peer:",
+            "method:",
+            "arg:",
+            "assign:",
+            "- result:",
+        ] {
+            assert!(
+                body.contains(key),
+                "chat scaffold should contain {key}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_template_uses_stream_step() {
+        let body = TemplateKind::Stream.body();
         assert!(
-            YAML_TEMPLATE.trim_start().starts_with('#'),
-            "first non-blank line should be a comment"
+            body.contains("- stream:"),
+            "stream scaffold missing `- stream:`: {body}"
         );
+    }
+
+    #[test]
+    fn try_template_uses_multi_catch_with_three_kinds() {
+        let body = TemplateKind::Try.body();
+        assert!(
+            body.contains("- try:"),
+            "try scaffold missing `- try:`: {body}"
+        );
+        assert!(
+            body.contains("- kind: timeout"),
+            "missing timeout clause: {body}"
+        );
+        assert!(
+            body.contains("- kind: policy_denied"),
+            "missing policy_denied clause: {body}"
+        );
+        assert!(body.contains("- kind: any"), "missing any clause: {body}");
+    }
+
+    #[test]
+    fn loop_template_uses_counted_loop_step() {
+        let body = TemplateKind::Loop.body();
+        assert!(
+            body.contains("- loop:"),
+            "loop scaffold missing `- loop:`: {body}"
+        );
+        assert!(
+            body.contains("times:"),
+            "loop scaffold missing `times:`: {body}"
+        );
+    }
+
+    #[test]
+    fn every_template_starts_with_a_comment_so_operators_see_the_intent() {
+        for t in [
+            TemplateKind::Chat,
+            TemplateKind::Stream,
+            TemplateKind::Try,
+            TemplateKind::Loop,
+        ] {
+            let body = t.body();
+            assert!(
+                body.trim_start().starts_with('#'),
+                "{t:?} should start with a comment:\n{body}"
+            );
+        }
     }
 }
