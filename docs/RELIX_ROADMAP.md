@@ -1406,7 +1406,7 @@ four shapes the major fine-tuning platforms expect.
   (`POST /v1/training/pii/{scan,preview}`) round out the
   operator surface for training data.
 - **PII anonymization across all four memory layers**
-  `[DONE — commits 049f43b + 982e75d]`. Extends the same
+  `[DONE — commits 049f43b + 982e75d + 655e26b]`. Extends the same
   PiiDetector + PiiAnonymizer to the four-layer
   `memory_records` pipeline + the underlying turns table.
   New `[memory.pii]` config block (reuses the same
@@ -1429,30 +1429,55 @@ four shapes the major fine-tuning platforms expect.
       anonymized BEFORE insert, so even an LLM that
       hallucinates a value can't smuggle PII into
       Observation / Model rows.
-  Two new coordinator capabilities
-  (`memory.pii_scan` + `memory.anonymize_preview`) +
-  two bridge endpoints
-  (`POST /v1/memory/pii/{scan,preview}`) mirror the
-  training surface. The caps are registered
-  unconditionally even when `[memory.pii]` is disabled, so
-  operators can audit / preview before flipping it on.
+  Three coordinator capabilities
+  (`memory.pii_scan` + `memory.anonymize_preview` +
+  `memory.bulk_anonymize`) + three bridge endpoints
+  (`POST /v1/memory/pii/{scan,preview,bulk_anonymize}`)
+  mirror the training surface. The scan + preview caps are
+  registered unconditionally even when `[memory.pii]` is
+  disabled, so operators can audit / preview before
+  flipping it on. The `bulk_anonymize` migration cap walks
+  every row in the turns table AND the four-layer
+  `memory_records` table (added in commit 655e26b), rewrites
+  each through the configured anonymizer, and returns
+  per-table + per-layer `(scanned, changed)` counts.
+  Idempotent — re-running on a clean store reports zero
+  `changed`. Refuses to run when `[memory.pii] enabled =
+  false` so a misconfigured controller doesn't silently
+  no-op. This closes the migration-script gap left over
+  from the initial four-layer ship: operators who flipped
+  `[memory.pii]` on a store that already accrued history
+  can now scrub every existing row in one call instead of
+  waiting for rows to re-enter the embed / promote
+  pipeline.
   Defaults to `enabled = false` so existing deployments
   see byte-identical behaviour until they opt in. RAG
   trade-off documented: anonymization at storage time
   reduces recall on PII-keyed queries — operators choosing
   to enable `[memory.pii]` make that explicit privacy
   trade.
-  Tests added this commit: 5 memory-layer integration
-  cases (turns + Layer 1 redact on write_turn, disabled
-  pass-through, pii_scan handler returns spans, pii_scan
-  rejects empty text, anonymize_preview explicit strategy
-  + unknown-strategy reject) + 2 bridge tests (one
-  `bad_request_returns_400` + one mini-mesh integration
-  test with four scenarios). All quality gates green:
-  cargo fmt --all, cargo clippy --workspace --all-targets
-  -- -D warnings, cargo test --workspace (2174 runtime +
-  456 bridge + 238 CLI). The `[memory.pii]` config block
-  AND the training `[training.pii]` block can be configured
+  Tests added across the sub-features:
+  - 5 memory-layer integration cases (turns + Layer 1 redact
+    on write_turn, disabled pass-through, pii_scan handler
+    returns spans, pii_scan rejects empty text,
+    anonymize_preview explicit strategy + unknown-strategy
+    reject).
+  - 7 bulk-anonymize cases (per-layer record walk,
+    idempotent re-run, disabled-anonymizer no-op,
+    turns walker redact + idempotent, turns walker
+    disabled no-op, handle_bulk_anonymize refuses when PII
+    disabled, handle_bulk_anonymize aggregates per-layer
+    counts).
+  - Bridge: `bad_request_returns_400` + mini-mesh
+    integration test now covering 6 scenarios
+    (scan 200 / scan empty 400 / preview 200 / preview
+    empty 400 / bulk_anonymize 200 with counts /
+    bulk_anonymize no-body 200).
+  Quality gates green across the workspace: cargo fmt
+  --all, cargo clippy --workspace --all-targets -- -D
+  warnings, cargo test --workspace (2181 runtime + 456
+  bridge + 238 CLI). The `[memory.pii]` config block AND
+  the training `[training.pii]` block can be configured
   independently — operators who need different strategies
   per data domain do that with two TOML blocks.
 - **Streaming-path tool calls** — the
