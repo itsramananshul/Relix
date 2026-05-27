@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    ChatInput, ChatOutput, ChatProvider, ChatStream, ProviderEntry, ProviderError, TokenUsage,
-    load_api_key,
+    ChatInput, ChatOutput, ChatProvider, ChatStream, ProviderEntry, ProviderError, StreamingChunk,
+    StreamingUsage, TokenUsage, load_api_key,
 };
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -201,6 +201,7 @@ impl ChatProvider for GeminiProvider {
             });
         }
 
+        let model_for_usage = model.clone();
         let byte_stream = resp.bytes_stream();
         let s = async_stream::stream! {
             use futures::StreamExt;
@@ -212,6 +213,12 @@ impl ChatProvider for GeminiProvider {
             // local frame (not a Mutex) so the stream future
             // stays `Send`.
             let mut last_emitted = String::new();
+            // RELIX-7.11 GAP 2: Gemini emits `usageMetadata` on
+            // every frame as a running total. We capture the
+            // latest observed value and emit a single
+            // `StreamingChunk::Usage` once the stream closes
+            // (or `[DONE]` arrives).
+            let mut pending_usage: Option<StreamingUsage> = None;
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
@@ -231,26 +238,54 @@ impl ChatProvider for GeminiProvider {
                     let frame = buf[..end].to_string();
                     buf.drain(..end + 2);
                     for line in frame.lines() {
-                        match parse_sse_line(line) {
-                            SseLine::Chunk(text) => {
-                                // Emit only the suffix beyond what
-                                // we've already yielded so partial-
-                                // total + delta-style upstreams both
-                                // produce a clean stream.
-                                if let Some(suffix) = text.strip_prefix(last_emitted.as_str()) {
-                                    if !suffix.is_empty() {
-                                        last_emitted = text.clone();
-                                        yield Ok(suffix.to_string());
-                                    }
-                                } else {
-                                    last_emitted = text.clone();
-                                    yield Ok(text);
-                                }
+                        let payload = match line.strip_prefix("data:") {
+                            Some(p) => p.trim(),
+                            None => continue,
+                        };
+                        if payload.is_empty() {
+                            continue;
+                        }
+                        if payload == "[DONE]" {
+                            if let Some(u) = pending_usage.take() {
+                                yield Ok(StreamingChunk::Usage(u));
                             }
-                            SseLine::Done | SseLine::Skip => {}
+                            return;
+                        }
+                        let parsed: serde_json::Value =
+                            match serde_json::from_str(payload) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                        // Extract running-total usage on every frame.
+                        if let Some(u) = extract_usage(&parsed) {
+                            pending_usage = Some(StreamingUsage {
+                                prompt_tokens: u.prompt_tokens,
+                                completion_tokens: u.completion_tokens,
+                                model: model_for_usage.clone(),
+                            });
+                        }
+                        if let Some(text) = extract_text(&parsed)
+                            && !text.is_empty()
+                        {
+                            if let Some(suffix) =
+                                text.strip_prefix(last_emitted.as_str())
+                            {
+                                if !suffix.is_empty() {
+                                    last_emitted = text.clone();
+                                    yield Ok(StreamingChunk::Text(suffix.to_string()));
+                                }
+                            } else {
+                                last_emitted = text.clone();
+                                yield Ok(StreamingChunk::Text(text));
+                            }
                         }
                     }
                 }
+            }
+            // Stream closed cleanly without `[DONE]` — flush
+            // whatever usage we observed.
+            if let Some(u) = pending_usage {
+                yield Ok(StreamingChunk::Usage(u));
             }
         };
         Ok(Box::pin(s))
@@ -427,7 +462,10 @@ fn extract_usage(parsed: &serde_json::Value) -> Option<TokenUsage> {
     })
 }
 
+/// Used only by tests; the streaming hot path parses inline so
+/// it can capture both text and usage on the same frame.
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum SseLine {
     Chunk(String),
     Done,
@@ -439,6 +477,7 @@ enum SseLine {
 /// `GenerateContentResponse` JSON object — we return whatever text
 /// it carries; the caller diffs against the cumulative emitted
 /// string to compute deltas.
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_sse_line(line: &str) -> SseLine {
     let Some(payload) = line.strip_prefix("data:") else {
         return SseLine::Skip;

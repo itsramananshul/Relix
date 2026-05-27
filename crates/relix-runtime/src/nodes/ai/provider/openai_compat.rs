@@ -19,7 +19,7 @@ use serde_json::json;
 
 use super::{
     ChatInput, ChatOutput, ChatProvider, ChatStream, EmbedInput, EmbedOutput, ProviderEntry,
-    ProviderError, TokenUsage, load_api_key,
+    ProviderError, StreamingChunk, StreamingUsage, TokenUsage, load_api_key,
 };
 
 const DEFAULT_EMBED_MODEL: &str = "text-embedding-3-small";
@@ -231,6 +231,11 @@ impl ChatProvider for OpenAICompatibleProvider {
             "model":    model,
             "messages": messages,
             "stream":   true,
+            // RELIX-7.11 GAP 2 — every OpenAI-compatible
+            // streaming response now requests an extra final
+            // frame carrying `usage` so the per-call token
+            // counts can land on the metric row.
+            "stream_options": { "include_usage": true },
         });
         if let Some(t) = input.temperature {
             body["temperature"] = json!(t);
@@ -280,6 +285,18 @@ impl ChatProvider for OpenAICompatibleProvider {
             use futures::StreamExt;
             let mut byte_stream = std::pin::pin!(byte_stream);
             let mut buf = String::new();
+            // Track the resolved model id reported by the
+            // upstream so the terminal `Usage` frame carries
+            // the same string downstream pricing looks up.
+            // OpenAI repeats the `model` field on every
+            // streaming frame; we capture the latest.
+            let mut observed_model: Option<String> = None;
+            // The final `Usage` frame (RELIX-7.11 GAP 2) is
+            // emitted once we see `[DONE]` OR a frame whose
+            // `usage` field is populated (OpenAI sends the
+            // usage on the second-to-last frame when
+            // `stream_options.include_usage = true`).
+            let mut pending_usage: Option<StreamingUsage> = None;
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
@@ -303,12 +320,39 @@ impl ChatProvider for OpenAICompatibleProvider {
                     buf.drain(..end + 2);
                     for line in frame.lines() {
                         match parse_sse_line(line) {
-                            SseLine::Delta(text) => yield Ok(text),
-                            SseLine::Done => return,
+                            SseLine::Delta { text, model } => {
+                                if let Some(m) = model
+                                    && observed_model.as_deref() != Some(&m)
+                                {
+                                    observed_model = Some(m);
+                                }
+                                yield Ok(StreamingChunk::Text(text));
+                            }
+                            SseLine::Usage { prompt, completion, model } => {
+                                if let Some(m) = model {
+                                    observed_model = Some(m);
+                                }
+                                pending_usage = Some(StreamingUsage {
+                                    prompt_tokens: prompt,
+                                    completion_tokens: completion,
+                                    model: observed_model.clone().unwrap_or_default(),
+                                });
+                            }
+                            SseLine::Done => {
+                                if let Some(u) = pending_usage.take() {
+                                    yield Ok(StreamingChunk::Usage(u));
+                                }
+                                return;
+                            }
                             SseLine::Skip => {}
                         }
                     }
                 }
+            }
+            // Stream closed without an explicit `[DONE]` — emit
+            // any pending usage payload we already saw.
+            if let Some(u) = pending_usage {
+                yield Ok(StreamingChunk::Usage(u));
             }
         };
         Ok(Box::pin(s))
@@ -411,21 +455,32 @@ impl ChatProvider for OpenAICompatibleProvider {
     }
 }
 
-/// What a single SSE line means after parsing. `Delta` carries
-/// one `choices[0].delta.content` token, `Done` is the upstream
-/// `[DONE]` terminator, `Skip` is everything else — keep-alive
-/// comments, role-only header frames, finish_reason frames.
+/// What a single SSE line means after parsing.
+/// - `Delta` carries one `choices[0].delta.content` token and
+///   (when present) the upstream's `model` field.
+/// - `Usage` carries the final `usage` payload OpenAI emits
+///   when `stream_options.include_usage = true`. The
+///   `choices` array on this frame is empty, so it does NOT
+///   produce a `Delta`.
+/// - `Done` is the upstream `[DONE]` terminator.
+/// - `Skip` is everything else (event lines, comments,
+///   role-only header frames, malformed JSON).
 enum SseLine {
-    Delta(String),
+    Delta {
+        text: String,
+        model: Option<String>,
+    },
+    Usage {
+        prompt: u32,
+        completion: u32,
+        model: Option<String>,
+    },
     Done,
     Skip,
 }
 
 /// Parse a single line from the upstream `/v1/chat/completions`
-/// SSE stream. Returns `Done` on `data: [DONE]`, `Delta(text)`
-/// when the line carries a non-empty `choices[0].delta.content`,
-/// `Skip` for every other shape (event lines, comments, role-only
-/// header frames, malformed JSON).
+/// SSE stream.
 fn parse_sse_line(line: &str) -> SseLine {
     let Some(payload) = line.strip_prefix("data:") else {
         return SseLine::Skip;
@@ -441,11 +496,47 @@ fn parse_sse_line(line: &str) -> SseLine {
         Ok(v) => v,
         Err(_) => return SseLine::Skip,
     };
+    let model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    // RELIX-7.11 GAP 2: detect the include_usage final frame.
+    // OpenAI sends a frame with `usage: {…}` and no choices on
+    // stream close. Local OpenAI-compatible servers (Ollama,
+    // vLLM) also emit this when configured.
+    if let Some(usage) = parsed.get("usage")
+        && !usage.is_null()
+    {
+        let prompt = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let completion = usage
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        // Some upstreams send usage on a frame with a final
+        // delta — return Usage if there's no text on it.
+        let has_text = parsed
+            .pointer("/choices/0/delta/content")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| !t.is_empty());
+        if !has_text {
+            return SseLine::Usage {
+                prompt,
+                completion,
+                model,
+            };
+        }
+    }
     match parsed
         .pointer("/choices/0/delta/content")
         .and_then(|v| v.as_str())
     {
-        Some(text) if !text.is_empty() => SseLine::Delta(text.to_string()),
+        Some(text) if !text.is_empty() => SseLine::Delta {
+            text: text.to_string(),
+            model,
+        },
         _ => SseLine::Skip,
     }
 }
@@ -459,8 +550,53 @@ mod tests {
         let line =
             r#"data: {"choices":[{"delta":{"content":"Hello"},"index":0,"finish_reason":null}]}"#;
         match parse_sse_line(line) {
-            SseLine::Delta(s) => assert_eq!(s, "Hello"),
+            SseLine::Delta { text, .. } => assert_eq!(text, "Hello"),
             _ => panic!("expected Delta"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_extracts_model_from_delta_frame_when_present() {
+        let line = r#"data: {"model":"gpt-4o-mini-2024-07-18","choices":[{"delta":{"content":"Hi"},"index":0,"finish_reason":null}]}"#;
+        match parse_sse_line(line) {
+            SseLine::Delta { text, model } => {
+                assert_eq!(text, "Hi");
+                assert_eq!(model.as_deref(), Some("gpt-4o-mini-2024-07-18"));
+            }
+            _ => panic!("expected Delta"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_extracts_usage_from_final_frame() {
+        // OpenAI's stream_options.include_usage tail frame:
+        // empty `choices` (or no choices array) + populated
+        // `usage`.
+        let line = r#"data: {"model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":17,"total_tokens":59}}"#;
+        match parse_sse_line(line) {
+            SseLine::Usage {
+                prompt,
+                completion,
+                model,
+            } => {
+                assert_eq!(prompt, 42);
+                assert_eq!(completion, 17);
+                assert_eq!(model.as_deref(), Some("gpt-4o-mini"));
+            }
+            _ => panic!("expected Usage"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_emits_delta_when_text_and_usage_both_present_on_same_frame() {
+        // Defence-in-depth: if a future upstream sends usage
+        // on a frame that also carries text, we still yield the
+        // text (no buffering regression). The usage frame
+        // arrives separately at stream close.
+        let line = r#"data: {"choices":[{"delta":{"content":"x"},"index":0}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        match parse_sse_line(line) {
+            SseLine::Delta { text, .. } => assert_eq!(text, "x"),
+            other => panic!("expected Delta, got {}", std::any::type_name_of_val(&other)),
         }
     }
 

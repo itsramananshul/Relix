@@ -78,7 +78,7 @@ use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 pub use provider::ChatInput;
 use provider::{
     AnthropicProvider, ChatProvider, EmbedInput, GeminiProvider, MockProvider,
-    OpenAICompatibleProvider, ProviderEntries, ProviderEntry, ProviderError,
+    OpenAICompatibleProvider, ProviderEntries, ProviderEntry, ProviderError, StreamingChunk,
 };
 
 /// Per-node AI configuration parsed from controller TOML `[ai]`.
@@ -328,6 +328,7 @@ pub fn register(
     let soul_for_chat_stream = soul_cache.clone();
     let skills_for_chat_stream = skills_cache.clone();
     let guardrail_for_chat_stream = input_guardrail.clone();
+    let metrics_for_chat_stream = metrics_sink.clone();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -338,7 +339,8 @@ pub fn register(
                 let soul = soul_for_chat_stream.clone();
                 let sk = skills_for_chat_stream.clone();
                 let gr = guardrail_for_chat_stream.clone();
-                async move { handle_chat_stream(p, model, mem, soul, sk, gr, ctx).await }
+                let metrics = metrics_for_chat_stream.clone();
+                async move { handle_chat_stream(p, model, mem, soul, sk, gr, metrics, ctx).await }
             },
         )),
     );
@@ -810,6 +812,7 @@ async fn handle_chat_stream(
     soul_cache: SoulCache,
     skills_cache: skills::SkillMatcher,
     input_guardrail: guardrails::InputGuardrail,
+    metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
     let preflight = build_chat_preflight(
@@ -845,28 +848,54 @@ async fn handle_chat_stream(
         }
     })?;
 
-    // Adapt the provider's per-token `Result<String, ProviderError>`
-    // stream into the dispatcher's
-    // `Result<Vec<u8>, ErrorEnvelope>` shape. Per-chunk errors
-    // map to the same envelope shape as the upfront error
-    // above so a provider that bails mid-stream surfaces with
-    // a consistent kind.
-    use futures::StreamExt;
-    let mapped = provider_stream.map(|item| match item {
-        Ok(token) => Ok(token.into_bytes()),
-        Err(ProviderError::Transient(c)) => Err(ErrorEnvelope {
-            kind: error_kinds::RESPONDER_OVERLOADED,
-            cause: format!("ai.chat.stream: {c}"),
-            retry_hint: 1,
-            retry_after: None,
-        }),
-        Err(ProviderError::Permanent(c)) => Err(ErrorEnvelope {
-            kind: error_kinds::RESPONDER_INTERNAL,
-            cause: format!("ai.chat.stream: {c}"),
-            retry_hint: 2,
-            retry_after: None,
-        }),
-    });
+    // Adapt the provider's `Result<StreamingChunk, ProviderError>`
+    // stream into the dispatcher's `Result<Vec<u8>, ErrorEnvelope>`
+    // shape. Text frames forward to the wire verbatim. Usage
+    // frames are intercepted (NOT forwarded to the client — they
+    // carry token counts the wire consumer doesn't care about)
+    // and routed to `metrics_sink.attach_ai_usage` so the
+    // RELIX-7.11 collector's join cache can merge them onto the
+    // dispatch row.
+    let request_id = ctx.request_id;
+    let mapped = async_stream::stream! {
+        use futures::StreamExt;
+        let mut s = std::pin::pin!(provider_stream);
+        while let Some(item) = s.next().await {
+            match item {
+                Ok(StreamingChunk::Text(t)) => {
+                    yield Ok(t.into_bytes());
+                }
+                Ok(StreamingChunk::Usage(u)) => {
+                    if let Some(sink) = metrics_sink.as_ref() {
+                        sink.attach_ai_usage(crate::metrics::AiUsageHint {
+                            request_id,
+                            prompt_tokens: u.prompt_tokens,
+                            completion_tokens: u.completion_tokens,
+                            model: u.model.clone(),
+                        });
+                    }
+                    // Don't forward Usage to the wire — it's
+                    // observation metadata, not assistant text.
+                }
+                Err(ProviderError::Transient(c)) => {
+                    yield Err(ErrorEnvelope {
+                        kind: error_kinds::RESPONDER_OVERLOADED,
+                        cause: format!("ai.chat.stream: {c}"),
+                        retry_hint: 1,
+                        retry_after: None,
+                    });
+                }
+                Err(ProviderError::Permanent(c)) => {
+                    yield Err(ErrorEnvelope {
+                        kind: error_kinds::RESPONDER_INTERNAL,
+                        cause: format!("ai.chat.stream: {c}"),
+                        retry_hint: 2,
+                        retry_after: None,
+                    });
+                }
+            }
+        }
+    };
     Ok(Box::pin(mapped))
 }
 
@@ -2655,7 +2684,11 @@ mod tests {
             _input: ChatInput,
         ) -> Result<provider::ChatStream, ProviderError> {
             let owned: Vec<String> = self.chunks.clone();
-            let s = futures::stream::iter(owned.into_iter().map(Ok));
+            let s = futures::stream::iter(
+                owned
+                    .into_iter()
+                    .map(|t| Ok(provider::StreamingChunk::Text(t))),
+            );
             Ok(Box::pin(s))
         }
     }
@@ -2697,6 +2730,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"session-1|hello|"),
         )
         .await
@@ -2724,6 +2758,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"only-session-id"),
         )
         .await;
@@ -2754,6 +2789,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(prompt.as_bytes()),
         )
         .await;
@@ -2773,6 +2809,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             ctx(b"session-1|hello|"),
         )
         .await;
@@ -2984,6 +3021,221 @@ mod tests {
             .unwrap();
         assert_eq!(tokens, Some(300));
         assert!(cost.unwrap() > 0);
+        assert_eq!(model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    // ── RELIX-7.11 GAP 2: streaming token enrichment ─────
+
+    /// Streaming provider that yields one text chunk followed by
+    /// a usage frame. Verifies the `ChatStream`'s new
+    /// `StreamingChunk::Usage` plumbing all the way through
+    /// `handle_chat_stream` to `attach_ai_usage`.
+    struct StreamingProviderWithUsage {
+        text: String,
+        usage: provider::StreamingUsage,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for StreamingProviderWithUsage {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Ok(provider::ChatOutput {
+                text: self.text.clone(),
+                provider: "streaming-with-usage",
+                model: self.usage.model.clone(),
+                usage: None,
+            })
+        }
+        async fn generate_reply_stream(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatStream, ProviderError> {
+            let text = self.text.clone();
+            let u = self.usage.clone();
+            let s = async_stream::stream! {
+                yield Ok(provider::StreamingChunk::Text(text));
+                yield Ok(provider::StreamingChunk::Usage(u));
+            };
+            Ok(Box::pin(s))
+        }
+        fn provider_name(&self) -> &'static str {
+            "streaming-with-usage"
+        }
+    }
+
+    /// Same shape but yields only Text chunks (no Usage).
+    struct StreamingProviderNoUsage {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for StreamingProviderNoUsage {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Ok(provider::ChatOutput {
+                text: self.text.clone(),
+                provider: "streaming-no-usage",
+                model: "doesnt-matter".to_string(),
+                usage: None,
+            })
+        }
+        async fn generate_reply_stream(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatStream, ProviderError> {
+            let text = self.text.clone();
+            let s = async_stream::stream! {
+                yield Ok(provider::StreamingChunk::Text(text));
+            };
+            Ok(Box::pin(s))
+        }
+        fn provider_name(&self) -> &'static str {
+            "streaming-no-usage"
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_handler_forwards_text_and_attaches_usage_to_sink() {
+        use futures::StreamExt;
+        let provider: Arc<dyn ChatProvider> = Arc::new(StreamingProviderWithUsage {
+            text: "hello stream".into(),
+            usage: provider::StreamingUsage {
+                prompt_tokens: 30,
+                completion_tokens: 70,
+                model: "gpt-4o-mini".into(),
+            },
+        });
+        let sink = Arc::new(RecordingMetricsSink::default());
+        let sink_dyn: Arc<dyn crate::metrics::MetricsSink> = sink.clone();
+        let rid = RequestId([9u8; 16]);
+        let stream = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(sink_dyn),
+            ctx_with_request_id(b"sess1|please reply|", rid),
+        )
+        .await
+        .expect("preflight + stream init");
+        // The wire stream MUST only carry text bytes — the
+        // Usage frame is consumed by the handler.
+        let collected: Vec<String> = stream
+            .map(|item| match item {
+                Ok(bytes) => String::from_utf8(bytes).expect("utf-8 chunk"),
+                Err(e) => panic!("unexpected stream error: {}", e.cause),
+            })
+            .collect()
+            .await;
+        let assembled: String = collected.join("");
+        assert_eq!(assembled, "hello stream");
+        let hints = sink.hints.lock().unwrap();
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].request_id, rid);
+        assert_eq!(hints[0].prompt_tokens, 30);
+        assert_eq!(hints[0].completion_tokens, 70);
+        assert_eq!(hints[0].model, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn streaming_handler_skips_attach_when_provider_emits_no_usage() {
+        use futures::StreamExt;
+        let provider: Arc<dyn ChatProvider> =
+            Arc::new(StreamingProviderNoUsage { text: "ack".into() });
+        let sink = Arc::new(RecordingMetricsSink::default());
+        let sink_dyn: Arc<dyn crate::metrics::MetricsSink> = sink.clone();
+        let stream = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(sink_dyn),
+            ctx(b"sess2|hi|"),
+        )
+        .await
+        .expect("stream");
+        let _: Vec<_> = stream.collect().await;
+        let hints = sink.hints.lock().unwrap();
+        assert!(hints.is_empty(), "no usage frame → no attach call");
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_round_trips_to_metrics_store() {
+        use crate::metrics::{
+            InvocationMetric, MetricsCollector, MetricsSink as MetricsSinkTrait, MetricsStore,
+            PriceTable, RetentionConfig,
+        };
+        use futures::StreamExt;
+        let store = MetricsStore::in_memory().unwrap();
+        let prices = PriceTable::with_defaults();
+        let (col, handles) = MetricsCollector::new(store.clone(), prices);
+        let _spawned = handles.spawn(RetentionConfig {
+            retention_days: 30,
+            sweep_interval: std::time::Duration::from_secs(3600),
+        });
+        let col_dyn: Arc<dyn MetricsSinkTrait> = Arc::new(col.clone());
+        let provider: Arc<dyn ChatProvider> = Arc::new(StreamingProviderWithUsage {
+            text: "x".into(),
+            usage: provider::StreamingUsage {
+                prompt_tokens: 100,
+                completion_tokens: 200,
+                model: "gpt-4o-mini".into(),
+            },
+        });
+        let rid = RequestId([55u8; 16]);
+        let stream = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(col_dyn.clone()),
+            ctx_with_request_id(b"sess|hi|", rid),
+        )
+        .await
+        .expect("stream");
+        // Drain the wire stream so the handler reaches the
+        // Usage frame and calls attach_ai_usage.
+        let _: Vec<_> = stream.collect().await;
+        // Simulate the dispatch bridge's post-handler metric
+        // record (the bridge calls record_invocation after the
+        // stream closes).
+        col.record_invocation(InvocationMetric {
+            agent_name: "alice".into(),
+            peer_alias: "ai".into(),
+            method: "ai.chat.stream".into(),
+            timestamp_ms: 1_700_000_000_000,
+            latency_ms: 12,
+            success: true,
+            error_kind: None,
+            token_count: None,
+            cost_micros: None,
+            input_bytes: 32,
+            output_bytes: 1,
+            model: None,
+            request_id: Some(rid),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let (tokens, cost, model): (Option<i64>, Option<i64>, Option<String>) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT token_count, cost_micros, model FROM metrics_invocations",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(tokens, Some(300));
+        assert!(cost.unwrap() > 0, "cost must compute from price table");
         assert_eq!(model.as_deref(), Some("gpt-4o-mini"));
     }
 }

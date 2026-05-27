@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    ChatInput, ChatOutput, ChatProvider, ChatStream, ProviderEntry, ProviderError, TokenUsage,
-    load_api_key,
+    ChatInput, ChatOutput, ChatProvider, ChatStream, ProviderEntry, ProviderError, StreamingChunk,
+    StreamingUsage, TokenUsage, load_api_key,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -300,11 +300,20 @@ impl ChatProvider for AnthropicProvider {
             });
         }
 
+        let model_for_usage = model.clone();
         let byte_stream = resp.bytes_stream();
         let s = async_stream::stream! {
             use futures::StreamExt;
             let mut byte_stream = std::pin::pin!(byte_stream);
             let mut buf = String::new();
+            // RELIX-7.11 GAP 2: Anthropic emits `input_tokens`
+            // on the `message_start` event and `output_tokens`
+            // on the final `message_delta` event. Collect both
+            // and emit a single `StreamingChunk::Usage` after
+            // `message_stop`.
+            let mut prompt_tokens: u32 = 0;
+            let mut completion_tokens: u32 = 0;
+            let mut saw_any_usage = false;
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
@@ -325,11 +334,40 @@ impl ChatProvider for AnthropicProvider {
                     buf.drain(..end + 2);
                     for line in frame.lines() {
                         match parse_anthropic_sse_line(line) {
-                            AnthropicEvent::TextDelta(t) => yield Ok(t),
-                            AnthropicEvent::Done | AnthropicEvent::Skip => {}
+                            AnthropicEvent::TextDelta(t) => {
+                                yield Ok(StreamingChunk::Text(t));
+                            }
+                            AnthropicEvent::InputTokens(n) => {
+                                prompt_tokens = n;
+                                saw_any_usage = true;
+                            }
+                            AnthropicEvent::OutputTokens(n) => {
+                                completion_tokens = n;
+                                saw_any_usage = true;
+                            }
+                            AnthropicEvent::Done => {
+                                if saw_any_usage {
+                                    yield Ok(StreamingChunk::Usage(StreamingUsage {
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        model: model_for_usage.clone(),
+                                    }));
+                                }
+                                return;
+                            }
+                            AnthropicEvent::Skip => {}
                         }
                     }
                 }
+            }
+            // Stream ended without an explicit message_stop —
+            // emit whatever usage we observed.
+            if saw_any_usage {
+                yield Ok(StreamingChunk::Usage(StreamingUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    model: model_for_usage.clone(),
+                }));
             }
         };
         Ok(Box::pin(s))
@@ -341,12 +379,16 @@ impl ChatProvider for AnthropicProvider {
 pub(crate) enum AnthropicEvent {
     /// One `content_block_delta` text chunk.
     TextDelta(String),
+    /// Input token count from `message_start.message.usage.input_tokens`.
+    InputTokens(u32),
+    /// Output token count from `message_delta.usage.output_tokens`.
+    OutputTokens(u32),
     /// Terminal `message_stop` event — caller should stop reading.
     Done,
-    /// Every other event type (block start/stop, message_start,
-    /// ping, usage updates, comments). The caller MUST ignore
-    /// these silently — they're meta-events the client doesn't
-    /// surface.
+    /// Every other event type (block start/stop, ping,
+    /// comments, extended-thinking deltas). The caller MUST
+    /// ignore these silently — they're meta-events the client
+    /// doesn't surface.
     Skip,
 }
 
@@ -372,6 +414,30 @@ pub(crate) fn parse_anthropic_sse_line(line: &str) -> AnthropicEvent {
     let ty = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
         "message_stop" => AnthropicEvent::Done,
+        "message_start" => {
+            // RELIX-7.11 GAP 2: input_tokens lives at
+            // `message_start.message.usage.input_tokens`.
+            if let Some(n) = parsed
+                .pointer("/message/usage/input_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                return AnthropicEvent::InputTokens(n as u32);
+            }
+            AnthropicEvent::Skip
+        }
+        "message_delta" => {
+            // RELIX-7.11 GAP 2: output_tokens lives at
+            // `message_delta.usage.output_tokens`. The
+            // `message_delta` event also carries `stop_reason`,
+            // `stop_sequence`, etc. — we only need the usage.
+            if let Some(n) = parsed
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                return AnthropicEvent::OutputTokens(n as u32);
+            }
+            AnthropicEvent::Skip
+        }
         "content_block_delta" => {
             // Only `text_delta` carries assistant text. `thinking_delta`
             // belongs to Anthropic's extended-thinking trace and is
@@ -451,6 +517,34 @@ mod tests {
         assert!(matches!(parse_anthropic_sse_line(""), AnthropicEvent::Skip));
         assert!(matches!(
             parse_anthropic_sse_line(": keep-alive comment"),
+            AnthropicEvent::Skip
+        ));
+    }
+
+    #[test]
+    fn parse_anthropic_sse_extracts_input_tokens_from_message_start() {
+        let line = r#"data: {"type":"message_start","message":{"id":"x","model":"claude-sonnet-4","usage":{"input_tokens":42,"output_tokens":0}}}"#;
+        match parse_anthropic_sse_line(line) {
+            AnthropicEvent::InputTokens(n) => assert_eq!(n, 42),
+            other => panic!("expected InputTokens, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_anthropic_sse_extracts_output_tokens_from_message_delta() {
+        let line = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":117}}"#;
+        match parse_anthropic_sse_line(line) {
+            AnthropicEvent::OutputTokens(n) => assert_eq!(n, 117),
+            other => panic!("expected OutputTokens, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_anthropic_sse_skips_message_start_without_usage() {
+        let line =
+            r#"data: {"type":"message_start","message":{"id":"x","model":"claude-sonnet-4"}}"#;
+        assert!(matches!(
+            parse_anthropic_sse_line(line),
             AnthropicEvent::Skip
         ));
     }

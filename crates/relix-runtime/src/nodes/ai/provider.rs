@@ -127,27 +127,76 @@ pub trait ChatProvider: Send + Sync {
         )))
     }
 
-    /// Generate a reply as a stream of text chunks. Each `Ok(String)`
-    /// is one chunk; the stream ends when the provider stops
-    /// emitting. The default implementation calls `generate_reply`
-    /// and yields the full response as a single item — so providers
-    /// that have no native streaming API (Anthropic, Gemini today)
-    /// still satisfy the contract. Mock + OpenAI-compatible
-    /// override to yield real per-token deltas.
+    /// Generate a reply as a stream of [`StreamingChunk`] frames.
+    /// The default implementation calls `generate_reply` and
+    /// yields the full response as a single `Text` frame
+    /// followed by an optional `Usage` frame when the
+    /// non-streaming response carried usage metadata. Providers
+    /// with native streaming APIs override and emit token-level
+    /// `Text` chunks + a terminal `Usage` chunk extracted from
+    /// the provider's final wire frame.
     async fn generate_reply_stream(&self, input: ChatInput) -> Result<ChatStream, ProviderError> {
         let out = self.generate_reply(input).await?;
-        let s = futures::stream::once(async move { Ok(out.text) });
+        let text = out.text;
+        let model = out.model;
+        let usage = out.usage;
+        let s = async_stream::stream! {
+            yield Ok(StreamingChunk::Text(text));
+            if let Some(u) = usage {
+                yield Ok(StreamingChunk::Usage(StreamingUsage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    model,
+                }));
+            }
+        };
         Ok(Box::pin(s))
     }
 }
 
-/// Streaming reply type alias. Producers yield one piece of reply
-/// text at a time; consumers join them in order. A `ProviderError`
-/// on any item terminates the stream — callers should treat the
-/// chunks accumulated before the error as a partial reply and
-/// surface the error to the client.
+/// One frame of a streaming chat reply. Producers yield zero or
+/// more [`StreamingChunk::Text`] items in order followed by an
+/// optional single [`StreamingChunk::Usage`] frame after the
+/// last text frame.
+///
+/// Consumers that only care about the assistant's words ignore
+/// the `Usage` variant — `match` covers both, but in the wire-
+/// path streaming bridge only `Text` frames are forwarded.
+/// `Usage` frames feed the RELIX-7.11 metrics enrichment hook
+/// (`MetricsSink::attach_ai_usage`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamingChunk {
+    /// One incremental piece of assistant text. Producers
+    /// preserve byte-level fidelity; consumers concatenate to
+    /// reproduce the full reply.
+    Text(String),
+    /// Provider-reported token usage. Emitted exactly once at
+    /// stream end when the provider's API surfaces a final
+    /// usage payload. Providers that don't expose usage on
+    /// their streaming API simply never yield this variant.
+    Usage(StreamingUsage),
+}
+
+/// Token usage carried by a [`StreamingChunk::Usage`] frame.
+/// Same shape as [`TokenUsage`] but adds the resolved `model`
+/// id so downstream pricing can look up the right per-1k rate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// Model identifier the provider actually used. Carries the
+    /// upstream's value verbatim (e.g. `"gpt-4o-mini-2024-07-18"`)
+    /// so the longest-prefix pricing lookup hits.
+    pub model: String,
+}
+
+/// Streaming reply type alias. Producers yield one frame at a
+/// time. A `ProviderError` on any item terminates the stream —
+/// callers should treat the frames accumulated before the
+/// error as a partial reply and surface the error to the
+/// client.
 pub type ChatStream =
-    std::pin::Pin<Box<dyn futures::Stream<Item = Result<String, ProviderError>> + Send>>;
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamingChunk, ProviderError>> + Send>>;
 
 /// Batch embedding request.
 #[derive(Clone, Debug, Default)]

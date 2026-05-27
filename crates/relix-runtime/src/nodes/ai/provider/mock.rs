@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use super::{
     ChatInput, ChatOutput, ChatProvider, ChatStream, EmbedInput, EmbedOutput, ProviderError,
-    TokenUsage,
+    StreamingChunk, StreamingUsage, TokenUsage,
 };
 
 /// Dimensionality the mock embedding generator returns. 8 is
@@ -80,18 +80,28 @@ impl ChatProvider for MockProvider {
     }
 
     /// Stream the deterministic reply word-by-word with a 20ms
-    /// delay between yields. Makes the streaming wire path
-    /// visible without a real provider — `relix boot` against the
-    /// mock provider behaves like a real streaming API end-to-end.
+    /// delay between yields, then emit a [`StreamingChunk::Usage`]
+    /// frame derived from the same fake token accounting the
+    /// unary path uses. Makes the RELIX-7.11 streaming-usage
+    /// path testable end-to-end without a network provider.
     async fn generate_reply_stream(&self, input: ChatInput) -> Result<ChatStream, ProviderError> {
         let out = self.generate_reply(input).await?;
         let words: Vec<String> = mock_split_into_chunks(&out.text);
+        let usage = out.usage;
+        let model = out.model;
         let s = async_stream::stream! {
             for (i, w) in words.into_iter().enumerate() {
                 if i > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                yield Ok(w);
+                yield Ok(StreamingChunk::Text(w));
+            }
+            if let Some(u) = usage {
+                yield Ok(StreamingChunk::Usage(StreamingUsage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    model,
+                }));
             }
         };
         Ok(Box::pin(s))
@@ -219,10 +229,16 @@ mod tests {
             })
             .await
             .expect("stream");
-        let chunks: Vec<String> = stream.map(|r| r.unwrap()).collect().await;
+        let frames: Vec<StreamingChunk> = stream.map(|r| r.unwrap()).collect().await;
+        // Pull text out for the lossless-reassembly check.
+        let chunks: Vec<String> = frames
+            .iter()
+            .filter_map(|f| match f {
+                StreamingChunk::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(chunks.len() >= 2, "expected multi-chunk reply: {chunks:?}");
-        // Concatenation must equal what generate_reply would
-        // have returned — streaming must be lossless.
         let assembled: String = chunks.join("");
         let full = p
             .generate_reply(ChatInput {
@@ -234,6 +250,17 @@ mod tests {
             .unwrap()
             .text;
         assert_eq!(assembled, full);
+        // RELIX-7.11 GAP 2: the mock provider emits a
+        // terminal Usage frame after the last text chunk.
+        let usage = frames
+            .iter()
+            .find_map(|f| match f {
+                StreamingChunk::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("expected a terminal Usage frame from mock");
+        assert!(usage.completion_tokens > 0, "mock usage must report tokens");
+        assert_eq!(usage.model, "mock-1");
     }
 
     #[test]
