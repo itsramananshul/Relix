@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::executor::{ExecutionStatus, ExecutionStep, ExecutionTrace, WorkflowResult};
+use super::executor::{ExecutionStep, ExecutionTrace, WorkflowResult};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ChronicleError {
@@ -135,10 +135,7 @@ impl WorkflowChronicle {
         let steps: Vec<StepRecord> = result.trace.steps.iter().map(StepRecord::from).collect();
         let steps_json =
             serde_json::to_string(&steps).map_err(|e| ChronicleError::Encode(e.to_string()))?;
-        let status = match result.status {
-            ExecutionStatus::Success => "success",
-            ExecutionStatus::Failed => "failed",
-        };
+        let status = result.status.as_str();
         let conn = self
             .conn
             .lock()
@@ -212,11 +209,7 @@ pub fn record_from(
     ended_at: i64,
 ) -> ExecutionRecord {
     let steps: Vec<StepRecord> = result.trace.steps.iter().map(StepRecord::from).collect();
-    let status = match result.status {
-        ExecutionStatus::Success => "success",
-        ExecutionStatus::Failed => "failed",
-    }
-    .to_string();
+    let status = result.status.as_str().to_string();
     ExecutionRecord {
         execution_id: result.trace.execution_id.0.clone(),
         workflow_name: result.trace.workflow_name.clone(),

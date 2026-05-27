@@ -50,8 +50,8 @@ pub use ast::{AgentSpec, Edge, EdgeCondition, FlowGraph, Workflow};
 pub use chronicle::{ChronicleError, ExecutionRecord, StepRecord, WorkflowChronicle};
 pub use dispatcher::{DispatchError, DispatchResult, WorkflowDispatcher};
 pub use executor::{
-    ExecutionId, ExecutionStatus, ExecutionStep, ExecutionTrace, WorkflowExecutor, WorkflowResult,
-    execute,
+    ExecutionId, ExecutionStatus, ExecutionStep, ExecutionTrace, WorkflowEvent, WorkflowExecutor,
+    WorkflowResult, execute, execute_with_events,
 };
 pub use mesh_dispatcher::{MeshWorkflowDispatcher, WorkflowDispatcherCell};
 pub use parser::{ParseError, parse_str};

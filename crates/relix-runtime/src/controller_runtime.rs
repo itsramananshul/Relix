@@ -3997,25 +3997,37 @@ fn register_node_type_handlers(
             workflow_dispatcher_cell.clone(),
             Arc::new(known_peers),
         );
-        let workflow_caps: &[(&str, &str, &[&str])] = &[
+        let workflow_caps: &[(&str, &str, &[&str], bool)] = &[
             (
                 "workflow.run",
                 "Execute a workflow by name. Arg JSON: \
                  {\"name\": \"<workflow>\", \"input\": \"<text>\"}. \
                  Returns the full execution record.",
                 &["workflow", "execute"],
+                false,
+            ),
+            (
+                "workflow.run.stream",
+                "Streaming variant of workflow.run. Emits per-step JSON \
+                 events (started / step_started / step_completed / \
+                 step_failed / finished) as they happen — drives the \
+                 bridge's POST /v1/workflows/run SSE response.",
+                &["workflow", "execute", "stream"],
+                true,
             ),
             (
                 "workflow.list",
                 "Enumerate every workflow file found in the \
                  workflows directory (returns name + description + version).",
                 &["workflow", "read"],
+                false,
             ),
             (
                 "workflow.status",
                 "Fetch a past execution by id. Arg JSON: \
                  {\"execution_id\": \"<hex>\"}.",
                 &["workflow", "read"],
+                false,
             ),
             (
                 "workflow.validate",
@@ -4023,10 +4035,24 @@ fn register_node_type_handlers(
                  Arg JSON: {\"source\": \"<yaml>\"}. \
                  Returns {ok, error?} without touching the catalog.",
                 &["workflow", "read"],
+                false,
+            ),
+            (
+                "workflow.reload",
+                "Drop the workflow file cache. Operators call this \
+                 after editing a .workflow file in place to pick up \
+                 changes without a coordinator restart.",
+                &["workflow", "mutate"],
+                false,
             ),
         ];
-        for (method, doc, cats) in workflow_caps {
-            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+        for (method, doc, cats, streaming) in workflow_caps {
+            let mut desc = if *streaming {
+                CapabilityDescriptor::stream_out(*method)
+            } else {
+                CapabilityDescriptor::unary(*method)
+            };
+            desc = desc.with_description(*doc);
             desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
             manifest.add_capability(desc);
         }

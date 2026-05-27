@@ -1,21 +1,22 @@
 //! HTTP proxies for the workflow engine.
 //!
-//! Four endpoints, each a thin forwarder to a `workflow.*`
+//! Five endpoints, each a thin forwarder to a `workflow.*`
 //! coordinator capability:
 //!
-//! - `POST /v1/workflows/run`                          — execute by name.
-//! - `GET  /v1/workflows`                              — list catalog.
-//! - `GET  /v1/workflows/:name/status/:execution_id`   — fetch past run.
-//! - `POST /v1/workflows/validate`                     — type-check source.
+//! - `POST /v1/workflows/run`                  — execute by name.
+//! - `GET  /v1/workflows`                      — list catalog.
+//! - `GET  /v1/workflows/status/:execution_id` — fetch past run.
+//! - `POST /v1/workflows/validate`             — type-check source.
+//! - `POST /v1/workflows/reload`               — drop the file cache.
 //!
 //! When `POST /v1/workflows/run` is called with `stream:
-//! true` the response is a single `text/event-stream` frame
-//! carrying the final execution record (the foundation
-//! engine is unary today — per-step SSE arrives when the
-//! coordinator gains a streaming workflow capability). The
-//! shape stays SSE-compatible so a future streaming
-//! upgrade is drop-in for dashboard clients.
+//! true` the response is a real `text/event-stream` driven
+//! by the coordinator's `workflow.run.stream` streaming
+//! capability — each emitted event (started / step_started /
+//! step_completed / step_failed / finished) becomes one SSE
+//! frame in real time as the workflow runs.
 
+use axum::body::Body;
 use axum::{
     Json,
     extract::{Path, State},
@@ -27,6 +28,7 @@ use serde_json::Value;
 
 use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
+use relix_runtime::transport::stream::{StreamFrame, StreamReader, write_request_envelope};
 
 use crate::config::AppState;
 
@@ -52,20 +54,12 @@ pub struct ValidateRequest {
 }
 
 /// `POST /v1/workflows/run` — execute a workflow.
-///
-/// Body: `{ "name": "<workflow>", "input": "<text>", "stream"?: bool }`.
-///
-/// Response (unary): the full execution record as JSON.
-///
-/// Response (stream): a single `text/event-stream` event of
-/// type `result` carrying the same execution record. Future
-/// streaming variant will interleave per-step events before
-/// the final `result` — the event-name discipline stays
-/// stable so dashboard clients pick up streaming without a
-/// rewrite.
 pub async fn run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> Response {
     if req.name.trim().is_empty() {
         return bad_json(StatusCode::BAD_REQUEST, "name is required");
+    }
+    if req.stream {
+        return run_stream(&state, &req).await;
     }
     let coord_args = serde_json::json!({
         "name": req.name,
@@ -75,14 +69,9 @@ pub async fn run(State(state): State<AppState>, Json(req): Json<RunRequest>) -> 
         Ok(b) => b,
         Err(e) => return bad_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("encode: {e}")),
     };
-    let body = match call_peer_json(&state, DEFAULT_PEER, "workflow.run", &coord_arg_bytes).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    if req.stream {
-        sse_single_event("result", &body).into_response()
-    } else {
-        json_response(StatusCode::OK, body)
+    match call_peer_json(&state, DEFAULT_PEER, "workflow.run", &coord_arg_bytes).await {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(resp) => resp,
     }
 }
 
@@ -94,13 +83,9 @@ pub async fn list(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `GET /v1/workflows/:name/status/:execution_id` — look up
-/// a past execution. `:name` is passed for human routing
-/// clarity but the lookup is keyed on execution_id alone.
-pub async fn status(
-    State(state): State<AppState>,
-    Path((_name, execution_id)): Path<(String, String)>,
-) -> Response {
+/// `GET /v1/workflows/status/:execution_id` — fetch a past
+/// execution. Returns 404 when the id is unknown.
+pub async fn status(State(state): State<AppState>, Path(execution_id): Path<String>) -> Response {
     let coord_args = serde_json::json!({ "execution_id": execution_id });
     let arg_bytes = match serde_json::to_vec(&coord_args) {
         Ok(b) => b,
@@ -110,19 +95,13 @@ pub async fn status(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    // The coordinator returns `{"error": "..."}` on miss; map
-    // that to 404 so clients see the right status code.
     if body.get("error").is_some() && body.get("execution_id").is_none() {
         return json_response(StatusCode::NOT_FOUND, body);
     }
     json_response(StatusCode::OK, body)
 }
 
-/// `POST /v1/workflows/validate` — type-check a workflow
-/// source string. Body: `{"source": "<yaml>"}`. Returns
-/// `200 { ok: true, name, version, description }` on a
-/// clean parse + validate, otherwise
-/// `400 { ok: false, error }`.
+/// `POST /v1/workflows/validate` — type-check a workflow source.
 pub async fn validate(State(state): State<AppState>, Json(req): Json<ValidateRequest>) -> Response {
     if req.source.trim().is_empty() {
         return bad_json(StatusCode::BAD_REQUEST, "source is required");
@@ -143,6 +122,131 @@ pub async fn validate(State(state): State<AppState>, Json(req): Json<ValidateReq
         StatusCode::BAD_REQUEST
     };
     json_response(status, body)
+}
+
+/// `POST /v1/workflows/reload` — drop the workflow file
+/// cache on the coordinator so the next list / run picks up
+/// any in-place edits without a coordinator restart.
+pub async fn reload(State(state): State<AppState>) -> Response {
+    match call_peer_json(&state, DEFAULT_PEER, "workflow.reload", b"").await {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(resp) => resp,
+    }
+}
+
+// ── streaming ────────────────────────────────────────────
+
+async fn run_stream(state: &AppState, req: &RunRequest) -> Response {
+    let Some(mesh) = state.mesh_client.as_ref().cloned() else {
+        return bad_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bridge mesh client not initialized",
+        );
+    };
+    let Some(peer_id) = mesh.peer_id_for(DEFAULT_PEER) else {
+        return bad_json(
+            StatusCode::NOT_FOUND,
+            "coordinator peer alias not in peers.toml",
+        );
+    };
+    let coord_args = serde_json::json!({
+        "name": req.name,
+        "input": req.input,
+    });
+    let arg_bytes = match serde_json::to_vec(&coord_args) {
+        Ok(b) => b,
+        Err(e) => return bad_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("encode: {e}")),
+    };
+    let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 600);
+    let envelope = build_request(
+        "workflow.run.stream",
+        arg_bytes,
+        state.identity_bundle.clone(),
+        deadline_secs,
+    );
+
+    let mut raw_stream = match mesh.client().open_stream(peer_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            return bad_json(
+                StatusCode::BAD_GATEWAY,
+                &format!("open stream to coordinator: {e}"),
+            );
+        }
+    };
+    if let Err(e) = write_request_envelope(&mut raw_stream, &envelope).await {
+        return bad_json(
+            StatusCode::BAD_GATEWAY,
+            &format!("write workflow.run.stream request: {e}"),
+        );
+    }
+    let reader = StreamReader::new(raw_stream);
+
+    let sse_body = async_stream::stream! {
+        let mut reader = reader;
+        loop {
+            match reader.next_frame().await {
+                Ok(Some(StreamFrame::Header { .. })) => {
+                    // Headers carry audit metadata, not a step
+                    // event — drop quietly.
+                    continue;
+                }
+                Ok(Some(StreamFrame::Chunk(bytes))) => {
+                    let payload = String::from_utf8_lossy(&bytes).to_string();
+                    let event_name = parse_event_name(&payload).unwrap_or("message".to_string());
+                    let frame = format!("event: {event_name}\ndata: {payload}\n\n");
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(frame));
+                }
+                Ok(Some(StreamFrame::End)) | Ok(None) => {
+                    break;
+                }
+                Ok(Some(StreamFrame::Err { kind, cause })) => {
+                    let payload = serde_json::json!({
+                        "event": "error",
+                        "kind": kind,
+                        "error": cause,
+                    });
+                    let frame = format!(
+                        "event: error\ndata: {}\n\n",
+                        serde_json::to_string(&payload).unwrap_or_default(),
+                    );
+                    yield Ok(bytes::Bytes::from(frame));
+                    break;
+                }
+                Err(e) => {
+                    let payload = serde_json::json!({
+                        "event": "error",
+                        "error": format!("stream read: {e}"),
+                    });
+                    let frame = format!(
+                        "event: error\ndata: {}\n\n",
+                        serde_json::to_string(&payload).unwrap_or_default(),
+                    );
+                    yield Ok(bytes::Bytes::from(frame));
+                    break;
+                }
+            }
+        }
+    };
+
+    let body = Body::from_stream(sse_body);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    (StatusCode::OK, headers, body).into_response()
+}
+
+/// Pull the `event` field out of a JSON payload chunk so we
+/// can stamp the SSE frame's `event:` line. The coordinator
+/// emits `{"event": "<name>", ...}` for every workflow
+/// event; if a chunk doesn't conform we fall back to the
+/// default `message` event-name (still valid SSE).
+fn parse_event_name(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload).ok()?;
+    v.get("event").and_then(Value::as_str).map(String::from)
 }
 
 // ── helpers ──────────────────────────────────────────────
@@ -168,22 +272,6 @@ fn json_response(status: StatusCode, body: Value) -> Response {
         HeaderValue::from_static("application/json"),
     );
     (status, headers, bytes).into_response()
-}
-
-fn sse_single_event(event_name: &str, body: &Value) -> Response {
-    let payload = serde_json::to_string(body).unwrap_or_default();
-    // Standard SSE encoding: optional event field + data field
-    // + blank-line terminator. Keep both lines literal so
-    // event-source parsers in every browser see the same
-    // shape.
-    let frame = format!("event: {event_name}\ndata: {payload}\n\n");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream"),
-    );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    (StatusCode::OK, headers, frame).into_response()
 }
 
 async fn call_peer_json(
@@ -261,16 +349,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sse_frame_is_well_formed() {
-        let body = serde_json::json!({"hello": "world"});
-        let resp = sse_single_event("result", &body);
-        // Surfaced via the response's content-type header
-        // because Response::into_body requires running the
-        // hyper runtime; assert structure indirectly.
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .map(|v| v.to_str().unwrap_or("").to_string());
-        assert_eq!(ct.as_deref(), Some("text/event-stream"));
+    fn parses_event_name_from_well_formed_payload() {
+        let name = parse_event_name(r#"{"event":"step_started","agent":"a"}"#);
+        assert_eq!(name.as_deref(), Some("step_started"));
+    }
+
+    #[test]
+    fn falls_back_when_payload_has_no_event_field() {
+        assert!(parse_event_name(r#"{"agent":"a"}"#).is_none());
+        assert!(parse_event_name("not even json").is_none());
     }
 }

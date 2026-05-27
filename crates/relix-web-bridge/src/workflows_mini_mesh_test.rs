@@ -292,8 +292,9 @@ addr = "{}"
         .route("/v1/workflows", get(crate::workflows::list))
         .route("/v1/workflows/run", post(crate::workflows::run))
         .route("/v1/workflows/validate", post(crate::workflows::validate))
+        .route("/v1/workflows/reload", post(crate::workflows::reload))
         .route(
-            "/v1/workflows/:name/status/:execution_id",
+            "/v1/workflows/status/:execution_id",
             get(crate::workflows::status),
         )
         .with_state(state);

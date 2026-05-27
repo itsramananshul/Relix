@@ -582,21 +582,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(cron::get_one).patch(cron::update).delete(cron::delete),
         )
         .route("/v1/cron/jobs/:job_id/trigger", post(cron::trigger))
-        // Workflow engine (RELIX-7.5). Four proxies onto the
+        // Workflow engine (RELIX-7.5). Five proxies onto the
         // coordinator's `workflow.*` capabilities. POST /run
-        // executes by name (returns the full execution record,
-        // or a `text/event-stream` carrying a single `result`
-        // event when the body sets `stream: true`); GET /
-        // enumerates the catalog; GET /:name/status/:id fetches
-        // a past execution; POST /validate type-checks a source
-        // string.
+        // executes by name — returns the full execution record,
+        // or a live `text/event-stream` of per-step events when
+        // the body sets `stream: true`. POST /reload drops the
+        // coordinator's workflow file cache so in-place edits
+        // pick up without a restart.
         .route("/v1/workflows", get(workflows::list))
         .route("/v1/workflows/run", post(workflows::run))
         .route("/v1/workflows/validate", post(workflows::validate))
-        .route(
-            "/v1/workflows/:name/status/:execution_id",
-            get(workflows::status),
-        )
+        .route("/v1/workflows/reload", post(workflows::reload))
+        .route("/v1/workflows/status/:execution_id", get(workflows::status))
         // PH-DELEGATE-BRIDGE: delegation surface. Four proxies onto
         // the coordinator's `delegate.*` capabilities. POST /spawn
         // creates the child task; GET /result polls its state;

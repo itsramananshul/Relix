@@ -56,12 +56,30 @@ impl std::fmt::Display for ExecutionId {
 /// Final status of an execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionStatus {
-    /// Every required step ran successfully and the final
-    /// result expression resolved.
+    /// Every executed step succeeded and the final result
+    /// resolved.
     Success,
-    /// At least one step failed and no failure-handling edge
-    /// recovered it.
+    /// Workflow completed (no propagating error) but the
+    /// trace contains at least one failed step that a
+    /// `failure` or `always` edge recovered. The final
+    /// result still resolved; the operator just sees that
+    /// some sibling / upstream step needed its handler.
+    PartiallyFailed,
+    /// A step failed and no `failure` / `always` edge
+    /// matched — the workflow stopped at that step.
     Failed,
+}
+
+impl ExecutionStatus {
+    /// Canonical wire string. Matches the JSON `status`
+    /// field operators see in the bridge response.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::PartiallyFailed => "partially_failed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// One step's contribution to the trace.
@@ -147,9 +165,39 @@ pub async fn execute(
     dispatcher: Arc<dyn WorkflowDispatcher>,
     input: &str,
 ) -> WorkflowResult {
+    execute_inner(workflow, dispatcher, input, None).await
+}
+
+/// Streaming variant. Same engine as [`execute`], but emits
+/// a [`WorkflowEvent`] on `events` at every step transition.
+/// The final event is always [`WorkflowEvent::Finished`]
+/// carrying the same [`WorkflowResult`] this function
+/// returns, so consumers that only care about the terminal
+/// state can drop the rest.
+pub async fn execute_with_events(
+    workflow: Arc<Workflow>,
+    dispatcher: Arc<dyn WorkflowDispatcher>,
+    input: &str,
+    events: tokio::sync::mpsc::UnboundedSender<WorkflowEvent>,
+) -> WorkflowResult {
+    execute_inner(workflow, dispatcher, input, Some(events)).await
+}
+
+async fn execute_inner(
+    workflow: Arc<Workflow>,
+    dispatcher: Arc<dyn WorkflowDispatcher>,
+    input: &str,
+    events: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
+) -> WorkflowResult {
     let started = Instant::now();
     let execution_id = ExecutionId::new();
-    let mut state = ExecutionState::new(input);
+    if let Some(tx) = events.as_ref() {
+        let _ = tx.send(WorkflowEvent::Started {
+            execution_id: execution_id.clone(),
+            workflow_name: workflow.name.clone(),
+        });
+    }
+    let mut state = ExecutionState::new_with_events(input, events.clone());
     let mut trace_steps: Vec<ExecutionStep> = Vec::new();
 
     // Run the start step + drive the BFS.
@@ -170,12 +218,18 @@ pub async fn execute(
         total_latency_ms,
     };
 
-    match outcome {
+    let result = match outcome {
         Ok(()) => {
             let final_result = render_final_result(&workflow, &state);
+            let any_failed_step = trace.steps.iter().any(|s| s.outcome.is_err());
+            let status = if any_failed_step {
+                ExecutionStatus::PartiallyFailed
+            } else {
+                ExecutionStatus::Success
+            };
             WorkflowResult {
                 trace,
-                status: ExecutionStatus::Success,
+                status,
                 result: final_result,
             }
         }
@@ -184,7 +238,58 @@ pub async fn execute(
             status: ExecutionStatus::Failed,
             result: message,
         },
+    };
+    if let Some(tx) = events.as_ref() {
+        let _ = tx.send(WorkflowEvent::Finished(result.clone()));
     }
+    result
+}
+
+/// Live event emitted by [`execute_with_events`] during
+/// workflow execution. Each event is a discrete moment the
+/// streaming consumer (dashboard, CLI, SSE response) can
+/// render. The terminal `Finished` event carries the full
+/// [`WorkflowResult`] so consumers don't have to reassemble
+/// state from per-step events.
+#[derive(Debug, Clone)]
+pub enum WorkflowEvent {
+    /// Workflow execution has been admitted and the
+    /// execution id is now bound. Fires once at the start.
+    Started {
+        execution_id: ExecutionId,
+        workflow_name: String,
+    },
+    /// One step is about to be dispatched. Fires before the
+    /// `dispatcher.dispatch` call.
+    StepStarted {
+        agent: String,
+        peer: String,
+        capability: String,
+        input: String,
+    },
+    /// One step finished successfully. Carries the response
+    /// body the executor bound to `{{<step>.output}}`.
+    StepCompleted {
+        agent: String,
+        peer: String,
+        capability: String,
+        latency_ms: u64,
+        output: String,
+    },
+    /// One step's dispatch returned an error. The executor
+    /// then routes along any matching `failure` / `always`
+    /// edge; the consumer sees the failure even when a
+    /// downstream handler recovers it.
+    StepFailed {
+        agent: String,
+        peer: String,
+        capability: String,
+        latency_ms: u64,
+        error: String,
+    },
+    /// Workflow has finished. Carries the full result —
+    /// status, resolved result string, and trace.
+    Finished(WorkflowResult),
 }
 
 /// Mutable execution state passed through the BFS.
@@ -196,20 +301,39 @@ struct ExecutionState {
     /// infinite re-entry on diamond patterns where two
     /// success edges converge on a single step.
     visited: HashSet<String>,
+    /// Optional live-event sender. When `Some`, every step
+    /// start / completion / failure emits a
+    /// [`WorkflowEvent`] the consumer (SSE stream, dashboard)
+    /// can render in real time. When `None`, the executor
+    /// runs in its silent unary mode.
+    events: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
 }
 
 impl ExecutionState {
-    fn new(input: &str) -> Self {
+    fn new_with_events(
+        input: &str,
+        events: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
+    ) -> Self {
         let mut bindings = BTreeMap::new();
         bindings.insert("workflow.input".to_string(), input.to_string());
         Self {
             bindings,
             visited: HashSet::new(),
+            events,
         }
     }
 
     fn bind(&mut self, output_name: &str, value: String) {
         self.bindings.insert(format!("{output_name}.output"), value);
+    }
+
+    fn emit(&self, event: WorkflowEvent) {
+        if let Some(tx) = self.events.as_ref() {
+            // Best-effort: an unbuffered receiver that has
+            // gone away is treated as "consumer no longer
+            // watching" and we silently drop the event.
+            let _ = tx.send(event);
+        }
     }
 }
 
@@ -283,6 +407,12 @@ async fn run_step_only(
             ));
         }
     };
+    state.emit(WorkflowEvent::StepStarted {
+        agent: agent_name.to_string(),
+        peer: spec.peer.clone(),
+        capability: spec.capability.clone(),
+        input: input_str.clone(),
+    });
     let started_at = Instant::now();
     let dispatch_outcome = dispatcher
         .dispatch(&spec.peer, &spec.capability, input_str.as_bytes())
@@ -293,6 +423,13 @@ async fn run_step_only(
         Ok(body) => {
             let body_str = String::from_utf8_lossy(&body).to_string();
             state.bind(&spec.output, body_str.clone());
+            state.emit(WorkflowEvent::StepCompleted {
+                agent: agent_name.to_string(),
+                peer: spec.peer.clone(),
+                capability: spec.capability.clone(),
+                latency_ms,
+                output: body_str.clone(),
+            });
             trace.push(ExecutionStep {
                 agent: agent_name.to_string(),
                 peer: spec.peer.clone(),
@@ -307,6 +444,13 @@ async fn run_step_only(
         Err(e) => {
             let cause = e.cause.clone();
             state.bind(&spec.output, cause.clone());
+            state.emit(WorkflowEvent::StepFailed {
+                agent: agent_name.to_string(),
+                peer: spec.peer.clone(),
+                capability: spec.capability.clone(),
+                latency_ms,
+                error: cause.clone(),
+            });
             trace.push(ExecutionStep {
                 agent: agent_name.to_string(),
                 peer: spec.peer.clone(),
@@ -376,10 +520,15 @@ fn follow_edges<'a>(
                 let dispatcher = dispatcher.clone();
                 let to = edge.to.clone();
                 let wf: Arc<Workflow> = Arc::new(workflow.clone());
+                // Parallel branches share the parent's event
+                // channel so per-step events stream in real
+                // time across siblings.
+                let events = state.events.clone();
                 futures.push(async move {
                     let mut local_state = ExecutionState {
                         bindings: parent_bindings,
                         visited: parent_visited,
+                        events,
                     };
                     let mut local_trace: Vec<ExecutionStep> = Vec::new();
                     let r = run_step_only(&wf, dispatcher, &to, &mut local_state, &mut local_trace)

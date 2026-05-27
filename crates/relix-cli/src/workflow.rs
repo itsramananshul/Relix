@@ -76,19 +76,22 @@ pub enum Cmd {
     /// workflow from the dashboard / API).
     Trace {
         /// Execution id (32 hex chars, printed by
-        /// `workflow run` and `workflow.status`).
+        /// `workflow run`).
         execution_id: String,
-        /// Optional workflow name. Today the bridge route is
-        /// `/v1/workflows/:name/status/:id`; `:name` is
-        /// purely cosmetic for human routing and the lookup
-        /// keys on `execution_id` alone. Defaults to
-        /// `unknown` when the operator hasn't recorded it.
-        #[arg(long, default_value = "unknown")]
-        name: String,
         #[arg(long, default_value = DEFAULT_BRIDGE)]
         bridge: String,
         /// Print raw bridge JSON instead of the formatted
         /// trace view.
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// Drop the workflow file cache on the coordinator so the
+    /// next list / run picks up any in-place edits without
+    /// requiring a coordinator restart.
+    Reload {
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        /// Print raw bridge JSON instead of `ok`.
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
@@ -106,10 +109,10 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Validate { file, bridge, raw } => validate(&bridge, &file, raw).await,
         Cmd::Trace {
             execution_id,
-            name,
             bridge,
             raw,
-        } => trace(&bridge, &name, &execution_id, raw).await,
+        } => trace(&bridge, &execution_id, raw).await,
+        Cmd::Reload { bridge, raw } => reload(&bridge, raw).await,
     }
 }
 
@@ -192,14 +195,12 @@ async fn validate(
 
 async fn trace(
     bridge: &str,
-    name: &str,
     execution_id: &str,
     raw: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!(
-        "{}/v1/workflows/{}/status/{}",
+        "{}/v1/workflows/status/{}",
         bridge.trim_end_matches('/'),
-        name,
         execution_id,
     );
     let body = http_get(&url).await?;
@@ -210,6 +211,17 @@ async fn trace(
     let rec: ExecutionRecord =
         serde_json::from_str(&body).map_err(|e| format!("decode trace body: {e} (body={body})"))?;
     render_execution(&rec);
+    Ok(())
+}
+
+async fn reload(bridge: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/workflows/reload", bridge.trim_end_matches('/'));
+    let body = http_post(&url, &serde_json::json!({})).await?;
+    if raw {
+        print_raw(&body);
+    } else {
+        println!("ok (workflow file cache cleared)");
+    }
     Ok(())
 }
 
