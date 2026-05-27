@@ -1159,6 +1159,77 @@ fn native_yaml_map_via_map_get_returns_correct_value() {
     // construction.
 }
 
+// ────────────────────── §Lower / Io error context ──────────
+
+#[test]
+fn io_error_message_includes_the_file_path() {
+    // Path doesn't exist — `compile_path` should surface the
+    // OS error AND the path the operator passed in.
+    let bogus = std::path::Path::new("does-not-exist-37cf914b.yml");
+    let err = super::compile_path(bogus).unwrap_err();
+    match err {
+        YamlFlowError::Io {
+            ref path,
+            ref cause,
+        } => {
+            assert!(
+                path.contains("does-not-exist-37cf914b.yml"),
+                "expected path in error, got `{path}`"
+            );
+            assert!(!cause.is_empty(), "expected non-empty cause");
+            // The Display impl renders both.
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("does-not-exist-37cf914b.yml"),
+                "expected Display to include path: {rendered}"
+            );
+        }
+        other => panic!("expected Io error, got {other:?}"),
+    }
+}
+
+#[test]
+fn lower_error_message_includes_step_context() {
+    // To trigger a Lower error we need YAML that schema-parses
+    // clean but lowers to invalid SOL. The simplest trigger is
+    // an `if.condition` that the SOL analyzer rejects — we
+    // pass a literal int where bool is required.
+    let yaml = r#"
+        steps:
+          - let:
+              name: ok
+              type: str
+              value: hi
+          - if:
+              condition: "42"
+              then:
+                - result: "yes"
+              else:
+                - result: "no"
+    "#;
+    let err = compile_source(yaml).unwrap_err();
+    match err {
+        YamlFlowError::Lower {
+            ref step_context,
+            ref lowered_source,
+            ref sol_error,
+        } => {
+            assert!(
+                step_context.contains("step"),
+                "step_context should name a step, got `{step_context}`"
+            );
+            assert!(!lowered_source.is_empty(), "lowered source must be present");
+            assert!(!sol_error.is_empty(), "sol error must be present");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("last lowered step"),
+                "Display should include step context: {rendered}"
+            );
+        }
+        other => panic!("expected Lower error, got {other:?}"),
+    }
+}
+
 // ────────────────────── §nested step line numbers ──────────
 
 #[test]
