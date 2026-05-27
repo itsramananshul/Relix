@@ -327,6 +327,54 @@ impl MemoryStore {
         Ok(out)
     }
 
+    /// RELIX-7.15 bulk-anonymize walker for the turns table.
+    /// Rewrites every row's `body` through the supplied
+    /// anonymizer when the result differs. Returns
+    /// `(scanned, changed)` counts. Idempotent — repeat calls
+    /// with the same anonymizer produce zero changes after
+    /// the first.
+    ///
+    /// Operators use this to retro-anonymize a memory store
+    /// that accrued history BEFORE `[memory.pii]` got flipped
+    /// to `enabled = true`. Pairs with
+    /// `LayeredMemoryStore::bulk_anonymize_records` on the
+    /// four-layer side.
+    pub fn bulk_anonymize_turns(
+        &self,
+        anon: &crate::training::PiiAnonymizer,
+    ) -> Result<(u64, u64), MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        let mut stmt = conn
+            .prepare("SELECT id, body FROM turns")
+            .map_err(MemoryError::Db)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(MemoryError::Db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(MemoryError::Db)?;
+        drop(stmt);
+        let mut update = conn
+            .prepare("UPDATE turns SET body = ?1 WHERE id = ?2")
+            .map_err(MemoryError::Db)?;
+        let mut scanned: u64 = 0;
+        let mut changed: u64 = 0;
+        for (id, body) in rows {
+            scanned += 1;
+            let scrubbed = if anon.enabled() {
+                anon.anonymize(&body)
+            } else {
+                body.clone()
+            };
+            if scrubbed != body {
+                update
+                    .execute(params![scrubbed, id])
+                    .map_err(MemoryError::Db)?;
+                changed += 1;
+            }
+        }
+        Ok((scanned, changed))
+    }
+
     /// Persistent agent memory: read both `agent` and `user`
     /// content for a `subject_id`. Missing rows return empty
     /// strings (not an error) — first-call agents start blank.
@@ -690,6 +738,26 @@ pub fn register(
             })),
         );
     }
+    // RELIX-7.15 PII migration: bulk-anonymize every row in
+    // both the turns table AND the four-layer
+    // `memory_records` table. Operators run this once after
+    // flipping `[memory.pii] enabled = true` on a store that
+    // already accrued history. Idempotent — re-running it on
+    // a clean store reports zero `changed`.
+    {
+        let store_for_bulk = store.clone();
+        let layered_for_bulk = layered.clone();
+        let anon = anonymizer.clone();
+        bridge.register(
+            "memory.bulk_anonymize",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let store = store_for_bulk.clone();
+                let layered = layered_for_bulk.clone();
+                let anon = anon.clone();
+                async move { handle_bulk_anonymize(&store, layered.as_ref(), &anon, &ctx) }
+            })),
+        );
+    }
     {
         let store = store.clone();
         bridge.register(
@@ -975,6 +1043,63 @@ fn handle_anonymize_preview(
     match serde_json::to_vec(&body) {
         Ok(b) => HandlerOutcome::Ok(b),
         Err(e) => internal(format!("memory.anonymize_preview: encode response: {e}")),
+    }
+}
+
+fn handle_bulk_anonymize(
+    store: &MemoryStore,
+    layered: Option<&LayeredContext>,
+    anonymizer: &crate::training::PiiAnonymizer,
+    _ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    if !anonymizer.enabled() {
+        return invalid_args(
+            "memory.bulk_anonymize: `[memory.pii] enabled = false` — \
+             flip the config to `true` before running the migration"
+                .to_string(),
+        );
+    }
+    let (turns_scanned, turns_changed) = match store.bulk_anonymize_turns(anonymizer) {
+        Ok(p) => p,
+        Err(e) => return internal(format!("memory.bulk_anonymize: turns: {e}")),
+    };
+    let records_stats = match layered {
+        Some(ctx) => match ctx.store.bulk_anonymize_records(anonymizer) {
+            Ok(s) => s,
+            Err(e) => return internal(format!("memory.bulk_anonymize: layered: {e}")),
+        },
+        // No layered store wired — return zero for every
+        // layer counter rather than erroring; the operator's
+        // turns-table migration still completed.
+        None => crate::nodes::memory::schema::BulkAnonymizeRecordsStats::default(),
+    };
+    tracing::info!(
+        turns_scanned,
+        turns_changed,
+        raw_scanned = records_stats.raw.scanned,
+        raw_changed = records_stats.raw.changed,
+        semantic_scanned = records_stats.semantic.scanned,
+        semantic_changed = records_stats.semantic.changed,
+        observation_scanned = records_stats.observation.scanned,
+        observation_changed = records_stats.observation.changed,
+        model_scanned = records_stats.model.scanned,
+        model_changed = records_stats.model.changed,
+        "memory.bulk_anonymize: migration pass complete"
+    );
+    let body = serde_json::json!({
+        "turns": { "scanned": turns_scanned, "changed": turns_changed },
+        "records": {
+            "raw": records_stats.raw,
+            "semantic": records_stats.semantic,
+            "observation": records_stats.observation,
+            "model": records_stats.model,
+            "total_scanned": records_stats.total_scanned(),
+            "total_changed": records_stats.total_changed(),
+        },
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => internal(format!("memory.bulk_anonymize: encode response: {e}")),
     }
 }
 
@@ -2750,6 +2875,110 @@ mod tests {
         match handle_anonymize_preview(&default_anon, &ctx) {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
             _ => panic!("expected INVALID_ARGS for unknown strategy"),
+        }
+    }
+
+    #[test]
+    fn bulk_anonymize_turns_redacts_existing_rows_idempotently() {
+        let store = MemoryStore::in_memory().expect("open");
+        store
+            .write_turn("s", "user", "email alice@example.com")
+            .unwrap();
+        store
+            .write_turn("s", "assistant", "ok will use that email")
+            .unwrap();
+        let anon = redact_anonymizer();
+        let (scanned, changed) = store.bulk_anonymize_turns(&anon).unwrap();
+        assert_eq!(scanned, 2);
+        assert_eq!(changed, 1);
+        // Persisted body is redacted.
+        let recent = store.recent_for_session("s", 10).unwrap();
+        let (_role, body) = recent.first().unwrap();
+        assert!(!body.contains("alice@example.com"));
+        assert!(body.contains("[EMAIL]"));
+        // Second pass is a no-op.
+        let (scanned2, changed2) = store.bulk_anonymize_turns(&anon).unwrap();
+        assert_eq!(scanned2, 2);
+        assert_eq!(changed2, 0);
+    }
+
+    #[test]
+    fn bulk_anonymize_turns_with_disabled_anonymizer_changes_nothing() {
+        let store = MemoryStore::in_memory().expect("open");
+        store
+            .write_turn("s", "user", "email alice@example.com")
+            .unwrap();
+        let disabled = disabled_anonymizer();
+        let (scanned, changed) = store.bulk_anonymize_turns(&disabled).unwrap();
+        assert_eq!(scanned, 1);
+        assert_eq!(changed, 0);
+    }
+
+    #[test]
+    fn handle_bulk_anonymize_rejects_when_pii_disabled() {
+        let store = MemoryStore::in_memory().expect("open");
+        let disabled = disabled_anonymizer();
+        let ctx = handler_ctx_for(b"{}");
+        match handle_bulk_anonymize(&store, None, &disabled, &ctx) {
+            HandlerOutcome::Err(e) => {
+                assert_eq!(e.kind, error_kinds::INVALID_ARGS);
+                assert!(e.cause.contains("[memory.pii] enabled"));
+            }
+            _ => panic!("expected INVALID_ARGS when anonymizer disabled"),
+        }
+    }
+
+    #[test]
+    fn handle_bulk_anonymize_returns_per_layer_counts() {
+        let store = Arc::new(MemoryStore::in_memory().expect("open"));
+        store
+            .write_turn("s", "user", "email alice@example.com")
+            .unwrap();
+        let layered = layered_ctx_no_qdrant();
+        // Seed the layered store with rows in every layer.
+        let raw = schema::MemoryRecord::new_raw("r", "alice@example.com", "s");
+        let mut sem = schema::MemoryRecord::new_raw("se", "phone 555-123-4567", "s");
+        sem.layer = schema::MemoryLayer::Semantic;
+        let mut obs =
+            schema::MemoryRecord::new_raw("o", "user is at 1600 Pennsylvania Avenue", "s");
+        obs.layer = schema::MemoryLayer::Observation;
+        let mut model = schema::MemoryRecord::new_raw("m", "clean text", "s");
+        model.layer = schema::MemoryLayer::Model;
+        layered.store.insert(&raw).unwrap();
+        layered.store.insert(&sem).unwrap();
+        layered.store.insert(&obs).unwrap();
+        layered.store.insert(&model).unwrap();
+        let anon = redact_anonymizer();
+        let ctx = handler_ctx_for(b"{}");
+        let r = handle_bulk_anonymize(&store, Some(&layered), &anon, &ctx);
+        match r {
+            HandlerOutcome::Ok(body) => {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let turns = v.get("turns").unwrap();
+                assert_eq!(
+                    turns.get("scanned").and_then(serde_json::Value::as_u64),
+                    Some(1)
+                );
+                assert_eq!(
+                    turns.get("changed").and_then(serde_json::Value::as_u64),
+                    Some(1)
+                );
+                let records = v.get("records").unwrap();
+                assert_eq!(
+                    records
+                        .get("total_scanned")
+                        .and_then(serde_json::Value::as_u64),
+                    Some(4)
+                );
+                // raw + semantic + observation each had PII; model didn't.
+                assert_eq!(
+                    records
+                        .get("total_changed")
+                        .and_then(serde_json::Value::as_u64),
+                    Some(3)
+                );
+            }
+            HandlerOutcome::Err(e) => panic!("expected Ok, got err: {}", e.cause),
         }
     }
 

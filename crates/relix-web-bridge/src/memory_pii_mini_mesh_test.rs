@@ -129,6 +129,11 @@ async fn memory_pii_mini_mesh_all_endpoints() {
         name = "ops_preview"
         method = "memory.anonymize_preview"
         allow_groups = ["operators"]
+
+        [[rules]]
+        name = "ops_bulk"
+        method = "memory.bulk_anonymize"
+        allow_groups = ["operators"]
         "#,
     );
 
@@ -144,8 +149,20 @@ async fn memory_pii_mini_mesh_all_endpoints() {
             { "pii_type": "EMAIL", "start": 14, "end": 31, "matched_text": "alice@example.com" }
         ]
     });
+    let bulk_response = serde_json::json!({
+        "turns": { "scanned": 12, "changed": 4 },
+        "records": {
+            "raw":         { "scanned": 8, "changed": 3 },
+            "semantic":    { "scanned": 5, "changed": 2 },
+            "observation": { "scanned": 3, "changed": 1 },
+            "model":       { "scanned": 1, "changed": 0 },
+            "total_scanned": 17,
+            "total_changed": 6
+        }
+    });
     let scan_arc = Arc::new(scan_response.clone());
     let preview_arc = Arc::new(preview_response.clone());
+    let bulk_arc = Arc::new(bulk_response.clone());
 
     dispatch.register(
         "memory.pii_scan",
@@ -161,6 +178,16 @@ async fn memory_pii_mini_mesh_all_endpoints() {
         "memory.anonymize_preview",
         Arc::new(FnHandler({
             let r = preview_arc.clone();
+            move |_ctx: InvocationCtx| {
+                let r = r.clone();
+                async move { HandlerOutcome::Ok(serde_json::to_vec(&*r).unwrap_or_default()) }
+            }
+        })),
+    );
+    dispatch.register(
+        "memory.bulk_anonymize",
+        Arc::new(FnHandler({
+            let r = bulk_arc.clone();
             move |_ctx: InvocationCtx| {
                 let r = r.clone();
                 async move { HandlerOutcome::Ok(serde_json::to_vec(&*r).unwrap_or_default()) }
@@ -256,6 +283,10 @@ addr = "{}"
     let app = Router::new()
         .route("/v1/memory/pii/scan", post(crate::memory_pii::scan))
         .route("/v1/memory/pii/preview", post(crate::memory_pii::preview))
+        .route(
+            "/v1/memory/pii/bulk_anonymize",
+            post(crate::memory_pii::bulk_anonymize),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = listener.local_addr().unwrap();
@@ -325,4 +356,45 @@ addr = "{}"
     .unwrap()
     .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
+
+    // 5. POST /v1/memory/pii/bulk_anonymize → 200 + per-layer counts
+    let url = format!("http://{}/v1/memory/pii/bulk_anonymize", bound);
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url).json(&serde_json::json!({})).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, bulk_response);
+    // Spot-check the shape: turns + records.{raw,semantic,observation,model,total_*}.
+    assert_eq!(
+        body.pointer("/turns/changed").and_then(Value::as_u64),
+        Some(4)
+    );
+    assert_eq!(
+        body.pointer("/records/total_scanned")
+            .and_then(Value::as_u64),
+        Some(17)
+    );
+    assert_eq!(
+        body.pointer("/records/raw/changed").and_then(Value::as_u64),
+        Some(3)
+    );
+
+    // 6. POST /v1/memory/pii/bulk_anonymize with no body → 200
+    // (operators may POST with a content-length header of 0).
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .header("content-type", "application/json")
+            .body("")
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
 }

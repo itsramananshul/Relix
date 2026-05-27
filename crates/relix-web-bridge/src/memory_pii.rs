@@ -1,12 +1,16 @@
 //! RELIX-7.15 — HTTP proxies for the memory node's PII surface.
 //!
-//! Two endpoints, both forwarders to the `memory.*` PII caps:
+//! Three endpoints, all forwarders to the `memory.*` PII caps:
 //!
-//! - `POST /v1/memory/pii/scan`    → `memory.pii_scan`.
-//! - `POST /v1/memory/pii/preview` → `memory.anonymize_preview`.
+//! - `POST /v1/memory/pii/scan`           → `memory.pii_scan`.
+//! - `POST /v1/memory/pii/preview`        → `memory.anonymize_preview`.
+//! - `POST /v1/memory/pii/bulk_anonymize` → `memory.bulk_anonymize`.
 //!
-//! Both endpoints reject empty-text requests with 400 +
-//! structured error body BEFORE dialing the mesh.
+//! The scan/preview endpoints reject empty-text requests with
+//! 400 + structured error body BEFORE dialing the mesh.
+//! `bulk_anonymize` takes no body args — operators just POST
+//! `{}` (or no body) and the coordinator walks both the turns
+//! table and the layered `memory_records` table once.
 
 use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -77,6 +81,33 @@ pub async fn preview(
         &peer,
         "memory.anonymize_preview",
         &Value::Object(body),
+    )
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BulkAnonymizeRequest {
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+/// `POST /v1/memory/pii/bulk_anonymize`
+pub async fn bulk_anonymize(
+    State(state): State<AppState>,
+    body: Option<Json<BulkAnonymizeRequest>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    match call_peer_json(
+        &state,
+        &peer,
+        "memory.bulk_anonymize",
+        &Value::Object(Default::default()),
     )
     .await
     {

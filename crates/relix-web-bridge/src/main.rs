@@ -532,9 +532,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/memory/search", post(memory_embed::search))
         .route("/v1/memory/sessions/search", get(session_search::search))
         .route("/v1/memory/embed_all", post(memory_embed::embed_all))
-        // RELIX-7.15 PII: memory-layer scan + preview.
+        // RELIX-7.15 PII: memory-layer scan + preview + migration.
         .route("/v1/memory/pii/scan", post(memory_pii::scan))
         .route("/v1/memory/pii/preview", post(memory_pii::preview))
+        .route(
+            "/v1/memory/pii/bulk_anonymize",
+            post(memory_pii::bulk_anonymize),
+        )
         // Four-layer memory inspector. Reads the layered store
         // directly from `AppState::layered_memory` — set
         // `[bridge] memory_db_path` to enable.

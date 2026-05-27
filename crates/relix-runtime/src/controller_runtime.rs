@@ -4165,6 +4165,19 @@ fn register_node_type_handlers(
                 &["read", "memory", "pii"],
                 &["reads:internal"],
             ),
+            (
+                "memory.bulk_anonymize",
+                "RELIX-7.15 migration: walk every row in the \
+                 turns table AND the four-layer `memory_records` \
+                 table, rewriting each through the configured \
+                 anonymizer. Idempotent — re-running produces \
+                 zero `changed` on already-clean rows. Returns \
+                 per-table + per-layer (scanned, changed) \
+                 counts. Refuses to run when `[memory.pii] \
+                 enabled = false`. Args: empty JSON object.",
+                &["mutate", "memory", "pii", "migration"],
+                &["mutate:memory"],
+            ),
         ];
         for (m, desc, cats, tags) in memory_caps {
             // PH-CAP-RISK: memory caps are either reads (Safe) or

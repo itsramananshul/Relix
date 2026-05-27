@@ -235,6 +235,100 @@ impl LayeredMemoryStore {
         Ok(())
     }
 
+    /// RELIX-7.15 bulk-anonymize walker. Walks every row in
+    /// `memory_records` and rewrites each row's `text` through
+    /// the supplied anonymizer when the result differs.
+    /// Returns per-layer (scanned, changed) counts.
+    ///
+    /// The walker is idempotent: running it twice on the same
+    /// store produces zero changes on the second pass because
+    /// the anonymizer's placeholders / pseudonyms don't match
+    /// the PII patterns. Safe to invoke from operator surfaces
+    /// at any time.
+    ///
+    /// Streams the table id-by-id under a single SQLite lock
+    /// so concurrent writes during the walk are linearised. On
+    /// a 10k-row store this finishes in a few hundred
+    /// milliseconds; operators bulk-anonymizing larger stores
+    /// should run the cap during a quiet window.
+    pub fn bulk_anonymize_records(
+        &self,
+        anon: &crate::training::PiiAnonymizer,
+    ) -> Result<BulkAnonymizeRecordsStats, LayeredMemoryError> {
+        let mut stats = BulkAnonymizeRecordsStats::default();
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare("SELECT id, layer, text FROM memory_records")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut update_stmt = conn.prepare("UPDATE memory_records SET text = ?1 WHERE id = ?2")?;
+        for (id, layer_str, text) in rows {
+            let layer = MemoryLayer::parse(&layer_str).unwrap_or(MemoryLayer::Raw);
+            let counter = stats.counter_mut(layer);
+            counter.scanned += 1;
+            // When the anonymizer is disabled it pass-throughs;
+            // we only count `changed` for rows where the text
+            // actually mutated (so the caller can tell whether
+            // a row was already clean vs needed scrubbing).
+            let scrubbed = if anon.enabled() {
+                anon.anonymize(&text)
+            } else {
+                text.clone()
+            };
+            if scrubbed != text {
+                update_stmt.execute(params![scrubbed, id])?;
+                counter.changed += 1;
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// Per-layer counters returned by
+/// [`LayeredMemoryStore::bulk_anonymize_records`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BulkAnonymizeRecordsStats {
+    pub raw: LayerCount,
+    pub semantic: LayerCount,
+    pub observation: LayerCount,
+    pub model: LayerCount,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LayerCount {
+    pub scanned: u64,
+    pub changed: u64,
+}
+
+impl BulkAnonymizeRecordsStats {
+    /// Sum of `scanned` across every layer.
+    pub fn total_scanned(&self) -> u64 {
+        self.raw.scanned + self.semantic.scanned + self.observation.scanned + self.model.scanned
+    }
+
+    /// Sum of `changed` across every layer.
+    pub fn total_changed(&self) -> u64 {
+        self.raw.changed + self.semantic.changed + self.observation.changed + self.model.changed
+    }
+
+    fn counter_mut(&mut self, layer: MemoryLayer) -> &mut LayerCount {
+        match layer {
+            MemoryLayer::Raw => &mut self.raw,
+            MemoryLayer::Semantic => &mut self.semantic,
+            MemoryLayer::Observation => &mut self.observation,
+            MemoryLayer::Model => &mut self.model,
+        }
+    }
+}
+
+impl LayeredMemoryStore {
     /// Fetch one record by id. `Ok(None)` when the row is
     /// absent; never raises.
     pub fn get(&self, id: &str) -> Result<Option<MemoryRecord>, LayeredMemoryError> {
@@ -741,5 +835,89 @@ mod tests {
         let b = qdrant_point_id_from_str("rec-2");
         assert_eq!(a1, a2, "same input must yield the same id");
         assert_ne!(a1, b, "different inputs should land on different ids");
+    }
+
+    // ── RELIX-7.15 bulk-anonymize walker ───────────────────
+
+    fn redact_anonymizer() -> crate::training::PiiAnonymizer {
+        crate::training::PiiAnonymizer::from_config(&crate::training::PiiConfig {
+            enabled: true,
+            strategy: crate::training::PiiStrategy::Redact,
+            overrides: Default::default(),
+        })
+    }
+
+    #[test]
+    fn bulk_anonymize_records_scrubs_every_layer_and_counts_changes() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        let raw = record("r", MemoryLayer::Raw, "email alice@example.com", "s1");
+        let sem = record("s", MemoryLayer::Semantic, "phone is 555-123-4567", "s1");
+        let obs = record(
+            "o",
+            MemoryLayer::Observation,
+            "user lives at 1600 Pennsylvania Avenue",
+            "s1",
+        );
+        let model = record("m", MemoryLayer::Model, "clean text only", "s1");
+        store.insert(&raw).unwrap();
+        store.insert(&sem).unwrap();
+        store.insert(&obs).unwrap();
+        store.insert(&model).unwrap();
+        let stats = store.bulk_anonymize_records(&redact_anonymizer()).unwrap();
+        assert_eq!(stats.raw.scanned, 1);
+        assert_eq!(stats.raw.changed, 1);
+        assert_eq!(stats.semantic.scanned, 1);
+        assert_eq!(stats.semantic.changed, 1);
+        assert_eq!(stats.observation.scanned, 1);
+        assert_eq!(stats.observation.changed, 1);
+        assert_eq!(stats.model.scanned, 1);
+        // Layer 4 row has no PII — nothing to change.
+        assert_eq!(stats.model.changed, 0);
+        assert_eq!(stats.total_scanned(), 4);
+        assert_eq!(stats.total_changed(), 3);
+        // Spot-check the persisted text.
+        let got_raw = store.get("r").unwrap().unwrap();
+        assert!(got_raw.text.contains("[EMAIL]"));
+        assert!(!got_raw.text.contains("alice@example.com"));
+        let got_model = store.get("m").unwrap().unwrap();
+        assert_eq!(got_model.text, "clean text only");
+    }
+
+    #[test]
+    fn bulk_anonymize_records_is_idempotent_on_second_run() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        store
+            .insert(&record(
+                "x",
+                MemoryLayer::Raw,
+                "email alice@example.com",
+                "s",
+            ))
+            .unwrap();
+        let anon = redact_anonymizer();
+        let first = store.bulk_anonymize_records(&anon).unwrap();
+        assert_eq!(first.raw.changed, 1);
+        let second = store.bulk_anonymize_records(&anon).unwrap();
+        assert_eq!(
+            second.raw.changed, 0,
+            "second pass must be a no-op: {second:?}"
+        );
+        // But the row is still scanned.
+        assert_eq!(second.raw.scanned, 1);
+    }
+
+    #[test]
+    fn bulk_anonymize_records_with_disabled_anonymizer_changes_nothing() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        store
+            .insert(&record("x", MemoryLayer::Raw, "alice@example.com", "s"))
+            .unwrap();
+        let disabled = crate::training::PiiAnonymizer::disabled();
+        let stats = store.bulk_anonymize_records(&disabled).unwrap();
+        assert_eq!(stats.raw.scanned, 1);
+        assert_eq!(stats.raw.changed, 0);
+        // Text is untouched.
+        let r = store.get("x").unwrap().unwrap();
+        assert!(r.text.contains("alice@example.com"));
     }
 }
