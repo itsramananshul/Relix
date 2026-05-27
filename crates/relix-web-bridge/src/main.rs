@@ -140,6 +140,7 @@ mod tools;
 mod topology;
 mod validate;
 mod ws;
+mod yaml_validate;
 
 use crate::config::{AppState, BridgeConfig};
 
@@ -628,6 +629,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // to surface line-numbered errors inline before a flow is
         // deployed. No execution happens here — pure parse.
         .route("/v1/sol/validate", post(sol_validate::validate))
+        // YAML twin of the SOL validator. Same parse-only
+        // contract, distinct response shape — see
+        // `crate::yaml_validate` for the JSON schema.
+        .route("/v1/yaml/validate", post(yaml_validate::validate))
         // W2-002g: proxy for `tool.browser.capture_read`. Streams
         // a failure-screenshot PNG from the configured tool-peer
         // `screenshot_on_failure_dir` back to the dashboard with
