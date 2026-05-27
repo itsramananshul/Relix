@@ -86,6 +86,9 @@ async fn route_latency_log(req: Request, next: Next) -> Response {
 
 mod agent;
 mod agent_memory;
+mod agent_metrics;
+#[cfg(test)]
+mod agent_metrics_mini_mesh_test;
 mod agents_access;
 mod auth;
 mod blocklist;
@@ -573,6 +576,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/email/send", post(email::send))
         .route("/v1/email/send_template", post(email::send_template))
         .route("/v1/email/status", get(email::status))
+        // RELIX-7.11: agent performance metrics. All six routes
+        // proxy onto the coordinator's `metrics.*` capabilities.
+        .route("/v1/metrics/agents", get(agent_metrics::list_agents))
+        .route(
+            "/v1/metrics/agents/:agent/summary",
+            get(agent_metrics::agent_summary),
+        )
+        .route(
+            "/v1/metrics/agents/:agent/methods",
+            get(agent_metrics::agent_methods),
+        )
+        .route(
+            "/v1/metrics/agents/:agent/timeseries",
+            get(agent_metrics::agent_timeseries),
+        )
+        .route("/v1/metrics/alerts", get(agent_metrics::alerts))
+        .route("/v1/metrics/cost", get(agent_metrics::cost))
         .route("/v1/plugins", get(plugins::list))
         .route("/v1/plugins/:plugin_id", get(plugins::status))
         .route("/v1/plugins/:plugin_id/reload", post(plugins::reload))
