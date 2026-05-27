@@ -998,13 +998,18 @@ tests; the email module contributes 92.
   dashboard-redesign work the slack / discord / telegram tiles
   are part of. The capability surface is ready when the
   dashboard work picks it up.
-- **Subject-line / sender-based agent routing rules** — the
-  controller currently routes every inbound email through the
-  canonical chat flow with the thread session_id. Per-subject /
-  per-sender routing rules require a coordinator-side router
-  hook that doesn't exist as a channel-agnostic primitive yet;
-  the foundation in this session is the right place to wire it
-  when the routing layer lands.
+- **Subject-line / sender-based agent routing rules** —
+  `[DONE — commit 29d48ea]`. `crates/relix-runtime/src/nodes/coordinator/routing.rs`
+  ships the channel-agnostic `ChannelRouter` with
+  sender_match / subject_match / content_match /
+  channel_type / catch_all rules, first-match-wins
+  evaluation, peer validation at startup, `routing.resolve`
+  and `routing.list` coordinator capabilities, and
+  `routing_resolve` + `dispatch_chat` wired into the
+  Telegram / Discord / Slack / Email outbound clients +
+  controller chat-flow paths. 19 unit tests cover glob
+  matching, evaluation order, channel-specific filtering,
+  validation rejection, and the list serialisation path.
 
 ### 7.8 Scheduled Reports `[DONE — commits 6a2d13a + 2a34b50]`
 
@@ -1119,36 +1124,50 @@ RELIX-7.11 metrics.
 **Not shipped this session (documented gaps):**
 
 - **AI handler-side token / cost enrichment for `ai.chat`** —
-  the metrics surface exposes `MetricsSink::attach_ai_usage`
-  + an in-memory join cache so an AI handler can fire a
-  per-call usage hint that the collector merges into the
-  dispatch row before persisting. The dispatch row carries
-  `request_id` so the join is unambiguous, and the unit test
-  `ai_usage_hint_enriches_subsequent_metric` proves the
-  merge path. What is NOT done yet is the wiring inside
-  `crates/relix-runtime/src/nodes/ai/mod.rs` — the AI handler
-  doesn't yet call `metrics_sink.attach_ai_usage(...)` before
-  returning. Cost + token columns will populate the moment
-  that one call lands; until then those columns stay NULL on
-  every row. The hook lives behind a `Option<Arc<dyn
-  MetricsSink>>` so the change is additive + safe to do in
-  a separate AI-focused commit.
-- **Alert channel fan-out** — alerts currently route to the
-  built-in `LoggingAlertSink`. The `AlertDeliver` trait is
-  pluggable so the coordinator can implement a sink that
-  dispatches the alert through Telegram / Discord / Slack /
-  Email via the existing channel `*.send` capabilities; that
-  implementation is a small wrapper but requires a
-  coordinator-side bundle of channel-peer aliases that we
-  don't want to plumb in until the channel routing layer
-  (mentioned in §7.7's deferred work) ships.
-- **Chronicle alert events** — alerts fire via the
-  `AlertDeliver` sink; the runtime does NOT currently route
-  them to the coordinator's chronicle (the workflow
-  chronicle is a different schema). A small chronicle
-  writer sink can be added later that records each alert as
-  a structured chronicle event; the foundation is the
-  `AlertDeliver` trait.
+  `[DONE — commit d3d753f]`. `ai::register` + `handle_chat`
+  take `Option<Arc<dyn MetricsSink>>`; the controller
+  threads `metrics.map(|b| b.sink.clone())` through. When a
+  provider returns `Ok(output)` with `output.usage`
+  present, the handler calls
+  `sink.attach_ai_usage(AiUsageHint { request_id, prompt,
+  completion, model })` BEFORE the planner / response
+  pipeline runs. The dispatch bridge records the metric
+  row AFTER the handler returns; the collector's join
+  cache merges the hint by `request_id`. Verified by three
+  tests including an end-to-end round-trip through the
+  real `MetricsCollector` to the SQLite store that asserts
+  non-null token_count + non-zero cost_micros + model on
+  the persisted row.
+- **Alert channel fan-out** — `[DONE — commit 4728c19]`.
+  `MultiChannelAlertSink` implements `AlertDeliver`,
+  formats the documented warning / critical / recovery
+  templates with badges + Agent / Metric / Current /
+  Threshold / Time fields, and dispatches each target on
+  its own tokio task so a slow / stuck channel never
+  blocks the engine or the next target. Email targets
+  call `email.send` through the configured coordinator
+  mesh client; Telegram / Discord / Slack targets log
+  honestly that those channels don't expose inbound
+  `*.send` capabilities today (the chronicle sink still
+  records the event). Targets configured in
+  `[[metrics.alerts.targets]]`. Wiring through
+  `StartupWiring::CoordAlertMesh` populates the mesh cell
+  post-startup.
+- **Chronicle alert events** — `[DONE — commit 4728c19]`.
+  `ChronicleAlertSink` implements `AlertDeliver` and writes
+  every fired / recovered event to a dedicated
+  `alerts.sqlite` next to `metrics.sqlite`. Schema carries
+  `event_type` (`alert.fired` / `alert.recovered`),
+  `agent`, `metric`, `severity` (fired only),
+  `actual_value`, `threshold_value`, ISO `triggered_at`
+  (both variants), ISO `recovered_at` (recovered only),
+  and `recorded_at_ms`. Append-only, indexed on
+  `(recorded_at_ms)` + `(agent, recorded_at_ms)`. Verified
+  persistent across restart by the
+  `chronicle_persists_across_reopen` test. The chronicle
+  sink ALWAYS runs alongside the channel sink so the
+  audit trail is complete even when no targets are
+  configured.
 - **Dashboard panel** — the bridge exposes JSON-shaped read
   endpoints today. The HTML dashboard panel that renders the
   sparkline + summary table + alert badges sits in the same
