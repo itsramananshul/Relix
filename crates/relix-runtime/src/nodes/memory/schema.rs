@@ -76,9 +76,56 @@ impl std::fmt::Display for MemoryLayer {
     }
 }
 
+/// RELIX-7.16: share-policy enum. Stored as the lowercase
+/// tag string in the `share_policy` column so operators can
+/// `SELECT * FROM memory_records WHERE share_policy = 'auto'`
+/// from `sqlite3` without joining a vocab table. `None` is
+/// the default (and what every pre-7.16 row migrates to).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SharePolicy {
+    /// Never shared. Default.
+    #[default]
+    None,
+    /// Shared only when an operator explicitly calls
+    /// `knowledge.share` / `knowledge.group_broadcast`.
+    Explicit,
+    /// Auto-propagated by the AutoShareTask to every other
+    /// member of the agent's sharing groups when first
+    /// observed.
+    Auto,
+}
+
+impl SharePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Explicit => "explicit",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "" => Some(Self::None),
+            "explicit" => Some(Self::Explicit),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
 /// One row in the four-layer memory store. `id` is the stable
 /// identifier — the embedding pipeline + Qdrant payload both
 /// reference it directly so updates are idempotent.
+///
+/// RELIX-7.16: rows carry four optional sharing fields. They
+/// default to safe values (`shareable = false`, `shared_with`
+/// empty, `shared_by = None`, `share_policy = None`) so the
+/// pre-7.16 pipeline keeps its semantics. The
+/// [`MemoryRecord::new_raw`] convenience constructor returns a
+/// record with these defaults so existing call sites compile
+/// unchanged.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryRecord {
     pub id: String,
@@ -91,6 +138,23 @@ pub struct MemoryRecord {
     pub valid_to: Option<i64>,
     pub observed_at: i64,
     pub embedding: Option<Vec<f32>>,
+    /// Operator-set flag: this observation is safe to share.
+    /// Only meaningful for Layer 3 observations; other layers
+    /// keep this `false`.
+    pub shareable: bool,
+    /// Agent names this record has been explicitly shared
+    /// with. Empty on the receiving copy; the SOURCE record
+    /// accrues entries as `knowledge.share` /
+    /// `knowledge.group_broadcast` runs.
+    pub shared_with: Vec<String>,
+    /// Source agent name on a copy that was received via
+    /// `knowledge.share`. `None` on every original (un-shared)
+    /// record.
+    pub shared_by: Option<String>,
+    /// One of [`SharePolicy::None`] / [`SharePolicy::Explicit`]
+    /// / [`SharePolicy::Auto`]. Defaults to `None` so pre-7.16
+    /// rows are never auto-propagated.
+    pub share_policy: SharePolicy,
 }
 
 impl MemoryRecord {
@@ -115,6 +179,10 @@ impl MemoryRecord {
             valid_to: None,
             observed_at: now,
             embedding: None,
+            shareable: false,
+            shared_with: Vec::new(),
+            shared_by: None,
+            share_policy: SharePolicy::None,
         }
     }
 }
@@ -182,11 +250,20 @@ impl LayeredMemoryStore {
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let tags_json = serde_json::to_string(&record.tags)
             .map_err(|e| LayeredMemoryError::Serialization(e.to_string()))?;
+        let shared_with_json = if record.shared_with.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&record.shared_with)
+                    .map_err(|e| LayeredMemoryError::Serialization(e.to_string()))?,
+            )
+        };
         let embedding_blob = record.embedding.as_ref().map(|v| encode_f32_le(v));
         conn.execute(
             "INSERT OR REPLACE INTO memory_records \
-             (id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+              shareable, shared_with, shared_by, share_policy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 record.id,
                 record.layer.as_str(),
@@ -198,6 +275,10 @@ impl LayeredMemoryStore {
                 record.valid_to,
                 record.observed_at,
                 embedding_blob,
+                record.shareable as i32,
+                shared_with_json,
+                record.shared_by,
+                record.share_policy.as_str(),
             ],
         )?;
         Ok(())
@@ -335,7 +416,8 @@ impl LayeredMemoryStore {
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let row = conn
             .query_row(
-                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
                  FROM memory_records WHERE id = ?1",
                 params![id],
                 row_to_record,
@@ -360,28 +442,32 @@ impl LayeredMemoryStore {
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) = match (layer, source) {
             (None, None) => (
-                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
                  FROM memory_records \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
                 vec![limit.into(), offset.into()],
             ),
             (Some(l), None) => (
-                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
                  FROM memory_records WHERE layer = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
                 vec![limit.into(), offset.into(), l.as_str().to_string().into()],
             ),
             (None, Some(s)) => (
-                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
                  FROM memory_records WHERE source = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
                 vec![limit.into(), offset.into(), s.to_string().into()],
             ),
             (Some(l), Some(s)) => (
-                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
                  FROM memory_records WHERE layer = ?3 AND source = ?4 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -417,7 +503,8 @@ impl LayeredMemoryStore {
         let pattern = format!("%{}%", query.replace('%', "\\%"));
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let mut stmt = conn.prepare(
-            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
              FROM memory_records WHERE text LIKE ?1 ESCAPE '\\' \
              ORDER BY created_at DESC, id ASC \
              LIMIT ?2",
@@ -479,7 +566,8 @@ impl LayeredMemoryStore {
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let row = conn
             .query_row(
-                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
                  FROM memory_records WHERE layer = ?1 AND source = ?2 \
                  ORDER BY observed_at DESC, id ASC LIMIT 1",
                 params![layer.as_str(), source],
@@ -527,7 +615,8 @@ impl LayeredMemoryStore {
         let limit = limit.clamp(1, 1000) as i64;
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let mut stmt = conn.prepare(
-            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding \
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
              FROM memory_records \
              WHERE embedding IS NULL \
              ORDER BY observed_at ASC, id ASC \
@@ -543,18 +632,26 @@ impl LayeredMemoryStore {
 }
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Step 1: create the base table (with the 7.16 columns
+    // baked in) + the legacy indexes. On a pre-7.16 database
+    // the CREATE TABLE IF NOT EXISTS is a no-op; the share
+    // columns get backfilled by the ALTER pass below.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_records (\
-             id          TEXT PRIMARY KEY,\
-             layer       TEXT NOT NULL,\
-             text        TEXT NOT NULL,\
-             source      TEXT NOT NULL DEFAULT '',\
-             tags        TEXT NOT NULL DEFAULT '[]',\
-             created_at  INTEGER NOT NULL,\
-             valid_from  INTEGER NOT NULL,\
-             valid_to    INTEGER,\
-             observed_at INTEGER NOT NULL,\
-             embedding   BLOB\
+             id           TEXT PRIMARY KEY,\
+             layer        TEXT NOT NULL,\
+             text         TEXT NOT NULL,\
+             source       TEXT NOT NULL DEFAULT '',\
+             tags         TEXT NOT NULL DEFAULT '[]',\
+             created_at   INTEGER NOT NULL,\
+             valid_from   INTEGER NOT NULL,\
+             valid_to     INTEGER,\
+             observed_at  INTEGER NOT NULL,\
+             embedding    BLOB,\
+             shareable    INTEGER NOT NULL DEFAULT 0,\
+             shared_with  TEXT,\
+             shared_by    TEXT,\
+             share_policy TEXT NOT NULL DEFAULT 'none'\
          );\
          CREATE INDEX IF NOT EXISTS memory_records_layer_created \
              ON memory_records(layer, created_at DESC);\
@@ -563,7 +660,44 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          CREATE INDEX IF NOT EXISTS memory_records_pending \
              ON memory_records(observed_at) WHERE embedding IS NULL;",
     )?;
+    // Step 2: RELIX-7.16 backwards-compat migration. ALTER
+    // TABLE ADD COLUMN guarded by PRAGMA table_info probe. A
+    // pre-7.16 database opening against this build picks up
+    // the four new columns without losing any rows. Must run
+    // BEFORE the share-related indexes get created (an index
+    // on a column that doesn't exist yet errors).
+    if !column_exists(conn, "memory_records", "shareable")? {
+        conn.execute_batch(
+            "ALTER TABLE memory_records ADD COLUMN shareable INTEGER NOT NULL DEFAULT 0;\
+             ALTER TABLE memory_records ADD COLUMN shared_with TEXT;\
+             ALTER TABLE memory_records ADD COLUMN shared_by TEXT;\
+             ALTER TABLE memory_records ADD COLUMN share_policy TEXT NOT NULL DEFAULT 'none';",
+        )?;
+    }
+    // Step 3: 7.16 indexes. Always issued with IF NOT EXISTS
+    // so they're idempotent across both fresh and migrated
+    // databases.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS memory_records_share_policy \
+             ON memory_records(share_policy) WHERE share_policy != 'none';\
+         CREATE INDEX IF NOT EXISTS memory_records_shared_by \
+             ON memory_records(shared_by) WHERE shared_by IS NOT NULL;",
+    )?;
     Ok(())
+}
+
+/// Probe `PRAGMA table_info` for `column` on `table`. Used by
+/// the RELIX-7.16 migration path to make column-add idempotent
+/// (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for r in rows {
+        if r? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `SELECT` row → `Result<MemoryRecord, LayeredMemoryError>`,
@@ -583,6 +717,14 @@ fn row_to_record(
     let valid_to: Option<i64> = r.get(7)?;
     let observed_at: i64 = r.get(8)?;
     let embedding_blob: Option<Vec<u8>> = r.get(9)?;
+    // RELIX-7.16 columns. The migration backfills these on
+    // pre-7.16 databases; we still tolerate NULLs here as a
+    // safety net (e.g. a row that lands via a future migration
+    // path that hasn't run yet).
+    let shareable: i32 = r.get(10).unwrap_or(0);
+    let shared_with_json: Option<String> = r.get(11).unwrap_or(None);
+    let shared_by: Option<String> = r.get(12).unwrap_or(None);
+    let share_policy_s: Option<String> = r.get(13).unwrap_or(None);
     Ok((|| {
         let layer = MemoryLayer::parse(&layer_s).ok_or_else(|| {
             LayeredMemoryError::Serialization(format!("unknown layer: {layer_s}"))
@@ -590,6 +732,14 @@ fn row_to_record(
         let tags: Vec<String> = serde_json::from_str(&tags_json)
             .map_err(|e| LayeredMemoryError::Serialization(e.to_string()))?;
         let embedding = embedding_blob.map(|b| decode_f32_le(&b));
+        let shared_with: Vec<String> = match shared_with_json.as_deref() {
+            None | Some("") => Vec::new(),
+            Some(s) => serde_json::from_str(s).unwrap_or_default(),
+        };
+        let share_policy = share_policy_s
+            .as_deref()
+            .and_then(SharePolicy::parse)
+            .unwrap_or(SharePolicy::None);
         Ok(MemoryRecord {
             id,
             layer,
@@ -601,6 +751,10 @@ fn row_to_record(
             valid_to,
             observed_at,
             embedding,
+            shareable: shareable != 0,
+            shared_with,
+            shared_by,
+            share_policy,
         })
     })())
 }
@@ -919,5 +1073,115 @@ mod tests {
         // Text is untouched.
         let r = store.get("x").unwrap().unwrap();
         assert!(r.text.contains("alice@example.com"));
+    }
+
+    // ── RELIX-7.16 sharing schema ──────────────────────────
+
+    #[test]
+    fn share_policy_round_trips_through_parse_and_as_str() {
+        for p in [SharePolicy::None, SharePolicy::Explicit, SharePolicy::Auto] {
+            assert_eq!(SharePolicy::parse(p.as_str()), Some(p));
+        }
+        // Empty / NULL-equivalent → None.
+        assert_eq!(SharePolicy::parse(""), Some(SharePolicy::None));
+        // Unknown values reject.
+        assert!(SharePolicy::parse("publish").is_none());
+    }
+
+    #[test]
+    fn new_raw_record_has_safe_share_defaults() {
+        let r = MemoryRecord::new_raw("x", "hi", "s");
+        assert!(!r.shareable);
+        assert!(r.shared_with.is_empty());
+        assert!(r.shared_by.is_none());
+        assert_eq!(r.share_policy, SharePolicy::None);
+    }
+
+    #[test]
+    fn insert_persists_share_fields_and_round_trips_through_get() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        let mut r = record(
+            "share-a",
+            MemoryLayer::Observation,
+            "user prefers Helvetica",
+            "alice",
+        );
+        r.shareable = true;
+        r.shared_with = vec!["bob".into(), "carol".into()];
+        r.shared_by = Some("alice".into());
+        r.share_policy = SharePolicy::Auto;
+        store.insert(&r).unwrap();
+        let got = store.get("share-a").unwrap().unwrap();
+        assert!(got.shareable);
+        assert_eq!(
+            got.shared_with,
+            vec!["bob".to_string(), "carol".to_string()]
+        );
+        assert_eq!(got.shared_by.as_deref(), Some("alice"));
+        assert_eq!(got.share_policy, SharePolicy::Auto);
+    }
+
+    #[test]
+    fn pre_7_16_database_picks_up_share_columns_on_open() {
+        use tempfile::TempDir;
+        // Simulate a pre-7.16 database by opening a connection
+        // directly + creating ONLY the legacy schema (no share
+        // columns).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            crate::db::apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memory_records (\
+                     id TEXT PRIMARY KEY,\
+                     layer TEXT NOT NULL,\
+                     text TEXT NOT NULL,\
+                     source TEXT NOT NULL DEFAULT '',\
+                     tags TEXT NOT NULL DEFAULT '[]',\
+                     created_at INTEGER NOT NULL,\
+                     valid_from INTEGER NOT NULL,\
+                     valid_to INTEGER,\
+                     observed_at INTEGER NOT NULL,\
+                     embedding BLOB\
+                 );\
+                 INSERT INTO memory_records (id, layer, text, source, tags, created_at, valid_from, observed_at) \
+                 VALUES ('legacy-1', 'observation', 'pre-7.16 row', 'alice', '[]', 100, 100, 100);",
+            ).unwrap();
+        }
+        // Open via the production code path — this must run
+        // the ALTER TABLE migration.
+        let store = LayeredMemoryStore::open(&path).unwrap();
+        let got = store.get("legacy-1").unwrap().unwrap();
+        assert_eq!(got.text, "pre-7.16 row");
+        assert!(!got.shareable, "default to non-shareable");
+        assert!(got.shared_with.is_empty());
+        assert!(got.shared_by.is_none());
+        assert_eq!(got.share_policy, SharePolicy::None);
+    }
+
+    #[test]
+    fn migration_is_idempotent_when_column_already_exists() {
+        // Opening the in_memory store twice (well, opening then
+        // re-running init_schema by closing + re-opening on a
+        // file path) should not raise — column_exists must
+        // short-circuit the ADD COLUMN.
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("idempotent.db");
+        let _ = LayeredMemoryStore::open(&path).unwrap();
+        // Drop the first handle; opening again triggers
+        // init_schema a second time. Must not error.
+        let store = LayeredMemoryStore::open(&path).unwrap();
+        store
+            .insert(&record(
+                "post-migrate",
+                MemoryLayer::Observation,
+                "fact",
+                "alice",
+            ))
+            .unwrap();
+        let got = store.get("post-migrate").unwrap().unwrap();
+        assert_eq!(got.share_policy, SharePolicy::None);
     }
 }

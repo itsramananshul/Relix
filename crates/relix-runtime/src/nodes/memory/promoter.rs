@@ -455,6 +455,17 @@ fn build_promoted_record(
         valid_to: None,
         observed_at: now,
         embedding: None,
+        // RELIX-7.16: promoted records inherit the parent's
+        // shareable flag + share_policy so an operator who
+        // marks a Raw record `share_policy = "auto"` gets that
+        // posture carried up the Semantic / Observation /
+        // Model chain. `shared_with` + `shared_by` reset on
+        // promotion — those are per-share-event metadata, not
+        // structural lineage.
+        shareable: parent.shareable,
+        shared_with: Vec::new(),
+        shared_by: None,
+        share_policy: parent.share_policy,
     }
 }
 

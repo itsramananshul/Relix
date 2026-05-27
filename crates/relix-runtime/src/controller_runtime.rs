@@ -113,6 +113,13 @@ pub struct ControllerConfig {
     /// and the six `training.*` capabilities stay unregistered.
     #[serde(default)]
     pub training: Option<crate::training::TrainingConfig>,
+    /// `[knowledge]` — RELIX-7.16 agent-to-agent knowledge
+    /// transfer. Absent / empty `groups` list keeps the
+    /// existing memory pipeline byte-identical to the
+    /// pre-7.16 build — no `knowledge.*` capabilities are
+    /// registered and the AutoShareTask is not spawned.
+    #[serde(default)]
+    pub knowledge: Option<crate::knowledge::KnowledgeConfig>,
     /// `[routing]` — RELIX-7.7 / 7.11 GAP 2 channel routing
     /// rules. Validated at coordinator boot against `[peers]`.
     /// Absent means every inbound channel message falls back
@@ -4199,6 +4206,67 @@ fn register_node_type_handlers(
             db = %mem_cfg.db_path.display(),
             "memory node: registered memory.write_turn / memory.recent_for_session / memory.search"
         );
+
+        // ── RELIX-7.16: agent-to-agent knowledge transfer ─────
+        //
+        // Five `knowledge.*` caps + an AutoShareTask, opt-in via
+        // `[knowledge]` in the memory-node TOML. The caps need
+        // the layered store so they're registered HERE (not on
+        // the coordinator branch — the data lives on the
+        // memory node). When `[knowledge]` is absent or the
+        // group list is empty, no caps are registered and no
+        // background task spawns.
+        if let (Some(layered), Some(knowledge_cfg)) = (layered_ctx.as_ref(), cfg.knowledge.clone())
+        {
+            if knowledge_cfg.has_active_groups() {
+                let svc = match crate::knowledge::KnowledgeService::new(
+                    layered.store.clone(),
+                    &knowledge_cfg,
+                ) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        return Err(format!("[knowledge] {e}").into());
+                    }
+                };
+                crate::knowledge::register(bridge, svc.clone());
+                for (method, doc) in crate::knowledge::knowledge_capability_descriptors() {
+                    let cats: &[&str] = match *method {
+                        "knowledge.share" | "knowledge.group_broadcast" => {
+                            &["mutate", "memory", "knowledge"]
+                        }
+                        "knowledge.revoke" => &["mutate", "memory", "knowledge"],
+                        _ => &["read", "memory", "knowledge"],
+                    };
+                    manifest.add_capability(
+                        CapabilityDescriptor::unary(*method)
+                            .with_description(*doc)
+                            .with_categories(cats.iter().map(|s| (*s).into())),
+                    );
+                }
+                // Spawn the AutoShareTask. The handle is dropped
+                // — the task runs for the process lifetime;
+                // shutdown happens when tokio's runtime tears
+                // down.
+                let autoshare_cfg =
+                    crate::knowledge::AutoShareConfig::from_knowledge_config(&knowledge_cfg);
+                let task = crate::knowledge::AutoShareTask::new(
+                    (*svc).clone(),
+                    layered.store.clone(),
+                    autoshare_cfg,
+                );
+                let _handle = task.spawn();
+                tracing::info!(
+                    groups = knowledge_cfg.groups.len(),
+                    auto_share_interval_secs = knowledge_cfg.auto_share_interval_secs,
+                    "memory node: registered knowledge.* + spawned AutoShareTask"
+                );
+            } else {
+                tracing::info!(
+                    "memory node: [knowledge] section present but has no active groups; \
+                     knowledge.* not registered"
+                );
+            }
+        }
     }
     if cfg.controller.node_type == "ai" {
         let ai_cfg: crate::nodes::ai::AiConfig = match &cfg.ai {
