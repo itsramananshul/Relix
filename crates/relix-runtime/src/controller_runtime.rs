@@ -614,6 +614,16 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     populate_workflow_dispatcher_cell(cell, peers, key_path, deadline_secs).await;
                 });
             }
+            StartupWiring::CoordAlertMesh {
+                cell,
+                peers,
+                deadline_secs,
+            } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_alert_mesh_cell(cell, peers, key_path, deadline_secs).await;
+                });
+            }
         }
     }
 
@@ -2818,6 +2828,97 @@ async fn populate_workflow_dispatcher_cell(
     }
 }
 
+/// RELIX-7.11 GAP 3: populate the alert-fan-out cell with an
+/// `AlertMeshContext` once the rpc::Client is up. The
+/// MultiChannelAlertSink reads from the cell on every alert; an
+/// empty cell means alerts get logged + chronicled but the
+/// channel fan-out skips (logged at warn).
+async fn populate_alert_mesh_cell(
+    cell: crate::metrics::AlertMeshCell,
+    peers: std::collections::BTreeMap<String, PeerConfig>,
+    key_path: std::path::PathBuf,
+    deadline_secs: i64,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+    if peers.is_empty() {
+        tracing::info!(
+            "alert mesh: no [peers] configured; channel fan-out disabled (chronicle still records)"
+        );
+        return;
+    }
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "alert mesh: identity bundle missing; channel fan-out disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "alert mesh: bundle decode failed");
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        _ => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "alert mesh: client key missing / wrong length"
+            );
+            return;
+        }
+    };
+    let mut peers_map = std::collections::HashMap::new();
+    for (alias, peer_cfg) in &peers {
+        peers_map.insert(
+            alias.clone(),
+            PeerEntry {
+                addr: format!("/ip4/127.0.0.1/tcp/{}", peer_cfg.port),
+            },
+        );
+    }
+    let peers_file = PeersFile { peers: peers_map };
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!("alert mesh: discover_and_pin returned None; channel fan-out disabled");
+            return;
+        }
+    };
+    let ctx = crate::metrics::AlertMeshContext {
+        mesh,
+        identity: bundle,
+    };
+    if cell.set(ctx).is_err() {
+        tracing::warn!("alert mesh: cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            peer_count = peers.len(),
+            "coordinator: alert mesh online (RELIX-7.11 GAP 3 / 4)"
+        );
+    }
+}
+
 /// Mirrors `populate_memory_curator_cell` — same identity-bundle
 /// + client-key + discover_and_pin pattern.
 async fn populate_memory_embedding_cell(
@@ -3255,6 +3356,16 @@ pub(crate) enum StartupWiring {
         peers: std::collections::BTreeMap<String, PeerConfig>,
         deadline_secs: i64,
     },
+    /// RELIX-7.11 GAP 3: coordinator-side mesh client for the
+    /// `MultiChannelAlertSink`. Dials every peer configured in
+    /// `[peers]` and publishes an `AlertMeshContext` into the
+    /// cell so alert events can fan out to channel `*.send`
+    /// capabilities.
+    CoordAlertMesh {
+        cell: crate::metrics::AlertMeshCell,
+        peers: std::collections::BTreeMap<String, PeerConfig>,
+        deadline_secs: i64,
+    },
 }
 
 // Parse `[guardrails]` from the top-level TOML section into
@@ -3346,6 +3457,13 @@ pub(crate) struct MetricsBundle {
     pub query: crate::metrics::MetricsQuery,
     pub alert_engine: crate::metrics::AlertEngine,
     pub alert_interval_secs: u64,
+    /// RELIX-7.11 GAP 3/4: chronicle for alert events + the
+    /// configured channel fan-out targets + the OnceCell the
+    /// post-startup wiring populates with an `AlertMeshContext`
+    /// once the mesh client is up.
+    pub alert_chronicle: crate::metrics::AlertChronicle,
+    pub alert_targets: Vec<crate::metrics::AlertTarget>,
+    pub alert_mesh_cell: crate::metrics::AlertMeshCell,
 }
 
 /// Open the metrics store, spawn the drain + retention loops,
@@ -3377,17 +3495,39 @@ pub(crate) fn build_metrics_bundle(
     });
     let query = crate::metrics::MetricsQuery::new(store.clone());
     let alert_engine = crate::metrics::AlertEngine::new(query.clone(), m_cfg.thresholds.clone());
+
+    // RELIX-7.11 GAP 4: alert chronicle. Drops next to the
+    // metrics db unless the operator overrides
+    // `[metrics.alerts.chronicle_path]`.
+    let chronicle_path = m_cfg.alerts.chronicle_path.clone().unwrap_or_else(|| {
+        db_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("alerts.sqlite")
+    });
+    let alert_chronicle = crate::metrics::AlertChronicle::open(&chronicle_path).map_err(|e| {
+        format!(
+            "[metrics.alerts] chronicle open {}: {e}",
+            chronicle_path.display()
+        )
+    })?;
     tracing::info!(
         db = %db_path.display(),
+        chronicle = %chronicle_path.display(),
         retention_days = m_cfg.retention_days,
         alert_interval_secs = m_cfg.alert_interval_secs,
-        "metrics: collector + query + alert engine online"
+        alert_targets = m_cfg.alerts.targets.len(),
+        "metrics: collector + query + alert engine + chronicle online"
     );
     Ok(Some(MetricsBundle {
         sink: std::sync::Arc::new(collector),
         query,
         alert_engine,
         alert_interval_secs: m_cfg.alert_interval_secs,
+        alert_chronicle,
+        alert_targets: m_cfg.alerts.targets.clone(),
+        alert_mesh_cell: std::sync::Arc::new(tokio::sync::OnceCell::new()),
     }))
 }
 
@@ -4412,17 +4552,48 @@ fn register_node_type_handlers(
                         .with_categories(["metrics".into(), "read".into()]),
                 );
             }
+            // RELIX-7.11 GAP 3+4: compose the alert delivery
+            // sinks. The chronicle sink ALWAYS runs so an
+            // operator without configured channel targets
+            // still has a persistent audit trail. The
+            // multi-channel sink fans out to Telegram /
+            // Discord / Slack / Email when
+            // `[metrics.alerts.targets]` is configured. The
+            // logging sink stays on for `tracing` consumers
+            // (Loki / Grafana log scrape, etc.).
+            let chronicle_sink: std::sync::Arc<dyn crate::metrics::alert::AlertDeliver> =
+                std::sync::Arc::new(crate::metrics::ChronicleAlertSink::new(
+                    b.alert_chronicle.clone(),
+                ));
+            let channel_sink: std::sync::Arc<dyn crate::metrics::alert::AlertDeliver> =
+                std::sync::Arc::new(crate::metrics::MultiChannelAlertSink::new(
+                    b.alert_mesh_cell.clone(),
+                    b.alert_targets.clone(),
+                ));
+            let logging_sink: std::sync::Arc<dyn crate::metrics::alert::AlertDeliver> =
+                std::sync::Arc::new(crate::metrics::alert::LoggingAlertSink);
+            let composite = crate::metrics::CompositeAlertSink::new(vec![
+                chronicle_sink,
+                channel_sink,
+                logging_sink,
+            ]);
+            // Wire the channel-fan-out's mesh client post-
+            // startup once the rpc::Client is up.
+            out.push(StartupWiring::CoordAlertMesh {
+                cell: b.alert_mesh_cell.clone(),
+                peers: cfg.peers.clone(),
+                deadline_secs: 30,
+            });
             // Spawn the alert-engine evaluation loop. Drops
             // the JoinHandle — the loop runs for the lifetime
             // of the controller.
             let interval = std::time::Duration::from_secs(b.alert_interval_secs.max(5));
-            let _alert_handle = alert_engine.spawn(
-                interval,
-                crate::metrics::alert::AlertSink::new(crate::metrics::alert::LoggingAlertSink),
-            );
+            let _alert_handle =
+                alert_engine.spawn(interval, crate::metrics::alert::AlertSink::new(composite));
             tracing::info!(
                 interval_secs = b.alert_interval_secs,
-                "coordinator node: registered metrics.* capabilities + spawned alert engine"
+                alert_targets = b.alert_targets.len(),
+                "coordinator node: registered metrics.* capabilities + spawned alert engine + chronicle"
             );
         } else {
             tracing::info!(

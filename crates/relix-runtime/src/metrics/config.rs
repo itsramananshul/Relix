@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use super::alert::AlertThresholds;
+use super::alert_delivery::AlertDeliveryConfig;
 use super::pricing::PriceTableConfig;
 
 /// Default location for the metrics SQLite store beneath a data
@@ -55,6 +56,12 @@ pub struct MetricsConfig {
     /// Interval between alert evaluations. Default 60s.
     #[serde(default = "default_alert_interval_secs")]
     pub alert_interval_secs: u64,
+    /// `[metrics.alerts]` — fan-out + chronicle. Absent means
+    /// the chronicle still writes to the default
+    /// `<data_dir>/alerts.sqlite` path; only the channel
+    /// fan-out stays dormant.
+    #[serde(default)]
+    pub alerts: AlertDeliveryConfig,
 }
 
 impl Default for MetricsConfig {
@@ -67,6 +74,7 @@ impl Default for MetricsConfig {
             thresholds: AlertThresholds::default(),
             prices: PriceTableConfig::default(),
             alert_interval_secs: default_alert_interval_secs(),
+            alerts: AlertDeliveryConfig::default(),
         }
     }
 }

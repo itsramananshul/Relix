@@ -24,6 +24,7 @@
 //! - `config`    — top-level `[metrics]` TOML schema.
 
 pub mod alert;
+pub mod alert_delivery;
 pub mod collector;
 pub mod config;
 pub mod coordinator;
@@ -33,6 +34,11 @@ pub mod store;
 pub mod types;
 
 pub use alert::{ActiveAlert, AlertEngine, AlertEvent, AlertKind, AlertSeverity, AlertThresholds};
+pub use alert_delivery::{
+    AlertChronicle, AlertChronicleRow, AlertDeliveryConfig, AlertMeshCell, AlertMeshContext,
+    AlertTarget, ChronicleAlertSink, ChronicleError as AlertChronicleError, CompositeAlertSink,
+    MultiChannelAlertSink,
+};
 pub use collector::{
     MetricsCollector, MetricsSink, MetricsWorkerHandles, NullMetricsSink, RetentionConfig,
     SpawnedMetrics,
