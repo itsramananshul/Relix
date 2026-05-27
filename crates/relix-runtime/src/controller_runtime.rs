@@ -61,6 +61,11 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub slack: Option<toml::Value>,
+    /// Email-channel node options. Present only when
+    /// `node_type = "email"`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub email: Option<toml::Value>,
     /// Plugin-host node options. Present only when
     /// `node_type = "plugin_host"`.
     #[serde(default)]
@@ -559,6 +564,12 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 let key_path = cfg.identity.key_path.clone();
                 tokio::spawn(async move {
                     populate_slack_outbound_cell(cell, sl_cfg, key_path).await;
+                });
+            }
+            StartupWiring::Email { cell, cfg: em_cfg } => {
+                let key_path = cfg.identity.key_path.clone();
+                tokio::spawn(async move {
+                    populate_email_outbound_cell(cell, *em_cfg, key_path).await;
                 });
             }
             StartupWiring::CoordDriftEmbed { cell, cfg: ai_cfg } => {
@@ -2251,6 +2262,130 @@ async fn populate_slack_outbound_cell(
     }
 }
 
+/// Email-channel outbound wiring. Same shape as the slack /
+/// discord / telegram populate functions — dials memory + ai +
+/// coord peers, builds an `EmailOutboundClient`, publishes into
+/// the cell. The IMAP listener loop already runs; on first
+/// inbound message the controller reads the cell and routes
+/// through whichever peers are reachable.
+async fn populate_email_outbound_cell(
+    cell: crate::nodes::email::EmailOutboundClientCell,
+    cfg: crate::nodes::email::EmailNodeConfig,
+    key_path: std::path::PathBuf,
+) {
+    use crate::flow_runner::{PeerEntry, PeersFile};
+    use crate::manifest::{DiscoveryOptions, discover_and_pin};
+
+    let bundle_path = key_path.with_extension("bundle");
+    let bundle_bytes = match std::fs::read(&bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                bundle_path = %bundle_path.display(),
+                error = %e,
+                "email: identity bundle missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let bundle: relix_core::bundle::Bundle = match relix_core::codec::decode(&bundle_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "email: identity bundle decode failed; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+    let client_key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            k
+        }
+        Ok(_) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                "email: client key not 32 bytes; outbound mesh client disabled"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                key_path = %key_path.display(),
+                error = %e,
+                "email: client key missing; outbound mesh client disabled"
+            );
+            return;
+        }
+    };
+
+    let mut peers_map = std::collections::HashMap::new();
+    peers_map.insert(
+        cfg.memory_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.memory_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.ai_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.ai_peer.addr.clone(),
+        },
+    );
+    peers_map.insert(
+        cfg.coord_peer.alias.clone(),
+        PeerEntry {
+            addr: cfg.coord_peer.addr.clone(),
+        },
+    );
+    let peers_file = PeersFile { peers: peers_map };
+
+    let opts = DiscoveryOptions {
+        identity_bundle: bundle.clone(),
+        client_key: client_key_bytes,
+        peers: peers_file,
+        deadline_secs: cfg.ai_peer.deadline_secs,
+        overall_timeout: std::time::Duration::from_secs(10),
+        local_port: None,
+    };
+
+    let (_cache, mesh) = match discover_and_pin(opts).await {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                memory = %cfg.memory_peer.addr,
+                ai = %cfg.ai_peer.addr,
+                coord = %cfg.coord_peer.addr,
+                "email: discover_and_pin returned None; outbound client disabled"
+            );
+            return;
+        }
+    };
+
+    let client = Arc::new(crate::nodes::email::EmailOutboundClient {
+        mesh,
+        identity: bundle,
+        memory_alias: cfg.memory_peer.alias.clone(),
+        memory_deadline_secs: cfg.memory_peer.deadline_secs,
+        ai_alias: cfg.ai_peer.alias.clone(),
+        ai_deadline_secs: cfg.ai_peer.deadline_secs,
+        coord_alias: cfg.coord_peer.alias.clone(),
+        coord_deadline_secs: cfg.coord_peer.deadline_secs,
+    });
+    if cell.set(client).is_err() {
+        tracing::warn!("email: outbound cell already populated; spurious second wiring");
+    } else {
+        tracing::info!(
+            memory = %cfg.memory_peer.alias,
+            ai = %cfg.ai_peer.alias,
+            coord = %cfg.coord_peer.alias,
+            "email node: outbound mesh client online"
+        );
+    }
+}
+
 async fn populate_memory_curator_cell(
     cell: Arc<tokio::sync::OnceCell<Arc<dyn crate::nodes::memory::AiDispatcher>>>,
     state: Arc<tokio::sync::Mutex<crate::nodes::memory::CuratorState>>,
@@ -3068,6 +3203,20 @@ pub(crate) enum StartupWiring {
     Slack {
         cell: crate::nodes::slack::SlackOutboundClientCell,
         cfg: crate::nodes::slack::SlackNodeConfig,
+    },
+    /// Email-channel outbound wiring. Same shape as Slack —
+    /// the IMAP listener already runs; the run() loop dials
+    /// memory + ai + coord peers and publishes the
+    /// `EmailOutboundClient` into `cell` so the controller
+    /// can reach memory + ai during chat-flow runs.
+    ///
+    /// `cfg` is boxed because `EmailNodeConfig` is larger than
+    /// every other channel config (SMTP + IMAP + DKIM + OAuth2
+    /// fields) and would otherwise force the entire enum's stack
+    /// footprint to ~1KB.
+    Email {
+        cell: crate::nodes::email::EmailOutboundClientCell,
+        cfg: Box<crate::nodes::email::EmailNodeConfig>,
     },
     /// Coordinator workflow dispatcher wiring (RELIX-7.5).
     /// The cell was already passed into the workflow
@@ -4920,6 +5069,98 @@ fn register_node_type_handlers(
             allow_everyone = sl_cfg.allow_everyone(),
             ring_capacity = sl_cfg.messages_ring_capacity,
             "slack node: registered slack.status / slack.messages_recent; polling loop spawned"
+        );
+    }
+    if cfg.controller.node_type == "email" {
+        let raw = cfg
+            .email
+            .clone()
+            .ok_or_else(|| "node_type=email requires an [email] section".to_string())?;
+        let em_cfg: crate::nodes::email::EmailNodeConfig = raw
+            .try_into()
+            .map_err(|e: toml::de::Error| format!("[email] parse: {e}"))?;
+        em_cfg
+            .validate()
+            .map_err(|e| format!("[email] validation: {e}"))?;
+        let smtp = std::sync::Arc::new(
+            crate::nodes::email::SmtpSender::from_config(&em_cfg)
+                .map_err(|e| format!("[email] smtp init: {e}"))?,
+        );
+        let state = Arc::new(crate::nodes::email::EmailChannelState::default());
+        let ring = Arc::new(crate::nodes::email::MessageRing::new(
+            em_cfg.messages_ring_capacity,
+        ));
+        let out_cell: crate::nodes::email::EmailOutboundClientCell =
+            Arc::new(tokio::sync::OnceCell::new());
+        crate::nodes::email::register(bridge, state.clone(), ring.clone(), smtp.clone());
+
+        let em_cfg_arc = Arc::new(em_cfg.clone());
+        let state_for_loop = state.clone();
+        let ring_for_loop = ring.clone();
+        let out_for_loop = out_cell.clone();
+        let smtp_for_loop = smtp.clone();
+        tokio::spawn(async move {
+            crate::nodes::email::run_email_controller(
+                em_cfg_arc,
+                smtp_for_loop,
+                out_for_loop,
+                state_for_loop,
+                ring_for_loop,
+            )
+            .await;
+        });
+        let em_cfg_for_wiring = em_cfg.clone();
+        out.push(StartupWiring::Email {
+            cell: out_cell,
+            cfg: Box::new(em_cfg_for_wiring),
+        });
+        let email_caps: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "email.status",
+                "SMTP + IMAP connection state, last successful send / poll timestamps, \
+                 + counters. Read-only capability the bridge proxies for the dashboard.",
+                &["read", "email", "status"],
+                &["reads:internal"],
+            ),
+            (
+                "email.messages_recent",
+                "Last N inbound emails from the bounded in-memory ring (newest-first). \
+                 Used by the dashboard's recent-messages widget.",
+                &["read", "email", "messages"],
+                &["reads:internal"],
+            ),
+            (
+                "email.send",
+                "Send an email via SMTP. Args: JSON { to, subject, body, html?, cc?, \
+                 bcc?, reply_to?, in_reply_to?, references?, attachments? }. \
+                 Returns { message_id }.",
+                &["write", "email", "send"],
+                &["sends:external"],
+            ),
+            (
+                "email.send_template",
+                "Render + send a templated email. Args: JSON { template_name, to, \
+                 variables, cc?, bcc?, reply_to?, in_reply_to?, references? }. \
+                 Templates resolve from `RELIX_EMAIL_TEMPLATES_DIR` or the built-in \
+                 registry (welcome / reset_password / task_completed / task_failed).",
+                &["write", "email", "send_template"],
+                &["sends:external"],
+            ),
+        ];
+        for (method, doc, cats, sensitivities) in email_caps {
+            let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
+            desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
+            desc = desc.with_sensitivity(sensitivities.iter().map(|s| (*s).into()));
+            manifest.add_capability(desc);
+        }
+        tracing::info!(
+            smtp_host = %em_cfg.smtp_host,
+            imap_host = %em_cfg.imap_host,
+            imap_folder = %em_cfg.imap_folder,
+            allow_everyone = em_cfg.allow_everyone(),
+            dkim = em_cfg.dkim_enabled(),
+            ring_capacity = em_cfg.messages_ring_capacity,
+            "email node: registered email.status / email.messages_recent / email.send / email.send_template; IMAP listener spawned"
         );
     }
     if cfg.controller.node_type == "plugin_host" {
