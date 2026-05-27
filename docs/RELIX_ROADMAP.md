@@ -864,10 +864,12 @@ End-to-end is now real:
 | 5. Bridge HTTP streaming (`chat_completions_streaming`) + `[flow] streaming_template_path` config | `9f3d791` |
 | 5b. Client-disconnect cancellation (`CancelSignal` + `CancelGuard`) | `639d785` |
 | 6. Wire-shape unit tests + extracted chunk builders | `26a8660` |
+| 7. STATE-OF-RELIX §6.5 + roadmap entry rewrite | `8fca08e` |
+| 8. Mini-mesh integration test (real AI peer + libp2p + AppState + axum + reqwest stream:true) | TBD |
 
 Opt-in by a single bridge config line; see
-`docs/STATE-OF-RELIX.md` §6.5 for the architecture, test
-coverage, and remaining queued work. Closes SIMP-019.
+`docs/STATE-OF-RELIX.md` §6.5 for the architecture and
+test coverage. Closes SIMP-019.
 
 ### 7.2 Telegram/Discord/Slack — Rich Message Support `[DONE — commit a689ad8]`
 

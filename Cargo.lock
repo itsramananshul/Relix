@@ -3402,6 +3402,7 @@ dependencies = [
  "axum",
  "blake3",
  "clap",
+ "ed25519-dalek",
  "futures",
  "hex",
  "hyper 1.9.0",

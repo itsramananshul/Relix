@@ -129,6 +129,8 @@ mod sessions_obs;
 mod slack;
 mod sol_validate;
 mod sse;
+#[cfg(test)]
+mod streaming_mini_mesh_test;
 mod task_recorder;
 mod tasks;
 mod telegram;

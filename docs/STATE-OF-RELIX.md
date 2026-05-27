@@ -845,17 +845,22 @@ Test coverage:
   * Bridge: 6 wire-shape unit tests for the SSE chunk
     builders (role / content / finish / DONE sentinel /
     full sequence + task_id-null when no coordinator).
-
-Remaining work (queued, not shipping):
-
-  * Full mini-mesh integration test that boots a real
-    coordinator + AI node + bridge HTTP server in-process
-    and sends an actual POST `/v1/chat/completions
-    stream:true` request. The wire-shape tests pin every
-    load-bearing piece; the full-mesh assertion is more
-    about catching plumbing regressions (config, dial,
-    identity bundles) than wire format. Tracked but not a
-    blocker.
+  * Bridge: 1 mini-mesh integration test
+    (`streaming_mini_mesh_test`) that boots a real libp2p
+    AI peer, builds a full `AppState` via `try_new` from
+    on-disk config (identity bundle + peers.toml + SOL
+    streaming template), stands up an axum router with
+    `POST /v1/chat/completions`, and sends a real
+    `stream:true` HTTP request — asserting role marker,
+    ordered content chunks reassemble to the handler's
+    output, `finish_reason: stop`, the Relix metadata
+    envelope, and the literal `[DONE]` sentinel. Catches
+    plumbing regressions (config, dial, identity bundle
+    decode, admission against `org_root`'s verifying key,
+    SOL template rendering, FlowRunner per-request
+    ephemeral peer dial) that wire-shape unit tests can't
+    see. Coordinator is intentionally absent — the test
+    pins the streaming path, not task persistence.
 
 This closes SIMP-019.
 
