@@ -4076,9 +4076,39 @@ The drift hook fires and writes `guardrail.drift_evaluation` chronicle entries b
 
 ---
 
-## YAML Workflow Format `[IDEA — HIGH PRIORITY]`
+## YAML Workflow Format `[DONE — docs/yaml-flow-reference.md, commit 7588761]`
 
-SOL is a custom language nobody outside this codebase knows. This is a real adoption blocker. YAML solves it — every developer already knows YAML from GitHub Actions, Docker Compose, Kubernetes. The YAML format compiles down to SOL internally so the existing runtime doesn't change.
+YAML flows now run alongside SOL. The FlowRunner dispatches on
+file extension — `.yml` / `.yaml` go through the YAML frontend
+at `crates/relix-runtime/src/yaml_flow/`, which lowers to SOL
+source text and compiles through the existing pipeline. The
+runtime is completely unchanged: same VM, same opcodes, same
+dispatcher, same event log, same chunk observer, same cancel
+signal.
+
+Shipped:
+
+* `crates/relix-runtime/src/yaml_flow/mod.rs` — frontend
+  with the typed step set: `let`, `call`, `stream`, `result`,
+  `print`, `if`, `loop` (counted + for-each), `try`.
+* `docs/yaml-flow-reference.md` — operator reference.
+* `flows/chat_template.yml` and
+  `flows/chat_template_streaming.yml` — YAML twins of the
+  existing chat templates; integration tests pin them to
+  byte-identical remote_call sequences with the same inputs.
+* Bridge: `web-bridge/src/flow.rs` picks the tempfile suffix
+  from the template's extension so YAML templates render
+  into a `.yml` tempfile; `config.rs`'s streaming-template
+  validator accepts either `remote_call_stream` (SOL) or
+  `stream:` (YAML) as the streaming-marker.
+* 29 unit tests for every construct + 2 integration tests
+  proving SOL/YAML behavioural equivalence on the chat
+  templates.
+
+The original IDEA writeup is preserved below for historical
+context.
+
+### What the YAML format originally proposed
 
 ### What the YAML format looks like
 
