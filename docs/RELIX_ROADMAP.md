@@ -1023,7 +1023,7 @@ Whisper via Ollama for voice transcription. Channel nodes accept voice messages,
 
 Pre-integrate popular MCP servers: filesystem, browser (Playwright), code execution (sandboxed), calendar, GitHub, Notion, Linear. Each becomes a first-class Relix capability, policy-controlled and audited.
 
-### 7.11 Agent Performance Dashboard `[DONE — commits 448c4c8 + 078e572 + 14dbd19 + 00e5998]`
+### 7.11 Agent Performance Dashboard `[DONE — commits 448c4c8 + 078e572 + 14dbd19 + 00e5998 + 164330c + 051578a]`
 
 Per-agent metrics: response time, token usage, cost (estimated from provider pricing), memory usage, task success rate, self-model confidence scores. Trends over time. Alerts when cost or error rate spikes.
 
@@ -1138,7 +1138,7 @@ RELIX-7.11 metrics.
   real `MetricsCollector` to the SQLite store that asserts
   non-null token_count + non-zero cost_micros + model on
   the persisted row.
-- **Alert channel fan-out** — `[DONE — commit 4728c19]`.
+- **Alert channel fan-out** — `[DONE — commits 4728c19 + 5795a33]`.
   `MultiChannelAlertSink` implements `AlertDeliver`,
   formats the documented warning / critical / recovery
   templates with badges + Agent / Metric / Current /
@@ -1146,10 +1146,18 @@ RELIX-7.11 metrics.
   its own tokio task so a slow / stuck channel never
   blocks the engine or the next target. Email targets
   call `email.send` through the configured coordinator
-  mesh client; Telegram / Discord / Slack targets log
-  honestly that those channels don't expose inbound
-  `*.send` capabilities today (the chronicle sink still
-  records the event). Targets configured in
+  mesh client. Telegram / Discord / Slack targets now
+  also real-dispatch through `telegram.send` /
+  `discord.send` / `slack.send` (added in 5795a33);
+  `AlertTarget` gained `chat_id` / `channel_id` /
+  `slack_channel` fields so each target knows where to
+  go. Per-channel handlers validate args (numeric chat_id
+  for Telegram, snowflake channel_id for Discord, `C…` id
+  or `#name` for Slack) and return structured
+  ErrorEnvelopes on failure. A `one_failing_target_does_not_block_others`
+  mini-mesh test asserts that a `telegram.send` returning
+  RESPONDER_INTERNAL still lets the other three targets
+  succeed. Targets configured in
   `[[metrics.alerts.targets]]`. Wiring through
   `StartupWiring::CoordAlertMesh` populates the mesh cell
   post-startup.
@@ -1168,11 +1176,58 @@ RELIX-7.11 metrics.
   sink ALWAYS runs alongside the channel sink so the
   audit trail is complete even when no targets are
   configured.
-- **Dashboard panel** — the bridge exposes JSON-shaped read
-  endpoints today. The HTML dashboard panel that renders the
-  sparkline + summary table + alert badges sits in the same
-  multi-week dashboard work the channel tiles are queued
-  behind.
+- **Dashboard panel** — `[DONE — commit 051578a]`.
+  `crates/relix-web-bridge/src/dashboard.html` gains four
+  production panels in the existing Metrics page section
+  (each polling on its own cadence with manual refresh +
+  last-refresh timestamp): **Agent summary** (30s,
+  `/v1/metrics/agents` — sortable invocations / error
+  badge / mean / p95 / tokens / cost; clicking a row pins
+  the trend panel), **Active alerts** (15s,
+  `/v1/metrics/alerts` — severity badges sorted critical
+  → info), **Cost breakdown** (60s, `/v1/metrics/cost` —
+  Unicode-block bar chart of top-15 agents + total),
+  **Per-agent trend** (30s,
+  `/v1/metrics/agents/:a/timeseries` — three
+  Unicode-block sparklines ▁▂▃▄▅▆▇█ for invocations /
+  mean latency / errors). Per-panel `setInterval` is torn
+  down on navigation away from `/metrics` (showRoute
+  teardown) so polling stops when invisible.
+  `RELIX_DASHBOARD_PATH` env override lets operators
+  hot-swap the dashboard HTML without rebuilding (falls
+  back to embedded `include_str!` copy on missing /
+  unreadable file). `localStorage.relixBridgeBase`
+  override lets a screen-shared dashboard target a
+  non-default bridge. +6 dashboard tests covering panel
+  landmarks (HTML + extracted JS asset), env override
+  branches (embedded fallback when unset / empty /
+  whitespace / missing-file; alternate file when set),
+  and JS loader / teardown function presence.
+- **Streaming AI token enrichment** — `[DONE — commit 164330c]`.
+  Unary `ai.chat` already attached token usage to metrics
+  (gap above, d3d753f); the streaming path
+  (`generate_reply_stream`) used to discard usage because
+  the wire protocol only carried text bytes. Trait
+  signature now yields `StreamingChunk` =
+  `Text(String) | Usage(StreamingUsage)`. OpenAI-compat
+  request adds `stream_options.include_usage=true` and
+  the parser emits a Usage variant from the final
+  `usage`-bearing frame after `[DONE]`. Anthropic parser
+  extracts `input_tokens` from `message_start` and
+  `output_tokens` from `message_delta`. Gemini parser
+  inline-tracks running-total `usageMetadata` across
+  every frame and emits at stream close. Mock provider
+  yields a terminal Usage derived from the same
+  accounting the unary path uses. `handle_chat_stream`
+  was rewritten as an `async_stream::stream!` block:
+  `Text` frames yield bytes on the wire; `Usage` frames
+  call `sink.attach_ai_usage(AiUsageHint { request_id,
+  prompt_tokens, completion_tokens, model })` and are
+  swallowed (clients still see text-only output);
+  errors yield an `ErrorEnvelope`. +9 tests including a
+  round-trip from `MockProvider` through `MetricsCollector`
+  into the SQLite store asserting non-null token_count +
+  non-zero cost_micros + model on the persisted row.
 
 ### 7.12 Conversation Export + Import `[DONE — coordinator scaffold 700ca11, real per-message history c51c864]`
 
