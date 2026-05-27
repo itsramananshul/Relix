@@ -675,6 +675,8 @@ fn unknown_step_type_returns_clear_semantic_error_with_step_path() {
         YamlFlowError::Semantic {
             ref path,
             ref message,
+            line,
+            ..
         } => {
             assert!(
                 message.contains("bonk"),
@@ -683,6 +685,10 @@ fn unknown_step_type_returns_clear_semantic_error_with_step_path() {
             assert!(
                 path.contains("step 1"),
                 "expected step path locator, got `{path}`"
+            );
+            assert!(
+                line > 0,
+                "expected real source line number for the offending step, got {line}"
             );
         }
         other => panic!("expected Semantic error naming the step, got {other:?}"),
@@ -704,6 +710,8 @@ fn missing_required_field_returns_clear_semantic_error() {
         YamlFlowError::Semantic {
             ref message,
             ref path,
+            line,
+            ..
         } => {
             assert!(
                 message.contains("value"),
@@ -712,6 +720,10 @@ fn missing_required_field_returns_clear_semantic_error() {
             assert!(
                 path.contains("step 1"),
                 "expected step path locator, got `{path}`"
+            );
+            assert!(
+                line > 0,
+                "expected real source line number for the offending step, got {line}"
             );
         }
         other => panic!("expected Semantic error for missing field, got {other:?}"),
