@@ -134,6 +134,15 @@ pub struct FlowRunOptions {
     /// `None` (default) means no observer — `remote_call_stream`
     /// still works but per-chunk callbacks are no-ops.
     pub chunk_observer: Option<ChunkObserver>,
+    /// RELIX-2 step 5b: optional cancellation signal. When
+    /// notified, an in-flight `remote_call_stream` aborts its
+    /// libp2p substream read and returns a structured
+    /// TRANSPORT error. The flow runner then writes the usual
+    /// `FlowFailed` / `task.failed` audit trail so the
+    /// chronicle honestly records the cancellation. `None`
+    /// means no cancellation hook — `remote_call_stream` runs
+    /// to natural completion.
+    pub cancel_signal: Option<CancelSignal>,
 }
 
 /// RELIX-2 step 5: callback the bridge supplies via
@@ -143,6 +152,19 @@ pub struct FlowRunOptions {
 /// `[Arc<dyn Fn(&[u8]) + Send + Sync>]` shape lives in
 /// one place.
 pub type ChunkObserver = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// RELIX-2 step 5b: cancellation signal the bridge wires
+/// through to the streaming dispatcher. The bridge holds the
+/// notify clone; when the HTTP SSE consumer drops (client
+/// disconnect), a `Drop` guard fires `notify_one()`, the
+/// streaming dispatcher's `tokio::select!` against
+/// `notified()` triggers, and the in-flight
+/// `remote_call_stream` returns a structured TRANSPORT error.
+/// The flow runner then writes the usual
+/// `FlowFailed` / `task.failed` audit events — the audit log
+/// honestly records "client cancelled mid-stream" instead of
+/// silently dropping the response.
+pub type CancelSignal = Arc<tokio::sync::Notify>;
 
 /// What `FlowRunner::run` returns to the caller (and `relix-cli flow-run`
 /// prints).
@@ -234,6 +256,7 @@ impl FlowRunner {
             deadline_secs: opts.deadline_secs,
             capability_cache: opts.capability_cache.clone(),
             mesh: opts.mesh_client.clone(),
+            cancel_signal: opts.cancel_signal.clone(),
         });
 
         // 6. Dispatch on file extension. `.sflow` runs the AST-walking
@@ -388,6 +411,12 @@ struct RealDispatcher {
     /// `relix-cli flow-run` path), we keep the original direct
     /// `Client::call(peer_id, ..)` flow.
     mesh: Option<Arc<MeshClient>>,
+    /// RELIX-2 step 5b: cancellation signal. The streaming
+    /// dispatcher's frame-read loop selects against
+    /// `cancel_signal.notified()` so the bridge can cancel
+    /// the in-flight substream read when the SSE consumer
+    /// drops.
+    cancel_signal: Option<CancelSignal>,
 }
 
 impl RealDispatcher {
@@ -632,6 +661,7 @@ impl RemoteCallDispatcher for RealDispatcher {
         let outer_timeout = Duration::from_secs((self.deadline_secs + 5) as u64);
         let peer_alias_owned = peer_alias.to_string();
         let method_owned = method.to_string();
+        let cancel_signal = self.cancel_signal.clone();
 
         // Drive the substream protocol synchronously from
         // this blocking thread. block_on is safe here — the
@@ -669,7 +699,32 @@ impl RemoteCallDispatcher for RealDispatcher {
             let mut reader = StreamReader::new(raw_stream);
             let mut concatenated: Vec<u8> = Vec::new();
             loop {
-                let frame = tokio::time::timeout(outer_timeout, reader.next_frame()).await;
+                // RELIX-2 step 5b: race the next-frame await
+                // against the cancellation signal. If the
+                // bridge cancels (HTTP client dropped the SSE
+                // response), we return TRANSPORT-classed
+                // error so the FlowRunner writes a
+                // `task.failed` / `chat.assistant_turn`
+                // partial record. When no signal is wired,
+                // `pending` ensures the select! just waits
+                // on the frame read.
+                let frame = match cancel_signal.as_ref() {
+                    Some(signal) => {
+                        let signal = signal.clone();
+                        tokio::select! {
+                            f = tokio::time::timeout(outer_timeout, reader.next_frame()) => f,
+                            () = signal.notified() => {
+                                return Err(RemoteCallError {
+                                    kind: relix_core::types::error_kinds::TRANSPORT,
+                                    peer: peer_alias_owned.clone(),
+                                    method: method_owned.clone(),
+                                    cause: "stream cancelled by caller".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    None => tokio::time::timeout(outer_timeout, reader.next_frame()).await,
+                };
                 match frame {
                     Ok(Ok(Some(StreamFrame::Header { .. }))) => {
                         // Header carries audit-correlation

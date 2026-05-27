@@ -427,6 +427,18 @@ async fn chat_completions_streaming(
         let _ = tx_for_observer.send(bytes.to_vec());
     });
 
+    // RELIX-2 step 5b: cancellation signal wired through to
+    // the streaming dispatcher. The Drop guard further down
+    // fires `notify_one` when the SSE stream future is
+    // dropped (client disconnect / proxy timeout), aborting
+    // the in-flight `remote_call_stream` and writing a
+    // `task.failed` audit trail instead of silently letting
+    // the flow run to completion with nobody listening.
+    let cancel_signal: relix_runtime::flow_runner::CancelSignal =
+        Arc::new(tokio::sync::Notify::new());
+    let cancel_for_flow = cancel_signal.clone();
+    let cancel_for_guard = cancel_signal.clone();
+
     let state_for_flow = state.clone();
     let session_id = translated.session_id.clone();
     let prompt = translated.prompt.clone();
@@ -437,6 +449,7 @@ async fn chat_completions_streaming(
             &prompt,
             &streaming_template,
             on_chunk,
+            cancel_for_flow,
         )
         .await;
         // Close the channel so the SSE stream exits its
@@ -444,6 +457,23 @@ async fn chat_completions_streaming(
         drop(tx);
         outcome
     });
+
+    /// RELIX-2 step 5b: cancellation guard. Lives inside the
+    /// SSE stream future. When the future drops (HTTP client
+    /// disconnect, proxy reset, shutdown), this Drop fires
+    /// `notify_one()` on the signal the streaming dispatcher
+    /// is selecting on — the in-flight substream read
+    /// returns TRANSPORT-classed error, the FlowRunner writes
+    /// `task.failed`, and the chronicle records the
+    /// cancellation honestly instead of leaving an in-flight
+    /// flow with no listener.
+    struct CancelGuard(std::sync::Arc<tokio::sync::Notify>);
+    impl Drop for CancelGuard {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+    let cancel_guard = CancelGuard(cancel_for_guard);
 
     // W8: SHA-256 of the system prompt for the provenance
     // snapshot. Captured BEFORE the SSE stream so the closure
@@ -472,6 +502,17 @@ async fn chat_completions_streaming(
     let state_for_tail = state.clone();
 
     let sse_stream = async_stream::stream! {
+        // RELIX-2 step 5b: move the cancel guard INTO the
+        // stream future. When this future drops (because the
+        // HTTP client dropped the SSE response), the guard's
+        // Drop impl fires `notify_one` on the cancel signal
+        // — the streaming dispatcher's `tokio::select!` arm
+        // sees it and aborts. Without this move the guard
+        // would live in the enclosing scope and only drop
+        // after the response handler returned, which would
+        // be AFTER the flow already finished.
+        let _cancel_guard = cancel_guard;
+
         let created = unix_now();
         // Role marker.
         let role_chunk = serde_json::json!({

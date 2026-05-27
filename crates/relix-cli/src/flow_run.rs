@@ -54,6 +54,7 @@ pub async fn run(
         mesh_client: None,
         trace_id: None,
         chunk_observer: None,
+        cancel_signal: None,
     };
     let result = FlowRunner::new(opts).run().await?;
 

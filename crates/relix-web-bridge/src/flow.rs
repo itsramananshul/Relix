@@ -126,6 +126,7 @@ pub async fn execute_chat_flow(
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
         chunk_observer: None,
+        cancel_signal: None,
     };
 
     finalize_flow_run(
@@ -336,6 +337,7 @@ pub async fn execute_chat_with_tool_flow(
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
         chunk_observer: None,
+        cancel_signal: None,
     };
 
     finalize_flow_run(
@@ -454,6 +456,7 @@ pub async fn execute_chat_flow_streaming(
     message: &str,
     streaming_template: &str,
     on_chunk: relix_runtime::flow_runner::ChunkObserver,
+    cancel_signal: relix_runtime::flow_runner::CancelSignal,
 ) -> Result<FlowOutcome, FlowExecError> {
     validate_input(session_id, message).map_err(FlowExecError::InvalidInput)?;
 
@@ -506,6 +509,7 @@ pub async fn execute_chat_flow_streaming(
         mesh_client: state.mesh_client.clone(),
         trace_id: Some(trace_id),
         chunk_observer: Some(on_chunk),
+        cancel_signal: Some(cancel_signal),
     };
 
     finalize_flow_run(
