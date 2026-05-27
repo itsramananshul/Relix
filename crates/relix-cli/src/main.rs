@@ -27,6 +27,7 @@ mod terminal;
 mod topology;
 mod update;
 mod web;
+mod workflow;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -157,6 +158,17 @@ enum Cmd {
     Flow {
         #[command(subcommand)]
         cmd: flow::Cmd,
+    },
+    /// Multi-agent workflow engine (RELIX-7.5).
+    /// `workflow list` shows the catalog, `workflow run
+    /// <name> --input <text>` executes one, `workflow
+    /// validate <file>` type-checks a `.workflow` source,
+    /// `workflow trace <execution-id>` looks up a past run.
+    /// Talks to the local bridge over HTTP (default
+    /// `http://127.0.0.1:19791`); override with `--bridge`.
+    Workflow {
+        #[command(subcommand)]
+        cmd: workflow::Cmd,
     },
     /// W2-008a: one-command environment health check. Hits
     /// the bridge's `/v1/health` and prints an opinionated
@@ -319,6 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             flow::run(cmd);
             Ok(())
         }
+        Cmd::Workflow { cmd } => workflow::run(cmd).await,
         Cmd::Doctor(args) => doctor::run(args).await,
         Cmd::Eval { cmd } => eval::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
