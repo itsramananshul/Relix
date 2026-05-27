@@ -586,6 +586,7 @@ mod tests {
     use super::*;
     use rand::Rng;
 
+    #[allow(clippy::too_many_arguments)]
     fn metric(
         agent: &str,
         method: &str,

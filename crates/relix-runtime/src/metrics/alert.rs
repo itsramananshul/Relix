@@ -493,13 +493,20 @@ mod tests {
         AlertEngine::new(q, thresholds)
     }
 
+    fn relaxed_thresholds() -> AlertThresholds {
+        AlertThresholds {
+            error_rate_pct: 10.0,
+            p95_latency_ms: u64::MAX,
+            cost_per_hour_micros: u64::MAX,
+            zero_success_window_mins: AlertThresholds::default().zero_success_window_mins,
+            min_invocations_for_rate_alert: 10,
+            eval_window_mins: AlertThresholds::default().eval_window_mins,
+        }
+    }
+
     #[test]
     fn error_rate_alert_fires_when_threshold_crossed() {
-        let mut t = AlertThresholds::default();
-        t.error_rate_pct = 10.0;
-        t.min_invocations_for_rate_alert = 10;
-        t.p95_latency_ms = u64::MAX; // disable p95 check
-        t.cost_per_hour_micros = u64::MAX;
+        let t = relaxed_thresholds();
         let engine = engine_with(t, |store| {
             let now = now_ms();
             for _ in 0..15 {
@@ -523,11 +530,7 @@ mod tests {
 
     #[test]
     fn error_rate_alert_does_not_fire_below_threshold() {
-        let mut t = AlertThresholds::default();
-        t.error_rate_pct = 10.0;
-        t.min_invocations_for_rate_alert = 10;
-        t.p95_latency_ms = u64::MAX;
-        t.cost_per_hour_micros = u64::MAX;
+        let t = relaxed_thresholds();
         let engine = engine_with(t, |store| {
             let now = now_ms();
             for _ in 0..50 {
@@ -545,11 +548,7 @@ mod tests {
 
     #[test]
     fn dedup_does_not_refire_active_alert() {
-        let mut t = AlertThresholds::default();
-        t.error_rate_pct = 10.0;
-        t.min_invocations_for_rate_alert = 10;
-        t.p95_latency_ms = u64::MAX;
-        t.cost_per_hour_micros = u64::MAX;
+        let t = relaxed_thresholds();
         let engine = engine_with(t, |store| {
             let now = now_ms();
             for _ in 0..15 {
@@ -580,11 +579,7 @@ mod tests {
 
     #[test]
     fn recovery_event_fires_when_threshold_clears() {
-        let mut t = AlertThresholds::default();
-        t.error_rate_pct = 10.0;
-        t.min_invocations_for_rate_alert = 10;
-        t.p95_latency_ms = u64::MAX;
-        t.cost_per_hour_micros = u64::MAX;
+        let t = relaxed_thresholds();
         let store = MetricsStore::in_memory().unwrap();
         let now = now_ms();
         for _ in 0..15 {
@@ -617,11 +612,13 @@ mod tests {
 
     #[test]
     fn zero_success_alert_fires_only_when_traffic_present() {
-        let mut t = AlertThresholds::default();
-        t.zero_success_window_mins = 10;
-        t.min_invocations_for_rate_alert = u64::MAX; // disable rate paths
-        t.p95_latency_ms = u64::MAX;
-        t.cost_per_hour_micros = u64::MAX;
+        let t = AlertThresholds {
+            zero_success_window_mins: 10,
+            min_invocations_for_rate_alert: u64::MAX,
+            p95_latency_ms: u64::MAX,
+            cost_per_hour_micros: u64::MAX,
+            ..AlertThresholds::default()
+        };
         let store = MetricsStore::in_memory().unwrap();
         let now = now_ms();
         // Only failures; no successes.
@@ -641,10 +638,12 @@ mod tests {
 
     #[test]
     fn cost_per_hour_alert_uses_critical_severity() {
-        let mut t = AlertThresholds::default();
-        t.cost_per_hour_micros = 1000; // $0.001
-        t.error_rate_pct = 100.0;
-        t.p95_latency_ms = u64::MAX;
+        let t = AlertThresholds {
+            cost_per_hour_micros: 1000, // $0.001
+            error_rate_pct: 100.0,
+            p95_latency_ms: u64::MAX,
+            ..AlertThresholds::default()
+        };
         let engine = engine_with(t, |store| {
             store
                 .insert(&metric(

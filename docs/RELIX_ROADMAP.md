@@ -1018,9 +1018,142 @@ Whisper via Ollama for voice transcription. Channel nodes accept voice messages,
 
 Pre-integrate popular MCP servers: filesystem, browser (Playwright), code execution (sandboxed), calendar, GitHub, Notion, Linear. Each becomes a first-class Relix capability, policy-controlled and audited.
 
-### 7.11 Agent Performance Dashboard `[SKIPPED — partially covered today by /v1/dispatch/stats (per-capability invocation + latency counters), /v1/health (uptime + peer counts + reconnect telemetry), and the OTel export shipped in 7.31; the full per-agent metrics aggregation + cost trend charts + drift alerts + dashboard UI is a multi-day build; deferred to a dedicated session]`
+### 7.11 Agent Performance Dashboard `[DONE — commits 448c4c8 + 078e572 + 14dbd19 + 00e5998]`
 
 Per-agent metrics: response time, token usage, cost (estimated from provider pricing), memory usage, task success rate, self-model confidence scores. Trends over time. Alerts when cost or error rate spikes.
+
+Production agent performance monitoring system, end-to-end:
+
+- **Metrics core (commit 448c4c8)**:
+  `crates/relix-runtime/src/metrics/` — `types.rs` (canonical
+  `InvocationMetric` + `AiUsageHint`), `store.rs` (append-only
+  SQLite, indexes on `(agent, ts)` + `(method, ts)` + `(ts)`,
+  retention via `prune_older_than`), `pricing.rs` (per-1k-token
+  micro-USD price table with OpenAI / Anthropic / Gemini
+  defaults + longest-prefix lookup + `[metrics.prices]` TOML
+  overrides), `collector.rs` (`MetricsSink` trait +
+  `MetricsCollector` with non-blocking unbounded mpsc, batch
+  flush at 100 rows / 100ms whichever first, 4096-entry AI
+  usage join cache, hourly retention sweep), `query.rs`
+  (`list_agents` / `agent_summary` / `method_breakdown` /
+  `timeseries` / `cost_report` / `successful_invocation_count`
+  + nearest-rank `percentile`; the 50k-row p95 query path
+  completes well under 100ms — enforced by a CI test),
+  `alert.rs` (`AlertEngine` with four conditions —
+  error_rate / p95_latency / cost_per_hour / zero_success
+  — dedup keyed by `(agent, kind)`, fires `Fired` +
+  `Recovered` events, pluggable `AlertDeliver` sink with a
+  default `LoggingAlertSink`), `coordinator.rs` (registers
+  the six `metrics.*` capabilities on the dispatch bridge),
+  `config.rs` (`[metrics]` TOML schema). `DispatchBridge`
+  gains `set_metrics_sink(sink, peer_alias)` + the dispatch
+  hot path records one row per dispatched call after the
+  handler returns (non-blocking; adds no measurable latency).
+  Numeric `error_kinds::*` constants map back to symbolic
+  strings via `error_kind_to_str`. 57 unit tests across
+  config / store / collector / pricing / query / alert /
+  coordinator.
+- **Controller wiring (commit 078e572)**:
+  `ControllerConfig::metrics: Option<MetricsConfig>`,
+  `build_metrics_bundle` opens the store, builds the
+  collector + query handle + alert engine, spawns drain +
+  retention + alert-evaluation loops, returns `None` when
+  `[metrics] enabled = false`. The bridge sink is wired
+  before any node-type handlers register so every dispatched
+  call (across every node-type) records a row. The
+  coordinator branch registers all six metrics caps on the
+  dispatch bridge with manifest entries tagged
+  `[metrics, read]`.
+- **Bridge HTTP endpoints (commit 14dbd19)**:
+  `GET /v1/metrics/agents`, `/v1/metrics/agents/:agent/summary`,
+  `/v1/metrics/agents/:agent/methods`,
+  `/v1/metrics/agents/:agent/timeseries`,
+  `/v1/metrics/alerts`, `/v1/metrics/cost`. All accept
+  `?hours=N&bucket_minutes=M&peer=alias`. Empty-window
+  responses map to `404` per spec. Error code mapping:
+  `INVALID_ARGS` → 400, peer missing → 404, responder fault →
+  502, mesh not ready → 503. End-to-end mini-mesh
+  integration test boots a fake coordinator with canned
+  responders for all six caps, dials via `discover_and_pin`,
+  mounts the routes on an ephemeral axum listener, asserts
+  every spec scenario including the empty-window 404 path.
+  8 in-process unit + 1 integration test.
+- **CLI (commit 00e5998)**: `relix metrics summary
+  [--agent X] [--hours N]` (formatted table of per-agent
+  summaries — calls / success% / err% / p95 / tokens / cost /
+  top error), `relix metrics alerts` (active alerts with
+  `[!!]` critical / `[! ]` warning severity badges),
+  `relix metrics cost [--hours N]` (cost breakdown by
+  agent + method sorted descending), `relix metrics
+  timeseries --agent X [--hours 6] [--bucket 5]` (Unicode
+  block sparkline ▁▂▃▄▅▆▇█ of invocation rate per bucket).
+  Every subcommand accepts `--bridge <url>` and `--raw`.
+  5 sparkline tests cover empty / all-zero / uniform / mixed
+  distributions plus the eight-level scale.
+
+Spec acceptance:
+
+- ✅ Time-series store with `(agent, ts)` + `(method, ts)`
+  covering indexes; append-only; configurable retention
+  (default 30 days) swept hourly.
+- ✅ Hot path is non-blocking: unbounded mpsc + batch
+  insert at 100 rows / 100ms. The dispatch test suite would
+  see latency regressions immediately.
+- ✅ Aggregation queries run in under 100ms on 50k+ rows
+  (enforced by
+  `percentile_under_100k_rows_completes_under_100ms`).
+- ✅ Alert dedup verified by
+  `dedup_does_not_refire_active_alert`; recovery verified by
+  `recovery_event_fires_when_threshold_clears`; severity
+  classification verified by
+  `cost_per_hour_alert_uses_critical_severity`.
+- ✅ All six coordinator caps registered with manifest
+  descriptors.
+- ✅ Empty-window queries return 404 from the bridge.
+
+Quality gates: `cargo fmt --all`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --workspace` all
+pass. The runtime crate runs 2011 tests, of which 57 are
+RELIX-7.11 metrics.
+
+**Not shipped this session (documented gaps):**
+
+- **AI handler-side token / cost enrichment for `ai.chat`** —
+  the metrics surface exposes `MetricsSink::attach_ai_usage`
+  + an in-memory join cache so an AI handler can fire a
+  per-call usage hint that the collector merges into the
+  dispatch row before persisting. The dispatch row carries
+  `request_id` so the join is unambiguous, and the unit test
+  `ai_usage_hint_enriches_subsequent_metric` proves the
+  merge path. What is NOT done yet is the wiring inside
+  `crates/relix-runtime/src/nodes/ai/mod.rs` — the AI handler
+  doesn't yet call `metrics_sink.attach_ai_usage(...)` before
+  returning. Cost + token columns will populate the moment
+  that one call lands; until then those columns stay NULL on
+  every row. The hook lives behind a `Option<Arc<dyn
+  MetricsSink>>` so the change is additive + safe to do in
+  a separate AI-focused commit.
+- **Alert channel fan-out** — alerts currently route to the
+  built-in `LoggingAlertSink`. The `AlertDeliver` trait is
+  pluggable so the coordinator can implement a sink that
+  dispatches the alert through Telegram / Discord / Slack /
+  Email via the existing channel `*.send` capabilities; that
+  implementation is a small wrapper but requires a
+  coordinator-side bundle of channel-peer aliases that we
+  don't want to plumb in until the channel routing layer
+  (mentioned in §7.7's deferred work) ships.
+- **Chronicle alert events** — alerts fire via the
+  `AlertDeliver` sink; the runtime does NOT currently route
+  them to the coordinator's chronicle (the workflow
+  chronicle is a different schema). A small chronicle
+  writer sink can be added later that records each alert as
+  a structured chronicle event; the foundation is the
+  `AlertDeliver` trait.
+- **Dashboard panel** — the bridge exposes JSON-shaped read
+  endpoints today. The HTML dashboard panel that renders the
+  sparkline + summary table + alert badges sits in the same
+  multi-week dashboard work the channel tiles are queued
+  behind.
 
 ### 7.12 Conversation Export + Import `[DONE — coordinator scaffold 700ca11, real per-message history c51c864]`
 
