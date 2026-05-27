@@ -4,6 +4,7 @@ mod browser;
 mod capability;
 mod config;
 mod doctor;
+mod email;
 mod eval;
 mod export;
 mod flow;
@@ -99,6 +100,16 @@ enum Cmd {
     Ops {
         #[command(subcommand)]
         cmd: ops::Cmd,
+    },
+    /// RELIX-7.7 email channel operator surface.
+    /// `email send`   — one-off `POST /v1/email/send`.
+    /// `email status` — SMTP + IMAP connection state.
+    /// `email test`   — self-test: send a probe email to the
+    /// configured `smtp_from`. Talks to the local bridge over
+    /// HTTP (default `http://127.0.0.1:19791`).
+    Email {
+        #[command(subcommand)]
+        cmd: email::Cmd,
     },
     /// Operate the Router Node — mesh observability + health
     /// control plane. Each subcommand dials the router peer
@@ -321,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Capability { cmd } => capability::run(cmd).await,
         Cmd::Topology { cmd } => topology::run(cmd).await,
         Cmd::Ops { cmd } => ops::run(cmd).await,
+        Cmd::Email { cmd } => email::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,
