@@ -4260,6 +4260,22 @@ fn register_node_type_handlers(
                     auto_share_interval_secs = knowledge_cfg.auto_share_interval_secs,
                     "memory node: registered knowledge.* + spawned AutoShareTask"
                 );
+                // RELIX-7.16 GAP 1: spawn the MemoryQualityScorer
+                // background loop iff `[knowledge.quality_scorer]`
+                // is enabled. The handle is dropped — the task
+                // runs for the process lifetime.
+                if knowledge_cfg.quality_scorer.enabled {
+                    let _q_handle = crate::knowledge::spawn_memory_quality_scorer(
+                        layered.store.clone(),
+                        knowledge_cfg.quality_scorer.clone(),
+                    );
+                    tracing::info!(
+                        interval_secs = knowledge_cfg.quality_scorer.interval_secs,
+                        batch_size = knowledge_cfg.quality_scorer.batch_size,
+                        observation_baseline = knowledge_cfg.quality_scorer.observation_baseline,
+                        "memory node: spawned MemoryQualityScorer"
+                    );
+                }
             } else {
                 tracing::info!(
                     "memory node: [knowledge] section present but has no active groups; \

@@ -530,6 +530,43 @@ impl LayeredMemoryStore {
         Ok(())
     }
 
+    /// RELIX-7.16 GAP 1: fetch a batch of Layer 3 observations
+    /// that don't carry a `quality:<f>` tag yet. Used by the
+    /// background `MemoryQualityScorer` task. The records are
+    /// ordered ascending by `observed_at` so the scorer makes
+    /// monotonic progress across restarts.
+    ///
+    /// The unscored predicate is a substring check in SQL
+    /// (`tags NOT LIKE '%"quality:%'`) which is faster than
+    /// deserialising every row in Rust to inspect the tag list.
+    /// False positives (e.g. a record whose `text` literally
+    /// contains the substring `"quality:` — extraordinarily
+    /// rare in practice) are caught + filtered after the
+    /// fetch via [`extract_quality_score`]-equivalent logic
+    /// in the scorer.
+    pub fn fetch_unscored_observations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 1000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy \
+             FROM memory_records \
+             WHERE layer = 'observation' \
+               AND tags NOT LIKE '%\"quality:%' \
+             ORDER BY observed_at ASC, id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// Append a tag to a record's `tags` JSON array. Used by
     /// the layer promoter to stamp "promoted:<layer>" markers
     /// so the same record isn't re-promoted on the next tick.

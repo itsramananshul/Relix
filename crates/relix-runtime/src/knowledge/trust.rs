@@ -282,6 +282,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: cap,
+            quality_scorer: Default::default(),
         };
         let resolver = Arc::new(cfg.resolve().unwrap());
         TrustChecker::new(store(), resolver, &cfg)
@@ -404,6 +405,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: Some(3),
+            quality_scorer: Default::default(),
         };
         let resolver = Arc::new(cfg.resolve().unwrap());
         let c = TrustChecker::new(store.clone(), resolver, &cfg);

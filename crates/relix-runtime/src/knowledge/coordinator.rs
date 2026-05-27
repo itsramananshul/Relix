@@ -260,6 +260,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = Arc::new(KnowledgeService::new(store.clone(), &cfg).unwrap());
         store.insert(&observation("a1", "alice", true)).unwrap();
@@ -318,6 +319,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store, &cfg).unwrap();
         let ctx =
@@ -340,6 +342,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store, &cfg).unwrap();
         let HandlerOutcome::Ok(body) = handle_groups(&svc) else {

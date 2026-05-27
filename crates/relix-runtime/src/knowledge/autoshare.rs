@@ -250,6 +250,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         let task = AutoShareTask::new(
@@ -344,6 +345,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         let task = AutoShareTask::new(

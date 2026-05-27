@@ -89,6 +89,14 @@ pub struct KnowledgeConfig {
     /// enough that a runaway auto-share loop hits a stop.
     #[serde(default = "default_observation_cap")]
     pub max_observations_per_agent: Option<u32>,
+    /// RELIX-7.16 GAP 1: `[knowledge.quality_scorer]` —
+    /// configures the periodic `MemoryQualityScorer` that
+    /// stamps `quality:<f>` tags on Layer 3 observations
+    /// missing one. Absent / `enabled = false` leaves the
+    /// task unspawned and the trust checker's quality floor
+    /// only enforces against operator-stamped tags.
+    #[serde(default)]
+    pub quality_scorer: super::quality_scorer::MemoryQualityScorerConfig,
 }
 
 fn default_auto_share_interval() -> u64 {
@@ -259,6 +267,7 @@ mod tests {
             groups,
             auto_share_interval_secs: default_auto_share_interval(),
             max_observations_per_agent: default_observation_cap(),
+            quality_scorer: Default::default(),
         }
     }
 

@@ -546,6 +546,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         let _ = policy; // reserved for future policy-on-source-row tests
@@ -746,6 +747,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store.clone(), &cfg).unwrap();
         store
@@ -776,6 +778,7 @@ mod tests {
             }],
             auto_share_interval_secs: 60,
             max_observations_per_agent: None,
+            quality_scorer: Default::default(),
         };
         let svc = KnowledgeService::new(store, &cfg).unwrap();
         let r = svc.group_broadcast("mallory", "trio", &["x".into()], None);
