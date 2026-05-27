@@ -21,6 +21,7 @@
 pub mod config;
 pub mod coordinator;
 pub mod exporter;
+pub mod pii;
 pub mod recorder;
 pub mod scorer;
 pub mod store;
@@ -29,6 +30,7 @@ pub mod types;
 pub use config::{TrainingConfig, default_export_dir, default_training_path};
 pub use coordinator::{register, training_capability_descriptors};
 pub use exporter::{ExportEngine, ExportError, ExportFilters, ExportFormat, ExportResult};
+pub use pii::{PiiAnonymizer, PiiConfig, PiiDetector, PiiSpan, PiiStrategy, PiiType};
 pub use recorder::{
     CollectingInteractionSink, InteractionRecorder, InteractionSink, NullInteractionSink,
     RecorderWorkerHandles, RetentionConfig, SpawnedRecorder,
