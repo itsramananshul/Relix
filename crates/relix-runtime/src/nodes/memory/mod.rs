@@ -1417,7 +1417,15 @@ async fn handle_records_search(
                     let Some(vec) = vectors.pop() else {
                         return fallback_text_search(&layered.store, query, n);
                     };
-                    match q.search(vec, n, layered.score_threshold, None).await {
+                    // GAP 23: scope the Qdrant search to the
+                    // caller's tenant collection. When
+                    // `tenant_isolation = false` this resolves
+                    // to the single shared collection.
+                    let coll = q.collection_for_tenant(ctx.tenant_id.as_deref());
+                    match q
+                        .search_in(&coll, vec, n, layered.score_threshold, None)
+                        .await
+                    {
                         Ok(results) => results
                             .into_iter()
                             .map(|r| {
@@ -2261,6 +2269,7 @@ mod tests {
             trace_id: relix_core::types::TraceId::new(),
             request_id: relix_core::types::RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         }
     }
 
@@ -2403,6 +2412,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         };
 
         let anon = disabled_anonymizer();
@@ -2654,6 +2664,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: b"alice".to_vec(),
+            tenant_id: None,
         };
         let r = handle_agent_read(&store, &ctx);
         let body = match r {
@@ -2687,6 +2698,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: arg.into_bytes(),
+            tenant_id: None,
         };
         match handle_agent_write(&store, &ctx) {
             HandlerOutcome::Err(env) => {
@@ -2713,6 +2725,7 @@ mod tests {
             trace_id: relix_core::types::TraceId::new(),
             request_id: relix_core::types::RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         };
         // Missing body field.
         let anon = disabled_anonymizer();
@@ -2776,6 +2789,7 @@ mod tests {
             trace_id: relix_core::types::TraceId::new(),
             request_id: relix_core::types::RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         }
     }
 
@@ -3001,6 +3015,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         }
     }
 
@@ -3328,6 +3343,8 @@ mod tests {
             collection: "t".into(),
             dim: 4,
             api_key: None,
+            tenant_isolation: false,
+            collection_prefix: "relix".into(),
         }));
         let layered = LayeredContext::new(
             Arc::new(schema::LayeredMemoryStore::in_memory().unwrap()),

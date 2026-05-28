@@ -220,6 +220,14 @@ pub struct MemoryRecord {
     /// for audit.
     #[serde(default)]
     pub consolidated: bool,
+    /// GAP 23: tenant identifier this record belongs to. When
+    /// `[memory.qdrant] tenant_isolation = true` the embedder
+    /// pipeline upserts the record's vector into the
+    /// per-tenant collection derived from this field. `None`
+    /// means "default tenant" and keeps single-tenant
+    /// deployments byte-identical to pre-GAP-23 behaviour.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl MemoryRecord {
@@ -252,6 +260,7 @@ impl MemoryRecord {
             frozen: false,
             last_edited_ms: None,
             consolidated: false,
+            tenant_id: None,
         }
     }
 }
@@ -345,8 +354,8 @@ impl LayeredMemoryStore {
             "INSERT OR REPLACE INTO memory_records \
              (id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
               shareable, shared_with, shared_by, share_policy, \
-              source_trust, frozen, last_edited_ms, consolidated) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+              source_trust, frozen, last_edited_ms, consolidated, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 record.id,
                 record.layer.as_str(),
@@ -366,6 +375,7 @@ impl LayeredMemoryStore {
                 record.frozen as i32,
                 record.last_edited_ms,
                 record.consolidated as i32,
+                record.tenant_id,
             ],
         )?;
         Ok(())
@@ -505,7 +515,7 @@ impl LayeredMemoryStore {
             .query_row(
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records WHERE id = ?1",
                 params![id],
                 row_to_record,
@@ -532,7 +542,7 @@ impl LayeredMemoryStore {
             (None, None) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -541,7 +551,7 @@ impl LayeredMemoryStore {
             (Some(l), None) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records WHERE layer = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -550,7 +560,7 @@ impl LayeredMemoryStore {
             (None, Some(s)) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records WHERE source = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -559,7 +569,7 @@ impl LayeredMemoryStore {
             (Some(l), Some(s)) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records WHERE layer = ?3 AND source = ?4 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -597,7 +607,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records WHERE text LIKE ?1 ESCAPE '\\' \
              ORDER BY created_at DESC, id ASC \
              LIMIT ?2",
@@ -646,7 +656,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records \
              WHERE layer = 'observation' \
                AND tags NOT LIKE '%\"quality:%' \
@@ -699,7 +709,7 @@ impl LayeredMemoryStore {
             .query_row(
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records WHERE layer = ?1 AND source = ?2 \
                  ORDER BY observed_at DESC, id ASC LIMIT 1",
                 params![layer.as_str(), source],
@@ -821,7 +831,7 @@ impl LayeredMemoryStore {
             Some(l) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                         shareable, shared_with, shared_by, share_policy, \
-                        source_trust, frozen, last_edited_ms, consolidated \
+                        source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records WHERE source = ?1 AND layer = ?2 \
                  ORDER BY observed_at ASC, id ASC",
                 vec![source.to_string().into(), l.as_str().to_string().into()],
@@ -829,7 +839,7 @@ impl LayeredMemoryStore {
             None => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                         shareable, shared_with, shared_by, share_policy, \
-                        source_trust, frozen, last_edited_ms, consolidated \
+                        source_trust, frozen, last_edited_ms, consolidated, tenant_id \
                  FROM memory_records WHERE source = ?1 \
                  ORDER BY observed_at ASC, id ASC",
                 vec![source.to_string().into()],
@@ -859,7 +869,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records \
              WHERE layer = ?1 \
                AND frozen = 0 \
@@ -892,7 +902,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records \
              WHERE layer = 'raw' \
                AND consolidated = 0 \
@@ -935,7 +945,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records \
              WHERE layer = 'observation' \
                AND (source IS NULL OR source = '') \
@@ -964,7 +974,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records r \
              WHERE r.layer = 'observation' \
                AND r.observed_at < ?1 \
@@ -998,7 +1008,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records m \
              WHERE m.layer = 'model' \
                AND m.valid_to IS NULL \
@@ -1123,7 +1133,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
              FROM memory_records \
              WHERE embedding IS NULL \
              ORDER BY observed_at ASC, id ASC \
@@ -1213,6 +1223,13 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             [],
         )?;
     }
+    // GAP 23: per-tenant column. NULL means "default tenant"
+    // — operator can flip `[memory.qdrant] tenant_isolation
+    // = true` on an existing store and the migration leaves
+    // every prior row in the default collection.
+    if !column_exists(conn, "memory_records", "tenant_id")? {
+        conn.execute("ALTER TABLE memory_records ADD COLUMN tenant_id TEXT", [])?;
+    }
     // Step 3: 7.16 indexes. Always issued with IF NOT EXISTS
     // so they're idempotent across both fresh and migrated
     // databases.
@@ -1292,6 +1309,9 @@ fn row_to_record(
     let frozen: i32 = r.get(15).unwrap_or(0);
     let last_edited_ms: Option<i64> = r.get(16).unwrap_or(None);
     let consolidated: i32 = r.get(17).unwrap_or(0);
+    // GAP 23: optional tenant_id column. NULL means "default
+    // tenant" (single-tenant deployments).
+    let tenant_id: Option<String> = r.get(18).unwrap_or(None);
     Ok((|| {
         let layer = MemoryLayer::parse(&layer_s).ok_or_else(|| {
             LayeredMemoryError::Serialization(format!("unknown layer: {layer_s}"))
@@ -1330,6 +1350,7 @@ fn row_to_record(
             frozen: frozen != 0,
             last_edited_ms,
             consolidated: consolidated != 0,
+            tenant_id,
         })
     })())
 }

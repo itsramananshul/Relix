@@ -485,6 +485,7 @@ pub(crate) fn fake_ctx(args: &[u8]) -> InvocationCtx {
         trace_id: TraceId::new(),
         request_id: RequestId::new(),
         args: args.to_vec(),
+        tenant_id: None,
     }
 }
 

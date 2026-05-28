@@ -128,11 +128,16 @@ pub async fn handle_context_flush(
 
     let mut flushed_ids: Vec<i64> = Vec::with_capacity(to_flush.len());
     let mut embedded = 0usize;
+    // GAP 23: stamp the caller's tenant on every flushed
+    // record so the embedder pipeline routes the resulting
+    // vector into the right Qdrant collection.
+    let tenant_for_records = ctx.tenant_id.clone();
     for ((turn_id, role, body), vec_opt) in to_flush.iter().zip(vectors.iter()) {
         let id = mint_flush_id(&args.session_id, *turn_id, role, body);
         let mut record = MemoryRecord::new_raw(id, body.clone(), args.session_id.clone());
         record.layer = MemoryLayer::Semantic;
         record.source_trust = SourceTrust::Internal;
+        record.tenant_id = tenant_for_records.clone();
         record.tags = vec![
             "ingest:context_flush".to_string(),
             "type:chat".to_string(),
@@ -245,6 +250,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: serde_json::to_vec(&args).unwrap(),
+            tenant_id: None,
         }
     }
 

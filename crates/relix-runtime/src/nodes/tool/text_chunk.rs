@@ -329,6 +329,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         }
     }
 

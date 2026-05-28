@@ -878,6 +878,11 @@ fn build_copy(source: &MemoryRecord, target: &str, message: Option<&str>) -> Mem
         frozen: false,
         last_edited_ms: None,
         consolidated: false,
+        // GAP 23: shared copies inherit the source record's
+        // tenant; cross-tenant sharing is an explicit
+        // operator action and is not implicit in the broadcast
+        // path.
+        tenant_id: source.tenant_id.clone(),
     }
 }
 

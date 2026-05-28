@@ -425,6 +425,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: serde_json::to_vec(args).unwrap(),
+            tenant_id: None,
         }
     }
 
@@ -443,6 +444,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: vec![],
+            tenant_id: None,
         }
     }
 

@@ -105,8 +105,14 @@ pub async fn handle_dialectic(
     // Step 2: Layer 3 observation candidates. Try Qdrant
     // semantic search first; fall back to text search on
     // any failure or when Qdrant isn't wired.
-    let (observations, retrieval_path) =
-        load_observations(layered, embed_cell, embedding_model, &args).await;
+    let (observations, retrieval_path) = load_observations(
+        layered,
+        embed_cell,
+        embedding_model,
+        &args,
+        ctx.tenant_id.as_deref(),
+    )
+    .await;
 
     // Step 3: assemble the synthesis prompt + dispatch the
     // AI call. The dispatcher cell stays empty when
@@ -213,6 +219,7 @@ async fn load_observations(
     embed_cell: &tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>,
     embedding_model: &str,
     args: &DialecticArgs,
+    tenant_id: Option<&str>,
 ) -> (Vec<MemoryRecord>, RetrievalPath) {
     let qdrant = layered.qdrant.clone();
     let dispatcher = embed_cell.get().cloned();
@@ -226,8 +233,12 @@ async fn load_observations(
                             {"key": "source", "match": {"value": args.subject_id}},
                         ]
                     });
+                    // GAP 23: dialectic Qdrant search runs
+                    // against the caller's tenant collection.
+                    let coll = q.collection_for_tenant(tenant_id);
                     match q
-                        .search(
+                        .search_in(
+                            &coll,
                             query_vec,
                             TOP_K_OBSERVATIONS,
                             layered.score_threshold,
@@ -361,6 +372,7 @@ mod tests {
                 "question": args.question,
             }))
             .unwrap(),
+            tenant_id: None,
         }
     }
 

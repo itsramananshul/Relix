@@ -474,6 +474,7 @@ mod tests {
             surface: surface.map(|s| s.to_string()),
             approval_token: None,
             task_id: None,
+            tenant_id: None,
         }
     }
 

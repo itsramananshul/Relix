@@ -239,7 +239,13 @@ async fn run_tick(p: &EmbeddingPipeline) -> usize {
         return 0;
     }
     let mut embedded = 0usize;
-    let mut points: Vec<QdrantPoint> = Vec::with_capacity(pending.len());
+    // GAP 23: group points by tenant so each batch lands in
+    // the right per-tenant Qdrant collection. When
+    // `tenant_isolation = false` the resolver returns the
+    // single default collection regardless of tenant, so the
+    // bucket map collapses to one key.
+    let mut buckets: std::collections::HashMap<String, Vec<QdrantPoint>> =
+        std::collections::HashMap::new();
     for (record, vector) in pending.iter().zip(vectors) {
         if vector.is_empty() {
             tracing::warn!(
@@ -259,16 +265,28 @@ async fn run_tick(p: &EmbeddingPipeline) -> usize {
                 continue;
             }
         }
-        points.push(qdrant_point_for_record(record, vector));
+        let coll = match p.qdrant.as_ref() {
+            Some(q) => q.collection_for_tenant(record.tenant_id.as_deref()),
+            None => String::new(),
+        };
+        buckets
+            .entry(coll)
+            .or_default()
+            .push(qdrant_point_for_record(record, vector));
     }
-    if let Some(q) = &p.qdrant
-        && !points.is_empty()
-        && let Err(e) = q.upsert(points).await
-    {
-        tracing::warn!(
-            error = %e,
-            "memory embedder: qdrant upsert failed (sqlite already updated)"
-        );
+    if let Some(q) = &p.qdrant {
+        for (coll, points) in buckets {
+            if coll.is_empty() || points.is_empty() {
+                continue;
+            }
+            if let Err(e) = q.upsert_in(&coll, points).await {
+                tracing::warn!(
+                    error = %e,
+                    collection = %coll,
+                    "memory embedder: qdrant upsert failed (sqlite already updated)"
+                );
+            }
+        }
     }
     embedded
 }
@@ -415,6 +433,8 @@ mod tests {
             collection: "t".into(),
             dim: 4,
             api_key: None,
+            tenant_isolation: false,
+            collection_prefix: "relix".into(),
         };
         let qclient = Arc::new(QdrantClient::new(qcfg));
         let store = store_with_pending(&["rec-1"]);

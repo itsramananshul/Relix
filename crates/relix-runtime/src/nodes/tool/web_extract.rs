@@ -1217,6 +1217,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: arg.into_bytes(),
+            tenant_id: None,
         };
         match handle(&cfg, &ctx) {
             HandlerOutcome::Err(e) => {
@@ -1247,6 +1248,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: b"nope|<p>x</p>".to_vec(),
+            tenant_id: None,
         };
         match handle(&cfg, &ctx) {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::INVALID_ARGS),
@@ -1520,6 +1522,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: b"markdown|<h1>Hello</h1><p>world</p>".to_vec(),
+            tenant_id: None,
         };
         let out = match handle(&cfg, &ctx) {
             HandlerOutcome::Ok(b) => String::from_utf8(b).unwrap(),
@@ -1547,6 +1550,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: b"bogus|<p>x</p>".to_vec(),
+            tenant_id: None,
         };
         match handle(&cfg, &ctx) {
             HandlerOutcome::Err(e) => assert!(e.cause.contains("markdown")),

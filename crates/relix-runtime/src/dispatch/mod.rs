@@ -42,6 +42,22 @@ pub struct InvocationCtx {
     pub request_id: relix_core::types::RequestId,
     /// CBOR-encoded arguments.
     pub args: Vec<u8>,
+    /// GAP 23: per-request tenant identifier propagated from
+    /// the `X-Relix-Tenant` header (or set explicitly by
+    /// mesh-internal callers). `None` is the default tenant.
+    /// Handlers that enforce per-tenant isolation read
+    /// [`Self::tenant_id_or_default`].
+    #[doc(hidden)]
+    pub tenant_id: Option<String>,
+}
+
+impl InvocationCtx {
+    /// Resolve the request's tenant id, defaulting to
+    /// `"default"` when the field is absent. Used by every cap
+    /// that scopes its work per tenant.
+    pub fn tenant_id_or_default(&self) -> &str {
+        self.tenant_id.as_deref().unwrap_or("default")
+    }
 }
 
 /// Outcome a handler returns. Maps to `ResponseResult` on the wire.
@@ -1113,6 +1129,7 @@ impl DispatchBridge {
             trace_id: req.tid,
             request_id: req.rid,
             args: args_for_dispatch,
+            tenant_id: req.tenant_id.clone(),
         };
         // W2-006a: capture per-call elapsed_ms. Instant::now
         // straddles only the handler invocation — admission /
@@ -1835,6 +1852,7 @@ impl DispatchBridge {
             trace_id: req.tid,
             request_id: req.rid,
             args: args_for_dispatch_stream,
+            tenant_id: req.tenant_id.clone(),
         };
         let dispatch_started = std::time::Instant::now();
 
@@ -2128,6 +2146,41 @@ pub fn build_request_with_surface(
         surface,
         approval_token,
         task_id,
+        tenant_id: None,
+    };
+    codec::encode(&req).unwrap_or_default()
+}
+
+/// GAP 23: same shape as [`build_request_with_surface`] plus
+/// the per-request tenant id. Used by the bridge to propagate
+/// the `X-Relix-Tenant` header into the mesh, and by
+/// mesh-internal callers that want to stamp a tenant
+/// explicitly. `tenant_id = None` keeps the wire-level field
+/// absent so older responders ignore it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_with_tenant(
+    method: impl Into<String>,
+    args: Vec<u8>,
+    identity: Bundle,
+    deadline_secs_from_now: i64,
+    surface: Option<String>,
+    approval_token: Option<String>,
+    task_id: Option<String>,
+    tenant_id: Option<String>,
+) -> Vec<u8> {
+    let req = RequestEnvelope {
+        pv: 1,
+        rid: relix_core::types::RequestId::new(),
+        tid: relix_core::types::TraceId::new(),
+        method: method.into(),
+        mv: 1,
+        args: ByteBuf::from(args),
+        identity_bundle: identity,
+        deadline: Timestamp::now().add_secs(deadline_secs_from_now),
+        surface,
+        approval_token,
+        task_id,
+        tenant_id,
     };
     codec::encode(&req).unwrap_or_default()
 }

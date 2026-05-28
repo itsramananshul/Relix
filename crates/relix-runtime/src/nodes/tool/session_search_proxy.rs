@@ -184,6 +184,7 @@ mod tests {
             trace_id: relix_core::types::TraceId::new(),
             request_id: relix_core::types::RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         }
     }
 

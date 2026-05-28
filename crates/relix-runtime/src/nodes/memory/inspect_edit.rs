@@ -264,6 +264,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: serde_json::to_vec(args).unwrap(),
+            tenant_id: None,
         }
     }
 

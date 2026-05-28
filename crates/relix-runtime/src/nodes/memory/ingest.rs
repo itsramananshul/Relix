@@ -144,7 +144,14 @@ pub async fn handle_ingest_document(
                 .or(args.content.clone())
                 .unwrap_or_default(),
         };
-        return handle_ingest_image_inner(layered, embed_cell, embedding_model, &img_args).await;
+        return handle_ingest_image_inner(
+            layered,
+            embed_cell,
+            embedding_model,
+            &img_args,
+            ctx.tenant_id.as_deref(),
+        )
+        .await;
     }
 
     if !matches!(
@@ -211,11 +218,16 @@ pub async fn handle_ingest_document(
 
     let mut chunks_created = 0usize;
     let mut embedded = 0usize;
+    // GAP 23: ingest writes are scoped to the caller's tenant
+    // so the per-tenant Qdrant collection receives the chunks
+    // on its next embedder pass.
+    let tenant_for_records = ctx.tenant_id.clone();
     for (i, (chunk, vec_opt)) in chunks.iter().zip(vectors.iter()).enumerate() {
         let id = mint_chunk_id(&args.source, &args.subject_id, i, chunk);
         let mut record = MemoryRecord::new_raw(id, chunk.clone(), args.source.clone());
         record.layer = MemoryLayer::Semantic;
         record.source_trust = SourceTrust::External;
+        record.tenant_id = tenant_for_records.clone();
         record.tags = vec![
             "ingest:document".to_string(),
             format!("content_type:{content_type}"),
@@ -269,7 +281,14 @@ pub async fn handle_ingest_image(
         Ok(a) => a,
         Err(e) => return invalid_args(format!("memory.ingest_image: decode args: {e}")),
     };
-    handle_ingest_image_inner(layered, embed_cell, embedding_model, &args).await
+    handle_ingest_image_inner(
+        layered,
+        embed_cell,
+        embedding_model,
+        &args,
+        ctx.tenant_id.as_deref(),
+    )
+    .await
 }
 
 async fn handle_ingest_image_inner(
@@ -277,6 +296,7 @@ async fn handle_ingest_image_inner(
     embed_cell: &tokio::sync::OnceCell<Arc<dyn EmbeddingDispatcher>>,
     embedding_model: &str,
     args: &IngestImageArgs,
+    tenant_id: Option<&str>,
 ) -> HandlerOutcome {
     if args.subject_id.trim().is_empty() {
         return invalid_args("memory.ingest_image: subject_id required".into());
@@ -369,6 +389,7 @@ async fn handle_ingest_image_inner(
     visual.layer = MemoryLayer::Semantic;
     visual.source_trust = SourceTrust::External;
     visual.embedding = Some(vector);
+    visual.tenant_id = tenant_id.map(str::to_string);
     visual.tags = vec![
         "ingest:image".to_string(),
         "type:image".to_string(),
@@ -404,6 +425,7 @@ async fn handle_ingest_image_inner(
             );
             ocr.layer = MemoryLayer::Semantic;
             ocr.source_trust = SourceTrust::External;
+            ocr.tenant_id = tenant_id.map(str::to_string);
             ocr.tags = vec![
                 "ingest:image".to_string(),
                 "type:image_ocr".to_string(),
@@ -780,6 +802,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: serde_json::to_vec(&args).unwrap(),
+            tenant_id: None,
         }
     }
 

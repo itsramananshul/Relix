@@ -768,6 +768,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: Vec::new(),
+            tenant_id: None,
         }
     }
 

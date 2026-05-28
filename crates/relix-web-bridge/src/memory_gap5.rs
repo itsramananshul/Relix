@@ -13,13 +13,15 @@
 //! single writer. When `mesh_client` is unset, every handler
 //! responds 503 with a structured body.
 
+use axum::extract::Extension;
 use axum::{Json, extract::State, http::StatusCode};
 use serde_json::Value;
 
-use relix_runtime::dispatch::{build_request, decode_response};
+use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
 use crate::config::AppState;
+use crate::tenant::TenantId;
 
 const DEFAULT_PEER: &str = "memory";
 
@@ -32,57 +34,88 @@ pub struct ApiError {
 /// (less the optional `peer` key) to `memory.dialectic`.
 pub async fn dialectic(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.dialectic").await
+    proxy_json(&state, Some(tenant.0.as_str()), req, "memory.dialectic").await
 }
 
 /// `POST /v1/memory/ingest` — forwards to `memory.ingest_document`.
 pub async fn ingest(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.ingest_document").await
+    proxy_json(
+        &state,
+        Some(tenant.0.as_str()),
+        req,
+        "memory.ingest_document",
+    )
+    .await
 }
 
 /// `POST /v1/memory/ingest_image` — forwards to `memory.ingest_image`.
 pub async fn ingest_image(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.ingest_image").await
+    proxy_json(&state, Some(tenant.0.as_str()), req, "memory.ingest_image").await
 }
 
 /// `POST /v1/memory/context_flush` — forwards to `memory.context_flush`.
 pub async fn context_flush(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.context_flush").await
+    proxy_json(&state, Some(tenant.0.as_str()), req, "memory.context_flush").await
 }
 
 /// `POST /v1/memory/quarantine/list` — forwards to `memory.quarantine_list`.
 pub async fn quarantine_list(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.quarantine_list").await
+    proxy_json(
+        &state,
+        Some(tenant.0.as_str()),
+        req,
+        "memory.quarantine_list",
+    )
+    .await
 }
 
 /// `POST /v1/memory/quarantine/approve` — forwards to `memory.quarantine_approve`.
 pub async fn quarantine_approve(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.quarantine_approve").await
+    proxy_json(
+        &state,
+        Some(tenant.0.as_str()),
+        req,
+        "memory.quarantine_approve",
+    )
+    .await
 }
 
 /// `POST /v1/memory/quarantine/reject` — forwards to `memory.quarantine_reject`.
 pub async fn quarantine_reject(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.quarantine_reject").await
+    proxy_json(
+        &state,
+        Some(tenant.0.as_str()),
+        req,
+        "memory.quarantine_reject",
+    )
+    .await
 }
 
 // ── GAP 7: inspector editing surface ──────────────────────
@@ -90,46 +123,68 @@ pub async fn quarantine_reject(
 /// `POST /v1/memory/records/edit` — forwards to `memory.edit_record`.
 pub async fn edit_record(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.edit_record").await
+    proxy_json(&state, Some(tenant.0.as_str()), req, "memory.edit_record").await
 }
 
 /// `POST /v1/memory/records/freeze` — forwards to `memory.freeze_record`.
 pub async fn freeze_record(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.freeze_record").await
+    proxy_json(&state, Some(tenant.0.as_str()), req, "memory.freeze_record").await
 }
 
 /// `POST /v1/memory/records/unfreeze` — forwards to `memory.unfreeze_record`.
 pub async fn unfreeze_record(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.unfreeze_record").await
+    proxy_json(
+        &state,
+        Some(tenant.0.as_str()),
+        req,
+        "memory.unfreeze_record",
+    )
+    .await
 }
 
 /// `POST /v1/memory/export` — forwards to `memory.bulk_export`.
 pub async fn bulk_export(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.bulk_export").await
+    proxy_json(&state, Some(tenant.0.as_str()), req, "memory.bulk_export").await
 }
 
 /// `POST /v1/memory/refresh_model` — forwards to `memory.request_model_refresh`.
 pub async fn request_model_refresh(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantId>,
     Json(req): Json<Value>,
 ) -> axum::response::Response {
-    proxy_json(&state, req, "memory.request_model_refresh").await
+    proxy_json(
+        &state,
+        Some(tenant.0.as_str()),
+        req,
+        "memory.request_model_refresh",
+    )
+    .await
 }
 
 // ── helpers ──────────────────────────────────────────────
 
-async fn proxy_json(state: &AppState, mut req: Value, method: &str) -> axum::response::Response {
+async fn proxy_json(
+    state: &AppState,
+    tenant: Option<&str>,
+    mut req: Value,
+    method: &str,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     // The bridge accepts an optional `peer` override per call;
     // strip it so the wire payload matches the cap's contract.
@@ -138,7 +193,7 @@ async fn proxy_json(state: &AppState, mut req: Value, method: &str) -> axum::res
         .and_then(|m| m.remove("peer"))
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| DEFAULT_PEER.to_string());
-    match call_peer_json(state, &peer, method, &req).await {
+    match call_peer_json(state, &peer, tenant, method, &req).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -147,6 +202,7 @@ async fn proxy_json(state: &AppState, mut req: Value, method: &str) -> axum::res
 async fn call_peer_json(
     state: &AppState,
     alias: &str,
+    tenant: Option<&str>,
     method: &str,
     args: &Value,
 ) -> Result<Value, axum::response::Response> {
@@ -180,11 +236,18 @@ async fn call_peer_json(
     // bridge calls so the bridge does not time out before the
     // memory peer has a chance to answer.
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(15, 600);
-    let envelope = build_request(
+    // GAP 23: stamp the tenant onto the envelope so the
+    // memory peer's per-cap handlers can scope Qdrant /
+    // policy / audit per tenant.
+    let envelope = build_request_with_tenant(
         method,
         arg_bytes,
         state.identity_bundle.clone(),
         deadline_secs,
+        None,
+        None,
+        None,
+        tenant.map(str::to_string),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
         let msg = e.to_string();

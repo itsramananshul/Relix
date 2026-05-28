@@ -558,6 +558,11 @@ fn build_promoted_record(
         frozen: parent.frozen,
         last_edited_ms: None,
         consolidated: false,
+        // GAP 23: promoted records inherit the parent's
+        // tenant so the per-tenant Qdrant collection stays
+        // consistent across the Raw → Semantic → Observation
+        // → Model promotion chain.
+        tenant_id: parent.tenant_id.clone(),
     }
 }
 

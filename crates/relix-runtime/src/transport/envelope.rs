@@ -57,6 +57,16 @@ pub struct RequestEnvelope {
     /// poll/decide, just without auto-pausing a calling task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// GAP 23: per-request tenant identifier. Operator-asserted
+    /// (not cryptographically proven). The bridge stamps it
+    /// from the `X-Relix-Tenant` header before issuing a mesh
+    /// dispatch; mesh-internal callers may pass it explicitly.
+    /// `None` is treated as the default tenant — every
+    /// downstream cap that consults the tenant defaults to
+    /// `"default"` when this field is absent, so the wire
+    /// format stays backwards-compatible with older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// RELIX-1 response envelope (alpha fields).

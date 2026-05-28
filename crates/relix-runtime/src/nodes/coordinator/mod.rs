@@ -8098,6 +8098,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         }
     }
 
@@ -11769,6 +11770,7 @@ mod tests {
             trace_id: TraceId::new(),
             request_id: RequestId::new(),
             args: args.to_vec(),
+            tenant_id: None,
         }
     }
 
@@ -12152,6 +12154,7 @@ mod tests {
                 trace_id: relix_core::types::TraceId::new(),
                 request_id: relix_core::types::RequestId::new(),
                 args: b"sess-A".to_vec(),
+                tenant_id: None,
             },
         );
         match outcome {
@@ -12362,6 +12365,7 @@ mod tests {
             trace_id: relix_core::types::TraceId::new(),
             request_id: relix_core::types::RequestId::new(),
             args: b"|needle|5".to_vec(),
+            tenant_id: None,
         };
         let outcome = handle_session_search(&s, &ctx);
         match outcome {
@@ -12396,6 +12400,7 @@ mod tests {
             trace_id: relix_core::types::TraceId::new(),
             request_id: relix_core::types::RequestId::new(),
             args: b"||20".to_vec(),
+            tenant_id: None,
         };
         let outcome = handle_session_search(&s, &ctx);
         match outcome {
