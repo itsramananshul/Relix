@@ -55,3 +55,25 @@ pub use orchestrator::{
 };
 pub use parser::{DEFAULT_COMPLEXITY_THRESHOLD, PlanSpec, SpecParser};
 pub use registry::{AgentCapabilityRegistry, AgentInfo, AgentMatch, CapabilityInfo};
+
+use serde::{Deserialize, Serialize};
+
+/// `[planning]` config block carrying the orchestrator + critic
+/// knobs. Both default in the orchestrator-on,
+/// critic-on, coordinator-as-AI-peer state — fresh installs
+/// get sensible multi-specialist planning out of the box. An
+/// operator who wants the legacy single-agent path back sets
+/// `enabled = false` (orchestrator) and `critic_enabled =
+/// false` (critic).
+///
+/// The orchestrator + critic fields are flattened to keep the
+/// TOML layout flat — operators write a single `[planning]`
+/// table with all the knobs rather than nested
+/// `[planning.orchestrator]` + `[planning.critic]` sub-tables.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PlanningConfig {
+    #[serde(flatten)]
+    pub orchestrator: OrchestratorConfig,
+    #[serde(flatten)]
+    pub critic: CriticConfig,
+}

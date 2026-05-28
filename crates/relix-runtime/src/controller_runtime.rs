@@ -128,6 +128,13 @@ pub struct ControllerConfig {
     /// [`crate::confidence::ConfidenceConfig`] for the schema.
     #[serde(default)]
     pub confidence: Option<crate::confidence::ConfidenceConfig>,
+    /// `[planning]` block — RELIX-7.24 Stage-1 + Stage-3
+    /// multi-specialist orchestrator + critic configuration.
+    /// Absent → both default to enabled with the coordinator
+    /// as the AI peer. See [`crate::planning::PlanningConfig`]
+    /// for the schema.
+    #[serde(default)]
+    pub planning: Option<crate::planning::PlanningConfig>,
     /// `[routing]` — RELIX-7.7 / 7.11 GAP 2 channel routing
     /// rules. Validated at coordinator boot against `[peers]`.
     /// Absent means every inbound channel message falls back
@@ -5161,10 +5168,13 @@ fn register_node_type_handlers(
             // declared-only agents until the cache warms.
             &std::collections::BTreeMap::new(),
         );
+        let planning_cfg: crate::planning::PlanningConfig =
+            cfg.planning.clone().unwrap_or_default();
         crate::planning::register(
             bridge,
             planning_registry.clone(),
             workflow_dispatcher_cell.clone(),
+            planning_cfg,
         );
         for (method, doc) in crate::planning::planning_capability_descriptors() {
             let cats: &[&str] = if *method == "planning.create_plan" {
