@@ -385,63 +385,37 @@ The §7.28 ship explicitly enumerated three NOT-DONE sub-bullets in the roadmap:
 
 ---
 
-## GAP 23 — §7.17 Multi-tenant identity namespacing: header-level only
+## GAP 23 — §7.17 Multi-tenant identity namespacing — CLOSED
 
-**Roadmap claim (`[DONE — commit 90eba16]` for the full 5.7 block, including 5.7.2):**
-> A SaaS operator gets one `tenant_id`. Each of their end users gets a `subject_id` under that tenant. Agents are scoped to tenants. Memory, permissions, and audit logs are isolated per tenant.
+**Closed in commits 7feed75 (23A), 1f4368d (23B), 447744a (23C).**
 
-**Actual code:**
-- `crates/relix-web-bridge/src/tenant.rs` PRESENT — extracts `X-Relix-Tenant` header, defaults to `"default"`, stashes in request extensions.
-- SDK's `with_tenant()` method PRESENT.
-- **Memory isolation by tenant**: Qdrant payload schema has `tenant_id` field, but the runtime does not enforce per-tenant collection isolation as the spec describes (one collection per `tenant_id_subject_id`). Records go into a shared collection scoped by `subject_id`.
-- **Permissions scoped per tenant**: no per-tenant policy file resolution. Policies are global.
-- **Audit logs separated per tenant**: audit log writes do not partition by tenant_id.
+- **23A Per-tenant Qdrant collections** (7feed75): `[memory.qdrant] tenant_isolation = true` + `collection_prefix = "relix"` route every record into `{prefix}_{sanitized_tenant_id}`. The X-Relix-Tenant header flows through `RequestEnvelope.tenant_id` → `InvocationCtx.tenant_id` → embedder buckets by tenant → `QdrantClient.upsert_in / search_in / ensure_collection_in`. New collections auto-create on first write (memoised). `MemoryRecord.tenant_id` column added via additive ALTER TABLE migration. Bridge `memory_gap5` handlers extract `Extension<TenantId>` and forward via `build_request_with_tenant`. 8 unit tests + the full sweep passing.
+- **23B Per-tenant policy resolution** (1f4368d): new `relix-core::policy::TenantPolicyResolver` resolves overrides from `{policy.dir}/{tenant_id}.policy.toml` with TTL-cached engines (positive + negative entries). Tenant ids are sanitised before file lookup so `../../etc/policy.toml` cannot escape `dir`. `DispatchBridge` admission consults the resolver when wired; falls back to the global engine otherwise. New caps `node.policy.tenant_list` + `node.policy.tenant_get`; bridge HTTP `GET /v1/policy/tenants` + `GET /v1/policy/tenants/:tenant_id`. 5 unit tests + 2 bridge parse tests.
+- **23C Per-tenant audit partitioning** (447744a): `AuditDraft` gained additive `tenant_id` field; the canonical signed CBOR `AuditRecord` + hash chain are deliberately NOT touched (changing the signed struct would break every existing chain). New `relix-runtime::audit_partition::AuditPartitionStore` mirrors every finalised audit into SQLite keyed by sanitised tenant id. Bridge admits + writes the mirror BEFORE finalising the canonical log; mirror failures degrade to `warn!` and the signed chain still finalises. New caps `node.audit.tenant_list` + `node.audit.tenant_recent`; bridge HTTP `GET /v1/audit/tenants` + `GET /v1/audit/tenants/:tenant_id?limit=N`. 5 unit tests + 2 bridge parse tests.
 
-**Severity:** PARTIAL DONE. The header flows through but the runtime-side isolation the spec describes is not enforced — a request with `X-Relix-Tenant: A` and another with `X-Relix-Tenant: B` see the same memory / policy / audit surfaces.
-
-**Gap size:** Medium-to-large — per-tenant Qdrant collections, per-tenant policy resolution, per-tenant audit-log partitioning.
+**Honest follow-ups (deferred):**
+- The canonical `AuditRecord` still does not carry `tenant_id` in its signed body — operators who need cryptographic per-tenant tamper-evidence have to verify the partition mirror's row against the canonical chain separately. Adding `tenant_id` to the signed struct is a chain-rotation event and was out of scope.
+- `tenant_id` is plumbed onto memory caps via `memory_gap5`; other bridge handlers default to `None` tenant. The bridge dispatch path itself reads `req.tenant_id` correctly, so nothing is *broken* on those handlers — they just don't propagate the header. Cross-cutting plumb of every bridge handler is a follow-up.
 
 ---
 
-## GAP 24 — `relix sessions` CLI (§7.31 Feature 3 docs) missing
+## GAP 24 — `relix sessions` CLI — CLOSED
 
-**Roadmap claim under §7.31 Feature 3 (Session-Centric Debugger, `[DONE — commits e16309e through 2f0ba25]`):**
-> ```
-> relix sessions list
-> relix sessions search --agent support_agent --status failed
-> relix sessions show sess_abc123
-> relix sessions show sess_abc123 --full
-> ```
+**Closed in commit 3b708f6.**
 
-**Actual code:**
-- `SessionDebugger` query layer PRESENT (`observability/session_debugger.rs`).
-- Bridge endpoints `/v1/sessions*` PRESENT.
-- **`relix sessions` CLI subcommand**: NOT present. No `crates/relix-cli/src/sessions.rs`. The CLI exposes session search via `relix ops session-search`, but the `relix sessions list / show / search` surface the roadmap promises does not exist.
+`crates/relix-cli/src/sessions.rs` ships three subcommands wired into `main.rs` as `Cmd::Sessions`:
 
-**Severity:** MISLABELED [DONE]. The bridge surface ships; the CLI surface the section opens with does not.
-
-**Gap size:** Small — wrap the existing bridge endpoints in CLI subcommands.
+- `relix sessions list [--agent A] [--status running|completed|stalled] [--limit N] [--json]` — forwards `--status` to `GET /v1/sessions`, filters `--agent` client-side, prints a table.
+- `relix sessions show <session_id> [--full --elevated] [--json]` — pulls `GET /v1/sessions/{id}`; with `--full` also fetches each event's content from `/v1/sessions/{id}/content/{event_id}` (requires `X-Relix-Elevated`). Per-event content fetches that fail degrade to a `content_error` field rather than aborting the whole timeline.
+- `relix sessions search --query Q [--agent A] [--limit N]` — substring-matches `session_id` + `agent_id` case-insensitively. The bridge has no server-side `/v1/sessions/search` today; richer server-side search is a follow-up. 4 new unit tests cover query matching, missing-field tolerance, urlencode round-trip, and the default limit guard.
 
 ---
 
-## GAP 25 — `relix provenance` CLI (§7.31 Feature 4) missing
+## GAP 25 — `relix provenance` CLI — CLOSED
 
-**Roadmap claim under §7.31 Feature 4 (Provenance Registry, same `[DONE]` block):**
-> ```
-> relix provenance show trace_xyz789
-> relix provenance diff trace_abc123 trace_xyz789
-> relix provenance history --prompt support_agent.md
-> relix provenance audit --from 2026-05-01 --to 2026-05-25
-> ```
+**Closed in commit c94f75a** (predates this multi-tenant pass — verified during the GAP 23/24/25 sweep).
 
-**Actual code:**
-- Bridge endpoints `GET /v1/provenance/{trace_id}` + `GET /v1/provenance/diff` PRESENT.
-- **`relix provenance` CLI subcommand**: NOT present.
-- **`history --prompt` + `audit --from --to` surfaces**: NOT present in any form.
-
-**Severity:** MISLABELED [DONE]. Same shape as GAP 24.
-
-**Gap size:** Small — CLI wrapper.
+`crates/relix-cli/src/provenance.rs` ships `Show`, `Diff`, `History`, and `Audit` subcommands proxying the bridge's `/v1/provenance/*` endpoints, registered on `main.rs` as `Cmd::Provenance`.
 
 ---
 
@@ -506,7 +480,7 @@ If a future session has limited budget, these are the highest-impact items where
 5. ~~**GAP 11** — closed by commit 235a32b~~
 6. ~~**GAP 12** — closed by commit 5aacced~~
 7. ~~**GAP 7** — closed by commit e39a079~~
-8. **GAP 23 — Multi-tenant isolation is header-level.** Per-tenant Qdrant collections, per-tenant policies, per-tenant audit partitions not enforced.
+8. ~~**GAP 23** — closed by commits 7feed75 (23A Qdrant) + 1f4368d (23B policy) + 447744a (23C audit partition)~~
 9. ~~**GAP 14** — closed by commit c94f75a~~
 10. ~~**GAP 13** — closed by commit c94f75a~~
 

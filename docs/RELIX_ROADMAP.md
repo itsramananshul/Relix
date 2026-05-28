@@ -490,7 +490,14 @@ await relix.ingest({ subjectId: "user-123", file: "./notes.md" });
 await relix.search({ subjectId: "user-123", query: "what did we discuss about pricing?" });
 ```
 
-**5.7.2 — Multi-Tenant Identity Namespacing**
+**5.7.2 — Multi-Tenant Identity Namespacing** `[DONE — commits 7feed75 (23A) + 1f4368d (23B) + 447744a (23C)]`
+
+> **GAP-FOLLOWUP (2026-05-28):** GAP 23 in `docs/GAP_REPORT.md` flagged this section as PARTIAL — the `X-Relix-Tenant` header was wired but the runtime didn't enforce per-tenant isolation. Closed in three commits:
+> - **7feed75** — `RequestEnvelope.tenant_id` + `InvocationCtx.tenant_id` + `build_request_with_tenant`; per-tenant Qdrant collections behind `[memory.qdrant] tenant_isolation` + `collection_prefix`; auto-create on first write; `MemoryRecord.tenant_id` column + migration; embedder buckets by tenant; bridge `memory_gap5` propagates tenant.
+> - **1f4368d** — `TenantPolicyResolver` (TTL-cached, path-sanitised) with `{policy.dir}/{tenant_id}.policy.toml` resolution; `DispatchBridge` admission consults the resolver; `node.policy.tenant_list` + `node.policy.tenant_get` caps; bridge `GET /v1/policy/tenants[/:tenant_id]`.
+> - **447744a** — `AuditDraft.tenant_id` + `AuditPartitionStore` (SQLite mirror) behind `[audit] partition_by_tenant = true`; canonical signed CBOR log + hash chain deliberately NOT touched (backwards compat); `node.audit.tenant_list` + `node.audit.tenant_recent` caps; bridge `GET /v1/audit/tenants[/:tenant_id]`.
+>
+> Deferred follow-ups: `tenant_id` is plumbed onto memory caps via `memory_gap5`; other bridge handlers default to `None` tenant and continue to dispatch correctly — cross-cutting plumbing is a future pass. The canonical `AuditRecord` still does not carry `tenant_id` in its signed body; adding it is a chain-rotation event.
 
 Currently everything is one subject_id per operator. For a SaaS with multiple end users, each user needs isolated memory, isolated agent identities, isolated permissions.
 
@@ -4436,7 +4443,11 @@ Every concrete agent invocation gets a unique cryptographic identity bound to it
 ---
 
 
-### 7.31 Observability — OTel Export, Two-Sink Architecture, Session Debugger, Provenance Registry `[DONE — commits e16309e through 2f0ba25]`
+### 7.31 Observability — OTel Export, Two-Sink Architecture, Session Debugger, Provenance Registry `[DONE — commits e16309e through 2f0ba25, follow-up CLIs 3b708f6 (sessions) + c94f75a (provenance)]`
+
+> **GAP-FOLLOWUP (2026-05-28):** `docs/GAP_REPORT.md` flagged GAPs 24 + 25 against the Feature 3 / Feature 4 CLI surfaces (the bridge endpoints shipped, but `relix sessions list / show / search` and `relix provenance show / diff / history / audit` did not). Both CLIs are now present:
+> - **3b708f6** — `crates/relix-cli/src/sessions.rs` ships `list / show / search` wired as `Cmd::Sessions`. `show --full --elevated` pulls per-event content bodies from `/v1/sessions/{id}/content/{event_id}`. `search` is client-side substring match over `session_id` + `agent_id`; a server-side `/v1/sessions/search` endpoint is a follow-up.
+> - **c94f75a** — `crates/relix-cli/src/provenance.rs` ships `show / diff / history / audit` against the bridge's `/v1/provenance/*` endpoints (closed earlier in the same session as GAPs 13 + 14).
 
 Four observability features that together give Relix complete observability — useful for ops, debugging, and compliance all at once. Built on top of the evidence capture (7.26 Component 3) and the observability dashboard (7.28) already in the roadmap.
 
