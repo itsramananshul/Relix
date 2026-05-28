@@ -330,6 +330,18 @@ pub struct DispatchBridge {
     /// finalised audit also lands as a row in a queryable
     /// SQLite store keyed by sanitised tenant id.
     audit_partition: Option<Arc<crate::audit_partition::AuditPartitionStore>>,
+    /// GAP 15 partial: global "always require operator approval"
+    /// method allowlist. Operators populate it from
+    /// `[approval] always_require_methods = [...]` in the
+    /// controller config. When a call's method name appears
+    /// here, admission step 8.5 rejects with
+    /// [`relix_core::types::error_kinds::APPROVAL_REQUIRED`] —
+    /// even if the caller's policy and (when wired) agent gate
+    /// would otherwise admit. The list is checked AFTER the
+    /// agent gate, so operators who run both surfaces get the
+    /// gate's per-agent semantics AND a hard "always require"
+    /// floor.
+    always_require_methods: Vec<String>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -504,7 +516,32 @@ impl DispatchBridge {
             pii_gate: None,
             tenant_policy: None,
             audit_partition: None,
+            always_require_methods: Vec::new(),
         })
+    }
+
+    /// GAP 15 partial: set the global "always require approval"
+    /// method allowlist. Pass a list of method names that
+    /// should ALWAYS require operator approval, regardless of
+    /// the caller's policy decision or per-agent gate rule.
+    /// Idempotent — calling twice replaces the prior list.
+    /// Passing an empty list disables the floor.
+    pub fn set_always_require_methods(&mut self, methods: Vec<String>) {
+        self.always_require_methods = methods;
+    }
+
+    /// GAP 15 partial: borrow the configured allowlist. Used by
+    /// tests + by the optional `node.policy.always_require_list`
+    /// surface for operator visibility.
+    pub fn always_require_methods(&self) -> &[String] {
+        &self.always_require_methods
+    }
+
+    /// GAP 15 partial: returns `true` when `method` is on the
+    /// always-require allowlist. Pure check; no admission side
+    /// effect.
+    pub fn always_requires_approval(&self, method: &str) -> bool {
+        self.always_require_methods.iter().any(|m| m == method)
     }
 
     /// GAP 23B: wire the per-tenant policy resolver. Idempotent
@@ -998,6 +1035,34 @@ impl DispatchBridge {
                         .await;
                 }
             }
+        }
+
+        // === Admission step 8.5 (GAP 15): always-require allowlist ===
+        // Some methods need an operator approval EVERY time,
+        // regardless of the caller's policy decision or any
+        // per-agent gate rule. Examples typically include
+        // `tool.fs.write` against production paths, payment
+        // emissions, or destructive infra calls.
+        //
+        // Calls that already carry an approval_token are
+        // exempt — the token is the operator's "yes" for this
+        // specific call. We do NOT consume the token here; if
+        // the agent_gate is wired it has already consumed it
+        // above, otherwise it's a one-shot the operator
+        // accepts is paired to this request.
+        if self.always_requires_approval(&req.method) && req.approval_token.is_none() {
+            self.bump_stats(&req.method, StatBucket::Denied, now);
+            let cause = "always_require_methods".to_string();
+            return self
+                .audit_and_err_with_id(
+                    &req,
+                    &verified,
+                    started_at,
+                    cause,
+                    relix_core::types::error_kinds::APPROVAL_REQUIRED,
+                    AuditStatus::Denied,
+                )
+                .await;
         }
 
         // === Admission step 9: policy ===
@@ -1731,6 +1796,28 @@ impl DispatchBridge {
             }
         }
 
+        // === Admission step 8.5 (GAP 15, streaming path) ===
+        // Sends the approval-required frame to the SSE writer
+        // before finalising the audit row.
+        if self.always_requires_approval(&req.method) && req.approval_token.is_none() {
+            self.bump_stats(&req.method, StatBucket::Denied, now);
+            let cause = "always_require_methods".to_string();
+            let _ = writer
+                .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
+                .await;
+            let _ = self
+                .audit_and_err_with_id(
+                    &req,
+                    &verified,
+                    started_at,
+                    cause,
+                    error_kinds::APPROVAL_REQUIRED,
+                    AuditStatus::Denied,
+                )
+                .await;
+            return;
+        }
+
         // === Admission step 9: policy ===
         // GAP 23B: route through the tenant resolver when wired
         // so a request with `tenant_id = Some(t)` evaluates
@@ -2302,6 +2389,117 @@ mod tests {
 
     async fn echo_handler(ctx: InvocationCtx) -> HandlerOutcome {
         HandlerOutcome::Ok(ctx.args)
+    }
+
+    // ---- GAP 15 partial: always_require_methods admission ----
+
+    fn allow_health_bridge() -> (DispatchBridge, Bundle, TempDir, SigningKey) {
+        let dir = TempDir::new().unwrap();
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let policy = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "any_caller_echo"
+            method = "node.health"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let mut bridge = DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+
+        let caller_key = SigningKey::generate(&mut OsRng);
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(&caller_key.verifying_key().to_bytes()),
+            name: "alice".into(),
+            org_id: NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let bundle = issue_identity(id, &org_root, 3600).unwrap();
+        (bridge, bundle, dir, org_root)
+    }
+
+    #[tokio::test]
+    async fn always_requires_approval_predicate_round_trips_through_setter() {
+        let (mut bridge, _bundle, _dir, _root) = allow_health_bridge();
+        assert!(!bridge.always_requires_approval("node.health"));
+        bridge.set_always_require_methods(vec!["node.health".into(), "tool.fs.write".into()]);
+        assert!(bridge.always_requires_approval("node.health"));
+        assert!(bridge.always_requires_approval("tool.fs.write"));
+        assert!(!bridge.always_requires_approval("ai.chat"));
+        assert_eq!(bridge.always_require_methods().len(), 2);
+        // Idempotent replace.
+        bridge.set_always_require_methods(Vec::new());
+        assert!(!bridge.always_requires_approval("node.health"));
+    }
+
+    #[tokio::test]
+    async fn admission_returns_approval_required_when_method_is_on_allowlist() {
+        let (mut bridge, bundle, _dir, _root) = allow_health_bridge();
+        bridge.set_always_require_methods(vec!["node.health".into()]);
+        // The policy would otherwise admit this call (chat-users
+        // is allowed on node.health) — the allowlist must
+        // override.
+        let envelope = build_request("node.health", b"hi".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(e) => {
+                assert_eq!(e.kind, error_kinds::APPROVAL_REQUIRED);
+                assert!(
+                    e.cause.contains("always_require_methods"),
+                    "cause should name the source: {:?}",
+                    e.cause
+                );
+            }
+            other => panic!("expected APPROVAL_REQUIRED, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_admits_an_allowlist_method_when_request_carries_an_approval_token() {
+        let (mut bridge, bundle, _dir, _root) = allow_health_bridge();
+        bridge.set_always_require_methods(vec!["node.health".into()]);
+        let envelope = build_request_with_tenant(
+            "node.health",
+            b"hi".to_vec(),
+            bundle,
+            30,
+            None,
+            Some("operator-approved-token".to_string()),
+            None,
+            None,
+        );
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Ok(b) => assert_eq!(b.as_ref(), b"hi"),
+            other => panic!("expected Ok with token attached; got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_with_empty_allowlist_does_not_change_decision() {
+        let (bridge, bundle, _dir, _root) = allow_health_bridge();
+        // Default allowlist empty.
+        assert!(bridge.always_require_methods().is_empty());
+        let envelope = build_request("node.health", b"hi".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Ok(b) => assert_eq!(b.as_ref(), b"hi"),
+            other => panic!("expected pre-GAP-15 admit, got {:?}", other),
+        }
     }
 
     #[tokio::test]

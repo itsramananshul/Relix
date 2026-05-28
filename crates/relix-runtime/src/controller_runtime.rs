@@ -160,6 +160,13 @@ pub struct ControllerConfig {
     /// a queryable SQLite row keyed by sanitised tenant id.
     #[serde(default)]
     pub audit: Option<AuditSection>,
+    /// `[approval]` — GAP 15 partial: cross-cap operator
+    /// approval surfaces. The current scope is the
+    /// always-require allowlist; future commits can grow this
+    /// section with a method-prefix wildcard set, a per-tenant
+    /// override map, etc.
+    #[serde(default)]
+    pub approval: Option<ApprovalSection>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -308,6 +315,34 @@ pub struct PolicySection {
 
 fn default_tenant_cache_ttl() -> u64 {
     60
+}
+
+/// GAP 15 partial: `[approval]` section.
+///
+/// Currently carries the "always require operator approval"
+/// allowlist. When `always_require_methods` is non-empty,
+/// every dispatched call whose method matches one of the
+/// listed names returns `APPROVAL_REQUIRED` unless the call
+/// already carries an `approval_token` — even if the caller's
+/// policy + (when wired) agent gate would otherwise admit.
+///
+/// Example:
+///
+/// ```toml
+/// [approval]
+/// always_require_methods = [
+///     "tool.fs.write",
+///     "tool.terminal.run",
+///     "memory.bulk_export",
+/// ]
+/// ```
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ApprovalSection {
+    /// Method names that always require an attached approval
+    /// token. Order is irrelevant — the dispatch bridge checks
+    /// for membership only.
+    #[serde(default)]
+    pub always_require_methods: Vec<String>,
 }
 
 /// GAP 23C: `[audit]` section. Wires the per-tenant audit
@@ -555,6 +590,23 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
+    // GAP 15 partial: always-require-approval allowlist. When
+    // the operator listed any methods under
+    // `[approval] always_require_methods`, register them with
+    // the dispatch bridge so admission step 8.5 rejects every
+    // dispatched call to those methods unless it carries an
+    // approval token.
+    if let Some(approval_cfg) = cfg.approval.as_ref()
+        && !approval_cfg.always_require_methods.is_empty()
+    {
+        let methods = approval_cfg.always_require_methods.clone();
+        tracing::info!(
+            count = methods.len(),
+            methods = ?methods,
+            "approval: always-require allowlist wired"
+        );
+        bridge.set_always_require_methods(methods);
     }
     // W2: build the per-controller access broker from
     // `[[execution.agents]]`. Absent / empty config produces
