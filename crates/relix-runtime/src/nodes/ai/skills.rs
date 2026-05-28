@@ -38,6 +38,14 @@ use std::path::{Path, PathBuf};
 /// inspects. Per the Linux Foundation spec.
 pub const AGENTS_MAX_WALK_LEVELS: usize = 5;
 
+/// Filenames the [`discover_agent_context`] helper walks for.
+/// Order is the priority order — when more than one is present
+/// in a single directory, every match is collected; the AI
+/// node concatenates them in this order so AGENTS.md remains
+/// the canonical document and the Claude / Cursor files layer
+/// on top.
+pub const AGENT_CONTEXT_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".cursorrules"];
+
 /// One discovered AGENTS.md file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentsContext {
@@ -49,9 +57,44 @@ pub struct AgentsContext {
 /// first match; `None` when the walk completes without finding
 /// one OR every candidate is empty.
 pub fn discover_agents_md(start: &Path) -> Option<AgentsContext> {
+    discover_named_md(start, "AGENTS.md")
+}
+
+/// GAP 3: walk up from `start` looking for `CLAUDE.md`. Same
+/// 5-level cap + non-empty contract as [`discover_agents_md`].
+///
+/// `CLAUDE.md` is the file convention used by Claude Code and
+/// related agentic coding assistants: a free-form markdown
+/// document at the root of a project that captures persistent
+/// agent context. When present, the Relix AI node merges its
+/// contents into the system prompt alongside `AGENTS.md`, so an
+/// agent dropped into a repo that already ships a `CLAUDE.md`
+/// inherits that context automatically.
+pub fn discover_claude_md(start: &Path) -> Option<AgentsContext> {
+    discover_named_md(start, "CLAUDE.md")
+}
+
+/// GAP 3: walk up from `start` looking for `.cursorrules`. Same
+/// 5-level cap + non-empty contract as [`discover_agents_md`].
+///
+/// `.cursorrules` is the file convention used by Cursor: a
+/// plain-text file at the project root that describes
+/// project-specific coding conventions, conventions the editor
+/// folds into every chat. The Relix AI node treats the file
+/// identically to AGENTS.md / CLAUDE.md — it lands in the
+/// merged system context at startup.
+pub fn discover_cursor_rules(start: &Path) -> Option<AgentsContext> {
+    discover_named_md(start, ".cursorrules")
+}
+
+/// Internal helper backing the three discover_* functions
+/// above. Walks up from `start` up to
+/// [`AGENTS_MAX_WALK_LEVELS`] times looking for `filename`.
+/// Returns the first non-empty match.
+fn discover_named_md(start: &Path, filename: &str) -> Option<AgentsContext> {
     let mut current = start.to_path_buf();
     for _ in 0..=AGENTS_MAX_WALK_LEVELS {
-        let candidate = current.join("AGENTS.md");
+        let candidate = current.join(filename);
         if let Ok(content) = std::fs::read_to_string(&candidate)
             && !content.trim().is_empty()
         {
@@ -65,6 +108,55 @@ pub fn discover_agents_md(start: &Path) -> Option<AgentsContext> {
         }
     }
     None
+}
+
+/// GAP 3: discover every supported agent-context file in one
+/// pass. Equivalent to calling [`discover_agents_md`],
+/// [`discover_claude_md`], and [`discover_cursor_rules`]; the
+/// returned vector preserves the canonical ordering from
+/// [`AGENT_CONTEXT_FILENAMES`] (AGENTS.md, then CLAUDE.md, then
+/// .cursorrules) so a caller that simply concatenates the bodies
+/// gets a deterministic prompt prefix.
+///
+/// The same source directory may contribute more than one file
+/// — for example a repo that ships both `AGENTS.md` AND
+/// `CLAUDE.md` returns two entries.
+pub fn discover_agent_context(start: &Path) -> Vec<AgentsContext> {
+    let mut out = Vec::with_capacity(AGENT_CONTEXT_FILENAMES.len());
+    for name in AGENT_CONTEXT_FILENAMES {
+        if let Some(ctx) = discover_named_md(start, name) {
+            out.push(ctx);
+        }
+    }
+    out
+}
+
+/// GAP 3: merge a sequence of [`AgentsContext`] entries into a
+/// single string suitable for prepending to the system prompt.
+///
+/// Each entry is rendered as
+/// `# <basename>\n\n<content>\n` so the model sees a
+/// machine-readable boundary between sources (and the operator
+/// who reads the prompt back can tell which file came from
+/// where). Empty input returns an empty string.
+pub fn merge_agent_context(entries: &[AgentsContext]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        let name = entry
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("context");
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("# ");
+        out.push_str(name);
+        out.push_str("\n\n");
+        out.push_str(entry.content.trim_end_matches('\n'));
+        out.push('\n');
+    }
+    out
 }
 
 /// One discovered skill. `name` is the file stem; `body` is
@@ -867,6 +959,73 @@ mod tests {
         assert_eq!(AGENTS_MAX_WALK_LEVELS, 5);
         let tmp = tempfile::tempdir().unwrap();
         let _ = discover_agents_md(tmp.path());
+    }
+
+    // ---- GAP 3: CLAUDE.md / .cursorrules / merge ----
+
+    #[test]
+    fn claude_md_walker_finds_file_in_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("nested");
+        std::fs::create_dir_all(&child).unwrap();
+        let f = tmp.path().join("CLAUDE.md");
+        std::fs::write(&f, "# Project Claude\nfollow style X").unwrap();
+        let found = discover_claude_md(&child).expect("walk must find parent's CLAUDE.md");
+        assert_eq!(found.path, f);
+        assert!(found.content.contains("style X"));
+    }
+
+    #[test]
+    fn cursor_rules_walker_finds_dotfile_in_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("nested");
+        std::fs::create_dir_all(&child).unwrap();
+        let f = tmp.path().join(".cursorrules");
+        std::fs::write(&f, "always use snake_case").unwrap();
+        let found = discover_cursor_rules(&child).expect("walk must find parent's .cursorrules");
+        assert_eq!(found.path, f);
+        assert!(found.content.contains("snake_case"));
+    }
+
+    #[test]
+    fn discover_agent_context_returns_each_present_file_in_canonical_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "agents body").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "claude body").unwrap();
+        // Skip .cursorrules: only two of three present.
+        let ctx = discover_agent_context(tmp.path());
+        let names: Vec<String> = ctx
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_agent_context_renders_each_file_with_a_header_and_blank_line_separator() {
+        let entries = vec![
+            AgentsContext {
+                path: PathBuf::from("/x/AGENTS.md"),
+                content: "agents body".into(),
+            },
+            AgentsContext {
+                path: PathBuf::from("/x/CLAUDE.md"),
+                content: "claude body\n".into(),
+            },
+        ];
+        let merged = merge_agent_context(&entries);
+        assert!(merged.contains("# AGENTS.md\n\nagents body"));
+        assert!(merged.contains("# CLAUDE.md\n\nclaude body"));
+        // Files separated by a blank line.
+        assert!(merged.contains("\n\n# CLAUDE.md"));
+    }
+
+    #[test]
+    fn merge_agent_context_returns_empty_string_for_empty_input() {
+        assert!(merge_agent_context(&[]).is_empty());
     }
 
     #[test]

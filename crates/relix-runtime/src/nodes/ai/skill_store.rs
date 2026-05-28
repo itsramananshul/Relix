@@ -107,6 +107,111 @@ pub struct SkillFilter {
     pub limit: Option<usize>,
 }
 
+/// GAP 3: render a stored skill as a SKILL.md document body.
+///
+/// The output follows the Linux Foundation SKILL.md shape used
+/// by [`crate::nodes::ai::skills::discover_skills`]: a top-level
+/// `# <name>` heading, a short description paragraph, a
+/// `## Procedure` ordered list of steps (with optional
+/// `(tool: ...)` and indented prompt bodies), an optional
+/// `## Examples` section, plus a trailing metadata block.
+///
+/// Pure function — no filesystem I/O. Use
+/// [`write_stored_skill_md`] when you want the file written to
+/// disk.
+pub fn render_stored_skill_md(skill: &StoredSkill) -> String {
+    let mut out = String::new();
+    out.push_str("# ");
+    out.push_str(skill.name.trim());
+    out.push_str("\n\n");
+    if !skill.description.trim().is_empty() {
+        out.push_str(skill.description.trim());
+        out.push_str("\n\n");
+    }
+
+    out.push_str("## Procedure\n\n");
+    if skill.steps.is_empty() {
+        out.push_str("_(no steps recorded)_\n\n");
+    } else {
+        for (idx, step) in skill.steps.iter().enumerate() {
+            use std::fmt::Write as _;
+            let header = match &step.tool {
+                Some(t) if !t.trim().is_empty() => format!("(tool: `{}`) ", t.trim()),
+                _ => String::new(),
+            };
+            let _ = writeln!(out, "{}. {}{}", idx + 1, header, step.step.trim());
+            if let Some(prompt) = &step.prompt
+                && !prompt.trim().is_empty()
+            {
+                for line in prompt.lines() {
+                    out.push_str("   > ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    if !skill.example_inputs.is_empty() || !skill.example_outputs.is_empty() {
+        out.push_str("## Examples\n\n");
+        let n = skill.example_inputs.len().max(skill.example_outputs.len());
+        for i in 0..n {
+            let input = skill
+                .example_inputs
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or("—");
+            let output = skill
+                .example_outputs
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or("—");
+            use std::fmt::Write as _;
+            let _ = writeln!(out, "- **Input:** {input}");
+            let _ = writeln!(out, "  **Output:** {output}");
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Metadata\n\n");
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "- id: `{}`", skill.id);
+    let _ = writeln!(out, "- source_agent: `{}`", skill.source_agent);
+    let _ = writeln!(out, "- version: {}", skill.version);
+    let _ = writeln!(out, "- confidence: {:.2}", skill.confidence);
+    let _ = writeln!(out, "- usage_count: {}", skill.usage_count);
+    let _ = writeln!(out, "- status: {}", skill.status.as_str());
+    if !skill.tags.is_empty() {
+        let _ = writeln!(out, "- tags: {}", skill.tags.join(", "));
+    }
+    out
+}
+
+/// GAP 3: write a stored skill out as a SKILL.md file. When
+/// `path` is a directory the helper writes
+/// `<dir>/{slug(skill.name)}.md`; when it's a regular-file path
+/// the body is written there verbatim. Returns the final path
+/// the body was written to. Parent directories are created if
+/// missing.
+pub fn write_stored_skill_md(
+    path: &std::path::Path,
+    skill: &StoredSkill,
+) -> std::io::Result<std::path::PathBuf> {
+    let body = render_stored_skill_md(skill);
+    let target = if path.is_dir() {
+        let slug = crate::nodes::ai::skills::slugify_for_filename(&skill.name);
+        path.join(format!("{slug}.md"))
+    } else {
+        path.to_path_buf()
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, body)?;
+    Ok(target)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SkillStoreError {
     #[error("skill store: sqlite: {0}")]
@@ -842,6 +947,72 @@ mod tests {
             example_outputs: vec!["here are the latest".into()],
             status: SkillStatus::Active,
         }
+    }
+
+    // ---- GAP 3: render_stored_skill_md + write_stored_skill_md ----
+
+    #[test]
+    fn render_stored_skill_md_contains_every_section() {
+        let s = sample("id-1", "fetch_and_summarise");
+        let md = render_stored_skill_md(&s);
+        assert!(md.starts_with("# fetch_and_summarise"));
+        assert!(md.contains("## Procedure"));
+        assert!(md.contains("(tool: `http.get`)"));
+        assert!(md.contains("1. (tool: `http.get`) fetch the data"));
+        assert!(md.contains("2. summarise"));
+        assert!(md.contains("   > summarise this in 3 bullets"));
+        assert!(md.contains("## Examples"));
+        assert!(md.contains("**Input:** fetch the latest"));
+        assert!(md.contains("**Output:** here are the latest"));
+        assert!(md.contains("## Metadata"));
+        assert!(md.contains("- id: `id-1`"));
+        assert!(md.contains("- source_agent: `agent.alpha`"));
+        assert!(md.contains("- confidence: 0.50"));
+        assert!(md.contains("- status: active"));
+        assert!(md.contains("- tags: tag1, rust"));
+    }
+
+    #[test]
+    fn render_stored_skill_md_handles_empty_steps_and_examples_gracefully() {
+        let mut s = sample("id-2", "empty_skill");
+        s.steps.clear();
+        s.example_inputs.clear();
+        s.example_outputs.clear();
+        s.tags.clear();
+        let md = render_stored_skill_md(&s);
+        assert!(md.contains("_(no steps recorded)_"));
+        // No `## Examples` heading when both example lists are
+        // empty.
+        assert!(!md.contains("## Examples"));
+        // Tags line omitted when empty.
+        assert!(!md.contains("- tags:"));
+    }
+
+    #[test]
+    fn write_stored_skill_md_creates_a_slugged_file_when_target_is_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sample("id-3", "Fetch and Summarise!");
+        let out = write_stored_skill_md(dir.path(), &s).unwrap();
+        assert_eq!(out.parent().unwrap(), dir.path());
+        let stem = out.file_stem().unwrap().to_string_lossy().to_string();
+        assert!(
+            stem.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "stem {stem:?} should be slugified"
+        );
+        assert!(out.extension().and_then(|x| x.to_str()) == Some("md"));
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert!(body.starts_with("# Fetch and Summarise!"));
+    }
+
+    #[test]
+    fn write_stored_skill_md_respects_explicit_file_path_and_creates_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested/dir/MY_SKILL.md");
+        let s = sample("id-4", "explicit_path");
+        let out = write_stored_skill_md(&target, &s).unwrap();
+        assert_eq!(out, target);
+        assert!(target.exists());
     }
 
     #[test]

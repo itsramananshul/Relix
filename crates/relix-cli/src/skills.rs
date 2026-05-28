@@ -119,10 +119,16 @@ pub struct ExportArgs {
     #[arg(long, default_value = "http://127.0.0.1:19791")]
     pub bridge: String,
     pub id: String,
-    /// Optional output path. When omitted the JSON document is
+    /// Optional output path. When omitted the document is
     /// printed to stdout.
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// GAP 3: output format. `json` (default) emits the JSON
+    /// document the bridge returned; `md` renders the skill as
+    /// a SKILL.md-style markdown document (works with the
+    /// Linux Foundation Agentic AI shared-file convention).
+    #[arg(long, default_value = "json")]
+    pub format: String,
 }
 
 #[derive(Args, Debug)]
@@ -363,16 +369,37 @@ async fn skills_export(args: ExportArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("error: HTTP {status}: {body}");
         std::process::exit(1);
     }
-    // Pretty-print so the on-disk artefact is human-readable.
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    let pretty = serde_json::to_string_pretty(&v)?;
+
+    let format = args.format.trim().to_ascii_lowercase();
+    let output = match format.as_str() {
+        "json" | "" => {
+            let v: serde_json::Value = serde_json::from_str(&body)?;
+            serde_json::to_string_pretty(&v)?
+        }
+        "md" | "markdown" => {
+            // GAP 3: render the bridge's JSON body as a
+            // SKILL.md-style markdown document. The runtime's
+            // render_stored_skill_md helper takes a typed
+            // StoredSkill; we deserialise the bridge body into
+            // it via serde so any forward-compat additions on
+            // the JSON side don't break the CLI.
+            let stored: relix_runtime::nodes::ai::skill_store::StoredSkill =
+                serde_json::from_str(&body)?;
+            relix_runtime::nodes::ai::skill_store::render_stored_skill_md(&stored)
+        }
+        other => {
+            eprintln!("error: unknown --format {other:?} (expected json or md)");
+            std::process::exit(2);
+        }
+    };
+
     match args.out.as_ref() {
         Some(p) => {
-            std::fs::write(p, &pretty)?;
-            eprintln!("wrote {} bytes to {}", pretty.len(), p.display());
+            std::fs::write(p, &output)?;
+            eprintln!("wrote {} bytes to {}", output.len(), p.display());
         }
         None => {
-            println!("{pretty}");
+            println!("{output}");
         }
     }
     Ok(())
@@ -464,14 +491,20 @@ fn urlencode(s: &str) -> String {
 
 fn list(extra_roots: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     let skills = relix_runtime::nodes::ai::skills::discover_skills(extra_roots);
-    // Also surface any AGENTS.md the loader sees from cwd —
-    // useful to confirm the bot will pick up project context.
-    if let Ok(cwd) = std::env::current_dir()
-        && let Some(agents) = relix_runtime::nodes::ai::skills::discover_agents_md(&cwd)
-    {
-        println!("AGENTS.md:");
-        println!("  {}", agents.path.display());
-        println!();
+    // GAP 3: surface every agent-context file the AI controller
+    // would pick up at startup — AGENTS.md, CLAUDE.md, and
+    // .cursorrules. The bot's system prompt merges these in
+    // canonical order so operators can confirm the wiring from
+    // the CLI without spinning up the controller.
+    if let Ok(cwd) = std::env::current_dir() {
+        let ctx = relix_runtime::nodes::ai::skills::discover_agent_context(&cwd);
+        if !ctx.is_empty() {
+            println!("Agent context files:");
+            for entry in &ctx {
+                println!("  {}", entry.path.display());
+            }
+            println!();
+        }
     }
     if skills.is_empty() {
         println!("no SKILL.md / *.md files discovered");
