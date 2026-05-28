@@ -55,6 +55,7 @@ pub async fn run(
         trace_id: None,
         chunk_observer: None,
         cancel_signal: None,
+        last_confidence_cell: None,
     };
     let result = FlowRunner::new(opts).run().await?;
 

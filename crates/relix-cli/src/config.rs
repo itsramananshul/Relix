@@ -45,6 +45,48 @@ pub struct RelixConfig {
     /// [`docs/chronicle-retention.md`](../../../docs/chronicle-retention.md).
     #[serde(default)]
     pub coordinator: CoordinatorBlock,
+    /// RELIX-7.19 GAP 4: `[confidence]` master switch +
+    /// rolling-window depth. Off by default — operators flip
+    /// `enabled = true` to wire the per-call ConfidenceScorer +
+    /// FallbackEngine into every node's dispatch bridge. The
+    /// wizard exposes the on/off switch; per-cap policies stay
+    /// edit-the-toml-yourself for now since the policy DSL is
+    /// richer than the wizard's yes/no shape.
+    #[serde(default)]
+    pub confidence: ConfidenceBlock,
+}
+
+/// `[confidence]` block in `~/.relix/config.toml`. Mirrors the
+/// subset of [`relix_runtime::confidence::ConfidenceConfig`]
+/// the setup wizard exposes: master `enabled` switch +
+/// rolling-window depth. Operators editing the file by hand
+/// add `[[confidence.policies]]` blocks per spec.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfidenceBlock {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_confidence_window_size")]
+    pub window_size: usize,
+    #[serde(default = "default_confidence_p95_baseline")]
+    pub p95_latency_baseline_ms: u64,
+}
+
+impl Default for ConfidenceBlock {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_size: default_confidence_window_size(),
+            p95_latency_baseline_ms: default_confidence_p95_baseline(),
+        }
+    }
+}
+
+fn default_confidence_window_size() -> usize {
+    100
+}
+
+fn default_confidence_p95_baseline() -> u64 {
+    1500
 }
 
 /// `[coordinator]` block in `~/.relix/config.toml`. Only carries

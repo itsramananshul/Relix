@@ -778,6 +778,7 @@ async fn real_dispatcher_remote_call_stream_honours_cancel_signal() {
         trace_id: Some(TraceId::new()),
         chunk_observer: None,
         cancel_signal: Some(cancel_signal),
+        last_confidence_cell: None,
     };
     let _flow_id_unused = FlowId::new();
 

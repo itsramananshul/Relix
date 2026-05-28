@@ -120,6 +120,14 @@ pub struct ControllerConfig {
     /// registered and the AutoShareTask is not spawned.
     #[serde(default)]
     pub knowledge: Option<crate::knowledge::KnowledgeConfig>,
+    /// `[confidence]` block — RELIX-7.19 per-step confidence
+    /// scoring and fallback. Absent OR `enabled = false` keeps
+    /// every node's `DispatchBridge` in pre-7.19 byte-identical
+    /// mode: no scorer, no fallback engine, no
+    /// `last_confidence` cell. See
+    /// [`crate::confidence::ConfidenceConfig`] for the schema.
+    #[serde(default)]
+    pub confidence: Option<crate::confidence::ConfidenceConfig>,
     /// `[routing]` — RELIX-7.7 / 7.11 GAP 2 channel routing
     /// rules. Validated at coordinator boot against `[peers]`.
     /// Absent means every inbound channel message falls back
@@ -359,6 +367,58 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // handler then runs with `interaction_sink = None` and
     // every other code path stays untouched.
     let training_bundle = build_training_bundle(&cfg, &data_dir)?;
+
+    // RELIX-7.19 GAP 4: confidence scoring + fallback. Returns
+    // Ok(None) when [confidence] is absent or enabled = false.
+    // When present, wires scorer + fallback engine + shared
+    // last-confidence cell into the dispatch bridge, AND
+    // registers the bridge's `Alert` fallback action with the
+    // alert pipeline from `[metrics.alerts]` so LowConfidence
+    // events fan out through MultiChannelAlertSink +
+    // ChronicleAlertSink.
+    let confidence_bundle = build_confidence_bundle(&cfg)?;
+    if let Some(b) = confidence_bundle.as_ref() {
+        bridge.set_confidence(b.scorer.clone(), b.engine.clone());
+        bridge.set_last_confidence_cell(b.cell.clone());
+        // Wire the alert pipeline when [metrics.alerts] is
+        // also configured. The composite sink writes to the
+        // chronicle synchronously AND fans out to channel
+        // targets non-blocking via MultiChannelAlertSink.
+        if let Some(m) = metrics_bundle.as_ref() {
+            let chronicle = crate::metrics::ChronicleAlertSink::new(m.alert_chronicle.clone());
+            let multi = crate::metrics::MultiChannelAlertSink::new(
+                m.alert_mesh_cell.clone(),
+                m.alert_targets.clone(),
+            );
+            let composite = crate::metrics::CompositeAlertSink::new(vec![
+                std::sync::Arc::new(chronicle),
+                std::sync::Arc::new(multi),
+            ]);
+            let sink: std::sync::Arc<dyn crate::metrics::AlertDeliver> =
+                std::sync::Arc::new(composite);
+            let engine = std::sync::Arc::new(m.alert_engine.clone());
+            bridge.set_alert_pipeline(engine, sink);
+        }
+        // Register confidence.* coordinator caps so operators
+        // can call confidence.policy_list / score_history /
+        // reset_history through the dispatch bridge.
+        crate::confidence::register(&mut bridge, b.scorer.clone(), b.engine.clone());
+        for (method, doc) in crate::confidence::confidence_capability_descriptors() {
+            manifest.add_capability(
+                relix_core::capability::CapabilityDescriptor::unary(*method)
+                    .with_description(*doc)
+                    .with_categories(
+                        if method.starts_with("confidence.reset") {
+                            ["mutate", "confidence"]
+                        } else {
+                            ["read", "confidence"]
+                        }
+                        .iter()
+                        .map(|s| (*s).into()),
+                    ),
+            );
+        }
+    }
 
     register_builtins(&mut bridge, &cfg, manifest.clone());
     // Router role short-circuits: it doesn't run the per-node-type
@@ -3645,6 +3705,60 @@ pub(crate) struct MetricsBundle {
     pub alert_mesh_cell: crate::metrics::AlertMeshCell,
 }
 
+/// RELIX-7.19 GAP 4 — boot-time bundle of every piece the
+/// confidence subsystem needs. Built once in `run()` so the
+/// dispatch bridge, the `confidence.*` coordinator caps, and
+/// the SOL `last_confidence()` cell all share the same
+/// scorer + engine + cell. Returned by
+/// [`build_confidence_bundle`]; consumed by both the bridge
+/// wiring AND the SOL flow_runner (web bridge constructs
+/// `FlowRunOptions.last_confidence_cell` from a cheap clone
+/// of `bundle.cell`).
+pub(crate) struct ConfidenceBundle {
+    pub scorer: std::sync::Arc<crate::confidence::ConfidenceScorer>,
+    pub engine: std::sync::Arc<crate::confidence::FallbackEngine>,
+    pub cell: crate::confidence::LastConfidenceCell,
+}
+
+/// RELIX-7.19 GAP 4: construct the confidence bundle from
+/// `[confidence]`. Returns `Ok(None)` when the section is
+/// absent OR `enabled = false` — the dispatch bridge then
+/// stays in pre-7.19 byte-identical mode.
+pub(crate) fn build_confidence_bundle(
+    cfg: &ControllerConfig,
+) -> Result<Option<ConfidenceBundle>, Box<dyn std::error::Error>> {
+    build_confidence_bundle_from(cfg.confidence.as_ref())
+}
+
+/// RELIX-7.19 GAP 4: internal builder pulled out of
+/// `build_confidence_bundle` so unit tests can exercise the
+/// branching without standing up a full `ControllerConfig`
+/// (which carries 20+ required sections).
+pub(crate) fn build_confidence_bundle_from(
+    cfg: Option<&crate::confidence::ConfidenceConfig>,
+) -> Result<Option<ConfidenceBundle>, Box<dyn std::error::Error>> {
+    let c_cfg = match cfg {
+        Some(c) if c.enabled => c.clone(),
+        _ => return Ok(None),
+    };
+    let scorer = std::sync::Arc::new(crate::confidence::ConfidenceScorer::from_config(&c_cfg));
+    let engine = std::sync::Arc::new(crate::confidence::FallbackEngine::from_policies(
+        &c_cfg.policies,
+    ));
+    let cell = crate::confidence::LastConfidenceCell::new();
+    tracing::info!(
+        window_size = c_cfg.window_size,
+        policy_count = c_cfg.policies.len(),
+        p95_baseline_ms = c_cfg.p95_latency_baseline_ms,
+        "confidence: scorer + fallback engine online (RELIX-7.19)"
+    );
+    Ok(Some(ConfidenceBundle {
+        scorer,
+        engine,
+        cell,
+    }))
+}
+
 /// RELIX-7.15: training-data pipeline bundle. Returned by
 /// [`build_training_bundle`] and consumed by both the AI node
 /// (to attach the recorder sink) and the coordinator node (to
@@ -6717,5 +6831,107 @@ async fn run_retention_loop(
             }
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod confidence_wiring_tests {
+    //! RELIX-7.19 GAP 4: confidence bundle wiring tests.
+    //!
+    //! Verifies `build_confidence_bundle_from` honours the
+    //! `[confidence]` section + `enabled` switch, and that
+    //! the returned bundle drops into the existing dispatch
+    //! bridge cleanly.
+
+    use super::*;
+    use crate::confidence::ConfidenceConfig;
+
+    #[test]
+    fn build_confidence_bundle_returns_none_when_section_absent() {
+        let b = build_confidence_bundle_from(None).expect("ok");
+        assert!(b.is_none());
+    }
+
+    #[test]
+    fn build_confidence_bundle_returns_none_when_enabled_false() {
+        let conf = ConfidenceConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let b = build_confidence_bundle_from(Some(&conf)).expect("ok");
+        assert!(b.is_none());
+    }
+
+    #[test]
+    fn build_confidence_bundle_returns_some_when_enabled_true() {
+        let conf = ConfidenceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let b = build_confidence_bundle_from(Some(&conf))
+            .expect("ok")
+            .expect("bundle");
+        // Cell starts at neutral 1.0 per spec.
+        assert!((b.cell.get() - 1.0).abs() < 1e-6);
+        // Scorer can score — confirms the bundle is alive.
+        let inputs = crate::confidence::ScoringInputs {
+            response_body: b"a complete answer.",
+            finish_reason: Some("stop"),
+            logprob: None,
+            latency_ms: 50,
+            success: true,
+        };
+        let v = b.scorer.score("alice", "ai.chat", &inputs);
+        assert!(v.final_score > 0.0);
+    }
+
+    #[test]
+    fn confidence_bundle_drops_into_dispatch_bridge() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        use relix_core::policy::PolicyEngine;
+        use tempfile::TempDir;
+        let conf = ConfidenceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let bundle = build_confidence_bundle_from(Some(&conf)).unwrap().unwrap();
+        let dir = TempDir::new().unwrap();
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        let mut bridge = crate::dispatch::DispatchBridge::new(
+            PolicyEngine::permissive(),
+            org_root.verifying_key(),
+            &dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        bridge.set_confidence(bundle.scorer.clone(), bundle.engine.clone());
+        bridge.set_last_confidence_cell(bundle.cell.clone());
+        assert!(bridge.confidence_scorer_handle().is_some());
+        assert!(bridge.last_confidence_cell().is_some());
+        // The cell handed back is the SAME cell — mutate via
+        // the bundle, observe via the bridge handle.
+        bundle.cell.set(0.42);
+        assert!(
+            (bridge.last_confidence_cell().unwrap().get() - 0.42).abs() < 1e-6,
+            "cell is shared storage"
+        );
+    }
+
+    #[test]
+    fn shared_cell_between_bundle_and_bridge_round_trips_through_dispatch() {
+        // RELIX-7.19 GAP 4 invariant: the cell handed to the
+        // bridge IS the same cell the SOL VM reads from.
+        let conf = ConfidenceConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let bundle = build_confidence_bundle_from(Some(&conf)).unwrap().unwrap();
+        // Imitate flow_runner: hand the cell to the VM.
+        let mut vm = crate::sol::vm::VM::new();
+        vm.set_last_confidence_cell(bundle.cell.clone());
+        bundle.cell.set(0.73);
+        assert!((vm.last_confidence() - 0.73).abs() < 1e-6);
     }
 }

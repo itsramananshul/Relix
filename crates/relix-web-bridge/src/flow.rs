@@ -148,6 +148,7 @@ pub async fn execute_chat_flow(
         trace_id: Some(trace_id),
         chunk_observer: None,
         cancel_signal: None,
+        last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
     };
 
     finalize_flow_run(
@@ -366,6 +367,7 @@ pub async fn execute_chat_with_tool_flow(
         trace_id: Some(trace_id),
         chunk_observer: None,
         cancel_signal: None,
+        last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
     };
 
     finalize_flow_run(
@@ -545,6 +547,7 @@ pub async fn execute_chat_flow_streaming(
         trace_id: Some(trace_id),
         chunk_observer: Some(on_chunk),
         cancel_signal: Some(cancel_signal),
+        last_confidence_cell: Some(relix_runtime::confidence::LastConfidenceCell::new()),
     };
 
     finalize_flow_run(

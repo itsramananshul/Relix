@@ -144,6 +144,12 @@ struct WizardState {
     /// prior value lets operators edit `~/.relix/config.toml` by
     /// hand and have the wizard not clobber their work.
     coordinator: crate::config::CoordinatorBlock,
+    /// RELIX-7.19 GAP 4: confidence scoring + fallback block.
+    /// Carried through unchanged unless the wizard's
+    /// confidence page flips it. The wizard's UI only exposes
+    /// the `enabled` switch; the rolling-window depth +
+    /// per-cap policies stay edit-the-toml-yourself.
+    confidence: crate::config::ConfidenceBlock,
     /// True when we were initialised from an existing `config.toml`.
     /// Drives diff hints on the confirm page and the "Updated" /
     /// "Saved" verb at the end.
@@ -167,6 +173,7 @@ impl WizardState {
             channels: p.channels.clone(),
             mesh: p.mesh.clone(),
             coordinator: p.coordinator.clone(),
+            confidence: p.confidence.clone(),
             is_reconfigure: prior.is_some(),
             prior: prior.cloned(),
         }
@@ -193,6 +200,7 @@ impl WizardState {
             channels: ch,
             mesh: self.mesh.clone(),
             coordinator: self.coordinator.clone(),
+            confidence: self.confidence.clone(),
         }
     }
 }

@@ -143,6 +143,16 @@ pub struct FlowRunOptions {
     /// means no cancellation hook — `remote_call_stream` runs
     /// to natural completion.
     pub cancel_signal: Option<CancelSignal>,
+    /// RELIX-7.19 GAP 4: shared last-confidence cell. When
+    /// wired, every `remote_call` reads the responder's
+    /// stamped `ResponseEnvelope::confidence` and writes it
+    /// to the cell BEFORE returning to the SOL VM, so
+    /// `last_confidence()` sees the latest dispatch-level
+    /// score. The cell is also installed on the VM so the
+    /// `Inst::LoadLastConfidence` opcode reads from the same
+    /// storage. `None` keeps pre-7.19 behaviour (cell starts
+    /// at 1.0 and never updates).
+    pub last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 }
 
 /// RELIX-2 step 5: callback the bridge supplies via
@@ -257,6 +267,7 @@ impl FlowRunner {
             capability_cache: opts.capability_cache.clone(),
             mesh: opts.mesh_client.clone(),
             cancel_signal: opts.cancel_signal.clone(),
+            last_confidence_cell: opts.last_confidence_cell.clone(),
         });
 
         // 6. Dispatch on file extension. `.sflow` runs the AST-walking
@@ -281,6 +292,7 @@ impl FlowRunner {
                     &opts.flow_path,
                     dispatcher.clone(),
                     opts.chunk_observer.clone(),
+                    opts.last_confidence_cell.clone(),
                 )
                 .await?
             }
@@ -289,6 +301,7 @@ impl FlowRunner {
                     &opts.flow_path,
                     dispatcher.clone(),
                     opts.chunk_observer.clone(),
+                    opts.last_confidence_cell.clone(),
                 )
                 .await?
             }
@@ -331,12 +344,20 @@ async fn run_sol(
     flow_path: &Path,
     dispatcher: Arc<dyn RemoteCallDispatcher>,
     chunk_observer: Option<ChunkObserver>,
+    last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
     let bytecode = compile_sol(flow_path)?;
     let vm_result = tokio::task::spawn_blocking(move || {
         let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
         if let Some(observer) = chunk_observer {
             vm_builder = vm_builder.with_chunk_observer(observer);
+        }
+        // RELIX-7.19 GAP 4: install the shared last-confidence
+        // cell so the SOL `last_confidence()` builtin reads
+        // the same storage the dispatcher writes after every
+        // remote_call.
+        if let Some(cell) = last_confidence_cell {
+            vm_builder = vm_builder.with_last_confidence_cell(cell);
         }
         let mut vm = vm_builder;
         let exit = vm.run();
@@ -362,6 +383,7 @@ async fn run_yaml(
     flow_path: &Path,
     dispatcher: Arc<dyn RemoteCallDispatcher>,
     chunk_observer: Option<ChunkObserver>,
+    last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
     let bytecode = crate::yaml_flow::compile_path(flow_path)
         .map_err(|e| FlowRunnerError::Config(format!("yaml flow {}: {e}", flow_path.display())))?;
@@ -369,6 +391,9 @@ async fn run_yaml(
         let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
         if let Some(observer) = chunk_observer {
             vm_builder = vm_builder.with_chunk_observer(observer);
+        }
+        if let Some(cell) = last_confidence_cell {
+            vm_builder = vm_builder.with_last_confidence_cell(cell);
         }
         let mut vm = vm_builder;
         let exit = vm.run();
@@ -463,6 +488,13 @@ struct RealDispatcher {
     /// the in-flight substream read when the SSE consumer
     /// drops.
     cancel_signal: Option<CancelSignal>,
+    /// RELIX-7.19 GAP 4: shared last-confidence cell. After
+    /// every successful `remote_call` the dispatcher reads
+    /// `ResponseEnvelope::confidence` and writes it here so
+    /// the SOL `last_confidence()` builtin reflects the
+    /// responder's score. `None` keeps pre-7.19 behaviour
+    /// (cell stays at 1.0).
+    last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 }
 
 impl RealDispatcher {
@@ -611,17 +643,33 @@ impl RemoteCallDispatcher for RealDispatcher {
         // e) Surface outcomes.
         let outcome = match resp_bytes_result {
             Ok(Ok(resp_bytes)) => match decode_response(&resp_bytes) {
-                Ok(resp) => match resp.res {
-                    ResponseResult::Ok(body) => Ok(body.to_vec()),
-                    ResponseResult::Err(env) => {
-                        Err(RemoteCallError::from_envelope(peer_alias, method, &env))
+                Ok(resp) => {
+                    // RELIX-7.19 GAP 4: publish the responder's
+                    // confidence score to the shared cell so
+                    // SOL `last_confidence()` reflects it on
+                    // the very next opcode after `remote_call`.
+                    if let (Some(cell), Some(score)) =
+                        (self.last_confidence_cell.as_ref(), resp.confidence)
+                    {
+                        cell.set(score);
+                    } else if let Some(cell) = self.last_confidence_cell.as_ref() {
+                        // Responder didn't score → don't
+                        // mutate; SOL sees whatever the last
+                        // scored call left.
+                        let _ = cell;
                     }
-                    ResponseResult::StreamHandle(_) => Err(RemoteCallError::local(
-                        peer_alias,
-                        method,
-                        "stream response not supported by alpha synchronous dispatcher",
-                    )),
-                },
+                    match resp.res {
+                        ResponseResult::Ok(body) => Ok(body.to_vec()),
+                        ResponseResult::Err(env) => {
+                            Err(RemoteCallError::from_envelope(peer_alias, method, &env))
+                        }
+                        ResponseResult::StreamHandle(_) => Err(RemoteCallError::local(
+                            peer_alias,
+                            method,
+                            "stream response not supported by alpha synchronous dispatcher",
+                        )),
+                    }
+                }
                 Err(e) => Err(RemoteCallError::local(
                     peer_alias,
                     method,
