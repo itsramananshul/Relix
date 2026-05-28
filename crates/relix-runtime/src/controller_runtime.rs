@@ -5145,6 +5145,44 @@ fn register_node_type_handlers(
             desc = desc.with_categories(cats.iter().map(|s| (*s).into()));
             manifest.add_capability(desc);
         }
+        // RELIX-7.24: planning.* coordinator capabilities.
+        // The registry merges three sources (local manifest +
+        // explicit [agents.<name>] capabilities + cached
+        // peer manifests). The dispatcher_cell shared with
+        // workflow.run lets planning.create_plan execute the
+        // generated workflow when dry_run = false.
+        let planning_registry = crate::planning::AgentCapabilityRegistry::from_sources(
+            &cfg.controller.name,
+            &manifest,
+            &cfg.agents,
+            // No peer-manifest cache wired at boot — the
+            // bridge's ManifestCache populates async after
+            // node.manifest round-trips. Operators get
+            // declared-only agents until the cache warms.
+            &std::collections::BTreeMap::new(),
+        );
+        crate::planning::register(
+            bridge,
+            planning_registry.clone(),
+            workflow_dispatcher_cell.clone(),
+        );
+        for (method, doc) in crate::planning::planning_capability_descriptors() {
+            let cats: &[&str] = if *method == "planning.create_plan" {
+                &["planning", "execute"]
+            } else {
+                &["planning", "read"]
+            };
+            manifest.add_capability(
+                CapabilityDescriptor::unary(*method)
+                    .with_description(*doc)
+                    .with_categories(cats.iter().map(|s| (*s).into())),
+            );
+        }
+        tracing::info!(
+            agent_count = planning_registry.agent_count(),
+            "planning: AgentCapabilityRegistry seeded + planning.* coordinator caps registered"
+        );
+
         // Post-startup wiring: dial every peer + publish a
         // MeshWorkflowDispatcher into the cell. Done outside
         // this boot path so the rpc::Client can finish coming

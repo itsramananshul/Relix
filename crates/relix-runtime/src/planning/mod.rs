@@ -35,10 +35,12 @@
 //! - [`coordinator`] — coordinator-side `planning.*` cap
 //!   handlers wiring the three above to the dispatch bridge.
 
+pub mod coordinator;
 pub mod generator;
 pub mod parser;
 pub mod registry;
 
+pub use coordinator::{planning_capability_descriptors, register};
 pub use generator::{GenerateError, GeneratorOptions, PlanGenerator, PlanTopology};
 pub use parser::{PlanSpec, SpecParser};
 pub use registry::{AgentCapabilityRegistry, AgentInfo, AgentMatch, CapabilityInfo};
