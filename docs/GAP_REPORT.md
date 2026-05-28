@@ -80,23 +80,26 @@
 
 ---
 
-## GAP 4 — §7.21 Auto-Skill Generation: scaffold only
+## GAP 4 — §7.21 Auto-Skill Generation — **CLOSED (0bac31e + e47dab2)**
 
 **Roadmap claim (`[DONE — commit 10932cb]`):**
 > When an agent successfully completes a non-trivial task, it automatically crystallizes what it learned into a reusable skill. … skill confidence scoring … skill versioning … skill refinement over time … skill sharing across agents.
 >
 > New capabilities: `memory.skill_search`, `memory.skill_store`, `memory.skill_update`. New bridge endpoints: `GET /v1/skills`, `GET /v1/skills/{id}`, `POST /v1/skills/import`, `DELETE /v1/skills/{id}`. `/skill list / show / edit / delete / export / import / stats` from CLI and channels.
 
-**Actual code:**
-- `crates/relix-runtime/src/nodes/ai/skills.rs` has skill *loading* + Qdrant-backed library config. Auto-generation pipeline is not active.
-- `memory.skill_search` / `memory.skill_store` / `memory.skill_update` — **NOT registered** on any node.
-- `/v1/skills*` bridge endpoints — **NOT registered**.
-- CLI `crates/relix-cli/src/skills.rs` — has `skills list` and `skills run <name>` only; **no show, edit, delete, export, import, stats** subcommands.
-- No skill confidence scoring, no version increments, no refinement loop, no Qdrant skill-library write-back path.
+**Closure (commits 0bac31e + e47dab2):**
 
-**Severity:** MISLABELED [DONE]. The spec described "agents that learn from their own work"; what shipped is a static skill loader.
+`0bac31e — feat(ai): GAP 4 part 1+2 — SkillStore + auto-extraction pipeline`:
+- `nodes/ai/skill_store.rs` — SQLite-backed `SkillStore` with `skills` + `skill_versions` tables (schema matches the spec verbatim), standard relix pragmas, versioned migrations. CRUD + search + version-aware update + FIFO example cap + stats + refinement-candidate query. 21 unit tests.
+- `nodes/ai/skill_extractor.rs` — 5-stage pipeline: complexity scoring (response > 200 words +0.3, tool calls +0.2, structured output +0.2, duration > 3s +0.1, session > 3 turns +0.2; floor 0.6) → duplicate check (cosine >= 0.85 bumps usage, no new skill) → LLM synthesis (strict JSON, name <= 40 chars snake_case, description <= 120 chars, 2-6 steps, 2-5 tags) → validation → insert. Non-blocking spawn from the AI handler; failures never panic. 17 unit tests.
+- `LocalProviderAiDispatcher` / `LocalProviderEmbedDispatcher` adapters route the synthesis + dedup calls through the local `ChatProvider` — no libp2p hop, no recursion through `ai.chat`.
 
-**Gap size:** Large — this is most of the feature. Auto-generation pipeline (complexity scoring, synthesis prompt, Qdrant write), confidence scoring formula, refinement-over-time loop, six missing CLI subcommands, four missing bridge endpoints, three missing capabilities.
+`e47dab2 — feat(ai, bridge, cli): GAP 4 part 3+4+5+6 — refinement, caps, bridge, CLI`:
+- `nodes/ai/skill_refinement.rs` — `record_usage(skill_id, UsageOutcome)` confidence updates (liked +0.05, success +0.01, failed -0.10; clamped to [0.05, 0.95]). Background refinement task (default 24h tick) pulls eligible candidates and asks the LLM to suggest improvements; only writes a new version row when the steps actually differ. 13 unit tests.
+- `nodes/ai/skill_caps.rs` — six caps `memory.skill_search / get / store / update / deprecate / stats` registered on the AI controller's DispatchBridge. 12 unit tests.
+- Bridge — `GET /v1/skills`, `GET /v1/skills/stats`, `GET /v1/skills/:id`, `POST /v1/skills`, `PATCH /v1/skills/:id`, `POST /v1/skills/:id/deprecate`. INVALID_ARGS → 400, SECURITY_DENIED → 403.
+- CLI — `relix skills list` extended with `--query / --agent / --min-confidence / --limit` (switches to bridge mode). New subcommands `show`, `edit`, `delete`, `export`, `import`, `stats`.
+- Controller wiring — `SkillsRuntime` bundle constructed via `build_skills_runtime`. `[skills] enabled + db_path` is the trigger; `auto_extract` and `refinement_enabled` are independent flags.
 
 ---
 
@@ -518,7 +521,7 @@ The following entries were verified PRESENT with no material gap beyond what the
 If a future session has limited budget, these are the highest-impact items where the roadmap currently overstates what's built:
 
 1. **GAP 1 — Python + TypeScript SDKs missing.** Blocks the §7.17 "Relix as a backend for AI-native apps" pitch for non-Rust frontends.
-2. **GAP 4 — Auto-skill generation is a static loader, not the learn-from-work pipeline.** This is the §7.21 differentiator and ships as scaffolding only.
+2. ~~**GAP 4** — closed by commits 0bac31e + e47dab2~~
 3. ~~**GAP 5** — closed by commit 3c9f3ec~~
 4. ~~**GAP 6** — closed by commit 80980e1~~
 5. **GAP 11 — Transactional Action Gateway is reversible-flag-only.** Three-tier model, idempotency, dry-run preview, compensating actions — all absent.

@@ -2204,7 +2204,13 @@ A SaaS developer building on Relix can publish a SKILL.md for their domain-speci
 
 ---
 
-### 7.21 Auto-Skill Generation — Agents That Learn From Their Own Work `[DONE — commit 10932cb]`
+### 7.21 Auto-Skill Generation — Agents That Learn From Their Own Work `[DONE — commit 10932cb, GAP-4 closure 0bac31e + e47dab2]`
+
+> **GAP-FOLLOWUP (2026-05-28):** `docs/GAP_REPORT.md` flagged this section as "MISLABELED [DONE]" — the original 10932cb commit shipped only the static SKILL.md loader. The full GAP-4 closure landed in two commits:
+> - **0bac31e** — SQLite-backed `SkillStore` (skills + skill_versions tables) and the 5-stage `SkillExtractor` (complexity scoring → duplicate check → LLM synthesis → validation → store). Wired into `ai.chat` as a non-blocking post-task hook.
+> - **e47dab2** — `SkillRefinementEngine` (confidence scoring + 24h background refinement pass), six coordinator caps `memory.skill_search/get/store/update/deprecate/stats`, bridge endpoints `GET /v1/skills`, `GET /v1/skills/:id`, `POST /v1/skills`, `PATCH /v1/skills/:id`, `POST /v1/skills/:id/deprecate`, `GET /v1/skills/stats`, and CLI subcommands `relix skills show / edit / delete / export / import / stats` (plus `list` filters).
+>
+> Enabled via `[skills]` config with `enabled = true` + `db_path`. Auto-extraction and refinement are independent flags so operators can wire either or both.
 
 This is one of the most powerful features Relix can have. When an agent successfully completes a non-trivial task, it automatically crystallizes what it learned into a reusable skill. The next time a similar task comes up — by any agent in the same tenant — it searches the skill library, finds the relevant skill, and starts from a position of accumulated knowledge instead of zero.
 
