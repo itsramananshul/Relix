@@ -101,6 +101,49 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// RELIX-7.24 Stage-4: approve a pending plan and trigger
+    /// execution.
+    Approve {
+        /// `plan_id` (uuid) of the pending plan.
+        plan_id: String,
+        /// Operator-facing decision note recorded alongside
+        /// the approval.
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// RELIX-7.24 Stage-4: reject a pending plan. No
+    /// execution happens.
+    Reject {
+        plan_id: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// RELIX-7.24 Stage-4: list approval records. Filter via
+    /// `--status pending|approved|rejected|expired`.
+    Approvals {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// RELIX-7.24 Stage-4: fetch one approval record by id.
+    Approval {
+        plan_id: String,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -130,7 +173,226 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             plan(&bridge, &spec, max_agents, effective_dry_run, raw).await
         }
         Cmd::Status { bridge, raw } => status(&bridge, raw).await,
+        Cmd::Approve {
+            plan_id,
+            note,
+            bridge,
+            raw,
+        } => approve(&bridge, &plan_id, note.as_deref(), raw).await,
+        Cmd::Reject {
+            plan_id,
+            note,
+            bridge,
+            raw,
+        } => reject(&bridge, &plan_id, note.as_deref(), raw).await,
+        Cmd::Approvals {
+            status,
+            bridge,
+            raw,
+        } => list_approvals(&bridge, status.as_deref(), raw).await,
+        Cmd::Approval {
+            plan_id,
+            bridge,
+            raw,
+        } => get_approval(&bridge, &plan_id, raw).await,
     }
+}
+
+async fn approve(
+    bridge: &str,
+    plan_id: &str,
+    note: Option<&str>,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/planning/approve", bridge.trim_end_matches('/'));
+    let mut body = serde_json::Map::new();
+    body.insert("plan_id".into(), Value::from(plan_id.to_string()));
+    if let Some(n) = note {
+        body.insert("note".into(), Value::from(n.to_string()));
+    }
+    let resp = http_post_json(&url, &Value::Object(body)).await?;
+    if raw {
+        println!("{resp}");
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("decode approve response: {e} (body={resp})"))?;
+    let record = v.get("record").cloned().unwrap_or(v.clone());
+    println!(
+        "plan_id:       {}",
+        record.get("plan_id").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "status:        {}",
+        record.get("status").and_then(Value::as_str).unwrap_or("?")
+    );
+    if let Some(note) = record.get("decision_note").and_then(Value::as_str) {
+        println!("decision_note: {note}");
+    }
+    if let Some(exec) = v.get("execution")
+        && !exec.is_null()
+    {
+        println!("\n--- execution ---");
+        let exec_id = exec
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let status = exec.get("status").and_then(Value::as_str).unwrap_or("");
+        let latency = exec
+            .get("total_latency_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        println!("execution_id:  {exec_id}");
+        println!("status:        {status}");
+        println!("total_latency: {latency}ms");
+        if let Some(result) = exec.get("result")
+            && !result.is_null()
+        {
+            println!("result:        {result}");
+        }
+    } else {
+        println!("(execution deferred — coordinator mesh dispatcher not yet wired)");
+    }
+    Ok(())
+}
+
+async fn reject(
+    bridge: &str,
+    plan_id: &str,
+    note: Option<&str>,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/planning/reject", bridge.trim_end_matches('/'));
+    let mut body = serde_json::Map::new();
+    body.insert("plan_id".into(), Value::from(plan_id.to_string()));
+    if let Some(n) = note {
+        body.insert("note".into(), Value::from(n.to_string()));
+    }
+    let resp = http_post_json(&url, &Value::Object(body)).await?;
+    if raw {
+        println!("{resp}");
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("decode reject response: {e} (body={resp})"))?;
+    println!(
+        "plan_id:       {}",
+        v.get("plan_id").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "status:        {}",
+        v.get("status").and_then(Value::as_str).unwrap_or("?")
+    );
+    if let Some(note) = v.get("decision_note").and_then(Value::as_str) {
+        println!("decision_note: {note}");
+    }
+    Ok(())
+}
+
+async fn list_approvals(
+    bridge: &str,
+    status: Option<&str>,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut url = format!("{}/v1/planning/approvals", bridge.trim_end_matches('/'));
+    if let Some(s) = status
+        && !s.is_empty()
+    {
+        url.push_str(&format!("?status={}", urlencode(s)));
+    }
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("decode approvals response: {e} (body={body})"))?;
+    let list = v
+        .get("approvals")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if list.is_empty() {
+        println!("(no approval records)");
+        return Ok(());
+    }
+    for r in list {
+        let plan_id = r.get("plan_id").and_then(Value::as_str).unwrap_or("?");
+        let status = r.get("status").and_then(Value::as_str).unwrap_or("?");
+        let created = r.get("created_at_ms").and_then(Value::as_i64).unwrap_or(0);
+        let goal = r
+            .get("spec")
+            .and_then(|s| s.get("goal"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let goal_preview: String = goal.chars().take(72).collect();
+        println!("{plan_id:<36}  {status:<10} created={created}  goal=\"{goal_preview}\"");
+    }
+    Ok(())
+}
+
+async fn get_approval(
+    bridge: &str,
+    plan_id: &str,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/v1/planning/approvals/{}",
+        bridge.trim_end_matches('/'),
+        urlencode(plan_id)
+    );
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("decode approval response: {e} (body={body})"))?;
+    println!(
+        "plan_id:       {}",
+        v.get("plan_id").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "status:        {}",
+        v.get("status").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "created_at_ms: {}",
+        v.get("created_at_ms").and_then(Value::as_i64).unwrap_or(0)
+    );
+    if let Some(d) = v.get("decided_at_ms").and_then(Value::as_i64) {
+        println!("decided_at_ms: {d}");
+    }
+    if let Some(note) = v.get("decision_note").and_then(Value::as_str) {
+        println!("decision_note: {note}");
+    }
+    if let Some(spec) = v.get("spec") {
+        let goal = spec.get("goal").and_then(Value::as_str).unwrap_or("");
+        println!("goal:          {goal}");
+        if let Some(sid) = spec.get("spec_id").and_then(Value::as_str) {
+            println!("spec_id:       {sid}");
+        }
+        if let Some(score) = spec.get("complexity_score").and_then(Value::as_f64) {
+            println!("complexity:    {score:.2}");
+        }
+    }
+    if let Some(yaml) = v.get("workflow_yaml").and_then(Value::as_str) {
+        println!("\n--- workflow_yaml ---\n{yaml}");
+    }
+    Ok(())
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 async fn agents(bridge: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {

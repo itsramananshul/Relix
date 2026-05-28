@@ -5170,11 +5170,54 @@ fn register_node_type_handlers(
         );
         let planning_cfg: crate::planning::PlanningConfig =
             cfg.planning.clone().unwrap_or_default();
+        // RELIX-7.24 Stage-4: open the approval store when
+        // require_approval is configured (or when the
+        // operator supplied an explicit approval_db_path,
+        // which signals intent to use the gate). When the
+        // store opens, we also spawn the background expiry
+        // sweep so pending plans don't pile up forever.
+        let approval_store: Option<crate::planning::ApprovalStore> =
+            if planning_cfg.require_approval || planning_cfg.approval_db_path.is_some() {
+                let approval_path = planning_cfg.approval_db_path.clone().unwrap_or_else(|| {
+                    coord_cfg
+                        .db_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join("plan_approvals.sqlite")
+                });
+                match crate::planning::ApprovalStore::open(&approval_path) {
+                    Ok(store) => {
+                        tracing::info!(
+                            path = %approval_path.display(),
+                            timeout_secs = planning_cfg.approval_timeout_secs,
+                            "planning: approval store opened — Stage-4 gate ENABLED"
+                        );
+                        let _sweep = crate::planning::spawn_approval_expiry_sweep(
+                            store.clone(),
+                            planning_cfg.approval_timeout_secs,
+                        );
+                        Some(store)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            path = %approval_path.display(),
+                            error = %e,
+                            "planning: failed to open approval store — Stage-4 gate DISABLED for \
+                             this boot; planning.create_plan with require_approval=true will \
+                             return RESPONDER_INTERNAL"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         crate::planning::register(
             bridge,
             planning_registry.clone(),
             workflow_dispatcher_cell.clone(),
             planning_cfg,
+            approval_store,
         );
         for (method, doc) in crate::planning::planning_capability_descriptors() {
             let cats: &[&str] = if *method == "planning.create_plan" {

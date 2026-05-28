@@ -71,6 +71,24 @@ pub struct ValidateSpecRequest {
     pub peer: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DecidePlanRequest {
+    pub plan_id: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListApprovalsQuery {
+    /// Optional `pending|approved|rejected|expired` filter.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
 /// `POST /v1/planning/plan`
 pub async fn create_plan(
     State(state): State<AppState>,
@@ -154,6 +172,88 @@ pub async fn orchestrator_status(
     use axum::response::IntoResponse;
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     match call_peer_json(&state, &peer, "planning.orchestrator_status", &Value::Null).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `POST /v1/planning/approve` — RELIX-7.24 Stage-4.
+pub async fn approve_plan(
+    State(state): State<AppState>,
+    Json(req): Json<DecidePlanRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.plan_id.trim().is_empty() {
+        return bad_request("plan_id is required");
+    }
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = serde_json::json!({
+        "plan_id": req.plan_id,
+        "note": req.note,
+    });
+    match call_peer_json(&state, &peer, "planning.approve_plan", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `POST /v1/planning/reject` — RELIX-7.24 Stage-4.
+pub async fn reject_plan(
+    State(state): State<AppState>,
+    Json(req): Json<DecidePlanRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.plan_id.trim().is_empty() {
+        return bad_request("plan_id is required");
+    }
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = serde_json::json!({
+        "plan_id": req.plan_id,
+        "note": req.note,
+    });
+    match call_peer_json(&state, &peer, "planning.reject_plan", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/planning/approvals` — RELIX-7.24 Stage-4.
+pub async fn list_approvals(
+    State(state): State<AppState>,
+    Query(q): Query<ListApprovalsQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let mut body = serde_json::Map::new();
+    if let Some(s) = q.status.as_ref() {
+        body.insert("status".into(), Value::from(s.clone()));
+    }
+    match call_peer_json(
+        &state,
+        &peer,
+        "planning.list_approvals",
+        &Value::Object(body),
+    )
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/planning/approvals/:id` — RELIX-7.24 Stage-4.
+pub async fn get_approval(
+    State(state): State<AppState>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+    Query(q): Query<PeerQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if plan_id.trim().is_empty() {
+        return bad_request("plan_id is required");
+    }
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = serde_json::json!({ "plan_id": plan_id });
+    match call_peer_json(&state, &peer, "planning.get_approval", &body).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }

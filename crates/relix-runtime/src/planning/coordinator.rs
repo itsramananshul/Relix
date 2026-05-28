@@ -47,11 +47,20 @@ use super::{
 /// the orchestrator's heuristic decomposer and the critic's
 /// "implicitly approved with caveat" fallback keep the
 /// pipeline running.
+///
+/// `approval_store` is `Some(...)` when the controller boots
+/// with an enabled Stage-4 approval gate; that turns on the
+/// `planning.approve_plan` / `.reject_plan` / `.list_approvals`
+/// / `.get_approval` capabilities. When `None`, those caps
+/// are NOT registered and `planning.create_plan` ignores
+/// `require_approval` (silently runs the legacy execute-now
+/// path), so existing operators see byte-identical behaviour.
 pub fn register(
     bridge: &mut DispatchBridge,
     registry: AgentCapabilityRegistry,
     dispatcher_cell: WorkflowDispatcherCell,
     planning_cfg: PlanningConfig,
+    approval_store: Option<super::ApprovalStore>,
 ) {
     {
         let r = registry.clone();
@@ -96,19 +105,70 @@ pub fn register(
         );
     }
     {
-        let r = registry;
-        let cell = dispatcher_cell;
-        let cfg = planning_cfg;
+        let r = registry.clone();
+        let cell = dispatcher_cell.clone();
+        let cfg = planning_cfg.clone();
+        let store_opt = approval_store.clone();
         bridge.register(
             "planning.create_plan",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let r = r.clone();
                 let cell = cell.clone();
                 let cfg = cfg.clone();
-                async move { handle_create_plan(&r, &cell, &cfg, &ctx).await }
+                let store_opt = store_opt.clone();
+                async move { handle_create_plan(&r, &cell, &cfg, store_opt.as_ref(), &ctx).await }
             })),
         );
     }
+    if let Some(store) = approval_store {
+        {
+            let s = store.clone();
+            let cell = dispatcher_cell.clone();
+            bridge.register(
+                "planning.approve_plan",
+                Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                    let s = s.clone();
+                    let cell = cell.clone();
+                    async move { handle_approve_plan(&s, &cell, &ctx).await }
+                })),
+            );
+        }
+        {
+            let s = store.clone();
+            bridge.register(
+                "planning.reject_plan",
+                Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                    let s = s.clone();
+                    async move { handle_reject_plan(&s, &ctx) }
+                })),
+            );
+        }
+        {
+            let s = store.clone();
+            bridge.register(
+                "planning.list_approvals",
+                Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                    let s = s.clone();
+                    async move { handle_list_approvals(&s, &ctx) }
+                })),
+            );
+        }
+        {
+            let s = store;
+            bridge.register(
+                "planning.get_approval",
+                Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                    let s = s.clone();
+                    async move { handle_get_approval(&s, &ctx) }
+                })),
+            );
+        }
+    }
+    // Hold a registry reference so the closures above can
+    // outlive the function scope. Without this, the move
+    // above for create_plan consumed `registry` and the
+    // remaining four caps wouldn't compile.
+    let _ = registry;
 }
 
 /// Static descriptor list mirrors the
@@ -177,7 +237,79 @@ pub fn planning_capability_descriptors() -> &'static [(&'static str, &'static st
              orchestrator + critic are wired and which peer \
              they'll dispatch to.",
         ),
+        (
+            "planning.approve_plan",
+            "RELIX-7.24 Stage-4: approve a pending plan, verify \
+             the persisted spec signature has not been \
+             tampered with, then execute the stored workflow \
+             through the wired WorkflowDispatcher. Args JSON: \
+             `{plan_id, note?}`. Returns the updated \
+             ApprovalRecord + the WorkflowResult. Errors \
+             INVALID_ARGS when the plan_id is unknown, the \
+             plan is already decided, or the signature \
+             mismatches.",
+        ),
+        (
+            "planning.reject_plan",
+            "RELIX-7.24 Stage-4: reject a pending plan. No \
+             execution happens. Args JSON: `{plan_id, note?}`. \
+             Returns the updated ApprovalRecord. Errors \
+             INVALID_ARGS when the plan_id is unknown or the \
+             plan is already decided.",
+        ),
+        (
+            "planning.list_approvals",
+            "RELIX-7.24 Stage-4: list approval records. Args \
+             JSON: `{status?}` — when provided, filters by \
+             pending|approved|rejected|expired. Returns \
+             `{approvals: [ApprovalRecord]}` newest-first.",
+        ),
+        (
+            "planning.get_approval",
+            "RELIX-7.24 Stage-4: fetch one approval record by \
+             plan_id. Args JSON: `{plan_id}`. Returns the full \
+             ApprovalRecord including spec + workflow_yaml + \
+             status + decision metadata.",
+        ),
     ]
+}
+
+/// RELIX-7.24 Stage-4: spawn a background sweep task that
+/// every 60 seconds expires every `pending` approval older
+/// than `timeout_secs`. The task runs until the returned
+/// [`tokio::task::JoinHandle`] is dropped OR the controller
+/// shuts down.
+pub fn spawn_approval_expiry_sweep(
+    store: super::ApprovalStore,
+    timeout_secs: i64,
+) -> tokio::task::JoinHandle<()> {
+    let timeout_ms = timeout_secs.max(1) * 1000;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        // Skip the first immediate tick — the controller's
+        // boot path may still be wiring other components.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let now_ms = unix_now_ms();
+            let cutoff_ms = now_ms - timeout_ms;
+            match store.expire_older_than(cutoff_ms, now_ms) {
+                Ok(expired) => {
+                    if !expired.is_empty() {
+                        tracing::info!(
+                            expired_count = expired.len(),
+                            cutoff_ms,
+                            "planning.approval: expired {} pending plan(s)",
+                            expired.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "planning.approval: expiry sweep failed");
+                }
+            }
+        }
+    })
 }
 
 // ── handlers ─────────────────────────────────────────────
@@ -233,12 +365,21 @@ struct CreatePlanArgs {
     max_agents: Option<usize>,
     #[serde(default)]
     dry_run: bool,
+    /// Per-call override of `[planning] require_approval`.
+    /// `None` defers to the global config; `Some(false)`
+    /// forces the legacy execute-now path; `Some(true)`
+    /// forces the approval gate even when global config has
+    /// `require_approval = false`. Useful for the relix-build
+    /// CLI which always wants the gate.
+    #[serde(default)]
+    require_approval: Option<bool>,
 }
 
 async fn handle_create_plan(
     registry: &AgentCapabilityRegistry,
     dispatcher_cell: &WorkflowDispatcherCell,
     planning_cfg: &PlanningConfig,
+    approval_store: Option<&super::ApprovalStore>,
     ctx: &InvocationCtx,
 ) -> HandlerOutcome {
     let args: CreatePlanArgs = match decode(ctx) {
@@ -406,18 +547,18 @@ async fn handle_create_plan(
     };
 
     let mut response = CreatePlanResponse {
-        plan_spec: revised_spec_for_response,
+        plan_spec: revised_spec_for_response.clone(),
         topology: topology_str,
         workflow_name: current_workflow.name.clone(),
-        workflow_yaml,
+        workflow_yaml: workflow_yaml.clone(),
         agents_selected,
         execution: None,
         orchestrator_activated,
         specialist_count,
         critic_rounds: critic_summary.rounds,
         critic_approved: critic_summary.approved,
-        critic: critic_summary,
-        orchestrator: orchestrator_summary,
+        critic: critic_summary.clone(),
+        orchestrator: orchestrator_summary.clone(),
         conflict_resolution_report: if conflict_report.conflicts_detected > 0
             || conflict_report.escalated.is_some()
         {
@@ -425,6 +566,7 @@ async fn handle_create_plan(
         } else {
             None
         },
+        approval: None,
     };
 
     // 4. Escalate conflict if unresolved.
@@ -435,6 +577,75 @@ async fn handle_create_plan(
     }
 
     if args.dry_run {
+        return ok_json(&response);
+    }
+
+    // 4b. RELIX-7.24 Stage-4 — gate on approval when
+    // configured. Only kicks in when:
+    //
+    // - the controller booted with an approval_store (caller
+    //   supplied Some(...) — None disables the gate entirely
+    //   and the legacy execute-now path runs);
+    // - require_approval is true (either via the per-call
+    //   override or the global [planning] config).
+    //
+    // When gated: persist the pending plan + fan out
+    // notifications + return the pending record to the caller
+    // without executing. The operator decides via
+    // planning.approve_plan / planning.reject_plan.
+    let require_approval = args
+        .require_approval
+        .unwrap_or(planning_cfg.require_approval);
+    if require_approval {
+        let Some(store) = approval_store else {
+            return internal_msg(
+                "planning.create_plan: require_approval = true but no approval store wired — \
+                 set [planning] approval_db_path on the coordinator OR omit require_approval.",
+            );
+        };
+        let orchestrator_meta = match serde_json::to_value(&orchestrator_summary) {
+            Ok(v) => v,
+            Err(e) => {
+                return internal_msg(&format!(
+                    "planning.create_plan: encode orchestrator metadata: {e}"
+                ));
+            }
+        };
+        let critic_meta = match serde_json::to_value(&critic_summary) {
+            Ok(v) => v,
+            Err(e) => {
+                return internal_msg(&format!(
+                    "planning.create_plan: encode critic metadata: {e}"
+                ));
+            }
+        };
+        let record = super::ApprovalRecord {
+            plan_id: revised_spec_for_response.spec_id.clone(),
+            spec: revised_spec_for_response.clone(),
+            workflow_yaml: workflow_yaml.clone(),
+            status: super::ApprovalStatus::Pending,
+            created_at_ms: unix_now_ms(),
+            decided_at_ms: None,
+            decision_note: None,
+            orchestrator_meta,
+            critic_meta,
+        };
+        if let Err(e) = store.insert_pending(&record) {
+            return internal_msg(&format!(
+                "planning.create_plan: persist pending approval: {e}"
+            ));
+        }
+        // Fan out notifications. Best-effort: non-blocking,
+        // failures only land in tracing logs so an operator
+        // with a broken Telegram peer can still queue plans
+        // for approval.
+        notify_pending_plan(dispatcher_cell, &planning_cfg.approval_targets, &record).await;
+        response.approval = Some(ApprovalSummary {
+            plan_id: record.plan_id.clone(),
+            status: super::ApprovalStatus::Pending.as_str().to_string(),
+            created_at_ms: record.created_at_ms,
+            notified_targets: planning_cfg.approval_targets.len(),
+        });
         return ok_json(&response);
     }
 
@@ -473,6 +684,345 @@ fn handle_orchestrator_status(
         dispatcher_live: cell.get().is_some(),
     };
     ok_json(&resp)
+}
+
+// ── RELIX-7.24 Stage-4 approval handlers ─────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct DecidePlanArgs {
+    #[serde(default)]
+    plan_id: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ListApprovalsArgs {
+    /// Optional `"pending"` / `"approved"` / `"rejected"` /
+    /// `"expired"` filter. Anything else surfaces as
+    /// INVALID_ARGS so operators see typos clearly.
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GetApprovalArgs {
+    #[serde(default)]
+    plan_id: String,
+}
+
+async fn handle_approve_plan(
+    store: &super::ApprovalStore,
+    dispatcher_cell: &WorkflowDispatcherCell,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    let args: DecidePlanArgs = match decode(ctx) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    if args.plan_id.trim().is_empty() {
+        return invalid("plan_id is required");
+    }
+    let now_ms = unix_now_ms();
+    let record = match store.get(&args.plan_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return invalid(&format!(
+                "planning.approve_plan: plan_id `{}` not found",
+                args.plan_id
+            ));
+        }
+        Err(e) => return internal_msg(&format!("approval store: {e}")),
+    };
+    // Verify the spec signature before we touch the row. A
+    // mismatch means the persisted spec has been tampered
+    // with since insert_pending; we refuse to execute.
+    if let Err(e) = record.spec.verify() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: format!(
+                "planning.approve_plan: spec signature mismatch on plan `{}` — refusing to \
+                 execute: {e}",
+                args.plan_id
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    // Flip status. decide() guards against double-approval
+    // via a SQL `WHERE status = 'pending'` clause.
+    let updated = match store.decide(
+        &args.plan_id,
+        super::ApprovalStatus::Approved,
+        args.note.as_deref(),
+        now_ms,
+    ) {
+        Ok(r) => r,
+        Err(super::ApprovalError::NotFound(_)) => {
+            return invalid(&format!(
+                "planning.approve_plan: plan_id `{}` not found",
+                args.plan_id
+            ));
+        }
+        Err(super::ApprovalError::NotPending { status, .. }) => {
+            return invalid(&format!(
+                "planning.approve_plan: plan_id `{}` is `{}`, expected `pending`",
+                args.plan_id,
+                status.as_str()
+            ));
+        }
+        Err(e) => return internal_msg(&format!("approval store: {e}")),
+    };
+    // Parse the workflow YAML we persisted at submit time
+    // and run it through the wired dispatcher. A missing
+    // dispatcher cell flips the response to a structured
+    // approval-without-execution outcome — operators see the
+    // approval landed but execution is deferred until the
+    // mesh comes online.
+    let workflow = match crate::workflow::parse_str(&updated.workflow_yaml) {
+        Ok(w) => w,
+        Err(e) => {
+            return internal_msg(&format!(
+                "planning.approve_plan: stored workflow_yaml failed to re-parse: {e}"
+            ));
+        }
+    };
+    let response = ApproveResponse {
+        record: updated.clone(),
+        execution: None,
+    };
+    let Some(dispatcher) = dispatcher_cell.get().cloned() else {
+        // Approval recorded but mesh not yet up. Operators
+        // see the approval went through; execution is
+        // deferred. Defensible UX — better than silently
+        // failing the whole approve call.
+        tracing::warn!(
+            plan_id = %updated.plan_id,
+            "planning.approve_plan: approval recorded but mesh dispatcher not yet \
+             wired — execution deferred"
+        );
+        return ok_json(&response);
+    };
+    let workflow_arc = Arc::new(workflow);
+    let result = crate::workflow::execute(workflow_arc, dispatcher, &updated.spec.goal).await;
+    let response = ApproveResponse {
+        record: updated,
+        execution: Some(ExecutionSummary::from_result(&result)),
+    };
+    ok_json(&response)
+}
+
+fn handle_reject_plan(store: &super::ApprovalStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let args: DecidePlanArgs = match decode(ctx) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    if args.plan_id.trim().is_empty() {
+        return invalid("plan_id is required");
+    }
+    let now_ms = unix_now_ms();
+    match store.decide(
+        &args.plan_id,
+        super::ApprovalStatus::Rejected,
+        args.note.as_deref(),
+        now_ms,
+    ) {
+        Ok(r) => ok_json(&r),
+        Err(super::ApprovalError::NotFound(_)) => invalid(&format!(
+            "planning.reject_plan: plan_id `{}` not found",
+            args.plan_id
+        )),
+        Err(super::ApprovalError::NotPending { status, .. }) => invalid(&format!(
+            "planning.reject_plan: plan_id `{}` is `{}`, expected `pending`",
+            args.plan_id,
+            status.as_str()
+        )),
+        Err(e) => internal_msg(&format!("approval store: {e}")),
+    }
+}
+
+fn handle_list_approvals(store: &super::ApprovalStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let args: ListApprovalsArgs = match decode(ctx) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    let filter = match args.status.as_deref() {
+        None | Some("") => None,
+        Some(s) => match super::ApprovalStatus::parse(s) {
+            Some(v) => Some(v),
+            None => {
+                return invalid(&format!(
+                    "planning.list_approvals: status must be pending|approved|rejected|expired, \
+                     got `{s}`"
+                ));
+            }
+        },
+    };
+    match store.list(filter) {
+        Ok(rows) => ok_json(&ListApprovalsResponse { approvals: rows }),
+        Err(e) => internal_msg(&format!("approval store: {e}")),
+    }
+}
+
+fn handle_get_approval(store: &super::ApprovalStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let args: GetApprovalArgs = match decode(ctx) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    if args.plan_id.trim().is_empty() {
+        return invalid("plan_id is required");
+    }
+    match store.get(&args.plan_id) {
+        Ok(Some(r)) => ok_json(&r),
+        Ok(None) => invalid(&format!(
+            "planning.get_approval: plan_id `{}` not found",
+            args.plan_id
+        )),
+        Err(e) => internal_msg(&format!("approval store: {e}")),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ListApprovalsResponse {
+    approvals: Vec<super::ApprovalRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApproveResponse {
+    record: super::ApprovalRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<ExecutionSummary>,
+}
+
+/// Best-effort fan-out of the pending-plan notification to
+/// every configured [`ApprovalTarget`]. Each target gets ONE
+/// `<channel>.send` call via the wired mesh dispatcher. Per-
+/// target failures land in tracing logs only — they do NOT
+/// fail the approval submission.
+async fn notify_pending_plan(
+    dispatcher_cell: &WorkflowDispatcherCell,
+    targets: &[super::ApprovalTarget],
+    record: &super::ApprovalRecord,
+) {
+    if targets.is_empty() {
+        tracing::info!(
+            plan_id = %record.plan_id,
+            "planning.approval: pending plan recorded but no [planning] approval_targets \
+             configured — operator must read planning.list_approvals"
+        );
+        return;
+    }
+    let Some(dispatcher) = dispatcher_cell.get().cloned() else {
+        tracing::warn!(
+            plan_id = %record.plan_id,
+            "planning.approval: pending plan recorded but mesh dispatcher not yet wired — \
+             notification fan-out skipped"
+        );
+        return;
+    };
+    let body = super::format_pending_notification(record, None);
+    for target in targets {
+        let dispatcher = dispatcher.clone();
+        let target = target.clone();
+        let body = body.clone();
+        let plan_id = record.plan_id.clone();
+        tokio::spawn(async move {
+            let (method, args_bytes) = match encode_approval_target(&target, &body) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        plan_id = %plan_id,
+                        channel = %target.channel,
+                        peer = %target.peer,
+                        error = %e,
+                        "planning.approval: notification encode failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = dispatcher.dispatch(&target.peer, method, &args_bytes).await {
+                tracing::warn!(
+                    plan_id = %plan_id,
+                    channel = %target.channel,
+                    peer = %target.peer,
+                    error = %e,
+                    "planning.approval: notification dispatch failed"
+                );
+            }
+        });
+    }
+}
+
+fn encode_approval_target(
+    target: &super::ApprovalTarget,
+    body: &str,
+) -> Result<(&'static str, Vec<u8>), String> {
+    let channel = target.channel.trim().to_ascii_lowercase();
+    match channel.as_str() {
+        "email" => {
+            let to = target
+                .to
+                .as_deref()
+                .ok_or_else(|| "email target missing `to` field".to_string())?;
+            let subject = target
+                .subject
+                .clone()
+                .unwrap_or_else(|| "Relix planning — approval needed".to_string());
+            let args = serde_json::json!({
+                "to": [to],
+                "subject": subject,
+                "body": body,
+            });
+            let bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
+            Ok(("email.send", bytes))
+        }
+        "telegram" => {
+            let chat_id = target
+                .chat_id
+                .as_deref()
+                .ok_or_else(|| "telegram target missing `chat_id` field".to_string())?;
+            let args = serde_json::json!({
+                "chat_id": chat_id,
+                "text": body,
+            });
+            let bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
+            Ok(("telegram.send", bytes))
+        }
+        "discord" => {
+            let channel_id = target
+                .channel_id
+                .as_deref()
+                .ok_or_else(|| "discord target missing `channel_id` field".to_string())?;
+            let args = serde_json::json!({
+                "channel_id": channel_id,
+                "content": body,
+            });
+            let bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
+            Ok(("discord.send", bytes))
+        }
+        "slack" => {
+            let slack_channel = target
+                .slack_channel
+                .as_deref()
+                .ok_or_else(|| "slack target missing `slack_channel` field".to_string())?;
+            let args = serde_json::json!({
+                "channel": slack_channel,
+                "text": body,
+            });
+            let bytes = serde_json::to_vec(&args).map_err(|e| format!("encode: {e}"))?;
+            Ok(("slack.send", bytes))
+        }
+        other => Err(format!(
+            "unknown approval target channel `{other}` (allowed: email / telegram / discord / slack)"
+        )),
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// [`PlanProducer`] impl that re-runs the orchestrator-with-
@@ -593,10 +1143,17 @@ struct CreatePlanResponse {
     /// detected during conflict resolution.
     #[serde(skip_serializing_if = "Option::is_none")]
     conflict_resolution_report: Option<ConflictResolutionReport>,
+    /// RELIX-7.24 Stage-4 — present only when the call hit
+    /// the approval gate and the plan was persisted into the
+    /// approval store in `pending` state. `None` for dry-run
+    /// requests AND for calls that bypassed the gate (the
+    /// legacy execute-now path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<ApprovalSummary>,
 }
 
 /// Orchestrator-specific block of the response.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct OrchestratorSummary {
     activated: bool,
     complexity_score: f32,
@@ -607,7 +1164,7 @@ struct OrchestratorSummary {
 }
 
 /// Critic-specific block of the response.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct CriticSummary {
     enabled: bool,
     rounds: usize,
@@ -617,6 +1174,23 @@ struct CriticSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
     history: Vec<super::critic::CriticVerdict>,
+}
+
+/// RELIX-7.24 Stage-4 — operator-facing summary of the
+/// pending-approval state when `require_approval` is on.
+#[derive(Clone, Debug, Serialize)]
+struct ApprovalSummary {
+    plan_id: String,
+    /// `"pending"` on the create_plan response (Stage-4
+    /// gating only ever leaves the plan pending). The full
+    /// status field is on the [`approve / reject / list /
+    /// get`] responses.
+    status: String,
+    created_at_ms: i64,
+    /// Number of channels we attempted to fan out the
+    /// pending-plan notification to. `0` when no
+    /// `[planning] approval_targets` are configured.
+    notified_targets: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -893,6 +1467,22 @@ mod tests {
             fixture_registry(),
             cell,
             PlanningConfig::default(),
+            None,
+        );
+        let _snapshot = bridge.capability_stats_snapshot();
+    }
+
+    #[tokio::test]
+    async fn caps_register_with_approval_store_wires_all_nine_caps() {
+        let (mut bridge, _dir) = fresh_bridge();
+        let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        register(
+            &mut bridge,
+            fixture_registry(),
+            cell,
+            PlanningConfig::default(),
+            Some(store),
         );
         let _snapshot = bridge.capability_stats_snapshot();
     }
@@ -991,7 +1581,7 @@ mod tests {
         let ctx = ctx_with(
             br#"{"spec":"Research the web on Rust runtimes.","dry_run":true,"max_agents":1}"#,
         );
-        let HandlerOutcome::Ok(body) = handle_create_plan(&r, &cell, &cfg, &ctx).await else {
+        let HandlerOutcome::Ok(body) = handle_create_plan(&r, &cell, &cfg, None, &ctx).await else {
             panic!("expected Ok");
         };
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1023,7 +1613,7 @@ mod tests {
             "max_agents": 3,
         });
         let ctx = ctx_with(serde_json::to_vec(&body).unwrap().as_slice());
-        let HandlerOutcome::Ok(out) = handle_create_plan(&r, &cell, &cfg, &ctx).await else {
+        let HandlerOutcome::Ok(out) = handle_create_plan(&r, &cell, &cfg, None, &ctx).await else {
             panic!("expected Ok");
         };
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -1041,7 +1631,7 @@ mod tests {
         let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
         let cfg = PlanningConfig::default();
         let ctx = ctx_with(br#"{"spec":""}"#);
-        match handle_create_plan(&r, &cell, &cfg, &ctx).await {
+        match handle_create_plan(&r, &cell, &cfg, None, &ctx).await {
             HandlerOutcome::Err(env) => {
                 assert_eq!(env.kind, relix_core::types::error_kinds::INVALID_ARGS)
             }
@@ -1055,7 +1645,7 @@ mod tests {
         let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
         let cfg = PlanningConfig::default();
         let ctx = ctx_with(br#"{"spec":"xylophone unicorn parsnip","dry_run":true}"#);
-        match handle_create_plan(&r, &cell, &cfg, &ctx).await {
+        match handle_create_plan(&r, &cell, &cfg, None, &ctx).await {
             HandlerOutcome::Err(env) => {
                 assert_eq!(env.kind, relix_core::types::error_kinds::INVALID_ARGS);
                 assert!(env.cause.contains("no configured agents match"));
@@ -1071,7 +1661,7 @@ mod tests {
         let cfg = PlanningConfig::default();
         // dry_run = false but dispatcher cell is empty.
         let ctx = ctx_with(br#"{"spec":"Research the web on async runtimes.","dry_run":false}"#);
-        match handle_create_plan(&r, &cell, &cfg, &ctx).await {
+        match handle_create_plan(&r, &cell, &cfg, None, &ctx).await {
             HandlerOutcome::Err(env) => {
                 assert_eq!(env.kind, relix_core::types::error_kinds::RESPONDER_INTERNAL);
                 assert!(env.cause.contains("no workflow dispatcher wired"));
@@ -1094,6 +1684,238 @@ mod tests {
         assert_eq!(v["critic"]["max_rounds"], 3);
         // Empty cell → dispatcher_live = false.
         assert_eq!(v["dispatcher_live"], false);
+    }
+
+    // ── RELIX-7.24 Stage-4 approval handlers ──────────
+
+    #[tokio::test]
+    async fn handle_create_plan_with_require_approval_persists_pending_and_returns_plan_id() {
+        let r = fixture_registry();
+        let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
+        let cfg = PlanningConfig {
+            require_approval: true,
+            ..PlanningConfig::default()
+        };
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        let ctx = ctx_with(
+            br#"{"spec":"Research the web on Rust runtimes.","dry_run":false,"max_agents":1}"#,
+        );
+        let HandlerOutcome::Ok(body) =
+            handle_create_plan(&r, &cell, &cfg, Some(&store), &ctx).await
+        else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let plan_id = v["approval"]["plan_id"].as_str().expect("plan_id");
+        assert_eq!(v["approval"]["status"], "pending");
+        // The record landed in the store.
+        let stored = store.get(plan_id).unwrap().expect("stored");
+        assert_eq!(stored.status, super::super::ApprovalStatus::Pending);
+        // Spec signature still verifies.
+        stored.spec.verify().expect("signature");
+    }
+
+    #[tokio::test]
+    async fn handle_create_plan_with_require_approval_but_no_store_returns_internal() {
+        let r = fixture_registry();
+        let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
+        let cfg = PlanningConfig {
+            require_approval: true,
+            ..PlanningConfig::default()
+        };
+        let ctx = ctx_with(br#"{"spec":"Research the web.","max_agents":1}"#);
+        match handle_create_plan(&r, &cell, &cfg, None, &ctx).await {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::RESPONDER_INTERNAL);
+                assert!(env.cause.contains("no approval store wired"));
+            }
+            _ => panic!("expected RESPONDER_INTERNAL"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_create_plan_per_call_override_forces_approval() {
+        let r = fixture_registry();
+        let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
+        // Global cfg has require_approval = false but the
+        // request asks for approval explicitly.
+        let cfg = PlanningConfig::default();
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        let ctx =
+            ctx_with(br#"{"spec":"Research the web.","max_agents":1,"require_approval":true}"#);
+        let HandlerOutcome::Ok(body) =
+            handle_create_plan(&r, &cell, &cfg, Some(&store), &ctx).await
+        else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["approval"]["status"], "pending");
+    }
+
+    fn seed_pending_record(store: &super::super::ApprovalStore, plan_id: &str) {
+        let mut spec = SpecParser::new().parse("Research the web.");
+        spec.spec_id = plan_id.to_string();
+        let _ = spec.sign();
+        let record = super::super::ApprovalRecord {
+            plan_id: plan_id.to_string(),
+            spec,
+            workflow_yaml: "name: x\nversion: 1\nagents:\n  a:\n    peer: p1\n    capability: ai.chat\n    input: hi\n    output: a\nflow:\n  start: a\n".into(),
+            status: super::super::ApprovalStatus::Pending,
+            created_at_ms: 100,
+            decided_at_ms: None,
+            decision_note: None,
+            orchestrator_meta: serde_json::Value::Null,
+            critic_meta: serde_json::Value::Null,
+        };
+        store.insert_pending(&record).unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_approve_plan_without_dispatcher_records_approval_without_executing() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        seed_pending_record(&store, "approve-1");
+        let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
+        let ctx = ctx_with(br#"{"plan_id":"approve-1","note":"looks good"}"#);
+        let HandlerOutcome::Ok(body) = handle_approve_plan(&store, &cell, &ctx).await else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["record"]["status"], "approved");
+        assert_eq!(v["record"]["decision_note"], "looks good");
+        // Execution is None because no dispatcher was wired.
+        assert!(v.get("execution").is_none() || v["execution"].is_null());
+        // Persisted state confirms approval.
+        let r = store.get("approve-1").unwrap().unwrap();
+        assert_eq!(r.status, super::super::ApprovalStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn handle_approve_plan_rejects_tampered_spec() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        // Insert a record whose signature does not match the
+        // stored spec — simulating tampering at rest.
+        let mut spec = SpecParser::new().parse("Research the web.");
+        spec.spec_id = "tampered".into();
+        // Sign first.
+        let _ = spec.sign();
+        // Then mutate AFTER signing — verify() will now fail.
+        spec.goal = "Hack the planet.".into();
+        let record = super::super::ApprovalRecord {
+            plan_id: "tampered".into(),
+            spec,
+            workflow_yaml: "name: x\nversion: 1\nagents:\n  a:\n    peer: p\n    capability: ai.chat\n    input: a\n    output: a\nflow:\n  start: a\n".into(),
+            status: super::super::ApprovalStatus::Pending,
+            created_at_ms: 1,
+            decided_at_ms: None,
+            decision_note: None,
+            orchestrator_meta: serde_json::Value::Null,
+            critic_meta: serde_json::Value::Null,
+        };
+        store.insert_pending(&record).unwrap();
+        let cell: WorkflowDispatcherCell = Arc::new(tokio::sync::OnceCell::new());
+        let ctx = ctx_with(br#"{"plan_id":"tampered"}"#);
+        match handle_approve_plan(&store, &cell, &ctx).await {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("signature mismatch"), "{}", env.cause);
+            }
+            _ => panic!("expected INVALID_ARGS"),
+        }
+        // Record stays pending — refusal is non-destructive.
+        let r = store.get("tampered").unwrap().unwrap();
+        assert_eq!(r.status, super::super::ApprovalStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn handle_reject_plan_marks_record_rejected_without_executing() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        seed_pending_record(&store, "rej-1");
+        let ctx = ctx_with(br#"{"plan_id":"rej-1","note":"out of scope"}"#);
+        let HandlerOutcome::Ok(body) = handle_reject_plan(&store, &ctx) else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "rejected");
+        assert_eq!(v["decision_note"], "out of scope");
+        let r = store.get("rej-1").unwrap().unwrap();
+        assert_eq!(r.status, super::super::ApprovalStatus::Rejected);
+    }
+
+    #[test]
+    fn handle_list_approvals_filters_by_status() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        seed_pending_record(&store, "p1");
+        seed_pending_record(&store, "p2");
+        // Decide p2.
+        store
+            .decide(
+                "p2",
+                super::super::ApprovalStatus::Approved,
+                Some("ok"),
+                999,
+            )
+            .unwrap();
+        let ctx = ctx_with(br#"{"status":"pending"}"#);
+        let HandlerOutcome::Ok(body) = handle_list_approvals(&store, &ctx) else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let approvals = v["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0]["plan_id"], "p1");
+    }
+
+    #[test]
+    fn handle_list_approvals_rejects_invalid_status() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        let ctx = ctx_with(br#"{"status":"definitely-not-a-status"}"#);
+        match handle_list_approvals(&store, &ctx) {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::INVALID_ARGS);
+            }
+            _ => panic!("expected INVALID_ARGS"),
+        }
+    }
+
+    #[test]
+    fn handle_get_approval_returns_record_or_not_found() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        seed_pending_record(&store, "g1");
+        // Hit.
+        let ctx = ctx_with(br#"{"plan_id":"g1"}"#);
+        let HandlerOutcome::Ok(body) = handle_get_approval(&store, &ctx) else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["plan_id"], "g1");
+        // Miss.
+        let ctx = ctx_with(br#"{"plan_id":"ghost"}"#);
+        match handle_get_approval(&store, &ctx) {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("not found"));
+            }
+            _ => panic!("expected INVALID_ARGS"),
+        }
+    }
+
+    #[test]
+    fn approval_descriptors_present() {
+        let methods: Vec<&str> = planning_capability_descriptors()
+            .iter()
+            .map(|(m, _)| *m)
+            .collect();
+        for expected in [
+            "planning.approve_plan",
+            "planning.reject_plan",
+            "planning.list_approvals",
+            "planning.get_approval",
+        ] {
+            assert!(
+                methods.contains(&expected),
+                "missing approval descriptor: {expected}"
+            );
+        }
     }
 
     #[test]

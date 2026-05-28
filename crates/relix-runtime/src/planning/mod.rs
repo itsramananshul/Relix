@@ -35,6 +35,7 @@
 //! - [`coordinator`] — coordinator-side `planning.*` cap
 //!   handlers wiring the three above to the dispatch bridge.
 
+pub mod approval;
 pub mod conflict;
 pub mod coordinator;
 pub mod critic;
@@ -43,20 +44,28 @@ pub mod orchestrator;
 pub mod parser;
 pub mod registry;
 
+pub use approval::{
+    ApprovalError, ApprovalRecord, ApprovalStatus, ApprovalStore, ApprovalTarget,
+    DEFAULT_APPROVAL_TIMEOUT_SECS, format_pending_notification,
+};
 pub use conflict::{
     ConflictKind, ConflictResolutionEntry, ConflictResolutionReport, ConflictResolver,
     ResolutionStrategy,
 };
-pub use coordinator::{planning_capability_descriptors, register};
+pub use coordinator::{planning_capability_descriptors, register, spawn_approval_expiry_sweep};
 pub use critic::{CriticConfig, CriticLoop, CriticOutcome, CriticVerdict, PlanProducer};
 pub use generator::{GenerateError, GeneratorOptions, PlanGenerator, PlanTopology};
 pub use orchestrator::{
     Orchestrator, OrchestratorConfig, OrchestratorError, OrchestratorOutcome, SpecialistAssignment,
 };
-pub use parser::{DEFAULT_COMPLEXITY_THRESHOLD, PlanSpec, SpecParser};
+pub use parser::{
+    DEFAULT_COMPLEXITY_THRESHOLD, PLAN_SPEC_VERSION, PlanSpec, SpecChange, SpecParser,
+    SpecVerificationError,
+};
 pub use registry::{AgentCapabilityRegistry, AgentInfo, AgentMatch, CapabilityInfo};
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// `[planning]` config block carrying the orchestrator + critic
 /// knobs. Both default in the orchestrator-on,
@@ -76,4 +85,31 @@ pub struct PlanningConfig {
     pub orchestrator: OrchestratorConfig,
     #[serde(flatten)]
     pub critic: CriticConfig,
+    /// RELIX-7.24 Stage-4 human-in-the-loop approval gate.
+    /// When `true`, every call to `planning.create_plan` that
+    /// would have executed (i.e. `dry_run = false`) is held in
+    /// the [`ApprovalStore`] in `pending` state until an
+    /// operator calls `planning.approve_plan` or
+    /// `planning.reject_plan`.
+    #[serde(default)]
+    pub require_approval: bool,
+    /// Pending plans older than this in the approval store
+    /// are auto-rejected (status `expired`) by the background
+    /// sweep. Default 3600s (1 hour).
+    #[serde(default = "default_approval_timeout_secs")]
+    pub approval_timeout_secs: i64,
+    /// SQLite path for the approval store + verification log.
+    /// Absent → the controller derives a path under the
+    /// coordinator's `[coordinator] db_path` directory.
+    #[serde(default)]
+    pub approval_db_path: Option<PathBuf>,
+    /// Channel targets for the pending-plan notification
+    /// fan-out. Empty list → operators get a tracing-log
+    /// entry only.
+    #[serde(default)]
+    pub approval_targets: Vec<ApprovalTarget>,
+}
+
+fn default_approval_timeout_secs() -> i64 {
+    DEFAULT_APPROVAL_TIMEOUT_SECS
 }
