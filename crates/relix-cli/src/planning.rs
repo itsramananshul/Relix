@@ -90,6 +90,17 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// RELIX-7.24 Stage-1/3 status: prints the configured
+    /// orchestrator + critic settings on the coordinator and
+    /// whether the AI dispatcher cell has been wired. Useful
+    /// for confirming a fresh boot has the planning pipeline
+    /// fully online.
+    Status {
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -118,6 +129,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             let effective_dry_run = !execute && dry_run;
             plan(&bridge, &spec, max_agents, effective_dry_run, raw).await
         }
+        Cmd::Status { bridge, raw } => status(&bridge, raw).await,
     }
 }
 
@@ -253,6 +265,78 @@ async fn plan(
     println!("workflow_name:  {name}");
     println!("topology:       {topology}");
     print_str_list("agents_selected:", v.get("agents_selected"));
+
+    // RELIX-7.24 Stage-1/3 fields.
+    let orch_activated = v
+        .get("orchestrator_activated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let specialist_count = v
+        .get("specialist_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    println!(
+        "orchestrator:   {} (specialist_count={specialist_count})",
+        if orch_activated { "ACTIVE" } else { "skipped" }
+    );
+    if orch_activated && let Some(o) = v.get("orchestrator") {
+        if let Some(s) = o.get("complexity_score").and_then(Value::as_f64) {
+            let t = o
+                .get("complexity_threshold")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.6);
+            println!("                complexity {s:.2} >= threshold {t:.2}");
+        }
+        if let Some(decomposed_by_heuristic) =
+            o.get("decomposed_by_heuristic").and_then(Value::as_bool)
+            && decomposed_by_heuristic
+        {
+            println!("                (decomposed via heuristic — AI decomposer unreachable)");
+        }
+        print_str_list("                sub_goals:", o.get("sub_goals"));
+    }
+
+    let critic_rounds = v.get("critic_rounds").and_then(Value::as_u64).unwrap_or(0);
+    let critic_approved = v
+        .get("critic_approved")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    println!(
+        "critic:         {} (rounds={critic_rounds})",
+        if critic_approved {
+            "APPROVED"
+        } else {
+            "NOT APPROVED"
+        }
+    );
+    if let Some(c) = v.get("critic")
+        && let Some(w) = c.get("warning").and_then(Value::as_str)
+        && !w.is_empty()
+    {
+        println!("                warning: {w}");
+    }
+
+    if let Some(report) = v.get("conflict_resolution_report")
+        && !report.is_null()
+    {
+        let detected = report
+            .get("conflicts_detected")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let resolved = report
+            .get("conflicts_resolved")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let strategy = report
+            .get("strategy_used")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        println!("conflicts:      detected={detected} resolved={resolved} strategy={strategy}");
+        if let Some(esc) = report.get("escalated").and_then(Value::as_str) {
+            println!("                ESCALATED: {esc}");
+        }
+    }
+
     if let Some(yaml) = v.get("workflow_yaml").and_then(Value::as_str) {
         println!("\n--- workflow_yaml ---\n{yaml}");
     }
@@ -278,6 +362,84 @@ async fn plan(
             println!("result:         {result}");
         }
     }
+    Ok(())
+}
+
+async fn status(bridge: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/planning/status", bridge.trim_end_matches('/'));
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: Value =
+        serde_json::from_str(&body).map_err(|e| format!("decode status: {e} (body={body})"))?;
+    let orch = v.get("orchestrator").cloned().unwrap_or(Value::Null);
+    let critic = v.get("critic").cloned().unwrap_or(Value::Null);
+    let live = v
+        .get("dispatcher_live")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    println!("orchestrator:");
+    println!(
+        "  enabled:                 {}",
+        orch.get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "  agent:                   {}",
+        orch.get("agent").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "  peer:                    {}",
+        orch.get("peer").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "  complexity_threshold:    {:.2}",
+        orch.get("complexity_threshold")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.6)
+    );
+    println!(
+        "  max_parallel_specialists:{}",
+        orch.get("max_parallel_specialists")
+            .and_then(Value::as_u64)
+            .unwrap_or(4)
+    );
+    println!("critic:");
+    println!(
+        "  enabled:                 {}",
+        critic
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    println!(
+        "  agent:                   {}",
+        critic.get("agent").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "  peer:                    {}",
+        critic.get("peer").and_then(Value::as_str).unwrap_or("?")
+    );
+    println!(
+        "  max_rounds:              {}",
+        critic
+            .get("max_rounds")
+            .and_then(Value::as_u64)
+            .unwrap_or(3)
+    );
+    println!(
+        "dispatcher_live:             {} ({})",
+        live,
+        if live {
+            "AI peers reachable"
+        } else {
+            "heuristic fallback only"
+        }
+    );
     Ok(())
 }
 

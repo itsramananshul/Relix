@@ -137,6 +137,11 @@ async fn planning_mini_mesh_all_endpoints() {
         name = "ops_create_plan"
         method = "planning.create_plan"
         allow_groups = ["operators"]
+
+        [[rules]]
+        name = "ops_orchestrator_status"
+        method = "planning.orchestrator_status"
+        allow_groups = ["operators"]
         "#,
     );
 
@@ -177,13 +182,93 @@ async fn planning_mini_mesh_all_endpoints() {
         "workflow_name": "planning__research_the_web",
         "workflow_yaml": "name: planning__research_the_web\nversion: 1\nagents: {}\nflow: {}\n",
         "agents_selected": [],
-        "execution": null
+        "execution": null,
+        "orchestrator_activated": false,
+        "specialist_count": 0,
+        "critic_rounds": 0,
+        "critic_approved": true,
+        "orchestrator": {
+            "activated": false,
+            "complexity_score": 0.0,
+            "complexity_threshold": 0.6,
+            "sub_goals": [],
+            "specialist_assignments": [],
+            "decomposed_by_heuristic": false,
+        },
+        "critic": {
+            "enabled": true,
+            "rounds": 0,
+            "approved": true,
+            "history": [],
+        },
+    });
+    // RELIX-7.24 Stage-1: a separate canned plan_response that
+    // tells operators "yes, the orchestrator fired" with a
+    // conflict resolution report attached. Returned when the
+    // test scenario sends a complex spec — the canned
+    // coordinator switches on `complex` substring match.
+    let complex_plan_response = serde_json::json!({
+        "plan_spec": validate_response.clone(),
+        "topology": "parallel",
+        "workflow_name": "planning_orch__research_and_design",
+        "workflow_yaml": "name: planning_orch__research_and_design\nversion: 1\nagents: {}\nflow: {}\n",
+        "agents_selected": [],
+        "execution": null,
+        "orchestrator_activated": true,
+        "specialist_count": 2,
+        "critic_rounds": 0,
+        "critic_approved": true,
+        "orchestrator": {
+            "activated": true,
+            "complexity_score": 0.9,
+            "complexity_threshold": 0.6,
+            "sub_goals": ["Research async runtimes", "Design a benchmark"],
+            "specialist_assignments": [
+                {
+                    "sub_goal": "Research async runtimes",
+                    "specialist_agent": "research-agent",
+                    "specialist_peer": "research-peer",
+                    "match_score": 7,
+                }
+            ],
+            "decomposed_by_heuristic": false,
+        },
+        "critic": {
+            "enabled": true,
+            "rounds": 0,
+            "approved": true,
+            "history": [],
+        },
+        "conflict_resolution_report": {
+            "conflicts_detected": 1,
+            "conflicts_resolved": 1,
+            "strategy_used": "rename",
+            "details": [],
+        },
+    });
+    let status_response = serde_json::json!({
+        "orchestrator": {
+            "enabled": true,
+            "agent": "coordinator",
+            "peer": "coordinator",
+            "complexity_threshold": 0.6,
+            "max_parallel_specialists": 4,
+        },
+        "critic": {
+            "enabled": true,
+            "agent": "coordinator",
+            "peer": "coordinator",
+            "max_rounds": 3,
+        },
+        "dispatcher_live": true,
     });
 
     let agents_arc = Arc::new(agents_response.clone());
     let find_arc = Arc::new(find_response.clone());
     let validate_arc = Arc::new(validate_response.clone());
     let plan_arc = Arc::new(plan_response.clone());
+    let complex_plan_arc = Arc::new(complex_plan_response.clone());
+    let status_arc = Arc::new(status_response.clone());
 
     dispatch.register(
         "planning.list_agents",
@@ -215,10 +300,35 @@ async fn planning_mini_mesh_all_endpoints() {
             }
         })),
     );
+    // create_plan returns the simple plan_response by default
+    // and the complex_plan_response when the request body's
+    // `spec` field contains the word "complex" — that's how the
+    // single canned coordinator covers both
+    // orchestrator-skipped and orchestrator-active scenarios.
     dispatch.register(
         "planning.create_plan",
         Arc::new(FnHandler({
             let r = plan_arc.clone();
+            let r_complex = complex_plan_arc.clone();
+            move |ctx: InvocationCtx| {
+                let r = r.clone();
+                let r_complex = r_complex.clone();
+                async move {
+                    let arg_text = std::str::from_utf8(&ctx.args).unwrap_or("");
+                    let body: &serde_json::Value = if arg_text.contains("complex") {
+                        &r_complex
+                    } else {
+                        &r
+                    };
+                    HandlerOutcome::Ok(serde_json::to_vec(body).unwrap_or_default())
+                }
+            }
+        })),
+    );
+    dispatch.register(
+        "planning.orchestrator_status",
+        Arc::new(FnHandler({
+            let r = status_arc.clone();
             move |_ctx: InvocationCtx| {
                 let r = r.clone();
                 async move { HandlerOutcome::Ok(serde_json::to_vec(&*r).unwrap_or_default()) }
@@ -318,6 +428,10 @@ addr = "{addr}"
             post(crate::planning::validate_spec),
         )
         .route("/v1/planning/plan", post(crate::planning::create_plan))
+        .route(
+            "/v1/planning/status",
+            get(crate::planning::orchestrator_status),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = listener.local_addr().unwrap();
@@ -412,4 +526,44 @@ addr = "{addr}"
     .unwrap()
     .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
+
+    // 7. POST /v1/planning/plan with a complex spec → 200 +
+    // orchestrator_activated = true + conflict_resolution_report
+    // populated. (The canned coordinator returns the
+    // complex_plan_response when the spec contains the word
+    // "complex".)
+    let resp = timeout(
+        Duration::from_secs(15),
+        http.post(&url)
+            .json(&serde_json::json!({
+                "spec": "Build a complex thing.",
+                "dry_run": true,
+                "max_agents": 4
+            }))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["orchestrator_activated"],
+        serde_json::Value::Bool(true)
+    );
+    assert_eq!(body["specialist_count"], 2);
+    let conflict = &body["conflict_resolution_report"];
+    assert!(!conflict.is_null(), "expected conflict_resolution_report");
+    assert_eq!(conflict["conflicts_resolved"], 1);
+
+    // 8. GET /v1/planning/status → 200 + orchestrator + critic
+    // config view.
+    let url = format!("http://{bound}/v1/planning/status");
+    let resp = timeout(Duration::from_secs(15), http.get(&url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, status_response);
 }

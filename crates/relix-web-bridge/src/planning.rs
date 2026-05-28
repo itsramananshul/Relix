@@ -1,13 +1,15 @@
 //! RELIX-7.24 — HTTP proxies for the `planning.*` capability
 //! surface.
 //!
-//! Four endpoints, each a thin forwarder to a `planning.*`
+//! Five endpoints, each a thin forwarder to a `planning.*`
 //! capability on the coordinator:
 //!
 //! - `POST /v1/planning/plan` — `planning.create_plan`
 //! - `GET  /v1/planning/agents` — `planning.list_agents`
 //! - `POST /v1/planning/agents/search` — `planning.find_agents`
 //! - `POST /v1/planning/validate` — `planning.validate_spec`
+//! - `GET  /v1/planning/status` — `planning.orchestrator_status`
+//!   (Stage-1/3: wired view of `[planning]` + dispatcher liveness)
 //!
 //! Error mapping mirrors the knowledge / confidence / metrics
 //! endpoints:
@@ -135,6 +137,23 @@ pub async fn validate_spec(
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "spec": req.spec });
     match call_peer_json(&state, &peer, "planning.validate_spec", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/planning/status`
+///
+/// RELIX-7.24 Stage-1/3: thin proxy onto
+/// `planning.orchestrator_status`. Returns the wired
+/// `[planning]` block plus a `dispatcher_live` flag.
+pub async fn orchestrator_status(
+    State(state): State<AppState>,
+    Query(q): Query<PeerQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    match call_peer_json(&state, &peer, "planning.orchestrator_status", &Value::Null).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
