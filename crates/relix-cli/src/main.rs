@@ -2,6 +2,7 @@
 
 mod browser;
 mod capability;
+mod confidence;
 mod config;
 mod doctor;
 mod email;
@@ -153,6 +154,18 @@ enum Cmd {
     Knowledge {
         #[command(subcommand)]
         cmd: knowledge::Cmd,
+    },
+    /// RELIX-7.19: per-step confidence scoring + fallback
+    /// surface.
+    /// `confidence policies` prints every configured policy.
+    /// `confidence history --agent X --method ai.chat` prints
+    /// the rolling window snapshot for a (agent, method) pair.
+    /// `confidence reset --agent X [--method M]` clears the
+    /// window. Talks to the local bridge over HTTP (default
+    /// `http://127.0.0.1:19791`).
+    Confidence {
+        #[command(subcommand)]
+        cmd: confidence::Cmd,
     },
     /// Operate the Router Node — mesh observability + health
     /// control plane. Each subcommand dials the router peer
@@ -379,6 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Metrics { cmd } => metrics::run(cmd).await,
         Cmd::Training { cmd } => training::run(cmd).await,
         Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
+        Cmd::Confidence { cmd } => confidence::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,
