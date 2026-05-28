@@ -1,6 +1,7 @@
 //! relix-cli — developer and operator CLI.
 
 mod browser;
+mod build;
 mod capability;
 mod confidence;
 mod config;
@@ -299,6 +300,18 @@ enum Cmd {
     /// the dashboard in the default browser unless `--no-browser`.
     Boot(mesh::BootArgs),
 
+    /// RELIX-7.24 Stage-1/3/4/5: Build Mode entry point.
+    /// `relix build "<spec>"` runs the full planning pipeline
+    /// (orchestrator + critic + conflict resolver +
+    /// optional approval gate + optional step-level
+    /// verification) and pretty-prints each stage. When the
+    /// coordinator requires approval, the command shows the
+    /// generated plan and asks for an interactive
+    /// approve/reject on stdin. `--no-approval` and
+    /// `--dry-run` opt out; `--output json` dumps raw
+    /// responses for scripting.
+    Build(build::BuildArgs),
+
     /// Stop every running `relix-controller` and `relix-web-bridge`
     /// on this machine. Idempotent — exits 0 if nothing was running.
     Stop,
@@ -430,6 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => ping::run(&peer, &identity, &method, &client_key).await,
         Cmd::Setup => setup::run().await,
         Cmd::Boot(args) => mesh::boot(args).await,
+        Cmd::Build(args) => build::run(args).await,
         Cmd::Stop => mesh::stop(),
         Cmd::Status(args) => mesh::status(args).await,
         Cmd::Update(args) => update::run(args).await,
