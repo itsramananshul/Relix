@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "relix"
+version = "0.1.0"
+description = "Python SDK for the Relix AI agent mesh platform"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Anshul Raman", email = "ramanal@mail.uc.edu" },
+]
+keywords = ["relix", "ai", "agents", "sdk", "memory", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "respx>=0.21.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/itsramananshul/Relix"
+Documentation = "https://github.com/itsramananshul/Relix/tree/main/docs"
+Repository = "https://github.com/itsramananshul/Relix"
+Issues = "https://github.com/itsramananshul/Relix/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["relix"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+python_files = ["test_*.py"]
