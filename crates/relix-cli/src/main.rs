@@ -20,6 +20,7 @@ mod mcp;
 mod memory_inspect;
 mod mesh;
 mod metrics;
+mod models;
 mod observe;
 mod ops;
 mod os_secure;
@@ -304,6 +305,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: sessions::Cmd,
     },
+    /// GAP 16: provider + model inventory. `relix models
+    /// list` shows every provider configured on the bridge
+    /// with its default model + enabled flag; `relix models
+    /// health` adds the aggregate cooldown / quarantine /
+    /// rate-limit counters.
+    Models {
+        #[command(subcommand)]
+        cmd: models::Cmd,
+    },
     /// GAP 11 + 12: transactional gateway + evidence inspector.
     /// `relix execution rollback <transaction_id>` undoes a
     /// transaction; `relix execution transaction <id>` prints
@@ -486,6 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Execution { cmd } => execution::run(cmd).await,
         Cmd::Provenance { cmd } => provenance::run(cmd).await,
         Cmd::Sessions { cmd } => sessions::run(cmd).await,
+        Cmd::Models { cmd } => models::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
