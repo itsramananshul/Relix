@@ -5233,6 +5233,56 @@ fn register_node_type_handlers(
         if let Some(s) = gateway_store.clone() {
             tool_dispatcher_builder = tool_dispatcher_builder.with_transaction_store(s);
         }
+        // GAP 12: build the evidence store next to the
+        // transaction store. When `evidence_db_path` is set, use
+        // it; otherwise we park evidence at
+        // `<gateway_db_stem>-evidence.db` so a single backup
+        // captures both stores. The store is opt-in: when the
+        // operator did not configure a transaction store, no
+        // evidence store opens either (capture without
+        // transaction is meaningless).
+        let evidence_store: Option<
+            std::sync::Arc<crate::nodes::execution::evidence::EvidenceStore>,
+        > = match gateway_section.as_ref() {
+            Some(g) if gateway_store.is_some() => {
+                let ev_path = g.evidence_db_path.clone().or_else(|| {
+                    g.db_path.clone().map(|p| {
+                        let stem = p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("gateway")
+                            .to_string();
+                        let mut q = p.clone();
+                        q.set_file_name(format!("{stem}-evidence.db"));
+                        q
+                    })
+                });
+                if let Some(p) = ev_path {
+                    let anon = std::sync::Arc::new(crate::training::PiiAnonymizer::disabled());
+                    match crate::nodes::execution::evidence::EvidenceStore::open(&p, anon) {
+                        Ok(s) => Some(std::sync::Arc::new(s)),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %p.display(),
+                                "[execution.gateway] open evidence store failed; capture disabled",
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(store) = evidence_store.clone() {
+            let sink: std::sync::Arc<dyn crate::nodes::tool::dispatcher::EvidenceCaptureSink> =
+                store.clone();
+            tool_dispatcher_builder = tool_dispatcher_builder.with_evidence_sink(sink);
+            crate::nodes::execution::evidence::register(bridge, store);
+            tracing::info!("execution caps: registered execution.evidence handler");
+        }
         let tool_dispatcher = std::sync::Arc::new(tool_dispatcher_builder);
         // Register `execution.rollback` + `execution.transaction_get`
         // when the store is available. The compensating dispatcher

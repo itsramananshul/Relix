@@ -16,6 +16,7 @@
 //! env without standing up either.
 
 pub mod broker;
+pub mod evidence;
 pub mod gateway;
 pub mod gateway_tier;
 pub mod rollback;
