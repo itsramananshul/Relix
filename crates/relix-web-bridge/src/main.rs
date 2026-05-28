@@ -152,6 +152,7 @@ mod secrets_available;
 mod security_headers;
 mod session_search;
 mod sessions_obs;
+mod skills;
 mod slack;
 mod sol_validate;
 mod sse;
@@ -588,6 +589,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/memory/refresh_model",
             post(memory_gap5::request_model_refresh),
         )
+        // GAP 4: SkillStore HTTP surface.
+        .route("/v1/skills", get(skills::list).post(skills::create))
+        .route("/v1/skills/stats", get(skills::stats))
+        .route("/v1/skills/:id", get(skills::get).patch(skills::update))
+        .route("/v1/skills/:id/deprecate", post(skills::deprecate))
         // RELIX-7.16 knowledge transfer.
         .route("/v1/knowledge/share", post(knowledge::share))
         .route("/v1/knowledge/shared/:agent", get(knowledge::list_shared))

@@ -4183,28 +4183,34 @@ pub(crate) fn build_access_broker(
 // section. Returns `Some(cfg)` only when `enabled = true`; an
 // absent / disabled config returns `None` so the coordinator's
 // drift hook short-circuits immediately.
-/// GAP 4: parse `[skills]` and (when enabled) construct the
-/// auto-skill extractor wrapping the local ChatProvider.
-///
-/// Returns `None` when:
-/// - `[skills]` is absent / fails to parse.
-/// - `[skills] enabled = false`.
-/// - `[skills] auto_extract = false` (the store + caps are
-///   still wired downstream, just no post-`ai.chat` hook).
-/// - `db_path` is missing.
-///
-/// The returned extractor wraps a [`crate::nodes::ai::skill_extractor::LocalProviderAiDispatcher`]
-/// so the synthesis call goes straight to the provider (no
-/// libp2p hop, no recursion through the AI handler).
-fn build_skill_extractor(
+
+/// GAP 4 — bundle of the SkillStore + extractor + refinement
+/// engine produced by [`build_skills_runtime`]. The same store
+/// is shared by every consumer: the AI handler holds the
+/// extractor (for the post-`ai.chat` hook), the coordinator
+/// bridge holds the store (for the six skill caps), and the
+/// refinement engine background task gets spawned from the
+/// same Arc so all three see the same SQLite rows.
+pub(crate) struct SkillsRuntime {
+    pub store: std::sync::Arc<crate::nodes::ai::skill_store::SkillStore>,
+    pub extractor: Option<std::sync::Arc<crate::nodes::ai::skill_extractor::SkillExtractor>>,
+    pub refinement:
+        Option<std::sync::Arc<crate::nodes::ai::skill_refinement::SkillRefinementEngine>>,
+}
+
+/// GAP 4: parse `[skills]` and, when enabled, construct the
+/// shared [`SkillsRuntime`] bundle. Returns `None` for the
+/// config-absent / disabled / unparseable cases.
+fn build_skills_runtime(
     raw: &Option<toml::Value>,
     provider: std::sync::Arc<dyn crate::nodes::ai::provider::ChatProvider>,
     default_model: &str,
-) -> Option<std::sync::Arc<crate::nodes::ai::skill_extractor::SkillExtractor>> {
+) -> Option<SkillsRuntime> {
     use crate::nodes::ai::skill_extractor::{
         LocalProviderAiDispatcher, LocalProviderEmbedDispatcher, SkillExtractor,
         SkillExtractorConfig,
     };
+    use crate::nodes::ai::skill_refinement::{RefinementConfig, SkillRefinementEngine};
     use crate::nodes::ai::skill_store::SkillStore;
     use crate::nodes::ai::skills::SkillsConfig;
     use crate::nodes::memory::curator::{AiDispatcher, EmbeddingDispatcher};
@@ -4212,17 +4218,17 @@ fn build_skill_extractor(
     let cfg: SkillsConfig = match raw.try_into() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "[skills] parse failed; skill extractor disabled");
+            tracing::warn!(error = %e, "[skills] parse failed; skill runtime disabled");
             return None;
         }
     };
-    if !cfg.enabled || !cfg.auto_extract {
+    if !cfg.enabled {
         return None;
     }
     let db_path = match cfg.db_path.as_ref() {
         Some(p) => p.clone(),
         None => {
-            tracing::warn!("[skills] enabled = true but db_path missing; skill extractor disabled");
+            tracing::warn!("[skills] enabled = true but db_path missing; skill runtime disabled");
             return None;
         }
     };
@@ -4256,14 +4262,40 @@ fn build_skill_extractor(
         embedding_model: cfg.embedding_model.clone().unwrap_or(default_embedding),
         ..SkillExtractorConfig::default()
     };
-    let extractor = SkillExtractor::new(store, ai_cell, embed_cell, ex_cfg);
+    let extractor = if cfg.auto_extract {
+        Some(std::sync::Arc::new(SkillExtractor::new(
+            store.clone(),
+            ai_cell.clone(),
+            embed_cell,
+            ex_cfg,
+        )))
+    } else {
+        None
+    };
+    let refinement = if cfg.refinement_enabled {
+        let rcfg = RefinementConfig {
+            model: extraction_model,
+            ..RefinementConfig::default()
+        };
+        Some(std::sync::Arc::new(SkillRefinementEngine::new(
+            store.clone(),
+            ai_cell,
+            rcfg,
+        )))
+    } else {
+        None
+    };
     tracing::info!(
         path = %db_path.display(),
-        min_complexity = cfg.min_complexity_score,
-        dup_threshold = cfg.dup_threshold,
-        "skill extractor: enabled"
+        auto_extract = cfg.auto_extract,
+        refinement_enabled = cfg.refinement_enabled,
+        "skill runtime: enabled"
     );
-    Some(std::sync::Arc::new(extractor))
+    Some(SkillsRuntime {
+        store,
+        extractor,
+        refinement,
+    })
 }
 
 fn build_drift_config(cfg: &ControllerConfig) -> Option<crate::nodes::ai::guardrails::DriftConfig> {
@@ -5084,12 +5116,21 @@ fn register_node_type_handlers(
                 std::sync::Arc<dyn crate::nodes::ai::execution::ToolMeshDispatcher>,
             >,
         > = std::sync::Arc::new(tokio::sync::OnceCell::new());
-        // GAP 4: build the skill extractor when `[skills]` config
-        // enables auto-extraction. The extractor wraps the local
-        // provider via a `LocalProviderAiDispatcher` so the
-        // synthesis call never round-trips through libp2p (which
-        // would also re-enter the same handler and recurse).
-        let skill_extractor = build_skill_extractor(&cfg.skills, provider.clone(), &default_model);
+        // GAP 4: build the shared skill runtime when `[skills]`
+        // is enabled. The bundle holds the SkillStore (shared
+        // with the cap registration below) and optionally the
+        // SkillExtractor (post-`ai.chat` hook) and
+        // SkillRefinementEngine (24h background task).
+        let skills_runtime = build_skills_runtime(&cfg.skills, provider.clone(), &default_model);
+        if let Some(rt) = skills_runtime.as_ref() {
+            crate::nodes::ai::skill_caps::register(bridge, rt.store.clone());
+            tracing::info!("skill caps: registered six memory.skill_* handlers");
+            if let Some(refinement) = rt.refinement.clone() {
+                refinement.spawn();
+                tracing::info!("skill refinement: background task spawned");
+            }
+        }
+        let skill_extractor = skills_runtime.as_ref().and_then(|rt| rt.extractor.clone());
         crate::nodes::ai::register(
             bridge,
             provider.clone(),

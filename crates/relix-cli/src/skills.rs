@@ -11,15 +11,16 @@ use clap::{Args, Subcommand};
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// List discovered SKILL.md files + their inferred titles.
-    /// Walks the documented roots: cwd/SKILL.md, cwd/skills/,
-    /// ~/.relix/skills/, plus any `--root` entries.
+    /// List discovered skills. By default walks the file-based
+    /// SKILL.md roots (cwd/SKILL.md, cwd/skills/, ~/.relix/skills/,
+    /// plus any --root entries). When `--query / --agent /
+    /// --min-confidence / --bridge` is passed, hits the bridge's
+    /// `GET /v1/skills` and prints the SQLite-backed catalogue
+    /// instead.
     List(ListArgs),
-    /// Print the body of the named skill to stdout. A future
-    /// commit wires this through an AI dispatch that uses the
-    /// skill body as the procedure description; the current
-    /// surface lets operators inspect skills + pipe them into
-    /// their own runners.
+    /// Print the body of the named skill to stdout (file-based
+    /// path) OR full detail of one stored skill (when --id and
+    /// --bridge are supplied).
     Run(RunArgs),
     /// Delete auto-generated SKILL.md files older than
     /// `--max-age-days` (default 30) from
@@ -27,6 +28,21 @@ pub enum Cmd {
     /// `~/.relix/skills/` are never touched. Use `--dry-run`
     /// to preview without deleting.
     Prune(PruneArgs),
+    /// GAP 4: print full detail (incl. version history) for one
+    /// stored skill. Hits GET /v1/skills/:id.
+    Show(ShowArgs),
+    /// GAP 4: update one stored skill. Hits PATCH /v1/skills/:id.
+    Edit(EditArgs),
+    /// GAP 4: deprecate one stored skill. Hits POST
+    /// /v1/skills/:id/deprecate.
+    Delete(DeleteArgs),
+    /// GAP 4: export one stored skill as JSON. Without --out the
+    /// document is printed to stdout.
+    Export(ExportArgs),
+    /// GAP 4: import a skill JSON file via POST /v1/skills.
+    Import(ImportArgs),
+    /// GAP 4: print aggregate statistics. Hits GET /v1/skills/stats.
+    Stats(StatsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -34,6 +50,97 @@ pub struct ListArgs {
     /// Extra root directory to scan. Repeatable.
     #[arg(long)]
     pub root: Vec<PathBuf>,
+    /// GAP 4: switch to bridge mode. Always set when any of
+    /// --query / --agent / --min-confidence is provided.
+    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    pub bridge: String,
+    /// Filter by source agent (bridge mode only).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Minimum confidence filter (bridge mode only).
+    #[arg(long = "min-confidence")]
+    pub min_confidence: Option<f32>,
+    /// Substring search on name + description + tags (bridge mode only).
+    #[arg(long)]
+    pub query: Option<String>,
+    /// Result cap (bridge mode only).
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    /// Print raw JSON instead of the human table.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    pub bridge: String,
+    pub id: String,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct EditArgs {
+    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    pub bridge: String,
+    pub id: String,
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Comma-separated tag list. Replaces the existing set.
+    #[arg(long)]
+    pub tags: Option<String>,
+    /// Path to a JSON file containing a `[{step, tool?, prompt?}, ...]`
+    /// array.
+    #[arg(long)]
+    pub steps_file: Option<PathBuf>,
+    /// `active` | `deprecated` | `quarantined`.
+    #[arg(long)]
+    pub status: Option<String>,
+    #[arg(long = "change-reason")]
+    pub change_reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DeleteArgs {
+    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    pub bridge: String,
+    pub id: String,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ExportArgs {
+    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    pub bridge: String,
+    pub id: String,
+    /// Optional output path. When omitted the JSON document is
+    /// printed to stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ImportArgs {
+    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    pub bridge: String,
+    /// Path to a JSON file with the StoreArgs schema.
+    pub file: PathBuf,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StatsArgs {
+    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    pub bridge: String,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -63,10 +170,296 @@ pub struct PruneArgs {
 
 pub fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        Cmd::List(args) => list(&args.root),
+        Cmd::List(args) => {
+            let bridge_mode =
+                args.query.is_some() || args.agent.is_some() || args.min_confidence.is_some();
+            if bridge_mode {
+                tokio_run(skills_list_remote(args))
+            } else {
+                list(&args.root)
+            }
+        }
         Cmd::Run(args) => run_skill(&args.name, &args.root),
         Cmd::Prune(args) => prune(&args),
+        Cmd::Show(args) => tokio_run(skills_show(args)),
+        Cmd::Edit(args) => tokio_run(skills_edit(args)),
+        Cmd::Delete(args) => tokio_run(skills_delete(args)),
+        Cmd::Export(args) => tokio_run(skills_export(args)),
+        Cmd::Import(args) => tokio_run(skills_import(args)),
+        Cmd::Stats(args) => tokio_run(skills_stats(args)),
     }
+}
+
+/// Build a small tokio runtime + drive `fut` to completion. The
+/// outer CLI is sync; the bridge calls are async — this is the
+/// adapter.
+fn tokio_run<F>(fut: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(fut)
+}
+
+async fn skills_list_remote(args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let base = args.bridge.trim_end_matches('/');
+    let mut url = format!("{base}/v1/skills?limit={}", args.limit);
+    if let Some(q) = args.query.as_ref() {
+        url.push_str("&q=");
+        url.push_str(&urlencode(q));
+    }
+    if let Some(a) = args.agent.as_ref() {
+        url.push_str("&agent=");
+        url.push_str(&urlencode(a));
+    }
+    if let Some(c) = args.min_confidence {
+        url.push_str(&format!("&min_confidence={c}"));
+    }
+    let client = reqwest::Client::new();
+    let r = client.get(&url).send().await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if args.json {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = v
+        .get("results")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no skills matched)");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:<28}  {:>6}  {:>5}  {:<10}",
+        "ID", "NAME", "CONF", "USES", "AGENT"
+    );
+    for r in rows {
+        let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("");
+        let name = r.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        let conf = r.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let uses = r.get("usage_count").and_then(|x| x.as_i64()).unwrap_or(0);
+        let agent = r.get("source_agent").and_then(|x| x.as_str()).unwrap_or("");
+        println!(
+            "{:<36}  {:<28}  {:>6.2}  {:>5}  {:<10}",
+            id,
+            truncate(name, 28),
+            conf,
+            uses,
+            truncate(agent, 10)
+        );
+    }
+    Ok(())
+}
+
+async fn skills_show(args: ShowArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let base = args.bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/skills/{}", urlencode(&args.id));
+    let r = reqwest::Client::new().get(&url).send().await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if args.json {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn skills_edit(args: EditArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut body = serde_json::Map::new();
+    if let Some(d) = args.description {
+        body.insert("description".into(), serde_json::Value::from(d));
+    }
+    if let Some(tags) = args.tags {
+        let parsed: Vec<String> = tags
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        body.insert("tags".into(), serde_json::Value::from(parsed));
+    }
+    if let Some(p) = args.steps_file {
+        let text = std::fs::read_to_string(&p)?;
+        let parsed: serde_json::Value = serde_json::from_str(&text)?;
+        body.insert("steps".into(), parsed);
+    }
+    if let Some(s) = args.status {
+        body.insert("status".into(), serde_json::Value::from(s));
+    }
+    if let Some(r) = args.change_reason {
+        body.insert("change_reason".into(), serde_json::Value::from(r));
+    }
+    let base = args.bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/skills/{}", urlencode(&args.id));
+    let r = reqwest::Client::new()
+        .patch(&url)
+        .json(&serde_json::Value::Object(body))
+        .send()
+        .await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if args.json {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn skills_delete(args: DeleteArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut body = serde_json::Map::new();
+    if let Some(r) = args.reason {
+        body.insert("reason".into(), serde_json::Value::from(r));
+    }
+    let base = args.bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/skills/{}/deprecate", urlencode(&args.id));
+    let r = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::Value::Object(body))
+        .send()
+        .await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if args.json {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn skills_export(args: ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let base = args.bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/skills/{}", urlencode(&args.id));
+    let r = reqwest::Client::new().get(&url).send().await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    // Pretty-print so the on-disk artefact is human-readable.
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let pretty = serde_json::to_string_pretty(&v)?;
+    match args.out.as_ref() {
+        Some(p) => {
+            std::fs::write(p, &pretty)?;
+            eprintln!("wrote {} bytes to {}", pretty.len(), p.display());
+        }
+        None => {
+            println!("{pretty}");
+        }
+    }
+    Ok(())
+}
+
+async fn skills_import(args: ImportArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(&args.file)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+    let base = args.bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/skills");
+    let r = reqwest::Client::new()
+        .post(&url)
+        .json(&parsed)
+        .send()
+        .await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if args.json {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn skills_stats(args: StatsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let base = args.bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/skills/stats");
+    let r = reqwest::Client::new().get(&url).send().await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if args.json {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let total = v.get("total_skills").and_then(|x| x.as_i64()).unwrap_or(0);
+    let active = v.get("active_skills").and_then(|x| x.as_i64()).unwrap_or(0);
+    let avg = v
+        .get("avg_confidence")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
+    println!("total_skills:    {total}");
+    println!("active_skills:   {active}");
+    println!("avg_confidence:  {avg:.2}");
+    if let Some(arr) = v.get("top_5_by_usage").and_then(|x| x.as_array())
+        && !arr.is_empty()
+    {
+        println!();
+        println!("top by usage:");
+        for s in arr {
+            let name = s.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let uses = s.get("usage_count").and_then(|x| x.as_i64()).unwrap_or(0);
+            let conf = s.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            println!("  {name:<32}  uses={uses:>4}  conf={conf:>4.2}");
+        }
+    }
+    Ok(())
+}
+
+/// Percent-encode the operator-supplied URL segment. Bare
+/// reqwest doesn't encode IDs in path segments; we do it
+/// ourselves so a hyphen-bearing UUID doesn't break the route
+/// match.
+fn urlencode(s: &str) -> String {
+    // Conservative: encode every byte that isn't an unreserved
+    // URL char. Matches RFC 3986 §2.3.
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        let c = *b as char;
+        let safe = c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~');
+        if safe {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn list(extra_roots: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
