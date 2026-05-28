@@ -164,12 +164,22 @@ pub fn register(
             );
         }
         {
-            let s = store;
+            let s = store.clone();
             bridge.register(
                 "planning.verification_log",
                 Arc::new(FnHandler(move |ctx: InvocationCtx| {
                     let s = s.clone();
                     async move { handle_verification_log(&s, &ctx) }
+                })),
+            );
+        }
+        {
+            let s = store;
+            bridge.register(
+                "planning.export_spec",
+                Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                    let s = s.clone();
+                    async move { handle_export_spec(&s, &ctx) }
                 })),
             );
         }
@@ -290,6 +300,20 @@ pub fn planning_capability_descriptors() -> &'static [(&'static str, &'static st
              chronologically. Empty array when verification \
              was skipped (verify_steps = false) OR no \
              success_criteria fired for this plan.",
+        ),
+        (
+            "planning.export_spec",
+            "RELIX-7.24 follow-up: export a stored plan as a \
+             portable artifact for external trackers. Args \
+             JSON: `{plan_id, format}` where `format` is one \
+             of `\"json\"` (full structured PlanSpec + \
+             workflow_yaml + status + decision metadata, with \
+             a `schema_version` field set to PLAN_SPEC_VERSION) \
+             or `\"markdown\"` (human-readable summary suitable \
+             for pasting into Linear / GitHub Issues / Jira). \
+             Returns `{plan_id, format, content}`. The spec \
+             signature is preserved in the JSON export so \
+             consumers can re-verify tamper-evidence.",
         ),
     ]
 }
@@ -973,6 +997,171 @@ fn handle_verification_log(store: &super::ApprovalStore, ctx: &InvocationCtx) ->
 #[derive(Debug, Serialize)]
 struct VerificationLogResponse {
     entries: Vec<super::VerificationEntry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ExportSpecArgs {
+    #[serde(default)]
+    plan_id: String,
+    #[serde(default = "default_export_format")]
+    format: String,
+}
+
+fn default_export_format() -> String {
+    "json".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct ExportResponse {
+    plan_id: String,
+    format: String,
+    content: String,
+}
+
+fn handle_export_spec(store: &super::ApprovalStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let args: ExportSpecArgs = match decode(ctx) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    if args.plan_id.trim().is_empty() {
+        return invalid("plan_id is required");
+    }
+    let record = match store.get(&args.plan_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return invalid(&format!(
+                "planning.export_spec: plan_id `{}` not found",
+                args.plan_id
+            ));
+        }
+        Err(e) => return internal_msg(&format!("approval store: {e}")),
+    };
+    let format = args.format.trim().to_ascii_lowercase();
+    let content = match format.as_str() {
+        "json" => match render_export_json(&record) {
+            Ok(s) => s,
+            Err(e) => {
+                return internal_msg(&format!("planning.export_spec: encode JSON: {e}"));
+            }
+        },
+        "markdown" | "md" => render_export_markdown(&record),
+        other => {
+            return invalid(&format!(
+                "planning.export_spec: format must be 'json' or 'markdown', got `{other}`"
+            ));
+        }
+    };
+    ok_json(&ExportResponse {
+        plan_id: args.plan_id,
+        format: if format == "md" {
+            "markdown".into()
+        } else {
+            format
+        },
+        content,
+    })
+}
+
+/// JSON export. Wraps the hardened PlanSpec + workflow_yaml +
+/// approval/verification metadata in a stable schema with an
+/// explicit `schema_version` field so external tools can lock
+/// against a known shape.
+fn render_export_json(record: &super::ApprovalRecord) -> serde_json::Result<String> {
+    let payload = serde_json::json!({
+        "schema_version": super::PLAN_SPEC_VERSION,
+        "plan_id": record.plan_id,
+        "status": record.status.as_str(),
+        "created_at_ms": record.created_at_ms,
+        "decided_at_ms": record.decided_at_ms,
+        "decision_note": record.decision_note,
+        "spec": record.spec,
+        "workflow_yaml": record.workflow_yaml,
+        "orchestrator_meta": record.orchestrator_meta,
+        "critic_meta": record.critic_meta,
+    });
+    serde_json::to_string_pretty(&payload)
+}
+
+/// Markdown export. Operator-friendly summary suitable for
+/// pasting into a tracker issue. Captures every field that
+/// would inform a human reviewer; the structured JSON export
+/// is the authoritative artifact for tooling.
+fn render_export_markdown(record: &super::ApprovalRecord) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "# Relix Plan {}", record.plan_id);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- **Status:** {}", record.status.as_str());
+    let _ = writeln!(out, "- **Created:** {} (unix ms)", record.created_at_ms);
+    if let Some(d) = record.decided_at_ms {
+        let _ = writeln!(out, "- **Decided:** {} (unix ms)", d);
+    }
+    if let Some(note) = &record.decision_note {
+        let _ = writeln!(out, "- **Decision note:** {note}");
+    }
+    if let Some(sig) = &record.spec.signature {
+        let _ = writeln!(out, "- **Signature (blake3):** `{sig}`");
+    }
+    let _ = writeln!(out, "- **Spec version:** {}", record.spec.version);
+    let _ = writeln!(
+        out,
+        "- **Complexity:** {:.2} (is_complex={})",
+        record.spec.complexity_score, record.spec.is_complex
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Goal");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", record.spec.goal);
+    let _ = writeln!(out);
+    if !record.spec.constraints.is_empty() {
+        let _ = writeln!(out, "## Constraints");
+        let _ = writeln!(out);
+        for c in &record.spec.constraints {
+            let _ = writeln!(out, "- {c}");
+        }
+        let _ = writeln!(out);
+    }
+    if !record.spec.success_criteria.is_empty() {
+        let _ = writeln!(out, "## Success criteria");
+        let _ = writeln!(out);
+        for s in &record.spec.success_criteria {
+            let _ = writeln!(out, "- {s}");
+        }
+        let _ = writeln!(out);
+    }
+    if !record.spec.preferred_agents.is_empty() {
+        let _ = writeln!(
+            out,
+            "- **Preferred agents:** {}",
+            record.spec.preferred_agents.join(", ")
+        );
+    }
+    if !record.spec.forbidden_agents.is_empty() {
+        let _ = writeln!(
+            out,
+            "- **Forbidden agents:** {}",
+            record.spec.forbidden_agents.join(", ")
+        );
+    }
+    if !record.spec.changelog.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## Changelog");
+        let _ = writeln!(out);
+        for ch in &record.spec.changelog {
+            let _ = writeln!(
+                out,
+                "- `{}` @ {}ms — {}",
+                ch.change_type, ch.changed_at_ms, ch.description
+            );
+        }
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Generated workflow");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "```yaml");
+    let _ = writeln!(out, "{}", record.workflow_yaml);
+    let _ = writeln!(out, "```");
+    out
 }
 
 #[derive(Debug, Serialize)]
@@ -2020,11 +2209,78 @@ mod tests {
             "planning.reject_plan",
             "planning.list_approvals",
             "planning.get_approval",
+            "planning.verification_log",
+            "planning.export_spec",
         ] {
             assert!(
                 methods.contains(&expected),
-                "missing approval descriptor: {expected}"
+                "missing descriptor: {expected}"
             );
+        }
+    }
+
+    #[test]
+    fn handle_export_spec_json_round_trips_signature() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        seed_pending_record(&store, "exp-json");
+        let ctx = ctx_with(br#"{"plan_id":"exp-json","format":"json"}"#);
+        let HandlerOutcome::Ok(body) = handle_export_spec(&store, &ctx) else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["plan_id"], "exp-json");
+        assert_eq!(v["format"], "json");
+        let content = v["content"].as_str().expect("content string");
+        let parsed: serde_json::Value =
+            serde_json::from_str(content).expect("content parses as JSON");
+        assert_eq!(parsed["schema_version"], super::super::PLAN_SPEC_VERSION);
+        assert_eq!(parsed["spec"]["spec_id"], "exp-json");
+        // Signature round-trips → consumer can re-verify.
+        let sig = parsed["spec"]["signature"].as_str().expect("signature");
+        assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn handle_export_spec_markdown_renders_human_summary() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        seed_pending_record(&store, "exp-md");
+        let ctx = ctx_with(br#"{"plan_id":"exp-md","format":"markdown"}"#);
+        let HandlerOutcome::Ok(body) = handle_export_spec(&store, &ctx) else {
+            panic!("expected Ok");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["format"], "markdown");
+        let content = v["content"].as_str().unwrap();
+        assert!(content.contains("# Relix Plan exp-md"));
+        assert!(content.contains("## Goal"));
+        assert!(content.contains("```yaml"));
+        assert!(content.contains("Signature (blake3):"));
+    }
+
+    #[test]
+    fn handle_export_spec_rejects_unknown_format() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        seed_pending_record(&store, "exp-bad");
+        let ctx = ctx_with(br#"{"plan_id":"exp-bad","format":"binary"}"#);
+        match handle_export_spec(&store, &ctx) {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("format must be"), "{}", env.cause);
+            }
+            _ => panic!("expected INVALID_ARGS"),
+        }
+    }
+
+    #[test]
+    fn handle_export_spec_returns_not_found_for_unknown_plan() {
+        let store = super::super::ApprovalStore::open_in_memory().unwrap();
+        let ctx = ctx_with(br#"{"plan_id":"ghost"}"#);
+        match handle_export_spec(&store, &ctx) {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("not found"));
+            }
+            _ => panic!("expected INVALID_ARGS"),
         }
     }
 

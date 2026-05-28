@@ -89,6 +89,15 @@ pub struct ListApprovalsQuery {
     pub peer: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ExportSpecQuery {
+    /// `"json"` (default) | `"markdown"`.
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
 /// `POST /v1/planning/plan`
 pub async fn create_plan(
     State(state): State<AppState>,
@@ -275,6 +284,135 @@ pub async fn verification_log(
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
+}
+
+/// `GET /v1/planning/export/:id` — RELIX-7.24 follow-up. Thin
+/// proxy onto `planning.export_spec`. Default format is JSON;
+/// pass `?format=markdown` to get the human-readable summary.
+pub async fn export_spec(
+    State(state): State<AppState>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+    Query(q): Query<ExportSpecQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if plan_id.trim().is_empty() {
+        return bad_request("plan_id is required");
+    }
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let format = q
+        .format
+        .clone()
+        .unwrap_or_else(|| "json".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let body = serde_json::json!({
+        "plan_id": plan_id,
+        "format": format,
+    });
+    match call_peer_json(&state, &peer, "planning.export_spec", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/planning/verification/:id/stream` — RELIX-7.24
+/// Stage-5 streaming variant. Opens a Server-Sent Events
+/// connection that polls `planning.verification_log` on the
+/// coordinator every 500ms and emits each NEW entry as one
+/// SSE `event: entry` payload. Emits `event: heartbeat`
+/// every 10s to keep proxies + load balancers from closing
+/// the connection on idle plans. Closes either when the
+/// consumer disconnects OR after a hard 10-minute cap (the
+/// consumer can reconnect to keep watching).
+///
+/// Event shapes:
+///
+/// - `event: entry` + `data: {VerificationEntry JSON}`
+/// - `event: heartbeat` + `data: {"seen":<N>}` every 10s of idle
+/// - `event: done` + `data: {"seen":<N>, "reason":"<why>"}`
+///   when the cap fires or polling encounters a fatal error
+pub async fn verification_stream(
+    State(state): State<AppState>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+    Query(q): Query<PeerQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::convert::Infallible;
+
+    if plan_id.trim().is_empty() {
+        return bad_request("plan_id is required");
+    }
+
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let state = state.clone();
+    let plan_id = plan_id.clone();
+
+    let stream = async_stream::stream! {
+        let poll_interval = std::time::Duration::from_millis(500);
+        let hard_cap = std::time::Duration::from_secs(600);
+        let heartbeat_after = std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let mut seen: usize = 0;
+        let mut last_emit = std::time::Instant::now();
+        let body = serde_json::json!({ "plan_id": plan_id });
+        loop {
+            if started.elapsed() >= hard_cap {
+                let payload = serde_json::json!({
+                    "seen": seen,
+                    "reason": "10-minute stream cap reached; reconnect to keep watching",
+                });
+                yield Ok::<_, Infallible>(
+                    Event::default()
+                        .event("done")
+                        .data(payload.to_string()),
+                );
+                break;
+            }
+            match call_peer_json(&state, &peer, "planning.verification_log", &body).await {
+                Ok(v) => {
+                    let entries = v
+                        .get("entries")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let total = entries.len();
+                    if total > seen {
+                        for entry in &entries[seen..] {
+                            yield Ok(Event::default()
+                                .event("entry")
+                                .data(entry.to_string()));
+                        }
+                        seen = total;
+                        last_emit = std::time::Instant::now();
+                    } else if last_emit.elapsed() >= heartbeat_after {
+                        yield Ok(Event::default()
+                            .event("heartbeat")
+                            .data(serde_json::json!({"seen": seen}).to_string()));
+                        last_emit = std::time::Instant::now();
+                    }
+                }
+                Err(_) => {
+                    // Coordinator unreachable. Emit a single
+                    // done event and terminate so the consumer
+                    // doesn't sit on a half-broken stream.
+                    let payload = serde_json::json!({
+                        "seen": seen,
+                        "reason": "coordinator verification_log call failed; stream closed",
+                    });
+                    yield Ok(Event::default()
+                        .event("done")
+                        .data(payload.to_string()));
+                    break;
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new())
+        .into_response()
 }
 
 // ── shared helpers ────────────────────────────────────────

@@ -143,11 +143,28 @@ pub async fn run(args: BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         match prompt_decision()? {
             Decision::Approve(note) => {
+                // RELIX-7.24 streaming verification: spawn a
+                // task that consumes the SSE stream and
+                // prints each new entry live AS the approve
+                // call executes the workflow. Tied to a
+                // cancel sender so the stream consumer exits
+                // cleanly once approve_plan returns.
+                let bridge_for_stream = args.bridge.clone();
+                let plan_id_for_stream = plan_id.clone();
+                let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+                let stream_handle = tokio::spawn(async move {
+                    stream_verification_live(&bridge_for_stream, &plan_id_for_stream, stop_rx)
+                        .await;
+                });
                 let approval_response =
                     call_approve(&args.bridge, &plan_id, note.as_deref()).await?;
+                // Approve returned — execution is done. Tell
+                // the stream task to wrap up.
+                let _ = stop_tx.send(());
+                let _ = stream_handle.await;
                 pretty_print_approval(&approval_response);
-                // 4. When verification ran, fetch the full
-                // log + display.
+                // Final full log (catches any entry the
+                // stream's last poll missed in the race).
                 if let Ok(log) = fetch_verification_log(&args.bridge, &plan_id).await {
                     pretty_print_verification_log(&log);
                 }
@@ -498,6 +515,88 @@ async fn fetch_verification_log(
     let body = http_get(&url).await?;
     serde_json::from_str(&body)
         .map_err(|e| format!("decode verification log: {e} (body={body})").into())
+}
+
+/// Open the SSE stream and print each `entry` event as it
+/// arrives. Exits cleanly when `stop` fires (the parent task
+/// signals end-of-execution) OR when the server closes the
+/// stream OR when the connection errors. Best-effort: any
+/// transport error is silently swallowed so the parent's
+/// approve_plan flow stays the source of truth.
+async fn stream_verification_live(
+    bridge: &str,
+    plan_id: &str,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    let url = format!(
+        "{}/v1/planning/verification/{}/stream",
+        bridge.trim_end_matches('/'),
+        urlencode(plan_id)
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+    println!();
+    println!("--- live verification stream ---");
+    let mut buf = String::new();
+    let mut stream = resp;
+    loop {
+        tokio::select! {
+            _ = &mut stop => return,
+            chunk = stream.chunk() => {
+                let Ok(Some(bytes)) = chunk else { return };
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                // Process complete SSE messages (delimited
+                // by a blank line). Each message has the
+                // form `event: <name>\ndata: <payload>\n\n`.
+                while let Some(idx) = buf.find("\n\n") {
+                    let msg: String = buf[..idx].to_string();
+                    buf.replace_range(..idx + 2, "");
+                    let mut event_name: Option<String> = None;
+                    let mut data: Option<String> = None;
+                    for line in msg.lines() {
+                        if let Some(rest) = line.strip_prefix("event:") {
+                            event_name = Some(rest.trim().to_string());
+                        } else if let Some(rest) = line.strip_prefix("data:") {
+                            data = Some(rest.trim().to_string());
+                        }
+                    }
+                    if let (Some(name), Some(payload)) = (event_name, data) {
+                        match name.as_str() {
+                            "entry" => print_stream_entry(&payload),
+                            "done" => return,
+                            _ => {} // ignore heartbeat / keep-alive
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn print_stream_entry(payload: &str) {
+    let Ok(v) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+    let step = v.get("step_id").and_then(Value::as_str).unwrap_or("?");
+    let strategy = v
+        .get("strategy_used")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let passed = v.get("passed").and_then(Value::as_bool).unwrap_or(false);
+    let reason = v.get("reason").and_then(Value::as_str).unwrap_or("");
+    println!(
+        "  [{}] {step:<24} {strategy:<18}  {reason}",
+        if passed { "PASS" } else { "FAIL" }
+    );
 }
 
 fn urlencode(s: &str) -> String {

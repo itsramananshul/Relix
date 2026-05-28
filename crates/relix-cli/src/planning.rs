@@ -153,6 +153,24 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// RELIX-7.24 follow-up: export a stored plan as a
+    /// portable artifact for external trackers. `--format
+    /// markdown` produces a human-readable summary; default
+    /// (`json`) produces the full structured PlanSpec +
+    /// workflow_yaml + signature, suitable for any tool that
+    /// can consume stable JSON. `--output path.{md,json}`
+    /// writes to disk instead of stdout.
+    Export {
+        plan_id: String,
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -209,7 +227,52 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             bridge,
             raw,
         } => verification(&bridge, &plan_id, raw).await,
+        Cmd::Export {
+            plan_id,
+            format,
+            output,
+            bridge,
+            raw,
+        } => export(&bridge, &plan_id, &format, output.as_deref(), raw).await,
     }
+}
+
+async fn export(
+    bridge: &str,
+    plan_id: &str,
+    format: &str,
+    output: Option<&std::path::Path>,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/v1/planning/export/{}?format={}",
+        bridge.trim_end_matches('/'),
+        urlencode(plan_id),
+        urlencode(format)
+    );
+    let body = http_get(&url).await?;
+    if raw {
+        if let Some(path) = output {
+            std::fs::write(path, body.as_bytes())?;
+            println!("(wrote {} bytes to {})", body.len(), path.display());
+        } else {
+            println!("{body}");
+        }
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("decode export response: {e} (body={body})"))?;
+    let content = v
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or("export response missing `content` field")?;
+    if let Some(path) = output {
+        std::fs::write(path, content.as_bytes())?;
+        println!("(wrote {} bytes to {})", content.len(), path.display());
+    } else {
+        println!("{content}");
+    }
+    Ok(())
 }
 
 async fn verification(

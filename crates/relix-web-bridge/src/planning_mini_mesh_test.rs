@@ -142,6 +142,16 @@ async fn planning_mini_mesh_all_endpoints() {
         name = "ops_orchestrator_status"
         method = "planning.orchestrator_status"
         allow_groups = ["operators"]
+
+        [[rules]]
+        name = "ops_verification_log"
+        method = "planning.verification_log"
+        allow_groups = ["operators"]
+
+        [[rules]]
+        name = "ops_export_spec"
+        method = "planning.export_spec"
+        allow_groups = ["operators"]
         "#,
     );
 
@@ -335,6 +345,96 @@ async fn planning_mini_mesh_all_endpoints() {
             }
         })),
     );
+    // planning.export_spec: canned coordinator returns one
+    // export shape for either format.
+    dispatch.register(
+        "planning.export_spec",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| async move {
+            let args_str = std::str::from_utf8(&ctx.args).unwrap_or("");
+            let v: serde_json::Value =
+                serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+            let format = v
+                .get("format")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("json")
+                .to_string();
+            let plan_id = v
+                .get("plan_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let content = if format == "markdown" {
+                format!("# Relix Plan {plan_id}\n\n## Goal\n\nDo the thing.\n")
+            } else {
+                serde_json::json!({
+                    "schema_version": 1,
+                    "plan_id": plan_id,
+                    "spec": {"goal": "Do the thing."},
+                })
+                .to_string()
+            };
+            let body = serde_json::json!({
+                "plan_id": plan_id,
+                "format": format,
+                "content": content,
+            });
+            HandlerOutcome::Ok(serde_json::to_vec(&body).unwrap_or_default())
+        })),
+    );
+    // planning.verification_log: returns a growing list. On
+    // the first call we return 1 entry; on subsequent calls
+    // we return 2. This lets the SSE stream scenario observe
+    // a NEW entry appear after the second poll.
+    let verification_call_counter = Arc::new(tokio::sync::Mutex::new(0u32));
+    dispatch.register(
+        "planning.verification_log",
+        Arc::new(FnHandler({
+            let counter = verification_call_counter.clone();
+            move |_ctx: InvocationCtx| {
+                let counter = counter.clone();
+                async move {
+                    let mut g = counter.lock().await;
+                    *g += 1;
+                    let n = *g;
+                    drop(g);
+                    let entries: Vec<serde_json::Value> = if n == 1 {
+                        vec![serde_json::json!({
+                            "plan_id": "stream-test",
+                            "step_id": "first",
+                            "criterion": "must include foo",
+                            "strategy_used": "keyword_presence",
+                            "passed": true,
+                            "reason": "first entry",
+                            "verified_at_ms": 1000,
+                        })]
+                    } else {
+                        vec![
+                            serde_json::json!({
+                                "plan_id": "stream-test",
+                                "step_id": "first",
+                                "criterion": "must include foo",
+                                "strategy_used": "keyword_presence",
+                                "passed": true,
+                                "reason": "first entry",
+                                "verified_at_ms": 1000,
+                            }),
+                            serde_json::json!({
+                                "plan_id": "stream-test",
+                                "step_id": "second",
+                                "criterion": "must include bar",
+                                "strategy_used": "keyword_presence",
+                                "passed": false,
+                                "reason": "second entry",
+                                "verified_at_ms": 1500,
+                            }),
+                        ]
+                    };
+                    let body = serde_json::json!({ "entries": entries });
+                    HandlerOutcome::Ok(serde_json::to_vec(&body).unwrap_or_default())
+                }
+            }
+        })),
+    );
     let dispatch = Arc::new(dispatch);
 
     let (_client, events, addr) = boot_peer(187).await;
@@ -432,6 +532,15 @@ addr = "{addr}"
             "/v1/planning/status",
             get(crate::planning::orchestrator_status),
         )
+        .route(
+            "/v1/planning/verification/:id",
+            get(crate::planning::verification_log),
+        )
+        .route(
+            "/v1/planning/verification/:id/stream",
+            get(crate::planning::verification_stream),
+        )
+        .route("/v1/planning/export/:id", get(crate::planning::export_spec))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = listener.local_addr().unwrap();
@@ -566,4 +675,67 @@ addr = "{addr}"
     assert_eq!(resp.status().as_u16(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body, status_response);
+
+    // 9. GET /v1/planning/verification/stream-test/stream →
+    // SSE stream emits entries as they appear in the
+    // verification log. Canned coordinator returns 1 entry
+    // on poll #1 and 2 entries on poll #2 — the stream
+    // should emit two distinct `entry` events.
+    let url = format!("http://{bound}/v1/planning/verification/stream-test/stream");
+    let mut resp = timeout(Duration::from_secs(15), http.get(&url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    // Consume the SSE byte stream until we've seen two
+    // entry events OR 10s elapse.
+    let mut buf = String::new();
+    let mut entry_events_seen = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while entry_events_seen < 2 && std::time::Instant::now() < deadline {
+        let chunk = timeout(Duration::from_secs(2), resp.chunk()).await;
+        let Ok(Ok(Some(bytes))) = chunk else { break };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        // Count newline-separated `event: entry` markers.
+        entry_events_seen = buf.matches("event: entry").count();
+    }
+    assert!(
+        entry_events_seen >= 2,
+        "expected at least two SSE entry events, got {entry_events_seen}; buf=\n{buf}"
+    );
+    // Drop the response → the stream task on the bridge side
+    // sees the consumer disconnect and stops.
+    drop(resp);
+
+    // 10. GET /v1/planning/export/exp-1?format=markdown → 200
+    // + content payload.
+    let url = format!("http://{bound}/v1/planning/export/exp-1?format=markdown");
+    let resp = timeout(Duration::from_secs(15), http.get(&url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["format"], "markdown");
+    assert_eq!(body["plan_id"], "exp-1");
+    assert!(
+        body["content"]
+            .as_str()
+            .unwrap()
+            .contains("# Relix Plan exp-1")
+    );
+
+    // 11. GET /v1/planning/export/exp-1 (default JSON) → 200
+    // + JSON content with schema_version.
+    let url = format!("http://{bound}/v1/planning/export/exp-1");
+    let resp = timeout(Duration::from_secs(15), http.get(&url).send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["format"], "json");
+    let content_str = body["content"].as_str().unwrap();
+    let content_json: Value = serde_json::from_str(content_str).unwrap();
+    assert_eq!(content_json["schema_version"], 1);
 }
