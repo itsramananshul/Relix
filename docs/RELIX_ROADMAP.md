@@ -518,7 +518,15 @@ For SaaS developers, plugins are how they add domain-specific capabilities. The 
 
 ---
 
-## Part 6 — Layered Memory + Agent Self-Modeling System `[DONE — commits 41ad328 through 406a995]`
+## Part 6 — Layered Memory + Agent Self-Modeling System `[DONE — commits 41ad328 through 406a995, gaps closed in 3c9f3ec / 80980e1 / e39a079 / 0e6fd5e]`
+
+> **GAP-FOLLOWUP (2026-05-28):** `docs/GAP_REPORT.md` flagged GAPS 5, 6, 7, 8 against this section as "MISLABELED [DONE]" — operator capabilities, anomaly scoring, quarantine flow, integrity auditor, inspector editing surface, and the consolidation archiver were all unbuilt at the time of the report. They have since been built in four commits:
+> - **3c9f3ec** — `memory.dialectic`, `memory.ingest_document`, `memory.ingest_image`, `memory.context_flush` + bridge endpoints + CLI subcommands.
+> - **80980e1** — write-time `AnomalyScorer`, `memory_quarantine` flow with three caps, `MemoryIntegrityAuditor` background task.
+> - **e39a079** — inspector editing surface: `memory.edit_record`, `memory.freeze_record`, `memory.unfreeze_record`, `memory.bulk_export`, `memory.request_model_refresh`.
+> - **0e6fd5e** — `ConsolidationArchiver` background task (6h interval) + Layer-1 cascade consolidation.
+>
+> Deferred items: scope-to-context (still owed; needs a `scope` column + vocabulary decision), hard-delete cascade (the inspector still uses `invalidate`), separate low-priority Qdrant segment (single-collection deployment makes this infeasible without a breaking schema change), and a dedicated chronicle channel for archive events (currently a structured tracing line).
 
 This is the biggest architectural feature. It combines Qdrant for storage, Nomic Embed for embeddings, and a Honcho-inspired layered memory model that gives every agent genuine understanding of its users and itself.
 
