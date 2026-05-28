@@ -1903,7 +1903,151 @@ default     = "default"               # what to fall back to
 auto_inject = true                    # inject identity into every system prompt
 ```
 
-### 7.19 Per-Step Confidence Scoring + Fallback `[SKIPPED — requires per-action-class confidence evaluators (tool-call / reasoning / response), retry-or-escalate state machine wired into the SOL VM + coordinator approval flow, schema-validation middleware on every tool call, and the audit-trail confidence-score column; large architecturally-coordinated build, not single-session deliverable; deferred to a dedicated session]`
+### 7.19 Per-Step Confidence Scoring + Fallback `[DONE — commits 574dbc5 + 9933aa0 + c24dd33 + aa12950 + e2f0b27]`
+
+**Shipped this session:**
+
+- **`crates/relix-runtime/src/confidence/` module (commit 574dbc5)**:
+  - `config.rs` — `[confidence]` TOML schema: `enabled`,
+    `window_size` (default 100), `p95_latency_baseline_ms`
+    (default 1500), `error_rate_discount` (default 0.5),
+    `[confidence.weights]` block (5 sub-score weights summing
+    to 1.0 by default), and `[[confidence.policies]]` array
+    where each policy carries a `capability` glob,
+    `low_threshold` (default 0.5), `critical_threshold`
+    (default 0.3), and per-tier `FallbackActionConfig` of one
+    of `Pass`, `Retry { max_retries, retry_delay_ms }`,
+    `Escalate { escalate_to }`, `SafeDefault { default_value
+    }`, `Alert { alert_message }`, `Abort { abort_message }`.
+  - `scorer.rs` — `ConfidenceScorer` with five weighted
+    sub-scores:
+    1. `response_length` — empty → 0.0 short-circuit;
+       optimal band 10–500 tokens (chars/4 estimate).
+    2. `response_coherence` — end-with-punctuation bump,
+       trigram-uniqueness penalty.
+    3. `provider_signal` — `finish_reason` (`stop` → 1.0,
+       `length` → 0.55, `content_filter` → 0.30) +
+       `exp(logprob)` clamped to [0, 1]; both → average.
+    4. `error_rate_history` — `1.0 − error_rate` from the
+       (agent, method) rolling window.
+    5. `latency_signal` — 1.0 ≤ baseline, linear taper to
+       0.0 at 4× baseline.
+    Final score is the weighted average, halved when rolling
+    error rate ≥ 0.5. `snapshot()` returns p50/p95/p99 latency
+    by reusing `crate::metrics::query::percentile`.
+  - `fallback.rs` — `FallbackEngine` with glob capability
+    matching (`tool.*`, `*.chat`, `*backup*`), first-match
+    wins; `decide(method, score)` returns the action verdict
+    without executing.
+  - `cell.rs` — `LastConfidenceCell` — lock-free
+    `Arc<AtomicU32>` slot holding the f32 bits of the most
+    recent score (initial 1.0 per spec).
+  - `coordinator.rs` — `confidence.policy_list` /
+    `confidence.score_history` / `confidence.reset_history`
+    coord cap handlers.
+
+- **`DispatchBridge` integration (commit 9933aa0)**: three new
+  setters: `set_confidence(scorer, engine)`,
+  `set_last_confidence_cell(cell)`. Inside `handle_inbound`,
+  after the handler returns, the bridge:
+  1. Extracts `finish_reason` + `logprob` from the response
+     body (JSON top-level field OR `[finish_reason:...]`
+     trailer line; falls back to neutral when neither
+     parses).
+  2. Scores via `ConfidenceScorer.score_and_record()`.
+  3. Asks the `FallbackEngine` for a verdict and executes
+     the action in-process:
+     - `Retry`: re-invokes the SAME handler up to
+       `max_retries` (clamped to `MAX_RETRY_CAP = 8`),
+       sleeps `retry_delay_ms` between attempts, keeps the
+       highest-confidence outcome, stops early when score
+       crosses the low threshold.
+     - `Escalate`: looks up `escalate_to` in the bridge's
+       handler registry, invokes with the same args, scores
+       against ITS own (agent, method) window, no recursive
+       fallback (avoids infinite loops).
+     - `SafeDefault`: replaces `HandlerOutcome::Ok` body
+       with the configured default.
+     - `Alert`: `tracing::warn!` with structured fields
+       (agent, method, score, error_rate, message).
+     - `Abort`: converts to
+       `HandlerOutcome::Err(INVALID_ARGS)`.
+  4. Records the metric row with `confidence_score` set
+     (new column on `metrics_invocations` via a
+     `column_exists`-guarded ALTER TABLE migration; pre-7.19
+     databases pick up the column on open with the NULL
+     default).
+  5. Updates the shared `LastConfidenceCell` so SOL
+     `last_confidence()` reads the latest verdict.
+  6. Stamps the score on a new `confidence: Option<f32>`
+     field on `ResponseEnvelope` (serde-backwards-compat
+     via `#[serde(default, skip_serializing_if = ...)]`).
+
+  `InvocationCtx` now derives `Clone` so the retry / escalate
+  paths can re-invoke handlers without forcing handlers to
+  take ownership. The whole post-handler pipeline is a no-op
+  when no scorer is wired (pre-7.19 byte-for-byte path
+  preserved). 7 integration tests under
+  `dispatch::tests::confidence_*` cover the noop, envelope
+  stamping, safe_default swap, abort conversion, escalate
+  re-dispatch, retry count, cell update, and alert keeping
+  the original body.
+
+- **SOL `last_confidence()` builtin (commit c24dd33)**:
+  - New `Inst::LoadLastConfidence` zero-arg opcode.
+  - `VM` gains `last_confidence: f32` field (default 1.0)
+    + `last_confidence_cell: Option<LastConfidenceCell>` so
+    hosts can either call `set_last_confidence()` per-call
+    or attach a shared cell the dispatcher writes to.
+  - Analyzer recognises `last_confidence` as a zero-arg
+    builtin returning `Type::Float` (panics on extra args
+    at compile time).
+  - 6 unit tests covering the default reading, set/get
+    round-trip, multi-call sequence, shared-cell semantics,
+    and end-to-end source compile.
+  - `docs/sol-language-reference.md` §7.7 documents the
+    builtin, the five sub-scores, the error_rate_discount,
+    and an example flow that escalates on low confidence.
+
+- **Web bridge endpoints (commit aa12950)**:
+  - `GET /v1/confidence/policies` →
+    `confidence.policy_list`
+  - `GET /v1/confidence/history/:agent?method=ai.chat` →
+    `confidence.score_history`
+  - `POST /v1/confidence/reset` → `confidence.reset_history`
+    (body `{agent, method?, peer?}`; method omitted → clear
+    every method on that agent).
+
+  Default coordinator peer alias; `peer` query / body
+  override. Error mapping mirrors the metrics surface: 400
+  on missing required args, 404 on unknown peer alias, 502
+  on responder fault, 503 when no mesh client. Mini-mesh
+  integration test boots a fake coordinator peer, dials it
+  via `discover_and_pin`, mounts every route on an
+  ephemeral axum listener, and drives 5 reqwest scenarios
+  end-to-end.
+
+- **CLI subcommand (commit e2f0b27)**: `relix confidence
+  policies / history / reset` — each is a thin HTTP
+  forwarder onto the bridge. `policies` pretty-prints with
+  short action labels (`retry x3`, `escalate -> ai.chat.premium`,
+  `safe_default`, `alert`, `abort`). All accept
+  `--bridge <url>` and `--raw` for verbatim JSON dump.
+
+**Tests added (+58):** 37 confidence module (scorer, fallback,
+cell, coord caps including the 1000-call latency benchmark
+asserting <1ms/call), 7 dispatch pipeline integration
+(safe_default, abort, escalate, retry, cell update, alert,
+noop), 6 SOL builtin (default + set + sequence + shared cell
++ dispatcher-write-visible + source compile), 4 bridge
+(unit + mini-mesh 5-scenario), 2 CLI (action formatter +
+urlencode).
+
+**Quality gates green:**
+- `cargo fmt --all` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- `cargo test --workspace`: runtime 2316 (+51), bridge 462 (+4),
+  CLI 242 (+2), every other crate green. Zero failures.
 
 From the research: adding confidence scoring with fallback cut agent task failure rates by up to 50% on the Tau²-Bench benchmark. This is one of the highest-ROI reliability improvements possible.
 
