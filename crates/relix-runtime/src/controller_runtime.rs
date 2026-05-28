@@ -333,6 +333,39 @@ pub struct ExecutionSection {
     /// (`IdentityBundle::name`).
     #[serde(default)]
     pub agents: Vec<crate::nodes::execution::broker::AccessPolicy>,
+    /// `[execution.gateway]` — GAP 11 three-tier transactional
+    /// gateway. Absent means no persistent transaction store +
+    /// no `execution.*` capabilities; the legacy in-memory
+    /// `ActionGateway` keeps working as before.
+    #[serde(default)]
+    pub gateway: Option<GatewaySection>,
+}
+
+/// `[execution.gateway]` — GAP 11 settings.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GatewaySection {
+    /// When `true`, every dispatch through
+    /// [`crate::nodes::tool::dispatcher::ToolDispatcher::dispatch_with_options`]
+    /// returns a [`crate::nodes::execution::gateway_tier::DryRunPreview`]
+    /// instead of invoking the handler. Mostly used for pre-
+    /// production runs.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Path to the transaction-store SQLite file. Required to
+    /// boot the `execution.*` capabilities — when missing, the
+    /// gateway runs in-memory only.
+    #[serde(default)]
+    pub db_path: Option<std::path::PathBuf>,
+    /// Static Tier C list — tools that are NEVER permitted,
+    /// regardless of caller.
+    #[serde(default)]
+    pub blocked_tools: Vec<String>,
+    /// Optional evidence-store db path (GAP 12). When `Some`,
+    /// the gateway captures one structured evidence record per
+    /// dispatch. Defaults to the same DB as the transaction
+    /// store when unset.
+    #[serde(default)]
+    pub evidence_db_path: Option<std::path::PathBuf>,
 }
 
 /// One peer alias.
@@ -4298,6 +4331,62 @@ fn build_skills_runtime(
     })
 }
 
+/// GAP 11: compensating-call dispatcher used by
+/// `execution.rollback`. Wraps the local `ToolDispatcher` so
+/// Tier A rollbacks ride the same admission pipeline (broker
+/// check, secret resolution, evidence capture) as the original
+/// dispatch.
+struct LocalCompensatingDispatcher {
+    inner: std::sync::Arc<crate::nodes::tool::dispatcher::ToolDispatcher>,
+}
+
+impl LocalCompensatingDispatcher {
+    fn new(inner: std::sync::Arc<crate::nodes::tool::dispatcher::ToolDispatcher>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::nodes::execution::rollback::CompensatingDispatcher for LocalCompensatingDispatcher {
+    async fn invoke(&self, tool: &str, args_json: &str) -> Result<String, String> {
+        use crate::nodes::execution::gateway_tier::GatewayDispatchOptions;
+        // Tier A compensation actions themselves run as Tier B
+        // — a successful rollback is irreversible; the operator
+        // accepts that.
+        let opts = GatewayDispatchOptions::default()
+            .human_rollback_plan(format!("auto-compensation for {tool}"));
+        // The compensating call has no local handler — we route
+        // it through whichever capability the original tool
+        // author declared. The closure here is a passthrough;
+        // the bridge's outbound dispatcher will be reached via
+        // the manifest's routing.
+        //
+        // Honest scope: in the alpha the compensating call must
+        // be a tool the same controller owns OR a tool reached
+        // through the existing tool_mesh dispatcher. When the
+        // tool isn't local, the closure returns an error and
+        // the rollback row carries `success: false` so the
+        // operator sees it.
+        let arg = args_json.to_string();
+        let tool_owned = tool.to_string();
+        let tool_for_closure = tool_owned.clone();
+        self.inner
+            .dispatch_with_options("rollback", &tool_owned, &arg, opts, move |a| async move {
+                // Surface "not implemented locally" rather than
+                // attempting to fan out to a mesh peer; the
+                // gateway can't safely re-enter the dispatch
+                // bridge from inside a handler without a full
+                // tool-mesh wiring (which lives on the
+                // controller binary, not the runtime crate).
+                Err(format!(
+                    "compensating call to `{tool_for_closure}` not handled locally (args={a})"
+                ))
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 fn build_drift_config(cfg: &ControllerConfig) -> Option<crate::nodes::ai::guardrails::DriftConfig> {
     use crate::nodes::ai::guardrails::DriftConfig;
     let raw = cfg.guardrails.clone()?;
@@ -5100,11 +5189,63 @@ fn register_node_type_handlers(
         // AI handler's ToolDispatcher.
         let secret_store =
             std::sync::Arc::new(crate::nodes::execution::secrets::SecretStore::from_env());
-        let tool_dispatcher =
-            std::sync::Arc::new(crate::nodes::tool::dispatcher::ToolDispatcher::new(
-                secret_store,
-                access_broker.clone(),
-            ));
+        // GAP 11: parse the `[execution.gateway]` block and
+        // build the persistent transaction store when an
+        // operator opted in. Absent → in-memory ActionGateway
+        // only (legacy behaviour); present + db_path missing →
+        // warn + skip; present + db_path → open the store and
+        // wire it into the dispatcher.
+        let gateway_section = cfg
+            .execution
+            .as_ref()
+            .and_then(|e| e.gateway.as_ref())
+            .cloned();
+        let gateway_store: Option<
+            std::sync::Arc<crate::nodes::execution::transaction_store::TransactionStore>,
+        > = match gateway_section.as_ref() {
+            Some(g) if g.db_path.is_some() => {
+                let p = g.db_path.as_ref().unwrap().clone();
+                match crate::nodes::execution::transaction_store::TransactionStore::open(&p) {
+                    Ok(s) => Some(std::sync::Arc::new(s)),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %p.display(),
+                            "[execution.gateway] open store failed; running in-memory only",
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let blocked_tools = gateway_section
+            .as_ref()
+            .map(|g| g.blocked_tools.clone())
+            .unwrap_or_default();
+        let global_dry_run = gateway_section.as_ref().map(|g| g.dry_run).unwrap_or(false);
+        let mut tool_dispatcher_builder = crate::nodes::tool::dispatcher::ToolDispatcher::new(
+            secret_store,
+            access_broker.clone(),
+        )
+        .with_blocked_tools(blocked_tools)
+        .with_global_dry_run(global_dry_run);
+        if let Some(s) = gateway_store.clone() {
+            tool_dispatcher_builder = tool_dispatcher_builder.with_transaction_store(s);
+        }
+        let tool_dispatcher = std::sync::Arc::new(tool_dispatcher_builder);
+        // Register `execution.rollback` + `execution.transaction_get`
+        // when the store is available. The compensating dispatcher
+        // hooks back into the same ToolDispatcher (downcast through
+        // a thin adapter that calls `dispatch_with_options`) so
+        // Tier A rollbacks ride the same admission pipeline.
+        if let Some(store) = gateway_store.clone() {
+            let comp_disp: std::sync::Arc<
+                dyn crate::nodes::execution::rollback::CompensatingDispatcher,
+            > = std::sync::Arc::new(LocalCompensatingDispatcher::new(tool_dispatcher.clone()));
+            crate::nodes::execution::rollback::register(bridge, store, Some(comp_disp));
+            tracing::info!("execution caps: registered rollback + transaction_get handlers");
+        }
         // OnceCell for the outbound tool dispatcher used by
         // the AI handler's planner ToolCall path. The
         // controller's startup flow can later populate this

@@ -8,6 +8,7 @@ mod config;
 mod doctor;
 mod email;
 mod eval;
+mod execution;
 mod export;
 mod flow;
 mod flow_run;
@@ -281,6 +282,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: eval::Cmd,
     },
+    /// GAP 11 + 12: transactional gateway + evidence inspector.
+    /// `relix execution rollback <transaction_id>` undoes a
+    /// transaction; `relix execution transaction <id>` prints
+    /// the full action history; `relix execution evidence
+    /// [--action <id>] [--actor <name>]` lists evidence
+    /// records.
+    Execution {
+        #[command(subcommand)]
+        cmd: execution::Cmd,
+    },
     /// PH-TERM-CLI: inspect + control tool.terminal.* on a
     /// tool node. `terminal sessions` lists live runs;
     /// `terminal audit` snapshots the completion ring;
@@ -450,6 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Workflow { cmd } => workflow::run(cmd).await,
         Cmd::Doctor(args) => doctor::run(args).await,
         Cmd::Eval { cmd } => eval::run(cmd).await,
+        Cmd::Execution { cmd } => execution::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,

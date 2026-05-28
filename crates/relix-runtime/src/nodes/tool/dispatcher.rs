@@ -21,7 +21,11 @@ use std::sync::{Arc, Mutex};
 
 use super::super::execution::broker::{AccessDecision, AgentAccessBroker};
 use super::super::execution::gateway::{ActionGateway, GatewayAction};
+use super::super::execution::gateway_tier::{DryRunPreview, GatewayDispatchOptions, GatewayTier};
 use super::super::execution::secrets::{SecretError, SecretStore};
+use super::super::execution::transaction_store::{
+    GatewayActionRow, TransactionStore, build_failure_row, build_success_row,
+};
 use super::contracts::ToolContract;
 use super::output_guard::ToolOutputGuard;
 
@@ -63,12 +67,57 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
-/// Central dispatcher. Cheap to clone (three Arcs).
+/// Central dispatcher. Cheap to clone (Arcs inside).
 #[derive(Clone)]
 pub struct ToolDispatcher {
     secret_store: Arc<SecretStore>,
     broker: Arc<AgentAccessBroker>,
     gateway: Arc<Mutex<ActionGateway>>,
+    /// GAP 11: optional persistent transaction store. When
+    /// `Some`, every `dispatch_with_options` call also writes
+    /// a row to `gateway_actions` so `execution.rollback` can
+    /// replay it. `None` keeps the in-memory `ActionGateway`
+    /// behaviour for backwards-compat callers.
+    transaction_store: Option<Arc<TransactionStore>>,
+    /// GAP 11: optional evidence sink. When `Some`, the
+    /// dispatcher captures one structured evidence record per
+    /// `dispatch_with_options` call.
+    evidence_sink: Option<Arc<dyn EvidenceCaptureSink>>,
+    /// GAP 11: Tier C — list of tools that are never permitted.
+    /// Populated from `[execution.gateway] blocked_tools`. An
+    /// empty list means no static blocks; per-call Tier C
+    /// classification via `GatewayDispatchOptions::blocked()`
+    /// still applies.
+    blocked_tools: Arc<Vec<String>>,
+    /// GAP 11: when `true`, every call goes through the
+    /// dry-run preview path regardless of the per-call
+    /// `dry_run` flag. Operators flip this on for
+    /// pre-production runs.
+    global_dry_run: bool,
+}
+
+/// Trait the dispatcher uses to hand evidence records to a
+/// store. Decoupled from the concrete `EvidenceStore` in
+/// `nodes/execution/evidence.rs` so the dispatcher compiles
+/// without the evidence wiring (and tests can stub it).
+pub trait EvidenceCaptureSink: Send + Sync {
+    /// Called once per `dispatch_with_options` call AFTER the
+    /// action row has been built. Implementations capture
+    /// state_before/state_after, redact args, compute diffs,
+    /// and persist the evidence row.
+    fn capture(&self, ctx: EvidenceCaptureCtx<'_>);
+}
+
+/// Per-call context handed to [`EvidenceCaptureSink::capture`].
+pub struct EvidenceCaptureCtx<'a> {
+    pub action: &'a GatewayActionRow,
+    pub agent: &'a str,
+    pub tool: &'a str,
+    pub args: &'a str,
+    pub result: Option<&'a str>,
+    pub error: Option<&'a str>,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
 }
 
 impl ToolDispatcher {
@@ -77,7 +126,48 @@ impl ToolDispatcher {
             secret_store,
             broker,
             gateway: Arc::new(Mutex::new(ActionGateway::new())),
+            transaction_store: None,
+            evidence_sink: None,
+            blocked_tools: Arc::new(Vec::new()),
+            global_dry_run: false,
         }
+    }
+
+    /// GAP 11: install the persistent transaction store. The
+    /// dispatcher records every `dispatch_with_options` call
+    /// into this store so `execution.rollback` can reach back.
+    pub fn with_transaction_store(mut self, store: Arc<TransactionStore>) -> Self {
+        self.transaction_store = Some(store);
+        self
+    }
+
+    /// GAP 11: install the static Tier C list. Tools on this
+    /// list are rejected with `AccessDenied` before any
+    /// handler dispatch.
+    pub fn with_blocked_tools(mut self, blocked: Vec<String>) -> Self {
+        self.blocked_tools = Arc::new(blocked);
+        self
+    }
+
+    /// GAP 11: flip global dry-run on/off. When on, every
+    /// dispatch returns a preview instead of running the
+    /// handler.
+    pub fn with_global_dry_run(mut self, dry_run: bool) -> Self {
+        self.global_dry_run = dry_run;
+        self
+    }
+
+    /// GAP 12: install an evidence-capture sink. When `Some`,
+    /// the dispatcher hands each completed action to the sink
+    /// for state-before/state-after capture + diff computation.
+    pub fn with_evidence_sink(mut self, sink: Arc<dyn EvidenceCaptureSink>) -> Self {
+        self.evidence_sink = Some(sink);
+        self
+    }
+
+    /// Borrow the transaction store handle (for tests).
+    pub fn transaction_store(&self) -> Option<Arc<TransactionStore>> {
+        self.transaction_store.clone()
     }
 
     /// Dispatch a single tool call. The `handler` closure
@@ -173,6 +263,237 @@ impl ToolDispatcher {
         }
     }
 
+    /// GAP 11 — rich dispatch that consults the three-tier
+    /// classification, dedupes on idempotency keys, supports
+    /// dry-run preview, and persists every call into the
+    /// transaction store (when configured).
+    ///
+    /// Returns the handler's result string on success. On
+    /// dry-run, the returned string is the JSON-encoded
+    /// [`DryRunPreview`]. On idempotency hit, the cached
+    /// result from the prior call is returned and the handler
+    /// is NOT invoked.
+    ///
+    /// Existing call sites that use the bare [`Self::dispatch`]
+    /// keep working unchanged.
+    pub async fn dispatch_with_options<F, Fut>(
+        &self,
+        agent: &str,
+        tool: &str,
+        args: &str,
+        mut options: GatewayDispatchOptions,
+        handler: F,
+    ) -> Result<String, DispatchError>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        // 0a. Static Tier C list.
+        if self.blocked_tools.iter().any(|t| t == tool) {
+            return Err(DispatchError::AccessDenied(format!(
+                "tool `{tool}` is on the gateway blocked list (Tier C)"
+            )));
+        }
+        // 0b. Per-call Tier C.
+        if let Some(GatewayTier::Blocked { reason }) = options.tier.as_ref() {
+            return Err(DispatchError::AccessDenied(format!(
+                "tool `{tool}` declared as Tier C: {reason}"
+            )));
+        }
+        // 1. Access broker.
+        match self.broker.check(agent, tool) {
+            AccessDecision::Allow => {}
+            AccessDecision::Deny { reason } => return Err(DispatchError::AccessDenied(reason)),
+            AccessDecision::RateLimited { retry_after_secs } => {
+                return Err(DispatchError::RateLimited { retry_after_secs });
+            }
+        }
+        // 2. Idempotency dedup.
+        if let Some(store) = self.transaction_store.as_ref()
+            && let Some(key) = options.idempotency_key.as_deref()
+            && let Ok(Some(prior)) = store.find_by_idempotency_key(tool, key)
+        {
+            // Replay the cached result. The handler is NOT
+            // invoked.
+            tracing::info!(
+                tool,
+                agent,
+                idempotency_key = %key,
+                action_id = %prior.action_id,
+                "dispatch_with_options: idempotency hit; replaying prior result"
+            );
+            if let Some(out) = prior.result {
+                return Ok(out);
+            }
+            if let Some(err) = prior.error {
+                return Err(DispatchError::HandlerFailed(format!(
+                    "idempotency replay: prior call failed: {err}"
+                )));
+            }
+            // Fall through if the prior row has neither a
+            // result nor an error — defensive.
+        }
+        // 3. Secret resolution.
+        let resolved_args = match self.secret_store.resolve(args) {
+            Ok(s) => s,
+            Err(SecretError::Missing(name, _hint)) => {
+                self.record_options_failure(
+                    tool,
+                    args,
+                    &options,
+                    format!("secret missing: {name}"),
+                );
+                return Err(DispatchError::SecretMissing(name));
+            }
+        };
+        // 4. Dry-run preview path.
+        let effective_dry_run = options.dry_run || self.global_dry_run;
+        if effective_dry_run {
+            options.dry_run = true;
+            let tier = options
+                .tier
+                .clone()
+                .unwrap_or(GatewayTier::HumanRollbackPlan {
+                    rollback_plan: String::new(),
+                });
+            let preview = DryRunPreview::build(tool, &resolved_args, &tier);
+            let payload = preview.to_json_string();
+            self.record_options_success(
+                tool,
+                &resolved_args,
+                Some(payload.clone()),
+                &options,
+                agent,
+                None,
+            );
+            return Ok(payload);
+        }
+        // 5. Handler dispatch.
+        let started = unix_millis();
+        let result = handler(resolved_args.clone()).await;
+        let completed = unix_millis();
+        match result {
+            Ok(output) => {
+                let guard = ToolOutputGuard::inspect(&output);
+                if guard.injection_detected {
+                    let reason = guard
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "tool output flagged by guard".to_string());
+                    self.record_options_failure(tool, &resolved_args, &options, reason.clone());
+                    return Err(DispatchError::HandlerFailed(reason));
+                }
+                let safe_output = guard.output;
+                self.record_options_success(
+                    tool,
+                    &resolved_args,
+                    Some(safe_output.clone()),
+                    &options,
+                    agent,
+                    Some((started, completed)),
+                );
+                self.broker.record_call(agent);
+                Ok(safe_output)
+            }
+            Err(reason) => {
+                self.record_options_failure(tool, &resolved_args, &options, reason.clone());
+                Err(DispatchError::HandlerFailed(reason))
+            }
+        }
+    }
+
+    fn record_options_success(
+        &self,
+        tool: &str,
+        args: &str,
+        result: Option<String>,
+        options: &GatewayDispatchOptions,
+        agent: &str,
+        timings: Option<(i64, i64)>,
+    ) {
+        let started_at_ms = timings.map(|(s, _)| s).unwrap_or_else(unix_millis);
+        let completed_at_ms = timings.map(|(_, c)| c).unwrap_or_else(unix_millis);
+        // Always update the legacy in-memory gateway so
+        // existing callers reading via `gateway_snapshot()`
+        // keep seeing the same shape.
+        let mut action = GatewayAction::new(tool, args, legacy_reversible(&options.tier));
+        if let Some(hint) = legacy_rollback_hint(&options.tier) {
+            action = action.with_rollback_hint(hint);
+        }
+        if let Some(r) = result.clone() {
+            action = action.with_result(r);
+        }
+        self.gateway.lock().unwrap().record_completed(action);
+        // GAP 11 — persist if a store is wired.
+        if let Some(store) = self.transaction_store.as_ref() {
+            let row = build_success_row(
+                tool,
+                args,
+                result.clone(),
+                options,
+                started_at_ms,
+                completed_at_ms,
+            );
+            if let Err(e) = store.record(&row) {
+                tracing::warn!(error = %e, tool, "dispatch_with_options: store record failed");
+            }
+            // GAP 12 — capture evidence.
+            if let Some(sink) = self.evidence_sink.as_ref() {
+                sink.capture(EvidenceCaptureCtx {
+                    action: &row,
+                    agent,
+                    tool,
+                    args,
+                    result: result.as_deref(),
+                    error: None,
+                    started_at_ms,
+                    completed_at_ms,
+                });
+            }
+        }
+    }
+
+    fn record_options_failure(
+        &self,
+        tool: &str,
+        args: &str,
+        options: &GatewayDispatchOptions,
+        error: String,
+    ) {
+        let completed_at_ms = unix_millis();
+        let started_at_ms = completed_at_ms;
+        let mut action = GatewayAction::new(tool, args, legacy_reversible(&options.tier));
+        if let Some(hint) = legacy_rollback_hint(&options.tier) {
+            action = action.with_rollback_hint(hint);
+        }
+        self.gateway.lock().unwrap().record_failed(action);
+        if let Some(store) = self.transaction_store.as_ref() {
+            let row = build_failure_row(
+                tool,
+                args,
+                error.clone(),
+                options,
+                started_at_ms,
+                completed_at_ms,
+            );
+            if let Err(e) = store.record(&row) {
+                tracing::warn!(error = %e, tool, "dispatch_with_options: store record failed (failure path)");
+            }
+            if let Some(sink) = self.evidence_sink.as_ref() {
+                sink.capture(EvidenceCaptureCtx {
+                    action: &row,
+                    agent: "",
+                    tool,
+                    args,
+                    result: None,
+                    error: Some(&error),
+                    started_at_ms,
+                    completed_at_ms,
+                });
+            }
+        }
+    }
+
     /// Schema-validated dispatch. Wraps [`Self::dispatch`]
     /// with JSON parsing + input/output validation against
     /// the supplied [`ToolContract`].
@@ -259,6 +580,38 @@ impl ToolDispatcher {
     pub fn rollback_notification(&self) -> String {
         self.gateway.lock().unwrap().rollback_notification()
     }
+}
+
+/// Map a [`GatewayTier`] back to the legacy `reversible: bool`
+/// the in-memory `ActionGateway` uses for the dashboard.
+fn legacy_reversible(tier: &Option<GatewayTier>) -> bool {
+    match tier {
+        Some(GatewayTier::AutoCompensated { .. }) => true,
+        Some(GatewayTier::HumanRollbackPlan { rollback_plan }) => !rollback_plan.is_empty(),
+        Some(GatewayTier::Blocked { .. }) => false,
+        None => true,
+    }
+}
+
+/// Pull the operator-readable rollback string out of a tier
+/// so the legacy in-memory gateway keeps showing the hint.
+fn legacy_rollback_hint(tier: &Option<GatewayTier>) -> Option<String> {
+    match tier {
+        Some(GatewayTier::AutoCompensated {
+            compensating_tool, ..
+        }) => Some(format!("auto-compensate via `{compensating_tool}`")),
+        Some(GatewayTier::HumanRollbackPlan { rollback_plan }) if !rollback_plan.is_empty() => {
+            Some(rollback_plan.clone())
+        }
+        _ => None,
+    }
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -557,5 +910,187 @@ mod tests {
         assert!(notice.contains("ROLLBACK NEEDED"));
         assert!(notice.contains("email.send"));
         assert!(notice.contains("manually retract"));
+    }
+
+    // ── GAP 11: dispatch_with_options ───────────────────────
+
+    use super::super::super::execution::gateway_tier::GatewayDispatchOptions;
+    use super::super::super::execution::transaction_store::TransactionStore;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn dispatcher_with_store() -> (ToolDispatcher, Arc<TransactionStore>) {
+        let store = store_with(&[]);
+        let broker = empty_broker();
+        let tx_store = Arc::new(TransactionStore::open_in_memory().unwrap());
+        let disp = ToolDispatcher::new(store, broker).with_transaction_store(tx_store.clone());
+        (disp, tx_store)
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_options_persists_action_to_transaction_store() {
+        let (disp, store) = dispatcher_with_store();
+        let opts = GatewayDispatchOptions::default()
+            .with_transaction_id("tx-test")
+            .human_rollback_plan("rollback by hand");
+        disp.dispatch_with_options("alice", "tool.x", r#"{"k":"v"}"#, opts, |args| async move {
+            Ok(format!("handled-{args}"))
+        })
+        .await
+        .unwrap();
+        let rows = store.list_for_transaction("tx-test").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].success);
+        assert!(rows[0].result.as_deref().unwrap().contains("handled-"));
+        assert_eq!(rows[0].tier.tag(), "human_rollback");
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_skips_handler_on_retry() {
+        let (disp, _store) = dispatcher_with_store();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let opts = || {
+            GatewayDispatchOptions::default()
+                .with_transaction_id("tx-idem")
+                .with_idempotency_key("k-1")
+                .human_rollback_plan("hint")
+        };
+        // First call runs the handler.
+        let c1 = calls.clone();
+        let r1 = disp
+            .dispatch_with_options("alice", "tool.x", "{}", opts(), |a| async move {
+                c1.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("first:{a}"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(r1.contains("first:"));
+        // Second call dedupes — handler is NOT invoked, the
+        // cached result comes back instead.
+        let c2 = calls.clone();
+        let r2 = disp
+            .dispatch_with_options("alice", "tool.x", "{}", opts(), |a| async move {
+                c2.fetch_add(1, Ordering::SeqCst);
+                Ok(format!("second:{a}"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "handler invoked twice — idempotency failed"
+        );
+        assert_eq!(r1, r2);
+    }
+
+    #[tokio::test]
+    async fn dry_run_returns_preview_without_invoking_handler() {
+        let (disp, store) = dispatcher_with_store();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let opts = GatewayDispatchOptions::default()
+            .with_transaction_id("tx-dry")
+            .auto_compensated("tool.x.undo", json!({"id": 1}))
+            .dry_run();
+        let c = calls.clone();
+        let r = disp
+            .dispatch_with_options("alice", "tool.x", r#"{"x":1}"#, opts, |_| async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok("real-call".into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["tier_tag"], "auto_compensated");
+        assert_eq!(v["compensating_tool"], "tool.x.undo");
+        // Row is persisted as dry_run.
+        let rows = store.list_for_transaction("tx-dry").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].dry_run);
+    }
+
+    #[tokio::test]
+    async fn statically_blocked_tool_is_refused_before_dispatch() {
+        let store = store_with(&[]);
+        let broker = empty_broker();
+        let disp = ToolDispatcher::new(store, broker)
+            .with_blocked_tools(vec!["tool.terminal.rm_rf".to_string()]);
+        let opts = GatewayDispatchOptions::default();
+        let err = disp
+            .dispatch_with_options("alice", "tool.terminal.rm_rf", "{}", opts, |_| async {
+                Ok("never".into())
+            })
+            .await
+            .unwrap_err();
+        match err {
+            DispatchError::AccessDenied(r) => assert!(r.contains("blocked list")),
+            other => panic!("expected AccessDenied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_call_blocked_tier_is_refused_before_dispatch() {
+        let (disp, _store) = dispatcher_with_store();
+        let opts = GatewayDispatchOptions::default().blocked("never permitted");
+        let err = disp
+            .dispatch_with_options("alice", "tool.x", "{}", opts, |_| async {
+                Ok("nope".into())
+            })
+            .await
+            .unwrap_err();
+        match err {
+            DispatchError::AccessDenied(r) => assert!(r.contains("never permitted")),
+            other => panic!("expected AccessDenied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_dispatch_keeps_old_behaviour() {
+        // Pre-GAP-11 callers using the bare `dispatch(...)` must
+        // still get the existing in-memory ActionGateway shape.
+        let store = store_with(&[]);
+        let broker = empty_broker();
+        let disp = ToolDispatcher::new(store, broker);
+        disp.dispatch(
+            "alice",
+            "web.fetch",
+            "{}",
+            true,
+            Some("re-fetch".into()),
+            |_| async { Ok("body".into()) },
+        )
+        .await
+        .unwrap();
+        let snap = disp.gateway_snapshot();
+        assert!(snap.contains("completed=1"));
+        // No transaction store wired → in-memory only; no
+        // transaction row appears anywhere.
+        assert!(disp.transaction_store().is_none());
+    }
+
+    #[tokio::test]
+    async fn global_dry_run_overrides_per_call_option() {
+        let store = store_with(&[]);
+        let broker = empty_broker();
+        let tx_store = Arc::new(TransactionStore::open_in_memory().unwrap());
+        let disp = ToolDispatcher::new(store, broker)
+            .with_transaction_store(tx_store.clone())
+            .with_global_dry_run(true);
+        let opts = GatewayDispatchOptions::default()
+            .with_transaction_id("tx-globaldry")
+            .human_rollback_plan("plan");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let r = disp
+            .dispatch_with_options("alice", "tool.x", "{}", opts, |_| async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok("never".into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["tier_tag"], "human_rollback");
     }
 }

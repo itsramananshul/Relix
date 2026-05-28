@@ -112,6 +112,7 @@ mod dispatch_stats;
 mod email;
 #[cfg(test)]
 mod email_mini_mesh_test;
+mod execution;
 mod export;
 mod flow;
 mod fs_audit;
@@ -653,6 +654,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // plus a flat diff between two traces.
         .route("/v1/provenance/diff", get(provenance::diff))
         .route("/v1/provenance/{trace_id}", get(provenance::show))
+        // GAP 11 + 12: transactional gateway + evidence.
+        .route("/v1/execution/rollback", post(execution::rollback))
+        .route(
+            "/v1/execution/transactions/{id}",
+            get(execution::transaction_get),
+        )
+        .route("/v1/execution/evidence", get(execution::evidence))
         // Agent access policies + recent call counts.
         .route("/v1/agents/access", get(agents_access::agents))
         // Tool registry — list + keyword search.

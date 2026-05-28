@@ -17,4 +17,7 @@
 
 pub mod broker;
 pub mod gateway;
+pub mod gateway_tier;
+pub mod rollback;
 pub mod secrets;
+pub mod transaction_store;
