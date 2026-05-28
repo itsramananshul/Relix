@@ -186,11 +186,19 @@ impl ChatProvider for AnthropicProvider {
                 .saturating_add(u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0))
                 as u32,
         });
+        // RELIX-7.19 GAP 3: extract stop_reason → finish_reason
+        // mapping. Anthropic does not report logprobs.
+        let finish_reason = parsed
+            .get("stop_reason")
+            .and_then(|v| v.as_str())
+            .map(normalise_anthropic_stop_reason);
         Ok(ChatOutput {
             text: reply,
             provider: "anthropic",
             model,
             usage,
+            finish_reason,
+            logprob: None,
         })
     }
 
@@ -341,9 +349,20 @@ impl ChatProvider for AnthropicProvider {
                                 prompt_tokens = n;
                                 saw_any_usage = true;
                             }
-                            AnthropicEvent::OutputTokens(n) => {
-                                completion_tokens = n;
-                                saw_any_usage = true;
+                            AnthropicEvent::MessageDelta { output_tokens, stop_reason } => {
+                                if let Some(n) = output_tokens {
+                                    completion_tokens = n;
+                                    saw_any_usage = true;
+                                }
+                                if let Some(fr) = stop_reason {
+                                    // RELIX-7.19 GAP 3: yield
+                                    // the finish reason BEFORE
+                                    // the Usage / Done frames
+                                    // so downstream consumers
+                                    // see the provider signal
+                                    // first.
+                                    yield Ok(StreamingChunk::FinishReason(fr));
+                                }
                             }
                             AnthropicEvent::Done => {
                                 if saw_any_usage {
@@ -382,7 +401,14 @@ pub(crate) enum AnthropicEvent {
     /// Input token count from `message_start.message.usage.input_tokens`.
     InputTokens(u32),
     /// Output token count from `message_delta.usage.output_tokens`.
-    OutputTokens(u32),
+    /// RELIX-7.19 GAP 3: the `message_delta` event also
+    /// carries `stop_reason`; emit it as a sibling field on
+    /// the same event since the SSE wire frame is single-
+    /// line and we only parse it once.
+    MessageDelta {
+        output_tokens: Option<u32>,
+        stop_reason: Option<String>,
+    },
     /// Terminal `message_stop` event — caller should stop reading.
     Done,
     /// Every other event type (block start/stop, ping,
@@ -390,6 +416,20 @@ pub(crate) enum AnthropicEvent {
     /// ignore these silently — they're meta-events the client
     /// doesn't surface.
     Skip,
+}
+
+/// RELIX-7.19 GAP 3: map Anthropic's `stop_reason` enum to
+/// the small ConfidenceScorer vocabulary. `end_turn` and
+/// `stop_sequence` map to `"stop"`; `max_tokens` maps to
+/// `"length"`; `tool_use` passes through; anything else
+/// (future Anthropic additions) becomes `"other"`.
+pub(crate) fn normalise_anthropic_stop_reason(v: &str) -> String {
+    match v {
+        "end_turn" | "stop_sequence" => "stop".to_string(),
+        "max_tokens" => "length".to_string(),
+        "tool_use" => "tool_use".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Parse one line of the Anthropic SSE stream. Returns
@@ -426,17 +466,27 @@ pub(crate) fn parse_anthropic_sse_line(line: &str) -> AnthropicEvent {
             AnthropicEvent::Skip
         }
         "message_delta" => {
-            // RELIX-7.11 GAP 2: output_tokens lives at
-            // `message_delta.usage.output_tokens`. The
-            // `message_delta` event also carries `stop_reason`,
-            // `stop_sequence`, etc. — we only need the usage.
-            if let Some(n) = parsed
+            // RELIX-7.11 GAP 2 + RELIX-7.19 GAP 3: this single
+            // SSE frame carries BOTH the per-frame token
+            // counter (`usage.output_tokens`) and the final
+            // `delta.stop_reason`. Return a combined event so
+            // the stream loop sees both at once.
+            let output_tokens = parsed
                 .pointer("/usage/output_tokens")
                 .and_then(|v| v.as_u64())
-            {
-                return AnthropicEvent::OutputTokens(n as u32);
+                .map(|n| n as u32);
+            let stop_reason = parsed
+                .pointer("/delta/stop_reason")
+                .and_then(|v| v.as_str())
+                .map(normalise_anthropic_stop_reason);
+            if output_tokens.is_none() && stop_reason.is_none() {
+                AnthropicEvent::Skip
+            } else {
+                AnthropicEvent::MessageDelta {
+                    output_tokens,
+                    stop_reason,
+                }
             }
-            AnthropicEvent::Skip
         }
         "content_block_delta" => {
             // Only `text_delta` carries assistant text. `thinking_delta`
@@ -534,8 +584,16 @@ mod tests {
     fn parse_anthropic_sse_extracts_output_tokens_from_message_delta() {
         let line = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":117}}"#;
         match parse_anthropic_sse_line(line) {
-            AnthropicEvent::OutputTokens(n) => assert_eq!(n, 117),
-            other => panic!("expected OutputTokens, got {other:?}"),
+            AnthropicEvent::MessageDelta {
+                output_tokens,
+                stop_reason,
+            } => {
+                assert_eq!(output_tokens, Some(117));
+                // RELIX-7.19 GAP 3: same frame carries the
+                // stop_reason — normalised to "stop".
+                assert_eq!(stop_reason.as_deref(), Some("stop"));
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
         }
     }
 
@@ -581,6 +639,34 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(ProviderError::Permanent(m)) => assert!(m.contains("missing api_key_env")),
             Err(other) => panic!("expected permanent, got {other}"),
+        }
+    }
+
+    // ── RELIX-7.19 GAP 3: stop_reason normalisation
+
+    #[test]
+    fn normalise_anthropic_stop_reason_maps_documented_values() {
+        assert_eq!(normalise_anthropic_stop_reason("end_turn"), "stop");
+        assert_eq!(normalise_anthropic_stop_reason("stop_sequence"), "stop");
+        assert_eq!(normalise_anthropic_stop_reason("max_tokens"), "length");
+        assert_eq!(normalise_anthropic_stop_reason("tool_use"), "tool_use");
+        // Unknown values pass through verbatim so future
+        // Anthropic additions don't silently lose information.
+        assert_eq!(normalise_anthropic_stop_reason("future"), "future");
+    }
+
+    #[test]
+    fn parse_anthropic_sse_message_delta_carries_stop_reason_alone() {
+        let line = r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null}}"#;
+        match parse_anthropic_sse_line(line) {
+            AnthropicEvent::MessageDelta {
+                output_tokens,
+                stop_reason,
+            } => {
+                assert!(output_tokens.is_none());
+                assert_eq!(stop_reason.as_deref(), Some("length"));
+            }
+            other => panic!("expected MessageDelta, got {other:?}"),
         }
     }
 }

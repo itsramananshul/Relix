@@ -53,4 +53,4 @@ pub use query::{
     TimeseriesQuery, percentile,
 };
 pub use store::{MetricsStore, MetricsStoreError};
-pub use types::{AiUsageHint, InvocationMetric};
+pub use types::{AiProviderSignalsHint, AiUsageHint, InvocationMetric};

@@ -142,11 +142,17 @@ impl ChatProvider for GeminiProvider {
             ))
         })?;
         let usage = extract_usage(&parsed);
+        // RELIX-7.19 GAP 3: candidates[0].finishReason →
+        // normalised finish_reason. Gemini doesn't expose
+        // logprobs on the standard API.
+        let finish_reason = extract_finish_reason(&parsed);
         Ok(ChatOutput {
             text: reply,
             provider: "gemini",
             model,
             usage,
+            finish_reason,
+            logprob: None,
         })
     }
 
@@ -219,6 +225,10 @@ impl ChatProvider for GeminiProvider {
             // `StreamingChunk::Usage` once the stream closes
             // (or `[DONE]` arrives).
             let mut pending_usage: Option<StreamingUsage> = None;
+            // RELIX-7.19 GAP 3: capture the finishReason from
+            // the LAST frame that carried one and emit it
+            // BEFORE the Usage frame at stream end.
+            let mut pending_finish: Option<String> = None;
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
@@ -246,6 +256,9 @@ impl ChatProvider for GeminiProvider {
                             continue;
                         }
                         if payload == "[DONE]" {
+                            if let Some(fr) = pending_finish.take() {
+                                yield Ok(StreamingChunk::FinishReason(fr));
+                            }
                             if let Some(u) = pending_usage.take() {
                                 yield Ok(StreamingChunk::Usage(u));
                             }
@@ -263,6 +276,11 @@ impl ChatProvider for GeminiProvider {
                                 completion_tokens: u.completion_tokens,
                                 model: model_for_usage.clone(),
                             });
+                        }
+                        // RELIX-7.19 GAP 3: capture finish
+                        // reason from any frame that has it.
+                        if let Some(fr) = extract_finish_reason(&parsed) {
+                            pending_finish = Some(fr);
                         }
                         if let Some(text) = extract_text(&parsed)
                             && !text.is_empty()
@@ -283,7 +301,10 @@ impl ChatProvider for GeminiProvider {
                 }
             }
             // Stream closed cleanly without `[DONE]` — flush
-            // whatever usage we observed.
+            // whatever finish reason + usage we observed.
+            if let Some(fr) = pending_finish {
+                yield Ok(StreamingChunk::FinishReason(fr));
+            }
             if let Some(u) = pending_usage {
                 yield Ok(StreamingChunk::Usage(u));
             }
@@ -422,6 +443,31 @@ fn split_role(line: &str) -> Option<(&str, &str)> {
     }
     let body = &trimmed[idx + 1..];
     Some((role, body))
+}
+
+/// RELIX-7.19 GAP 3: extract Gemini's `finishReason` from a
+/// parsed response (non-streaming OR per-frame for the
+/// streaming path) and normalise it to the ConfidenceScorer
+/// vocabulary. Mapping per spec:
+///   STOP → "stop"
+///   MAX_TOKENS → "length"
+///   SAFETY → "content_filter"
+///   RECITATION → "content_filter"
+///   anything else → "other"
+fn extract_finish_reason(parsed: &serde_json::Value) -> Option<String> {
+    let raw = parsed
+        .pointer("/candidates/0/finishReason")
+        .and_then(|v| v.as_str())?;
+    Some(normalise_gemini_finish_reason(raw))
+}
+
+pub(crate) fn normalise_gemini_finish_reason(v: &str) -> String {
+    match v {
+        "STOP" => "stop".to_string(),
+        "MAX_TOKENS" => "length".to_string(),
+        "SAFETY" | "RECITATION" => "content_filter".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
 }
 
 /// Extract the concatenated text from a Gemini response. Joins
@@ -906,5 +952,20 @@ mod tests {
             .expect_err("must be Err");
         assert!(matches!(err, ProviderError::Permanent(_)));
         let _ = server.await;
+    }
+
+    // ── RELIX-7.19 GAP 3: finishReason normalisation
+
+    #[test]
+    fn normalise_gemini_finish_reason_maps_documented_values() {
+        assert_eq!(normalise_gemini_finish_reason("STOP"), "stop");
+        assert_eq!(normalise_gemini_finish_reason("MAX_TOKENS"), "length");
+        assert_eq!(normalise_gemini_finish_reason("SAFETY"), "content_filter");
+        assert_eq!(
+            normalise_gemini_finish_reason("RECITATION"),
+            "content_filter"
+        );
+        // OTHER + any unknown value lowercases.
+        assert_eq!(normalise_gemini_finish_reason("OTHER"), "other");
     }
 }

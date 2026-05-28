@@ -41,13 +41,25 @@ use super::pricing::PriceTable;
 use super::store::MetricsStore;
 #[cfg(test)]
 use super::store::MetricsStoreError;
-use super::types::{AiUsageHint, InvocationMetric};
+use super::types::{AiProviderSignalsHint, AiUsageHint, InvocationMetric};
 
 /// Trait the dispatch bridge holds. Stripped down so the
 /// dispatch tests can stub it without pulling in sqlite.
 pub trait MetricsSink: Send + Sync {
     fn record_invocation(&self, m: InvocationMetric);
     fn attach_ai_usage(&self, hint: AiUsageHint);
+    /// RELIX-7.19 GAP 3: attach a provider-signals hint
+    /// (finish_reason + logprob) keyed by `request_id`. The
+    /// dispatch bridge calls [`Self::take_provider_signals`]
+    /// during confidence scoring to retrieve the matching
+    /// hint. Default no-op for back-compat with sinks that
+    /// don't care about confidence scoring.
+    fn attach_provider_signals(&self, _hint: AiProviderSignalsHint) {}
+    /// RELIX-7.19 GAP 3: pop the provider-signals hint
+    /// matching `request_id`, if any. Default returns `None`.
+    fn take_provider_signals(&self, _request_id: RequestId) -> Option<AiProviderSignalsHint> {
+        None
+    }
 }
 
 /// Production sink. Cheap to clone (couple of `Arc`s).
@@ -55,6 +67,10 @@ pub trait MetricsSink: Send + Sync {
 pub struct MetricsCollector {
     tx: mpsc::UnboundedSender<InvocationMetric>,
     hints: Arc<Mutex<HashMap<RequestId, AiUsageHint>>>,
+    /// RELIX-7.19 GAP 3: per-request provider-signals join
+    /// cache. Bounded by [`HINT_CACHE_CAP`]; FIFO-cleared on
+    /// overflow same as [`MetricsCollector::hints`].
+    provider_signals: Arc<Mutex<HashMap<RequestId, AiProviderSignalsHint>>>,
     prices: Arc<PriceTable>,
     store: MetricsStore,
 }
@@ -82,6 +98,7 @@ impl MetricsCollector {
         let collector = Self {
             tx,
             hints: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
+            provider_signals: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
             prices: Arc::new(prices),
             store: store.clone(),
         };
@@ -147,6 +164,25 @@ impl MetricsSink for MetricsCollector {
             g.clear();
         }
         g.insert(hint.request_id, hint);
+    }
+
+    fn attach_provider_signals(&self, hint: AiProviderSignalsHint) {
+        let mut g = match self.provider_signals.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if g.len() >= HINT_CACHE_CAP {
+            g.clear();
+        }
+        g.insert(hint.request_id, hint);
+    }
+
+    fn take_provider_signals(&self, request_id: RequestId) -> Option<AiProviderSignalsHint> {
+        let mut g = match self.provider_signals.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.remove(&request_id)
     }
 }
 

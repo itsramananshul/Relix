@@ -117,6 +117,25 @@ pub struct AiUsageHint {
     pub model: String,
 }
 
+/// RELIX-7.19 GAP 3: side-channel hint emitted by an AI
+/// handler so the dispatch bridge's `ConfidenceScorer` can
+/// read provider-reported `finish_reason` + `logprob` without
+/// the body-parsing workaround. Keyed by `request_id`; the
+/// collector's join cache hands the hint back to the bridge
+/// when scoring the matching invocation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiProviderSignalsHint {
+    pub request_id: RequestId,
+    /// Normalised finish reason — `"stop"`, `"length"`,
+    /// `"content_filter"`, `"tool_use"`, `"other"`, or any
+    /// other provider-specific value. `None` when the
+    /// provider didn't report one.
+    pub finish_reason: Option<String>,
+    /// Average per-token log-probability. `None` when the
+    /// provider doesn't expose it (Anthropic + Gemini).
+    pub logprob: Option<f32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

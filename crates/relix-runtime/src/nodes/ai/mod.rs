@@ -936,6 +936,21 @@ async fn handle_chat_stream(
                     // Don't forward Usage to the wire — it's
                     // observation metadata, not assistant text.
                 }
+                Ok(StreamingChunk::FinishReason(fr)) => {
+                    // RELIX-7.19 GAP 3: side-channel the finish
+                    // reason to the metrics sink so the dispatch
+                    // bridge's ConfidenceScorer can pick it up
+                    // when scoring the streaming response.
+                    if let Some(sink) = metrics_sink.as_ref() {
+                        sink.attach_provider_signals(crate::metrics::AiProviderSignalsHint {
+                            request_id,
+                            finish_reason: Some(fr),
+                            logprob: None,
+                        });
+                    }
+                    // Don't forward to the wire — operator-
+                    // observation metadata only.
+                }
                 Err(ProviderError::Transient(c)) => {
                     stream_error = Some(c.clone());
                     stream_error_kind = Some("RESPONDER_OVERLOADED");
@@ -1194,6 +1209,19 @@ async fn handle_chat(
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     model: output.model.clone(),
+                });
+            }
+            // RELIX-7.19 GAP 3: side-channel provider signals
+            // (finish_reason + logprob) keyed by request_id so
+            // the dispatch bridge's ConfidenceScorer can read
+            // them without parsing the response body.
+            if let Some(sink) = metrics_sink.as_ref()
+                && (output.finish_reason.is_some() || output.logprob.is_some())
+            {
+                sink.attach_provider_signals(crate::metrics::AiProviderSignalsHint {
+                    request_id: ctx.request_id,
+                    finish_reason: output.finish_reason.clone(),
+                    logprob: output.logprob,
                 });
             }
             let plan = execution::Planner::parse_response(&output.text);
@@ -1524,6 +1552,8 @@ mod tests {
                 provider: "recording",
                 model: input.model.clone(),
                 usage: None,
+                finish_reason: None,
+                logprob: None,
             })
         }
         fn provider_name(&self) -> &'static str {
@@ -2107,6 +2137,8 @@ mod tests {
                 provider: "no-embed",
                 model: input.model.clone(),
                 usage: None,
+                finish_reason: None,
+                logprob: None,
             })
         }
         fn provider_name(&self) -> &'static str {
@@ -2636,6 +2668,8 @@ mod tests {
                 provider: "canned",
                 model: String::new(),
                 usage: None,
+                finish_reason: None,
+                logprob: None,
             })
         }
         fn provider_name(&self) -> &'static str {
@@ -2953,6 +2987,8 @@ mod tests {
                 provider: "chunked-stream",
                 model: String::new(),
                 usage: None,
+                finish_reason: None,
+                logprob: None,
             })
         }
         fn provider_name(&self) -> &'static str {
@@ -3153,6 +3189,8 @@ mod tests {
                 provider: "test-with-usage",
                 model: self.model.to_string(),
                 usage: Some(self.usage),
+                finish_reason: None,
+                logprob: None,
             })
         }
         fn provider_name(&self) -> &'static str {
@@ -3177,6 +3215,8 @@ mod tests {
                 provider: "test-no-usage",
                 model: "doesnt-matter".to_string(),
                 usage: None,
+                finish_reason: None,
+                logprob: None,
             })
         }
         fn provider_name(&self) -> &'static str {
@@ -3338,6 +3378,8 @@ mod tests {
                 provider: "streaming-with-usage",
                 model: self.usage.model.clone(),
                 usage: None,
+                finish_reason: None,
+                logprob: None,
             })
         }
         async fn generate_reply_stream(
@@ -3373,6 +3415,8 @@ mod tests {
                 provider: "streaming-no-usage",
                 model: "doesnt-matter".to_string(),
                 usage: None,
+                finish_reason: None,
+                logprob: None,
             })
         }
         async fn generate_reply_stream(

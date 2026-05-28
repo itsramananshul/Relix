@@ -62,6 +62,11 @@ impl ChatProvider for MockProvider {
             provider: "mock",
             model,
             usage: Some(usage),
+            // RELIX-7.19 GAP 3: deterministic mock signal so
+            // confidence-scoring tests against the mock
+            // provider see a populated provider_signal field.
+            finish_reason: Some("stop".to_string()),
+            logprob: Some(-0.05_f32),
         })
     }
 
@@ -89,12 +94,19 @@ impl ChatProvider for MockProvider {
         let words: Vec<String> = mock_split_into_chunks(&out.text);
         let usage = out.usage;
         let model = out.model;
+        let finish_reason = out.finish_reason;
         let s = async_stream::stream! {
             for (i, w) in words.into_iter().enumerate() {
                 if i > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
                 yield Ok(StreamingChunk::Text(w));
+            }
+            // RELIX-7.19 GAP 3: emit finish reason BEFORE
+            // usage so consumers see the provider signal
+            // first in the stream.
+            if let Some(fr) = finish_reason {
+                yield Ok(StreamingChunk::FinishReason(fr));
             }
             if let Some(u) = usage {
                 yield Ok(StreamingChunk::Usage(StreamingUsage {
@@ -288,5 +300,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.model, "custom-model");
+    }
+
+    // ── RELIX-7.19 GAP 3: finish_reason + logprob populated
+
+    #[tokio::test]
+    async fn mock_provider_populates_finish_reason_and_logprob() {
+        let p = MockProvider;
+        let r = p
+            .generate_reply(ChatInput {
+                session_id: "s1".into(),
+                prompt: "hi".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+        assert!(r.logprob.is_some());
+    }
+
+    #[tokio::test]
+    async fn mock_provider_stream_emits_finish_reason_before_usage() {
+        use futures::StreamExt;
+        let p = MockProvider;
+        let mut stream = p
+            .generate_reply_stream(ChatInput {
+                session_id: "s1".into(),
+                prompt: "hi".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut chunks: Vec<StreamingChunk> = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        let last_text = chunks
+            .iter()
+            .rposition(|c| matches!(c, StreamingChunk::Text(_)))
+            .expect("at least one text chunk");
+        let fr_pos = chunks
+            .iter()
+            .position(|c| matches!(c, StreamingChunk::FinishReason(_)))
+            .expect("FinishReason emitted");
+        let usage_pos = chunks
+            .iter()
+            .position(|c| matches!(c, StreamingChunk::Usage(_)))
+            .expect("Usage emitted");
+        assert!(fr_pos > last_text, "FinishReason after last text");
+        assert!(fr_pos < usage_pos, "FinishReason before Usage");
+        match &chunks[fr_pos] {
+            StreamingChunk::FinishReason(fr) => assert_eq!(fr, "stop"),
+            _ => unreachable!(),
+        }
     }
 }

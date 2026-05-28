@@ -85,7 +85,7 @@ pub struct ChatInput {
 }
 
 /// Structured response from a provider.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ChatOutput {
     /// Reply text.
     pub text: String,
@@ -95,6 +95,19 @@ pub struct ChatOutput {
     pub model: String,
     /// Provider-supplied token usage, if known.
     pub usage: Option<TokenUsage>,
+    /// RELIX-7.19 GAP 3: provider-reported finish reason
+    /// normalised to a small vocabulary the ConfidenceScorer
+    /// understands: `"stop"`, `"length"`, `"content_filter"`,
+    /// `"tool_use"`, or `"other"`. `None` when the provider
+    /// didn't report one. Streaming providers populate this
+    /// from the final SSE frame.
+    pub finish_reason: Option<String>,
+    /// RELIX-7.19 GAP 3: average per-token log-probability of
+    /// the response, when the provider reports it
+    /// (OpenAI-compatible `logprobs.content[*].logprob`). The
+    /// scorer maps `exp(logprob)` clamped to `[0, 1]` into the
+    /// `provider_signal` sub-score.
+    pub logprob: Option<f32>,
 }
 
 /// Best-effort token accounting.
@@ -140,8 +153,12 @@ pub trait ChatProvider: Send + Sync {
         let text = out.text;
         let model = out.model;
         let usage = out.usage;
+        let finish_reason = out.finish_reason;
         let s = async_stream::stream! {
             yield Ok(StreamingChunk::Text(text));
+            if let Some(fr) = finish_reason {
+                yield Ok(StreamingChunk::FinishReason(fr));
+            }
             if let Some(u) = usage {
                 yield Ok(StreamingChunk::Usage(StreamingUsage {
                     prompt_tokens: u.prompt_tokens,
@@ -175,6 +192,14 @@ pub enum StreamingChunk {
     /// usage payload. Providers that don't expose usage on
     /// their streaming API simply never yield this variant.
     Usage(StreamingUsage),
+    /// RELIX-7.19 GAP 3: provider-reported finish reason from
+    /// the final stream frame. Emitted at most once per
+    /// stream, BEFORE the optional `Usage` chunk. Consumers
+    /// that only forward `Text` frames to the wire (the AI
+    /// handler does) should intercept this variant and feed
+    /// it into the `AiProviderSignalsHint` side channel for
+    /// the dispatch bridge to pick up.
+    FinishReason(String),
 }
 
 /// Token usage carried by a [`StreamingChunk::Usage`] frame.

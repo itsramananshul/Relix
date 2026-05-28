@@ -394,14 +394,20 @@ pub const RECENT_LATENCIES_CAP: usize = 32;
 /// — a runaway retry loop is worse than a wrong policy.
 pub const MAX_RETRY_CAP: u32 = 8;
 
-/// RELIX-7.19: score the just-completed handler outcome via the
-/// scorer + record it on the rolling window. Pulled out for
-/// reuse by the retry / escalate paths in
-/// [`DispatchBridge::apply_confidence`]. Extracts a best-effort
-/// `finish_reason` + `logprob` from the response body when the
-/// body parses as JSON; falls back to `None` otherwise.
+/// RELIX-7.19 GAP 3: score the just-completed handler outcome
+/// via the scorer + record it on the rolling window. Pulled
+/// out for reuse by the retry / escalate paths in
+/// [`DispatchBridge::apply_confidence`]. Reads provider
+/// signals (`finish_reason` + `logprob`) from the
+/// `MetricsSink`'s join cache keyed by `request_id` — the
+/// AI handler fires them via `attach_provider_signals` after
+/// every `generate_reply` (or after each streamed
+/// `FinishReason` chunk). Sinks that don't implement the
+/// trait default (no-op) safely return `None`.
 fn score_outcome(
     scorer: &crate::confidence::ConfidenceScorer,
+    sink: Option<&Arc<dyn crate::metrics::MetricsSink>>,
+    request_id: relix_core::types::RequestId,
     agent: &str,
     method: &str,
     outcome: &HandlerOutcome,
@@ -411,7 +417,9 @@ fn score_outcome(
         HandlerOutcome::Ok(b) => (b.as_slice(), true),
         HandlerOutcome::Err(_) => (&[], false),
     };
-    let (finish_reason, logprob) = extract_provider_signals(body);
+    let hint = sink.and_then(|s| s.take_provider_signals(request_id));
+    let finish_reason = hint.as_ref().and_then(|h| h.finish_reason.clone());
+    let logprob = hint.as_ref().and_then(|h| h.logprob);
     let inputs = crate::confidence::ScoringInputs {
         response_body: body,
         finish_reason: finish_reason.as_deref(),
@@ -420,50 +428,6 @@ fn score_outcome(
         success,
     };
     scorer.score_and_record(agent, method, &inputs)
-}
-
-/// RELIX-7.19: best-effort extraction of `finish_reason` +
-/// `logprob` from a handler response body. Recognises:
-///
-/// 1. JSON objects with top-level `finish_reason` (string) and
-///    `logprob` (number). Used by AI provider passthroughs that
-///    emit raw provider envelopes.
-/// 2. Plain-text bodies with a `[finish_reason:<value>]` trailer
-///    line. Used by `ai.chat` (UTF-8 text body with optional
-///    decoration).
-///
-/// Returns `(None, None)` when neither signal can be parsed —
-/// the scorer's `provider_signal` sub-score then defaults to
-/// the neutral 0.50.
-fn extract_provider_signals(body: &[u8]) -> (Option<String>, Option<f32>) {
-    if body.is_empty() {
-        return (None, None);
-    }
-    // Path 1: JSON.
-    if body.first() == Some(&b'{')
-        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(body)
-    {
-        let fr = v
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let lp = v.get("logprob").and_then(|v| v.as_f64()).map(|f| f as f32);
-        if fr.is_some() || lp.is_some() {
-            return (fr, lp);
-        }
-    }
-    // Path 2: trailer line like `[finish_reason:stop]`.
-    if let Ok(text) = std::str::from_utf8(body) {
-        for line in text.lines() {
-            let t = line.trim();
-            if let Some(rest) = t.strip_prefix("[finish_reason:")
-                && let Some(value) = rest.strip_suffix(']')
-            {
-                return (Some(value.to_string()), None);
-            }
-        }
-    }
-    (None, None)
 }
 
 impl DispatchBridge {
@@ -1150,10 +1114,19 @@ impl DispatchBridge {
         };
 
         let agent = ctx.caller.name.clone();
+        let request_id = ctx.request_id;
+        let sink = self.metrics_sink.as_ref();
         let mut current_outcome = outcome;
         let mut total_elapsed = first_elapsed_ms;
-        let initial_score =
-            score_outcome(&scorer, &agent, method, &current_outcome, first_elapsed_ms);
+        let initial_score = score_outcome(
+            &scorer,
+            sink,
+            request_id,
+            &agent,
+            method,
+            &current_outcome,
+            first_elapsed_ms,
+        );
         let mut best_score = initial_score.final_score;
         let verdict = engine.decide(method, initial_score.final_score);
         if !verdict.matched || matches!(verdict.action, crate::confidence::FallbackAction::Pass) {
@@ -1195,8 +1168,15 @@ impl DispatchBridge {
                     let retry_elapsed =
                         retry_start.elapsed().as_millis().min(u64::MAX as u128) as u64;
                     total_elapsed = total_elapsed.saturating_add(retry_elapsed);
-                    let retry_score =
-                        score_outcome(&scorer, &agent, method, &retry_outcome, retry_elapsed);
+                    let retry_score = score_outcome(
+                        &scorer,
+                        sink,
+                        request_id,
+                        &agent,
+                        method,
+                        &retry_outcome,
+                        retry_elapsed,
+                    );
                     if retry_score.final_score >= best_score {
                         best_score = retry_score.final_score;
                         current_outcome = retry_outcome;
@@ -1221,8 +1201,15 @@ impl DispatchBridge {
                     // escalated call gets its own confidence
                     // check" — we score + record but do not
                     // re-fallback).
-                    let escalated_score =
-                        score_outcome(&scorer, &agent, &escalate_to, &escalated, escalated_elapsed);
+                    let escalated_score = score_outcome(
+                        &scorer,
+                        sink,
+                        request_id,
+                        &agent,
+                        &escalate_to,
+                        &escalated,
+                        escalated_elapsed,
+                    );
                     if escalated_score.final_score >= best_score {
                         best_score = escalated_score.final_score;
                         current_outcome = escalated;
@@ -2931,6 +2918,108 @@ mod tests {
         let resp_bytes = bridge.handle_inbound(envelope).await;
         let resp = decode_response(&resp_bytes).unwrap();
         assert!(resp.confidence.is_none(), "no scorer => no confidence");
+    }
+
+    /// RELIX-7.19 GAP 3: a `MetricsSink` that pre-loads a
+    /// provider-signals hint keyed by the next-known
+    /// request_id. The dispatch bridge must consume it during
+    /// score_outcome instead of parsing the body.
+    struct PreloadedSignalsSink {
+        signals: std::sync::Mutex<
+            std::collections::HashMap<
+                relix_core::types::RequestId,
+                crate::metrics::AiProviderSignalsHint,
+            >,
+        >,
+    }
+
+    impl crate::metrics::MetricsSink for PreloadedSignalsSink {
+        fn record_invocation(&self, _m: crate::metrics::InvocationMetric) {}
+        fn attach_ai_usage(&self, _hint: crate::metrics::AiUsageHint) {}
+        fn attach_provider_signals(&self, hint: crate::metrics::AiProviderSignalsHint) {
+            self.signals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(hint.request_id, hint);
+        }
+        fn take_provider_signals(
+            &self,
+            request_id: relix_core::types::RequestId,
+        ) -> Option<crate::metrics::AiProviderSignalsHint> {
+            self.signals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&request_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn confidence_scorer_reads_finish_reason_from_metrics_sink_side_channel() {
+        use crate::metrics::MetricsSink as _;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        // Handler that returns a body with NO finish_reason
+        // embedded — the scorer must read it from the side
+        // channel instead.
+        bridge.register(
+            "anything.method",
+            Arc::new(FnHandler(|ctx: InvocationCtx| {
+                let _ = ctx;
+                async move {
+                    HandlerOutcome::Ok(
+                        b"a complete answer that ends with proper punctuation.".to_vec(),
+                    )
+                }
+            })),
+        );
+        let (scorer, engine) = make_confidence(Vec::new());
+        bridge.set_confidence(scorer.clone(), engine);
+        let sink = Arc::new(PreloadedSignalsSink {
+            signals: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let sink_dyn: Arc<dyn crate::metrics::MetricsSink> = sink.clone();
+        bridge.set_metrics_sink(sink_dyn, "test-peer");
+
+        // Issue two calls — one where we pre-load the sink
+        // with finish_reason="stop", and one where we pre-load
+        // with finish_reason="length". The "stop" call should
+        // score strictly higher because of the higher
+        // provider_signal sub-score.
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope_stop = build_request("anything.method", b"x".to_vec(), bundle.clone(), 30);
+        let parsed_stop: crate::transport::envelope::RequestEnvelope =
+            relix_core::codec::decode(&envelope_stop).unwrap();
+        sink.attach_provider_signals(crate::metrics::AiProviderSignalsHint {
+            request_id: parsed_stop.rid,
+            finish_reason: Some("stop".into()),
+            logprob: None,
+        });
+        let resp_stop = bridge.handle_inbound(envelope_stop).await;
+        let resp_stop = decode_response(&resp_stop).unwrap();
+        let score_stop = resp_stop.confidence.expect("scored");
+
+        // Reset rolling-window state so the second call gets
+        // an apples-to-apples scoring (otherwise the first
+        // call's lower error_rate_history contribution would
+        // shift things).
+        scorer.reset_pair("alice", "anything.method");
+
+        let envelope_length = build_request("anything.method", b"x".to_vec(), bundle, 30);
+        let parsed_length: crate::transport::envelope::RequestEnvelope =
+            relix_core::codec::decode(&envelope_length).unwrap();
+        sink.attach_provider_signals(crate::metrics::AiProviderSignalsHint {
+            request_id: parsed_length.rid,
+            finish_reason: Some("length".into()),
+            logprob: None,
+        });
+        let resp_length = bridge.handle_inbound(envelope_length).await;
+        let resp_length = decode_response(&resp_length).unwrap();
+        let score_length = resp_length.confidence.expect("scored");
+
+        assert!(
+            score_stop > score_length,
+            "stop ({score_stop}) should beat length ({score_length})"
+        );
     }
 
     #[tokio::test]

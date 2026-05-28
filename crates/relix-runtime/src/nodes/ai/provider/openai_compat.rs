@@ -184,11 +184,22 @@ impl ChatProvider for OpenAICompatibleProvider {
                 .unwrap_or(0) as u32,
             total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         });
+        // RELIX-7.19 GAP 3: extract finish_reason +
+        // logprobs.content[*].logprob average from the parsed
+        // response so the ConfidenceScorer's provider_signal
+        // sub-score has real data to work with.
+        let finish_reason = parsed
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+            .map(normalise_openai_finish_reason);
+        let logprob = extract_openai_logprob(&parsed);
         Ok(ChatOutput {
             text: reply_text,
             provider: self.name,
             model,
             usage,
+            finish_reason,
+            logprob,
         })
     }
 
@@ -338,6 +349,13 @@ impl ChatProvider for OpenAICompatibleProvider {
                                     model: observed_model.clone().unwrap_or_default(),
                                 });
                             }
+                            SseLine::FinishReason(fr) => {
+                                // RELIX-7.19 GAP 3: emit
+                                // BEFORE the Usage frame so
+                                // downstream consumers see the
+                                // provider signal first.
+                                yield Ok(StreamingChunk::FinishReason(fr));
+                            }
                             SseLine::Done => {
                                 if let Some(u) = pending_usage.take() {
                                     yield Ok(StreamingChunk::Usage(u));
@@ -463,6 +481,11 @@ impl ChatProvider for OpenAICompatibleProvider {
 ///   `choices` array on this frame is empty, so it does NOT
 ///   produce a `Delta`.
 /// - `Done` is the upstream `[DONE]` terminator.
+/// - `FinishReason` carries the upstream
+///   `choices[0].finish_reason` from the last delta frame.
+///   RELIX-7.19 GAP 3 added this so streaming producers can
+///   forward the same provider signal the non-streaming path
+///   already does.
 /// - `Skip` is everything else (event lines, comments,
 ///   role-only header frames, malformed JSON).
 enum SseLine {
@@ -475,6 +498,7 @@ enum SseLine {
         completion: u32,
         model: Option<String>,
     },
+    FinishReason(String),
     Done,
     Skip,
 }
@@ -537,8 +561,61 @@ fn parse_sse_line(line: &str) -> SseLine {
             text: text.to_string(),
             model,
         },
-        _ => SseLine::Skip,
+        _ => {
+            // RELIX-7.19 GAP 3: a frame with no delta.content
+            // but a populated finish_reason is the terminal
+            // "[finish_reason: ...]" marker from OpenAI. Emit
+            // it so the streaming wrapper can pass it through
+            // as `StreamingChunk::FinishReason`.
+            if let Some(fr) = parsed
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str())
+                && !fr.is_empty()
+            {
+                return SseLine::FinishReason(normalise_openai_finish_reason(fr));
+            }
+            SseLine::Skip
+        }
     }
+}
+
+/// RELIX-7.19 GAP 3: normalise OpenAI `finish_reason` strings
+/// into the small vocabulary the ConfidenceScorer uses.
+/// `stop` and `length` pass through; `content_filter` keeps
+/// its name; `tool_calls` maps to `tool_use` to match the
+/// Anthropic normalisation; anything else becomes `"other"`.
+pub(crate) fn normalise_openai_finish_reason(v: &str) -> String {
+    match v {
+        "stop" => "stop".to_string(),
+        "length" => "length".to_string(),
+        "content_filter" => "content_filter".to_string(),
+        "tool_calls" | "function_call" => "tool_use".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// RELIX-7.19 GAP 3: average the per-token logprobs from an
+/// OpenAI-compatible response. Returns `None` when no
+/// `logprobs.content` array is present or every entry is
+/// missing the field. The result is the raw average log-
+/// probability — the scorer applies `exp(.)` clamped to
+/// `[0, 1]` to convert it to a probability.
+pub(crate) fn extract_openai_logprob(parsed: &serde_json::Value) -> Option<f32> {
+    let arr = parsed
+        .pointer("/choices/0/logprobs/content")
+        .and_then(|v| v.as_array())?;
+    let mut sum = 0.0_f64;
+    let mut count = 0_usize;
+    for entry in arr {
+        if let Some(lp) = entry.get("logprob").and_then(|v| v.as_f64()) {
+            sum += lp;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((sum / count as f64) as f32)
 }
 
 #[cfg(test)]
@@ -617,9 +694,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_sse_line_skips_finish_reason_only_frame() {
+    fn parse_sse_line_finish_reason_only_frame_emits_finish_reason_post_7_19() {
+        // RELIX-7.19 GAP 3 changed the behaviour: a frame with
+        // no `delta.content` but a populated `finish_reason`
+        // now emits `SseLine::FinishReason(...)` so the
+        // streaming wrapper can forward it as
+        // `StreamingChunk::FinishReason`. Previously this was
+        // `SseLine::Skip`.
         let line = r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}"#;
-        assert!(matches!(parse_sse_line(line), SseLine::Skip));
+        match parse_sse_line(line) {
+            SseLine::FinishReason(fr) => assert_eq!(fr, "stop"),
+            _ => panic!("expected FinishReason"),
+        }
     }
 
     #[test]
@@ -676,5 +762,69 @@ mod tests {
         assert_eq!(p.provider_name(), "local");
         assert_eq!(p.default_model, "llama3:8b");
         assert!(p.api_key.is_none());
+    }
+
+    // ── RELIX-7.19 GAP 3: finish_reason + logprob extraction
+
+    #[test]
+    fn normalise_openai_finish_reason_maps_documented_values() {
+        assert_eq!(normalise_openai_finish_reason("stop"), "stop");
+        assert_eq!(normalise_openai_finish_reason("length"), "length");
+        assert_eq!(
+            normalise_openai_finish_reason("content_filter"),
+            "content_filter"
+        );
+        assert_eq!(normalise_openai_finish_reason("tool_calls"), "tool_use");
+        assert_eq!(normalise_openai_finish_reason("function_call"), "tool_use");
+        assert_eq!(normalise_openai_finish_reason("unknown"), "unknown");
+    }
+
+    #[test]
+    fn extract_openai_logprob_averages_content_logprobs() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"choices":[{"logprobs":{"content":[
+                {"token":"hello","logprob":-0.10},
+                {"token":"world","logprob":-0.20},
+                {"token":"!","logprob":-0.30}
+            ]}}]}"#,
+        )
+        .unwrap();
+        let lp = extract_openai_logprob(&v).expect("logprob present");
+        // Average of -0.10, -0.20, -0.30 = -0.20.
+        assert!((lp - (-0.20_f32)).abs() < 1e-5, "got {lp}");
+    }
+
+    #[test]
+    fn extract_openai_logprob_returns_none_when_no_content_array() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"hi"}}]}"#).unwrap();
+        assert!(extract_openai_logprob(&v).is_none());
+    }
+
+    #[test]
+    fn parse_sse_line_emits_finish_reason_when_present_and_no_delta() {
+        let line = r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}"#;
+        match parse_sse_line(line) {
+            SseLine::FinishReason(fr) => assert_eq!(fr, "stop"),
+            other => panic!(
+                "expected FinishReason, got {other:?}",
+                other = match other {
+                    SseLine::Skip => "Skip",
+                    SseLine::Done => "Done",
+                    SseLine::Delta { .. } => "Delta",
+                    SseLine::Usage { .. } => "Usage",
+                    SseLine::FinishReason(_) => "FinishReason",
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn parse_sse_line_emits_normalised_finish_reason_for_length() {
+        let line = r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"length"}]}"#;
+        match parse_sse_line(line) {
+            SseLine::FinishReason(fr) => assert_eq!(fr, "length"),
+            _ => panic!("expected FinishReason"),
+        }
     }
 }
