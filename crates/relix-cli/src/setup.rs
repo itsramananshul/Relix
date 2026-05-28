@@ -1,11 +1,11 @@
 //! `relix setup` — guided interactive wizard. Also reachable as
 //! `relix reconfigure` (same flow, alias-only).
 //!
-//! Five pages: welcome → provider → API key → channels → confirm.
-//! Each page after the welcome supports left-arrow / `b` back
-//! navigation; the prior page re-renders with the user's last
-//! selection pre-filled so going back never costs the user any
-//! input they'd already given.
+//! Six pages: welcome → provider → API key → channels →
+//! confidence → confirm. Each page after the welcome supports
+//! left-arrow / `b` back navigation; the prior page re-renders
+//! with the user's last selection pre-filled so going back never
+//! costs the user any input they'd already given.
 //!
 //! When `~/.relix/config.toml` already exists the wizard loads it
 //! and pre-fills every field — provider selection, masked current
@@ -29,7 +29,9 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 
-use crate::config::{ChannelsConfig, MeshConfig, ProviderConfig, RelixConfig, mask_api_key};
+use crate::config::{
+    ChannelsConfig, ConfidenceBlock, MeshConfig, ProviderConfig, RelixConfig, mask_api_key,
+};
 
 /// Top-level entry from `main.rs` for both `relix setup` and
 /// `relix reconfigure`.
@@ -117,6 +119,12 @@ enum Page {
     Provider,
     ApiKey,
     Channels,
+    /// RELIX-7.19 GAP 4: per-step confidence scoring + fallback
+    /// toggle. The page asks operators whether to enable the
+    /// `ConfidenceScorer` + `FallbackEngine` wiring; the
+    /// rolling-window depth + per-cap policies stay
+    /// edit-the-toml-yourself.
+    Confidence,
     Confirm,
 }
 
@@ -234,7 +242,7 @@ fn run_wizard(prior: Option<&RelixConfig>) -> io::Result<RelixConfig> {
                 PageResult::Back => page = Page::Provider,
             },
             Page::Channels => match run_channels_stage(&mut state)? {
-                PageResult::Next(()) => page = Page::Confirm,
+                PageResult::Next(()) => page = Page::Confidence,
                 PageResult::Back => {
                     page = if state.needs_key() {
                         Page::ApiKey
@@ -243,9 +251,16 @@ fn run_wizard(prior: Option<&RelixConfig>) -> io::Result<RelixConfig> {
                     };
                 }
             },
+            Page::Confidence => match pick_confidence(state.confidence.clone())? {
+                PageResult::Next(updated) => {
+                    state.confidence = updated;
+                    page = Page::Confirm;
+                }
+                PageResult::Back => page = Page::Channels,
+            },
             Page::Confirm => match confirm(&state)? {
                 PageResult::Next(()) => break,
-                PageResult::Back => page = Page::Channels,
+                PageResult::Back => page = Page::Confidence,
             },
         }
     }
@@ -486,6 +501,106 @@ fn run_channels_stage(state: &mut WizardState) -> io::Result<PageResult<()>> {
     }
 }
 
+/// RELIX-7.19 GAP 4 wizard page: ask the operator whether to
+/// enable per-step confidence scoring + fallback. Renders the
+/// current state, the documented defaults the operator gets
+/// when it's on, and a single yes/no toggle. Space / arrows
+/// flip it; Enter confirms; Back returns to the channels
+/// page.
+fn pick_confidence(initial: ConfidenceBlock) -> io::Result<PageResult<ConfidenceBlock>> {
+    let mut enabled = initial.enabled;
+    let mut out = io::stdout();
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(
+            out,
+            Print("Per-step confidence scoring + fallback (optional)")
+        )?;
+        queue!(out, ResetColor)?;
+
+        queue!(out, cursor::MoveTo(2, 2))?;
+        queue!(out, Print("Space or arrows toggle, Enter to continue"))?;
+
+        queue!(out, cursor::MoveTo(2, 4))?;
+        let mark = if enabled { 'x' } else { ' ' };
+        queue!(out, SetForegroundColor(Color::Yellow))?;
+        queue!(
+            out,
+            Print(format!("> [{mark}] Enable [confidence] in this config"))
+        )?;
+        queue!(out, ResetColor)?;
+
+        queue!(out, cursor::MoveTo(2, 6))?;
+        queue!(out, SetForegroundColor(Color::DarkGrey))?;
+        queue!(out, Print("When enabled, every dispatched capability is"))?;
+        queue!(out, cursor::MoveTo(2, 7))?;
+        queue!(
+            out,
+            Print("scored on a 0.0–1.0 scale and configurable per-cap")
+        )?;
+        queue!(out, cursor::MoveTo(2, 8))?;
+        queue!(
+            out,
+            Print("policies fire fallback actions (retry / escalate /")
+        )?;
+        queue!(out, cursor::MoveTo(2, 9))?;
+        queue!(
+            out,
+            Print("safe_default / alert / abort) on low scores. SOL flows")
+        )?;
+        queue!(out, cursor::MoveTo(2, 10))?;
+        queue!(
+            out,
+            Print("can read the latest score via `last_confidence()`.")
+        )?;
+
+        queue!(out, cursor::MoveTo(2, 12))?;
+        queue!(
+            out,
+            Print(format!(
+                "Defaults: window_size = {}, p95_latency_baseline = {} ms",
+                initial.window_size, initial.p95_latency_baseline_ms
+            ))
+        )?;
+        queue!(out, cursor::MoveTo(2, 13))?;
+        queue!(
+            out,
+            Print("Per-cap policies live under [[confidence.policies]] —")
+        )?;
+        queue!(out, cursor::MoveTo(2, 14))?;
+        queue!(
+            out,
+            Print("edit ~/.relix/config.toml directly to add them.")
+        )?;
+        queue!(out, ResetColor)?;
+
+        draw_nav_hint(&mut out, 16)?;
+        out.flush()?;
+
+        match read_key()? {
+            Key::Up
+            | Key::Down
+            | Key::Space
+            | Key::Char('y')
+            | Key::Char('Y')
+            | Key::Char('n')
+            | Key::Char('N') => {
+                enabled = !enabled;
+            }
+            Key::Enter => {
+                let mut updated = initial.clone();
+                updated.enabled = enabled;
+                return Ok(PageResult::Next(updated));
+            }
+            Key::Left | Key::Char('b') | Key::Char('B') => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
 fn pick_channels(initial: [bool; 3]) -> io::Result<PageResult<[bool; 3]>> {
     let mut selected = initial;
     let mut idx: usize = 0;
@@ -697,6 +812,30 @@ fn confirm(state: &WizardState) -> io::Result<PageResult<()>> {
             row += 1;
         }
     }
+
+    // RELIX-7.19 GAP 4: confidence summary + diff line.
+    let confidence_str = if new_cfg.confidence.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    queue!(out, cursor::MoveTo(2, row))?;
+    queue!(out, Print(format!("Confidence: {confidence_str}")))?;
+    row += 1;
+    if let Some(p) = prior
+        && p.confidence.enabled != new_cfg.confidence.enabled
+    {
+        let verb = if new_cfg.confidence.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        queue!(out, cursor::MoveTo(2, row))?;
+        queue!(out, SetForegroundColor(Color::Yellow))?;
+        queue!(out, Print(format!("           ({verb})")))?;
+        queue!(out, ResetColor)?;
+        row += 1;
+    }
     row += 1;
 
     queue!(out, cursor::MoveTo(2, row))?;
@@ -864,6 +1003,8 @@ mod tests {
         prior.channels.discord = true;
         prior.channels.discord_token = "dc-token".into();
         prior.channels.discord_channel = "12345".into();
+        prior.confidence.enabled = true;
+        prior.confidence.window_size = 250;
 
         let s = WizardState::from_prior(Some(&prior));
         assert_eq!(s.provider_idx, 1, "openai is row 1 in PROVIDER_CHOICES");
@@ -874,6 +1015,22 @@ mod tests {
         assert_eq!(s.channels.discord_channel, "12345");
         assert!(s.is_reconfigure);
         assert!(s.needs_key(), "openai needs a key");
+        // RELIX-7.19 GAP 4: confidence carries through.
+        assert!(s.confidence.enabled);
+        assert_eq!(s.confidence.window_size, 250);
+    }
+
+    #[test]
+    fn state_round_trips_confidence_block_through_to_config() {
+        let mut prior = RelixConfig::default();
+        prior.confidence.enabled = true;
+        prior.confidence.window_size = 75;
+        prior.confidence.p95_latency_baseline_ms = 999;
+        let s = WizardState::from_prior(Some(&prior));
+        let back = s.to_config();
+        assert!(back.confidence.enabled);
+        assert_eq!(back.confidence.window_size, 75);
+        assert_eq!(back.confidence.p95_latency_baseline_ms, 999);
     }
 
     #[test]
