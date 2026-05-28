@@ -21,6 +21,11 @@
 //! The engine's `evaluate` signature mirrors Cedar's `(principal, action, resource, context)`
 //! so the Gate-2 swap is straightforward.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 use crate::identity::VerifiedIdentity;
@@ -166,6 +171,191 @@ pub enum PolicyError {
     Io(String),
 }
 
+/// GAP 23B — per-tenant policy resolution.
+///
+/// Wraps a base [`PolicyEngine`] (the global / shared file) and
+/// resolves per-tenant overrides from `dir/{tenant_id}.policy.toml`.
+/// Per-tenant engines are cached for [`Self::ttl`] so a hot-path
+/// admission check doesn't stat the filesystem on every call.
+///
+/// Order of resolution for a call with `tenant_id = Some(t)`:
+///
+/// 1. If `dir` is set AND the per-tenant file exists, parse it
+///    (or hit the cache) and evaluate against the per-tenant
+///    engine.
+/// 2. Otherwise fall back to the global engine the resolver
+///    was built with.
+///
+/// Tenant ids are sanitised before the file lookup — the same
+/// alnum-plus-underscore rule used elsewhere (Qdrant collection
+/// names, audit partitions) — so an attacker can't traverse out
+/// of `dir` via `../../etc/policy.toml`.
+pub struct TenantPolicyResolver {
+    global: PolicyEngine,
+    dir: Option<PathBuf>,
+    ttl: Duration,
+    /// `tenant_id -> (loaded_at, engine_or_negative_cache)`.
+    /// `Some(engine)` = a file was found and parsed. `None` =
+    /// negative cache: no file at that path. Both expire after
+    /// `ttl` so operators can drop a new file in `dir` without
+    /// restarting the node.
+    cache: Mutex<HashMap<String, (Instant, Option<PolicyEngine>)>>,
+}
+
+impl TenantPolicyResolver {
+    /// Construct. `dir = None` disables per-tenant resolution
+    /// (every call falls straight through to `global`). A
+    /// `ttl_secs` of 0 disables caching — useful in tests.
+    pub fn new(global: PolicyEngine, dir: Option<PathBuf>, ttl_secs: u64) -> Self {
+        Self {
+            global,
+            dir,
+            ttl: Duration::from_secs(ttl_secs),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Borrow the global / fallback engine.
+    pub fn global(&self) -> &PolicyEngine {
+        &self.global
+    }
+
+    /// Sanitise a tenant id so it can safely form part of a
+    /// filename. Replaces every non-`[A-Za-z0-9_]` char with
+    /// `_`; an empty / `None` tenant resolves to `"default"`.
+    pub fn sanitise_tenant_id(raw: Option<&str>) -> String {
+        let s = raw.unwrap_or("default");
+        if s.is_empty() {
+            return "default".to_string();
+        }
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    /// Path the resolver would load for `tenant_id` (None when
+    /// `dir` isn't configured).
+    pub fn tenant_path(&self, tenant_id: Option<&str>) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        let sanitised = Self::sanitise_tenant_id(tenant_id);
+        Some(dir.join(format!("{sanitised}.policy.toml")))
+    }
+
+    /// Resolve the appropriate engine for `tenant_id` and
+    /// evaluate the call. Always returns a `Decision` — load
+    /// errors are logged via tracing and fall back to the
+    /// global engine so a typo in a per-tenant TOML never bricks
+    /// the cap.
+    pub fn evaluate(
+        &self,
+        caller: &VerifiedIdentity,
+        method: &str,
+        tenant_id: Option<&str>,
+    ) -> Decision {
+        if let Some(engine) = self.engine_for_tenant(tenant_id) {
+            engine.evaluate(caller, method)
+        } else {
+            self.global.evaluate(caller, method)
+        }
+    }
+
+    /// Returns the per-tenant engine if one exists; otherwise
+    /// `None` so the caller knows to use the global. Memoised
+    /// for `ttl`.
+    fn engine_for_tenant(&self, tenant_id: Option<&str>) -> Option<PolicyEngine> {
+        let path = self.tenant_path(tenant_id)?;
+        let key = path.display().to_string();
+
+        // Cache hit (positive or negative) wins when fresh. A
+        // poisoned mutex (another thread panicked while
+        // holding the lock) bypasses the cache and re-reads
+        // from disk; we never panic an admission check on a
+        // background lock issue.
+        if !self.ttl.is_zero()
+            && let Ok(cache) = self.cache.lock()
+            && let Some((at, entry)) = cache.get(&key)
+            && at.elapsed() < self.ttl
+        {
+            return entry.clone();
+        }
+
+        let loaded = match std::fs::metadata(&path) {
+            Ok(_) => match PolicyEngine::from_path(&path) {
+                Ok(eng) => Some(eng),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "per-tenant policy file failed to load; falling back to global"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
+        if !self.ttl.is_zero()
+            && let Ok(mut cache) = self.cache.lock()
+        {
+            cache.insert(key, (Instant::now(), loaded.clone()));
+        }
+
+        loaded
+    }
+
+    /// Enumerate tenant ids that have a per-tenant policy file
+    /// in `dir`. Sorted; deduped. Returns empty when `dir` is
+    /// unset or missing. Pure read; does not warm the cache.
+    pub fn list_tenants(&self) -> Vec<String> {
+        let Some(dir) = self.dir.as_ref() else {
+            return Vec::new();
+        };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(it) => it,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                // Match `{tenant_id}.policy.toml` exactly.
+                name.strip_suffix(".policy.toml").map(str::to_string)
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Read the per-tenant policy file's raw TOML text for
+    /// operator inspection. Returns `None` when `dir` is unset
+    /// or no file exists for `tenant_id`. Does not parse or
+    /// cache.
+    pub fn tenant_policy_text(&self, tenant_id: &str) -> Option<String> {
+        let path = self.tenant_path(Some(tenant_id))?;
+        std::fs::read_to_string(&path).ok()
+    }
+
+    /// Drop every cached tenant engine. Used by operator tooling
+    /// + tests that want a clean reload without waiting for TTL.
+    pub fn clear_cache(&self) {
+        if let Ok(mut g) = self.cache.lock() {
+            g.clear();
+        }
+    }
+
+    /// Borrow the configured directory (for diagnostics).
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +452,162 @@ mod tests {
             }
             d => panic!("expected admit-deny, got {:?}", d),
         }
+    }
+
+    // ── GAP 23B: TenantPolicyResolver ─────────────────────
+
+    fn write_policy(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).expect("write policy file");
+    }
+
+    #[test]
+    fn resolver_falls_back_to_global_when_no_tenant_file() {
+        // Global file ALLOWS chat-users on ai.chat; no per-tenant
+        // file for "acme" exists, so the resolver must fall back
+        // to the global engine.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let global = engine_for(
+            r#"
+            [[rules]]
+            name = "g_chat"
+            method = "ai.chat"
+            allow_groups = ["chat-users"]
+            "#,
+        );
+        let resolver = TenantPolicyResolver::new(global, Some(tmp.path().to_path_buf()), 60);
+        let alice = mk_id("alice", &["chat-users"]);
+        match resolver.evaluate(&alice, "ai.chat", Some("acme")) {
+            Decision::Allow { matched_rule } => assert_eq!(matched_rule, "g_chat"),
+            d => panic!("expected global Allow, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn resolver_uses_tenant_specific_file_when_present() {
+        // Global engine DENIES ai.chat; tenant "acme" has a
+        // per-tenant file that allows it. The tenant-scoped
+        // call must Allow.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_policy(
+            tmp.path(),
+            "acme.policy.toml",
+            r#"
+            [[rules]]
+            name = "acme_chat"
+            method = "ai.chat"
+            allow_groups = ["chat-users"]
+            "#,
+        );
+        let global = PolicyEngine::permissive();
+        let resolver = TenantPolicyResolver::new(global, Some(tmp.path().to_path_buf()), 60);
+        let alice = mk_id("alice", &["chat-users"]);
+
+        // Tenant-scoped: hit the per-tenant file.
+        match resolver.evaluate(&alice, "ai.chat", Some("acme")) {
+            Decision::Allow { matched_rule } => assert_eq!(matched_rule, "acme_chat"),
+            d => panic!("expected acme Allow, got {:?}", d),
+        }
+        // Global call (no tenant): default-deny on permissive.
+        match resolver.evaluate(&alice, "ai.chat", None) {
+            Decision::Deny { .. } => {}
+            d => panic!("expected global Deny, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn resolver_caches_within_ttl_and_refreshes_after() {
+        // Write tenant file; first call loads + caches it.
+        // Delete the file; within TTL the cached decision still
+        // holds. After clear_cache (equivalent to TTL expiry),
+        // the resolver re-reads the disk and falls back to
+        // global.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_policy(
+            tmp.path(),
+            "acme.policy.toml",
+            r#"
+            [[rules]]
+            name = "acme_chat"
+            method = "ai.chat"
+            allow_groups = ["chat-users"]
+            "#,
+        );
+        let global = PolicyEngine::permissive();
+        let resolver = TenantPolicyResolver::new(global, Some(tmp.path().to_path_buf()), 60);
+        let alice = mk_id("alice", &["chat-users"]);
+
+        // Prime the cache.
+        match resolver.evaluate(&alice, "ai.chat", Some("acme")) {
+            Decision::Allow { matched_rule } => assert_eq!(matched_rule, "acme_chat"),
+            d => panic!("first allow expected, got {:?}", d),
+        }
+
+        // Delete the file. Cache still serves the prior decision.
+        std::fs::remove_file(tmp.path().join("acme.policy.toml")).expect("remove tenant file");
+        match resolver.evaluate(&alice, "ai.chat", Some("acme")) {
+            Decision::Allow { matched_rule } => assert_eq!(matched_rule, "acme_chat"),
+            d => panic!("cached allow expected, got {:?}", d),
+        }
+
+        // Force TTL expiry; resolver now misses the file and
+        // falls back to global (permissive => default-deny per
+        // method).
+        resolver.clear_cache();
+        match resolver.evaluate(&alice, "ai.chat", Some("acme")) {
+            Decision::Deny { .. } => {}
+            d => panic!("post-expiry deny expected, got {:?}", d),
+        }
+    }
+
+    #[test]
+    fn resolver_sanitises_tenant_id_in_file_lookup() {
+        // Traversal-style tenant id must NOT escape `dir`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resolver = TenantPolicyResolver::new(
+            PolicyEngine::permissive(),
+            Some(tmp.path().to_path_buf()),
+            60,
+        );
+        let p = resolver
+            .tenant_path(Some("../../etc/secrets"))
+            .expect("dir set");
+        let fname = p.file_name().and_then(|s| s.to_str()).expect("file");
+        // Sanitiser turns `/`, `.`, `..` → `_`. The resulting
+        // filename must live inside `dir` (parent == tmp.path()).
+        assert_eq!(p.parent().expect("parent"), tmp.path());
+        assert!(
+            !fname.contains("..") && !fname.contains('/') && !fname.contains('\\'),
+            "filename {fname:?} should be sanitised"
+        );
+    }
+
+    #[test]
+    fn resolver_lists_tenants_and_reads_text() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_policy(
+            tmp.path(),
+            "acme.policy.toml",
+            "[[rules]]\nname = \"a\"\nmethod = \"ai.chat\"\n",
+        );
+        write_policy(
+            tmp.path(),
+            "globex.policy.toml",
+            "[[rules]]\nname = \"b\"\nmethod = \"ai.chat\"\n",
+        );
+        // Noise: an unrelated TOML must NOT be listed.
+        write_policy(tmp.path(), "notes.txt", "ignore me");
+        let resolver = TenantPolicyResolver::new(
+            PolicyEngine::permissive(),
+            Some(tmp.path().to_path_buf()),
+            60,
+        );
+        let tenants = resolver.list_tenants();
+        assert_eq!(tenants, vec!["acme".to_string(), "globex".to_string()]);
+        let text = resolver
+            .tenant_policy_text("acme")
+            .expect("acme text present");
+        assert!(text.contains("name = \"a\""));
+        assert!(resolver.tenant_policy_text("nope").is_none());
     }
 
     #[test]

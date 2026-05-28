@@ -285,6 +285,22 @@ pub struct TrustSection {
 #[derive(Clone, Debug, Deserialize)]
 pub struct PolicySection {
     pub file: PathBuf,
+    /// GAP 23B: per-tenant policy directory. When set, the
+    /// controller looks up `{dir}/{tenant_id}.policy.toml` on
+    /// every admission check; missing per-tenant files fall
+    /// through to [`Self::file`]. Absent = single-tenant
+    /// behaviour (every call evaluates against `file`).
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// GAP 23B: TTL (seconds) for the per-tenant engine cache.
+    /// Default 60. A value of 0 disables caching — useful in
+    /// tests / dev where a policy file is edited frequently.
+    #[serde(default = "default_tenant_cache_ttl")]
+    pub tenant_cache_ttl_secs: u64,
+}
+
+fn default_tenant_cache_ttl() -> u64 {
+    60
 }
 
 /// `[observability]` section — top-level container for
@@ -467,6 +483,28 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Dispatch bridge.
     let mut bridge = DispatchBridge::new(policy, trust_root, &audit_path, node_signer.clone())?;
+    // GAP 23B: per-tenant policy resolver. When [policy] dir is
+    // set, every admission step looks up
+    // `{dir}/{tenant_id}.policy.toml` (sanitised) before falling
+    // through to the global engine. The resolver is wired even
+    // when `dir = None` so the `node.policy.tenant_*` caps can
+    // answer with `count=0` rather than 404.
+    {
+        let global_handle = bridge.policy_handle();
+        let resolver = std::sync::Arc::new(relix_core::policy::TenantPolicyResolver::new(
+            global_handle,
+            cfg.policy.dir.clone(),
+            cfg.policy.tenant_cache_ttl_secs,
+        ));
+        if let Some(d) = cfg.policy.dir.as_ref() {
+            tracing::info!(
+                policy_dir = %d.display(),
+                ttl_secs = cfg.policy.tenant_cache_ttl_secs,
+                "per-tenant policy resolver wired"
+            );
+        }
+        bridge.set_tenant_policy_resolver(resolver);
+    }
     // W2: build the per-controller access broker from
     // `[[execution.agents]]`. Absent / empty config produces
     // an empty broker — every check returns Allow so
@@ -1015,6 +1053,27 @@ fn register_builtins(
             async move { handle_policy_recent_denials(&ring, &ctx) }
         })),
     );
+    // GAP 23B: node.policy.tenant_list + node.policy.tenant_get.
+    // Pure read of the per-tenant policy directory. Both no-op
+    // (404-style) when the bridge wasn't configured with a
+    // tenant resolver — keeps single-tenant deployments
+    // backwards-compatible.
+    let tenant_resolver_for_list = bridge.tenant_policy_handle();
+    bridge.register(
+        "node.policy.tenant_list",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let r = tenant_resolver_for_list.clone();
+            async move { handle_policy_tenant_list(r.as_deref(), &ctx) }
+        })),
+    );
+    let tenant_resolver_for_get = bridge.tenant_policy_handle();
+    bridge.register(
+        "node.policy.tenant_get",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let r = tenant_resolver_for_get.clone();
+            async move { handle_policy_tenant_get(r.as_deref(), &ctx) }
+        })),
+    );
     // Built-in: every node serves its own NodeManifest.
     let manifest_for_handler = manifest.clone();
     bridge.register(
@@ -1083,6 +1142,28 @@ fn register_builtins(
             .with_categories(["observe".into(), "policy".into(), "read".into()])
             .with_risk(relix_core::capability::RiskLevel::Safe),
     );
+    // GAP 23B: per-tenant policy enumeration + inspection.
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.policy.tenant_list")
+            .with_description(
+                "Enumerate tenant ids that have a per-tenant policy file at \
+                 `{policy.dir}/{tenant_id}.policy.toml`. Empty arg. Returns one tenant id \
+                 per line followed by `count=N`. Returns `count=0` when [policy] dir is \
+                 unset or the directory is empty.",
+            )
+            .with_categories(["observe".into(), "policy".into(), "read".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
+    );
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.policy.tenant_get")
+            .with_description(
+                "Read the raw TOML text of `{policy.dir}/{tenant_id}.policy.toml`. \
+                 Arg: tenant id as a UTF-8 string. Returns the TOML text on hit, \
+                 a NOT_FOUND error envelope on miss.",
+            )
+            .with_categories(["observe".into(), "policy".into(), "read".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
+    );
 }
 
 /// W2-007d: handle `node.policy.recent_denials`. Optional arg
@@ -1140,6 +1221,78 @@ fn handle_policy_recent_denials(
     }
     let _ = writeln!(body, "count={count}");
     HandlerOutcome::Ok(body.into_bytes())
+}
+
+/// GAP 23B: handle `node.policy.tenant_list`. Pure read of the
+/// configured per-tenant policy directory. When the bridge was
+/// built without a resolver (single-tenant mode) the cap returns
+/// `count=0` rather than an error, so dashboards can poll it
+/// uniformly.
+fn handle_policy_tenant_list(
+    resolver: Option<&relix_core::policy::TenantPolicyResolver>,
+    _ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    let tenants: Vec<String> = match resolver {
+        Some(r) => r.list_tenants(),
+        None => Vec::new(),
+    };
+    let count = tenants.len();
+    let mut body = String::new();
+    for t in &tenants {
+        let _ = writeln!(body, "{t}");
+    }
+    let _ = writeln!(body, "count={count}");
+    HandlerOutcome::Ok(body.into_bytes())
+}
+
+/// GAP 23B: handle `node.policy.tenant_get`. Arg is the tenant
+/// id as a UTF-8 string. Returns the raw TOML on hit;
+/// `UNKNOWN_METHOD` (re-purposed as "no such resource") on miss.
+fn handle_policy_tenant_get(
+    resolver: Option<&relix_core::policy::TenantPolicyResolver>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    use relix_core::types::error_kinds;
+    let tenant = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("node.policy.tenant_get arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if tenant.is_empty() {
+        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "node.policy.tenant_get: tenant id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let resolver = match resolver {
+        Some(r) => r,
+        None => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::UNKNOWN_METHOD,
+                cause: "node.policy.tenant_get: per-tenant policy not configured".into(),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    match resolver.tenant_policy_text(tenant) {
+        Some(text) => HandlerOutcome::Ok(text.into_bytes()),
+        None => HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: error_kinds::UNKNOWN_METHOD,
+            cause: format!("node.policy.tenant_get: no policy file for tenant {tenant:?}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+    }
 }
 
 /// W2-007a: handle `node.policy.simulate`. Parses `<method>|<groups_csv>`,

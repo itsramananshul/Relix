@@ -145,6 +145,7 @@ mod planning_mini_mesh_test;
 mod plugins;
 mod policy_denials;
 mod policy_simulate;
+mod policy_tenants;
 mod provenance;
 mod rate_limit;
 mod schema;
@@ -535,6 +536,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Returns the bounded ring of recent policy-denied
         // attempts (capacity 256 per peer). Pure read.
         .route("/v1/policy/denials", get(policy_denials::denials))
+        // GAP 23B: per-tenant policy enumeration + inspection.
+        // Both endpoints are read-only proxies for the
+        // `node.policy.tenant_*` caps on the target peer.
+        .route("/v1/policy/tenants", get(policy_tenants::list_tenants))
+        .route(
+            "/v1/policy/tenants/:tenant_id",
+            get(policy_tenants::get_tenant),
+        )
         // W2-MEMORY-3: proxy for `memory.agent_read`. Returns
         // the persistent agent + user memory for a subject_id.
         // Read-only — writes happen via the agent's own

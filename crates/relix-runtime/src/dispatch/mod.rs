@@ -317,6 +317,13 @@ pub struct DispatchBridge {
     /// optionally outbound response bodies) at the mesh
     /// boundary.
     pii_gate: Option<Arc<crate::nodes::pii_gate::MeshPiiGate>>,
+    /// GAP 23B: per-tenant policy resolver. `None` keeps the
+    /// bridge in single-tenant mode (every call evaluates
+    /// against the global [`Self::policy`]). When wired, the
+    /// admission step consults the resolver with the request's
+    /// `tenant_id`; tenants without a per-tenant policy file
+    /// transparently fall through to the global engine.
+    tenant_policy: Option<Arc<relix_core::policy::TenantPolicyResolver>>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -489,7 +496,27 @@ impl DispatchBridge {
             alert_sink: None,
             budget_enforcer: None,
             pii_gate: None,
+            tenant_policy: None,
         })
+    }
+
+    /// GAP 23B: wire the per-tenant policy resolver. Idempotent
+    /// — calling twice replaces the prior resolver. `None`
+    /// reverts to single-tenant mode (admission falls back to
+    /// the bridge's global [`Self::policy`]).
+    pub fn set_tenant_policy_resolver(
+        &mut self,
+        resolver: Arc<relix_core::policy::TenantPolicyResolver>,
+    ) {
+        self.tenant_policy = Some(resolver);
+    }
+
+    /// GAP 23B: cheap-clone handle on the tenant resolver. Used
+    /// by the `node.policy.tenant_list` + `node.policy.tenant_get`
+    /// caps so the handlers can read the resolver without owning
+    /// the bridge.
+    pub fn tenant_policy_handle(&self) -> Option<Arc<relix_core::policy::TenantPolicyResolver>> {
+        self.tenant_policy.clone()
     }
 
     /// RELIX-7.28 Part 1: wire the budget enforcer. Idempotent —
@@ -948,7 +975,14 @@ impl DispatchBridge {
         }
 
         // === Admission step 9: policy ===
-        let decision = self.policy.evaluate(&verified, &req.method);
+        // GAP 23B: route through the tenant resolver when wired
+        // so a request with `tenant_id = Some(t)` evaluates
+        // against `{policy.dir}/{t}.policy.toml` when present,
+        // falling back to the global engine otherwise.
+        let decision = match &self.tenant_policy {
+            Some(r) => r.evaluate(&verified, &req.method, req.tenant_id.as_deref()),
+            None => self.policy.evaluate(&verified, &req.method),
+        };
         let (policy_decision_str, denied) = match &decision {
             Decision::Allow { matched_rule } => (format!("allow:{matched_rule}"), false),
             Decision::Deny {
@@ -1672,7 +1706,14 @@ impl DispatchBridge {
         }
 
         // === Admission step 9: policy ===
-        let decision = self.policy.evaluate(&verified, &req.method);
+        // GAP 23B: route through the tenant resolver when wired
+        // so a request with `tenant_id = Some(t)` evaluates
+        // against `{policy.dir}/{t}.policy.toml` when present,
+        // falling back to the global engine otherwise.
+        let decision = match &self.tenant_policy {
+            Some(r) => r.evaluate(&verified, &req.method, req.tenant_id.as_deref()),
+            None => self.policy.evaluate(&verified, &req.method),
+        };
         let (policy_decision_str, denied) = match &decision {
             Decision::Allow { matched_rule } => (format!("allow:{matched_rule}"), false),
             Decision::Deny {
