@@ -32,7 +32,7 @@ use crate::dispatch::{build_request, decode_response};
 use crate::manifest::MeshClient;
 use crate::transport::envelope::ResponseResult;
 
-use super::alert::{ActiveAlert, AlertDeliver, AlertEvent, AlertSeverity};
+use super::alert::{ActiveAlert, AlertDeliver, AlertEvent, AlertKind, AlertSeverity};
 
 /// Static dispatch deadline for channel sends — kept short so a
 /// hung Telegram / Discord doesn't pile up tokio tasks.
@@ -128,6 +128,11 @@ impl MultiChannelAlertSink {
 }
 
 fn format_fired(a: &ActiveAlert) -> String {
+    // RELIX-7.19 GAP 2: LowConfidence uses a dedicated
+    // operator-facing format per spec.
+    if a.kind == AlertKind::LowConfidence {
+        return format_low_confidence_fired(a);
+    }
     let (badge, header) = match a.severity {
         AlertSeverity::Warning => ("⚠️", "Relix Alert — WARNING"),
         AlertSeverity::Critical => ("🚨", "Relix Alert — CRITICAL"),
@@ -150,6 +155,9 @@ fn format_fired(a: &ActiveAlert) -> String {
 }
 
 fn format_recovered(a: &ActiveAlert) -> String {
+    if a.kind == AlertKind::LowConfidence {
+        return format_low_confidence_recovered(a);
+    }
     format!(
         "✅ Relix Alert — RECOVERED\n\
          Agent: {agent}\n\
@@ -165,6 +173,59 @@ fn format_recovered(a: &ActiveAlert) -> String {
     )
 }
 
+/// RELIX-7.19 GAP 2: low-confidence formatter. Spec format:
+///
+/// ```text
+/// ⚠️ Relix Alert — LOW CONFIDENCE
+/// Agent: <agent>
+/// Method: <method>
+/// Confidence: <score> (threshold: <threshold>)
+/// Message: <alert_message>
+/// ```
+///
+/// And the critical variant swaps the badge + header:
+///
+/// ```text
+/// 🚨 Relix Alert — CRITICALLY LOW CONFIDENCE
+/// ```
+fn format_low_confidence_fired(a: &ActiveAlert) -> String {
+    let (badge, header) = match a.severity {
+        AlertSeverity::Warning => ("⚠️", "Relix Alert — LOW CONFIDENCE"),
+        AlertSeverity::Critical => ("🚨", "Relix Alert — CRITICALLY LOW CONFIDENCE"),
+    };
+    let method = a.method.as_deref().unwrap_or("(unknown)");
+    format!(
+        "{badge} {header}\n\
+         Agent: {agent}\n\
+         Method: {method}\n\
+         Confidence: {score} (threshold: {threshold})\n\
+         Message: {message}",
+        badge = badge,
+        header = header,
+        agent = a.agent,
+        method = method,
+        score = format_value("low_confidence", a.actual),
+        threshold = format_value("low_confidence", a.threshold),
+        message = a.message,
+    )
+}
+
+fn format_low_confidence_recovered(a: &ActiveAlert) -> String {
+    let method = a.method.as_deref().unwrap_or("(unknown)");
+    format!(
+        "✅ Relix Alert — CONFIDENCE RECOVERED\n\
+         Agent: {agent}\n\
+         Method: {method}\n\
+         Confidence: {score} (threshold: {threshold})\n\
+         Time: {ts}",
+        agent = a.agent,
+        method = method,
+        score = format_value("low_confidence", a.actual),
+        threshold = format_value("low_confidence", a.threshold),
+        ts = iso_ms(unix_now_ms()),
+    )
+}
+
 /// Render a metric value with units appropriate to the metric.
 fn format_value(metric: &str, value: f64) -> String {
     match metric {
@@ -172,6 +233,9 @@ fn format_value(metric: &str, value: f64) -> String {
         "p95_latency" => format!("{value:.0} ms"),
         "cost_per_hour" => format!("${:.4}", value / 1_000_000.0),
         "zero_success" => format!("{value:.0} successes"),
+        // RELIX-7.19 GAP 2: confidence renders as a fixed
+        // 3-decimal float in `[0, 1]`.
+        "low_confidence" => format!("{value:.3}"),
         _ => format!("{value:.2}"),
     }
 }
@@ -357,6 +421,16 @@ pub struct AlertChronicleRow {
     /// Unix-ms timestamp the row was written. Useful for
     /// pure-SQL queries.
     pub recorded_at_ms: i64,
+    /// RELIX-7.19 GAP 2: capability method the alert was raised
+    /// against. `None` for poll-driven kinds; `Some(method)` for
+    /// `LowConfidence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// RELIX-7.19 GAP 2: operator-supplied alert message.
+    /// `None` for poll-driven kinds whose message is built from
+    /// the metric values; `Some(msg)` for `LowConfidence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl AlertChronicle {
@@ -399,6 +473,12 @@ impl AlertChronicle {
                 triggered_at: Some(iso_ms(a.triggered_at_ms)),
                 recovered_at: None,
                 recorded_at_ms: now_ms,
+                method: a.method.clone(),
+                message: if a.kind == AlertKind::LowConfidence {
+                    Some(a.message.clone())
+                } else {
+                    None
+                },
             },
             AlertEvent::Recovered(a) => AlertChronicleRow {
                 event_type: "alert.recovered".into(),
@@ -410,14 +490,16 @@ impl AlertChronicle {
                 triggered_at: Some(iso_ms(a.triggered_at_ms)),
                 recovered_at: Some(iso_ms(now_ms)),
                 recorded_at_ms: now_ms,
+                method: a.method.clone(),
+                message: None,
             },
         };
         let conn = self.conn.lock().map_err(|_| ChronicleError::Lock)?;
         conn.execute(
             "INSERT INTO alert_events \
              (event_type, agent, metric, severity, actual_value, threshold_value, \
-              triggered_at, recovered_at, recorded_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              triggered_at, recovered_at, recorded_at_ms, method, message) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 row.event_type,
                 row.agent,
@@ -428,6 +510,8 @@ impl AlertChronicle {
                 row.triggered_at,
                 row.recovered_at,
                 row.recorded_at_ms,
+                row.method,
+                row.message,
             ],
         )?;
         Ok(())
@@ -440,7 +524,7 @@ impl AlertChronicle {
         let limit = limit.clamp(1, 1000) as i64;
         let mut stmt = conn.prepare(
             "SELECT event_type, agent, metric, severity, actual_value, threshold_value, \
-                    triggered_at, recovered_at, recorded_at_ms \
+                    triggered_at, recovered_at, recorded_at_ms, method, message \
              FROM alert_events ORDER BY recorded_at_ms DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], |r| {
@@ -454,6 +538,8 @@ impl AlertChronicle {
                 triggered_at: r.get(6)?,
                 recovered_at: r.get(7)?,
                 recorded_at_ms: r.get(8)?,
+                method: r.get(9)?,
+                message: r.get(10)?,
             })
         })?;
         let mut out = Vec::new();
@@ -491,7 +577,33 @@ fn init_schema(conn: &Connection) -> Result<(), ChronicleError> {
          CREATE INDEX IF NOT EXISTS alert_events_agent_ts \
              ON alert_events(agent, recorded_at_ms DESC);",
     )?;
+    // RELIX-7.19 GAP 2: backwards-compat ALTER to add the
+    // `method` + `message` columns when missing. Pre-7.19
+    // databases pick them up on open with safe NULL defaults.
+    if !column_exists(conn, "alert_events", "method")? {
+        conn.execute("ALTER TABLE alert_events ADD COLUMN method TEXT", [])?;
+    }
+    if !column_exists(conn, "alert_events", "message")? {
+        conn.execute("ALTER TABLE alert_events ADD COLUMN message TEXT", [])?;
+    }
     Ok(())
+}
+
+/// Probe for a column's existence using SQLite's `PRAGMA
+/// table_info`. Used by the 7.19 GAP 2 alert-chronicle
+/// migration so an upgraded database picks up the new
+/// columns without failing the `ALTER TABLE` on a fresh
+/// schema.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, ChronicleError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `AlertDeliver` that writes every event to a chronicle.
@@ -608,6 +720,27 @@ mod tests {
             threshold: 10.0,
             actual: 12.5,
             message: "test".into(),
+            method: None,
+        }
+    }
+
+    fn fired_low_conf(
+        agent: &str,
+        method: &str,
+        score: f64,
+        threshold: f64,
+        severity: AlertSeverity,
+        ts_ms: i64,
+    ) -> ActiveAlert {
+        ActiveAlert {
+            agent: agent.into(),
+            kind: AlertKind::LowConfidence,
+            severity,
+            triggered_at_ms: ts_ms,
+            threshold,
+            actual: score,
+            message: "tool wobble".into(),
+            method: Some(method.into()),
         }
     }
 
@@ -972,5 +1105,110 @@ mod tests {
         )));
         // Give spawned tasks one tick.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ── RELIX-7.19 GAP 2: LowConfidence formatting + chronicle
+
+    #[test]
+    fn format_low_confidence_warning_matches_documented_shape() {
+        let ev = AlertEvent::Fired(fired_low_conf(
+            "alice",
+            "ai.chat",
+            0.42,
+            0.50,
+            AlertSeverity::Warning,
+            1_700_000_000_000,
+        ));
+        let body = MultiChannelAlertSink::format_message(&ev);
+        // Spec format — every line present.
+        assert!(body.contains("Relix Alert — LOW CONFIDENCE"), "{body}");
+        assert!(body.contains("Agent: alice"), "{body}");
+        assert!(body.contains("Method: ai.chat"), "{body}");
+        assert!(
+            body.contains("Confidence: 0.420 (threshold: 0.500)"),
+            "{body}"
+        );
+        assert!(body.contains("Message: tool wobble"), "{body}");
+        // Warning badge ⚠️ not the critical 🚨.
+        assert!(body.starts_with("\u{26A0}"), "{body}");
+    }
+
+    #[test]
+    fn format_low_confidence_critical_uses_critical_header() {
+        let ev = AlertEvent::Fired(fired_low_conf(
+            "alice",
+            "ai.chat",
+            0.20,
+            0.30,
+            AlertSeverity::Critical,
+            1_700_000_000_000,
+        ));
+        let body = MultiChannelAlertSink::format_message(&ev);
+        assert!(
+            body.contains("Relix Alert — CRITICALLY LOW CONFIDENCE"),
+            "{body}"
+        );
+        // 🚨 prefix.
+        assert!(body.starts_with("\u{1F6A8}"), "{body}");
+    }
+
+    #[test]
+    fn format_low_confidence_recovered_uses_recovered_header() {
+        let ev = AlertEvent::Recovered(fired_low_conf(
+            "alice",
+            "ai.chat",
+            0.85,
+            0.50,
+            AlertSeverity::Warning,
+            1_700_000_000_000,
+        ));
+        let body = MultiChannelAlertSink::format_message(&ev);
+        assert!(
+            body.contains("Relix Alert — CONFIDENCE RECOVERED"),
+            "{body}"
+        );
+        assert!(body.contains("Method: ai.chat"), "{body}");
+    }
+
+    #[test]
+    fn chronicle_records_low_confidence_event_with_method_and_message() {
+        let c = AlertChronicle::in_memory().unwrap();
+        let ev = AlertEvent::Fired(fired_low_conf(
+            "alice",
+            "ai.chat",
+            0.40,
+            0.50,
+            AlertSeverity::Warning,
+            1_700_000_000_000,
+        ));
+        c.record(&ev).unwrap();
+        let rows = c.recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.event_type, "alert.fired");
+        assert_eq!(row.metric, "low_confidence");
+        assert_eq!(row.method.as_deref(), Some("ai.chat"));
+        assert_eq!(row.message.as_deref(), Some("tool wobble"));
+        assert_eq!(row.severity.as_deref(), Some("warning"));
+    }
+
+    #[test]
+    fn chronicle_records_low_confidence_recovered_with_method() {
+        let c = AlertChronicle::in_memory().unwrap();
+        let ev = AlertEvent::Recovered(fired_low_conf(
+            "alice",
+            "ai.chat",
+            0.85,
+            0.50,
+            AlertSeverity::Warning,
+            1_700_000_000_000,
+        ));
+        c.record(&ev).unwrap();
+        let rows = c.recent(10).unwrap();
+        assert_eq!(rows[0].event_type, "alert.recovered");
+        assert_eq!(rows[0].method.as_deref(), Some("ai.chat"));
+        // Recovered rows leave `message` None — the message is
+        // operator-supplied at fire time, not at recovery.
+        assert!(rows[0].message.is_none());
     }
 }

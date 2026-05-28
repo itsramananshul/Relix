@@ -277,6 +277,18 @@ pub struct DispatchBridge {
     /// host a SOL VM execution surface. Updated atomically
     /// after every scored dispatch.
     last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
+    /// RELIX-7.19 GAP 2: the alert engine the bridge calls
+    /// when a confidence verdict triggers the `Alert`
+    /// fallback action. Holds the per-(agent, method,
+    /// LowConfidence) dedup state. `None` keeps the legacy
+    /// `tracing::warn!` fallback path so operators who
+    /// haven't wired the alert pipeline still see the alert.
+    alert_engine: Option<Arc<crate::metrics::AlertEngine>>,
+    /// RELIX-7.19 GAP 2: the alert sink the bridge fires
+    /// `LowConfidence` events through. Wired alongside the
+    /// engine. Typically a `CompositeAlertSink` over the
+    /// chronicle + multi-channel fan-out.
+    alert_sink: Option<Arc<dyn crate::metrics::AlertDeliver>>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -481,6 +493,8 @@ impl DispatchBridge {
             confidence_scorer: None,
             fallback_engine: None,
             last_confidence_cell: None,
+            alert_engine: None,
+            alert_sink: None,
         })
     }
 
@@ -521,6 +535,31 @@ impl DispatchBridge {
     /// behaviour preserved).
     pub fn last_confidence_cell(&self) -> Option<crate::confidence::LastConfidenceCell> {
         self.last_confidence_cell.clone()
+    }
+
+    /// RELIX-7.19 GAP 2: wire the alert pipeline the bridge
+    /// fires through when a confidence verdict triggers the
+    /// `Alert` fallback action. Both arms must be wired
+    /// together: the engine owns the per-(agent, method,
+    /// LowConfidence) dedup state; the sink delivers the
+    /// resulting `AlertEvent`s. Calling once with `None` for
+    /// either arm leaves the bridge in `tracing::warn!`
+    /// fallback mode — backwards compatible.
+    pub fn set_alert_pipeline(
+        &mut self,
+        engine: Arc<crate::metrics::AlertEngine>,
+        sink: Arc<dyn crate::metrics::AlertDeliver>,
+    ) {
+        self.alert_engine = Some(engine);
+        self.alert_sink = Some(sink);
+    }
+
+    /// Cheap-clone handle on the alert engine. Used by tests
+    /// and the operator-facing `alerts.active` capability so
+    /// the alert pipeline can introspect dedup state without
+    /// owning the bridge.
+    pub fn alert_engine_handle(&self) -> Option<Arc<crate::metrics::AlertEngine>> {
+        self.alert_engine.clone()
     }
 
     /// RELIX-7.11: wire the per-invocation metrics sink + the
@@ -1209,15 +1248,40 @@ impl DispatchBridge {
                 best_score = (best_score).max(1.0); // safe default is trusted
             }
             crate::confidence::FallbackAction::Alert { alert_message } => {
-                tracing::warn!(
-                    target: "confidence.alert",
-                    agent = %agent,
-                    method = %method,
-                    score = best_score,
-                    error_rate = initial_score.rolling_error_rate,
-                    message = %alert_message,
-                    "confidence alert"
-                );
+                // RELIX-7.19 GAP 2: prefer the wired alert
+                // pipeline (engine dedup + sink fan-out). Fall
+                // back to `tracing::warn!` when neither arm has
+                // been wired — operators who haven't configured
+                // `[metrics.alerts]` still see the alert in
+                // their tracing collector.
+                match (&self.alert_engine, &self.alert_sink) {
+                    (Some(engine), Some(sink)) => {
+                        let low = verdict.low_threshold.unwrap_or(0.5);
+                        let critical = verdict.critical_threshold.unwrap_or(0.3);
+                        let events = engine.evaluate_low_confidence(
+                            &agent,
+                            method,
+                            best_score,
+                            low,
+                            critical,
+                            alert_message,
+                        );
+                        for ev in events {
+                            sink.deliver(&ev);
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            target: "confidence.alert",
+                            agent = %agent,
+                            method = %method,
+                            score = best_score,
+                            error_rate = initial_score.rolling_error_rate,
+                            message = %alert_message,
+                            "confidence alert"
+                        );
+                    }
+                }
             }
             crate::confidence::FallbackAction::Abort { abort_message } => {
                 current_outcome = HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
@@ -3056,6 +3120,162 @@ mod tests {
             panic!("expected Ok");
         };
         // Alert leaves body unchanged.
+        assert_eq!(body.as_slice(), b"hi");
+    }
+
+    // ── RELIX-7.19 GAP 2: AlertEngine + AlertDeliver wiring
+
+    /// AlertDeliver that records every event into a shared
+    /// vec — used by the GAP 2 wiring tests to verify the
+    /// bridge fires `LowConfidence` events through the
+    /// configured pipeline instead of falling back to
+    /// `tracing::warn!`.
+    struct RecordingAlertSink {
+        events: Arc<std::sync::Mutex<Vec<crate::metrics::AlertEvent>>>,
+    }
+
+    impl crate::metrics::AlertDeliver for RecordingAlertSink {
+        fn deliver(&self, event: &crate::metrics::AlertEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(event.clone());
+        }
+    }
+
+    fn make_alert_engine() -> Arc<crate::metrics::AlertEngine> {
+        let store = crate::metrics::MetricsStore::in_memory().unwrap();
+        let query = crate::metrics::MetricsQuery::new(store);
+        Arc::new(crate::metrics::AlertEngine::new(
+            query,
+            crate::metrics::AlertThresholds::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn low_confidence_alert_fires_through_wired_sink() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register(
+            "flaky.method",
+            Arc::new(FnHandler(|_ctx: InvocationCtx| async {
+                HandlerOutcome::Ok(b"hi".to_vec())
+            })),
+        );
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            // Aggressive thresholds so the small "hi" body trips
+            // the alert action.
+            low_threshold: 0.95,
+            critical_threshold: 0.90,
+            low_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "wobble".into(),
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "very wobble".into(),
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        let alert_engine = make_alert_engine();
+        let events: Arc<std::sync::Mutex<Vec<crate::metrics::AlertEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn crate::metrics::AlertDeliver> = Arc::new(RecordingAlertSink {
+            events: events.clone(),
+        });
+        bridge.set_alert_pipeline(alert_engine, sink);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("flaky.method", b"x".to_vec(), bundle, 30);
+        let _ = bridge.handle_inbound(envelope).await;
+        let g = events.lock().unwrap();
+        assert_eq!(g.len(), 1, "expected one Fired event, got {:?}", *g);
+        match &g[0] {
+            crate::metrics::AlertEvent::Fired(a) => {
+                assert_eq!(a.kind, crate::metrics::AlertKind::LowConfidence);
+                assert_eq!(a.agent, "alice");
+                assert_eq!(a.method.as_deref(), Some("flaky.method"));
+            }
+            o => panic!("expected Fired, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn low_confidence_alert_dedups_across_back_to_back_calls() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register(
+            "flaky.method",
+            Arc::new(FnHandler(|_ctx: InvocationCtx| async {
+                HandlerOutcome::Ok(b"hi".to_vec())
+            })),
+        );
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            low_threshold: 0.95,
+            critical_threshold: 0.90,
+            low_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "wobble".into(),
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "very wobble".into(),
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        let alert_engine = make_alert_engine();
+        let events: Arc<std::sync::Mutex<Vec<crate::metrics::AlertEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: Arc<dyn crate::metrics::AlertDeliver> = Arc::new(RecordingAlertSink {
+            events: events.clone(),
+        });
+        bridge.set_alert_pipeline(alert_engine, sink);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        for _ in 0..3 {
+            let envelope = build_request("flaky.method", b"x".to_vec(), bundle.clone(), 30);
+            let _ = bridge.handle_inbound(envelope).await;
+        }
+        let g = events.lock().unwrap();
+        assert_eq!(
+            g.len(),
+            1,
+            "expected exactly one Fired event despite three calls: {:?}",
+            *g
+        );
+    }
+
+    #[tokio::test]
+    async fn low_confidence_alert_falls_back_to_tracing_when_no_sink_wired() {
+        // Without an alert pipeline wired the bridge must
+        // continue with the original body — the only side
+        // effect should be a tracing::warn (untestable without
+        // a subscriber, so we assert the body survives).
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register(
+            "flaky.method",
+            Arc::new(FnHandler(|_ctx: InvocationCtx| async {
+                HandlerOutcome::Ok(b"hi".to_vec())
+            })),
+        );
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            low_threshold: 0.95,
+            critical_threshold: 0.90,
+            low_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "wobble".into(),
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "very wobble".into(),
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        // No set_alert_pipeline call: pre-7.19 behaviour
+        // preserved (tracing::warn + original body).
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("flaky.method", b"x".to_vec(), bundle, 30);
+        let resp = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp).unwrap();
+        let ResponseResult::Ok(body) = resp.res else {
+            panic!("expected Ok");
+        };
         assert_eq!(body.as_slice(), b"hi");
     }
 }

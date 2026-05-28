@@ -152,6 +152,7 @@ fn fired_alert() -> AlertEvent {
         threshold: 10.0,
         actual: 12.5,
         message: "alice error_rate test".into(),
+        method: None,
     })
 }
 

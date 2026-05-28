@@ -33,7 +33,10 @@ pub mod query;
 pub mod store;
 pub mod types;
 
-pub use alert::{ActiveAlert, AlertEngine, AlertEvent, AlertKind, AlertSeverity, AlertThresholds};
+pub use alert::{
+    ActiveAlert, AlertDeliver, AlertEngine, AlertEvent, AlertKind, AlertSeverity, AlertSink,
+    AlertThresholds, LoggingAlertSink,
+};
 pub use alert_delivery::{
     AlertChronicle, AlertChronicleRow, AlertDeliveryConfig, AlertMeshCell, AlertMeshContext,
     AlertTarget, ChronicleAlertSink, ChronicleError as AlertChronicleError, CompositeAlertSink,

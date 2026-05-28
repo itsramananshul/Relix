@@ -82,6 +82,14 @@ pub struct ActionVerdict {
     /// True iff the matched policy's `critical_threshold` was
     /// crossed (vs just `low_threshold`).
     pub critical: bool,
+    /// RELIX-7.19 GAP 2: the matched policy's `low_threshold`.
+    /// `None` when no policy matched. Used by the dispatch
+    /// bridge to feed `AlertEngine::evaluate_low_confidence`
+    /// without re-walking the policy list.
+    pub low_threshold: Option<f32>,
+    /// RELIX-7.19 GAP 2: the matched policy's
+    /// `critical_threshold`. `None` when no policy matched.
+    pub critical_threshold: Option<f32>,
 }
 
 impl ActionVerdict {
@@ -90,6 +98,8 @@ impl ActionVerdict {
             action: FallbackAction::Pass,
             matched: false,
             critical: false,
+            low_threshold: None,
+            critical_threshold: None,
         }
     }
 }
@@ -148,6 +158,8 @@ impl FallbackEngine {
                     action: p.critical_action.clone(),
                     matched: true,
                     critical: true,
+                    low_threshold: Some(p.low_threshold),
+                    critical_threshold: Some(p.critical_threshold),
                 };
             }
             if score <= p.low_threshold {
@@ -155,6 +167,8 @@ impl FallbackEngine {
                     action: p.low_action.clone(),
                     matched: true,
                     critical: false,
+                    low_threshold: Some(p.low_threshold),
+                    critical_threshold: Some(p.critical_threshold),
                 };
             }
             // Above both thresholds → pass; but we already
@@ -163,6 +177,8 @@ impl FallbackEngine {
                 action: FallbackAction::Pass,
                 matched: true,
                 critical: false,
+                low_threshold: Some(p.low_threshold),
+                critical_threshold: Some(p.critical_threshold),
             };
         }
         ActionVerdict::pass()

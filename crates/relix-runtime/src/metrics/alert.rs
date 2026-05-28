@@ -93,6 +93,16 @@ pub enum AlertKind {
     P95Latency,
     CostPerHour,
     ZeroSuccess,
+    /// RELIX-7.19 GAP 2: emitted by the dispatch bridge when
+    /// the `ConfidenceScorer` returns a verdict below a
+    /// configured `Alert` fallback threshold. Unlike the
+    /// poll-driven kinds above, this kind is event-driven —
+    /// the bridge calls
+    /// [`AlertEngine::evaluate_low_confidence`] directly. The
+    /// dedup key includes the called method so a chatty
+    /// `tool.*` and a chatty `ai.chat` don't suppress each
+    /// other.
+    LowConfidence,
 }
 
 impl AlertKind {
@@ -102,6 +112,7 @@ impl AlertKind {
             AlertKind::P95Latency => "p95_latency",
             AlertKind::CostPerHour => "cost_per_hour",
             AlertKind::ZeroSuccess => "zero_success",
+            AlertKind::LowConfidence => "low_confidence",
         }
     }
 }
@@ -131,6 +142,16 @@ pub struct ActiveAlert {
     pub threshold: f64,
     pub actual: f64,
     pub message: String,
+    /// RELIX-7.19 GAP 2: capability method this alert was
+    /// raised against. `None` for poll-driven kinds
+    /// (`ErrorRate`, `P95Latency`, `CostPerHour`,
+    /// `ZeroSuccess`) that operate over an entire agent's
+    /// metric stream. `Some(method)` for `LowConfidence` so
+    /// the dedup key + chronicle row + channel formatting
+    /// all carry which capability tripped the threshold.
+    /// Additive — older serialised rows decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
 }
 
 /// What the engine emits on a single evaluation tick. The
@@ -164,12 +185,22 @@ impl AlertEvent {
 /// Periodic threshold evaluator. Cheap to clone — holds an
 /// `Arc<Mutex<>>` of the active-alerts map plus the read-only
 /// thresholds + query handle.
+///
+/// RELIX-7.19 GAP 2: the dedup key carries an optional
+/// `method` so `LowConfidence` alerts can dedup per
+/// `(agent, method, kind)` while the poll-driven kinds keep
+/// dedup per `(agent, kind)` (method = `None`).
 #[derive(Clone)]
 pub struct AlertEngine {
     query: MetricsQuery,
     thresholds: Arc<AlertThresholds>,
-    active: Arc<Mutex<HashMap<(String, AlertKind), ActiveAlert>>>,
+    active: Arc<Mutex<HashMap<DedupKey, ActiveAlert>>>,
 }
+
+/// Per-alert dedup key. Three components keep the per-kind
+/// semantics straight: `agent`, `method` (Some for
+/// `LowConfidence`, None for poll-driven kinds), and `kind`.
+pub(crate) type DedupKey = (String, Option<String>, AlertKind);
 
 impl AlertEngine {
     pub fn new(query: MetricsQuery, thresholds: AlertThresholds) -> Self {
@@ -334,7 +365,28 @@ impl AlertEngine {
         message: String,
         events: &mut Vec<AlertEvent>,
     ) {
-        let key = (agent.to_string(), kind);
+        self.evaluate_threshold_keyed(
+            agent, None, kind, actual, threshold, crossed, severity, message, events,
+        );
+    }
+
+    /// RELIX-7.19 GAP 2: key-extended variant. `method` is
+    /// `None` for poll-driven kinds and `Some(method)` for
+    /// `LowConfidence` so the per-method dedup is exact.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_threshold_keyed(
+        &self,
+        agent: &str,
+        method: Option<&str>,
+        kind: AlertKind,
+        actual: f64,
+        threshold: f64,
+        crossed: bool,
+        severity: AlertSeverity,
+        message: String,
+        events: &mut Vec<AlertEvent>,
+    ) {
+        let key: DedupKey = (agent.to_string(), method.map(|s| s.to_string()), kind);
         let mut g = self
             .active
             .lock()
@@ -349,6 +401,7 @@ impl AlertEngine {
                     threshold,
                     actual,
                     message,
+                    method: method.map(|s| s.to_string()),
                 };
                 g.insert(key, active.clone());
                 events.push(AlertEvent::Fired(active));
@@ -363,6 +416,56 @@ impl AlertEngine {
                 // wasn't active. No event.
             }
         }
+    }
+
+    /// RELIX-7.19 GAP 2: event-driven low-confidence
+    /// evaluator the dispatch bridge calls every time its
+    /// `Alert` fallback action fires. Behaves like
+    /// `evaluate_threshold` but: (a) keyed on
+    /// `(agent, method, LowConfidence)` so per-cap brittle
+    /// providers don't suppress each other, (b) severity is
+    /// derived from the score-vs-threshold split — at-or-
+    /// below `critical_threshold` raises `Critical`, otherwise
+    /// `Warning`, (c) returns the event list directly so the
+    /// caller can deliver synchronously. Dedup semantics
+    /// match the polled kinds: a `Fired` event is emitted on
+    /// the crossing edge, a `Recovered` event is emitted when
+    /// the score climbs back above `low_threshold`, and
+    /// neither is emitted for already-active or already-clear
+    /// states.
+    pub fn evaluate_low_confidence(
+        &self,
+        agent: &str,
+        method: &str,
+        score: f32,
+        low_threshold: f32,
+        critical_threshold: f32,
+        message: impl Into<String>,
+    ) -> Vec<AlertEvent> {
+        let mut events = Vec::new();
+        let crossed = score <= low_threshold;
+        let severity = if score <= critical_threshold {
+            AlertSeverity::Critical
+        } else {
+            AlertSeverity::Warning
+        };
+        let threshold = if score <= critical_threshold {
+            critical_threshold as f64
+        } else {
+            low_threshold as f64
+        };
+        self.evaluate_threshold_keyed(
+            agent,
+            Some(method),
+            AlertKind::LowConfidence,
+            score as f64,
+            threshold,
+            crossed,
+            severity,
+            message.into(),
+            &mut events,
+        );
+        events
     }
 
     /// Spawn a periodic evaluation task. `sink` is invoked for
@@ -675,5 +778,77 @@ mod tests {
         let engine = AlertEngine::new(q, t);
         // Empty before evaluation.
         assert!(engine.active_alerts().is_empty());
+    }
+
+    // ── RELIX-7.19 GAP 2: LowConfidence dedup tests ─────────
+
+    fn empty_engine() -> AlertEngine {
+        let store = MetricsStore::in_memory().unwrap();
+        let q = MetricsQuery::new(store);
+        AlertEngine::new(q, AlertThresholds::default())
+    }
+
+    #[test]
+    fn low_confidence_alert_fires_when_score_below_low_threshold() {
+        let engine = empty_engine();
+        let events =
+            engine.evaluate_low_confidence("alice", "ai.chat", 0.40, 0.50, 0.30, "low confidence");
+        assert_eq!(events.len(), 1, "expected one Fired event");
+        match &events[0] {
+            AlertEvent::Fired(a) => {
+                assert_eq!(a.kind, AlertKind::LowConfidence);
+                assert_eq!(a.agent, "alice");
+                assert_eq!(a.method.as_deref(), Some("ai.chat"));
+                assert_eq!(a.severity, AlertSeverity::Warning);
+                assert!((a.actual - 0.40).abs() < 1e-3);
+            }
+            o => panic!("expected Fired, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn low_confidence_critical_severity_when_score_below_critical_threshold() {
+        let engine = empty_engine();
+        let events =
+            engine.evaluate_low_confidence("alice", "ai.chat", 0.20, 0.50, 0.30, "very low");
+        match &events[0] {
+            AlertEvent::Fired(a) => assert_eq!(a.severity, AlertSeverity::Critical),
+            o => panic!("expected Fired, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn low_confidence_does_not_re_fire_while_active() {
+        let engine = empty_engine();
+        let first = engine.evaluate_low_confidence("alice", "ai.chat", 0.40, 0.50, 0.30, "msg");
+        let second = engine.evaluate_low_confidence("alice", "ai.chat", 0.35, 0.50, 0.30, "msg");
+        assert_eq!(first.len(), 1, "first call fires");
+        assert!(second.is_empty(), "second call dedups: {second:?}");
+    }
+
+    #[test]
+    fn low_confidence_clears_when_score_recovers_above_low_threshold() {
+        let engine = empty_engine();
+        let _ = engine.evaluate_low_confidence("alice", "ai.chat", 0.40, 0.50, 0.30, "msg");
+        let recovery = engine.evaluate_low_confidence("alice", "ai.chat", 0.85, 0.50, 0.30, "msg");
+        assert_eq!(recovery.len(), 1, "recovery event expected");
+        match &recovery[0] {
+            AlertEvent::Recovered(a) => {
+                assert_eq!(a.kind, AlertKind::LowConfidence);
+                assert_eq!(a.method.as_deref(), Some("ai.chat"));
+            }
+            o => panic!("expected Recovered, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn low_confidence_dedup_is_per_agent_method_not_per_agent() {
+        let engine = empty_engine();
+        let a = engine.evaluate_low_confidence("alice", "ai.chat", 0.4, 0.5, 0.3, "m1");
+        let b = engine.evaluate_low_confidence("alice", "tool.web", 0.4, 0.5, 0.3, "m2");
+        let c = engine.evaluate_low_confidence("alice", "ai.chat", 0.4, 0.5, 0.3, "m1-dup");
+        assert_eq!(a.len(), 1, "alice/ai.chat fires");
+        assert_eq!(b.len(), 1, "alice/tool.web fires (different method)");
+        assert!(c.is_empty(), "alice/ai.chat dedups: {c:?}");
     }
 }
