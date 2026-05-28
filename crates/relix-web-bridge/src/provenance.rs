@@ -83,6 +83,44 @@ pub async fn diff(
     diff_logic(&state.observability, &q).map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RecentQuery {
+    #[serde(default = "default_recent_limit")]
+    pub limit: usize,
+}
+
+fn default_recent_limit() -> usize {
+    200
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentResponse {
+    pub snapshots: Vec<ProvenanceSnapshot>,
+    pub count: usize,
+}
+
+/// GAP 13 — `GET /v1/provenance/recent?limit=200` returns the
+/// newest N snapshots. Powers the `relix provenance history`
+/// and `relix provenance audit` CLI subcommands.
+pub async fn recent(
+    State(state): State<AppState>,
+    Query(q): Query<RecentQuery>,
+) -> Result<Json<RecentResponse>, HandlerError> {
+    let limit = q.limit.clamp(1, 1000);
+    match state.observability.provenance.list_recent(limit) {
+        Ok(snapshots) => {
+            let count = snapshots.len();
+            Ok(Json(RecentResponse { snapshots, count }))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("provenance: {e}"),
+            }),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

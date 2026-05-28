@@ -26,6 +26,7 @@ mod os_secure;
 mod pii;
 mod ping;
 mod planning;
+mod provenance;
 mod router;
 mod setup;
 mod skills;
@@ -282,6 +283,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: eval::Cmd,
     },
+    /// GAP 13: provenance registry inspector. `relix
+    /// provenance show <trace>` prints the snapshot; `…
+    /// diff <a> <b>` prints the change list; `… history
+    /// [--prompt FILE]` lists prompt-file load events;
+    /// `… audit [--from] [--to]` lists every snapshot in a
+    /// time range.
+    Provenance {
+        #[command(subcommand)]
+        cmd: provenance::Cmd,
+    },
     /// GAP 11 + 12: transactional gateway + evidence inspector.
     /// `relix execution rollback <transaction_id>` undoes a
     /// transaction; `relix execution transaction <id>` prints
@@ -462,6 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Doctor(args) => doctor::run(args).await,
         Cmd::Eval { cmd } => eval::run(cmd).await,
         Cmd::Execution { cmd } => execution::run(cmd).await,
+        Cmd::Provenance { cmd } => provenance::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,

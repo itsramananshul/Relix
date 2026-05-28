@@ -167,6 +167,26 @@ impl ProvenanceRegistry {
         }
     }
 
+    /// GAP 13: return the newest `limit` snapshots, newest
+    /// first. Used by `GET /v1/provenance/recent` and the CLI
+    /// `relix provenance history / audit` subcommands.
+    pub fn list_recent(&self, limit: usize) -> Result<Vec<ProvenanceSnapshot>, ProvenanceError> {
+        let limit = limit.clamp(1, 1000) as i64;
+        let conn = self.conn.lock().map_err(|_| ProvenanceError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT trace_id, timestamp_unix, model_id, policy_version, skill_versions, tool_versions \
+             FROM provenance_snapshots \
+             ORDER BY timestamp_unix DESC, trace_id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_snapshot)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
     /// Compute the diff between two recorded snapshots.
     pub fn diff(&self, a: &str, b: &str) -> Result<ProvenanceDiff, ProvenanceError> {
         let snap_a = self

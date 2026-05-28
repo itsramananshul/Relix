@@ -653,6 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Provenance registry — recorded surface per trace
         // plus a flat diff between two traces.
         .route("/v1/provenance/diff", get(provenance::diff))
+        .route("/v1/provenance/recent", get(provenance::recent))
         .route("/v1/provenance/{trace_id}", get(provenance::show))
         // GAP 11 + 12: transactional gateway + evidence.
         .route("/v1/execution/rollback", post(execution::rollback))

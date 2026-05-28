@@ -295,6 +295,39 @@ pub struct PolicySection {
 pub struct ObservabilitySection {
     #[serde(default)]
     pub otel: Option<OtelConfigToml>,
+    /// GAP 13 + 14: AI-controller two-sink observability. When
+    /// `enabled = true` AND `metadata_db_path` is set, the AI
+    /// node carries its own [`crate::observability::ObservabilityContext`]
+    /// so every mesh-internal `ai.chat` call records a
+    /// metadata event + a provenance snapshot.
+    #[serde(default)]
+    pub two_sink: Option<TwoSinkConfig>,
+}
+
+/// `[observability.two_sink]` — Sink-A + Sink-B + Provenance
+/// configuration for mesh-internal calls (the bridge already
+/// carries its own ObservabilityContext on `AppState`; this
+/// block is for the AI controller).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TwoSinkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub metadata_db_path: Option<std::path::PathBuf>,
+    /// When unset, defaults to the same directory as
+    /// `metadata_db_path` with a `content.db` filename.
+    #[serde(default)]
+    pub content_db_path: Option<std::path::PathBuf>,
+    /// When unset, defaults to the same directory as
+    /// `metadata_db_path` with a `provenance.db` filename.
+    #[serde(default)]
+    pub provenance_db_path: Option<std::path::PathBuf>,
+    #[serde(default = "default_content_retention_days")]
+    pub content_retention_days: u32,
+}
+
+fn default_content_retention_days() -> u32 {
+    7
 }
 
 /// `[observability.otel]` — operator-friendly shape that
@@ -4387,6 +4420,65 @@ impl crate::nodes::execution::rollback::CompensatingDispatcher for LocalCompensa
     }
 }
 
+/// GAP 13 + 14: build the AI controller's own two-sink
+/// `ObservabilityContext`. Returns `None` when the operator
+/// did not enable `[observability.two_sink]`. On any open
+/// error, logs a warn and returns `None` — the AI handler then
+/// short-circuits its provenance + metadata hooks.
+fn build_ai_observability(
+    cfg: &ControllerConfig,
+) -> Option<std::sync::Arc<crate::observability::ObservabilityContext>> {
+    use crate::observability::{
+        ContentSink, MetadataSink, ObservabilityContext, ProvenanceRegistry,
+    };
+    let obs = cfg.observability.as_ref()?;
+    let ts = obs.two_sink.as_ref()?;
+    if !ts.enabled {
+        return None;
+    }
+    let metadata_path = ts.metadata_db_path.clone()?;
+    let metadata = match MetadataSink::open(&metadata_path) {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %metadata_path.display(), "[observability.two_sink] open metadata sink failed");
+            return None;
+        }
+    };
+    let content_path = ts.content_db_path.clone().unwrap_or_else(|| {
+        let mut p = metadata_path.clone();
+        p.set_file_name("content.db");
+        p
+    });
+    let content = match ContentSink::open(&content_path, ts.content_retention_days) {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %content_path.display(), "[observability.two_sink] open content sink failed");
+            return None;
+        }
+    };
+    let provenance_path = ts.provenance_db_path.clone().unwrap_or_else(|| {
+        let mut p = metadata_path.clone();
+        p.set_file_name("provenance.db");
+        p
+    });
+    let provenance = match ProvenanceRegistry::open(&provenance_path) {
+        Ok(r) => std::sync::Arc::new(r),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %provenance_path.display(), "[observability.two_sink] open provenance registry failed");
+            return None;
+        }
+    };
+    tracing::info!(
+        metadata_db = %metadata_path.display(),
+        content_db = %content_path.display(),
+        provenance_db = %provenance_path.display(),
+        "ai observability: two-sink context wired",
+    );
+    Some(std::sync::Arc::new(ObservabilityContext::new(
+        metadata, content, provenance,
+    )))
+}
+
 fn build_drift_config(cfg: &ControllerConfig) -> Option<crate::nodes::ai::guardrails::DriftConfig> {
     use crate::nodes::ai::guardrails::DriftConfig;
     let raw = cfg.guardrails.clone()?;
@@ -5322,6 +5414,16 @@ fn register_node_type_handlers(
             }
         }
         let skill_extractor = skills_runtime.as_ref().and_then(|rt| rt.extractor.clone());
+        // GAP 13 + 14: build the AI-controller-side
+        // `ObservabilityContext` when the operator enabled
+        // `[observability.two_sink]`. The bridge already
+        // carries its own; this one covers mesh-internal
+        // `ai.chat` dispatches that never enter the bridge.
+        let ai_observability = build_ai_observability(cfg);
+        let soul_cache_for_obs = soul_cache.clone();
+        if let Some(obs) = ai_observability.as_ref() {
+            crate::nodes::ai::provenance_hooks::record_soul_provenance(obs, &soul_cache_for_obs);
+        }
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
@@ -5335,6 +5437,7 @@ fn register_node_type_handlers(
             metrics.map(|b| b.sink.clone()),
             training.map(|b| b.sink.clone()),
             skill_extractor,
+            ai_observability.clone(),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when

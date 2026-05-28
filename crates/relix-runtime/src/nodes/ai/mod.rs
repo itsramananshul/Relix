@@ -56,6 +56,7 @@ pub mod execution;
 pub mod failover;
 pub mod guardrails;
 pub mod memory_dispatcher;
+pub mod provenance_hooks;
 pub mod provider;
 pub mod router;
 pub mod skill_caps;
@@ -293,6 +294,7 @@ pub fn register(
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
     skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
+    observability: Option<Arc<crate::observability::ObservabilityContext>>,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
@@ -306,6 +308,7 @@ pub fn register(
     let provider_name_for_chat: String = provider.provider_name().to_string();
     let interaction_for_chat = interaction_sink.clone();
     let extractor_for_chat = skill_extractor.clone();
+    let observability_for_chat = observability.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -321,6 +324,7 @@ pub fn register(
             let provider_name = provider_name_for_chat.clone();
             let training = interaction_for_chat.clone();
             let extractor = extractor_for_chat.clone();
+            let obs = observability_for_chat.clone();
             async move {
                 handle_chat(
                     p,
@@ -334,6 +338,7 @@ pub fn register(
                     metrics,
                     training,
                     extractor,
+                    obs,
                     provider_name,
                     ctx,
                 )
@@ -360,6 +365,7 @@ pub fn register(
     let metrics_for_chat_stream = metrics_sink.clone();
     let interaction_for_chat_stream = interaction_sink.clone();
     let provider_name_for_chat_stream: String = provider.provider_name().to_string();
+    let observability_for_stream = observability.clone();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -373,6 +379,7 @@ pub fn register(
                 let metrics = metrics_for_chat_stream.clone();
                 let training = interaction_for_chat_stream.clone();
                 let provider_name = provider_name_for_chat_stream.clone();
+                let obs = observability_for_stream.clone();
                 async move {
                     handle_chat_stream(
                         p,
@@ -383,6 +390,7 @@ pub fn register(
                         gr,
                         metrics,
                         training,
+                        obs,
                         provider_name,
                         ctx,
                     )
@@ -861,6 +869,7 @@ async fn handle_chat_stream(
     input_guardrail: guardrails::InputGuardrail,
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
+    observability: Option<Arc<crate::observability::ObservabilityContext>>,
     provider_name: String,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
@@ -987,32 +996,66 @@ async fn handle_chat_stream(
         // the planner). The model name comes from the Usage
         // frame when present, else falls back to the requested
         // model.
-        if let Some(sink) = interaction_sink.as_ref() {
-            let (prompt_tokens, completion_tokens, model_used) = match accumulated_usage {
-                Some((p, c, m)) => (Some(p), Some(c), if m.is_empty() { training_model.clone() } else { m }),
+        let (prompt_tokens_for_obs, completion_tokens_for_obs, model_used_for_obs) =
+            match accumulated_usage.as_ref() {
+                Some((p, c, m)) => (Some(*p), Some(*c), if m.is_empty() { training_model.clone() } else { m.clone() }),
                 None => (None, None, training_model.clone()),
             };
-            let success = stream_error.is_none();
+        let stream_success = stream_error.is_none();
+        if let Some(sink) = interaction_sink.as_ref() {
             let rec = crate::training::InteractionRecord::new(
                 crate::training::InteractionId::from_request(&request_id),
                 training_session.clone(),
                 training_agent.clone(),
-                model_used,
+                model_used_for_obs.clone(),
                 provider_name.clone(),
                 training_system_prompt.clone(),
                 training_user_message.clone(),
                 accumulated_text.clone(),
                 vec![],
-                prompt_tokens,
-                completion_tokens,
+                prompt_tokens_for_obs,
+                completion_tokens_for_obs,
                 stream_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                success,
+                stream_success,
                 stream_error_kind.map(|k| k.to_string()).or_else(|| {
                     stream_error.as_ref().map(|_| "RESPONDER_INTERNAL".to_string())
                 }),
                 0,
             );
             sink.record_interaction(rec);
+        }
+        // GAP 13 + 14: post-stream provenance + observability
+        // metadata writes. Same shape as the unary path so
+        // downstream tooling sees identical fields per session.
+        if let Some(obs) = observability.as_ref() {
+            let trace_id = format!("{:032x}", u128::from_le_bytes(request_id.0));
+            let system_hash = if training_system_prompt.is_empty() {
+                String::new()
+            } else {
+                crate::nodes::ai::provenance_hooks::hash_blake3(&training_system_prompt)
+            };
+            crate::nodes::ai::provenance_hooks::record_chat_provenance(
+                obs.as_ref(),
+                &training_session,
+                &trace_id,
+                &model_used_for_obs,
+                &system_hash,
+                Some(&training_agent),
+            );
+            let duration_ms =
+                stream_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            crate::nodes::ai::provenance_hooks::record_chat_metadata(
+                obs.as_ref(),
+                &training_session,
+                &trace_id,
+                &training_agent,
+                "ai.chat.stream.complete",
+                &model_used_for_obs,
+                duration_ms,
+                prompt_tokens_for_obs
+                    .map(|p| p as u64 + completion_tokens_for_obs.unwrap_or(0) as u64),
+                stream_success,
+            );
         }
     };
     Ok(Box::pin(mapped))
@@ -1031,6 +1074,7 @@ async fn handle_chat(
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
     skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
+    observability: Option<Arc<crate::observability::ObservabilityContext>>,
     provider_name: String,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
@@ -1175,9 +1219,12 @@ async fn handle_chat(
         prompt: prompt.to_string(),
         history: merged_history,
         model: default_model,
-        system_prompt,
+        // Clone for the GAP 13 provenance hook below — the
+        // ChatInput consumes the original Option.
+        system_prompt: system_prompt.clone(),
         ..ChatInput::default()
     };
+    let system_prompt_for_obs = system_prompt;
     // Extract an optional `approval_token=<value>` field
     // from the request args. The token presence flips
     // `RequiresApproval` plans to `Approved` so an operator
@@ -1469,6 +1516,39 @@ async fn handle_chat(
                 // is happy with.
                 drop(ex.spawn(task));
             }
+            // GAP 13 + 14: post-flight provenance + observability
+            // metadata write. Runs after the response is built
+            // so a wedge here doesn't delay the caller; it WILL
+            // delay the handler's tokio task, but the work is a
+            // few SQLite inserts so the cost is bounded.
+            if let Some(obs) = observability.as_ref() {
+                let trace_id = format!("{:032x}", u128::from_le_bytes(ctx.trace_id.0));
+                let system_hash = system_prompt_for_obs
+                    .as_deref()
+                    .map(crate::nodes::ai::provenance_hooks::hash_blake3)
+                    .unwrap_or_default();
+                crate::nodes::ai::provenance_hooks::record_chat_provenance(
+                    obs.as_ref(),
+                    session_id,
+                    &trace_id,
+                    &model_used,
+                    &system_hash,
+                    Some(&ctx.caller.name),
+                );
+                let duration_ms =
+                    chat_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                crate::nodes::ai::provenance_hooks::record_chat_metadata(
+                    obs.as_ref(),
+                    session_id,
+                    &trace_id,
+                    &ctx.caller.name,
+                    "ai.chat.complete",
+                    &model_used,
+                    duration_ms,
+                    prompt_tokens.map(|p| p as u64 + completion_tokens.unwrap_or(0) as u64),
+                    success,
+                );
+            }
             inner_outcome
         }
         Err(ProviderError::Transient(c)) => {
@@ -1643,6 +1723,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hello|"),
         )
@@ -1656,6 +1737,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -1676,6 +1758,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -1710,6 +1793,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"only-session-id"),
         )
@@ -1732,6 +1816,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -1781,6 +1866,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hi|"),
         )
@@ -1825,6 +1911,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hi|"),
         )
@@ -1857,6 +1944,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -1893,6 +1981,7 @@ mod tests {
             guardrail,
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -1938,6 +2027,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hello|"),
         )
@@ -1974,6 +2064,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2039,6 +2130,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess1|new question|"),
         )
@@ -2079,6 +2171,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2125,6 +2218,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2257,6 +2351,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
@@ -2301,6 +2396,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2349,6 +2445,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
@@ -2392,6 +2489,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2459,6 +2557,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2566,6 +2665,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2771,6 +2871,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess-1|please email ops|"),
         )
@@ -2804,6 +2905,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -2934,6 +3036,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess-1|fetch the example|"),
         )
@@ -2970,6 +3073,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -3015,6 +3119,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             None,
@@ -3122,6 +3227,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"session-1|hello|"),
         )
@@ -3150,6 +3256,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -3185,6 +3292,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(prompt.as_bytes()),
         )
@@ -3205,6 +3313,7 @@ mod tests {
             SoulCache::no_op(),
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -3331,6 +3440,7 @@ mod tests {
             Some(sink_dyn),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
@@ -3360,6 +3470,7 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             Some(sink_dyn),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -3534,6 +3645,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(sink_dyn),
             None,
+            None,
             "mock".to_string(),
             ctx_with_request_id(b"sess1|please reply|", rid),
         )
@@ -3573,6 +3685,7 @@ mod tests {
             skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
             guardrails::InputGuardrail::permissive(),
             Some(sink_dyn),
+            None,
             None,
             "mock".to_string(),
             ctx(b"sess2|hi|"),
@@ -3617,6 +3730,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(col_dyn.clone()),
             None,
+            None,
             "mock".to_string(),
             ctx_with_request_id(b"sess|hi|", rid),
         )
@@ -3657,5 +3771,65 @@ mod tests {
         assert_eq!(tokens, Some(300));
         assert!(cost.unwrap() > 0, "cost must compute from price table");
         assert_eq!(model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    // ── GAP 13 + 14: handler-side provenance + observability ──
+
+    #[tokio::test]
+    async fn handle_chat_records_provenance_and_metadata_when_observability_wired() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(CannedProvider { reply: "ok".into() });
+        let obs = std::sync::Arc::new(crate::observability::ObservabilityContext::in_memory());
+        let r = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            None,
+            Arc::new(tokio::sync::OnceCell::new()),
+            None,
+            None,
+            None,
+            Some(obs.clone()),
+            "mock".to_string(),
+            ctx(b"sess-obs|hello|"),
+        )
+        .await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        // Metadata event lands in Sink A.
+        let rows = obs.metadata.query(Some("sess-obs"), None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "ai.chat.complete");
+        assert!(rows[0].success);
+        // No content in Sink B (mesh-internal calls are
+        // metadata-only by design).
+        assert!(obs.content.get(&rows[0].event_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_chat_skips_observability_when_no_context() {
+        let provider: Arc<dyn ChatProvider> = Arc::new(CannedProvider { reply: "ok".into() });
+        let r = handle_chat(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            None,
+            Arc::new(tokio::sync::OnceCell::new()),
+            None,
+            None,
+            None,
+            None,
+            "mock".to_string(),
+            ctx(b"sess-noobs|hi|"),
+        )
+        .await;
+        assert!(matches!(r, HandlerOutcome::Ok(_)));
+        // No panic, no overhead beyond the existing pipeline —
+        // this test is the regression guard that an absent
+        // ObservabilityContext is a true no-op.
     }
 }
