@@ -143,8 +143,9 @@ fn insert_one(conn: &Connection, m: &InvocationMetric) -> Result<(), MetricsStor
     conn.execute(
         "INSERT INTO metrics_invocations \
          (agent_name, peer_alias, method, timestamp_ms, latency_ms, success, \
-          error_kind, token_count, cost_micros, input_bytes, output_bytes, model) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+          error_kind, token_count, cost_micros, input_bytes, output_bytes, model, \
+          confidence_score) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             m.agent_name,
             m.peer_alias,
@@ -158,6 +159,7 @@ fn insert_one(conn: &Connection, m: &InvocationMetric) -> Result<(), MetricsStor
             m.input_bytes as i64,
             m.output_bytes as i64,
             m.model,
+            m.confidence_score.map(|v| v as f64),
         ],
     )?;
     Ok(())
@@ -187,7 +189,33 @@ fn init_schema(conn: &Connection) -> Result<(), MetricsStoreError> {
          CREATE INDEX IF NOT EXISTS metrics_invocations_ts \
              ON metrics_invocations(timestamp_ms DESC);",
     )?;
+    // RELIX-7.19: backwards-compat ALTER to add `confidence_score`
+    // when the column doesn't exist yet. Pre-7.19 databases pick
+    // up the new column on open with the NULL default (which
+    // serialises to `None` on the model side).
+    if !column_exists(conn, "metrics_invocations", "confidence_score")? {
+        conn.execute(
+            "ALTER TABLE metrics_invocations ADD COLUMN confidence_score REAL",
+            [],
+        )?;
+    }
     Ok(())
+}
+
+/// Probe for a column's existence using SQLite's `PRAGMA
+/// table_info`. Used by the 7.19 confidence migration so a
+/// pre-7.19 database picks up the new column on open without
+/// failing the `ALTER TABLE` on a fresh schema.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, MetricsStoreError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Default location for the metrics DB beneath a data dir.
@@ -217,6 +245,7 @@ mod tests {
             input_bytes: 32,
             output_bytes: 64,
             model: None,
+            confidence_score: None,
             request_id: None,
         }
     }

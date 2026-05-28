@@ -18,7 +18,7 @@ use relix_core::types::RequestId;
 /// bridge. Every field except `token_count` / `cost_micros` /
 /// `model` is filled in at the dispatch site; the AI-specific
 /// fields are filled in by [`AiUsageHint`] when present.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InvocationMetric {
     /// Caller's friendly identity name (`IdentityBundle::name`)
     /// — the agent name. Empty when admission step 5 ran the
@@ -65,6 +65,13 @@ pub struct InvocationMetric {
     /// Model identifier when the call was AI-bearing
     /// (`"gpt-4o-mini"`, `"claude-sonnet-4"`, …).
     pub model: Option<String>,
+    /// RELIX-7.19: per-call confidence score stamped by the
+    /// responder's `ConfidenceScorer`. `None` when the bridge
+    /// has no scorer wired (pre-7.19 / disabled config). The
+    /// metrics dashboard projects this to show confidence
+    /// trends per (agent, method).
+    #[serde(default)]
+    pub confidence_score: Option<f32>,
     /// Original `RequestId`. Carried through the collector's
     /// in-memory join cache so an [`AiUsageHint`] arriving
     /// before the dispatcher's record can be matched. The
@@ -132,6 +139,7 @@ mod tests {
             input_bytes: 32,
             output_bytes: 96,
             model: None,
+            confidence_score: None,
             request_id: Some(rid()),
         }
     }

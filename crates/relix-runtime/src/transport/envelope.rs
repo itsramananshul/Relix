@@ -74,6 +74,15 @@ pub struct ResponseEnvelope {
     pub aid: ByteBuf,
     /// Processed-at timestamp.
     pub processed_at: Timestamp,
+    /// RELIX-7.19: optional per-call confidence score stamped
+    /// by the responder's `ConfidenceScorer`. `None` when the
+    /// responder didn't wire confidence scoring — older clients
+    /// + responders coexist on the wire unchanged.
+    ///   Caller-side
+    ///   dispatch reads this to update the SOL `last_confidence()`
+    ///   cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 /// Outcome of an RPC.

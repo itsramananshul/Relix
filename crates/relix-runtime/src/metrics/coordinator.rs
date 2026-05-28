@@ -309,6 +309,7 @@ mod tests {
             input_bytes: 10,
             output_bytes: 20,
             model: None,
+            confidence_score: None,
             request_id: None,
         }
     }

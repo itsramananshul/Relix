@@ -338,6 +338,7 @@ mod tests {
             input_bytes: 16,
             output_bytes: 32,
             model: None,
+            confidence_score: None,
             request_id: Some(req),
         }
     }

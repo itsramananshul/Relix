@@ -29,6 +29,10 @@ use crate::transport::envelope::{RequestEnvelope, ResponseEnvelope, ResponseResu
 
 /// Context passed to a capability handler. Carries verified caller identity
 /// and enough state for the handler to perform outbound calls and emit events.
+///
+/// `Clone` lets the RELIX-7.19 fallback engine re-invoke the same handler
+/// (retry / escalate paths) without forcing handlers to take ownership.
+#[derive(Clone)]
 pub struct InvocationCtx {
     /// Verified caller identity (post admission steps 5+9).
     pub caller: VerifiedIdentity,
@@ -256,6 +260,23 @@ pub struct DispatchBridge {
     /// disambiguate (the agent name is the *caller's*
     /// identity; this is the responder's friendly name).
     peer_alias: String,
+    /// RELIX-7.19: per-invocation confidence scorer. `None`
+    /// keeps the bridge's hot path byte-for-byte pre-7.19;
+    /// `Some` wires the scorer + the fallback engine so every
+    /// dispatched outcome gets scored, scored-recorded on the
+    /// metric row, and (when a policy matches) passed through
+    /// the fallback action selector.
+    confidence_scorer: Option<Arc<crate::confidence::ConfidenceScorer>>,
+    /// RELIX-7.19: fallback engine wired alongside the scorer.
+    /// `None` means "score but never re-dispatch / replace /
+    /// alert / abort" — useful for read-only observation
+    /// deployments.
+    fallback_engine: Option<Arc<crate::confidence::FallbackEngine>>,
+    /// RELIX-7.19: shared last-confidence slot read by the SOL
+    /// `last_confidence()` builtin. `None` on nodes that don't
+    /// host a SOL VM execution surface. Updated atomically
+    /// after every scored dispatch.
+    last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -356,6 +377,83 @@ pub struct CapStats {
 /// bloating the per-row footprint.
 pub const RECENT_LATENCIES_CAP: usize = 32;
 
+/// RELIX-7.19: hard ceiling on `Retry` action `max_retries`.
+/// Operators that configure a higher value get clamped silently
+/// — a runaway retry loop is worse than a wrong policy.
+pub const MAX_RETRY_CAP: u32 = 8;
+
+/// RELIX-7.19: score the just-completed handler outcome via the
+/// scorer + record it on the rolling window. Pulled out for
+/// reuse by the retry / escalate paths in
+/// [`DispatchBridge::apply_confidence`]. Extracts a best-effort
+/// `finish_reason` + `logprob` from the response body when the
+/// body parses as JSON; falls back to `None` otherwise.
+fn score_outcome(
+    scorer: &crate::confidence::ConfidenceScorer,
+    agent: &str,
+    method: &str,
+    outcome: &HandlerOutcome,
+    elapsed_ms: u64,
+) -> crate::confidence::ConfidenceScore {
+    let (body, success): (&[u8], bool) = match outcome {
+        HandlerOutcome::Ok(b) => (b.as_slice(), true),
+        HandlerOutcome::Err(_) => (&[], false),
+    };
+    let (finish_reason, logprob) = extract_provider_signals(body);
+    let inputs = crate::confidence::ScoringInputs {
+        response_body: body,
+        finish_reason: finish_reason.as_deref(),
+        logprob,
+        latency_ms: elapsed_ms,
+        success,
+    };
+    scorer.score_and_record(agent, method, &inputs)
+}
+
+/// RELIX-7.19: best-effort extraction of `finish_reason` +
+/// `logprob` from a handler response body. Recognises:
+///
+/// 1. JSON objects with top-level `finish_reason` (string) and
+///    `logprob` (number). Used by AI provider passthroughs that
+///    emit raw provider envelopes.
+/// 2. Plain-text bodies with a `[finish_reason:<value>]` trailer
+///    line. Used by `ai.chat` (UTF-8 text body with optional
+///    decoration).
+///
+/// Returns `(None, None)` when neither signal can be parsed —
+/// the scorer's `provider_signal` sub-score then defaults to
+/// the neutral 0.50.
+fn extract_provider_signals(body: &[u8]) -> (Option<String>, Option<f32>) {
+    if body.is_empty() {
+        return (None, None);
+    }
+    // Path 1: JSON.
+    if body.first() == Some(&b'{')
+        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(body)
+    {
+        let fr = v
+            .get("finish_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let lp = v.get("logprob").and_then(|v| v.as_f64()).map(|f| f as f32);
+        if fr.is_some() || lp.is_some() {
+            return (fr, lp);
+        }
+    }
+    // Path 2: trailer line like `[finish_reason:stop]`.
+    if let Ok(text) = std::str::from_utf8(body) {
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("[finish_reason:")
+                && let Some(value) = rest.strip_suffix(']')
+            {
+                return (Some(value.to_string()), None);
+            }
+        }
+    }
+    (None, None)
+}
+
 impl DispatchBridge {
     /// Construct.
     pub fn new(
@@ -380,7 +478,49 @@ impl DispatchBridge {
             access_broker: None,
             metrics_sink: None,
             peer_alias: String::new(),
+            confidence_scorer: None,
+            fallback_engine: None,
+            last_confidence_cell: None,
         })
+    }
+
+    /// RELIX-7.19: wire confidence scoring + fallback. Both
+    /// arms must be wired together — operators that want
+    /// scoring without auto-fallback pass a `FallbackEngine`
+    /// built from an empty policy list (every cap defaults to
+    /// `Pass`). Idempotent.
+    pub fn set_confidence(
+        &mut self,
+        scorer: Arc<crate::confidence::ConfidenceScorer>,
+        engine: Arc<crate::confidence::FallbackEngine>,
+    ) {
+        self.confidence_scorer = Some(scorer);
+        self.fallback_engine = Some(engine);
+    }
+
+    /// RELIX-7.19: cheap-clone handle on the confidence scorer
+    /// — used by the `confidence.*` coordinator caps + tests.
+    pub fn confidence_scorer_handle(&self) -> Option<Arc<crate::confidence::ConfidenceScorer>> {
+        self.confidence_scorer.clone()
+    }
+
+    /// RELIX-7.19: cheap-clone handle on the fallback engine.
+    pub fn fallback_engine_handle(&self) -> Option<Arc<crate::confidence::FallbackEngine>> {
+        self.fallback_engine.clone()
+    }
+
+    /// RELIX-7.19: install the shared last-confidence cell.
+    /// The bridge writes to it after every scored dispatch;
+    /// the SOL VM reads it via `last_confidence()`.
+    pub fn set_last_confidence_cell(&mut self, cell: crate::confidence::LastConfidenceCell) {
+        self.last_confidence_cell = Some(cell);
+    }
+
+    /// Borrow the bridge's last-confidence cell. Returns
+    /// `None` when no cell has been wired (pre-7.19
+    /// behaviour preserved).
+    pub fn last_confidence_cell(&self) -> Option<crate::confidence::LastConfidenceCell> {
+        self.last_confidence_cell.clone()
     }
 
     /// RELIX-7.11: wire the per-invocation metrics sink + the
@@ -407,6 +547,10 @@ impl DispatchBridge {
     /// configured metrics sink. Called from the dispatch hot
     /// path after the handler returns. No-op when no sink is
     /// wired.
+    ///
+    /// RELIX-7.19: `confidence_score` is the verdict from the
+    /// [`crate::confidence::ConfidenceScorer`] for this call;
+    /// `None` when the bridge has no scorer wired.
     #[allow(clippy::too_many_arguments)]
     fn record_metric(
         &self,
@@ -418,6 +562,7 @@ impl DispatchBridge {
         error_kind: Option<&str>,
         input_bytes: usize,
         output_bytes: usize,
+        confidence_score: Option<f32>,
     ) {
         let Some(sink) = self.metrics_sink.as_ref() else {
             return;
@@ -435,6 +580,7 @@ impl DispatchBridge {
             input_bytes,
             output_bytes,
             model: None,
+            confidence_score,
             request_id: Some(request_id),
         };
         sink.record_invocation(metric);
@@ -866,8 +1012,14 @@ impl DispatchBridge {
         // operator-visible latency reflects user code, not the
         // bridge's overhead.
         let dispatch_started = std::time::Instant::now();
-        let outcome = handler.invoke(ctx).await;
+        let outcome = handler.invoke(ctx.clone()).await;
         let elapsed_ms = dispatch_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+        // RELIX-7.19: confidence scoring + fallback. No-op when
+        // no scorer is wired (pre-7.19 byte-for-byte path).
+        let (outcome, total_elapsed_ms, confidence_score) = self
+            .apply_confidence(&req.method, &handler, &ctx, outcome, elapsed_ms)
+            .await;
 
         // === Admission step 11: audit ===
         let (result, status, error_kind) = match outcome {
@@ -889,7 +1041,7 @@ impl DispatchBridge {
         } else {
             StatBucket::Err
         };
-        self.bump_stats_with_latency(&req.method, bucket, now, Some(elapsed_ms));
+        self.bump_stats_with_latency(&req.method, bucket, now, Some(total_elapsed_ms));
         // RELIX-7.11: per-invocation metric row. Dispatched
         // outcomes only — denied / unknown_method already get
         // dispatch-stats counters above. The sink is
@@ -906,11 +1058,12 @@ impl DispatchBridge {
             &req.method,
             &verified.name,
             req.rid,
-            elapsed_ms,
+            total_elapsed_ms,
             matches!(status, AuditStatus::Ok),
             err_kind_str,
             req.args.len(),
             output_bytes,
+            confidence_score,
         );
         let aid = self
             .write_audit(
@@ -929,8 +1082,164 @@ impl DispatchBridge {
             res: result,
             aid: ByteBuf::from(aid),
             processed_at: Timestamp::now(),
+            confidence: confidence_score,
         };
         codec::encode(&resp).unwrap_or_default()
+    }
+
+    /// RELIX-7.19: post-handler scoring + fallback execution.
+    /// Returns the (possibly-replaced) outcome, the total
+    /// wall-clock latency including retries / escalations, and
+    /// the final confidence score the metric + envelope carry.
+    /// `None` confidence => no scorer wired => no fallback
+    /// considered.
+    async fn apply_confidence(
+        &self,
+        method: &str,
+        handler: &Arc<dyn Handler>,
+        ctx: &InvocationCtx,
+        outcome: HandlerOutcome,
+        first_elapsed_ms: u64,
+    ) -> (HandlerOutcome, u64, Option<f32>) {
+        let scorer = match &self.confidence_scorer {
+            Some(s) => s.clone(),
+            None => return (outcome, first_elapsed_ms, None),
+        };
+        let engine = match &self.fallback_engine {
+            Some(e) => e.clone(),
+            None => return (outcome, first_elapsed_ms, None),
+        };
+
+        let agent = ctx.caller.name.clone();
+        let mut current_outcome = outcome;
+        let mut total_elapsed = first_elapsed_ms;
+        let initial_score =
+            score_outcome(&scorer, &agent, method, &current_outcome, first_elapsed_ms);
+        let mut best_score = initial_score.final_score;
+        let verdict = engine.decide(method, initial_score.final_score);
+        if !verdict.matched || matches!(verdict.action, crate::confidence::FallbackAction::Pass) {
+            self.publish_confidence(initial_score.final_score);
+            return (
+                current_outcome,
+                total_elapsed,
+                Some(initial_score.final_score),
+            );
+        }
+        match verdict.action {
+            crate::confidence::FallbackAction::Pass => {}
+            crate::confidence::FallbackAction::Retry {
+                max_retries,
+                retry_delay_ms,
+            } => {
+                let mut threshold = if verdict.critical {
+                    // Critical retry — climb past low_threshold
+                    // before stopping. Default threshold falls
+                    // out from the policy match.
+                    0.5
+                } else {
+                    0.5
+                };
+                if let Some(p) = engine
+                    .list()
+                    .iter()
+                    .find(|p| crate::confidence::fallback::glob_match(&p.capability, method))
+                {
+                    threshold = p.low_threshold;
+                }
+                let retries = max_retries.min(MAX_RETRY_CAP);
+                for _ in 0..retries {
+                    if retry_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+                    }
+                    let retry_start = std::time::Instant::now();
+                    let retry_outcome = handler.invoke(ctx.clone()).await;
+                    let retry_elapsed =
+                        retry_start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    total_elapsed = total_elapsed.saturating_add(retry_elapsed);
+                    let retry_score =
+                        score_outcome(&scorer, &agent, method, &retry_outcome, retry_elapsed);
+                    if retry_score.final_score >= best_score {
+                        best_score = retry_score.final_score;
+                        current_outcome = retry_outcome;
+                    }
+                    if retry_score.final_score > threshold {
+                        break;
+                    }
+                }
+            }
+            crate::confidence::FallbackAction::Escalate { escalate_to } => {
+                if let Some(escalated_handler) = self.handlers.get(&escalate_to).cloned() {
+                    let escalate_start = std::time::Instant::now();
+                    let escalated = escalated_handler.invoke(ctx.clone()).await;
+                    let escalated_elapsed =
+                        escalate_start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    total_elapsed = total_elapsed.saturating_add(escalated_elapsed);
+                    // Score the escalated call against ITS OWN
+                    // (agent, method) rolling window. The
+                    // engine's decision on the escalated call
+                    // is NOT re-applied to avoid recursive
+                    // escalation loops (the spec says "The
+                    // escalated call gets its own confidence
+                    // check" — we score + record but do not
+                    // re-fallback).
+                    let escalated_score =
+                        score_outcome(&scorer, &agent, &escalate_to, &escalated, escalated_elapsed);
+                    if escalated_score.final_score >= best_score {
+                        best_score = escalated_score.final_score;
+                        current_outcome = escalated;
+                    }
+                } else {
+                    tracing::warn!(
+                        target: "confidence.escalate",
+                        method = %method,
+                        escalate_to = %escalate_to,
+                        "escalation target not registered; falling through to original outcome"
+                    );
+                }
+            }
+            crate::confidence::FallbackAction::SafeDefault { default_value } => {
+                tracing::warn!(
+                    target: "confidence.safe_default",
+                    agent = %agent,
+                    method = %method,
+                    score = best_score,
+                    "swapping low-confidence body for configured safe default"
+                );
+                current_outcome = HandlerOutcome::Ok(default_value.into_bytes());
+                best_score = (best_score).max(1.0); // safe default is trusted
+            }
+            crate::confidence::FallbackAction::Alert { alert_message } => {
+                tracing::warn!(
+                    target: "confidence.alert",
+                    agent = %agent,
+                    method = %method,
+                    score = best_score,
+                    error_rate = initial_score.rolling_error_rate,
+                    message = %alert_message,
+                    "confidence alert"
+                );
+            }
+            crate::confidence::FallbackAction::Abort { abort_message } => {
+                current_outcome = HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                    kind: relix_core::types::error_kinds::INVALID_ARGS,
+                    cause: abort_message,
+                    retry_hint: 0,
+                    retry_after: None,
+                });
+                best_score = 0.0;
+            }
+        }
+        self.publish_confidence(best_score);
+        (current_outcome, total_elapsed, Some(best_score))
+    }
+
+    /// Write the most-recent confidence to the shared cell so
+    /// SOL `last_confidence()` reads the new value. No-op when
+    /// no cell is wired.
+    fn publish_confidence(&self, score: f32) {
+        if let Some(cell) = &self.last_confidence_cell {
+            cell.set(score);
+        }
     }
 
     async fn audit_and_err(
@@ -1536,6 +1845,7 @@ fn encode_error_response(
         }),
         aid: ByteBuf::from(aid),
         processed_at: Timestamp::now(),
+        confidence: None,
     };
     codec::encode(&resp).unwrap_or_default()
 }
@@ -2461,5 +2771,291 @@ mod tests {
             max_calls_per_minute: 0,
             max_cost_cents_per_hour: 0,
         };
+    }
+
+    // ── RELIX-7.19: confidence pipeline integration ─────────
+
+    async fn ok_long_handler(_ctx: InvocationCtx) -> HandlerOutcome {
+        HandlerOutcome::Ok(
+            b"This is a complete answer that ends with proper punctuation. \
+              Long enough to clear the length floor on the scorer."
+                .to_vec(),
+        )
+    }
+
+    async fn ok_empty_handler(_ctx: InvocationCtx) -> HandlerOutcome {
+        HandlerOutcome::Ok(Vec::new())
+    }
+
+    fn permissive_bridge(audit_dir: &TempDir) -> (DispatchBridge, SigningKey) {
+        let org_root = SigningKey::generate(&mut OsRng);
+        let responder = SigningKey::generate(&mut OsRng);
+        // PolicyEngine::permissive() defaults to DENY for any
+        // method not explicitly allowed — the name is
+        // misleading. For the confidence pipeline tests we
+        // need an admit-all rule against every test method
+        // chat-users may call.
+        let policy = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "anything"
+            method = "anything.method"
+            allow_groups = ["chat-users"]
+            [[rules]]
+            name = "flaky"
+            method = "flaky.method"
+            allow_groups = ["chat-users"]
+            [[rules]]
+            name = "premium"
+            method = "premium.method"
+            allow_groups = ["chat-users"]
+            "#,
+        )
+        .unwrap();
+        let bridge = DispatchBridge::new(
+            policy,
+            org_root.verifying_key(),
+            &audit_dir.path().join("audit.log"),
+            responder,
+        )
+        .unwrap();
+        (bridge, org_root)
+    }
+
+    fn make_confidence(
+        policies: Vec<crate::confidence::ConfidencePolicy>,
+    ) -> (
+        Arc<crate::confidence::ConfidenceScorer>,
+        Arc<crate::confidence::FallbackEngine>,
+    ) {
+        let cfg = crate::confidence::ConfidenceConfig {
+            enabled: true,
+            policies: policies.clone(),
+            ..Default::default()
+        };
+        let scorer = Arc::new(crate::confidence::ConfidenceScorer::from_config(&cfg));
+        let engine = Arc::new(crate::confidence::FallbackEngine::from_policies(&policies));
+        (scorer, engine)
+    }
+
+    #[tokio::test]
+    async fn confidence_score_lands_in_response_envelope_when_scorer_wired() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register("anything.method", Arc::new(FnHandler(ok_long_handler)));
+        let (scorer, engine) = make_confidence(Vec::new());
+        bridge.set_confidence(scorer, engine);
+
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("anything.method", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        let score = resp.confidence.expect("confidence stamped");
+        assert!(
+            score > 0.5,
+            "long well-formed reply should score > 0.5: {score}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confidence_pipeline_is_byte_for_byte_noop_when_not_wired() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register("anything.method", Arc::new(FnHandler(ok_long_handler)));
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("anything.method", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert!(resp.confidence.is_none(), "no scorer => no confidence");
+    }
+
+    #[tokio::test]
+    async fn safe_default_action_swaps_response_body_below_critical_threshold() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register("flaky.method", Arc::new(FnHandler(ok_empty_handler)));
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            low_threshold: 0.5,
+            critical_threshold: 0.3,
+            low_action: Some(crate::confidence::FallbackActionConfig::SafeDefault {
+                default_value: "FALLBACK BODY".into(),
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::SafeDefault {
+                default_value: "FALLBACK BODY".into(),
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("flaky.method", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        let ResponseResult::Ok(body) = resp.res else {
+            panic!("expected Ok");
+        };
+        assert_eq!(body.as_slice(), b"FALLBACK BODY");
+    }
+
+    #[tokio::test]
+    async fn abort_action_converts_low_confidence_to_invalid_args() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register("flaky.method", Arc::new(FnHandler(ok_empty_handler)));
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            low_threshold: 0.5,
+            critical_threshold: 0.3,
+            low_action: Some(crate::confidence::FallbackActionConfig::Abort {
+                abort_message: "low".into(),
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::Abort {
+                abort_message: "critical".into(),
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("flaky.method", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        let ResponseResult::Err(e) = resp.res else {
+            panic!("expected Err: {:?}", resp.res);
+        };
+        assert_eq!(e.kind, relix_core::types::error_kinds::INVALID_ARGS);
+    }
+
+    #[tokio::test]
+    async fn escalate_action_re_dispatches_to_a_different_capability() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register("flaky.method", Arc::new(FnHandler(ok_empty_handler)));
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_for = counter.clone();
+        bridge.register(
+            "premium.method",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let c = counter_for.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    HandlerOutcome::Ok(
+                        b"premium reply with enough body to score full marks on length.".to_vec(),
+                    )
+                }
+            })),
+        );
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            low_threshold: 0.5,
+            critical_threshold: 0.3,
+            low_action: Some(crate::confidence::FallbackActionConfig::Escalate {
+                escalate_to: "premium.method".into(),
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::Escalate {
+                escalate_to: "premium.method".into(),
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("flaky.method", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        let ResponseResult::Ok(body) = resp.res else {
+            panic!("expected Ok");
+        };
+        assert!(body.starts_with(b"premium"));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_action_re_dispatches_up_to_max_retries() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_for = counter.clone();
+        // Always returns an empty body so confidence stays low
+        // and retries always fire.
+        bridge.register(
+            "flaky.method",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let c = counter_for.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    HandlerOutcome::Ok(Vec::new())
+                }
+            })),
+        );
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            low_threshold: 0.5,
+            critical_threshold: 0.3,
+            low_action: Some(crate::confidence::FallbackActionConfig::Retry {
+                max_retries: 3,
+                retry_delay_ms: 0,
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::Retry {
+                max_retries: 3,
+                retry_delay_ms: 0,
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("flaky.method", b"x".to_vec(), bundle, 30);
+        let _ = bridge.handle_inbound(envelope).await;
+        // 1 initial + 3 retries = 4 total.
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn last_confidence_cell_is_updated_after_each_scored_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register("anything.method", Arc::new(FnHandler(ok_long_handler)));
+        let (scorer, engine) = make_confidence(Vec::new());
+        bridge.set_confidence(scorer, engine);
+        let cell = crate::confidence::LastConfidenceCell::new();
+        bridge.set_last_confidence_cell(cell.clone());
+        // Default reading: 1.0 (no calls yet).
+        assert!((cell.get() - 1.0).abs() < 1e-6);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("anything.method", b"x".to_vec(), bundle, 30);
+        let _ = bridge.handle_inbound(envelope).await;
+        // Cell now reflects the just-scored verdict (some value
+        // in (0, 1] post scoring).
+        let v = cell.get();
+        assert!(v > 0.0 && v <= 1.0, "cell={v}");
+    }
+
+    #[tokio::test]
+    async fn alert_action_logs_warning_and_keeps_original_body() {
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = permissive_bridge(&dir);
+        bridge.register(
+            "flaky.method",
+            Arc::new(FnHandler(|_ctx: InvocationCtx| async {
+                HandlerOutcome::Ok(b"hi".to_vec())
+            })),
+        );
+        let (scorer, engine) = make_confidence(vec![crate::confidence::ConfidencePolicy {
+            capability: "flaky.method".into(),
+            low_threshold: 0.95,
+            critical_threshold: 0.9,
+            low_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "wobble".into(),
+            }),
+            critical_action: Some(crate::confidence::FallbackActionConfig::Alert {
+                alert_message: "very wobble".into(),
+            }),
+        }]);
+        bridge.set_confidence(scorer, engine);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("flaky.method", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        let ResponseResult::Ok(body) = resp.res else {
+            panic!("expected Ok");
+        };
+        // Alert leaves body unchanged.
+        assert_eq!(body.as_slice(), b"hi");
     }
 }

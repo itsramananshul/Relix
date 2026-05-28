@@ -3297,6 +3297,7 @@ mod tests {
             input_bytes: 32,
             output_bytes: 64,
             model: None,
+            confidence_score: None,
             request_id: Some(rid),
         });
         // Let the drain loop flush.
@@ -3519,6 +3520,7 @@ mod tests {
             input_bytes: 32,
             output_bytes: 1,
             model: None,
+            confidence_score: None,
             request_id: Some(rid),
         });
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;

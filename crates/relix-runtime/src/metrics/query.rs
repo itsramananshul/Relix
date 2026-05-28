@@ -610,6 +610,7 @@ mod tests {
             input_bytes: 100,
             output_bytes: 200,
             model: tokens.map(|_| "gpt-4o-mini".to_string()),
+            confidence_score: None,
             request_id: None,
         }
     }
