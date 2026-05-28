@@ -35,6 +35,7 @@
 //! - [`coordinator`] — coordinator-side `planning.*` cap
 //!   handlers wiring the three above to the dispatch bridge.
 
+pub mod conflict;
 pub mod coordinator;
 pub mod critic;
 pub mod generator;
@@ -42,6 +43,10 @@ pub mod orchestrator;
 pub mod parser;
 pub mod registry;
 
+pub use conflict::{
+    ConflictKind, ConflictResolutionEntry, ConflictResolutionReport, ConflictResolver,
+    ResolutionStrategy,
+};
 pub use coordinator::{planning_capability_descriptors, register};
 pub use critic::{CriticConfig, CriticLoop, CriticOutcome, CriticVerdict, PlanProducer};
 pub use generator::{GenerateError, GeneratorOptions, PlanGenerator, PlanTopology};
