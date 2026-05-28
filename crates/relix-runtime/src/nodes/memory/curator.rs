@@ -91,6 +91,11 @@ pub struct CuratorConfig {
     /// tick. Default 20.
     #[serde(default = "default_promotion_batch_size")]
     pub promotion_batch_size: usize,
+    /// Model identifier the `memory.dialectic` capability
+    /// reports on the `model_used` field of its response.
+    /// Defaults to the spec's recommended cheap-tier model.
+    #[serde(default = "default_dialectic_model")]
+    pub dialectic_model: String,
 }
 
 fn default_promotion_interval_secs() -> u64 {
@@ -99,6 +104,10 @@ fn default_promotion_interval_secs() -> u64 {
 
 fn default_promotion_batch_size() -> usize {
     20
+}
+
+fn default_dialectic_model() -> String {
+    super::dialectic::DEFAULT_DIALECTIC_MODEL.to_string()
 }
 
 impl Default for CuratorConfig {
@@ -112,6 +121,7 @@ impl Default for CuratorConfig {
             promotion_enabled: false,
             promotion_interval_secs: default_promotion_interval_secs(),
             promotion_batch_size: default_promotion_batch_size(),
+            dialectic_model: default_dialectic_model(),
         }
     }
 }
@@ -1240,6 +1250,7 @@ mod tests {
             promotion_enabled: false,
             promotion_interval_secs: 300,
             promotion_batch_size: 20,
+            dialectic_model: default_dialectic_model(),
         };
         let body = render_status_body(&state, &cfg);
         for needle in [

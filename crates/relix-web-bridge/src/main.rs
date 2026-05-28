@@ -125,6 +125,7 @@ mod mcp;
 mod mcp_audit;
 mod memory_curator;
 mod memory_embed;
+mod memory_gap5;
 mod memory_inspect;
 mod memory_pii;
 #[cfg(test)]
@@ -553,6 +554,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/memory/pii/bulk_anonymize",
             post(memory_pii::bulk_anonymize),
         )
+        // GAP 5: four missing memory caps — dialectic Q&A, doc /
+        // image ingest, explicit context flush.
+        .route("/v1/memory/dialectic", post(memory_gap5::dialectic))
+        .route("/v1/memory/ingest", post(memory_gap5::ingest))
+        .route("/v1/memory/ingest_image", post(memory_gap5::ingest_image))
+        .route("/v1/memory/context_flush", post(memory_gap5::context_flush))
         // RELIX-7.16 knowledge transfer.
         .route("/v1/knowledge/share", post(knowledge::share))
         .route("/v1/knowledge/shared/:agent", get(knowledge::list_shared))

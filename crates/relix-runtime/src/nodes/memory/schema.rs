@@ -115,6 +115,44 @@ impl SharePolicy {
     }
 }
 
+/// Source-trust tag stamped on records that enter the memory
+/// pipeline. Read by the memory-poisoning quarantine pipeline
+/// (GAP 6) — `External` records arriving via ingestion or LLM
+/// derivation must be operator-approved before they reach the
+/// Layer 3 store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceTrust {
+    /// Captured directly from the agent's own conversation
+    /// stream. Auto-promoted.
+    #[default]
+    Internal,
+    /// Derived from operator-ingested content (documents,
+    /// images, URLs). Quarantined pending operator review.
+    External,
+    /// Provenance unknown. Treated the same as `External`.
+    Unknown,
+}
+
+impl SourceTrust {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::External => "external",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "internal" | "" => Some(Self::Internal),
+            "external" => Some(Self::External),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
 /// One row in the four-layer memory store. `id` is the stable
 /// identifier — the embedding pipeline + Qdrant payload both
 /// reference it directly so updates are idempotent.
@@ -126,6 +164,13 @@ impl SharePolicy {
 /// [`MemoryRecord::new_raw`] convenience constructor returns a
 /// record with these defaults so existing call sites compile
 /// unchanged.
+///
+/// RELIX-MEM (GAP 6/7/8): rows additionally carry `source_trust`,
+/// `frozen`, `last_edited_ms`, and `consolidated` so the
+/// quarantine, inspector edit, and archival pipelines all share
+/// one schema. Each new column has a safe default and is
+/// added to pre-existing databases via the `init_schema`
+/// `column_exists`-guarded ALTER pass.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecord {
     pub id: String,
@@ -155,6 +200,26 @@ pub struct MemoryRecord {
     /// / [`SharePolicy::Auto`]. Defaults to `None` so pre-7.16
     /// rows are never auto-propagated.
     pub share_policy: SharePolicy,
+    /// GAP 6: provenance trust level. Default `Internal` for
+    /// agent-captured records; ingestion paths set `External`.
+    #[serde(default)]
+    pub source_trust: SourceTrust,
+    /// GAP 7: operator-frozen flag. Frozen records are never
+    /// overwritten by the curator, never invalidated by context
+    /// flush, and never archived by the consolidation pipeline.
+    #[serde(default)]
+    pub frozen: bool,
+    /// GAP 7: unix-ms timestamp of the most recent operator
+    /// edit via `memory.edit_record`. `None` on records that
+    /// have never been edited.
+    #[serde(default)]
+    pub last_edited_ms: Option<i64>,
+    /// GAP 8: set to true by the consolidation archiver when
+    /// every observation derived from this raw record has been
+    /// archived. Excluded from future RAG retrieval; preserved
+    /// for audit.
+    #[serde(default)]
+    pub consolidated: bool,
 }
 
 impl MemoryRecord {
@@ -183,8 +248,25 @@ impl MemoryRecord {
             shared_with: Vec::new(),
             shared_by: None,
             share_policy: SharePolicy::None,
+            source_trust: SourceTrust::Internal,
+            frozen: false,
+            last_edited_ms: None,
+            consolidated: false,
         }
     }
+}
+
+/// GAP 6: one row in the memory_quarantine table. Operators
+/// list these via `memory.quarantine_list` and either approve
+/// (re-inserting the original record into the main store) or
+/// reject (permanently discarding).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuarantineRow {
+    pub id: String,
+    pub record_json: String,
+    pub reason: String,
+    pub queued_at_ms: i64,
+    pub source_trust: SourceTrust,
 }
 
 /// Errors raised by [`LayeredMemoryStore`]. Mirrors the shape
@@ -262,8 +344,9 @@ impl LayeredMemoryStore {
         conn.execute(
             "INSERT OR REPLACE INTO memory_records \
              (id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-              shareable, shared_with, shared_by, share_policy) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              shareable, shared_with, shared_by, share_policy, \
+              source_trust, frozen, last_edited_ms, consolidated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 record.id,
                 record.layer.as_str(),
@@ -279,6 +362,10 @@ impl LayeredMemoryStore {
                 shared_with_json,
                 record.shared_by,
                 record.share_policy.as_str(),
+                record.source_trust.as_str(),
+                record.frozen as i32,
+                record.last_edited_ms,
+                record.consolidated as i32,
             ],
         )?;
         Ok(())
@@ -417,7 +504,8 @@ impl LayeredMemoryStore {
         let row = conn
             .query_row(
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
                  FROM memory_records WHERE id = ?1",
                 params![id],
                 row_to_record,
@@ -443,7 +531,8 @@ impl LayeredMemoryStore {
         let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) = match (layer, source) {
             (None, None) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
                  FROM memory_records \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -451,7 +540,8 @@ impl LayeredMemoryStore {
             ),
             (Some(l), None) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
                  FROM memory_records WHERE layer = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -459,7 +549,8 @@ impl LayeredMemoryStore {
             ),
             (None, Some(s)) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
                  FROM memory_records WHERE source = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -467,7 +558,8 @@ impl LayeredMemoryStore {
             ),
             (Some(l), Some(s)) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
                  FROM memory_records WHERE layer = ?3 AND source = ?4 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -504,7 +596,8 @@ impl LayeredMemoryStore {
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
              FROM memory_records WHERE text LIKE ?1 ESCAPE '\\' \
              ORDER BY created_at DESC, id ASC \
              LIMIT ?2",
@@ -552,7 +645,8 @@ impl LayeredMemoryStore {
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
              FROM memory_records \
              WHERE layer = 'observation' \
                AND tags NOT LIKE '%\"quality:%' \
@@ -604,7 +698,8 @@ impl LayeredMemoryStore {
         let row = conn
             .query_row(
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
                  FROM memory_records WHERE layer = ?1 AND source = ?2 \
                  ORDER BY observed_at DESC, id ASC LIMIT 1",
                 params![layer.as_str(), source],
@@ -641,6 +736,362 @@ impl LayeredMemoryStore {
         Ok(out)
     }
 
+    /// GAP 7: operator edit — replace `text` and stamp
+    /// `last_edited_ms`. Clears the existing embedding so the
+    /// background pipeline re-embeds the new text on its next
+    /// tick. Frozen rows are still editable — the operator
+    /// who froze the row is the same operator editing it.
+    pub fn edit_record_text(
+        &self,
+        id: &str,
+        new_text: &str,
+        edited_at_ms: i64,
+    ) -> Result<(), LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let n = conn.execute(
+            "UPDATE memory_records SET text = ?1, last_edited_ms = ?2, embedding = NULL \
+             WHERE id = ?3",
+            params![new_text, edited_at_ms, id],
+        )?;
+        if n == 0 {
+            return Err(LayeredMemoryError::Serialization(format!(
+                "memory record {id} not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// GAP 7: set the `frozen` flag. A frozen record survives
+    /// the curator, the context-flush archiver, and the
+    /// consolidation pass. Idempotent.
+    pub fn set_frozen(&self, id: &str, frozen: bool) -> Result<(), LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let n = conn.execute(
+            "UPDATE memory_records SET frozen = ?1 WHERE id = ?2",
+            params![frozen as i32, id],
+        )?;
+        if n == 0 {
+            return Err(LayeredMemoryError::Serialization(format!(
+                "memory record {id} not found"
+            )));
+        }
+        Ok(())
+    }
+
+    /// GAP 8: stamp the consolidated flag. Used by the
+    /// archiver to mark raw records whose downstream
+    /// observations have all been archived.
+    pub fn set_consolidated(&self, id: &str, consolidated: bool) -> Result<(), LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        conn.execute(
+            "UPDATE memory_records SET consolidated = ?1 WHERE id = ?2",
+            params![consolidated as i32, id],
+        )?;
+        Ok(())
+    }
+
+    /// GAP 7: bulk-export every record for `subject_id`,
+    /// optionally filtered to a single layer. Returns the
+    /// records as a Vec (bridge wraps as JSON / JSONL).
+    pub fn export_for_source(
+        &self,
+        source: &str,
+        layer: Option<MemoryLayer>,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) = match layer {
+            Some(l) => (
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                        shareable, shared_with, shared_by, share_policy, \
+                        source_trust, frozen, last_edited_ms, consolidated \
+                 FROM memory_records WHERE source = ?1 AND layer = ?2 \
+                 ORDER BY observed_at ASC, id ASC",
+                vec![source.to_string().into(), l.as_str().to_string().into()],
+            ),
+            None => (
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                        shareable, shared_with, shared_by, share_policy, \
+                        source_trust, frozen, last_edited_ms, consolidated \
+                 FROM memory_records WHERE source = ?1 \
+                 ORDER BY observed_at ASC, id ASC",
+                vec![source.to_string().into()],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), row_to_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// GAP 8: list valid observation records older than
+    /// `cutoff_observed_at` that are NOT frozen and NOT
+    /// archived. Used by the consolidation archiver to find
+    /// terminal observations.
+    pub fn list_archive_candidates(
+        &self,
+        layer: MemoryLayer,
+        cutoff_observed_at: i64,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
+             FROM memory_records \
+             WHERE layer = ?1 \
+               AND frozen = 0 \
+               AND valid_to IS NULL \
+               AND observed_at < ?2 \
+               AND tags NOT LIKE '%\"archived\"%' \
+             ORDER BY observed_at ASC, id ASC \
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![layer.as_str(), cutoff_observed_at, limit],
+            row_to_record,
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// GAP 8: list raw records whose downstream observations
+    /// have ALL been archived. Used by the archiver to mark
+    /// the source raw as `consolidated = true`.
+    pub fn list_raw_candidates_for_consolidation(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
+             FROM memory_records \
+             WHERE layer = 'raw' \
+               AND consolidated = 0 \
+               AND frozen = 0 \
+             ORDER BY observed_at ASC, id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// GAP 6: integrity audit — count records flagged by the
+    /// auditor. Each return field is the count of records the
+    /// auditor stamped with the corresponding tag during the
+    /// last sweep. Used by tests + the status endpoint.
+    pub fn count_records_with_tag(&self, tag: &str) -> Result<u64, LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let needle = format!("%\"{tag}\"%");
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_records WHERE tags LIKE ?1 ESCAPE '\\'",
+            params![needle],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// GAP 6: list every valid Layer 3 observation that's
+    /// older than `cutoff_observed_at` and has no source
+    /// attribution. Used by the integrity auditor.
+    pub fn list_observations_missing_source(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
+             FROM memory_records \
+             WHERE layer = 'observation' \
+               AND (source IS NULL OR source = '') \
+             ORDER BY observed_at ASC, id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// GAP 6: list stale unmodeled Layer 3 observations —
+    /// records that have been in the store for at least
+    /// `min_age_secs` without being referenced by any Layer 4
+    /// model update for their source.
+    pub fn list_stale_unmodeled_observations(
+        &self,
+        cutoff_observed_at: i64,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
+             FROM memory_records r \
+             WHERE r.layer = 'observation' \
+               AND r.observed_at < ?1 \
+               AND r.valid_to IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM memory_records m \
+                   WHERE m.layer = 'model' \
+                     AND m.source = r.source \
+                     AND m.observed_at > r.observed_at \
+               ) \
+             ORDER BY r.observed_at ASC, r.id ASC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff_observed_at, limit], row_to_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// GAP 6: list Layer 4 model records whose `source` has
+    /// no corresponding Layer 3 observation rows. These
+    /// "models without sources" are flagged by the auditor.
+    pub fn list_unsourced_models(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
+             FROM memory_records m \
+             WHERE m.layer = 'model' \
+               AND m.valid_to IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM memory_records o \
+                   WHERE o.layer = 'observation' \
+                     AND o.source = m.source \
+               ) \
+             ORDER BY m.observed_at ASC, m.id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// GAP 6: push a quarantine row. `record_json` is the
+    /// serialised candidate; the caller can rehydrate it via
+    /// `serde_json::from_str` after operator approval.
+    pub fn quarantine_insert(
+        &self,
+        id: &str,
+        record_json: &str,
+        reason: &str,
+        queued_at_ms: i64,
+        source_trust: SourceTrust,
+    ) -> Result<(), LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_quarantine \
+             (id, record_json, reason, queued_at_ms, source_trust) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, record_json, reason, queued_at_ms, source_trust.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// GAP 6: list the pending quarantine rows, newest first.
+    pub fn quarantine_list(&self, limit: usize) -> Result<Vec<QuarantineRow>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 1000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, record_json, reason, queued_at_ms, source_trust \
+             FROM memory_quarantine \
+             ORDER BY queued_at_ms DESC, id ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(QuarantineRow {
+                id: r.get(0)?,
+                record_json: r.get(1)?,
+                reason: r.get(2)?,
+                queued_at_ms: r.get(3)?,
+                source_trust: r
+                    .get::<_, String>(4)
+                    .ok()
+                    .as_deref()
+                    .and_then(SourceTrust::parse)
+                    .unwrap_or(SourceTrust::Unknown),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// GAP 6: pop one quarantine row by id. Returns the JSON
+    /// payload so the caller can rehydrate the candidate and
+    /// re-insert it into the main store on approval.
+    pub fn quarantine_take(&self, id: &str) -> Result<Option<QuarantineRow>, LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT id, record_json, reason, queued_at_ms, source_trust \
+                 FROM memory_quarantine WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(QuarantineRow {
+                        id: r.get(0)?,
+                        record_json: r.get(1)?,
+                        reason: r.get(2)?,
+                        queued_at_ms: r.get(3)?,
+                        source_trust: r
+                            .get::<_, String>(4)
+                            .ok()
+                            .as_deref()
+                            .and_then(SourceTrust::parse)
+                            .unwrap_or(SourceTrust::Unknown),
+                    })
+                },
+            )
+            .optional()?;
+        if row.is_some() {
+            conn.execute("DELETE FROM memory_quarantine WHERE id = ?1", params![id])?;
+        }
+        Ok(row)
+    }
+
+    /// GAP 6: clear a quarantine row without re-inserting it
+    /// into the main store. Used by `memory.quarantine_reject`.
+    pub fn quarantine_delete(&self, id: &str) -> Result<bool, LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let n = conn.execute("DELETE FROM memory_quarantine WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
     /// Return up to `limit` records that still need embedding.
     /// Ordered by `observed_at ASC` so the oldest unembedded
     /// record gets processed first. Used by the embedding
@@ -653,7 +1104,8 @@ impl LayeredMemoryStore {
         let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
-                    shareable, shared_with, shared_by, share_policy \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated \
              FROM memory_records \
              WHERE embedding IS NULL \
              ORDER BY observed_at ASC, id ASC \
@@ -669,26 +1121,31 @@ impl LayeredMemoryStore {
 }
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    // Step 1: create the base table (with the 7.16 columns
-    // baked in) + the legacy indexes. On a pre-7.16 database
-    // the CREATE TABLE IF NOT EXISTS is a no-op; the share
-    // columns get backfilled by the ALTER pass below.
+    // Step 1: create the base table (with the 7.16 + RELIX-MEM
+    // columns baked in) + the legacy indexes. On a pre-7.16
+    // database the CREATE TABLE IF NOT EXISTS is a no-op; the
+    // share + memory-gap columns get backfilled by the ALTER
+    // pass below.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_records (\
-             id           TEXT PRIMARY KEY,\
-             layer        TEXT NOT NULL,\
-             text         TEXT NOT NULL,\
-             source       TEXT NOT NULL DEFAULT '',\
-             tags         TEXT NOT NULL DEFAULT '[]',\
-             created_at   INTEGER NOT NULL,\
-             valid_from   INTEGER NOT NULL,\
-             valid_to     INTEGER,\
-             observed_at  INTEGER NOT NULL,\
-             embedding    BLOB,\
-             shareable    INTEGER NOT NULL DEFAULT 0,\
-             shared_with  TEXT,\
-             shared_by    TEXT,\
-             share_policy TEXT NOT NULL DEFAULT 'none'\
+             id              TEXT PRIMARY KEY,\
+             layer           TEXT NOT NULL,\
+             text            TEXT NOT NULL,\
+             source          TEXT NOT NULL DEFAULT '',\
+             tags            TEXT NOT NULL DEFAULT '[]',\
+             created_at      INTEGER NOT NULL,\
+             valid_from      INTEGER NOT NULL,\
+             valid_to        INTEGER,\
+             observed_at     INTEGER NOT NULL,\
+             embedding       BLOB,\
+             shareable       INTEGER NOT NULL DEFAULT 0,\
+             shared_with     TEXT,\
+             shared_by       TEXT,\
+             share_policy    TEXT NOT NULL DEFAULT 'none',\
+             source_trust    TEXT NOT NULL DEFAULT 'internal',\
+             frozen          INTEGER NOT NULL DEFAULT 0,\
+             last_edited_ms  INTEGER,\
+             consolidated    INTEGER NOT NULL DEFAULT 0\
          );\
          CREATE INDEX IF NOT EXISTS memory_records_layer_created \
              ON memory_records(layer, created_at DESC);\
@@ -700,15 +1157,42 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // Step 2: RELIX-7.16 backwards-compat migration. ALTER
     // TABLE ADD COLUMN guarded by PRAGMA table_info probe. A
     // pre-7.16 database opening against this build picks up
-    // the four new columns without losing any rows. Must run
-    // BEFORE the share-related indexes get created (an index
-    // on a column that doesn't exist yet errors).
+    // the four new columns without losing any rows.
     if !column_exists(conn, "memory_records", "shareable")? {
         conn.execute_batch(
             "ALTER TABLE memory_records ADD COLUMN shareable INTEGER NOT NULL DEFAULT 0;\
              ALTER TABLE memory_records ADD COLUMN shared_with TEXT;\
              ALTER TABLE memory_records ADD COLUMN shared_by TEXT;\
              ALTER TABLE memory_records ADD COLUMN share_policy TEXT NOT NULL DEFAULT 'none';",
+        )?;
+    }
+    // RELIX-MEM (GAP 6/7/8): backwards-compat migration for
+    // the source-trust / freeze / edit / archive columns.
+    // Each column is added independently so a pre-existing
+    // store that has a subset of these (e.g. from a partial
+    // intermediate build) still migrates cleanly.
+    if !column_exists(conn, "memory_records", "source_trust")? {
+        conn.execute(
+            "ALTER TABLE memory_records ADD COLUMN source_trust TEXT NOT NULL DEFAULT 'internal'",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "memory_records", "frozen")? {
+        conn.execute(
+            "ALTER TABLE memory_records ADD COLUMN frozen INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "memory_records", "last_edited_ms")? {
+        conn.execute(
+            "ALTER TABLE memory_records ADD COLUMN last_edited_ms INTEGER",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "memory_records", "consolidated")? {
+        conn.execute(
+            "ALTER TABLE memory_records ADD COLUMN consolidated INTEGER NOT NULL DEFAULT 0",
+            [],
         )?;
     }
     // Step 3: 7.16 indexes. Always issued with IF NOT EXISTS
@@ -719,6 +1203,30 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              ON memory_records(share_policy) WHERE share_policy != 'none';\
          CREATE INDEX IF NOT EXISTS memory_records_shared_by \
              ON memory_records(shared_by) WHERE shared_by IS NOT NULL;",
+    )?;
+    // RELIX-MEM (GAP 6): quarantine table for high-anomaly
+    // observations + external-trust records awaiting operator
+    // approval. Stored as a separate table rather than a
+    // boolean column so the main memory_records query path
+    // stays linear — the quarantine is poll-by-list,
+    // approve-or-reject, not part of normal retrieval.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_quarantine (\
+             id            TEXT PRIMARY KEY,\
+             record_json   TEXT NOT NULL,\
+             reason        TEXT NOT NULL,\
+             queued_at_ms  INTEGER NOT NULL,\
+             source_trust  TEXT NOT NULL DEFAULT 'unknown'\
+         );\
+         CREATE INDEX IF NOT EXISTS memory_quarantine_queued_at \
+             ON memory_quarantine(queued_at_ms DESC);",
+    )?;
+    // RELIX-MEM (GAP 8): indexes for the consolidation
+    // archiver's hot path (age + confidence scan).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS memory_records_archive_scan \
+             ON memory_records(layer, observed_at) \
+             WHERE frozen = 0 AND valid_to IS NULL;",
     )?;
     Ok(())
 }
@@ -762,6 +1270,10 @@ fn row_to_record(
     let shared_with_json: Option<String> = r.get(11).unwrap_or(None);
     let shared_by: Option<String> = r.get(12).unwrap_or(None);
     let share_policy_s: Option<String> = r.get(13).unwrap_or(None);
+    let source_trust_s: Option<String> = r.get(14).unwrap_or(None);
+    let frozen: i32 = r.get(15).unwrap_or(0);
+    let last_edited_ms: Option<i64> = r.get(16).unwrap_or(None);
+    let consolidated: i32 = r.get(17).unwrap_or(0);
     Ok((|| {
         let layer = MemoryLayer::parse(&layer_s).ok_or_else(|| {
             LayeredMemoryError::Serialization(format!("unknown layer: {layer_s}"))
@@ -777,6 +1289,10 @@ fn row_to_record(
             .as_deref()
             .and_then(SharePolicy::parse)
             .unwrap_or(SharePolicy::None);
+        let source_trust = source_trust_s
+            .as_deref()
+            .and_then(SourceTrust::parse)
+            .unwrap_or(SourceTrust::Internal);
         Ok(MemoryRecord {
             id,
             layer,
@@ -792,6 +1308,10 @@ fn row_to_record(
             shared_with,
             shared_by,
             share_policy,
+            source_trust,
+            frozen: frozen != 0,
+            last_edited_ms,
+            consolidated: consolidated != 0,
         })
     })())
 }

@@ -73,10 +73,13 @@
 //!   then by `id ASC` as a tie-breaker, so identical-score results are
 //!   deterministic across runs.
 
+pub mod context_flush;
 pub mod curator;
+pub mod dialectic;
 pub mod embedder;
 pub mod embeddings;
 pub mod guard;
+pub mod ingest;
 pub mod promoter;
 pub mod qdrant;
 pub mod schema;
@@ -297,6 +300,75 @@ impl MemoryStore {
         )
         .map_err(MemoryError::Db)?;
         Ok(())
+    }
+
+    /// GAP 5 / context_flush: return every unflushed turn for
+    /// `session_id`, oldest first. The caller picks the most
+    /// recent `keep_recent_n` to leave in the live context and
+    /// flushes the rest. Returns `(turn_id, role, body)` tuples.
+    pub fn unflushed_turns_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(i64, String, String)>, MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, role, body FROM turns \
+                 WHERE session_id = ?1 AND flushed = 0 \
+                 ORDER BY id ASC",
+            )
+            .map_err(MemoryError::Db)?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(MemoryError::Db)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(MemoryError::Db)?);
+        }
+        Ok(out)
+    }
+
+    /// GAP 5: count remaining unflushed turns for a session.
+    /// Used to report `remaining_in_context` in the flush
+    /// response after marking flushed rows.
+    pub fn unflushed_turn_count(&self, session_id: &str) -> Result<usize, MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE session_id = ?1 AND flushed = 0",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .map_err(MemoryError::Db)?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// GAP 5: mark a batch of turn ids as flushed. Used by
+    /// `memory.context_flush` after each turn has been
+    /// embedded + upserted as a Layer 2 record.
+    pub fn mark_turns_flushed(&self, ids: &[i64]) -> Result<usize, MemoryError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        let tx = conn.transaction().map_err(MemoryError::Db)?;
+        let mut updated = 0usize;
+        {
+            let mut stmt = tx
+                .prepare("UPDATE turns SET flushed = 1 WHERE id = ?1")
+                .map_err(MemoryError::Db)?;
+            for id in ids {
+                updated += stmt.execute(params![id]).map_err(MemoryError::Db)?;
+            }
+        }
+        tx.commit().map_err(MemoryError::Db)?;
+        Ok(updated)
     }
 
     /// Most recent N turns for a session, oldest first.
@@ -699,6 +771,12 @@ pub fn register(
     coord_cell: Arc<tokio::sync::OnceCell<Arc<dyn CoordDispatcher>>>,
     anonymizer: Arc<crate::training::PiiAnonymizer>,
 ) {
+    // Dialectic model: pulled from the curator config when
+    // available, otherwise the documented default.
+    let dialectic_model: String = curator
+        .as_ref()
+        .map(|(_, cfg)| cfg.dialectic_model.clone())
+        .unwrap_or_else(|| dialectic::DEFAULT_DIALECTIC_MODEL.to_string());
     {
         let store = store.clone();
         let layered = layered.clone();
@@ -887,6 +965,97 @@ pub fn register(
                 }
             })),
         );
+        // ── GAP 5: memory.dialectic ──────────────────────────
+        {
+            let layered = ctx.clone();
+            let ai = ai_cell.clone();
+            let embed_cell = embedding_cell.clone();
+            let embed_model = embedding_model.clone();
+            let dialectic_model = dialectic_model.clone();
+            bridge.register(
+                "memory.dialectic",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    let ai = ai.clone();
+                    let embed_cell = embed_cell.clone();
+                    let embed_model = embed_model.clone();
+                    let dialectic_model = dialectic_model.clone();
+                    async move {
+                        dialectic::handle_dialectic(
+                            &layered,
+                            ai.as_ref(),
+                            embed_cell.as_ref(),
+                            &embed_model,
+                            &dialectic_model,
+                            &ictx,
+                        )
+                        .await
+                    }
+                })),
+            );
+        }
+        // ── GAP 5: memory.ingest_document ───────────────────
+        {
+            let layered = ctx.clone();
+            let embed_cell = embedding_cell.clone();
+            let model = embedding_model.clone();
+            bridge.register(
+                "memory.ingest_document",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    let embed_cell = embed_cell.clone();
+                    let model = model.clone();
+                    async move {
+                        ingest::handle_ingest_document(&layered, embed_cell.as_ref(), &model, &ictx)
+                            .await
+                    }
+                })),
+            );
+        }
+        // ── GAP 5: memory.ingest_image ──────────────────────
+        {
+            let layered = ctx.clone();
+            let embed_cell = embedding_cell.clone();
+            let model = embedding_model.clone();
+            bridge.register(
+                "memory.ingest_image",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    let embed_cell = embed_cell.clone();
+                    let model = model.clone();
+                    async move {
+                        ingest::handle_ingest_image(&layered, embed_cell.as_ref(), &model, &ictx)
+                            .await
+                    }
+                })),
+            );
+        }
+        // ── GAP 5: memory.context_flush ─────────────────────
+        {
+            let layered = ctx.clone();
+            let store_for_flush = store.clone();
+            let embed_cell = embedding_cell.clone();
+            let model = embedding_model.clone();
+            bridge.register(
+                "memory.context_flush",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    let store = store_for_flush.clone();
+                    let embed_cell = embed_cell.clone();
+                    let model = model.clone();
+                    async move {
+                        context_flush::handle_context_flush(
+                            &store,
+                            &layered,
+                            embed_cell.as_ref(),
+                            &model,
+                            &ictx,
+                        )
+                        .await
+                    }
+                })),
+            );
+        }
     }
 }
 
@@ -1767,7 +1936,7 @@ fn lookup_existing(
     estore.lookup_by_hash(subject_id, target, entry_hash)
 }
 
-fn invalid_args(cause: String) -> HandlerOutcome {
+pub(crate) fn invalid_args(cause: String) -> HandlerOutcome {
     HandlerOutcome::Err(ErrorEnvelope {
         kind: error_kinds::INVALID_ARGS,
         cause,
@@ -1776,7 +1945,7 @@ fn invalid_args(cause: String) -> HandlerOutcome {
     })
 }
 
-fn internal(cause: String) -> HandlerOutcome {
+pub(crate) fn internal(cause: String) -> HandlerOutcome {
     HandlerOutcome::Err(ErrorEnvelope {
         kind: error_kinds::RESPONDER_INTERNAL,
         cause,
@@ -1795,9 +1964,11 @@ fn init_schema(conn: &Connection) -> Result<(), MemoryError> {
             session_id TEXT    NOT NULL,
             role       TEXT    NOT NULL,
             body       TEXT    NOT NULL,
-            ts         INTEGER NOT NULL
+            ts         INTEGER NOT NULL,
+            flushed    INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS turns_session ON turns(session_id, id);
+        CREATE INDEX IF NOT EXISTS turns_session_flushed ON turns(session_id, flushed, id);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
             body,
@@ -1836,7 +2007,34 @@ fn init_schema(conn: &Connection) -> Result<(), MemoryError> {
         "#,
     )
     .map_err(MemoryError::Db)?;
+    // RELIX-MEM (GAP 5): backwards-compat migration for the
+    // `flushed` column on the turns table. Pre-existing
+    // databases get the column with default 0 so
+    // `memory.context_flush` semantics are consistent across
+    // fresh + migrated stores.
+    if !turns_column_exists(conn, "flushed")? {
+        conn.execute(
+            "ALTER TABLE turns ADD COLUMN flushed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(MemoryError::Db)?;
+    }
     Ok(())
+}
+
+fn turns_column_exists(conn: &Connection, column: &str) -> Result<bool, MemoryError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(turns)")
+        .map_err(MemoryError::Db)?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(MemoryError::Db)?;
+    for r in rows {
+        if r.map_err(MemoryError::Db)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_target(conn: &Connection, subject_id: &str, target: &str) -> Result<String, MemoryError> {

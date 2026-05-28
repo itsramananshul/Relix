@@ -394,6 +394,76 @@ pub enum MemoryCmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// GAP 5: Q&A across one subject's Layer 3/4 memory. Hits
+    /// POST /v1/memory/dialectic.
+    Dialectic {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        observer: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        question: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 5: chunk + embed a document into Layer 2. Hits POST
+    /// /v1/memory/ingest. `--content` or `--content-file` must
+    /// be supplied; for binary inputs use `--content-base64-file`.
+    Ingest {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        observer: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long = "content-type", default_value = "text")]
+        content_type: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long = "content-file")]
+        content_file: Option<String>,
+        #[arg(long = "content-base64-file")]
+        content_base64_file: Option<String>,
+        #[arg(long = "chunk-size-chars")]
+        chunk_size_chars: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 5: vision-embed an image into Layer 2. Hits POST
+    /// /v1/memory/ingest_image. `--image-file` is read, base64-
+    /// encoded, and posted to the bridge.
+    IngestImage {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        observer: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long = "image-file")]
+        image_file: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 5: promote in-context turns to Layer 2. Hits POST
+    /// /v1/memory/context_flush.
+    Flush {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long = "session-id")]
+        session_id: String,
+        #[arg(long = "agent")]
+        agent_name: String,
+        #[arg(long = "keep-recent", default_value_t = 5)]
+        keep_recent_n: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -842,7 +912,243 @@ async fn memory_run(cmd: MemoryCmd) -> Result<(), Box<dyn std::error::Error>> {
             subject_id,
             json,
         } => memory_embed_all_cmd(&bridge, &subject_id, json).await,
+        MemoryCmd::Dialectic {
+            bridge,
+            observer,
+            subject,
+            question,
+            json,
+        } => memory_dialectic_cmd(&bridge, &observer, &subject, &question, json).await,
+        MemoryCmd::Ingest {
+            bridge,
+            observer,
+            subject,
+            source,
+            content_type,
+            content,
+            content_file,
+            content_base64_file,
+            chunk_size_chars,
+            json,
+        } => {
+            memory_ingest_cmd(
+                &bridge,
+                &observer,
+                &subject,
+                &source,
+                &content_type,
+                content.as_deref(),
+                content_file.as_deref(),
+                content_base64_file.as_deref(),
+                chunk_size_chars,
+                json,
+            )
+            .await
+        }
+        MemoryCmd::IngestImage {
+            bridge,
+            observer,
+            subject,
+            source,
+            image_file,
+            json,
+        } => {
+            memory_ingest_image_cmd(&bridge, &observer, &subject, &source, &image_file, json).await
+        }
+        MemoryCmd::Flush {
+            bridge,
+            session_id,
+            agent_name,
+            keep_recent_n,
+            json,
+        } => memory_context_flush_cmd(&bridge, &session_id, &agent_name, keep_recent_n, json).await,
     }
+}
+
+async fn memory_dialectic_cmd(
+    bridge: &str,
+    observer: &str,
+    subject: &str,
+    question: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/dialectic");
+    let client = reqwest::Client::new();
+    let r = client
+        .post(&url)
+        .json(&json!({
+            "observer_id": observer,
+            "subject_id": subject,
+            "question": question,
+        }))
+        .send()
+        .await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let answer = v.get("answer").and_then(|x| x.as_str()).unwrap_or("");
+    let confidence = v.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let sources = v.get("sources_used").and_then(|x| x.as_u64()).unwrap_or(0);
+    let model = v.get("model_used").and_then(|x| x.as_str()).unwrap_or("");
+    let fallback = v.get("fallback_reason").and_then(|x| x.as_str());
+    println!("model       {model}");
+    println!("sources     {sources}");
+    println!("confidence  {confidence:.2}");
+    if let Some(reason) = fallback {
+        println!("fallback    {reason}");
+    }
+    println!();
+    println!("{answer}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn memory_ingest_cmd(
+    bridge: &str,
+    observer: &str,
+    subject: &str,
+    source: &str,
+    content_type: &str,
+    content: Option<&str>,
+    content_file: Option<&str>,
+    content_base64_file: Option<&str>,
+    chunk_size_chars: Option<usize>,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine;
+    let mut body = serde_json::json!({
+        "observer_id": observer,
+        "subject_id": subject,
+        "source": source,
+        "content_type": content_type,
+    });
+    if let Some(n) = chunk_size_chars {
+        body.as_object_mut()
+            .unwrap()
+            .insert("chunk_size_chars".into(), serde_json::Value::from(n));
+    }
+    let provided = [
+        content.is_some(),
+        content_file.is_some(),
+        content_base64_file.is_some(),
+    ]
+    .iter()
+    .filter(|x| **x)
+    .count();
+    if provided != 1 {
+        return Err(
+            "exactly one of --content / --content-file / --content-base64-file is required".into(),
+        );
+    }
+    if let Some(s) = content {
+        body.as_object_mut()
+            .unwrap()
+            .insert("content".into(), serde_json::Value::from(s));
+    } else if let Some(path) = content_file {
+        let s = std::fs::read_to_string(path)?;
+        body.as_object_mut()
+            .unwrap()
+            .insert("content".into(), serde_json::Value::from(s));
+    } else if let Some(path) = content_base64_file {
+        let bytes = std::fs::read(path)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        body.as_object_mut()
+            .unwrap()
+            .insert("content_base64".into(), serde_json::Value::from(encoded));
+    }
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/ingest");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn memory_ingest_image_cmd(
+    bridge: &str,
+    observer: &str,
+    subject: &str,
+    source: &str,
+    image_file: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine;
+    let bytes = std::fs::read(image_file)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let body = serde_json::json!({
+        "observer_id": observer,
+        "subject_id": subject,
+        "source": source,
+        "image_data": encoded,
+    });
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/ingest_image");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn memory_context_flush_cmd(
+    bridge: &str,
+    session_id: &str,
+    agent_name: &str,
+    keep_recent_n: usize,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::json!({
+        "session_id": session_id,
+        "agent_name": agent_name,
+        "keep_recent_n": keep_recent_n,
+    });
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/context_flush");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
 }
 
 async fn memory_embed_cmd(

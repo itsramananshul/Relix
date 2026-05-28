@@ -4589,6 +4589,57 @@ fn register_node_type_handlers(
                 &["mutate", "memory", "pii", "migration"],
                 &["mutate:memory"],
             ),
+            // ── GAP 5: missing memory capabilities ─────────────
+            (
+                "memory.dialectic",
+                "GAP 5: Q&A across one subject's Layer 3/4 \
+                 memory. Args JSON `{observer_id, subject_id, \
+                 question}`. Loads the Layer-4 model if any, \
+                 searches Layer-3 observations (Qdrant w/ text \
+                 fallback), and asks the configured dialectic \
+                 model to synthesise. Returns `{answer, \
+                 confidence, sources_used, model_used, \
+                 fallback_reason?}`.",
+                &["read", "memory", "dialectic", "semantic"],
+                &["reads:internal", "external:ai"],
+            ),
+            (
+                "memory.ingest_document",
+                "GAP 5: chunk + embed a document into Layer 2. \
+                 Args JSON `{observer_id, subject_id, source, \
+                 content?|content_base64?, content_type, \
+                 chunk_size_chars?}`. Supports text, markdown, \
+                 code, and pdf (lopdf). Returns counts of \
+                 chunks_persisted / chunks_embedded / \
+                 deferred_embeddings.",
+                &["persist", "memory", "ingest", "embedding"],
+                &["mutate:memory", "external:ai"],
+            ),
+            (
+                "memory.ingest_image",
+                "GAP 5: vision-embed an image into Layer 2. \
+                 Args JSON `{observer_id, subject_id, source, \
+                 image_data}` where image_data is base64 of a \
+                 PNG/JPEG/PDF. PDFs are routed through the same \
+                 lopdf pipeline as ingest_document. Returns \
+                 `{records_persisted, embedded, \
+                 deferred_embeddings, pdf_pages?}`.",
+                &["persist", "memory", "ingest", "vision"],
+                &["mutate:memory", "external:ai"],
+            ),
+            (
+                "memory.context_flush",
+                "GAP 5: explicit promotion of in-context conver\
+                 sational turns into Layer 2. Args JSON \
+                 `{session_id, agent_name, keep_recent_n?}` \
+                 (default keep_recent_n = 5). Embeds and \
+                 persists all but the keep_recent_n most recent \
+                 unflushed turns and marks them flushed. Returns \
+                 `{flushed_count, remaining_in_context, \
+                 session_id, embedded, deferred_embeddings}`.",
+                &["mutate", "memory", "ingest", "embedding"],
+                &["mutate:memory", "external:ai"],
+            ),
         ];
         for (m, desc, cats, tags) in memory_caps {
             // PH-CAP-RISK: memory caps are either reads (Safe) or

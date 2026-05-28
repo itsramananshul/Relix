@@ -871,6 +871,13 @@ fn build_copy(source: &MemoryRecord, target: &str, message: Option<&str>) -> Mem
         shared_with: Vec::new(),
         shared_by: Some(source.source.clone()),
         share_policy: SharePolicy::None,
+        // RELIX-MEM: incoming shared copies start with the
+        // source agent's trust posture (Internal) and clean
+        // freeze / edit / consolidation flags.
+        source_trust: source.source_trust,
+        frozen: false,
+        last_edited_ms: None,
+        consolidated: false,
     }
 }
 

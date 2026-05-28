@@ -466,6 +466,13 @@ fn build_promoted_record(
         shared_with: Vec::new(),
         shared_by: None,
         share_policy: parent.share_policy,
+        // RELIX-MEM: derived records inherit the parent's
+        // source-trust and freeze posture; consolidation +
+        // edit timestamps start fresh on every promotion.
+        source_trust: parent.source_trust,
+        frozen: parent.frozen,
+        last_edited_ms: None,
+        consolidated: false,
     }
 }
 
