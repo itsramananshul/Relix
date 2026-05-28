@@ -26,6 +26,7 @@ pub mod manifest;
 pub mod metrics;
 pub mod nodes;
 pub mod observability;
+pub mod planning;
 pub mod plugin;
 pub mod sflow;
 pub mod sol;

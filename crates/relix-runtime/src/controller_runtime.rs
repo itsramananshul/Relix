@@ -151,13 +151,54 @@ pub struct ControllerConfig {
 
 /// `[agents.<name>]` config section. Operators add one of
 /// these for any agent whose default training behaviour they
-/// want to change.
+/// want to change OR to declare planning-time capabilities
+/// (RELIX-7.24).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AgentSection {
     /// `[agents.<name>.training]` — RELIX-7.15 training opt-in
     /// + per-agent PII strategy.
     #[serde(default)]
     pub training: Option<AgentTrainingSection>,
+    /// RELIX-7.24: the libp2p peer alias from `[peers]` that
+    /// hosts this agent's capabilities. `None` defaults to
+    /// the agent's name — operators with a 1:1
+    /// agent-name → peer-alias mapping leave this unset.
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// RELIX-7.24: one-sentence human-readable description
+    /// the planner shows operators + scores against the spec
+    /// goal via keyword overlap.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// RELIX-7.24: explicit per-capability declarations.
+    /// Each entry tells the planner "this agent handles
+    /// `method` for these tags." Empty / absent → the planner
+    /// falls back to the cached peer manifest from
+    /// `[crate::manifest::ManifestCache]`.
+    #[serde(default)]
+    pub capabilities: Vec<AgentCapabilityDecl>,
+}
+
+/// RELIX-7.24: one row under `[agents.<name>] capabilities`.
+/// Decoupled from `CapabilityDescriptor` so operators can
+/// declare planner-facing tags + descriptions without
+/// re-stating the wire-level descriptor fields the
+/// node-type registration already owns.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AgentCapabilityDecl {
+    /// Fully-qualified capability method
+    /// (e.g. `"ai.chat"`, `"tool.web_search"`).
+    pub method: String,
+    /// Operator-supplied description shown in the planner's
+    /// `planning.list_agents` output.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Free-form keyword tags the planner scores against the
+    /// spec goal. Conventional examples: `"research"`,
+    /// `"code"`, `"summarise"`. Empty → tag-overlap scoring
+    /// degrades to description-overlap scoring.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// `[agents.<name>.training]` — per-agent training config.
