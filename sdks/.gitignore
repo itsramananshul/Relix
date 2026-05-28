@@ -11,3 +11,4 @@ python/.pytest_cache/
 typescript/node_modules/
 typescript/dist/
 typescript/coverage/
+typescript/package-lock.json
