@@ -340,10 +340,16 @@ async fn handle_create_plan(
         }
     };
 
-    // 2. Conflict resolution.
+    // 2. Conflict resolution. Every mutation the resolver
+    // performs is also recorded in the PlanSpec's changelog +
+    // re-signed via ConflictResolver::record_into_spec so the
+    // downstream approval store + verification harness still
+    // see a valid signature.
     let resolver = ConflictResolver::new();
     let (resolved_workflow, conflict_report) = resolver.resolve(current_workflow);
     current_workflow = resolved_workflow;
+    let mut plan_spec = plan_spec;
+    ConflictResolver::record_into_spec(&conflict_report, &mut plan_spec);
 
     // 3. Critic loop (only on non-dry-run).
     let mut revised_spec_for_response = plan_spec.clone();

@@ -304,19 +304,49 @@ impl CriticLoop {
 /// Append every critic issue + suggestion to the spec's
 /// constraints list so the next regeneration pass sees them
 /// in its prompt prelude. Returns a fresh spec — never
-/// mutates the original.
+/// mutates the original. RELIX-7.24 hardening: every
+/// non-sentinel feedback item is recorded in the spec's
+/// `changelog` via [`PlanSpec::with_change`], and the spec is
+/// re-signed so [`PlanSpec::verify`] continues to pass after
+/// the injection.
 pub fn inject_feedback(spec: &PlanSpec, verdict: &CriticVerdict) -> PlanSpec {
     let mut next = spec.clone();
+    let mut injected: Vec<String> = Vec::new();
     for issue in &verdict.issues {
         if !issue.starts_with("__critic_") {
             next.constraints
                 .push(format!("Critic flagged: {}", issue.trim()));
+            injected.push(format!("issue: {}", issue.trim()));
         }
     }
     for sug in &verdict.suggestions {
         next.constraints
             .push(format!("Critic recommends: {}", sug.trim()));
+        injected.push(format!("suggestion: {}", sug.trim()));
     }
+    if injected.is_empty() {
+        // Critic returned an empty rejection — record the
+        // mutation anyway so the audit trail captures the
+        // round even when no constraints were added.
+        next.with_change(
+            "critic_feedback",
+            "critic rejected the plan but returned no actionable feedback",
+        );
+    } else {
+        next.with_change(
+            "critic_feedback",
+            &format!(
+                "injected {} item(s): {}",
+                injected.len(),
+                injected.join("; ")
+            ),
+        );
+    }
+    // Re-sign so downstream signature verification continues
+    // to pass. Failure here is structurally unreachable for
+    // PlanSpec; silently fall back to leaving the signature
+    // empty if serde_json ever surprises us.
+    let _ = next.sign();
     next
 }
 
@@ -628,6 +658,32 @@ mod tests {
         // Only "real issue" survives.
         assert_eq!(revised.constraints.len(), 1);
         assert!(revised.constraints[0].contains("real issue"));
+    }
+
+    #[test]
+    fn inject_feedback_records_a_critic_feedback_changelog_entry_and_resigns() {
+        // Use a fully-parsed-and-signed spec so we can assert
+        // the re-sign happened cleanly.
+        let parser = super::super::SpecParser::new();
+        let spec = parser.parse("Research the web.");
+        let original_changelog_len = spec.changelog.len();
+        let v = CriticVerdict {
+            approved: false,
+            issues: vec!["fix step 2".into()],
+            suggestions: vec!["use research-agent".into()],
+        };
+        let revised = inject_feedback(&spec, &v);
+        assert_eq!(
+            revised.changelog.len(),
+            original_changelog_len + 1,
+            "exactly one critic_feedback entry appended"
+        );
+        let last = revised.changelog.last().unwrap();
+        assert_eq!(last.change_type, "critic_feedback");
+        assert!(last.description.contains("fix step 2"));
+        assert!(last.description.contains("use research-agent"));
+        // Signature was re-stamped and verifies.
+        revised.verify().expect("revised spec verifies");
     }
 
     #[tokio::test]

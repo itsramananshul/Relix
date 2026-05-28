@@ -155,6 +155,31 @@ impl ConflictResolver {
         Self
     }
 
+    /// Record every entry in `report` into `spec`'s changelog
+    /// via [`super::PlanSpec::with_change`], then re-sign the
+    /// spec via [`super::PlanSpec::sign`] so downstream
+    /// verification keeps passing. Called by the coordinator
+    /// after [`Self::resolve`] when the spec is the
+    /// signed-and-audited artifact passed into the approval
+    /// store. Safe to call with a report carrying zero
+    /// entries — it's a no-op in that case (no signature
+    /// invalidation).
+    pub fn record_into_spec(report: &ConflictResolutionReport, spec: &mut super::PlanSpec) {
+        if report.details.is_empty() && report.escalated.is_none() {
+            return;
+        }
+        for entry in &report.details {
+            let change_type = match entry.strategy {
+                ResolutionStrategy::Rename => "conflict_rename",
+                ResolutionStrategy::Sequence => "conflict_sequence",
+                ResolutionStrategy::Drop => "conflict_drop",
+                ResolutionStrategy::Escalate => "conflict_escalate",
+            };
+            spec.with_change(change_type, &entry.description);
+        }
+        let _ = spec.sign();
+    }
+
     /// Detect every recognised conflict in `workflow`, apply
     /// each strategy in order, and return the (possibly-
     /// rewritten) workflow alongside a
@@ -755,4 +780,52 @@ mod tests {
         assert!(out.contains("after"));
     }
 
+    #[test]
+    fn record_into_spec_appends_one_changelog_entry_per_conflict_and_resigns() {
+        let mut spec = super::super::SpecParser::new().parse("Research the web.");
+        let original_changelog_len = spec.changelog.len();
+        let original_sig = spec.signature.clone();
+        let mut report = ConflictResolutionReport::default();
+        report.record(ConflictResolutionEntry {
+            kind: ConflictKind::DuplicateOutput,
+            strategy: ResolutionStrategy::Rename,
+            description: "renamed `foo` -> `foo_2`".into(),
+            affected_step: "b".into(),
+        });
+        report.record(ConflictResolutionEntry {
+            kind: ConflictKind::InterferingParallelCall,
+            strategy: ResolutionStrategy::Sequence,
+            description: "sequenced w2 after w1".into(),
+            affected_step: "w2".into(),
+        });
+        ConflictResolver::record_into_spec(&report, &mut spec);
+        assert_eq!(
+            spec.changelog.len(),
+            original_changelog_len + 2,
+            "two conflict entries → two changelog rows"
+        );
+        assert_eq!(
+            spec.changelog[original_changelog_len].change_type,
+            "conflict_rename"
+        );
+        assert_eq!(
+            spec.changelog[original_changelog_len + 1].change_type,
+            "conflict_sequence"
+        );
+        // Re-signed → verify passes + signature is fresh.
+        assert!(spec.signature.is_some());
+        assert_ne!(spec.signature, original_sig);
+        spec.verify().expect("verify");
+    }
+
+    #[test]
+    fn record_into_spec_is_a_noop_when_report_is_empty() {
+        let mut spec = super::super::SpecParser::new().parse("Research the web.");
+        let original_changelog_len = spec.changelog.len();
+        let original_sig = spec.signature.clone();
+        let report = ConflictResolutionReport::default();
+        ConflictResolver::record_into_spec(&report, &mut spec);
+        assert_eq!(spec.changelog.len(), original_changelog_len);
+        assert_eq!(spec.signature, original_sig);
+    }
 }

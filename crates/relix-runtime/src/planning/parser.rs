@@ -30,8 +30,37 @@
 //!   selection (cheap → single agent; expensive → parallel).
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Stable wire version for the [`PlanSpec`] schema. Bumped when
+/// a non-backwards-compatible field is added or renamed. The
+/// approval store and any external consumer that holds a
+/// signed spec across upgrades reads this to decide whether
+/// to re-sign or migrate.
+pub const PLAN_SPEC_VERSION: u32 = 1;
 
 /// Structured output of [`SpecParser::parse`].
+///
+/// RELIX-7.24 hardened spec format. Carries five
+/// tamper-evidence + change-tracking fields on top of the
+/// heuristic fields the parser extracts:
+///
+/// - [`Self::version`] — schema version (always
+///   [`PLAN_SPEC_VERSION`] for fresh parses).
+/// - [`Self::spec_id`] — uuid v4 minted by the parser. Stable
+///   across revisions of the same logical spec (the critic
+///   loop and conflict resolver mutate the spec but keep
+///   `spec_id` constant so an operator can correlate
+///   pre-revision and post-revision views).
+/// - [`Self::created_at_ms`] — unix millis at parse time.
+/// - [`Self::signature`] — `blake3` hex of the canonical JSON
+///   serialisation (all fields except `signature` itself,
+///   keys sorted, no whitespace). Tamper-evident: any field
+///   modified post-sign without re-signing makes
+///   [`Self::verify`] return [`SpecVerificationError`].
+/// - [`Self::changelog`] — ordered audit trail of every
+///   `with_change` call the planning pipeline made on this
+///   spec.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlanSpec {
     /// The operator's stated objective. Always non-empty
@@ -85,6 +114,151 @@ pub struct PlanSpec {
     /// read it directly off the parsed spec.
     #[serde(default)]
     pub is_complex: bool,
+    /// RELIX-7.24 spec hardening — schema version (currently
+    /// `1`). Always equal to [`PLAN_SPEC_VERSION`] for
+    /// freshly-parsed specs.
+    #[serde(default = "default_version")]
+    pub version: u32,
+    /// uuid v4 minted at parse time. Stable across critic /
+    /// conflict-resolver revisions of the same logical spec.
+    #[serde(default)]
+    pub spec_id: String,
+    /// Unix millis at parse time.
+    #[serde(default)]
+    pub created_at_ms: i64,
+    /// `blake3` hex digest of the canonical-JSON
+    /// representation (all fields except `signature` itself,
+    /// keys sorted, no whitespace). `None` while the spec is
+    /// being mutated; the planner / critic / conflict resolver
+    /// re-sign via [`Self::sign`] after each mutation, and the
+    /// approval store verifies via [`Self::verify`].
+    #[serde(default)]
+    pub signature: Option<String>,
+    /// Append-only audit log of every change applied to the
+    /// spec by the planning pipeline. Ordered chronologically;
+    /// the parser seeds it with one `"parsed"` entry on
+    /// initial parse.
+    #[serde(default)]
+    pub changelog: Vec<SpecChange>,
+}
+
+fn default_version() -> u32 {
+    PLAN_SPEC_VERSION
+}
+
+/// One entry in [`PlanSpec::changelog`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpecChange {
+    /// Unix millis at the moment the change was applied.
+    pub changed_at_ms: i64,
+    /// Stable string keying the change category. Conventions
+    /// used by the planning pipeline today:
+    ///
+    /// - `"parsed"` — initial parse.
+    /// - `"critic_feedback"` — critic loop injected issues +
+    ///   suggestions as constraints.
+    /// - `"conflict_rename"`, `"conflict_sequence"`,
+    ///   `"conflict_drop"`, `"conflict_escalate"` — conflict
+    ///   resolver mutated the spec via one of its strategies.
+    /// - `"operator_edit"` — operator manually edited the
+    ///   spec via the bridge / CLI.
+    pub change_type: String,
+    /// Free-form one-line human-readable description of the
+    /// change.
+    pub description: String,
+}
+
+/// Errors surfaced by [`PlanSpec::verify`].
+#[derive(Debug, Clone, Error, Serialize, Deserialize)]
+pub enum SpecVerificationError {
+    #[error("plan spec has no signature — call PlanSpec::sign() first")]
+    Missing,
+    #[error(
+        "plan spec signature mismatch — expected `{expected}`, got `{actual}` \
+         (spec has been modified since signing)"
+    )]
+    Mismatch { expected: String, actual: String },
+    #[error("plan spec canonicalisation failed: {0}")]
+    Canonicalise(String),
+}
+
+impl PlanSpec {
+    /// Compute the canonical-JSON form for signing or
+    /// verification: serialise every field except `signature`
+    /// to JSON, then re-emit with sorted keys + no whitespace.
+    /// `serde_json::Value::Object` is backed by `BTreeMap` in
+    /// the default build, so key ordering is deterministic.
+    pub fn canonical_json(&self) -> Result<String, SpecVerificationError> {
+        let mut v = serde_json::to_value(self)
+            .map_err(|e| SpecVerificationError::Canonicalise(e.to_string()))?;
+        if let serde_json::Value::Object(map) = &mut v {
+            map.remove("signature");
+        }
+        serde_json::to_string(&v).map_err(|e| SpecVerificationError::Canonicalise(e.to_string()))
+    }
+
+    /// Compute the blake3 hex digest of the canonical-JSON
+    /// representation and write it into [`Self::signature`].
+    /// Returns the freshly-computed signature so callers can
+    /// log or echo it.
+    pub fn sign(&mut self) -> Result<String, SpecVerificationError> {
+        let canonical = self.canonical_json()?;
+        let digest = blake3::hash(canonical.as_bytes());
+        let hex = digest.to_hex().to_string();
+        self.signature = Some(hex.clone());
+        Ok(hex)
+    }
+
+    /// Recompute the canonical hash and compare it against the
+    /// stored signature. Returns `Ok(())` on a match,
+    /// [`SpecVerificationError`] otherwise.
+    pub fn verify(&self) -> Result<(), SpecVerificationError> {
+        let Some(expected) = self.signature.as_ref() else {
+            return Err(SpecVerificationError::Missing);
+        };
+        let canonical = self.canonical_json()?;
+        let actual = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+        if actual == *expected {
+            Ok(())
+        } else {
+            Err(SpecVerificationError::Mismatch {
+                expected: expected.clone(),
+                actual,
+            })
+        }
+    }
+
+    /// Record a change in the audit log + invalidate any
+    /// previous signature so subsequent
+    /// [`Self::verify`] calls fail until the caller re-signs.
+    /// Use [`Self::with_change_and_sign`] to record + re-sign
+    /// in one shot.
+    pub fn with_change(&mut self, change_type: &str, description: &str) {
+        self.changelog.push(SpecChange {
+            changed_at_ms: unix_now_ms(),
+            change_type: change_type.to_string(),
+            description: description.to_string(),
+        });
+        self.signature = None;
+    }
+
+    /// Record a change AND re-sign in one shot. Returns the
+    /// new signature on success.
+    pub fn with_change_and_sign(
+        &mut self,
+        change_type: &str,
+        description: &str,
+    ) -> Result<String, SpecVerificationError> {
+        self.with_change(change_type, description);
+        self.sign()
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The parser. Stateless — every call to [`Self::parse`] is
@@ -117,13 +291,35 @@ impl SpecParser {
     /// Returns a `PlanSpec` even for marginal input — the
     /// goal field carries whatever the parser could extract.
     /// Empty / whitespace-only input yields an empty `goal`.
+    ///
+    /// RELIX-7.24 hardening: every parsed spec is stamped
+    /// with `version`, a fresh uuid v4 `spec_id`,
+    /// `created_at_ms`, a one-entry `changelog` (`"parsed"`),
+    /// and a blake3 signature over the canonical JSON
+    /// representation. Downstream pipeline stages (critic,
+    /// conflict resolver, approval store) preserve `spec_id`
+    /// across revisions and re-sign after every mutation.
     pub fn parse(&self, spec: &str) -> PlanSpec {
         let trimmed = spec.trim();
+        let created_at_ms = unix_now_ms();
+        let spec_id = uuid::Uuid::new_v4().hyphenated().to_string();
         if trimmed.is_empty() {
-            return PlanSpec {
+            let mut empty = PlanSpec {
                 original_spec: spec.to_string(),
+                version: PLAN_SPEC_VERSION,
+                spec_id: spec_id.clone(),
+                created_at_ms,
+                changelog: vec![SpecChange {
+                    changed_at_ms: created_at_ms,
+                    change_type: "parsed".into(),
+                    description: "empty input — placeholder spec".into(),
+                }],
                 ..Default::default()
             };
+            // Sign the placeholder so the approval store can
+            // still verify it.
+            let _ = empty.sign();
+            return empty;
         }
         let sentences = split_sentences(trimmed);
         let goal = sentences
@@ -151,7 +347,8 @@ impl SpecParser {
             compute_complexity_score(trimmed, &goal, &constraints, &success_criteria);
         let is_complex = complexity_score >= DEFAULT_COMPLEXITY_THRESHOLD;
 
-        PlanSpec {
+        let goal_preview: String = goal.chars().take(96).collect();
+        let mut out = PlanSpec {
             goal,
             constraints,
             success_criteria,
@@ -162,7 +359,25 @@ impl SpecParser {
             original_spec: spec.to_string(),
             complexity_score,
             is_complex,
-        }
+            version: PLAN_SPEC_VERSION,
+            spec_id,
+            created_at_ms,
+            signature: None,
+            changelog: vec![SpecChange {
+                changed_at_ms: created_at_ms,
+                change_type: "parsed".into(),
+                description: format!("initial parse: \"{goal_preview}\""),
+            }],
+        };
+        // Sign the freshly-parsed spec. Failure here is only
+        // possible if `serde_json::to_value(self)` fails,
+        // which is structurally unreachable for `PlanSpec`
+        // (no Map<NonString, _> or NaN floats in any field) —
+        // the result is discarded as a defence-in-depth
+        // anyway. Any caller can re-sign explicitly via
+        // [`PlanSpec::sign`].
+        let _ = out.sign();
+        out
     }
 }
 
@@ -625,5 +840,161 @@ mod tests {
         assert_eq!(distinct_output_types("produce a report and code"), 2);
         // Pluralisation: "reports" counts.
         assert_eq!(distinct_output_types("file two reports here"), 1);
+    }
+
+    // ─── RELIX-7.24 hardened spec format ──────────────
+
+    #[test]
+    fn freshly_parsed_spec_has_version_uuid_timestamp_and_signature() {
+        let p = SpecParser::new();
+        let s = p.parse("Greet the user.");
+        assert_eq!(s.version, PLAN_SPEC_VERSION);
+        // uuid v4 in standard hyphenated form is exactly 36 chars.
+        assert_eq!(s.spec_id.len(), 36, "spec_id={}", s.spec_id);
+        // Sanity: hyphen positions match uuid v4 layout.
+        let bytes = s.spec_id.as_bytes();
+        assert_eq!(bytes[8], b'-');
+        assert_eq!(bytes[13], b'-');
+        assert_eq!(bytes[18], b'-');
+        assert_eq!(bytes[23], b'-');
+        assert!(s.created_at_ms > 0, "created_at_ms must be set");
+        let sig = s.signature.as_ref().expect("freshly parsed must be signed");
+        // blake3 hex is 64 characters.
+        assert_eq!(sig.len(), 64, "blake3 hex sig len = {}", sig.len());
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn freshly_parsed_spec_has_initial_parsed_changelog_entry() {
+        let p = SpecParser::new();
+        let s = p.parse("Do the thing.");
+        assert_eq!(s.changelog.len(), 1);
+        assert_eq!(s.changelog[0].change_type, "parsed");
+        assert!(s.changelog[0].description.contains("initial parse"));
+        assert!(s.changelog[0].changed_at_ms > 0);
+    }
+
+    #[test]
+    fn verify_returns_ok_on_unmodified_spec() {
+        let p = SpecParser::new();
+        let s = p.parse("Research the web.");
+        s.verify().expect("freshly-parsed spec must verify");
+    }
+
+    #[test]
+    fn verify_returns_mismatch_after_any_field_modified_without_resign() {
+        let p = SpecParser::new();
+        let mut s = p.parse("Research the web.");
+        // Tamper with a non-signature field.
+        s.goal = "Hack the planet.".into();
+        match s.verify() {
+            Err(SpecVerificationError::Mismatch { .. }) => {}
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_returns_missing_when_signature_is_none() {
+        let p = SpecParser::new();
+        let mut s = p.parse("Research the web.");
+        s.signature = None;
+        assert!(matches!(s.verify(), Err(SpecVerificationError::Missing)));
+    }
+
+    #[test]
+    fn sign_after_modification_makes_verify_pass_again() {
+        let p = SpecParser::new();
+        let mut s = p.parse("Research the web.");
+        s.goal = "Research the web carefully.".into();
+        assert!(s.verify().is_err());
+        s.sign().expect("re-sign");
+        s.verify().expect("verify after re-sign");
+    }
+
+    #[test]
+    fn with_change_appends_log_entry_and_invalidates_signature() {
+        let p = SpecParser::new();
+        let mut s = p.parse("Research the web.");
+        let original_changelog_len = s.changelog.len();
+        let original_sig = s.signature.clone();
+        s.with_change("critic_feedback", "Critic flagged step 2");
+        assert_eq!(s.changelog.len(), original_changelog_len + 1);
+        let last = s.changelog.last().unwrap();
+        assert_eq!(last.change_type, "critic_feedback");
+        assert!(last.description.contains("step 2"));
+        assert!(last.changed_at_ms > 0);
+        // Signature must have been invalidated.
+        assert!(s.signature.is_none());
+        assert!(original_sig.is_some());
+    }
+
+    #[test]
+    fn with_change_and_sign_records_and_resigns_atomically() {
+        let p = SpecParser::new();
+        let mut s = p.parse("Research the web.");
+        let sig = s
+            .with_change_and_sign("operator_edit", "manual tweak")
+            .expect("re-sign succeeds");
+        // New signature returned + stored.
+        assert_eq!(s.signature.as_deref(), Some(sig.as_str()));
+        // Verifies cleanly.
+        s.verify().expect("verify");
+        // Changelog grew.
+        assert_eq!(s.changelog.last().unwrap().change_type, "operator_edit");
+    }
+
+    #[test]
+    fn changelog_grows_across_multiple_with_change_calls() {
+        let p = SpecParser::new();
+        let mut s = p.parse("Research the web.");
+        s.with_change("critic_feedback", "round 1");
+        s.with_change("conflict_rename", "step b renamed");
+        s.with_change("operator_edit", "tweaked goal");
+        assert_eq!(s.changelog.len(), 4); // parsed + 3 changes
+        assert_eq!(s.changelog[0].change_type, "parsed");
+        assert_eq!(s.changelog[1].change_type, "critic_feedback");
+        assert_eq!(s.changelog[2].change_type, "conflict_rename");
+        assert_eq!(s.changelog[3].change_type, "operator_edit");
+    }
+
+    #[test]
+    fn empty_input_parse_still_signs_and_verifies() {
+        let p = SpecParser::new();
+        let s = p.parse("");
+        assert!(s.goal.is_empty());
+        assert_eq!(s.version, PLAN_SPEC_VERSION);
+        assert!(s.signature.is_some());
+        s.verify().expect("empty spec verifies");
+    }
+
+    #[test]
+    fn canonical_json_excludes_signature_field() {
+        let p = SpecParser::new();
+        let s = p.parse("Research the web.");
+        let canonical = s.canonical_json().expect("canonical_json");
+        assert!(
+            !canonical.contains("\"signature\""),
+            "canonical_json must not include the signature field: {canonical}"
+        );
+    }
+
+    #[test]
+    fn two_parses_of_identical_input_yield_different_spec_ids_but_signatures_match_after_normalising_timestamps()
+     {
+        let p = SpecParser::new();
+        let mut a = p.parse("Research the web.");
+        let mut b = p.parse("Research the web.");
+        assert_ne!(a.spec_id, b.spec_id, "spec_id must be unique per parse");
+        // Even with the same goal text, two parses differ on
+        // timestamp + spec_id so signatures differ.
+        assert_ne!(a.signature, b.signature);
+        // Normalise the fields that legitimately vary, re-sign,
+        // and the signatures should match.
+        b.spec_id = a.spec_id.clone();
+        b.created_at_ms = a.created_at_ms;
+        b.changelog = a.changelog.clone();
+        let _ = a.sign();
+        let _ = b.sign();
+        assert_eq!(a.signature, b.signature);
     }
 }

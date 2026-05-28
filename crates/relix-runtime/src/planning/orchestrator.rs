@@ -580,6 +580,12 @@ pub fn build_decomposition_prompt(spec: &PlanSpec, registry: &AgentCapabilityReg
 /// so the downstream [`PlanGenerator`] selects it
 /// deterministically.
 fn sub_spec(parent: &PlanSpec, sub_goal: &str, specialist: &str) -> PlanSpec {
+    // Inherit the parent's hardening fields (version, spec_id,
+    // created_at_ms) so an operator can correlate the sub-spec
+    // back to the parent. The parent's spec_id stays so all
+    // specialist sub-plans share an audit-trail root. The
+    // sub-spec carries no signature initially — it's an
+    // internal generator-only artifact never persisted.
     PlanSpec {
         goal: sub_goal.to_string(),
         constraints: parent.constraints.clone(),
@@ -591,6 +597,11 @@ fn sub_spec(parent: &PlanSpec, sub_goal: &str, specialist: &str) -> PlanSpec {
         original_spec: sub_goal.to_string(),
         complexity_score: 0.0,
         is_complex: false,
+        version: parent.version,
+        spec_id: parent.spec_id.clone(),
+        created_at_ms: parent.created_at_ms,
+        signature: None,
+        changelog: Vec::new(),
     }
 }
 
