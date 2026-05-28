@@ -23,39 +23,33 @@
 
 ---
 
-## GAP 1 — §7.17 Backend SDK: Python + TypeScript SDKs do not exist
+## GAP 1 — §7.17 Backend SDK: Python + TypeScript SDKs — CLOSED
 
-**Roadmap claim (RELIX_ROADMAP.md §5.7.1 / §7.17, marked `[DONE — commit 90eba16]`):**
-> Three SDKs: Rust SDK (native, lives in a new `relix-sdk` crate), Python SDK (wraps the HTTP bridge), TypeScript/JS SDK (wraps the HTTP bridge).
->
-> ```typescript
-> const relix = new RelixClient({ bridgeUrl: "http://localhost:19791", token: "..." });
-> await relix.chat({ sessionId: "user-123", message: "hello" });
-> ```
+**Closed in commits 29d25e9 (Python) + 3d1317d (TypeScript).**
 
-**Actual code:**
-- `crates/relix-sdk/src/lib.rs` — Rust SDK exists.
-- `crates/relix-plugin-sdk/` — plugin protocol SDK (Rust), unrelated to client SDK.
-- **No Python SDK directory anywhere in repo.**
-- **No TypeScript / JavaScript SDK directory.**
-- The Cargo workspace listed in `Cargo.toml`: relix-cli, relix-controller, relix-core, relix-discord, relix-flow-inspect, relix-plugin-sdk, relix-runtime, relix-sdk, relix-slack, relix-telegram, relix-web-bridge. No `relix-python-sdk`, no `relix-js`, no `sdks/`.
+- **Python SDK** (`29d25e9`): `sdks/python/` ships a production-quality package wrapping the Relix web bridge's HTTP surface. Public surface: `RelixClient` with both sync (`chat`) and async (`achat`) variants of every method; sub-APIs `client.memory` (search / ingest_document / dialectic / flush_context), `client.planning` (plan / agents / search_agents / validate), `client.skills` (search / stats / get), `client.observability` (health / alerts / alert_history). Streaming returns `Iterator[StreamChunk]` / `AsyncIterator[StreamChunk]` with a buffer-carry SSE parser that tolerates LF/CRLF separators and bytes split across `iter_text` boundaries. Bearer auth + `X-Relix-Tenant` propagation per request; typed exception hierarchy (`RelixError` / `Connection` / `Auth` / `Response` / `Timeout`). httpx + pydantic v2; Python 3.10+. 30 pytest tests passing via respx-mocked httpx; README documents every sub-API.
+- **TypeScript SDK** (`3d1317d`): `sdks/typescript/` ships `@relix/sdk` using native Node 18+ `fetch` (no axios, no node-fetch). Mirror surface of the Python SDK. Streaming via `eventsource-parser` for correct framing across split-byte chunks. Strict TypeScript with `noImplicitAny` + every public type exported; no `any` in the source. 28 jest tests passing using a tiny in-tree FetchMock (the SDK accepts a `fetch` override on `RelixClientOptions` so tests inject without monkey-patching globals); README documents the full surface.
 
-**Severity:** MISLABELED [DONE]. Two of three documented SDKs are absent.
-
-**Gap size:** Large — building two real SDKs (HTTP wrappers with proper auth, streaming, types, package metadata, publication to PyPI / npm) is a multi-week effort per language.
+Both SDKs target the same wire contract the Rust SDK consumes, so a polyglot deployment sees consistent behaviour. The Rust `relix-sdk` crate continues to ship unchanged.
 
 ---
 
-## GAP 2 — §7.17 / 5.7.3 "Embeddable Mode" (`relix-embedded` crate)
+## GAP 2 — §7.17 / 5.7.3 "Embeddable Mode" (`relix-embedded` crate) — CLOSED
 
-**Roadmap claim (§5.7.3, marked `[DONE — commit 90eba16]` collectively):**
-> Add a `relix-embedded` crate that runs memory + ai + coordinator nodes in-process with no external dependencies. Limited functionality but zero setup.
+**Closed in commit 44f83d0.**
 
-**Actual code:** No `relix-embedded` crate. Cargo workspace has none.
+`crates/relix-embedded/` ships an in-process runtime for developers who want Relix capabilities embedded in their own Rust application. The crate exposes a `RelixEmbedded` struct (clone-able) constructed via a builder; the builder requires an AI provider (any `Arc<dyn ChatProvider>` impl — MockProvider, OpenAICompatibleProvider for Ollama / OpenAI / OpenRouter / xAI, Anthropic, Gemini, or a custom impl) and optionally takes a SQLite memory-db path (defaults to `:memory:`).
 
-**Severity:** MISLABELED [DONE]. The bullet under 5.7's blanket `[DONE]` heading is materially absent.
+Three operations:
+- `chat(ChatInput) -> ChatResponse` — renders a per-session conversation history from an in-process 20-turn ring, calls the configured provider, then persists both turns to the memory store as Layer-1 `Raw` records. SQLite write failures are logged but do not invalidate the reply that already came back.
+- `memory_ingest_document(MemoryIngestInput) -> MemoryIngestResult` — paragraph chunker with 100-char overlap; writes Layer-2 `Semantic` records keyed by `subject_id`. Capped at 5,000 chunks per call.
+- `memory_search(MemorySearchInput) -> Vec<MemoryHit>` — `text_search` (SQLite `LIKE`) with optional `subject_id` filter.
 
-**Gap size:** Large — running coordinator + memory + ai as a library inside an external process is an architectural change (currently every node is a separate binary).
+What's deliberately NOT included (and the reason): libp2p mesh networking, the web bridge HTTP server, the CLI, multi-node federation, and Qdrant vector search. Embedded mode is for single-process apps — the moment a host app needs cross-process orchestration, it runs the full mesh instead.
+
+**Honest deviation from the roadmap text**: the roadmap suggested adding an `embedded` feature flag to `relix-runtime` that "gates out the libp2p transport, mesh client, and web bridge". This commit does NOT add such a feature flag. Threading a feature flag through `relix-runtime` would touch ~150 files cross-cutting; the resulting refactor was scoped out as multi-day cross-cutting work. Instead `relix-embedded` consumes the runtime's existing public surface (`LayeredMemoryStore`, `ChatProvider`, `MockProvider`, `OpenAICompatibleProvider`, etc.) and bypasses libp2p by simply never instantiating a `DispatchBridge` or `MeshClient`. Embedded callers compile the same `relix-runtime` binary as the full mesh — they just exercise less of it. Adding a true `--features embedded` opt-in is a future follow-up if the embedded use case justifies the cross-cutting refactor.
+
+11 integration tests in `crates/relix-embedded/tests/embedded_smoke.rs` + 1 doctest passing.
 
 ---
 
@@ -473,7 +467,7 @@ The following entries were verified PRESENT with no material gap beyond what the
 
 If a future session has limited budget, these are the highest-impact items where the roadmap currently overstates what's built:
 
-1. **GAP 1 — Python + TypeScript SDKs missing.** Blocks the §7.17 "Relix as a backend for AI-native apps" pitch for non-Rust frontends.
+1. ~~**GAP 1** — closed by commits 29d25e9 (Python SDK) + 3d1317d (TypeScript SDK)~~
 2. ~~**GAP 4** — closed by commits 0bac31e + e47dab2~~
 3. ~~**GAP 5** — closed by commit 3c9f3ec~~
 4. ~~**GAP 6** — closed by commit 80980e1~~

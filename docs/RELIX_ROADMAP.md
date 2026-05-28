@@ -471,7 +471,11 @@ This is the most important architectural addition for Relix to be genuinely usab
 
 **What to build:**
 
-**5.7.1 — SDK Layer**
+**5.7.1 — SDK Layer** `[DONE — commits 29d25e9 (Python) + 3d1317d (TypeScript); Rust SDK predates this section]`
+
+> **GAP-FOLLOWUP (2026-05-28):** GAP 1 in `docs/GAP_REPORT.md` flagged this section as MISLABELED — only the Rust SDK existed. Closed in two commits:
+> - **29d25e9** — `sdks/python/` ships a production-quality Python package wrapping the bridge HTTP surface. Sync + async + streaming variants of every method; sub-APIs for memory / planning / skills / observability; typed Pydantic v2 response models; `X-Relix-Tenant` + bearer auth header propagation; 30 pytest tests passing.
+> - **3d1317d** — `sdks/typescript/` ships `@relix/sdk` using native Node 18+ `fetch` + `eventsource-parser` for SSE; mirror surface of the Python SDK; strict TypeScript with no `any`; 28 jest tests passing.
 
 A clean programmatic API so developers don't have to write SOL flows for basic operations. Three SDKs:
 
@@ -508,7 +512,14 @@ tenant_id / subject_id / agent_id
 
 A SaaS operator gets one `tenant_id`. Each of their end users gets a `subject_id` under that tenant. Agents are scoped to tenants. Memory, permissions, and audit logs are isolated per tenant.
 
-**5.7.3 — Embeddable Mode**
+**5.7.3 — Embeddable Mode** `[DONE — commit 44f83d0]`
+
+> **GAP-FOLLOWUP (2026-05-28):** GAP 2 in `docs/GAP_REPORT.md` flagged this section as MISLABELED — `relix-embedded` did not exist. Closed in commit `44f83d0`:
+> - `crates/relix-embedded/` ships `RelixEmbedded` (builder pattern; clone-able) with `chat(ChatInput)`, `memory_ingest_document(...)`, and `memory_search(...)`. Backed by the runtime's `LayeredMemoryStore` (SQLite) and any `Arc<dyn ChatProvider>` impl (MockProvider, OpenAICompatibleProvider for Ollama, Anthropic, Gemini, or a custom one).
+> - The crate bypasses libp2p by never instantiating a `DispatchBridge` or `MeshClient` — it consumes the runtime's existing public surface and exercises less of it. NO `embedded` feature flag was added to `relix-runtime`; threading one through the runtime's ~150 source files was scoped out as multi-day cross-cutting work and is a future follow-up.
+> - 11 integration tests + 1 doctest passing (`tests/embedded_smoke.rs`).
+>
+> What stays explicitly excluded (documented in the crate docs): libp2p mesh networking, the web bridge HTTP server, the CLI, multi-node federation, Qdrant vector search. The moment a host app needs cross-process orchestration it runs the full mesh instead.
 
 Developers embedding Relix in their SaaS shouldn't need to tell users "also install Docker and Ollama." The core mesh should be runnable as a library, not just as a set of external processes.
 
