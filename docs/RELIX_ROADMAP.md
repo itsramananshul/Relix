@@ -3074,7 +3074,9 @@ requires_approval = false
 
 ---
 
-#### Component 3 — Evidence Capture
+#### Component 3 — Evidence Capture `[GAP-12 closure: commit 5aacced]`
+
+> **GAP-FOLLOWUP (2026-05-28):** docs/GAP_REPORT.md flagged this component as MISLABELED [DONE] — what actually shipped was the metrics + audit-log surface, not the machine-readable evidence artifact described below. Closure landed in commit **5aacced**: `crates/relix-runtime/src/nodes/execution/evidence.rs` implements the full spec'd schema (state_before / state_after / unified diff / arguments_redacted via PiiAnonymizer / policy_decision / reversibility / tier / duration), `execution.evidence` capability registered on the bridge, HTTP endpoint `GET /v1/execution/evidence`, and `relix execution evidence` CLI subcommand. Out of scope: screenshot capture (browser-tool wiring) and test-outcome attachment (runner-tool wiring) — both have a clean `StateProbe` hook for future commits.
 
 Every action the executor runs produces a structured evidence record. Not a text log — a machine-readable artifact that captures the full before/after state.
 
@@ -3139,7 +3141,9 @@ never_expose_to_model = true  # raw secrets never in model context
 
 ---
 
-#### Component 5 — Transactional Action Gateway `[DONE — commit 663c737]`
+#### Component 5 — Transactional Action Gateway `[DONE — commit 663c737, GAP-11 closure: commit 235a32b]`
+
+> **GAP-FOLLOWUP (2026-05-28):** docs/GAP_REPORT.md flagged this component as MISLABELED [DONE] — the original 663c737 commit shipped a flat reversible-or-not bool, NOT the three-tier model. Closure landed in commit **235a32b**: `GatewayTier::{AutoCompensated, HumanRollbackPlan, Blocked}` enum + `GatewayDispatchOptions` builder (transaction_id, idempotency_key, tier, dry_run, actor), persistent `gateway_actions` SQLite store with unique partial index on `(tool, idempotency_key)` for retry dedup, `dispatch_with_options(...)` rich entry point on `ToolDispatcher`, `execution.rollback` + `execution.transaction_get` caps, bridge endpoints `POST /v1/execution/rollback` and `GET /v1/execution/transactions/:id`, and CLI subcommands `relix execution rollback / transaction`. Legacy `dispatch(reversible, hint, ...)` still works unchanged for tools that haven't migrated.
 
 The most important missing primitive in agentic AI. When an agent calls a third-party API, sends an email, writes to a database, or deploys something — there's currently no concept of preview before commit, no idempotency, no rollback. One retry and the customer gets charged twice. One failed deployment and you need a manual rollback.
 
@@ -4653,7 +4657,15 @@ schema break.
 
 ---
 
-#### Feature 4 — Provenance Registry
+#### Feature 4 — Provenance Registry `[GAP-13 + GAP-14 closure: commit c94f75a]`
+
+> **GAP-FOLLOWUP (2026-05-28):** docs/GAP_REPORT.md flagged GAP 13 (write path bridge-only) and GAP 14 (observability metadata not recorded in AI handler — the W8 fix had only patched the bridge). Closure landed in commit **c94f75a**:
+> - `nodes/ai/provenance_hooks.rs` — `record_chat_provenance(...)` and `record_chat_metadata(...)` fire after every `handle_chat` and `handle_chat_stream` completion (mesh-internal calls included). Payload mirrors the bridge's W8 layout exactly.
+> - Prompt-file auto-versioning via `record_prompt_file_load(obs, path, content)` invoked at controller boot from the SoulCache. Trace ids derive from the content hash so unchanged content is idempotent.
+> - Tool-manifest auto-versioning via `record_tool_manifest_register(obs, name, json)`.
+> - New `ProvenanceRegistry::list_recent` + bridge endpoint `GET /v1/provenance/recent`.
+> - CLI: `relix provenance show | diff | history | audit` (history filters `prompt_file_load` snapshots by path + ISO date range; audit lists every snapshot in a time range).
+> - `[observability.two_sink]` config block builds the AI-controller-side ObservabilityContext (metadata + content + provenance) so mesh-internal calls record Sink-A events. Sink B is intentionally None on the mesh-internal path to avoid double-storing content that lands via the bridge.
 
 Every trace links back to exactly what was running when it ran. When something goes wrong six months later, you can answer exactly: what system prompt was the agent given, what model was it using, what tools were enabled, what policy rules were in effect, what version of the memory corpus was it querying.
 

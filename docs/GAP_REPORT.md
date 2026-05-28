@@ -207,89 +207,68 @@
 
 ---
 
-## GAP 11 — §7.26 Component 5 Transactional Action Gateway: three-tier model absent
+## GAP 11 — §7.26 Component 5 Transactional Action Gateway — **CLOSED (235a32b)**
 
 **Roadmap claim (`[DONE — commit 663c737]`):**
 > The gateway operates in three tiers:
 > Tier A — Auto-compensated actions … Tier B — Human-rollback-plan actions … Tier C — Flat-out blocked actions.
 > Idempotency keys across all tiers. Dry-run preview across Tiers B and C.
 
-**Actual code:**
-- `nodes/execution/gateway.rs` exists with `GatewayAction { tool, args, result, reversible, rollback_hint }` and `ActionGateway` tracking completed / failed actions.
-- `transaction_summary()` marks rows `[rev]` or `[IRREVERSIBLE]`.
-- `has_irreversible_work()` returns a bool.
-- **No three-tier classification** (Tier A / B / C as an enum): the gateway is a flat reversible-or-not bool.
-- **No `idempotency_key` field**: a retry will not be deduped by the gateway.
-- **No dry-run preview**: no preview-then-commit primitive.
-- **No auto-compensating action declaration on tool side** (the spec wants tool authors to declare a compensating action; today only a `rollback_hint` string exists).
-- **No human-rollback-plan capture** (the Tier B "operator writes the rollback plan before committing" gate doesn't exist).
-
-**Severity:** MISLABELED [DONE]. The shipped gateway is a "record actions in sequence with a reversible flag" log, not the three-tier transactional gateway the spec describes.
-
-**Gap size:** Medium-to-large — schema change (`tier` enum, `idempotency_key`, `rollback_plan` columns), dry-run preview executor mode, compensating-action declaration on every tool, rollback execution path.
+**Closure (commit 235a32b, feat(execution): GAP 11 — three-tier transactional action gateway):**
+- `nodes/execution/gateway_tier.rs` — `GatewayTier::{AutoCompensated, HumanRollbackPlan, Blocked}` enum + `GatewayDispatchOptions` builder (transaction_id, idempotency_key, tier, dry_run, actor) + `DryRunPreview` + `RollbackResult` shapes.
+- `nodes/execution/transaction_store.rs` — SQLite-backed `gateway_actions` table with a unique partial index on `(tool, idempotency_key)` so duplicate keys fail loudly. CRUD + `find_by_idempotency_key` + `mark_rolled_back`. Stable `g.<16hex>` and `tx.<16hex>` id formats.
+- `nodes/execution/rollback.rs` — `execute_rollback(...)` walks the transaction newest-first, runs Tier A compensating calls, surfaces Tier B plans, errors on persisted Tier C rows. `execution.rollback` + `execution.transaction_get` caps registered on the coordinator DispatchBridge.
+- `nodes/tool/dispatcher.rs` — new `dispatch_with_options(...)` consults Tier C lists (config + per-call), dedupes on idempotency keys, short-circuits to a `DryRunPreview` when `dry_run = true`, persists every successful + failed dispatch to the store. Legacy `dispatch(...)` unchanged.
+- Bridge endpoints `POST /v1/execution/rollback`, `GET /v1/execution/transactions/:id`. CLI subcommands `relix execution rollback / transaction / evidence`.
+- `[execution.gateway]` config block: `dry_run`, `db_path`, `blocked_tools`, `evidence_db_path`.
+- 25 new unit tests across the three modules; 8 new dispatcher tests.
 
 ---
 
-## GAP 12 — §7.26 Component 3 Evidence Capture: minimal recording, not the spec record
+## GAP 12 — §7.26 Component 3 Evidence Capture — **CLOSED (5aacced)**
 
 **Roadmap claim (Component 3, embedded under `[DONE]`):**
 > Every action the executor runs produces a structured evidence record. Not a text log — a machine-readable artifact that captures the full before/after state.
-> ```json
-> { "evidence_id":..., "action_id":..., "actor_id":..., "tenant_id":...,
->   "tool":..., "arguments_redacted":..., "policy_decision":..., "reversibility":...,
->   "sandbox_context":..., "started_at":..., "completed_at":..., "duration_ms":...,
->   "cost_usd":..., "diff":..., "screenshot":..., "state_before":..., "state_after":...,
->   "test_outcomes":..., "error":... }
-> ```
 
-**Actual code:**
-- The gateway tracks `GatewayAction { tool, args, result, reversible, rollback_hint }`.
-- The dispatch bridge records `InvocationMetric` rows (agent, method, latency, success, cost, model).
-- The audit log records `AuditDraft` lines.
-- **No `evidence_id`-shaped structured record exists** with the documented schema (state_before, state_after, diff, screenshot, test_outcomes, sandbox_context).
-- No file under `crates/` named `evidence.rs` / `evidence/`.
+**Closure (commit 5aacced, feat(execution): GAP 12 — structured evidence records):**
+- `nodes/execution/evidence.rs` — SQLite-backed `evidence_records` with the spec's full column list (evidence_id, action_id, actor_id, tenant_id, tool, arguments_redacted, policy_decision, reversibility, tier, started/completed/duration, cost_usd, state_before, state_after, diff, error, recorded_at_ms). Three indexes: action_id, (actor_id, recorded_at_ms DESC), (tool, recorded_at_ms DESC).
+- `EvidenceStore` implements the `EvidenceCaptureSink` trait the GAP-11 dispatcher declares. Every `dispatch_with_options` call produces one evidence row.
+- `StateProbe` trait — tools that can snapshot pre/post state register a probe. When wired, the row carries `state_before` + `state_after` + a pure-Rust `unified_diff(a, b)` string.
+- PII anonymisation: every `arguments_redacted` field runs through the configured `PiiAnonymizer` before storage.
+- `execution.evidence` capability registered on the bridge. Bridge endpoint `GET /v1/execution/evidence` with `?action_id=` / `?actor_id=` / `?limit=` query params.
+- 10 unit tests covering capture, redaction, action / actor filters, state probe + diff, dry-run + blocked policy decisions, diff edge cases, evidence-id shape, failed dispatch error capture.
 
-**Severity:** MISLABELED [DONE]. What ships is metrics + audit log; the structured evidence artifact with state diff / screenshot / test outcome attachment is not built.
-
-**Gap size:** Medium-to-large — new schema, capture sites at every tool dispatch point, diff computation for code changes, screenshot capture for browser actions, test-outcome attachment for runners.
+**Out of scope (deferred):** screenshot capture for browser actions and test-outcome attachment for runners — the spec mentions both, but they need browser-specific + runner-specific instrumentation that lives in separate crates; the StateProbe interface gives those future commits a clean hook without re-touching the gateway.
 
 ---
 
-## GAP 13 — §7.31 Provenance Registry: schema present, write path not wired
+## GAP 13 — §7.31 Provenance Registry — **CLOSED (c94f75a)**
 
 **Roadmap claim (`[DONE — commits e16309e through 2f0ba25]`, Feature 4):**
 > Every trace links back to exactly what was running when it ran. … `ProvenanceRegistry` stores: Every version of every system prompt, policy file, and tool manifest … Traces link to hashes. Queries join through the registry.
->
-> Wiring gap W8 was explicitly claimed DONE in commit 917a70e: "after every `/v1/chat/completions` call, record a `ProvenanceSnapshot` with model_id, system_prompt_hash from the request body."
 
-**Actual code:**
-- `crates/relix-runtime/src/observability/provenance.rs` PRESENT — `ProvenanceSnapshot`, `ProvenanceRegistry::record`, `ProvenanceRegistry::diff_snapshots` with SQLite backing.
-- Bridge endpoints `GET /v1/provenance/{trace_id}` and `GET /v1/provenance/diff` PRESENT.
-- **Write call from chat path:** the bridge's `openai.rs` reaches the observability sinks but the AI handler `handle_chat` in `nodes/ai/mod.rs` does NOT call `registry.record_snapshot()`. Provenance is recorded at the bridge boundary only.
-- **No CLI** `relix provenance show / diff / history / audit` (the doc explicitly lists these).
-- **No prompt-file version tracking**: the spec wants every system-prompt file change to mint a new version with a content hash. The registry stores per-call snapshots but does not auto-version prompt files on edit.
-- **No tool-manifest version → registry write-back**: tool manifests are signed (§7.27) but the version isn't pushed into the provenance registry on every tool registration.
+**Closure (commit c94f75a, feat(ai, observability, bridge, cli): GAP 13 + 14 — provenance writes from AI handler, two-sink observability for mesh-internal calls, prompt + manifest auto-versioning, relix provenance CLI):**
+- `nodes/ai/provenance_hooks.rs` — `record_chat_provenance(...)` writes a ProvenanceSnapshot after every `handle_chat` AND `handle_chat_stream` completion. The payload mirrors the W8 bridge layout exactly so the diff endpoint sees identical field names from either entry point.
+- `record_prompt_file_load(obs, path, content)` and `record_tool_manifest_register(obs, name, json)` — auto-versioning helpers. Trace ids derive from the content hash so unchanged content is idempotent; a changed file mints a new trace id.
+- `record_soul_provenance(...)` is invoked at controller boot so the registry knows what's active before the first chat call.
+- New `ProvenanceRegistry::list_recent(limit)` + bridge `GET /v1/provenance/recent?limit=200`.
+- CLI `relix provenance show / diff / history / audit` (4 subcommands). `history` filters `prompt_file_load` snapshots by path + ISO date range; `audit` lists every snapshot in a time range.
 
-**Severity:** PARTIAL DONE. Read surface is real; the write path is bridge-only, and the CLI + auto-versioning surfaces are absent.
-
-**Gap size:** Medium — wire `handle_chat`'s post-flight to write a snapshot; add four CLI subcommands; auto-version prompt files on edit; auto-version tool manifests on register.
+**Out of scope (deferred):** the spec mentions a `policy file` auto-versioning leg alongside the prompt file + tool manifest legs; the existing policy plumbing already carries a `policy_version` string per call, so the deliberate decision here was to leave it as-is rather than build a second hashing pipeline. The `relix provenance diff` surface already shows `policy_version` changes.
 
 ---
 
-## GAP 14 — §7.32 Wiring W8: observability metadata not recorded inside AI handler
+## GAP 14 — §7.32 Wiring W8: observability metadata in AI handler — **CLOSED (c94f75a)**
 
 **Roadmap claim (`Wiring Gaps … W8 — Provenance Not Recorded On Every Chat Call [DONE — commit 917a70e]`):**
 > `ProvenanceRegistry` is on `AppState` but `record_chat_observability` in `openai.rs` does NOT write a provenance snapshot. Fix: after every `/v1/chat/completions` call, record a `ProvenanceSnapshot` with model_id, system_prompt_hash from the request body.
 
-**Actual code:**
-- `record_chat_observability` is present in `crates/relix-web-bridge/src/openai.rs`.
-- Provenance is recorded at the bridge boundary (after `openai::chat_completions` returns).
-- **The AI handler `handle_chat` in `nodes/ai/mod.rs` does NOT call any observability metadata sink.** It calls `attach_ai_usage` (for the §7.11 metrics path) and `attach_provider_signals` (for the §7.19 confidence path) — but does NOT call `ObservabilityContext::record_event`, `MetadataSink::record`, or `ProvenanceRegistry::record_snapshot`.
-- Implication: direct AI-to-coordinator calls (mesh-internal, not going through the OpenAI bridge endpoint) produce metrics + confidence data but produce no observability metadata events and no provenance snapshots.
-
-**Severity:** PARTIAL DONE. The W8 commit fixes the bridge-side gap; the AI-handler-side gap remains. The roadmap framing "after every /v1/chat/completions call" matches what was fixed, but the §7.31 two-sink + provenance architecture is supposed to cover every call, not just the bridge surface.
-
-**Gap size:** Small — pass `ObservabilityContext` into the AI node's `register`, call it from `handle_chat` and `handle_chat_stream`.
+**Closure (commit c94f75a, same commit as GAP 13):**
+- `record_chat_metadata(obs, session, trace, agent, event_type, model, duration_ms, tokens, success)` writes one Sink-A `MetadataEvent` after every `handle_chat` and `handle_chat_stream` completion. `event_type` is `"ai.chat.complete"` for the unary path and `"ai.chat.stream.complete"` for the streaming path.
+- `[observability.two_sink]` config block: `enabled`, `metadata_db_path`, `content_db_path?`, `provenance_db_path?`, `content_retention_days`. When paths are unset, derived from the metadata path.
+- `build_ai_observability(cfg)` opens the three sinks and returns an `Arc<ObservabilityContext>` plumbed into `nodes::ai::register`.
+- Sink B is intentionally `None` on the mesh-internal path — `ai.chat` content lands in Sink B from the bridge's W8 path when the bridge boundary is involved; mesh-internal calls do not duplicate.
+- 2 integration tests in `nodes/ai/mod.rs`: `handle_chat_records_provenance_and_metadata_when_observability_wired` and `handle_chat_skips_observability_when_no_context` (regression guard that the absent-context path is a true no-op).
 
 ---
 
@@ -524,12 +503,12 @@ If a future session has limited budget, these are the highest-impact items where
 2. ~~**GAP 4** — closed by commits 0bac31e + e47dab2~~
 3. ~~**GAP 5** — closed by commit 3c9f3ec~~
 4. ~~**GAP 6** — closed by commit 80980e1~~
-5. **GAP 11 — Transactional Action Gateway is reversible-flag-only.** Three-tier model, idempotency, dry-run preview, compensating actions — all absent.
-6. **GAP 12 — Evidence Capture as documented does not exist.** Metrics + audit log ship; the structured evidence record with diff/screenshot/state-before/after does not.
+5. ~~**GAP 11** — closed by commit 235a32b~~
+6. ~~**GAP 12** — closed by commit 5aacced~~
 7. ~~**GAP 7** — closed by commit e39a079~~
 8. **GAP 23 — Multi-tenant isolation is header-level.** Per-tenant Qdrant collections, per-tenant policies, per-tenant audit partitions not enforced.
-9. **GAP 14 — Observability metadata not recorded in AI handler.** W8 closed at the bridge boundary only; mesh-internal calls bypass observability.
-10. **GAP 13 — Provenance Registry write path not wired into chat.** Read endpoints work, but only the bridge writes snapshots; prompt-file auto-versioning + CLI absent.
+9. ~~**GAP 14** — closed by commit c94f75a~~
+10. ~~**GAP 13** — closed by commit c94f75a~~
 
 GAP 8 — closed by commit 0e6fd5e (alongside GAPs 5/6/7 in the same session).
 
