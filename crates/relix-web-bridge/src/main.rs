@@ -98,6 +98,9 @@ mod browser_captures;
 mod browser_sessions;
 mod capabilities;
 mod chat;
+mod confidence;
+#[cfg(test)]
+mod confidence_mini_mesh_test;
 mod config;
 mod config_api;
 mod cron;
@@ -548,6 +551,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/knowledge/broadcast", post(knowledge::broadcast))
         .route("/v1/knowledge/groups", get(knowledge::groups))
         .route("/v1/knowledge/revoke", post(knowledge::revoke))
+        // RELIX-7.19: confidence scoring + fallback surface.
+        .route("/v1/confidence/policies", get(confidence::policies))
+        .route("/v1/confidence/history/:agent", get(confidence::history))
+        .route("/v1/confidence/reset", post(confidence::reset))
         .route("/v1/knowledge/recall", post(knowledge::recall))
         // Four-layer memory inspector. Reads the layered store
         // directly from `AppState::layered_memory` — set
