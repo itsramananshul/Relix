@@ -92,6 +92,7 @@ mod agent_metrics_mini_mesh_test;
 mod agents_access;
 #[cfg(test)]
 mod alert_dispatch_mini_mesh_test;
+mod audit_tenants;
 mod auth;
 mod blocklist;
 mod browser_captures;
@@ -544,6 +545,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/policy/tenants/:tenant_id",
             get(policy_tenants::get_tenant),
         )
+        // GAP 23C: per-tenant audit enumeration + recent rows.
+        // Read-only proxies for the `node.audit.tenant_*` caps.
+        .route("/v1/audit/tenants", get(audit_tenants::list_tenants))
+        .route("/v1/audit/tenants/:tenant_id", get(audit_tenants::recent))
         // W2-MEMORY-3: proxy for `memory.agent_read`. Returns
         // the persistent agent + user memory for a subject_id.
         // Read-only — writes happen via the agent's own

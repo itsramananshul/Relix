@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod audit_partition;
 pub mod confidence;
 pub mod controller_runtime;
 pub mod coordinator;

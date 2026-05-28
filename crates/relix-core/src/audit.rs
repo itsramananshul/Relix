@@ -89,6 +89,15 @@ pub struct AuditDraft {
     pub flow_id: Option<FlowId>,
     /// Started_at, used to compute latency at finish.
     pub started_at: std::time::Instant,
+    /// GAP 23C: caller-supplied tenant id (X-Relix-Tenant
+    /// header → RequestEnvelope.tenant_id → here). Recorded on
+    /// the partition mirror so operators can slice audit
+    /// queries per tenant; NOT copied into the signed
+    /// [`AuditRecord`] because changing that struct would
+    /// break the existing hash chain. `None` means "no tenant
+    /// header supplied" — the partition mirror routes those to
+    /// the literal tenant id `"default"`.
+    pub tenant_id: Option<String>,
 }
 
 /// Append-only audit log writer.
@@ -325,6 +334,7 @@ mod tests {
             method: "ai.chat".into(),
             flow_id: Some(FlowId::new()),
             started_at: std::time::Instant::now(),
+            tenant_id: None,
         }
     }
 

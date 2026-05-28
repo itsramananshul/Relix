@@ -324,6 +324,12 @@ pub struct DispatchBridge {
     /// `tenant_id`; tenants without a per-tenant policy file
     /// transparently fall through to the global engine.
     tenant_policy: Option<Arc<relix_core::policy::TenantPolicyResolver>>,
+    /// GAP 23C: per-tenant audit partition mirror. `None`
+    /// keeps the bridge in pre-23C mode (only the canonical
+    /// signed CBOR log is written). When wired, every
+    /// finalised audit also lands as a row in a queryable
+    /// SQLite store keyed by sanitised tenant id.
+    audit_partition: Option<Arc<crate::audit_partition::AuditPartitionStore>>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -497,6 +503,7 @@ impl DispatchBridge {
             budget_enforcer: None,
             pii_gate: None,
             tenant_policy: None,
+            audit_partition: None,
         })
     }
 
@@ -517,6 +524,25 @@ impl DispatchBridge {
     /// the bridge.
     pub fn tenant_policy_handle(&self) -> Option<Arc<relix_core::policy::TenantPolicyResolver>> {
         self.tenant_policy.clone()
+    }
+
+    /// GAP 23C: wire the audit partition mirror. Idempotent —
+    /// calling twice replaces the prior store. `None` reverts to
+    /// pre-23C mode (only the canonical signed log is written).
+    pub fn set_audit_partition_store(
+        &mut self,
+        store: Arc<crate::audit_partition::AuditPartitionStore>,
+    ) {
+        self.audit_partition = Some(store);
+    }
+
+    /// GAP 23C: cheap-clone handle on the audit partition store.
+    /// Used by the `node.audit.tenant_*` caps so the handlers can
+    /// read the store without owning the bridge.
+    pub fn audit_partition_handle(
+        &self,
+    ) -> Option<Arc<crate::audit_partition::AuditPartitionStore>> {
+        self.audit_partition.clone()
     }
 
     /// RELIX-7.28 Part 1: wire the budget enforcer. Idempotent —
@@ -2031,8 +2057,34 @@ impl DispatchBridge {
             method: req.method.clone(),
             flow_id: None,
             started_at: started,
+            tenant_id: req.tenant_id.clone(),
         };
         let aid = req.rid.0.to_vec(); // alpha: use rid as audit id (cross-correlation key)
+        // GAP 23C: when a partition mirror is wired, write a
+        // queryable row BEFORE finalising the canonical signed
+        // log. Mirror failures are logged but never block the
+        // signed write — the canonical CBOR chain stays the
+        // source of truth.
+        if let Some(part) = &self.audit_partition {
+            let row = crate::audit_partition::PartitionRow {
+                ts_secs: unix_now(),
+                request_id_hex: hex::encode(req.rid.0),
+                tenant_id: req.tenant_id.clone(),
+                caller_name: caller.name.clone(),
+                method: req.method.clone(),
+                policy_decision: decision.clone(),
+                status: match status {
+                    AuditStatus::Ok => "ok",
+                    AuditStatus::Denied => "denied",
+                    AuditStatus::Error => "error",
+                },
+                error_kind,
+                latency_ms: started.elapsed().as_millis() as u64,
+            };
+            if let Err(e) = part.append(&row) {
+                tracing::warn!(error = %e, "audit partition mirror write failed");
+            }
+        }
         let mut audit = self.audit.lock().await;
         if let Err(e) = audit.finalize(draft, decision, status, error_kind) {
             tracing::error!(error = %e, "audit write failed");

@@ -1,0 +1,343 @@
+//! GAP 23C — per-tenant audit log partitioning.
+//!
+//! A SQLite-backed mirror of every audit write the bridge
+//! produces, keyed by tenant id. The canonical signed CBOR
+//! audit log (in `relix-core::audit`) stays unchanged so its
+//! hash chain remains backwards-compatible; this mirror is an
+//! additional, queryable view operators can slice by tenant
+//! without trawling the binary log.
+//!
+//! ## Schema
+//!
+//! ```sql
+//! CREATE TABLE IF NOT EXISTS audit_partition (
+//!   tenant_id        TEXT    NOT NULL,
+//!   ts_secs          INTEGER NOT NULL,
+//!   request_id       TEXT    NOT NULL,
+//!   caller_name      TEXT    NOT NULL,
+//!   method           TEXT    NOT NULL,
+//!   policy_decision  TEXT    NOT NULL,
+//!   status           TEXT    NOT NULL,
+//!   error_kind       INTEGER,
+//!   latency_ms       INTEGER NOT NULL,
+//!   PRIMARY KEY (tenant_id, ts_secs, request_id)
+//! );
+//! CREATE INDEX IF NOT EXISTS idx_audit_partition_ts
+//!   ON audit_partition(tenant_id, ts_secs DESC);
+//! ```
+//!
+//! Rows with no tenant header land under the literal tenant id
+//! `"default"` so `audit.tenant_list` always returns at least
+//! that bucket once any traffic has flowed.
+//!
+//! ## Honest scope
+//!
+//! - This mirror is best-effort. A write failure is logged at
+//!   `warn!` and the canonical CBOR log still finalises — the
+//!   signed chain stays the source of truth for compliance
+//!   audits.
+//! - No deletes, no compaction; operators are expected to
+//!   roll the file periodically (same lifecycle as the
+//!   canonical log).
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use rusqlite::{Connection, params};
+
+/// One row written to the partition mirror per finalised
+/// audit record.
+#[derive(Clone, Debug)]
+pub struct PartitionRow {
+    pub ts_secs: i64,
+    pub request_id_hex: String,
+    pub tenant_id: Option<String>,
+    pub caller_name: String,
+    pub method: String,
+    pub policy_decision: String,
+    pub status: &'static str,
+    pub error_kind: Option<u32>,
+    pub latency_ms: u64,
+}
+
+/// One read-back row surfaced through the `audit.tenant_recent`
+/// cap (and the bridge proxy).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PartitionReadRow {
+    pub ts_secs: i64,
+    pub request_id: String,
+    pub tenant_id: String,
+    pub caller_name: String,
+    pub method: String,
+    pub policy_decision: String,
+    pub status: String,
+    pub error_kind: Option<u32>,
+    pub latency_ms: u64,
+}
+
+/// The mirror store. Holds a single connection guarded by a
+/// mutex — writes are infrequent (one per dispatched call) and
+/// SQLite's WAL mode + a serialised writer keeps contention
+/// low. Cheap to clone the [`Arc`] callers wrap around it.
+pub struct AuditPartitionStore {
+    path: PathBuf,
+    conn: Mutex<Connection>,
+}
+
+impl AuditPartitionStore {
+    /// Open or create the partition store at `path`. Creates
+    /// parent directories. Idempotent — the schema migration
+    /// runs every open.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_partition (
+                tenant_id        TEXT    NOT NULL,
+                ts_secs          INTEGER NOT NULL,
+                request_id       TEXT    NOT NULL,
+                caller_name      TEXT    NOT NULL,
+                method           TEXT    NOT NULL,
+                policy_decision  TEXT    NOT NULL,
+                status           TEXT    NOT NULL,
+                error_kind       INTEGER,
+                latency_ms       INTEGER NOT NULL,
+                PRIMARY KEY (tenant_id, ts_secs, request_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_partition_ts
+                ON audit_partition(tenant_id, ts_secs DESC);",
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Append one row. The bridge calls this just before
+    /// finalising the canonical CBOR record.
+    pub fn append(&self, row: &PartitionRow) -> Result<(), String> {
+        let tenant = sanitise_tenant_id(row.tenant_id.as_deref());
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR REPLACE INTO audit_partition
+             (tenant_id, ts_secs, request_id, caller_name, method,
+              policy_decision, status, error_kind, latency_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                tenant,
+                row.ts_secs,
+                row.request_id_hex,
+                row.caller_name,
+                row.method,
+                row.policy_decision,
+                row.status,
+                row.error_kind,
+                row.latency_ms as i64,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Enumerate every distinct tenant id seen by the mirror.
+    /// Sorted ascending; deterministic for tests.
+    pub fn list_tenants(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT tenant_id FROM audit_partition ORDER BY tenant_id ASC")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    /// Read the most recent rows for `tenant_id`. `limit` is
+    /// clamped to `[1, 1000]` server-side. Newest first.
+    pub fn tenant_recent(
+        &self,
+        tenant_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PartitionReadRow>, String> {
+        let tenant = sanitise_tenant_id(Some(tenant_id));
+        let cap = limit.clamp(1, 1000) as i64;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT ts_secs, request_id, tenant_id, caller_name, method,
+                        policy_decision, status, error_kind, latency_ms
+                 FROM audit_partition
+                 WHERE tenant_id = ?1
+                 ORDER BY ts_secs DESC, request_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![tenant, cap], |r| {
+                Ok(PartitionReadRow {
+                    ts_secs: r.get(0)?,
+                    request_id: r.get(1)?,
+                    tenant_id: r.get(2)?,
+                    caller_name: r.get(3)?,
+                    method: r.get(4)?,
+                    policy_decision: r.get(5)?,
+                    status: r.get(6)?,
+                    error_kind: r.get(7)?,
+                    latency_ms: r.get::<_, i64>(8)? as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    /// Path on disk (diagnostics + tests).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Sanitise a tenant id for the partition key. Same rule used
+/// by the Qdrant collection sanitiser + the per-tenant policy
+/// path lookup: ASCII alnum + `_`; everything else → `_`.
+/// `None` / empty resolves to `"default"`.
+pub fn sanitise_tenant_id(raw: Option<&str>) -> String {
+    let s = raw.unwrap_or("default");
+    if s.is_empty() {
+        return "default".to_string();
+    }
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(tenant: Option<&str>, ts: i64, rid: &str, method: &str) -> PartitionRow {
+        PartitionRow {
+            ts_secs: ts,
+            request_id_hex: rid.to_string(),
+            tenant_id: tenant.map(str::to_string),
+            caller_name: "alice".into(),
+            method: method.into(),
+            policy_decision: "allow:r".into(),
+            status: "ok",
+            error_kind: None,
+            latency_ms: 5,
+        }
+    }
+
+    #[test]
+    fn open_creates_schema_and_round_trips() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = AuditPartitionStore::open(tmp.path().join("audit.db")).expect("open");
+        store
+            .append(&row(Some("acme"), 1000, "aa", "ai.chat"))
+            .expect("append");
+        let recent = store.tenant_recent("acme", 10).expect("recent");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].request_id, "aa");
+        assert_eq!(recent[0].method, "ai.chat");
+        assert_eq!(recent[0].tenant_id, "acme");
+    }
+
+    #[test]
+    fn list_tenants_returns_distinct_sorted() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = AuditPartitionStore::open(tmp.path().join("audit.db")).expect("open");
+        for (t, rid) in [
+            (Some("acme"), "1"),
+            (Some("globex"), "2"),
+            (Some("acme"), "3"),
+            (None, "4"),
+        ] {
+            store.append(&row(t, 1000, rid, "ai.chat")).expect("append");
+        }
+        let tenants = store.list_tenants().expect("list");
+        assert_eq!(tenants, vec!["acme", "default", "globex"]);
+    }
+
+    #[test]
+    fn tenant_recent_isolates_buckets_and_orders_newest_first() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = AuditPartitionStore::open(tmp.path().join("audit.db")).expect("open");
+        store
+            .append(&row(Some("acme"), 100, "a1", "ai.chat"))
+            .expect("a1");
+        store
+            .append(&row(Some("acme"), 300, "a3", "ai.chat"))
+            .expect("a3");
+        store
+            .append(&row(Some("acme"), 200, "a2", "ai.chat"))
+            .expect("a2");
+        store
+            .append(&row(Some("globex"), 999, "g1", "tool.web_fetch"))
+            .expect("g1");
+        let acme = store.tenant_recent("acme", 100).expect("recent");
+        assert_eq!(
+            acme.iter()
+                .map(|r| r.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a3", "a2", "a1"]
+        );
+        // Globex bucket sees only its own row.
+        let globex = store.tenant_recent("globex", 100).expect("recent");
+        assert_eq!(globex.len(), 1);
+        assert_eq!(globex[0].request_id, "g1");
+    }
+
+    #[test]
+    fn rows_without_tenant_land_in_default_bucket() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = AuditPartitionStore::open(tmp.path().join("audit.db")).expect("open");
+        store
+            .append(&row(None, 1000, "x", "ai.chat"))
+            .expect("append");
+        store
+            .append(&row(Some(""), 1001, "y", "ai.chat"))
+            .expect("append");
+        let recent = store.tenant_recent("default", 10).expect("recent");
+        assert_eq!(recent.len(), 2);
+    }
+
+    #[test]
+    fn tenant_id_sanitised_so_special_chars_collapse() {
+        // Both "acme/eu" and "acme_eu" must land in the same
+        // sanitised bucket — the slash is rewritten to '_'.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = AuditPartitionStore::open(tmp.path().join("audit.db")).expect("open");
+        store
+            .append(&row(Some("acme/eu"), 100, "x", "ai.chat"))
+            .expect("append");
+        store
+            .append(&row(Some("acme_eu"), 200, "y", "ai.chat"))
+            .expect("append");
+        let tenants = store.list_tenants().expect("list");
+        assert_eq!(tenants, vec!["acme_eu"]);
+        let rows = store.tenant_recent("acme_eu", 10).expect("recent");
+        assert_eq!(rows.len(), 2);
+    }
+}

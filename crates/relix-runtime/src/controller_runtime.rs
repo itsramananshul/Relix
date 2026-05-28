@@ -153,6 +153,13 @@ pub struct ControllerConfig {
     /// to the legacy fixed `("ai", "ai.chat")` target.
     #[serde(default)]
     pub routing: Option<crate::nodes::coordinator::routing::RoutingConfig>,
+    /// `[audit]` — GAP 23C per-tenant audit partition mirror.
+    /// Absent / `partition_by_tenant = false` keeps the bridge
+    /// in pre-23C mode (only the canonical signed CBOR log is
+    /// written). When enabled, every finalised audit lands as
+    /// a queryable SQLite row keyed by sanitised tenant id.
+    #[serde(default)]
+    pub audit: Option<AuditSection>,
     /// `[peers]` — alias → endpoint info.
     #[serde(default)]
     pub peers: std::collections::BTreeMap<String, PeerConfig>,
@@ -301,6 +308,23 @@ pub struct PolicySection {
 
 fn default_tenant_cache_ttl() -> u64 {
     60
+}
+
+/// GAP 23C: `[audit]` section. Wires the per-tenant audit
+/// partition mirror. Absent / `partition_by_tenant = false`
+/// keeps the bridge in pre-23C mode.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AuditSection {
+    /// When `true`, every finalised audit is mirrored to the
+    /// SQLite partition store at [`Self::db_path`] keyed by
+    /// sanitised tenant id. Defaults to `false` so existing
+    /// deployments stay byte-identical.
+    #[serde(default)]
+    pub partition_by_tenant: bool,
+    /// Path to the SQLite mirror file. Defaults to
+    /// `{data_dir}/audit-partition.db` when unset.
+    #[serde(default)]
+    pub db_path: Option<PathBuf>,
 }
 
 /// `[observability]` section — top-level container for
@@ -504,6 +528,33 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         bridge.set_tenant_policy_resolver(resolver);
+    }
+    // GAP 23C: audit partition mirror. Wired only when
+    // [audit] partition_by_tenant = true so existing
+    // deployments stay byte-identical.
+    if let Some(audit_cfg) = cfg.audit.as_ref()
+        && audit_cfg.partition_by_tenant
+    {
+        let db_path = audit_cfg
+            .db_path
+            .clone()
+            .unwrap_or_else(|| data_dir.join("audit-partition.db"));
+        match crate::audit_partition::AuditPartitionStore::open(&db_path) {
+            Ok(store) => {
+                tracing::info!(
+                    audit_partition_db = %db_path.display(),
+                    "per-tenant audit partition mirror wired"
+                );
+                bridge.set_audit_partition_store(std::sync::Arc::new(store));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    audit_partition_db = %db_path.display(),
+                    error = %e,
+                    "audit partition open failed; continuing without per-tenant mirror"
+                );
+            }
+        }
     }
     // W2: build the per-controller access broker from
     // `[[execution.agents]]`. Absent / empty config produces
@@ -1053,6 +1104,26 @@ fn register_builtins(
             async move { handle_policy_recent_denials(&ring, &ctx) }
         })),
     );
+    // GAP 23C: node.audit.tenant_list + node.audit.tenant_recent.
+    // Pure read of the audit partition mirror. Both no-op
+    // (count=0 / error) when partitioning is disabled on this
+    // node — keeps existing deployments backwards-compatible.
+    let audit_part_for_list = bridge.audit_partition_handle();
+    bridge.register(
+        "node.audit.tenant_list",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let p = audit_part_for_list.clone();
+            async move { handle_audit_tenant_list(p.as_deref(), &ctx) }
+        })),
+    );
+    let audit_part_for_recent = bridge.audit_partition_handle();
+    bridge.register(
+        "node.audit.tenant_recent",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let p = audit_part_for_recent.clone();
+            async move { handle_audit_tenant_recent(p.as_deref(), &ctx) }
+        })),
+    );
     // GAP 23B: node.policy.tenant_list + node.policy.tenant_get.
     // Pure read of the per-tenant policy directory. Both no-op
     // (404-style) when the bridge wasn't configured with a
@@ -1162,6 +1233,28 @@ fn register_builtins(
                  a NOT_FOUND error envelope on miss.",
             )
             .with_categories(["observe".into(), "policy".into(), "read".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
+    );
+    // GAP 23C: per-tenant audit enumeration + inspection.
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.audit.tenant_list")
+            .with_description(
+                "Enumerate every distinct tenant id seen by the audit partition mirror. \
+                 Empty arg. Returns one tenant id per line followed by `count=N`. \
+                 Returns `count=0` when partitioning is disabled or no traffic has flowed yet.",
+            )
+            .with_categories(["observe".into(), "audit".into(), "read".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe),
+    );
+    manifest.add_capability(
+        relix_core::capability::CapabilityDescriptor::unary("node.audit.tenant_recent")
+            .with_description(
+                "Return the most recent audit rows for a tenant from the partition mirror. \
+                 Arg: `<tenant_id>|<limit>` (limit optional; defaults 100, clamped to [1,1000]). \
+                 Returns JSON: {\"tenant_id\": ..., \"count\": N, \"rows\": [...]}. \
+                 Newest first.",
+            )
+            .with_categories(["observe".into(), "audit".into(), "read".into()])
             .with_risk(relix_core::capability::RiskLevel::Safe),
     );
 }
@@ -1290,6 +1383,122 @@ fn handle_policy_tenant_get(
             kind: error_kinds::UNKNOWN_METHOD,
             cause: format!("node.policy.tenant_get: no policy file for tenant {tenant:?}"),
             retry_hint: 0,
+            retry_after: None,
+        }),
+    }
+}
+
+/// GAP 23C: handle `node.audit.tenant_list`. Pure read of the
+/// partition mirror's distinct tenant ids. Returns `count=0`
+/// when partitioning is disabled — dashboards poll uniformly.
+fn handle_audit_tenant_list(
+    store: Option<&crate::audit_partition::AuditPartitionStore>,
+    _ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    use std::fmt::Write as _;
+    let tenants: Vec<String> = match store {
+        Some(s) => match s.list_tenants() {
+            Ok(v) => v,
+            Err(e) => {
+                return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                    kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                    cause: format!("audit partition list_tenants: {e}"),
+                    retry_hint: 1,
+                    retry_after: None,
+                });
+            }
+        },
+        None => Vec::new(),
+    };
+    let count = tenants.len();
+    let mut body = String::new();
+    for t in &tenants {
+        let _ = writeln!(body, "{t}");
+    }
+    let _ = writeln!(body, "count={count}");
+    HandlerOutcome::Ok(body.into_bytes())
+}
+
+/// GAP 23C: handle `node.audit.tenant_recent`. Arg shape
+/// `<tenant_id>|<limit>` (limit optional, default 100).
+/// Returns JSON `{ "tenant_id": ..., "count": N, "rows": [...] }`.
+fn handle_audit_tenant_recent(
+    store: Option<&crate::audit_partition::AuditPartitionStore>,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    use relix_core::types::error_kinds;
+    let raw = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("node.audit.tenant_recent arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    if raw.is_empty() {
+        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "node.audit.tenant_recent: tenant id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let (tenant, limit) = match raw.split_once('|') {
+        Some((t, l)) => {
+            let n = l
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(100);
+            (t.trim(), n)
+        }
+        None => (raw, 100usize),
+    };
+    if tenant.is_empty() {
+        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "node.audit.tenant_recent: tenant id required".into(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    let store = match store {
+        Some(s) => s,
+        None => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::UNKNOWN_METHOD,
+                cause: "node.audit.tenant_recent: audit partition not configured".into(),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    let rows = match store.tenant_recent(tenant, limit) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                kind: error_kinds::RESPONDER_INTERNAL,
+                cause: format!("audit partition tenant_recent: {e}"),
+                retry_hint: 1,
+                retry_after: None,
+            });
+        }
+    };
+    let body = serde_json::json!({
+        "tenant_id": tenant,
+        "count": rows.len(),
+        "rows": rows,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(b) => HandlerOutcome::Ok(b),
+        Err(e) => HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("node.audit.tenant_recent encode: {e}"),
+            retry_hint: 1,
             retry_after: None,
         }),
     }
