@@ -144,6 +144,15 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// RELIX-7.24 Stage-5: full step-level verification log
+    /// for one plan.
+    Verification {
+        plan_id: String,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -195,7 +204,59 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             bridge,
             raw,
         } => get_approval(&bridge, &plan_id, raw).await,
+        Cmd::Verification {
+            plan_id,
+            bridge,
+            raw,
+        } => verification(&bridge, &plan_id, raw).await,
     }
+}
+
+async fn verification(
+    bridge: &str,
+    plan_id: &str,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/v1/planning/verification/{}",
+        bridge.trim_end_matches('/'),
+        urlencode(plan_id)
+    );
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("decode verification response: {e} (body={body})"))?;
+    let entries = v
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if entries.is_empty() {
+        println!("(no verification entries for plan_id={plan_id})");
+        return Ok(());
+    }
+    println!(
+        "{:<28} {:<8} {:<20} {:<6}  reason",
+        "step_id", "passed", "strategy", "ts"
+    );
+    for e in entries {
+        let step = e.get("step_id").and_then(Value::as_str).unwrap_or("?");
+        let strategy = e
+            .get("strategy_used")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let passed = e.get("passed").and_then(Value::as_bool).unwrap_or(false);
+        let ts = e.get("verified_at_ms").and_then(Value::as_i64).unwrap_or(0);
+        let reason = e.get("reason").and_then(Value::as_str).unwrap_or("");
+        println!(
+            "{step:<28} {pass:<8} {strategy:<20} {ts:<6}  {reason}",
+            pass = if passed { "PASS" } else { "FAIL" },
+        );
+    }
+    Ok(())
 }
 
 async fn approve(

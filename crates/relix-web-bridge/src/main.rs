@@ -568,6 +568,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/planning/reject", post(planning::reject_plan))
         .route("/v1/planning/approvals", get(planning::list_approvals))
         .route("/v1/planning/approvals/:id", get(planning::get_approval))
+        .route(
+            "/v1/planning/verification/:id",
+            get(planning::verification_log),
+        )
         .route("/v1/knowledge/recall", post(knowledge::recall))
         // Four-layer memory inspector. Reads the layered store
         // directly from `AppState::layered_memory` — set

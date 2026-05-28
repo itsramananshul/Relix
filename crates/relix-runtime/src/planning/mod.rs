@@ -43,10 +43,11 @@ pub mod generator;
 pub mod orchestrator;
 pub mod parser;
 pub mod registry;
+pub mod verification;
 
 pub use approval::{
     ApprovalError, ApprovalRecord, ApprovalStatus, ApprovalStore, ApprovalTarget,
-    DEFAULT_APPROVAL_TIMEOUT_SECS, format_pending_notification,
+    DEFAULT_APPROVAL_TIMEOUT_SECS, VerificationEntry, format_pending_notification,
 };
 pub use conflict::{
     ConflictKind, ConflictResolutionEntry, ConflictResolutionReport, ConflictResolver,
@@ -63,6 +64,10 @@ pub use parser::{
     SpecVerificationError,
 };
 pub use registry::{AgentCapabilityRegistry, AgentInfo, AgentMatch, CapabilityInfo};
+pub use verification::{
+    VerificationConfig, VerificationHarness, VerificationOutcome, VerificationStrategy,
+    execute_with_verification, pick_strategy,
+};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -108,6 +113,12 @@ pub struct PlanningConfig {
     /// entry only.
     #[serde(default)]
     pub approval_targets: Vec<ApprovalTarget>,
+    /// RELIX-7.24 Stage-5 step-level verification harness.
+    /// Flattened so operators write `verify_steps = true /
+    /// verifier_agent = ... / required_steps = [...]` at the
+    /// top of `[planning]` alongside the other knobs.
+    #[serde(flatten)]
+    pub verification: VerificationConfig,
 }
 
 fn default_approval_timeout_secs() -> i64 {

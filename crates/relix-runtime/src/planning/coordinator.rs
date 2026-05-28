@@ -154,12 +154,22 @@ pub fn register(
             );
         }
         {
-            let s = store;
+            let s = store.clone();
             bridge.register(
                 "planning.get_approval",
                 Arc::new(FnHandler(move |ctx: InvocationCtx| {
                     let s = s.clone();
                     async move { handle_get_approval(&s, &ctx) }
+                })),
+            );
+        }
+        {
+            let s = store;
+            bridge.register(
+                "planning.verification_log",
+                Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                    let s = s.clone();
+                    async move { handle_verification_log(&s, &ctx) }
                 })),
             );
         }
@@ -270,6 +280,16 @@ pub fn planning_capability_descriptors() -> &'static [(&'static str, &'static st
              plan_id. Args JSON: `{plan_id}`. Returns the full \
              ApprovalRecord including spec + workflow_yaml + \
              status + decision metadata.",
+        ),
+        (
+            "planning.verification_log",
+            "RELIX-7.24 Stage-5: full step-level verification \
+             log for one plan. Args JSON: `{plan_id}`. Returns \
+             `{entries: [{step_id, criterion, strategy_used, \
+             passed, reason, verified_at_ms}]}` ordered \
+             chronologically. Empty array when verification \
+             was skipped (verify_steps = false) OR no \
+             success_criteria fired for this plan.",
         ),
     ]
 }
@@ -567,6 +587,7 @@ async fn handle_create_plan(
             None
         },
         approval: None,
+        verification: None,
     };
 
     // 4. Escalate conflict if unresolved.
@@ -657,6 +678,53 @@ async fn handle_create_plan(
         );
     };
     let dispatcher: Arc<dyn WorkflowDispatcher> = dispatcher;
+    // 5a. RELIX-7.24 Stage-5: when verify_steps is enabled
+    // AND we have an approval store to persist into, stream
+    // step events through the harness so verification rows
+    // land in the DB AND the final WorkflowResult status can
+    // be overridden when required steps fail.
+    if planning_cfg.verification.verify_steps
+        && let Some(store) = approval_store
+    {
+        let harness = super::VerificationHarness::new(
+            dispatcher.clone(),
+            store.clone(),
+            planning_cfg.verification.clone(),
+        );
+        let workflow_arc = Arc::new(current_workflow);
+        let (mut wf_result, outcome) = super::execute_with_verification(
+            workflow_arc,
+            dispatcher,
+            &response.plan_spec.goal,
+            harness,
+            &response.plan_spec.spec_id,
+            &response.plan_spec,
+        )
+        .await;
+        if !outcome.passed {
+            // Override the workflow result status so the
+            // operator sees the run failed even when the
+            // executor's own status was Success — the
+            // verification failure IS the failure here.
+            wf_result.status = crate::workflow::ExecutionStatus::Failed;
+            let failure_count = outcome.critical_failures.len();
+            wf_result.result = format!(
+                "verification: {failure_count} required-step criterion failure(s); see \
+                 planning.verification_log for details. Workflow's own result: {prev}",
+                prev = wf_result.result
+            );
+        }
+        response.execution = Some(ExecutionSummary::from_result(&wf_result));
+        response.verification = Some(VerificationSummary {
+            ran: true,
+            passed: outcome.passed,
+            total_entries: outcome.entries.len(),
+            critical_failures: outcome.critical_failures.len(),
+            advisory_failures: outcome.advisory_failures.len(),
+            required_steps: planning_cfg.verification.required_steps.clone(),
+        });
+        return ok_json(&response);
+    }
     let workflow_arc = Arc::new(current_workflow);
     let result = execute(workflow_arc.clone(), dispatcher, &response.plan_spec.goal).await;
     response.execution = Some(ExecutionSummary::from_result(&result));
@@ -880,6 +948,31 @@ fn handle_get_approval(store: &super::ApprovalStore, ctx: &InvocationCtx) -> Han
         )),
         Err(e) => internal_msg(&format!("approval store: {e}")),
     }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct VerificationLogArgs {
+    #[serde(default)]
+    plan_id: String,
+}
+
+fn handle_verification_log(store: &super::ApprovalStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let args: VerificationLogArgs = match decode(ctx) {
+        Ok(a) => a,
+        Err(out) => return out,
+    };
+    if args.plan_id.trim().is_empty() {
+        return invalid("plan_id is required");
+    }
+    match store.list_verifications(&args.plan_id) {
+        Ok(entries) => ok_json(&VerificationLogResponse { entries }),
+        Err(e) => internal_msg(&format!("verification log: {e}")),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct VerificationLogResponse {
+    entries: Vec<super::VerificationEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1150,6 +1243,23 @@ struct CreatePlanResponse {
     /// legacy execute-now path).
     #[serde(skip_serializing_if = "Option::is_none")]
     approval: Option<ApprovalSummary>,
+    /// RELIX-7.24 Stage-5 — present only when `verify_steps`
+    /// was enabled AND the run actually executed (not on
+    /// dry-runs or approval-gated submissions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<VerificationSummary>,
+}
+
+/// RELIX-7.24 Stage-5 — operator-facing summary of the
+/// step-level verification harness's verdict.
+#[derive(Clone, Debug, Serialize)]
+struct VerificationSummary {
+    ran: bool,
+    passed: bool,
+    total_entries: usize,
+    critical_failures: usize,
+    advisory_failures: usize,
+    required_steps: Vec<String>,
 }
 
 /// Orchestrator-specific block of the response.

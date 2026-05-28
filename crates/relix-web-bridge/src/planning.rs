@@ -259,6 +259,24 @@ pub async fn get_approval(
     }
 }
 
+/// `GET /v1/planning/verification/:id` — RELIX-7.24 Stage-5.
+pub async fn verification_log(
+    State(state): State<AppState>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+    Query(q): Query<PeerQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if plan_id.trim().is_empty() {
+        return bad_request("plan_id is required");
+    }
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = serde_json::json!({ "plan_id": plan_id });
+    match call_peer_json(&state, &peer, "planning.verification_log", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 // ── shared helpers ────────────────────────────────────────
 
 fn bad_request(msg: &str) -> axum::response::Response {

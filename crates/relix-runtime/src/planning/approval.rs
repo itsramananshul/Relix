@@ -226,9 +226,95 @@ impl ApprovalStore {
             )?;
             crate::db::record_migration_applied(conn, 1)?;
         }
+        if current < 2 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS plan_verifications (\
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,\
+                     plan_id         TEXT    NOT NULL,\
+                     step_id         TEXT    NOT NULL,\
+                     criterion       TEXT    NOT NULL,\
+                     strategy_used   TEXT    NOT NULL,\
+                     passed          INTEGER NOT NULL,\
+                     reason          TEXT    NOT NULL,\
+                     verified_at_ms  INTEGER NOT NULL\
+                 );\
+                 CREATE INDEX IF NOT EXISTS plan_verifications_plan_id_idx \
+                     ON plan_verifications(plan_id);",
+            )?;
+            crate::db::record_migration_applied(conn, 2)?;
+        }
         Ok(())
     }
 
+    /// Persist a single [`VerificationEntry`]. Used by the
+    /// verification harness as each step completes.
+    pub fn insert_verification(&self, entry: &VerificationEntry) -> Result<(), ApprovalError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO plan_verifications \
+             (plan_id, step_id, criterion, strategy_used, passed, reason, verified_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                entry.plan_id,
+                entry.step_id,
+                entry.criterion,
+                entry.strategy_used,
+                if entry.passed { 1 } else { 0 },
+                entry.reason,
+                entry.verified_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List every verification entry for `plan_id`, ordered
+    /// by `verified_at_ms` ascending so operators read the
+    /// log in chronological order.
+    pub fn list_verifications(
+        &self,
+        plan_id: &str,
+    ) -> Result<Vec<VerificationEntry>, ApprovalError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT plan_id, step_id, criterion, strategy_used, passed, reason, verified_at_ms \
+             FROM plan_verifications WHERE plan_id = ?1 ORDER BY verified_at_ms ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![plan_id], |row| {
+            Ok(VerificationEntry {
+                plan_id: row.get(0)?,
+                step_id: row.get(1)?,
+                criterion: row.get(2)?,
+                strategy_used: row.get(3)?,
+                passed: row.get::<_, i64>(4)? != 0,
+                reason: row.get(5)?,
+                verified_at_ms: row.get(6)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(ApprovalError::Sqlite)
+    }
+}
+
+/// One row of the verification log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VerificationEntry {
+    pub plan_id: String,
+    pub step_id: String,
+    pub criterion: String,
+    /// One of `"length_check"`, `"keyword_presence"`,
+    /// `"keyword_absence"`, `"pattern_match"`, `"ai_judge"`.
+    pub strategy_used: String,
+    pub passed: bool,
+    /// Human-readable explanation of why the criterion
+    /// passed or failed. For LengthCheck this includes the
+    /// observed count vs. the limit; for KeywordPresence /
+    /// KeywordAbsence the matched / missing keyword; for
+    /// AiJudge the verifier's returned `reason` field.
+    pub reason: String,
+    pub verified_at_ms: i64,
+}
+
+impl ApprovalStore {
     /// Insert a new pending approval. Errors if a record with
     /// the same `plan_id` already exists.
     pub fn insert_pending(&self, record: &ApprovalRecord) -> Result<(), ApprovalError> {
