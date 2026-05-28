@@ -74,6 +74,7 @@
 //!   deterministic across runs.
 
 pub mod anomaly;
+pub mod archiver;
 pub mod context_flush;
 pub mod curator;
 pub mod dialectic;

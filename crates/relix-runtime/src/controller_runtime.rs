@@ -4476,6 +4476,19 @@ fn register_node_type_handlers(
                 "memory node: integrity auditor spawned"
             );
         }
+        // ── GAP 8: spawn the consolidation archiver. Runs
+        // every 6h; archives terminal Layer-3 observations and
+        // marks their parent Raw rows as consolidated.
+        if let Some(layered) = layered_ctx.as_ref() {
+            let archiver = std::sync::Arc::new(
+                crate::nodes::memory::archiver::ConsolidationArchiver::new(layered.store.clone()),
+            );
+            archiver.spawn();
+            tracing::info!(
+                interval_secs = crate::nodes::memory::archiver::DEFAULT_ARCHIVE_INTERVAL_SECS,
+                "memory node: consolidation archiver spawned"
+            );
+        }
         let memory_caps: &[(&str, &str, &[&str], &[&str])] = &[
             (
                 "memory.write_turn",
