@@ -560,6 +560,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/memory/ingest", post(memory_gap5::ingest))
         .route("/v1/memory/ingest_image", post(memory_gap5::ingest_image))
         .route("/v1/memory/context_flush", post(memory_gap5::context_flush))
+        // GAP 6: quarantine list / approve / reject.
+        .route(
+            "/v1/memory/quarantine/list",
+            post(memory_gap5::quarantine_list),
+        )
+        .route(
+            "/v1/memory/quarantine/approve",
+            post(memory_gap5::quarantine_approve),
+        )
+        .route(
+            "/v1/memory/quarantine/reject",
+            post(memory_gap5::quarantine_reject),
+        )
         // RELIX-7.16 knowledge transfer.
         .route("/v1/knowledge/share", post(knowledge::share))
         .route("/v1/knowledge/shared/:agent", get(knowledge::list_shared))

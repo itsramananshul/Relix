@@ -4465,6 +4465,17 @@ fn register_node_type_handlers(
                 );
             }
         }
+        // ── GAP 6: spawn the memory integrity auditor. Runs
+        // every 24h; pure read pass over Layer 3 + Layer 4.
+        if let Some(layered) = layered_ctx.as_ref() {
+            let auditor =
+                crate::nodes::memory::integrity::MemoryIntegrityAuditor::new(layered.store.clone());
+            auditor.spawn();
+            tracing::info!(
+                interval_secs = crate::nodes::memory::integrity::DEFAULT_AUDIT_INTERVAL_SECS,
+                "memory node: integrity auditor spawned"
+            );
+        }
         let memory_caps: &[(&str, &str, &[&str], &[&str])] = &[
             (
                 "memory.write_turn",
@@ -4639,6 +4650,38 @@ fn register_node_type_handlers(
                  session_id, embedded, deferred_embeddings}`.",
                 &["mutate", "memory", "ingest", "embedding"],
                 &["mutate:memory", "external:ai"],
+            ),
+            // ── GAP 6: memory-poisoning defense quarantine ────
+            (
+                "memory.quarantine_list",
+                "GAP 6: page through observation candidates the \
+                 anomaly scorer parked in the quarantine table. \
+                 Args JSON `{limit?, source?}` (default \
+                 limit=50, max 500). Returns `{rows: [{id, \
+                 source, text, reason, source_trust, \
+                 queued_at_ms}], count}` newest-first.",
+                &["read", "memory", "quarantine"],
+                &["reads:internal"],
+            ),
+            (
+                "memory.quarantine_approve",
+                "GAP 6: promote a quarantined candidate to a \
+                 real Layer-3 observation. Args JSON `{id}`. \
+                 The candidate runs through the standard \
+                 anonymizer before insert; tags include \
+                 `origin:quarantine_approved`. Returns `{ok, \
+                 observation_id}`.",
+                &["mutate", "memory", "quarantine"],
+                &["mutate:memory"],
+            ),
+            (
+                "memory.quarantine_reject",
+                "GAP 6: permanently discard a quarantined \
+                 candidate. Args JSON `{id}`. The candidate is \
+                 deleted with no audit-side trace beyond the \
+                 chronicle reject event. Returns `{ok}`.",
+                &["mutate", "memory", "quarantine"],
+                &["mutate:memory"],
             ),
         ];
         for (m, desc, cats, tags) in memory_caps {

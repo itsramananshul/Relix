@@ -73,6 +73,7 @@
 //!   then by `id ASC` as a tie-breaker, so identical-score results are
 //!   deterministic across runs.
 
+pub mod anomaly;
 pub mod context_flush;
 pub mod curator;
 pub mod dialectic;
@@ -80,8 +81,10 @@ pub mod embedder;
 pub mod embeddings;
 pub mod guard;
 pub mod ingest;
+pub mod integrity;
 pub mod promoter;
 pub mod qdrant;
+pub mod quarantine;
 pub mod schema;
 
 use std::path::PathBuf;
@@ -1053,6 +1056,37 @@ pub fn register(
                         )
                         .await
                     }
+                })),
+            );
+        }
+        // ── GAP 6: memory.quarantine_{list,approve,reject} ──
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.quarantine_list",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { quarantine::handle_list(&layered, &ictx).await }
+                })),
+            );
+        }
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.quarantine_approve",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { quarantine::handle_approve(&layered, &ictx).await }
+                })),
+            );
+        }
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.quarantine_reject",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { quarantine::handle_reject(&layered, &ictx).await }
                 })),
             );
         }

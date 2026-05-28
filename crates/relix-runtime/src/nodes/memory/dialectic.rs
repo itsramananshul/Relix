@@ -474,7 +474,11 @@ mod tests {
         let captured = stub.captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert!(captured[0].1.contains("User prefers terse replies"));
-        assert!(captured[0].1.contains("How does alice prefer to communicate?"));
+        assert!(
+            captured[0]
+                .1
+                .contains("How does alice prefer to communicate?")
+        );
     }
 
     #[tokio::test]

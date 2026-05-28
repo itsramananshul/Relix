@@ -61,6 +61,30 @@ pub async fn context_flush(
     proxy_json(&state, req, "memory.context_flush").await
 }
 
+/// `POST /v1/memory/quarantine/list` — forwards to `memory.quarantine_list`.
+pub async fn quarantine_list(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.quarantine_list").await
+}
+
+/// `POST /v1/memory/quarantine/approve` — forwards to `memory.quarantine_approve`.
+pub async fn quarantine_approve(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.quarantine_approve").await
+}
+
+/// `POST /v1/memory/quarantine/reject` — forwards to `memory.quarantine_reject`.
+pub async fn quarantine_reject(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.quarantine_reject").await
+}
+
 // ── helpers ──────────────────────────────────────────────
 
 async fn proxy_json(state: &AppState, mut req: Value, method: &str) -> axum::response::Response {

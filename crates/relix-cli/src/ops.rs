@@ -464,6 +464,39 @@ pub enum MemoryCmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// GAP 6: list observation candidates parked in the quarantine
+    /// table by the anomaly scorer. Hits POST
+    /// /v1/memory/quarantine/list.
+    QuarantineList {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 6: approve a quarantined candidate. Hits POST
+    /// /v1/memory/quarantine/approve.
+    QuarantineApprove {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 6: reject a quarantined candidate. Hits POST
+    /// /v1/memory/quarantine/reject.
+    QuarantineReject {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -962,7 +995,100 @@ async fn memory_run(cmd: MemoryCmd) -> Result<(), Box<dyn std::error::Error>> {
             keep_recent_n,
             json,
         } => memory_context_flush_cmd(&bridge, &session_id, &agent_name, keep_recent_n, json).await,
+        MemoryCmd::QuarantineList {
+            bridge,
+            limit,
+            source,
+            json,
+        } => memory_quarantine_list_cmd(&bridge, limit, source.as_deref(), json).await,
+        MemoryCmd::QuarantineApprove { bridge, id, json } => {
+            memory_quarantine_approve_cmd(&bridge, &id, json).await
+        }
+        MemoryCmd::QuarantineReject { bridge, id, json } => {
+            memory_quarantine_reject_cmd(&bridge, &id, json).await
+        }
     }
+}
+
+async fn memory_quarantine_list_cmd(
+    bridge: &str,
+    limit: usize,
+    source: Option<&str>,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut body = serde_json::json!({ "limit": limit });
+    if let Some(s) = source {
+        body.as_object_mut()
+            .unwrap()
+            .insert("source".into(), serde_json::Value::from(s));
+    }
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/quarantine/list");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn memory_quarantine_approve_cmd(
+    bridge: &str,
+    id: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::json!({ "id": id });
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/quarantine/approve");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+async fn memory_quarantine_reject_cmd(
+    bridge: &str,
+    id: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::json!({ "id": id });
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/memory/quarantine/reject");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
 }
 
 async fn memory_dialectic_cmd(

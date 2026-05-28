@@ -41,8 +41,9 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
+use super::anomaly::{AnomalyAction, score_observation};
 use super::guard::MemoryGuard;
-use super::schema::{LayeredMemoryStore, MemoryLayer, MemoryRecord};
+use super::schema::{LayeredMemoryStore, MemoryLayer, MemoryRecord, SourceTrust};
 
 /// `Fn(prompt) -> reply` shaped function the promoter uses to
 /// reach the LLM. Production wires this to the same `ai.chat`
@@ -269,6 +270,33 @@ impl LayerPromoter {
                 .filter_map(|l| l.strip_prefix('-').map(|s| s.trim().to_string()))
                 .filter(|s| !s.is_empty())
                 .collect();
+            // GAP 6: snapshot existing observations for this
+            // source so the anomaly scorer can detect
+            // contradictions against prior writes.
+            let existing_observations = self
+                .store
+                .list(
+                    Some(MemoryLayer::Observation),
+                    Some(source.as_str()),
+                    1000,
+                    0,
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.valid_to.is_none())
+                .collect::<Vec<_>>();
+            // Source trust inherits from the parent semantic
+            // records — if any parent was external, the
+            // observations they yielded are external too.
+            let inherited_trust = group
+                .iter()
+                .map(|r| r.source_trust)
+                .max_by_key(|t| match t {
+                    SourceTrust::External => 2,
+                    SourceTrust::Unknown => 1,
+                    SourceTrust::Internal => 0,
+                })
+                .unwrap_or(SourceTrust::Internal);
             for (i, obs_text) in observations.iter().enumerate() {
                 if MemoryGuard::is_poisoned(obs_text) {
                     outcome.poisoned += 1;
@@ -288,6 +316,55 @@ impl LayerPromoter {
                 record.observed_at = now;
                 record.valid_from = now;
                 record.tags = vec![AUTO_GENERATED_TAG.to_string()];
+                record.source_trust = inherited_trust;
+
+                // GAP 6: write-time anomaly scoring.
+                let anomaly = score_observation(&record.text, &existing_observations);
+                match anomaly.action() {
+                    AnomalyAction::Reject => {
+                        outcome.anomaly_rejected += 1;
+                        tracing::warn!(
+                            source = %source,
+                            index = i,
+                            reason = %anomaly.reason_line(),
+                            score = anomaly.score,
+                            "promoter: extracted observation rejected by anomaly scorer"
+                        );
+                        continue;
+                    }
+                    AnomalyAction::Quarantine => {
+                        let id = quarantine_id_for(&record, anomaly.score);
+                        let json = match serde_json::to_string(&record) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "promoter: quarantine encode failed");
+                                continue;
+                            }
+                        };
+                        if let Err(e) = self.store.quarantine_insert(
+                            &id,
+                            &json,
+                            &anomaly.reason_line(),
+                            now * 1000,
+                            inherited_trust,
+                        ) {
+                            tracing::warn!(error = %e, "promoter: quarantine insert failed");
+                            continue;
+                        }
+                        outcome.quarantined += 1;
+                        tracing::warn!(
+                            source = %source,
+                            index = i,
+                            reason = %anomaly.reason_line(),
+                            score = anomaly.score,
+                            quarantine_id = %id,
+                            "promoter: extracted observation routed to quarantine"
+                        );
+                        continue;
+                    }
+                    AnomalyAction::Accept => {}
+                }
+
                 if let Err(e) = self.store.insert(&record) {
                     tracing::warn!(error = %e, "promoter: insert Observation failed");
                     continue;
@@ -423,6 +500,14 @@ impl LayerPromoter {
 pub struct StageOutcome {
     pub promoted: usize,
     pub poisoned: usize,
+    /// GAP 6: count of candidates routed to the
+    /// `memory_quarantine` table by the [`super::anomaly`]
+    /// scorer (write-time, not detected as a poisoning pattern,
+    /// but anomalous enough to require operator review).
+    pub quarantined: usize,
+    /// GAP 6: count of candidates hard-rejected by the anomaly
+    /// scorer.
+    pub anomaly_rejected: usize,
 }
 
 /// Build a child record carrying the parent's metadata + the
@@ -484,6 +569,21 @@ fn mint_promoted_id(parent_id: &str, layer: MemoryLayer, suffix: usize) -> Strin
     hasher.update(b"|");
     hasher.update(suffix.to_le_bytes().as_ref());
     hasher.finalize().to_hex().as_str()[..16].to_string()
+}
+
+/// GAP 6: derive a quarantine row id from the candidate record
+/// plus the anomaly score. Stable across retries (so a duplicate
+/// scoring call upserts instead of inflating the row count).
+fn quarantine_id_for(record: &MemoryRecord, score: f32) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(record.id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(record.text.as_bytes());
+    hasher.update(b"|");
+    hasher.update(record.source.as_bytes());
+    hasher.update(b"|");
+    hasher.update(score.to_le_bytes().as_ref());
+    format!("q.{}", hex::encode(&hasher.finalize().as_bytes()[..8]))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -598,8 +698,13 @@ mod tests {
         r.layer = MemoryLayer::Semantic;
         r.embedding = Some(vec![1.0]);
         store.insert(&r).unwrap();
-        let ai_reply =
-            "- The user prefers terse replies\n- The user works in EST\n   - The user uses Rust";
+        // GAP 6: every dash-prefixed line carries at least one
+        // proper-noun token (Postgres, EST, Rust) so the anomaly
+        // scorer accepts all three and they all land as
+        // observations.
+        let ai_reply = "- The user prefers Postgres in production\n\
+                        - The user works in EST\n\
+                           - The user uses Rust";
         let promoter = LayerPromoter::new(Arc::new(store.clone()), ai_returning(ai_reply), 10);
         let s = promoter
             .promote_semantic_to_observation()
@@ -611,7 +716,7 @@ mod tests {
             .unwrap();
         assert_eq!(observations.len(), 3);
         let texts: Vec<&str> = observations.iter().map(|r| r.text.as_str()).collect();
-        assert!(texts.iter().any(|t| t.contains("terse replies")));
+        assert!(texts.iter().any(|t| t.contains("Postgres")));
         assert!(texts.iter().any(|t| t.contains("EST")));
         let semantics = store
             .list(Some(MemoryLayer::Semantic), Some("session-x"), 10, 0)
@@ -694,7 +799,13 @@ mod tests {
             ("a", "fact one", vec![1.0, 0.0]),
             ("b", "fact two", vec![0.0, 1.0]),
         ]);
-        let promoter = LayerPromoter::new(store_arc.clone(), ai_returning("- one\n- two"), 10);
+        // GAP 6: each observation needs at least one specific
+        // token so the anomaly scorer doesn't quarantine it.
+        let promoter = LayerPromoter::new(
+            store_arc.clone(),
+            ai_returning("- The user uses Postgres for storage\n- The user works on Rust services"),
+            10,
+        );
         let stats = promoter.run_once().await;
         assert_eq!(stats.raw_to_semantic, 2);
         // The newly-minted Semantic records get processed in
