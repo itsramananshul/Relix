@@ -485,6 +485,16 @@ impl Analyzer {
                     }
                     return Some(Type::Integer);
                 }
+                // RELIX-7.19: confidence accessor. Zero-arg
+                // builtin returning the score of the most
+                // recently completed remote_call (1.0 before
+                // any call).
+                if name == "last_confidence" {
+                    if !args.is_empty() {
+                        panic!("last_confidence() takes no arguments");
+                    }
+                    return Some(Type::Float);
+                }
                 // F6: list built-ins. Element type tracking is
                 // intentionally coarse — lists are
                 // heterogeneous and operators use them as

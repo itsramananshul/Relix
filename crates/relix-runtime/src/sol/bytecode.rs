@@ -143,6 +143,14 @@ pub enum Inst {
     LoadErrorRetryHint,
     Rethrow,
 
+    // ---- RELIX-7.19: last_confidence() builtin ----
+    //
+    // Zero-arg opcode that pushes the VM's `last_confidence`
+    // field (an `f32` stored as the bit pattern of an `f64`)
+    // onto the operand stack. Updated by the host AFTER each
+    // `remote_call` returns; reads `1.0` before any call.
+    LoadLastConfidence,
+
     // ---- F5 / F7: list & map opcodes ----
     //
     // Lists and maps are heap objects (`HeapObject::List` /
@@ -685,6 +693,11 @@ impl Codegen {
                     insts.push(Inst::LoadErrorCause);
                 } else if name == "error_retry_hint" {
                     insts.push(Inst::LoadErrorRetryHint);
+                } else if name == "last_confidence" {
+                    // RELIX-7.19: zero-arg builtin. Returns the
+                    // VM's confidence register (set by the host
+                    // after each remote_call) as a Float.
+                    insts.push(Inst::LoadLastConfidence);
                 } else if matches!(
                     name.as_str(),
                     "list_len"
@@ -922,6 +935,10 @@ impl Codegen {
                 }
                 if name == "error_retry_hint" {
                     return Type::Integer;
+                }
+                // RELIX-7.19: confidence accessor.
+                if name == "last_confidence" {
+                    return Type::Float;
                 }
                 // F6 / F8: list & map built-ins.
                 match name.as_str() {

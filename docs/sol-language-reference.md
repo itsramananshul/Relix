@@ -639,6 +639,60 @@ for any callers that aliased the old reference.
 | `map_len(m)` | `(map) -> int` | Number of pairs. |
 | `map_del(m, k)` | `(map, str) -> map` | New map without `k`. Absent key is a no-op (returns a copy). |
 
+### 7.7 last_confidence — RELIX-7.19
+
+```
+last_confidence() -> float
+```
+
+Zero-argument builtin that returns a `float` in `[0.0, 1.0]` carrying
+the confidence score of the most recently completed `remote_call` in
+this execution context. Returns `1.0` (neutral) before any `remote_call`
+has been made.
+
+The score is produced by the host's
+[`ConfidenceScorer`](../crates/relix-runtime/src/confidence/scorer.rs)
+after the dispatch bridge returns each capability response. Five
+weighted sub-scores combine:
+
+- `response_length` — empty body scores `0.0` immediately; short bodies
+  scale up; the optimal band is roughly 10–500 tokens.
+- `response_coherence` — bumps for a sentence-final punctuation
+  ending, penalty when the trigram-uniqueness ratio dips below `0.5`.
+- `provider_signal` — derived from `finish_reason` (`stop` → `1.0`,
+  `length` → `0.55`, `content_filter` → `0.30`) and per-token
+  `logprob` when the provider emits one.
+- `error_rate_history` — `1.0 − rolling error rate` for the
+  `(caller_agent, called_method)` pair.
+- `latency_signal` — `1.0` when the response was faster than the
+  configured `p95_latency_baseline_ms`; linearly tapers to `0.0` at
+  `4× baseline`.
+
+When the rolling error rate is at or above `0.5`, the final score is
+multiplied by the configured `error_rate_discount` (default `0.5`) —
+brittle providers get their scores halved.
+
+Use it from a flow to react to low confidence directly:
+
+```sol
+let answer: str = remote_call("ai", "ai.chat", prompt);
+if (last_confidence() < 0.4) {
+    log("low confidence; escalating to premium model");
+    answer = remote_call("ai-premium", "ai.chat", prompt);
+}
+return answer;
+```
+
+Reading `last_confidence()` is wait-free (a single atomic load) so
+flows can sprinkle it without performance concern. The opcode is
+[`Inst::LoadLastConfidence`](../crates/relix-runtime/src/sol/bytecode.rs);
+the source-of-truth is either the VM-local `last_confidence` field
+(set via `VM::set_last_confidence`) or a shared
+[`LastConfidenceCell`](../crates/relix-runtime/src/confidence/cell.rs)
+when one has been attached. The dispatcher integration in
+`crates/relix-runtime/src/dispatch/mod.rs` updates the cell after
+every scored dispatch.
+
 ---
 
 ## 8. Try / catch / rethrow

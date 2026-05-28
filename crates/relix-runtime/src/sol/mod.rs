@@ -38,6 +38,8 @@ mod branch_return_tests;
 #[cfg(test)]
 mod language_reference_examples;
 #[cfg(test)]
+mod last_confidence_tests;
+#[cfg(test)]
 mod list_map_tests;
 #[cfg(test)]
 mod remote_call_compile_tests;

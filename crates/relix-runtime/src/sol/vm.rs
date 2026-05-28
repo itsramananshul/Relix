@@ -81,6 +81,22 @@ pub struct VM {
     /// still running. None = no observer (a no-op closure is
     /// passed instead).
     chunk_observer: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+    /// RELIX-7.19: confidence score of the most recently
+    /// completed `remote_call`. The host updates this via
+    /// [`VM::set_last_confidence`] after each call (or via a
+    /// shared [`crate::confidence::LastConfidenceCell`] if
+    /// the host prefers shared storage). Read by the
+    /// `last_confidence()` SOL builtin via
+    /// [`Inst::LoadLastConfidence`]. Defaults to `1.0` so
+    /// flows that read the value before any call see a
+    /// neutral score.
+    last_confidence: f32,
+    /// RELIX-7.19: optional shared confidence cell. When
+    /// wired, `Inst::LoadLastConfidence` reads from the cell
+    /// instead of `last_confidence` so the dispatcher and the
+    /// VM see the same value without per-call updates from
+    /// the host.
+    last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 }
 
 impl VM {
@@ -97,6 +113,8 @@ impl VM {
             last_error: None,
             try_handlers: Vec::new(),
             chunk_observer: None,
+            last_confidence: 1.0,
+            last_confidence_cell: None,
         }
     }
 
@@ -112,6 +130,46 @@ impl VM {
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn RemoteCallDispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
         self
+    }
+
+    /// RELIX-7.19: set the confidence score for the most
+    /// recently completed `remote_call`. Hosts call this after
+    /// every dispatch so `last_confidence()` returns the
+    /// latest verdict. Clamped to `[0.0, 1.0]`.
+    pub fn set_last_confidence(&mut self, value: f32) {
+        self.last_confidence = value.clamp(0.0, 1.0);
+    }
+
+    /// RELIX-7.19: read the current confidence reading (the
+    /// value that `last_confidence()` would push). Defaults to
+    /// `1.0` before any `remote_call` has been made.
+    pub fn last_confidence(&self) -> f32 {
+        if let Some(cell) = &self.last_confidence_cell {
+            return cell.get();
+        }
+        self.last_confidence
+    }
+
+    /// RELIX-7.19: attach a shared confidence cell. When wired,
+    /// `Inst::LoadLastConfidence` reads from the cell instead
+    /// of the VM-local field — useful when the dispatcher
+    /// integration owns the source-of-truth value.
+    pub fn with_last_confidence_cell(
+        mut self,
+        cell: crate::confidence::LastConfidenceCell,
+    ) -> Self {
+        self.last_confidence_cell = Some(cell);
+        self
+    }
+
+    /// RELIX-7.19: post-construction setter for the
+    /// confidence cell. Same semantics as
+    /// [`Self::with_last_confidence_cell`] but consumable
+    /// after the VM is built — flow_runner uses this because
+    /// the cell is created alongside the dispatcher AFTER the
+    /// VM is parked.
+    pub fn set_last_confidence_cell(&mut self, cell: crate::confidence::LastConfidenceCell) {
+        self.last_confidence_cell = Some(cell);
     }
 
     /// RELIX-2 step 4: attach a chunk observer. Invoked once
@@ -771,6 +829,17 @@ impl VM {
                 // panic. Future commits can add the field to
                 // the dispatcher trait.
                 self.push(0);
+            }
+            Inst::LoadLastConfidence => {
+                // RELIX-7.19: zero-arg builtin. Push the f32
+                // confidence (widened to f64) as the bit
+                // pattern the SOL float opcodes expect.
+                let v = if let Some(cell) = &self.last_confidence_cell {
+                    cell.get()
+                } else {
+                    self.last_confidence
+                };
+                self.push((v as f64).to_bits());
             }
             Inst::Rethrow => {
                 if let Some(sentinel) = self.try_dispatch_error() {
