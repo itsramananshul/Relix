@@ -32,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Structured output of [`SpecParser::parse`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlanSpec {
     /// The operator's stated objective. Always non-empty
     /// when the parse succeeds.
@@ -61,6 +61,30 @@ pub struct PlanSpec {
     /// Echo of the original spec for the planner's audit
     /// trail.
     pub original_spec: String,
+    /// RELIX-7.24 Stage-1: heuristic complexity score in
+    /// `0.0..=1.0`. Computed in [`SpecParser::parse`] from the
+    /// number of constraints, success criteria, goal length,
+    /// and distinct output types mentioned. Higher = the
+    /// orchestrator is more likely to activate.
+    ///
+    /// Triggers (each contributes 0.7, summed, capped at 1.0):
+    ///
+    /// - More than 3 success criteria.
+    /// - More than 5 constraint clauses.
+    /// - Goal text longer than 150 words.
+    /// - The spec mentions two or more distinct output
+    ///   types (report, code, summary, analysis, plan,
+    ///   design, implementation, documentation).
+    #[serde(default)]
+    pub complexity_score: f32,
+    /// `true` when [`Self::complexity_score`] meets or
+    /// exceeds the default 0.6 orchestrator-activation
+    /// threshold. Operator-tunable thresholds live on
+    /// [`super::orchestrator::OrchestratorConfig`]; this
+    /// bool reports the default judgement so operators can
+    /// read it directly off the parsed spec.
+    #[serde(default)]
+    pub is_complex: bool,
 }
 
 /// The parser. Stateless — every call to [`Self::parse`] is
@@ -123,6 +147,9 @@ impl SpecParser {
             extract_agent_mentions(trimmed, &self.known_agents);
         let max_steps = extract_max_steps(trimmed);
         let budget_hint = extract_budget_hint(trimmed);
+        let complexity_score =
+            compute_complexity_score(trimmed, &goal, &constraints, &success_criteria);
+        let is_complex = complexity_score >= DEFAULT_COMPLEXITY_THRESHOLD;
 
         PlanSpec {
             goal,
@@ -133,8 +160,82 @@ impl SpecParser {
             max_steps,
             budget_hint,
             original_spec: spec.to_string(),
+            complexity_score,
+            is_complex,
         }
     }
+}
+
+/// Default complexity-threshold used by [`PlanSpec::is_complex`]
+/// and the default
+/// [`super::orchestrator::OrchestratorConfig::complexity_threshold`].
+/// Kept here so both the parser and the orchestrator agree on
+/// the "is this a complex spec?" boundary out of the box.
+pub const DEFAULT_COMPLEXITY_THRESHOLD: f32 = 0.6;
+
+/// Output-type keywords that contribute to the complexity
+/// score when two or more distinct ones appear in the spec.
+const OUTPUT_TYPE_KEYWORDS: &[&str] = &[
+    "report",
+    "code",
+    "summary",
+    "analysis",
+    "plan",
+    "design",
+    "implementation",
+    "documentation",
+];
+
+/// Score the spec on the heuristic complexity ladder. Each of
+/// the four triggers contributes 0.7; the sum is clamped to
+/// `1.0`. Any single trigger therefore clears the default 0.6
+/// activation threshold.
+fn compute_complexity_score(
+    full_spec: &str,
+    goal: &str,
+    constraints: &[String],
+    success_criteria: &[String],
+) -> f32 {
+    let mut score: f32 = 0.0;
+    if success_criteria.len() > 3 {
+        score += 0.7;
+    }
+    if constraints.len() > 5 {
+        score += 0.7;
+    }
+    if goal_word_count(goal) > 150 {
+        score += 0.7;
+    }
+    if distinct_output_types(full_spec) >= 2 {
+        score += 0.7;
+    }
+    score.min(1.0)
+}
+
+fn goal_word_count(goal: &str) -> usize {
+    goal.split_whitespace().count()
+}
+
+fn distinct_output_types(spec: &str) -> usize {
+    let lower = spec.to_lowercase();
+    let mut found = 0;
+    for kw in OUTPUT_TYPE_KEYWORDS {
+        // Word-boundary match: surround spec with spaces so
+        // " report " matches but "reporter" does not.
+        let needle_a = format!(" {kw} ");
+        let needle_b = format!(" {kw}.");
+        let needle_c = format!(" {kw},");
+        let needle_d = format!(" {kw}s "); // crude pluralisation
+        let padded = format!(" {lower} ");
+        if padded.contains(&needle_a)
+            || padded.contains(&needle_b)
+            || padded.contains(&needle_c)
+            || padded.contains(&needle_d)
+        {
+            found += 1;
+        }
+    }
+    found
 }
 
 // ── helpers ───────────────────────────────────────────────
@@ -433,5 +534,96 @@ mod tests {
     fn split_sentences_handles_mixed_terminators() {
         let s = split_sentences("First. Second! Third? Fourth; Fifth");
         assert_eq!(s, vec!["First", "Second", "Third", "Fourth", "Fifth"]);
+    }
+
+    #[test]
+    fn complexity_score_is_zero_for_a_short_simple_spec() {
+        let p = SpecParser::new();
+        let s = p.parse("Greet the user.");
+        assert_eq!(s.complexity_score, 0.0);
+        assert!(!s.is_complex);
+    }
+
+    #[test]
+    fn long_goal_alone_pushes_complexity_above_the_default_threshold() {
+        let p = SpecParser::new();
+        // 160-word goal.
+        let goal: String = std::iter::repeat_n("word", 160)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let spec = p.parse(&format!("{goal}. Return a summary."));
+        assert!(
+            spec.complexity_score >= DEFAULT_COMPLEXITY_THRESHOLD,
+            "complex due to long goal: score={}",
+            spec.complexity_score,
+        );
+        assert!(spec.is_complex);
+    }
+
+    #[test]
+    fn many_success_criteria_alone_pushes_complexity_above_the_default_threshold() {
+        let p = SpecParser::new();
+        let s = p.parse(
+            "Goal here. Return X. Return Y. Return Z. Return W. \
+             Return V. Produce a markdown report.",
+        );
+        assert!(s.success_criteria.len() > 3);
+        assert!(s.is_complex);
+    }
+
+    #[test]
+    fn many_constraints_alone_pushes_complexity_above_the_default_threshold() {
+        let p = SpecParser::new();
+        let s = p.parse(
+            "Goal. Must not exceed 100 words. Must not call external APIs. \
+             Avoid speculation. Do not use the code-agent. Should not retry. \
+             Without redactions. Avoid placeholders.",
+        );
+        assert!(s.constraints.len() > 5, "{:?}", s.constraints);
+        assert!(s.is_complex);
+    }
+
+    #[test]
+    fn distinct_output_types_alone_pushes_complexity_above_the_default_threshold() {
+        let p = SpecParser::new();
+        let s = p.parse("Build the system. Produce a report and code and a design.");
+        assert!(s.is_complex);
+        assert!(s.complexity_score >= DEFAULT_COMPLEXITY_THRESHOLD);
+    }
+
+    #[test]
+    fn single_output_type_alone_does_not_push_complexity_above_threshold() {
+        let p = SpecParser::new();
+        let s = p.parse("Build the system. Produce a single report.");
+        // Only one output type → no contribution; goal short
+        // → no contribution; no constraints or successes.
+        assert!(s.complexity_score < DEFAULT_COMPLEXITY_THRESHOLD);
+        assert!(!s.is_complex);
+    }
+
+    #[test]
+    fn complexity_score_is_capped_at_one() {
+        let p = SpecParser::new();
+        let long_goal: String = std::iter::repeat_n("alpha", 160)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let s = p.parse(&format!(
+            "{long_goal}. Return X. Return Y. Return Z. Return W. Return V. \
+             Produce a report and code and a design. \
+             Must not exceed 100 words. Must not call external APIs. \
+             Avoid speculation. Do not use the code-agent. Should not retry. \
+             Without redactions. Avoid placeholders."
+        ));
+        assert!((s.complexity_score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn distinct_output_types_counts_words_not_substrings() {
+        // "reporter" must NOT count as "report".
+        assert_eq!(distinct_output_types("a reporter wrote the article"), 0);
+        // "report" and "code" both count, distinct = 2.
+        assert_eq!(distinct_output_types("produce a report and code"), 2);
+        // Pluralisation: "reports" counts.
+        assert_eq!(distinct_output_types("file two reports here"), 1);
     }
 }

@@ -37,10 +37,14 @@
 
 pub mod coordinator;
 pub mod generator;
+pub mod orchestrator;
 pub mod parser;
 pub mod registry;
 
 pub use coordinator::{planning_capability_descriptors, register};
 pub use generator::{GenerateError, GeneratorOptions, PlanGenerator, PlanTopology};
-pub use parser::{PlanSpec, SpecParser};
+pub use orchestrator::{
+    Orchestrator, OrchestratorConfig, OrchestratorError, OrchestratorOutcome, SpecialistAssignment,
+};
+pub use parser::{DEFAULT_COMPLEXITY_THRESHOLD, PlanSpec, SpecParser};
 pub use registry::{AgentCapabilityRegistry, AgentInfo, AgentMatch, CapabilityInfo};
