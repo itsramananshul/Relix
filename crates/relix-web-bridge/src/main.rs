@@ -132,6 +132,9 @@ mod messaging;
 mod metrics;
 mod openai;
 mod os_secure;
+mod planning;
+#[cfg(test)]
+mod planning_mini_mesh_test;
 mod plugins;
 mod policy_denials;
 mod policy_simulate;
@@ -555,6 +558,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/confidence/policies", get(confidence::policies))
         .route("/v1/confidence/history/:agent", get(confidence::history))
         .route("/v1/confidence/reset", post(confidence::reset))
+        // RELIX-7.24: spec-driven multi-agent planning surface.
+        .route("/v1/planning/plan", post(planning::create_plan))
+        .route("/v1/planning/agents", get(planning::list_agents))
+        .route("/v1/planning/agents/search", post(planning::search_agents))
+        .route("/v1/planning/validate", post(planning::validate_spec))
         .route("/v1/knowledge/recall", post(knowledge::recall))
         // Four-layer memory inspector. Reads the layered store
         // directly from `AppState::layered_memory` — set
