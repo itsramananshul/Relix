@@ -694,20 +694,27 @@ fn unix_now_ms() -> i64 {
 
 /// Workflow-event-stream wrapper used by the coordinator's
 /// execute path. Spawns a task that drains an
-/// `execute_with_events` channel into the harness, recording
-/// any non-critical failures as advisory rows. Returns once
-/// the `Finished` event arrives.
+/// `execute_with_cancellation` channel into the harness,
+/// recording each verification entry as soon as the step
+/// completes AND signalling a cooperative cancel when a
+/// required-step criterion fails. Returns once the
+/// `Finished` event arrives.
 ///
-/// The harness can't intercept dispatch failures or
-/// pre-cancel later steps — it observes outputs as they're
-/// emitted and persists results. Critical-step decisions are
-/// applied AFTER the run via [`VerificationHarness::evaluate_run`]
-/// — see the module docstring's honesty contract.
+/// RELIX-7.24 follow-up: the harness now wires a
+/// [`crate::workflow::CancellationFlag`] through the
+/// executor. When a step in `required_steps` fails ANY
+/// criterion, the harness calls `cancel.cancel_with_reason`
+/// and the workflow's BFS aborts BEFORE the next step
+/// dispatches. The in-flight step finishes cooperatively;
+/// subsequent steps never start. The final WorkflowResult
+/// carries `ExecutionStatus::Cancelled` with the verification
+/// reason.
 pub async fn drain_events_into_log(
     mut events: tokio::sync::mpsc::UnboundedReceiver<WorkflowEvent>,
     harness: VerificationHarness,
     plan_id: String,
     spec: PlanSpec,
+    cancel: crate::workflow::CancellationFlag,
 ) -> Option<WorkflowResult> {
     if !harness.enabled() {
         // Caller should not have wired the channel; drain
@@ -721,7 +728,6 @@ pub async fn drain_events_into_log(
         }
         return result;
     }
-    let mut completed_outputs: Vec<(String, String)> = Vec::new();
     let mut result: Option<WorkflowResult> = None;
     while let Some(ev) = events.recv().await {
         match ev {
@@ -730,7 +736,11 @@ pub async fn drain_events_into_log(
                 // the fly. The final-result pass below
                 // re-evaluates against the full result so
                 // critical_failures can be aggregated, but
-                // this gives operators a real-time signal.
+                // this gives operators a real-time signal AND
+                // lets us cancel the workflow before the next
+                // step dispatches when a required-step
+                // criterion fails.
+                let mut critical_failure_reason: Option<String> = None;
                 for criterion in &spec.success_criteria {
                     let strategy = pick_strategy(criterion);
                     let (passed, reason) = harness.evaluate(strategy, criterion, &output).await;
@@ -740,7 +750,7 @@ pub async fn drain_events_into_log(
                         criterion: criterion.clone(),
                         strategy_used: strategy.as_str().to_string(),
                         passed,
-                        reason,
+                        reason: reason.clone(),
                         verified_at_ms: unix_now_ms(),
                     };
                     if let Err(e) = harness.store.insert_verification(&entry) {
@@ -751,8 +761,25 @@ pub async fn drain_events_into_log(
                             "verification: failed to persist entry"
                         );
                     }
+                    if !passed
+                        && !harness.cfg.required_steps.is_empty()
+                        && harness.cfg.required_steps.iter().any(|s| s == &agent)
+                        && critical_failure_reason.is_none()
+                    {
+                        critical_failure_reason = Some(format!(
+                            "verification: required step `{agent}` failed criterion \
+                             `{criterion}` ({reason})"
+                        ));
+                    }
                 }
-                completed_outputs.push((agent, output));
+                if let Some(reason) = critical_failure_reason {
+                    tracing::warn!(
+                        plan_id = %plan_id,
+                        step_id = %agent,
+                        "verification: cancelling workflow on critical-step failure"
+                    );
+                    cancel.cancel_with_reason(reason);
+                }
             }
             WorkflowEvent::Finished(r) => {
                 result = Some(r);
@@ -764,10 +791,11 @@ pub async fn drain_events_into_log(
 }
 
 /// Build a [`Workflow`] +
-/// [`crate::workflow::execute_with_events`] driver that
-/// streams its events through the harness and returns the
-/// final [`WorkflowResult`] alongside the recorded outcome.
-/// Convenience used by the coordinator.
+/// [`crate::workflow::execute_with_cancellation`] driver
+/// that streams events through the harness, lets the harness
+/// signal a cooperative cancel on critical-step failure, and
+/// returns the final [`WorkflowResult`] alongside the
+/// recorded outcome. Convenience used by the coordinator.
 pub async fn execute_with_verification(
     workflow_arc: Arc<Workflow>,
     dispatcher: Arc<dyn WorkflowDispatcher>,
@@ -788,11 +816,25 @@ pub async fn execute_with_verification(
             },
         );
     }
+    let cancel = crate::workflow::CancellationFlag::new();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let plan_id_owned = plan_id.to_string();
     let spec_owned = spec.clone();
-    let drainer = drain_events_into_log(rx, harness.clone(), plan_id_owned, spec_owned);
-    let exec = crate::workflow::execute_with_events(workflow_arc, dispatcher, input, tx);
+    let cancel_for_drain = cancel.clone();
+    let drainer = drain_events_into_log(
+        rx,
+        harness.clone(),
+        plan_id_owned,
+        spec_owned,
+        cancel_for_drain,
+    );
+    let exec = crate::workflow::execute_with_cancellation(
+        workflow_arc,
+        dispatcher,
+        input,
+        Some(tx),
+        cancel,
+    );
     let (drain_result, exec_result) = tokio::join!(drainer, exec);
     // drain_result is the stream's final Finished result;
     // exec_result is the executor's return value. They should
@@ -1121,6 +1163,124 @@ mod tests {
         let f = &outcome.critical_failures[0];
         assert_eq!(f.step_id, "critical");
         assert!(!f.passed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_with_verification_cancels_on_critical_step_failure() {
+        // Wire a small two-step workflow + a stub dispatcher.
+        // The first step's output deliberately violates a
+        // length criterion; required_steps marks it as
+        // critical → the harness must cancel before the
+        // second step dispatches.
+        use crate::workflow::{
+            AgentSpec, DispatchResult, Edge, EdgeCondition, FlowGraph, Workflow, WorkflowDispatcher,
+        };
+        use std::collections::BTreeMap;
+
+        struct CountingDispatcher {
+            calls: tokio::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl WorkflowDispatcher for CountingDispatcher {
+            async fn dispatch(&self, peer: &str, _cap: &str, _input: &[u8]) -> DispatchResult {
+                let mut g = self.calls.lock().await;
+                let n = g.len();
+                g.push(peer.to_string());
+                drop(g);
+                // First step's response violates the
+                // length-check criterion below (7 words).
+                // Second step's response is irrelevant because
+                // we expect it to never be called.
+                if n == 0 {
+                    Ok(b"this output has seven different total words here".to_vec())
+                } else {
+                    Ok(b"second".to_vec())
+                }
+            }
+        }
+
+        let dispatcher = Arc::new(CountingDispatcher {
+            calls: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let store = ApprovalStore::open_in_memory().unwrap();
+        let harness = VerificationHarness::new(
+            dispatcher.clone(),
+            store,
+            VerificationConfig {
+                verify_steps: true,
+                verifier_agent: "c".into(),
+                verifier_peer: "c".into(),
+                required_steps: vec!["first".into()],
+            },
+        );
+        let spec = super::super::SpecParser::new()
+            .parse("Build the system. Output must be under 5 words.");
+
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "first".to_string(),
+            AgentSpec {
+                peer: "p1".into(),
+                capability: "ai.chat".into(),
+                input: "{{workflow.input}}".into(),
+                output: "first".into(),
+            },
+        );
+        agents.insert(
+            "second".to_string(),
+            AgentSpec {
+                peer: "p2".into(),
+                capability: "ai.chat".into(),
+                input: "{{first.output}}".into(),
+                output: "second".into(),
+            },
+        );
+        let workflow = Arc::new(Workflow {
+            name: "cancel_test".into(),
+            version: 1,
+            description: "test".into(),
+            agents,
+            flow: FlowGraph {
+                start: "first".into(),
+                edges: vec![Edge {
+                    from: "first".into(),
+                    to: "second".into(),
+                    condition: EdgeCondition::Success,
+                }],
+                result: Some("{{second.output}}".into()),
+            },
+        });
+
+        let (result, _outcome) = execute_with_verification(
+            workflow,
+            dispatcher.clone(),
+            "hi",
+            harness,
+            "plan-cancel",
+            &spec,
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            crate::workflow::ExecutionStatus::Cancelled,
+            "verification critical failure must cancel the workflow"
+        );
+        assert!(
+            result.result.contains("verification"),
+            "result must surface the verification reason: {}",
+            result.result
+        );
+        // The CRITICAL part: only the first step dispatched.
+        let calls = dispatcher.calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one dispatch (the critical step), got {}: {:?}",
+            calls.len(),
+            *calls
+        );
+        assert_eq!(calls[0], "p1");
     }
 
     #[tokio::test]

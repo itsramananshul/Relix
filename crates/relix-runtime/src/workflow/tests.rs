@@ -752,3 +752,129 @@ fn shipped_example_workflows_validate() {
         "expected ≥ 3 example workflows under examples/workflows/, found {checked}"
     );
 }
+
+// ── RELIX-7.24 cancellation primitive ────────────────────
+
+#[tokio::test]
+async fn cancellation_flag_aborts_workflow_between_steps() {
+    use super::execute_with_cancellation;
+    use super::executor::CancellationFlag;
+    let src = r#"
+name: cancel_seq
+version: 1
+agents:
+  first:
+    peer: ai
+    capability: chat
+    input: "{{workflow.input}}"
+    output: first
+  second:
+    peer: ai
+    capability: chat
+    input: "after {{first.output}}"
+    output: second
+flow:
+  start: first
+  edges:
+    - { from: first, to: second, condition: success }
+"#;
+    let wf = parse_and_validate(src);
+    let stub = Arc::new(StubDispatcher::new());
+    stub.respond_ok("ai", "chat", "alpha").await;
+    stub.respond_ok("ai", "chat", "beta").await;
+    let cancel = CancellationFlag::new();
+    // Pre-cancel BEFORE we start so the first step is the
+    // one the flag sees.
+    cancel.cancel_with_reason("operator pulled the plug");
+    let result = execute_with_cancellation(Arc::new(wf), stub.clone(), "hi", None, cancel).await;
+    assert_eq!(result.status, ExecutionStatus::Cancelled);
+    assert_eq!(result.result, "operator pulled the plug");
+    // No dispatches happened — flag was set before the first
+    // step's check.
+    assert!(stub.calls().await.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_flag_post_first_step_lets_first_dispatch_complete() {
+    use super::execute_with_cancellation;
+    use super::executor::CancellationFlag;
+    // Single-threaded runtime + the executor's pre-step
+    // yield_now() gives the listener a deterministic window
+    // to set the cancel flag between events. On
+    // multi-threaded runtimes the race is best-effort; we
+    // pin this test to current_thread so it's
+    // deterministic.
+    let src = r#"
+name: cancel_mid
+version: 1
+agents:
+  first:
+    peer: ai
+    capability: chat
+    input: "{{workflow.input}}"
+    output: first
+  second:
+    peer: ai
+    capability: chat
+    input: "after {{first.output}}"
+    output: second
+flow:
+  start: first
+  edges:
+    - { from: first, to: second, condition: success }
+"#;
+    let wf = parse_and_validate(src);
+    let stub = Arc::new(StubDispatcher::new());
+    stub.respond_ok("ai", "chat", "alpha").await;
+    stub.respond_ok("ai", "chat", "beta").await;
+    let cancel = CancellationFlag::new();
+    // Cancel AFTER the first step finishes — listen on the
+    // event stream for StepCompleted on `first` and flip the
+    // flag.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel_for_listener = cancel.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let WorkflowEvent::StepCompleted { agent, .. } = ev
+                && agent == "first"
+            {
+                cancel_for_listener.cancel_with_reason("verification critical");
+                break;
+            }
+        }
+    });
+    let result =
+        execute_with_cancellation(Arc::new(wf), stub.clone(), "hi", Some(tx), cancel).await;
+    assert_eq!(result.status, ExecutionStatus::Cancelled);
+    assert_eq!(result.result, "verification critical");
+    // The first step ran; the second never did.
+    let calls = stub.calls().await;
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected exactly one dispatch, got {calls:?}"
+    );
+    assert_eq!(calls[0].input, b"hi");
+}
+
+#[test]
+fn cancellation_flag_reason_round_trips() {
+    use super::executor::CancellationFlag;
+    let f = CancellationFlag::new();
+    assert!(!f.is_cancelled());
+    assert!(f.reason().is_none());
+    f.cancel_with_reason("operator quit");
+    assert!(f.is_cancelled());
+    assert_eq!(f.reason().as_deref(), Some("operator quit"));
+}
+
+#[test]
+fn cancellation_flag_clones_share_state() {
+    use super::executor::CancellationFlag;
+    let f1 = CancellationFlag::new();
+    let f2 = f1.clone();
+    assert!(!f1.is_cancelled());
+    assert!(!f2.is_cancelled());
+    f1.cancel();
+    assert!(f2.is_cancelled(), "clone should see the cancel");
+}

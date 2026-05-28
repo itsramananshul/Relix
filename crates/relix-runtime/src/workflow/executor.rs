@@ -19,10 +19,74 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::ast::{Edge, EdgeCondition, Workflow};
 use super::dispatcher::{DispatchError, WorkflowDispatcher};
+
+/// Cooperative cancellation signal for the workflow
+/// executor. Cheap-to-clone (single `Arc<AtomicBool>`).
+/// Producers call [`Self::cancel`] from any thread; the
+/// executor checks [`Self::is_cancelled`] before every
+/// dispatch and exits the BFS cleanly when set.
+///
+/// Cancellation is COOPERATIVE: an in-flight dispatch will
+/// run to completion (the executor doesn't kill the
+/// dispatcher's future). Subsequent steps are not started
+/// and the trace records a Cancelled event. The final
+/// [`WorkflowResult`] carries
+/// [`ExecutionStatus::Cancelled`] with a reason string the
+/// caller passed via [`Self::cancel_with_reason`].
+#[derive(Clone, Debug, Default)]
+pub struct CancellationFlag {
+    inner: Arc<CancellationInner>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationInner {
+    cancelled: AtomicBool,
+    reason: std::sync::Mutex<Option<String>>,
+}
+
+impl CancellationFlag {
+    /// Build a fresh, never-cancelled flag.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signal cancellation with no reason text. The executor
+    /// will use `"workflow cancelled"` as the trace reason.
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Signal cancellation with a human-readable reason.
+    /// Wins over any earlier reason set on the same flag.
+    pub fn cancel_with_reason(&self, reason: impl Into<String>) {
+        let s = reason.into();
+        if let Ok(mut guard) = self.inner.reason.lock() {
+            *guard = Some(s);
+        }
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// `true` once any clone of this flag has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Reason text set via [`Self::cancel_with_reason`].
+    /// `None` when the flag is not cancelled OR was
+    /// cancelled with no reason.
+    pub fn reason(&self) -> Option<String> {
+        self.inner
+            .reason
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+    }
+}
 
 /// Opaque identifier for one workflow execution. Today this
 /// is a hex-encoded random u128; the coordinator records the
@@ -68,6 +132,10 @@ pub enum ExecutionStatus {
     /// A step failed and no `failure` / `always` edge
     /// matched — the workflow stopped at that step.
     Failed,
+    /// A [`CancellationFlag`] was set mid-execution. The
+    /// executor finished the in-flight dispatch (cooperative
+    /// cancel) and aborted before starting the next step.
+    Cancelled,
 }
 
 impl ExecutionStatus {
@@ -78,6 +146,7 @@ impl ExecutionStatus {
             Self::Success => "success",
             Self::PartiallyFailed => "partially_failed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -165,7 +234,7 @@ pub async fn execute(
     dispatcher: Arc<dyn WorkflowDispatcher>,
     input: &str,
 ) -> WorkflowResult {
-    execute_inner(workflow, dispatcher, input, None).await
+    execute_inner(workflow, dispatcher, input, None, CancellationFlag::new()).await
 }
 
 /// Streaming variant. Same engine as [`execute`], but emits
@@ -180,7 +249,33 @@ pub async fn execute_with_events(
     input: &str,
     events: tokio::sync::mpsc::UnboundedSender<WorkflowEvent>,
 ) -> WorkflowResult {
-    execute_inner(workflow, dispatcher, input, Some(events)).await
+    execute_inner(
+        workflow,
+        dispatcher,
+        input,
+        Some(events),
+        CancellationFlag::new(),
+    )
+    .await
+}
+
+/// Cancellable streaming variant. Same engine as
+/// [`execute_with_events`], but checks `cancel` before every
+/// dispatch and aborts the BFS as soon as the flag flips.
+/// Producers (e.g. the verification harness, an operator
+/// CLI, a SIGINT handler) call `cancel.cancel()` from any
+/// thread; the in-flight dispatch finishes cooperatively
+/// before the abort lands. The result's status is
+/// [`ExecutionStatus::Cancelled`] when the cancel signal
+/// caused the early exit.
+pub async fn execute_with_cancellation(
+    workflow: Arc<Workflow>,
+    dispatcher: Arc<dyn WorkflowDispatcher>,
+    input: &str,
+    events: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
+    cancel: CancellationFlag,
+) -> WorkflowResult {
+    execute_inner(workflow, dispatcher, input, events, cancel).await
 }
 
 async fn execute_inner(
@@ -188,6 +283,7 @@ async fn execute_inner(
     dispatcher: Arc<dyn WorkflowDispatcher>,
     input: &str,
     events: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
+    cancel: CancellationFlag,
 ) -> WorkflowResult {
     let started = Instant::now();
     let execution_id = ExecutionId::new();
@@ -197,7 +293,7 @@ async fn execute_inner(
             workflow_name: workflow.name.clone(),
         });
     }
-    let mut state = ExecutionState::new_with_events(input, events.clone());
+    let mut state = ExecutionState::new_with_events(input, events.clone(), cancel.clone());
     let mut trace_steps: Vec<ExecutionStep> = Vec::new();
 
     // Run the start step + drive the BFS.
@@ -218,26 +314,43 @@ async fn execute_inner(
         total_latency_ms,
     };
 
-    let result = match outcome {
-        Ok(()) => {
-            let final_result = render_final_result(&workflow, &state);
-            let any_failed_step = trace.steps.iter().any(|s| s.outcome.is_err());
-            let status = if any_failed_step {
-                ExecutionStatus::PartiallyFailed
-            } else {
-                ExecutionStatus::Success
-            };
-            WorkflowResult {
-                trace,
-                status,
-                result: final_result,
-            }
-        }
-        Err(message) => WorkflowResult {
+    // If the cancellation flag was set, the final status is
+    // Cancelled regardless of the Ok/Err outcome above —
+    // cancellation arrives via the run_from Err path (the
+    // step aborts), but we want operators to see the
+    // cancellation-distinct status rather than a generic
+    // Failed.
+    let result = if cancel.is_cancelled() {
+        let reason = cancel
+            .reason()
+            .unwrap_or_else(|| "workflow cancelled".to_string());
+        WorkflowResult {
             trace,
-            status: ExecutionStatus::Failed,
-            result: message,
-        },
+            status: ExecutionStatus::Cancelled,
+            result: reason,
+        }
+    } else {
+        match outcome {
+            Ok(()) => {
+                let final_result = render_final_result(&workflow, &state);
+                let any_failed_step = trace.steps.iter().any(|s| s.outcome.is_err());
+                let status = if any_failed_step {
+                    ExecutionStatus::PartiallyFailed
+                } else {
+                    ExecutionStatus::Success
+                };
+                WorkflowResult {
+                    trace,
+                    status,
+                    result: final_result,
+                }
+            }
+            Err(message) => WorkflowResult {
+                trace,
+                status: ExecutionStatus::Failed,
+                result: message,
+            },
+        }
     };
     if let Some(tx) = events.as_ref() {
         let _ = tx.send(WorkflowEvent::Finished(result.clone()));
@@ -290,6 +403,11 @@ pub enum WorkflowEvent {
     /// Workflow has finished. Carries the full result —
     /// status, resolved result string, and trace.
     Finished(WorkflowResult),
+    /// A [`CancellationFlag`] was set before this step would
+    /// have dispatched. The executor records the agent that
+    /// was about to run + the reason from the flag and exits
+    /// the BFS cleanly.
+    Cancelled { agent: String, reason: String },
 }
 
 /// Mutable execution state passed through the BFS.
@@ -307,12 +425,18 @@ struct ExecutionState {
     /// can render in real time. When `None`, the executor
     /// runs in its silent unary mode.
     events: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
+    /// Cooperative cancellation flag. Checked before every
+    /// dispatch; when set the executor exits the BFS cleanly
+    /// and the final result carries
+    /// [`ExecutionStatus::Cancelled`].
+    cancel: CancellationFlag,
 }
 
 impl ExecutionState {
     fn new_with_events(
         input: &str,
         events: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
+        cancel: CancellationFlag,
     ) -> Self {
         let mut bindings = BTreeMap::new();
         bindings.insert("workflow.input".to_string(), input.to_string());
@@ -320,6 +444,7 @@ impl ExecutionState {
             bindings,
             visited: HashSet::new(),
             events,
+            cancel,
         }
     }
 
@@ -388,6 +513,33 @@ async fn run_step_only(
 ) -> StepRunResult {
     if state.visited.contains(agent_name) {
         return StepRunResult::Skipped;
+    }
+    // Yield to the scheduler before the cancel check so any
+    // event we emitted at the END of the previous step has
+    // had a chance to be processed by a listener task. The
+    // verification harness flips the cancel flag from inside
+    // its event-drain loop; without this yield, the BFS
+    // could race past the check on a multi-threaded runtime
+    // before the harness sees the previous StepCompleted
+    // event. yield_now() is a no-op for callers without an
+    // events channel and adds only a scheduler tick on the
+    // happy path.
+    tokio::task::yield_now().await;
+    // Cooperative cancellation check. Fires BEFORE the
+    // dispatch so an external producer (verification harness,
+    // operator cancel cap, SIGINT handler) can stop the BFS
+    // between any two steps. The in-flight dispatch above
+    // ran to completion; this one never starts.
+    if state.cancel.is_cancelled() {
+        let reason = state
+            .cancel
+            .reason()
+            .unwrap_or_else(|| "workflow cancelled".to_string());
+        state.emit(WorkflowEvent::Cancelled {
+            agent: agent_name.to_string(),
+            reason: reason.clone(),
+        });
+        return StepRunResult::Aborted(reason);
     }
     state.visited.insert(agent_name.to_string());
 
@@ -524,11 +676,13 @@ fn follow_edges<'a>(
                 // channel so per-step events stream in real
                 // time across siblings.
                 let events = state.events.clone();
+                let cancel = state.cancel.clone();
                 futures.push(async move {
                     let mut local_state = ExecutionState {
                         bindings: parent_bindings,
                         visited: parent_visited,
                         events,
+                        cancel,
                     };
                     let mut local_trace: Vec<ExecutionStep> = Vec::new();
                     let r = run_step_only(&wf, dispatcher, &to, &mut local_state, &mut local_trace)

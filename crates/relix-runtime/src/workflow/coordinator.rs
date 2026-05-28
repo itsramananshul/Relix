@@ -322,6 +322,11 @@ fn render_event(event: &WorkflowEvent) -> serde_json::Result<Vec<u8>> {
                 "steps": record.steps,
             })
         }
+        WorkflowEvent::Cancelled { agent, reason } => serde_json::json!({
+            "event": "cancelled",
+            "agent": agent,
+            "reason": reason,
+        }),
     };
     serde_json::to_vec(&value)
 }
