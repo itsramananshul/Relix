@@ -1903,7 +1903,88 @@ default     = "default"               # what to fall back to
 auto_inject = true                    # inject identity into every system prompt
 ```
 
-### 7.19 Per-Step Confidence Scoring + Fallback `[DONE — commits 574dbc5 + 9933aa0 + c24dd33 + aa12950 + e2f0b27]`
+### 7.19 Per-Step Confidence Scoring + Fallback `[DONE — commits 574dbc5 + 9933aa0 + c24dd33 + aa12950 + e2f0b27 + 1c888ab + 2ae97f2 + 6f8a7e4]`
+
+**Follow-up gap closures (commits 1c888ab, 2ae97f2, 6f8a7e4)** — the
+three "NOT DONE" bullets from the first §7.19 ship have all been
+closed:
+
+- **GAP 2: Alert action fires through MultiChannelAlertSink (commit
+  1c888ab).** Replaces the `tracing::warn!` placeholder in the
+  DispatchBridge's `Alert` fallback action with a real `AlertDeliver`
+  pipeline. New `AlertKind::LowConfidence` variant + dedup key
+  extended to `(agent, Option<method>, kind)` so LowConfidence
+  alerts dedup per (agent, method) while poll-driven kinds keep
+  agent-only dedup. New `AlertEngine::evaluate_low_confidence` event-
+  driven entry point. `MultiChannelAlertSink` formats LowConfidence
+  to the documented operator-facing shape; `ChronicleAlertSink`
+  persists `method` + `message` via a `column_exists`-guarded
+  ALTER TABLE migration. `DispatchBridge::set_alert_pipeline` setter
+  wires the engine + sink; absent pipeline falls back to the
+  pre-7.19 `tracing::warn!` path. 10 new tests cover fire/dedup/
+  recovery semantics, per-(agent, method) keying, sink wiring,
+  no-sink fallback, formatting, and chronicle round-trip.
+
+- **GAP 3: finish_reason + logprob from provider adapters (commit
+  2ae97f2).** Removes the body-parsing workaround in
+  `score_outcome` and replaces it with a real side-channel.
+  `ChatOutput` carries `finish_reason: Option<String>` +
+  `logprob: Option<f32>`. Every provider populates both:
+  OpenAI extracts `choices[0].finish_reason` + averages
+  `choices[0].logprobs.content[*].logprob`; Anthropic maps
+  `stop_reason` to the normalised vocabulary (end_turn /
+  stop_sequence → stop, max_tokens → length, tool_use → tool_use);
+  Gemini maps `candidates[0].finishReason` (STOP → stop,
+  MAX_TOKENS → length, SAFETY/RECITATION → content_filter);
+  mock fills both deterministically for tests. New
+  `StreamingChunk::FinishReason(String)` lands in each streaming
+  provider's stream BEFORE the Usage chunk. New
+  `AiProviderSignalsHint` + `MetricsSink::attach_provider_signals`
+  / `take_provider_signals` side-channel join cache keyed by
+  request_id, mirroring `AiUsageHint`. The AI handler fires the
+  hint after every non-streaming reply and after every streaming
+  `FinishReason` chunk; the dispatch bridge's `score_outcome` reads
+  it via `take_provider_signals` and passes into `ScoringInputs`.
+  12 new tests cover normalisation per provider, logprob
+  averaging, `MessageDelta` carrying stop_reason + output_tokens
+  together, mock stream chunk ordering, and a dispatch integration
+  test confirming finish_reason=stop scores strictly higher than
+  finish_reason=length when both are fed via the sink (no body
+  parsing involved).
+
+- **GAP 4: Controller auto-wires confidence from config (commit
+  6f8a7e4).** `ControllerConfig` gains
+  `confidence: Option<ConfidenceConfig>`; serde-default so existing
+  TOMLs decode unchanged. New `ConfidenceBundle { scorer, engine,
+  cell }` parallels `MetricsBundle` / `TrainingBundle`;
+  `build_confidence_bundle` returns `Ok(None)` when the section is
+  absent or `enabled = false`, `Ok(Some)` otherwise. In `run()`
+  the bundle wires `set_confidence(scorer, engine)` +
+  `set_last_confidence_cell(cell)` on the bridge. When
+  `[metrics.alerts]` is ALSO configured the bundle builds a
+  `CompositeAlertSink` over `ChronicleAlertSink` +
+  `MultiChannelAlertSink` and installs it via the GAP 2
+  `set_alert_pipeline` setter — closing the end-to-end config →
+  alert-fan-out loop. `confidence::register` installs the three
+  `confidence.*` coord caps + manifest descriptors.
+  `FlowRunOptions` gains `last_confidence_cell`;
+  `RealDispatcher` reads `ResponseEnvelope.confidence` after every
+  `remote_call` and writes it to the cell so SOL
+  `last_confidence()` sees the responder's score; `run_sol` /
+  `run_yaml` install the cell on the VM via
+  `with_last_confidence_cell` so the opcode reads from the same
+  storage. The web bridge creates a fresh cell per flow run so
+  per-execution contexts don't bleed scores. `RelixConfig` (the
+  setup wizard's user config) carries a `[confidence]` block
+  through `WizardState::from_prior` / `to_config` so re-running
+  `relix setup` doesn't clobber operator-edited values. 5 new
+  controller_runtime tests verify build_confidence_bundle_from
+  branching, bundle-into-bridge round-trip, and shared-cell
+  VM↔bridge round-trip.
+
+Updated workspace test count: runtime 2345 (was 2316 at first ship,
++29 across GAP 2/3/4), bridge 462, CLI 242, every other crate
+green. Zero failures.
 
 **Shipped this session:**
 
