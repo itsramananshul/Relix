@@ -2192,7 +2192,14 @@ low_action        = "escalate"   # or "retry" or "log"
 
 ---
 
-### 7.20 SKILL.md + AGENTS.md Compatibility `[DONE — commit 0dcad1e]`
+### 7.20 SKILL.md + AGENTS.md Compatibility `[DONE — commit 0dcad1e + follow-up d48dfc4]`
+
+> **GAP-FOLLOWUP (2026-05-29):** GAP 3 in `docs/GAP_REPORT.md` flagged the writer + CLAUDE.md / .cursorrules sub-bullets as missing. Closed in `d48dfc4`:
+> - `discover_claude_md` + `discover_cursor_rules` + `discover_agent_context` + `merge_agent_context` helpers in `relix-runtime/src/nodes/ai/skills.rs`.
+> - `render_stored_skill_md` + `write_stored_skill_md` in `relix-runtime/src/nodes/ai/skill_store.rs` (pure-function renderer + path-aware writer).
+> - `relix skills export --format md` CLI surface; `relix skills list` surfaces every discovered context file (AGENTS.md / CLAUDE.md / .cursorrules) at startup so operators can confirm the AI controller will pick them up.
+> - 9 new unit tests.
+
 
 SKILL.md and AGENTS.md are becoming open standards in 2025/2026, adopted by Claude Code, Cursor, VS Code, OpenAI Codex, and 30+ other tools. Atlassian, Figma, Stripe, and Notion have published skills at launch. If Relix supports these standards, it becomes instantly compatible with the entire emerging agent skill ecosystem.
 
@@ -2697,7 +2704,15 @@ Key features:
 
 ---
 
-### Bi-Temporal Validity on Facts `[SKIPPED — requires schema migration on the layered memory store (add valid_from / valid_to columns + asserted_at vs effective_at), provenance integration, and corpus-snapshot indexing for replay; deferred to a dedicated session]`
+### Bi-Temporal Validity on Facts `[DONE — commit 40c82d4]`
+
+> **GAP-FOLLOWUP (2026-05-29):** GAP 18 in `docs/GAP_REPORT.md` flagged this section as SKIPPED. Closed in `40c82d4`:
+> - `MemoryRecord.superseded_by: Option<String>` schema field + column_exists-guarded migration. `valid_from` / `valid_to` columns already existed.
+> - 17 SELECT column lists updated in lockstep so ordinals match `row_to_record`.
+> - New `LayeredMemoryStore` methods: `supersede(old_id, new_record, at)` (atomic supersede inside one SQLite transaction), `as_of(at, source, limit)` (point-in-time read), `supersedes_chain(start_id)` (forward walk, bounded to 1024 hops).
+> - 7 new unit tests.
+>
+> **Honest deferral:** automatic contradiction-detection write path that calls `supersede` when a new write semantically conflicts with an existing one. The helper is in place; deciding what counts as a contradiction is a separate signal-engineering pass.
 
 The current Qdrant schema uses a single `timestamp` field per record. This is not enough for temporal reasoning.
 
@@ -3889,7 +3904,14 @@ Dashboard PII panel: detection counts by type over time, block events, pseudonym
 ---
 
 
-### 7.29 Reasoning and Decision Engine — Smart Routing, Confidence, Belief Tracking, and Judge Model `[SKIPPED — four sub-components (smart model routing, real confidence measurement via log-prob sampling, belief state tracking, judge model); each is a multi-day build requiring provider-API research (which providers expose log-probs, which expose internal reasoning tokens) + cross-cutting middleware wiring through the AI node and SOL VM; deferred to a dedicated session]`
+### 7.29 Reasoning and Decision Engine — Smart Routing, Confidence, Belief Tracking, and Judge Model `[PARTIAL — `relix models` CLI shipped ac301e4; four core sub-components remain SKIPPED]`
+
+> **GAP-FOLLOWUP (2026-05-29):** GAP 16 in `docs/GAP_REPORT.md` listed the `relix models` CLI as one of five sub-bullets. Closed in `ac301e4`:
+> - `relix models list` → `GET /v1/config/providers` table (provider, configured-status, default-marker, enabled flag, default model, last-test outcome).
+> - `relix models health` → `GET /v1/providers/health` (same table plus aggregate cooldown / quarantine / rate-limit counters).
+> - 4 new unit tests.
+>
+> The four remaining sub-bullets stay SKIPPED for the original multi-day reasons (smart tier routing, three-signal real-confidence measurement, belief state tracking, judge model). Each remains a future dedicated commit.
 
 Four components that make Relix's agents smarter, more reliable, and genuinely trustworthy. Each one works independently but all four together create an agent that thinks carefully, knows what it knows, catches its own mistakes, and never wastes money on unnecessary horsepower.
 
@@ -4252,7 +4274,14 @@ last_fetched              = ""
 ---
 
 
-### 7.30 Identity and Permissions — Credential Lifecycle, Out-of-Band Approval, and Session Identity `[SKIPPED — three "build now" components (out-of-band approval via Telegram/Slack/email, credential lifecycle with rotation + revocation, lightweight session identity tokens) plus two future SPIFFE components. Component 1 partially covered today by the agent-gate + approval flow + telegram /approve wiring (commits e152c62 / dda09f6); full out-of-band-approval expansion, credential rotation policy, and per-session JWT-style identity tokens each require their own cross-cutting cryptographic + policy review and are not single-session deliverables; deferred]`
+### 7.30 Identity and Permissions — Credential Lifecycle, Out-of-Band Approval, and Session Identity `[PARTIAL — always-require allowlist shipped 17bffe8; other three Component-1/2/3 items remain SKIPPED]`
+
+> **GAP-FOLLOWUP (2026-05-29):** GAP 15 in `docs/GAP_REPORT.md` flagged the generic always-require allowlist as missing alongside the SKIPPED items. Closed in `17bffe8`:
+> - `DispatchBridge.always_require_methods: Vec<String>` + setter + predicate; new admission step 8.5 returns `APPROVAL_REQUIRED` with cause `always_require_methods` unless the request carries an `approval_token`. Mirrored on the streaming path.
+> - New `ApprovalSection { always_require_methods }` parsed from `[approval]` in `ControllerConfig`; startup wires the list onto the bridge.
+> - 4 new dispatch tests.
+>
+> The remaining Component-1/2/3 items stay SKIPPED for their original multi-day cryptographic + policy reasons (out-of-band approval delivery matrix across Slack/email/dashboard/mobile push, credential rotation policy with HSM hooks + grace window, per-session JWT-style identity tokens with auto-revoke at session end). Each remains a future dedicated commit.
 
 Three identity and permissions features built in priority order. Two are built now because they're high impact and build naturally on existing infrastructure. One is a lightweight version of a complex concept that gets most of the benefit at a fraction of the complexity. Two more are noted as future work — the right design but the wrong time.
 

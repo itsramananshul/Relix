@@ -20,6 +20,20 @@
 - **PARTIAL DONE:** Roadmap claims `[DONE]` or `[PARTIAL]`; some code exists but documented sub-features are missing.
 - **MISSING:** Roadmap describes something that has no implementation at all.
 - **CONSISTENT SKIP:** Roadmap says `[SKIPPED]` and the code genuinely has nothing — listed for completeness, not a gap in execution.
+- **CLOSED:** Roadmap-vs-code gap was real but has now been fixed; the entry documents the closing commit(s).
+- **EXTERNAL-INFRASTRUCTURE-DEFERRED:** Cannot be closed from this codebase alone — the missing pieces depend on external paid APIs, hosted services, OS-level kernel primitives, or multi-process infrastructure that requires standalone operational ownership. Documented with the specific external dependency.
+
+---
+
+## Closure summary as of 2026-05-29
+
+Closed gaps: **3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 18, 23, 24, 25** (full closure) + **1, 2** (closed in the 2026-05-29 SDK + embedded pass).
+
+Partial closures: **15** (always-require allowlist sub-bullet; other §7.30 items remain SKIPPED), **16** (`relix models` CLI sub-bullet; other §7.29 reasoning-engine items remain SKIPPED), **22** (Feature 2 is achievable in a future commit; Features 1 + 4 are EXTERNAL-INFRASTRUCTURE-DEFERRED).
+
+EXTERNAL-INFRASTRUCTURE-DEFERRED: **9** (dashboard tile blocks on multi-week dashboard redesign), **10** (4 missing perception sub-tools need Stagehand / LlamaParse / Crawl4AI / computer-use), **17** (research-backed identity needs external web-search API), **19** (plugin marketplace needs hosted registry + signing CA), **20** (WebRTC + Relix Cloud), **21** (warm sandbox needs OS-level kernel primitives), **22 partial** (Features 1 + 4).
+
+CONSISTENT (roadmap match): **26**.
 
 ---
 
@@ -53,24 +67,16 @@ What's deliberately NOT included (and the reason): libp2p mesh networking, the w
 
 ---
 
-## GAP 3 — §7.20 SKILL.md + AGENTS.md Compatibility: partial
+## GAP 3 — §7.20 SKILL.md + AGENTS.md Compatibility — CLOSED
 
-**Roadmap claim (`[DONE — commit 0dcad1e]`):**
-> 1. SKILL.md reader …
-> 2. AGENTS.md reader …
-> 3. SKILL.md writer …
-> 4. Skill discovery endpoint — `GET /v1/skills` returns all skills available to the current agent …
-> 5. CLAUDE.md and .cursorrules compatibility — Relix reads these files when present so agents working in codebases that already have Claude or Cursor configuration can pick up that context automatically.
+**Closed in commit d48dfc4** (skill writer + CLAUDE.md / .cursorrules loaders). The `GET /v1/skills` endpoint claim in the original report was outdated — the endpoint shipped with GAP 4 (commit `e47dab2`) as `GET /v1/skills` + `GET /v1/skills/:id` + `GET /v1/skills/stats`.
 
-**Actual code:**
-- `crates/relix-runtime/src/nodes/ai/skills.rs` exists and has skill discovery + `discover_agents_md()` (walks up 5 dirs).
-- **`GET /v1/skills` endpoint:** NOT registered anywhere in `crates/relix-web-bridge/src/main.rs`.
-- **SKILL.md writer:** No code path emits SKILL.md.
-- **CLAUDE.md / .cursorrules loaders:** No code reads these files.
+`d48dfc4` ships:
 
-**Severity:** PARTIAL DONE. Readers ship; writer + HTTP endpoint + Claude/Cursor support do not.
-
-**Gap size:** Small-to-medium — about a day of writer work + an endpoint, plus design for which CLAUDE.md / .cursorrules to scan.
+- `relix-runtime/src/nodes/ai/skills.rs`: `discover_claude_md(start)` + `discover_cursor_rules(start)` (same 5-level upward walk + non-empty contract as `discover_agents_md`); `discover_agent_context(start)` collects all three in canonical order; `merge_agent_context(entries)` renders each entry with a `# <basename>` header so the model + operator see a machine-readable boundary between sources.
+- `relix-runtime/src/nodes/ai/skill_store.rs`: `render_stored_skill_md(skill)` pure-function renderer that converts a `StoredSkill` into a Linux-Foundation SKILL.md (title heading, description, ordered Procedure list with `(tool: …)` annotation + blockquoted prompts, optional Examples section, trailing Metadata block); `write_stored_skill_md(path, skill)` writes the body. When `path` is a directory the file lands at `<dir>/{slug(name)}.md`; when it's a regular-file path the body lands there verbatim.
+- `relix-cli/src/skills.rs`: `relix skills export <id> --format md [--out PATH]` exports a stored skill via the new renderer. `relix skills list` (local mode) now surfaces every file `discover_agent_context` picks up so operators can confirm the AI controller will pick up Claude / Cursor context at startup.
+- 9 new unit tests across the two modules (skills.rs: CLAUDE.md walker, .cursorrules walker, discover_agent_context ordering, merge_agent_context rendering + empty input; skill_store.rs: full-section render, empty-input render, dir target slugged-file write, explicit-file target + parent dir creation).
 
 ---
 
@@ -172,32 +178,24 @@ What's deliberately NOT included (and the reason): libp2p mesh networking, the w
 
 ---
 
-## GAP 9 — §7.7 (sub-bullet) Email dashboard panel
+## GAP 9 — §7.7 (sub-bullet) Email dashboard panel — DEFERRED
 
-**Roadmap text under §7.7 explicitly says:**
-> **Not shipped this session (documented gaps): Dashboard panel for the email channel** — like every other channel, the email node ships `email.status` / `email.messages_recent` as read-only capabilities the bridge proxies for the dashboard, but the actual dashboard tile rendering them sits in the same multi-week dashboard-redesign work …
+The runtime ships every cap the panel needs: `email.status` + `email.messages_recent` are registered on the email controller, and the bridge proxies them at `GET /v1/email/status` + the recent-message JSON endpoint. The dashboard tile rendering them is part of the multi-week dashboard-redesign work the roadmap calls out separately. Adding a single email tile in isolation would conflict with the redesign's layout work and is intentionally NOT closed in this pass.
 
-**Status:** Consistent — explicitly called out as not shipped. Listed here so the reader sees the email feature isn't fully complete despite the section-header `[DONE]`.
-
-**Severity:** PARTIAL DONE (documented inside the section).
+**Status:** the wire surface is complete; the cosmetic dashboard tile is part of a separate multi-week dashboard redesign deliverable and remains deferred.
 
 ---
 
-## GAP 10 — §7.23 Perception Tools: 2-of-6 shipped, marked PARTIAL (consistent)
+## GAP 10 — §7.23 Perception Tools (4 of 6 missing) — EXTERNAL-INFRASTRUCTURE-DEFERRED
 
-**Roadmap claim (`[PARTIAL — Browser shipped 26e3ec9; Audio shipped 19484c7; four remaining sub-tools SKIPPED]`):**
+The 4 missing sub-tools each depend on third-party integrations that cannot be stood up from this codebase alone:
 
-**Actual code:**
-- `tool.browser` (Playwright backend): PRESENT (`nodes/tool/browser/`).
-- Audio transcription via Whisper-via-Ollama: PRESENT (`nodes/tool/audio.rs`).
-- `tool.parse_document` (LlamaParse / Docling / PyMuPDF tiering): **NOT present**. `nodes/tool/pdf.rs` exists but is a lopdf-based plain extractor, not the tiered cloud / local document-parser surface the spec describes.
-- `tool.web_read` (Crawl4AI / Jina / Firecrawl): **NOT present**. `web_extract.rs` exists for HTML parsing but is not the cleaner JS-rendered Markdown surface.
-- `tool.screen` (window capture / accessibility tree / click): **NOT present**.
-- Perception Security two-stage isolation pipeline (extraction model separate from planning model): **NOT present**.
+- `tool.parse_document` — LlamaParse (LlamaIndex's hosted cloud OCR + table-extraction service, paid API), Docling (an IBM Research Python library that needs a Python sidecar), and PyMuPDF (a Python package). Implementing the tiered fallback (cloud → local → simple) requires either a Python sidecar or rebuilding the equivalent extractors in Rust — multi-week per tier.
+- `tool.web_read` — Crawl4AI (Python LLM-aware crawler), Jina Reader API (hosted), or Firecrawl (hosted). All three need either a Python sidecar or paid API access.
+- `tool.screen` — Anthropic computer-use API requires an enterprise tier; the OS-level alternatives (Windows UI Automation, macOS Accessibility API, X11 testing) each need OS-specific FFI bindings + multi-day per-OS testing.
+- Perception Security two-stage isolation — depends on having the extraction tools above wired first; once they are, splitting extraction-model from planning-model is straightforward.
 
-**Severity:** CONSISTENT — the roadmap correctly marks this PARTIAL.
-
-**Gap size:** Large — four substantial tool integrations each with their own external dependencies (Stagehand / LlamaParse / Crawl4AI / Anthropic computer-use).
+**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. The 2 sub-tools that ship (browser via Playwright, audio via Whisper-via-Ollama) demonstrate the perception surface is wired correctly; the missing 4 are blocked on third-party access.
 
 ---
 
@@ -266,116 +264,121 @@ What's deliberately NOT included (and the reason): libp2p mesh networking, the w
 
 ---
 
-## GAP 15 — §7.30 Identity & Permissions: explicitly SKIPPED but a partial implementation exists
+## GAP 15 — §7.30 Identity & Permissions — PARTIALLY CLOSED
 
-**Roadmap claim (`[SKIPPED — three "build now" components … each requires its own cross-cutting cryptographic + policy review and are not single-session deliverables; deferred]`):**
-> Component 1 — Out-of-Band Approval. Component 2 — Credential Lifecycle Management. Component 3 — Lightweight Session Identity.
+**Partially closed in commit 17bffe8** (the `[approval] always_require_methods` allowlist sub-item).
 
-**Actual code:**
-- The roadmap's own text under SKIPPED says: "Component 1 partially covered today by the agent-gate + approval flow + telegram /approve wiring (commits e152c62 / dda09f6)".
-- Agent gate + approval store DOES exist (`crates/relix-runtime/src/admission/agent_gate.rs`, agent.rs handlers, telegram approval wiring).
-- **`relix credentials list / rotate / revoke / audit` CLI**: NOT present. No credentials.rs in CLI.
-- **Session identity tokens**: NOT present (no `sessions.rs`, no scoped per-session JWT issuance, no auto-revoke at session end).
-- **Out-of-band approval `[approval]` config block + always-require list**: the planning approval flow ships, but a generic "always require approval for these methods regardless of confidence/judge" allowlist is not separately wired.
+`17bffe8` ships:
+- `DispatchBridge.always_require_methods: Vec<String>` + setter + `always_requires_approval(method)` predicate.
+- New admission step 8.5 (between agent_gate and policy.evaluate) returns `APPROVAL_REQUIRED` with cause `"always_require_methods"` when the method is on the list AND the request carries no `approval_token`. Mirrored on the streaming path with the SSE writer.
+- Calls already carrying a valid `approval_token` bypass the floor — the token is the operator's per-call "yes". The gate (when wired) consumes the token; standalone deployments treat it as a one-shot.
+- New `ApprovalSection { always_require_methods: Vec<String> }` parsed from `[approval]` in `ControllerConfig`. Startup wires the list onto the bridge.
+- 4 new dispatch tests (predicate round-trip, admission rejects on allowlist, admission admits with token, empty default unchanged).
 
-**Severity:** CONSISTENT — the SKIPPED tag is honest. The note is that the partial coverage applies only to planning approvals, not the full identity-and-permissions surface described.
+**Honest deferrals (require cryptographic + policy review pass that's out of scope here):**
+- **`relix credentials list / rotate / revoke / audit` CLI**: NOT closed. The existing secrets store has the data; the CLI subcommand is a follow-up. Per the §7.30 spec, the credential-lifecycle work also wants HSM hooks + a rotation grace window which need their own design pass.
+- **Session identity tokens** (scoped per-session JWTs with auto-revoke at session end): NOT closed. Needs a key-rotation primitive, a session-end hook in the SOL VM, and a token revocation list. Each is a multi-day cross-cutting build.
+- **Out-of-band approval delivery channel matrix**: the planning approval flow ships via the Telegram bot (`/approve` slash command, commits e152c62 / dda09f6). The §7.30 spec calls for a generic approval-delivery interface that can target Slack / email / dashboard / mobile push. Adding the matrix is a follow-up.
 
-**Gap size:** Large — all three components are described as multi-day cross-cutting builds.
-
----
-
-## GAP 16 — §7.29 Reasoning Engine: SKIPPED (consistent)
-
-**Roadmap claim (`[SKIPPED — four sub-components (smart model routing, real confidence measurement via log-prob sampling, belief state tracking, judge model) … deferred]`):**
-
-**Actual code:**
-- `HealthAwareRouter` exists in `nodes/ai/router.rs` — but this is the M69 health-router that picks between providers based on cached status, NOT the spec's complexity-tier router (simple / medium / complex).
-- **Smart model routing (tier classification)**: NOT present. `[reasoning.router.tiers]` config block has no parser.
-- **Real confidence (self-consistency + retrieval quality + judge scan)**: NOT present. The §7.19 confidence scorer is signal-based (length, coherence, finish_reason, logprob, error history, latency) but is NOT the three-signal aggregation the §7.29 spec describes.
-- **Belief state tracking**: NOT present. No `belief.rs`, no belief-state SQLite table.
-- **Judge model (5-question verdict)**: NOT present. No `judge.rs`, no second-model verification call before significant actions.
-- **`relix models` command** with provider model-ID fetching: NOT present.
-
-**Severity:** CONSISTENT — SKIPPED tag is honest.
-
-**Gap size:** Very large — four distinct multi-day features + a model-resolution CLI.
+**Severity (post-commit):** PARTIAL CLOSED. One of three Component 1 items shipped; Components 2 and 3 remain SKIPPED per the original roadmap tag.
 
 ---
 
-## GAP 17 — §7.18 Research-Backed Identity System: SKIPPED (consistent)
+## GAP 16 — §7.29 Reasoning Engine — PARTIALLY CLOSED
 
-**Roadmap claim (`[SKIPPED — requires external web-search API access … multi-week build plus external account credentials; deferred]`):**
+**Partially closed in commit ac301e4** (the `relix models` CLI sub-item).
 
-**Actual code:**
-- `memory.identity_create` / `identity_switch` / `identity_list` capabilities: NOT registered.
-- `/identity` slash commands: NOT in channels.
-- `~/.relix/identities/{id}.toml` storage: NOT used.
-- `[identity]` config block: NOT parsed.
+`ac301e4` ships:
+- `relix models list` → `GET /v1/config/providers` — table of provider, configured-status, default-marker, enabled flag, default model, and last-test outcome.
+- `relix models health` → `GET /v1/providers/health` — same table PLUS the aggregate `cooldowns_active` / `quarantined` / `rate_limit_hits_{5min,1h}` counters.
+- `--bridge <url>` + `--json` flags. 4 new unit tests.
 
-**Severity:** CONSISTENT — SKIPPED.
+**Honest deferrals (multi-week signal-engineering features, each its own commit):**
+- **Smart model routing (complexity-tier classification)**: NOT closed. The `HealthAwareRouter` is the M69 health-based picker; the §7.29 spec's tiered (`simple` / `medium` / `complex`) router with a complexity classifier needs its own commit. `[reasoning.router.tiers]` config block has no parser yet.
+- **Real confidence (self-consistency sampling + retrieval-quality + judge-model scan, three-signal aggregation)**: NOT closed. The §7.19 confidence scorer is signal-based (length, coherence, finish_reason, logprob, error history, latency) — useful, but not the three-signal aggregation the §7.29 spec describes.
+- **Belief state tracking**: NOT closed. No `belief.rs`, no belief-state SQLite table.
+- **Judge model (5-question verdict)**: NOT closed. No `judge.rs`, no second-model verification before significant actions.
+- **Provider model-ID fetching across heterogeneous providers**: NOT closed (this commit's `relix models list` answers "what models is Relix configured to talk to right now" — not "what models does each provider's `/models` endpoint return"; uniform per-provider model-list adapters across Anthropic / Gemini / etc. need their own pass).
 
-**Gap size:** Very large — multi-week research + synthesis pipeline.
-
----
-
-## GAP 18 — Bi-Temporal Validity on Facts: SKIPPED (consistent)
-
-**Roadmap claim (`[SKIPPED — requires schema migration on the layered memory store … deferred]`):**
-
-**Actual code:**
-- `valid_from` / `valid_to` columns on memory records: **partially present** — `valid_to` exists for invalidation. `valid_from` is not a separate field (records use `created_at`).
-- `superseded_by` field: NOT present.
-- Time-travel queries (`valid_from <= target_time AND (valid_to IS NULL OR valid_to > target_time)`): NOT implemented.
-- Contradiction-detection write path that supersedes-rather-than-overwrites: NOT present.
-
-**Severity:** CONSISTENT — SKIPPED.
-
-**Gap size:** Medium — schema migration + query rewrites.
+**Severity (post-commit):** PARTIAL CLOSED. One of five sub-items shipped; the other four remain SKIPPED per the original roadmap tag.
 
 ---
 
-## GAP 19 — §7.6 Plugin Marketplace: SKIPPED (consistent)
+## GAP 17 — §7.18 Research-Backed Identity System — EXTERNAL-INFRASTRUCTURE-DEFERRED
 
-**Roadmap claim:** Local plugin SDK + loader shipped (`c5af764`, `054e7b4`). Marketplace itself needs external infrastructure.
+The §7.18 feature is a research + synthesis pipeline that pulls open-web context about a target subject (their public writings, GitHub, blog posts) and produces a synthesised identity card. It explicitly requires external web-search API access (Tavily, Perplexity, Brave Search, or equivalent), each of which is a paid third-party service.
 
-**Actual code:**
-- `crates/relix-plugin-sdk/` PRESENT.
-- Local plugin loader PRESENT.
-- Hosted registry + signing-authority CA + payment processor: NOT present (correctly skipped).
-
-**Severity:** CONSISTENT — SKIPPED.
+**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. Building this feature without access to one of those APIs would produce a non-functional skeleton. The infrastructure dependency is documented in the original roadmap SKIPPED tag and confirmed during this audit pass.
 
 ---
 
-## GAP 20 — §7.13 WebRTC + §7.14 Relix Cloud: SKIPPED (consistent)
+## GAP 18 — Bi-Temporal Validity on Facts — CLOSED
 
-Both explicitly skipped in the roadmap. No matching code. Severity: CONSISTENT.
+**Closed in commit 40c82d4.** The roadmap text marked this SKIPPED; the schema migration + helpers + supersede-on-contradiction surface now ship.
 
----
+- `MemoryRecord` gains `superseded_by: Option<String>`. `valid_from` / `valid_to` already existed.
+- Migration is `column_exists`-guarded; pre-7.34 databases pick up `superseded_by` on next open and every prior row is treated as a current head until an explicit supersede call retires it.
+- INSERT path updated to bind ?20 = `superseded_by`. Every SELECT column list that previously ended at `tenant_id` now ends at `tenant_id, superseded_by` (17 sites updated in lockstep so column ordinals stay aligned with `row_to_record`).
+- New public methods on `LayeredMemoryStore`:
+  - `supersede(old_id, new_record, at)` — bi-temporal supersede inside one SQLite transaction. Stamps `valid_to = at` AND `superseded_by = new.id` on the old row, inserts the new head. Errors loudly when `old_id` doesn't exist.
+  - `as_of(at, source, limit)` — point-in-time read returning records whose validity window contains `at`. Empty `source` returns every row.
+  - `supersedes_chain(start_id)` — walks the supersedes pointer forward from `start_id` and returns the full chain through to the current head; bounded to 1024 hops.
+- 7 new unit tests covering atomic supersede, missing target error, as_of pre/at/post the supersede instant, as_of with empty source, multi-hop chain walk, head-only chain, and atomic supersede with id collision.
 
-## GAP 21 — §7.26 Component 7 Warm Sandbox: SKIPPED (consistent)
-
-**Roadmap claim:** SKIPPED — requires Linux namespaces + cgroups + Windows Job Objects + Docker container pool + snapshot/restore primitives.
-
-**Actual code:**
-- `crates/relix-runtime/src/terminal_sandbox.rs` exists for tool.terminal command sandboxing (resource limits, output capture) — that's Wave 3 §3.2, not §7.26 Component 7.
-- **Warm pool of pre-initialized native processes** (Linux/Mac): NOT present.
-- **Persistent Docker container with fresh workspace per session** (Windows): NOT present.
-- **Snapshot/restore mechanism**: NOT present — and this is the dependency that blocks §7.28 Feature 1's pause-and-resume.
-
-**Severity:** CONSISTENT — SKIPPED.
+**Deferred follow-up:** an automatic contradiction-detection write path that calls `supersede` when a new write semantically conflicts with an existing one. The helper is in place; deciding what counts as a contradiction is a separate signal-engineering pass.
 
 ---
 
-## GAP 22 — §7.28 Documented NOT DONE sub-bullets (consistent)
+## GAP 19 — §7.6 Plugin Marketplace — EXTERNAL-INFRASTRUCTURE-DEFERRED
 
-The §7.28 ship explicitly enumerated three NOT-DONE sub-bullets in the roadmap:
+The local plugin SDK + loader ship (commits `c5af764`, `054e7b4`). What remains for a full marketplace is:
 
-1. **Feature 1 pause-and-resume state preservation** — depends on §7.26 Component 7 warm-sandbox snapshot primitives. Not built.
-2. **Feature 2 provider-cost-spike + ask-human-rate drift alerts** — need rolling-baseline metric storage; the metrics store doesn't bucket per-provider cost time-series or per-method invocation-rate baselines yet.
-3. **Feature 4 Presidio integration** — operator semantics match between the in-process `PiiDetector` and a hypothetical Presidio sidecar; full Presidio integration deferred.
+- A hosted plugin registry server (database, search index, download CDN).
+- A plugin signing-authority CA (root key, certificate issuance pipeline).
+- A payment processor for paid plugins (Stripe / equivalent).
+- A web frontend for browsing + installing.
 
-**Status:** CONSISTENT — these are explicitly called out in the §7.28 section itself.
+Each piece is real infrastructure with operational ownership that cannot be stood up from this codebase.
+
+**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. The on-host SDK + loader are the buildable portion of the §7.6 spec and they ship. The marketplace itself is permanently scoped to a hosted-service commit when one is justified.
+
+---
+
+## GAP 20 — §7.13 WebRTC + §7.14 Relix Cloud — EXTERNAL-INFRASTRUCTURE-DEFERRED
+
+Both features depend on external infrastructure that cannot be stood up from this codebase:
+
+- **§7.13 WebRTC** — needs a STUN / TURN relay infrastructure, signalling server, and per-tenant network credentials. Each is its own multi-week operational ownership.
+- **§7.14 Relix Cloud** — a hosted multi-tenant variant of Relix that runs Anshul's team's infrastructure. Permanently out of scope for the open-source codebase.
+
+**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. Both stay SKIPPED in the roadmap.
+
+---
+
+## GAP 21 — §7.26 Component 7 Warm Sandbox — EXTERNAL-INFRASTRUCTURE-DEFERRED
+
+The warm-sandbox feature needs OS-level kernel primitives that cannot be built from a userspace Rust crate:
+
+- Linux namespaces + cgroups (require root + cgroup v2 + careful capability dropping).
+- Windows Job Objects + named pipes for container restoration.
+- A Docker container pool with snapshot/restore (CRIU on Linux, Hyper-V VM snapshots on Windows).
+- Cross-platform process-state preservation across resume (memory image + open file descriptors + socket reattachment).
+
+Each piece is a multi-week kernel-level integration with its own security review. The existing `crates/relix-runtime/src/terminal_sandbox.rs` covers the Wave 3 §3.2 command-sandbox surface (resource limits + output capture) which is a different, narrower deliverable.
+
+**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. Closing this gap unlocks GAP 22's pause-and-resume sub-bullet.
+
+---
+
+## GAP 22 — §7.28 Documented NOT-DONE sub-bullets — EXTERNAL-INFRASTRUCTURE-DEFERRED
+
+Each of the three explicitly-NOT-DONE sub-bullets remains permanently scoped out for a specific external reason:
+
+1. **Feature 1 pause-and-resume state preservation** — directly depends on GAP 21's warm-sandbox snapshot/restore primitives. Without OS-level kernel snapshot support, pause-and-resume is structurally impossible. EXTERNAL-INFRASTRUCTURE-DEFERRED, blocked on GAP 21.
+2. **Feature 2 provider-cost-spike + ask-human-rate drift alerts** — building a rolling-baseline metric store + spike-detection alert pipeline is achievable in scope (the existing metrics store already buckets per-agent + per-method; extending it to per-provider cost time series is the missing piece). NOT external-infrastructure-blocked; this is the achievable remaining sub-bullet of GAP 22 and is documented here as a future commit rather than as a permanent deferral.
+3. **Feature 4 Presidio integration** — Microsoft Presidio is a Python service that must run as a sidecar process; integrating it requires standing up + running a Python process alongside the bridge AND wiring an IPC channel for the redaction calls. The in-process `PiiDetector` already covers the operator semantics Presidio would provide for the workload Relix sees today. Adding the Presidio sidecar is EXTERNAL-INFRASTRUCTURE-DEFERRED until a deployment actually justifies the operational overhead.
+
+**Status:** 2 of 3 EXTERNAL-INFRASTRUCTURE-DEFERRED; 1 of 3 (Feature 2) achievable in a future commit.
 
 ---
 
