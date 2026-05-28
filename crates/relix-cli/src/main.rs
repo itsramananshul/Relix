@@ -28,6 +28,7 @@ mod ping;
 mod planning;
 mod provenance;
 mod router;
+mod sessions;
 mod setup;
 mod skills;
 mod sol;
@@ -293,6 +294,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: provenance::Cmd,
     },
+    /// GAP 24: two-sink session debugger. `relix sessions
+    /// list` lists sessions (optionally filtered by
+    /// `--agent` / `--status`); `… show <id>` prints the
+    /// timeline (`--full --elevated` also pulls each event's
+    /// content body); `… search --query Q` substring-matches
+    /// session_id + agent_id.
+    Sessions {
+        #[command(subcommand)]
+        cmd: sessions::Cmd,
+    },
     /// GAP 11 + 12: transactional gateway + evidence inspector.
     /// `relix execution rollback <transaction_id>` undoes a
     /// transaction; `relix execution transaction <id>` prints
@@ -474,6 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Eval { cmd } => eval::run(cmd).await,
         Cmd::Execution { cmd } => execution::run(cmd).await,
         Cmd::Provenance { cmd } => provenance::run(cmd).await,
+        Cmd::Sessions { cmd } => sessions::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
         Cmd::Ping {
             peer,
