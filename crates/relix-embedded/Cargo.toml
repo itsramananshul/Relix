@@ -1,0 +1,30 @@
+[package]
+name = "relix-embedded"
+description = "Embed Relix AI agent + four-layer memory in-process with zero external binary dependencies. Wraps the existing relix-runtime memory store + provider trait so an external Rust app gets chat + memory without standing up the full libp2p mesh + web bridge."
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[dependencies]
+relix-core = { path = "../relix-core" }
+relix-runtime = { path = "../relix-runtime" }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
