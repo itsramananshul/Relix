@@ -228,6 +228,17 @@ pub struct MemoryRecord {
     /// deployments byte-identical to pre-GAP-23 behaviour.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// GAP 18: id of the record that supersedes this one.
+    /// `None` on the current head; populated when
+    /// [`LayeredMemoryStore::supersede`] retires this record in
+    /// favour of a new one (typically a contradicting Layer-3
+    /// observation). The pair forms a bi-temporal chain — the
+    /// retired row keeps its original `valid_from`, gets
+    /// `valid_to = now`, and points forward; the new row
+    /// inherits `valid_from = now` and has
+    /// `superseded_by = None` until it too is superseded.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 impl MemoryRecord {
@@ -261,6 +272,7 @@ impl MemoryRecord {
             last_edited_ms: None,
             consolidated: false,
             tenant_id: None,
+            superseded_by: None,
         }
     }
 }
@@ -354,8 +366,8 @@ impl LayeredMemoryStore {
             "INSERT OR REPLACE INTO memory_records \
              (id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
               shareable, shared_with, shared_by, share_policy, \
-              source_trust, frozen, last_edited_ms, consolidated, tenant_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+              source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 record.id,
                 record.layer.as_str(),
@@ -376,6 +388,7 @@ impl LayeredMemoryStore {
                 record.last_edited_ms,
                 record.consolidated as i32,
                 record.tenant_id,
+                record.superseded_by,
             ],
         )?;
         Ok(())
@@ -515,7 +528,7 @@ impl LayeredMemoryStore {
             .query_row(
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records WHERE id = ?1",
                 params![id],
                 row_to_record,
@@ -542,7 +555,7 @@ impl LayeredMemoryStore {
             (None, None) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -551,7 +564,7 @@ impl LayeredMemoryStore {
             (Some(l), None) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records WHERE layer = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -560,7 +573,7 @@ impl LayeredMemoryStore {
             (None, Some(s)) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records WHERE source = ?3 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -569,7 +582,7 @@ impl LayeredMemoryStore {
             (Some(l), Some(s)) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records WHERE layer = ?3 AND source = ?4 \
                  ORDER BY created_at DESC, id ASC \
                  LIMIT ?1 OFFSET ?2",
@@ -607,7 +620,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records WHERE text LIKE ?1 ESCAPE '\\' \
              ORDER BY created_at DESC, id ASC \
              LIMIT ?2",
@@ -633,6 +646,166 @@ impl LayeredMemoryStore {
         Ok(())
     }
 
+    /// GAP 18: bi-temporal supersede. Retires `old_id` at
+    /// timestamp `at` (stamps `valid_to = at` AND
+    /// `superseded_by = new.id`) and inserts `new_record` as
+    /// the new head. The two writes happen inside one SQLite
+    /// transaction so a crash mid-supersede never leaves the
+    /// chain in a half-retired state.
+    ///
+    /// Use this instead of [`Self::insert`] + [`Self::invalidate`]
+    /// when a fact has *changed* and the host wants the audit
+    /// trail to preserve the prior assertion. The
+    /// [`Self::as_of`] helper relies on the
+    /// `(valid_from, valid_to)` interval to surface the
+    /// correct historical row.
+    ///
+    /// Returns `Err(LayeredMemoryError::Serialization)` when
+    /// the old record does not exist; this surfaces config
+    /// bugs (writing a supersede against a vanished row)
+    /// rather than silently inserting an orphan.
+    pub fn supersede(
+        &self,
+        old_id: &str,
+        new_record: &MemoryRecord,
+        at: i64,
+    ) -> Result<(), LayeredMemoryError> {
+        let mut conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
+            "UPDATE memory_records \
+             SET valid_to = ?1, superseded_by = ?2 \
+             WHERE id = ?3",
+            params![at, new_record.id, old_id],
+        )?;
+        if updated == 0 {
+            return Err(LayeredMemoryError::Serialization(format!(
+                "supersede target {old_id:?} does not exist"
+            )));
+        }
+        let tags_json = serde_json::to_string(&new_record.tags)
+            .map_err(|e| LayeredMemoryError::Serialization(e.to_string()))?;
+        let shared_with_json = if new_record.shared_with.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&new_record.shared_with)
+                    .map_err(|e| LayeredMemoryError::Serialization(e.to_string()))?,
+            )
+        };
+        let embedding_blob = new_record.embedding.as_ref().map(|v| encode_f32_le(v));
+        tx.execute(
+            "INSERT OR REPLACE INTO memory_records \
+             (id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+              shareable, shared_with, shared_by, share_policy, \
+              source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                new_record.id,
+                new_record.layer.as_str(),
+                new_record.text,
+                new_record.source,
+                tags_json,
+                new_record.created_at,
+                new_record.valid_from,
+                new_record.valid_to,
+                new_record.observed_at,
+                embedding_blob,
+                new_record.shareable as i32,
+                shared_with_json,
+                new_record.shared_by,
+                new_record.share_policy.as_str(),
+                new_record.source_trust.as_str(),
+                new_record.frozen as i32,
+                new_record.last_edited_ms,
+                new_record.consolidated as i32,
+                new_record.tenant_id,
+                new_record.superseded_by,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// GAP 18: bi-temporal point-in-time read.
+    ///
+    /// Returns every record whose validity window contains
+    /// `at` — i.e. `valid_from <= at AND (valid_to IS NULL OR
+    /// valid_to > at)`. Optionally narrows to one `source`
+    /// (passing an empty string disables the source filter).
+    /// Results are ordered by `observed_at DESC` so the most
+    /// recent assertion within the window appears first.
+    pub fn as_of(
+        &self,
+        at: i64,
+        source: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut out = Vec::new();
+        if source.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                        shareable, shared_with, shared_by, share_policy, \
+                        source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+                 FROM memory_records \
+                 WHERE valid_from <= ?1 AND (valid_to IS NULL OR valid_to > ?1) \
+                 ORDER BY observed_at DESC, id ASC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![at, limit], row_to_record)?;
+            for r in rows {
+                out.push(r??);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                        shareable, shared_with, shared_by, share_policy, \
+                        source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+                 FROM memory_records \
+                 WHERE source = ?1 AND valid_from <= ?2 AND (valid_to IS NULL OR valid_to > ?2) \
+                 ORDER BY observed_at DESC, id ASC \
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![source, at, limit], row_to_record)?;
+            for r in rows {
+                out.push(r??);
+            }
+        };
+        Ok(out)
+    }
+
+    /// GAP 18: walk the supersedes chain forward from
+    /// `start_id`, returning every record id from the start
+    /// through the current head. Each step follows the
+    /// `superseded_by` pointer until a record with no
+    /// successor (the head) is reached or a cycle is
+    /// detected. Cycles short-circuit by walk length cap
+    /// (1024) so a corrupt chain can't lock the call up.
+    pub fn supersedes_chain(&self, start_id: &str) -> Result<Vec<String>, LayeredMemoryError> {
+        const MAX_HOPS: usize = 1024;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut current = start_id.to_string();
+        let mut out: Vec<String> = vec![current.clone()];
+        for _ in 0..MAX_HOPS {
+            let mut stmt =
+                conn.prepare("SELECT superseded_by FROM memory_records WHERE id = ?1")?;
+            let next: Option<String> = stmt
+                .query_row(params![current], |r| r.get::<_, Option<String>>(0))
+                .ok()
+                .flatten();
+            match next {
+                Some(n) if !n.is_empty() && n != current => {
+                    out.push(n.clone());
+                    current = n;
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// RELIX-7.16 GAP 1: fetch a batch of Layer 3 observations
     /// that don't carry a `quality:<f>` tag yet. Used by the
     /// background `MemoryQualityScorer` task. The records are
@@ -656,7 +829,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records \
              WHERE layer = 'observation' \
                AND tags NOT LIKE '%\"quality:%' \
@@ -709,7 +882,7 @@ impl LayeredMemoryStore {
             .query_row(
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records WHERE layer = ?1 AND source = ?2 \
                  ORDER BY observed_at DESC, id ASC LIMIT 1",
                 params![layer.as_str(), source],
@@ -831,7 +1004,7 @@ impl LayeredMemoryStore {
             Some(l) => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                         shareable, shared_with, shared_by, share_policy, \
-                        source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                        source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records WHERE source = ?1 AND layer = ?2 \
                  ORDER BY observed_at ASC, id ASC",
                 vec![source.to_string().into(), l.as_str().to_string().into()],
@@ -839,7 +1012,7 @@ impl LayeredMemoryStore {
             None => (
                 "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                         shareable, shared_with, shared_by, share_policy, \
-                        source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                        source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
                  FROM memory_records WHERE source = ?1 \
                  ORDER BY observed_at ASC, id ASC",
                 vec![source.to_string().into()],
@@ -869,7 +1042,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records \
              WHERE layer = ?1 \
                AND frozen = 0 \
@@ -902,7 +1075,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records \
              WHERE layer = 'raw' \
                AND consolidated = 0 \
@@ -945,7 +1118,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records \
              WHERE layer = 'observation' \
                AND (source IS NULL OR source = '') \
@@ -974,7 +1147,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records r \
              WHERE r.layer = 'observation' \
                AND r.observed_at < ?1 \
@@ -1008,7 +1181,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records m \
              WHERE m.layer = 'model' \
                AND m.valid_to IS NULL \
@@ -1133,7 +1306,7 @@ impl LayeredMemoryStore {
         let mut stmt = conn.prepare(
             "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
                     shareable, shared_with, shared_by, share_policy, \
-                    source_trust, frozen, last_edited_ms, consolidated, tenant_id \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
              FROM memory_records \
              WHERE embedding IS NULL \
              ORDER BY observed_at ASC, id ASC \
@@ -1230,6 +1403,18 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     if !column_exists(conn, "memory_records", "tenant_id")? {
         conn.execute("ALTER TABLE memory_records ADD COLUMN tenant_id TEXT", [])?;
     }
+    // GAP 18: bi-temporal supersedes pointer. NULL on the
+    // current head of every fact chain; non-NULL on retired
+    // rows pointing forward to the row that replaced them.
+    // Pre-7.34 databases get a clean migration — every prior
+    // row is treated as a current head until / unless an
+    // explicit supersede call retires it.
+    if !column_exists(conn, "memory_records", "superseded_by")? {
+        conn.execute(
+            "ALTER TABLE memory_records ADD COLUMN superseded_by TEXT",
+            [],
+        )?;
+    }
     // Step 3: 7.16 indexes. Always issued with IF NOT EXISTS
     // so they're idempotent across both fresh and migrated
     // databases.
@@ -1312,6 +1497,11 @@ fn row_to_record(
     // GAP 23: optional tenant_id column. NULL means "default
     // tenant" (single-tenant deployments).
     let tenant_id: Option<String> = r.get(18).unwrap_or(None);
+    // GAP 18: bi-temporal supersedes pointer. NULL on the
+    // current head of the chain; populated on retired rows.
+    // `.unwrap_or(None)` because the migration column may not
+    // exist on a future read path that selects fewer columns.
+    let superseded_by: Option<String> = r.get(19).unwrap_or(None);
     Ok((|| {
         let layer = MemoryLayer::parse(&layer_s).ok_or_else(|| {
             LayeredMemoryError::Serialization(format!("unknown layer: {layer_s}"))
@@ -1351,6 +1541,7 @@ fn row_to_record(
             last_edited_ms,
             consolidated: consolidated != 0,
             tenant_id,
+            superseded_by,
         })
     })())
 }
@@ -1413,6 +1604,151 @@ mod tests {
             assert_eq!(format!("{l}"), l.as_str());
         }
         assert!(MemoryLayer::parse("not-a-layer").is_none());
+    }
+
+    // ---- GAP 18: bi-temporal validity tests ---------------
+
+    fn stamped_record(id: &str, text: &str, source: &str, ts: i64) -> MemoryRecord {
+        let mut r = record(id, MemoryLayer::Observation, text, source);
+        r.created_at = ts;
+        r.valid_from = ts;
+        r.observed_at = ts;
+        r
+    }
+
+    #[test]
+    fn supersede_marks_old_row_and_inserts_new_head_atomically() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        let old = stamped_record("a", "user lives in NY", "user.alice", 100);
+        store.insert(&old).unwrap();
+        let new = stamped_record("b", "user lives in SF", "user.alice", 200);
+        store.supersede("a", &new, 200).unwrap();
+
+        // a now points to b with valid_to = 200; b is head.
+        let chain = store.supersedes_chain("a").unwrap();
+        assert_eq!(chain, vec!["a".to_string(), "b".to_string()]);
+
+        // The stored a row carries the supersedes pointer.
+        let all = store.text_search("user lives", 10).unwrap();
+        let a_row = all.iter().find(|r| r.id == "a").expect("a still present");
+        assert_eq!(a_row.superseded_by.as_deref(), Some("b"));
+        assert_eq!(a_row.valid_to, Some(200));
+        let b_row = all.iter().find(|r| r.id == "b").expect("b inserted");
+        assert!(b_row.superseded_by.is_none());
+        assert!(b_row.valid_to.is_none());
+    }
+
+    #[test]
+    fn supersede_errors_when_target_does_not_exist() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        let new = stamped_record("b", "x", "src", 200);
+        let err = store
+            .supersede("nope", &new, 200)
+            .expect_err("missing target");
+        assert!(format!("{err}").contains("nope"));
+    }
+
+    #[test]
+    fn as_of_returns_only_records_valid_at_the_query_timestamp() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        let old = stamped_record("a", "fact1", "src", 100);
+        store.insert(&old).unwrap();
+        let new = stamped_record("b", "fact2", "src", 300);
+        store.supersede("a", &new, 300).unwrap();
+
+        // At t=150 only `a` was valid.
+        let pre = store.as_of(150, "src", 10).unwrap();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0].id, "a");
+
+        // At t=300, `a` has been retired (valid_to = 300 is
+        // strict ">") and `b` is now head.
+        let mid = store.as_of(300, "src", 10).unwrap();
+        assert!(mid.iter().any(|r| r.id == "b"));
+        assert!(!mid.iter().any(|r| r.id == "a"));
+
+        // At t=999, only `b` is valid.
+        let post = store.as_of(999, "src", 10).unwrap();
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0].id, "b");
+    }
+
+    #[test]
+    fn as_of_with_empty_source_returns_every_row_in_the_window() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        store
+            .insert(&stamped_record("a", "x", "src1", 100))
+            .unwrap();
+        store
+            .insert(&stamped_record("b", "y", "src2", 110))
+            .unwrap();
+        let rows = store.as_of(200, "", 10).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn supersedes_chain_walks_multi_hop_history() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        store
+            .insert(&stamped_record("a", "v1", "src", 100))
+            .unwrap();
+        store
+            .supersede("a", &stamped_record("b", "v2", "src", 200), 200)
+            .unwrap();
+        store
+            .supersede("b", &stamped_record("c", "v3", "src", 300), 300)
+            .unwrap();
+        store
+            .supersede("c", &stamped_record("d", "v4", "src", 400), 400)
+            .unwrap();
+        let chain = store.supersedes_chain("a").unwrap();
+        assert_eq!(
+            chain,
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn supersedes_chain_handles_uninvolved_head_record() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        store
+            .insert(&stamped_record("solo", "alone", "src", 100))
+            .unwrap();
+        let chain = store.supersedes_chain("solo").unwrap();
+        assert_eq!(chain, vec!["solo".to_string()]);
+    }
+
+    #[test]
+    fn supersede_is_atomic_when_new_record_violates_index() {
+        // Inserting the new record with the SAME id as an
+        // unrelated existing row still succeeds because the
+        // INSERT path uses OR REPLACE. The transaction
+        // ensures the old row's valid_to is set even when the
+        // new id collides with an existing one.
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        store
+            .insert(&stamped_record("a", "v1", "src", 100))
+            .unwrap();
+        store
+            .insert(&stamped_record("c", "preexisting c", "src", 110))
+            .unwrap();
+        let new = stamped_record("c", "supersedes a", "src", 200);
+        store.supersede("a", &new, 200).unwrap();
+        // a got valid_to = 200 + superseded_by = c.
+        let all = store.text_search("supersedes", 10).unwrap();
+        assert!(all.iter().any(|r| r.id == "c"));
+        let a_row = store
+            .text_search("v1", 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "a")
+            .expect("a present");
+        assert_eq!(a_row.superseded_by.as_deref(), Some("c"));
     }
 
     #[test]

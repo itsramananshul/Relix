@@ -883,6 +883,10 @@ fn build_copy(source: &MemoryRecord, target: &str, message: Option<&str>) -> Mem
         // operator action and is not implicit in the broadcast
         // path.
         tenant_id: source.tenant_id.clone(),
+        // GAP 18: a freshly-cloned share starts a new fact
+        // chain on the receiver — it isn't superseding
+        // anything on this side of the wire.
+        superseded_by: None,
     }
 }
 

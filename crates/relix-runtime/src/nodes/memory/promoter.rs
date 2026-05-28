@@ -563,6 +563,10 @@ fn build_promoted_record(
         // consistent across the Raw → Semantic → Observation
         // → Model promotion chain.
         tenant_id: parent.tenant_id.clone(),
+        // GAP 18: a freshly-promoted record starts its own
+        // bi-temporal chain. Supersedes is a per-fact
+        // pointer, not a layer-promotion concept.
+        superseded_by: None,
     }
 }
 
