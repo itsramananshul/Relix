@@ -4183,6 +4183,89 @@ pub(crate) fn build_access_broker(
 // section. Returns `Some(cfg)` only when `enabled = true`; an
 // absent / disabled config returns `None` so the coordinator's
 // drift hook short-circuits immediately.
+/// GAP 4: parse `[skills]` and (when enabled) construct the
+/// auto-skill extractor wrapping the local ChatProvider.
+///
+/// Returns `None` when:
+/// - `[skills]` is absent / fails to parse.
+/// - `[skills] enabled = false`.
+/// - `[skills] auto_extract = false` (the store + caps are
+///   still wired downstream, just no post-`ai.chat` hook).
+/// - `db_path` is missing.
+///
+/// The returned extractor wraps a [`crate::nodes::ai::skill_extractor::LocalProviderAiDispatcher`]
+/// so the synthesis call goes straight to the provider (no
+/// libp2p hop, no recursion through the AI handler).
+fn build_skill_extractor(
+    raw: &Option<toml::Value>,
+    provider: std::sync::Arc<dyn crate::nodes::ai::provider::ChatProvider>,
+    default_model: &str,
+) -> Option<std::sync::Arc<crate::nodes::ai::skill_extractor::SkillExtractor>> {
+    use crate::nodes::ai::skill_extractor::{
+        LocalProviderAiDispatcher, LocalProviderEmbedDispatcher, SkillExtractor,
+        SkillExtractorConfig,
+    };
+    use crate::nodes::ai::skill_store::SkillStore;
+    use crate::nodes::ai::skills::SkillsConfig;
+    use crate::nodes::memory::curator::{AiDispatcher, EmbeddingDispatcher};
+    let raw = raw.clone()?;
+    let cfg: SkillsConfig = match raw.try_into() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "[skills] parse failed; skill extractor disabled");
+            return None;
+        }
+    };
+    if !cfg.enabled || !cfg.auto_extract {
+        return None;
+    }
+    let db_path = match cfg.db_path.as_ref() {
+        Some(p) => p.clone(),
+        None => {
+            tracing::warn!("[skills] enabled = true but db_path missing; skill extractor disabled");
+            return None;
+        }
+    };
+    let store = match SkillStore::open(&db_path) {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %db_path.display(), "[skills] open store failed");
+            return None;
+        }
+    };
+    let extraction_model = cfg
+        .extraction_model
+        .clone()
+        .unwrap_or_else(|| default_model.to_string());
+    let ai_dispatcher: std::sync::Arc<dyn AiDispatcher> = std::sync::Arc::new(
+        LocalProviderAiDispatcher::new(provider.clone(), extraction_model.clone()),
+    );
+    let embed_dispatcher: std::sync::Arc<dyn EmbeddingDispatcher> =
+        std::sync::Arc::new(LocalProviderEmbedDispatcher::new(provider.clone()));
+    let ai_cell: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<dyn AiDispatcher>>> =
+        std::sync::Arc::new(tokio::sync::OnceCell::new());
+    let _ = ai_cell.set(ai_dispatcher);
+    let embed_cell: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<dyn EmbeddingDispatcher>>> =
+        std::sync::Arc::new(tokio::sync::OnceCell::new());
+    let _ = embed_cell.set(embed_dispatcher);
+    let default_embedding = SkillExtractorConfig::default().embedding_model;
+    let ex_cfg = SkillExtractorConfig {
+        extraction_model: extraction_model.clone(),
+        min_complexity_score: cfg.min_complexity_score,
+        dup_threshold: cfg.dup_threshold,
+        embedding_model: cfg.embedding_model.clone().unwrap_or(default_embedding),
+        ..SkillExtractorConfig::default()
+    };
+    let extractor = SkillExtractor::new(store, ai_cell, embed_cell, ex_cfg);
+    tracing::info!(
+        path = %db_path.display(),
+        min_complexity = cfg.min_complexity_score,
+        dup_threshold = cfg.dup_threshold,
+        "skill extractor: enabled"
+    );
+    Some(std::sync::Arc::new(extractor))
+}
+
 fn build_drift_config(cfg: &ControllerConfig) -> Option<crate::nodes::ai::guardrails::DriftConfig> {
     use crate::nodes::ai::guardrails::DriftConfig;
     let raw = cfg.guardrails.clone()?;
@@ -5001,6 +5084,12 @@ fn register_node_type_handlers(
                 std::sync::Arc<dyn crate::nodes::ai::execution::ToolMeshDispatcher>,
             >,
         > = std::sync::Arc::new(tokio::sync::OnceCell::new());
+        // GAP 4: build the skill extractor when `[skills]` config
+        // enables auto-extraction. The extractor wraps the local
+        // provider via a `LocalProviderAiDispatcher` so the
+        // synthesis call never round-trips through libp2p (which
+        // would also re-enter the same handler and recurse).
+        let skill_extractor = build_skill_extractor(&cfg.skills, provider.clone(), &default_model);
         crate::nodes::ai::register(
             bridge,
             provider.clone(),
@@ -5013,6 +5102,7 @@ fn register_node_type_handlers(
             tool_mesh_cell,
             metrics.map(|b| b.sink.clone()),
             training.map(|b| b.sink.clone()),
+            skill_extractor,
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when

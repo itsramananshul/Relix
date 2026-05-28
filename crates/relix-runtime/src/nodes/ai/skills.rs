@@ -527,10 +527,27 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Operator-facing config for the auto-skill generator. Lives
 /// under `[skills]` in the controller TOML so operators can
 /// toggle the behaviour without touching capability config.
+///
+/// Two related feature flags coexist here so legacy operators
+/// who flipped `[skills] auto_generate = true` against the
+/// SKILL.md path keep their behaviour, AND the new GAP-4
+/// SQLite-backed `auto_extract` path can be enabled
+/// independently:
+///
+/// `auto_generate` is the original SKILL.md writer — when true, a
+/// completed task writes a templated SKILL.md to `~/.relix/skills/auto/`
+/// (the pre-GAP-4 behaviour).
+///
+/// `enabled` + `auto_extract` drive the SQLite-backed SkillStore +
+/// SkillExtractor + SkillRefinementEngine. When `enabled = true`
+/// AND `db_path` is set, the auto-skill pipeline boots. Setting
+/// `auto_extract = false` keeps the store + caps available but
+/// suppresses the post-`ai.chat` extraction hook (operators who
+/// want manual seeding only).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct SkillsConfig {
-    /// Master switch. `false` (default) means task completion
-    /// never writes a SKILL.md.
+    /// Master switch for the SKILL.md path. `false` (default)
+    /// means task completion never writes a SKILL.md.
     #[serde(default)]
     pub auto_generate: bool,
     /// Age threshold for `relix skills prune` AND for the
@@ -543,6 +560,39 @@ pub struct SkillsConfig {
     /// alone; the override is for sandboxed tests.
     #[serde(default)]
     pub auto_dir: Option<PathBuf>,
+    /// GAP 4: master switch for the SQLite-backed SkillStore +
+    /// caps. When `false` (default) the store and caps are not
+    /// registered.
+    #[serde(default)]
+    pub enabled: bool,
+    /// GAP 4: filesystem path to the skills.db SQLite file.
+    /// Required when `enabled = true`; ignored otherwise.
+    #[serde(default)]
+    pub db_path: Option<PathBuf>,
+    /// GAP 4: when `true` (default when `enabled = true`),
+    /// successful `ai.chat` completions trigger the
+    /// SkillExtractor hook. `false` disables auto-extraction
+    /// but leaves the store + caps usable for manual seeding.
+    #[serde(default = "default_true")]
+    pub auto_extract: bool,
+    /// GAP 4: complexity floor below which the extractor skips.
+    #[serde(default = "default_min_complexity")]
+    pub min_complexity_score: f32,
+    /// GAP 4: enable the background refinement task that ticks
+    /// every 24h.
+    #[serde(default = "default_true")]
+    pub refinement_enabled: bool,
+    /// GAP 4: model id the SkillExtractor passes to the
+    /// synthesis call. Default is the cheap-tier model.
+    #[serde(default)]
+    pub extraction_model: Option<String>,
+    /// GAP 4: embedding model used by the duplicate-check path.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// GAP 4: cosine threshold above which the extractor treats
+    /// a candidate as a duplicate of an existing skill.
+    #[serde(default = "default_dup_threshold")]
+    pub dup_threshold: f32,
 }
 
 impl Default for SkillsConfig {
@@ -551,12 +601,32 @@ impl Default for SkillsConfig {
             auto_generate: false,
             max_age_days: default_max_age_days(),
             auto_dir: None,
+            enabled: false,
+            db_path: None,
+            auto_extract: true,
+            min_complexity_score: default_min_complexity(),
+            refinement_enabled: true,
+            extraction_model: None,
+            embedding_model: None,
+            dup_threshold: default_dup_threshold(),
         }
     }
 }
 
 fn default_max_age_days() -> i64 {
     30
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_min_complexity() -> f32 {
+    0.6
+}
+
+fn default_dup_threshold() -> f32 {
+    0.85
 }
 
 /// Resolve the auto-skill directory. Honors

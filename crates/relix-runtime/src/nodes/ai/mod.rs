@@ -58,6 +58,8 @@ pub mod guardrails;
 pub mod memory_dispatcher;
 pub mod provider;
 pub mod router;
+pub mod skill_extractor;
+pub mod skill_store;
 pub mod skills;
 pub mod soul;
 
@@ -288,6 +290,7 @@ pub fn register(
     tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
+    skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
 ) {
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
@@ -300,6 +303,7 @@ pub fn register(
     let metrics_for_chat = metrics_sink.clone();
     let provider_name_for_chat: String = provider.provider_name().to_string();
     let interaction_for_chat = interaction_sink.clone();
+    let extractor_for_chat = skill_extractor.clone();
     bridge.register(
         "ai.chat",
         Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -314,6 +318,7 @@ pub fn register(
             let metrics = metrics_for_chat.clone();
             let provider_name = provider_name_for_chat.clone();
             let training = interaction_for_chat.clone();
+            let extractor = extractor_for_chat.clone();
             async move {
                 handle_chat(
                     p,
@@ -326,6 +331,7 @@ pub fn register(
                     mesh,
                     metrics,
                     training,
+                    extractor,
                     provider_name,
                     ctx,
                 )
@@ -1022,6 +1028,7 @@ async fn handle_chat(
     tool_mesh: Arc<tokio::sync::OnceCell<Arc<dyn execution::ToolMeshDispatcher>>>,
     metrics_sink: Option<Arc<dyn crate::metrics::MetricsSink>>,
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
+    skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
     provider_name: String,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
@@ -1392,8 +1399,9 @@ async fn handle_chat(
                     })
                 }
             };
+            let success = matches!(inner_outcome, HandlerOutcome::Ok(_));
+            let duration_secs = chat_started_at.elapsed().as_secs() as i64;
             if let Some(sink) = interaction_sink.as_ref() {
-                let success = matches!(inner_outcome, HandlerOutcome::Ok(_));
                 let error_kind = match &inner_outcome {
                     HandlerOutcome::Err(env) => {
                         Some(crate::dispatch::error_kind_to_str(env.kind).to_string())
@@ -1404,12 +1412,12 @@ async fn handle_chat(
                     crate::training::InteractionId::from_request(&ctx.request_id),
                     training_session.clone(),
                     training_agent.clone(),
-                    model_used,
+                    model_used.clone(),
                     provider_name.clone(),
                     training_system_prompt.clone(),
                     training_user_message.clone(),
                     output.text.clone(),
-                    tool_records,
+                    tool_records.clone(),
                     prompt_tokens,
                     completion_tokens,
                     chat_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -1418,6 +1426,46 @@ async fn handle_chat(
                     0,
                 );
                 sink.record_interaction(rec);
+            }
+            // GAP 4: spawn the skill extractor on successful
+            // completions. Non-blocking — the spawn future
+            // returns the inner_outcome immediately and the
+            // extractor runs on its own tokio task.
+            if let Some(extractor) = skill_extractor.as_ref()
+                && success
+            {
+                let tool_call_names: Vec<String> = tool_records
+                    .iter()
+                    .filter(|r| r.success)
+                    .map(|r| r.tool.clone())
+                    .collect();
+                let response_text = output.text.clone();
+                let response_word_count = response_text.split_whitespace().count();
+                let asked_for_structured = skill_extractor::detect_structured_output(prompt);
+                let task = skill_extractor::TaskCompletion {
+                    session_id: session_id.to_string(),
+                    agent_name: ctx.caller.name.clone(),
+                    prompt: prompt.to_string(),
+                    response: response_text,
+                    response_word_count,
+                    tool_calls: tool_call_names,
+                    asked_for_structured_output: asked_for_structured,
+                    duration_secs,
+                    // Session-turn counting is approximate at
+                    // the handler boundary — `history` carries
+                    // the conversation so far and `\n\n`
+                    // separated turns is the documented wire
+                    // shape downstream of `memory.recent_for_session`.
+                    session_turns: history.lines().filter(|l| !l.trim().is_empty()).count(),
+                    success,
+                };
+                let ex = extractor.clone();
+                // Detached fire-and-forget; the spawned task
+                // owns its own JoinHandle and will run to
+                // completion on its own. `drop` is the explicit
+                // form clippy's `let_underscore_future` lint
+                // is happy with.
+                drop(ex.spawn(task));
             }
             inner_outcome
         }
@@ -1592,6 +1640,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hello|"),
         )
@@ -1605,6 +1654,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -1624,6 +1674,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -1656,6 +1707,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"only-session-id"),
         )
@@ -1678,6 +1730,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -1725,6 +1778,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hi|"),
         )
@@ -1768,6 +1822,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hi|"),
         )
@@ -1800,6 +1855,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -1835,6 +1891,7 @@ mod tests {
             guardrail,
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -1878,6 +1935,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"s1|hello|"),
         )
@@ -1914,6 +1972,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -1977,6 +2036,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess1|new question|"),
         )
@@ -2017,6 +2077,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2062,6 +2123,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2192,6 +2254,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
@@ -2238,6 +2301,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess1|hi|"),
         )
@@ -2280,6 +2344,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2325,6 +2390,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2391,6 +2457,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2497,6 +2564,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2700,6 +2768,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess-1|please email ops|"),
         )
@@ -2733,6 +2802,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             None,
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2861,6 +2931,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             None,
             None,
+            None,
             "mock".to_string(),
             ctx(b"sess-1|fetch the example|"),
         )
@@ -2897,6 +2968,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -2941,6 +3013,7 @@ mod tests {
             guardrails::InputGuardrail::permissive(),
             Some(dispatcher.clone()),
             Arc::new(tokio::sync::OnceCell::new()),
+            None,
             None,
             None,
             "mock".to_string(),
@@ -3255,6 +3328,7 @@ mod tests {
             Arc::new(tokio::sync::OnceCell::new()),
             Some(sink_dyn),
             None,
+            None,
             "mock".to_string(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
@@ -3284,6 +3358,7 @@ mod tests {
             None,
             Arc::new(tokio::sync::OnceCell::new()),
             Some(sink_dyn),
+            None,
             None,
             "mock".to_string(),
             ctx(b"sess2|hi|"),

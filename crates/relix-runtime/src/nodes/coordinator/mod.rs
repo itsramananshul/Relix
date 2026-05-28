@@ -7536,6 +7536,7 @@ mod auto_skill_tests {
             auto_generate: true,
             max_age_days: 30,
             auto_dir: Some(tmp.path().to_path_buf()),
+            ..Default::default()
         };
         run_auto_skill_for_task(&store, &id, &cfg);
         // Walk the dir for the synthesised SKILL.md.
@@ -7569,6 +7570,7 @@ mod auto_skill_tests {
             auto_generate: false,
             max_age_days: 30,
             auto_dir: Some(tmp.path().to_path_buf()),
+            ..Default::default()
         };
         run_auto_skill_for_task(&store, &id, &cfg);
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
