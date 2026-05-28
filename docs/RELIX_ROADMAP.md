@@ -2731,7 +2731,26 @@ consolidation_interval_h   = 24
 
 ---
 
-### 7.24 Spec-Driven Multi-Agent Planning Pipeline `[SKIPPED — entire multi-agent coordinator extension (planner agent + critic agent + conflict-resolution protocol + spec format + integration with existing delegation/messaging); three or more new agent types and a multi-week pipeline build; deferred to a dedicated session]`
+### 7.24 Spec-Driven Multi-Agent Planning Pipeline `[DONE — foundation: AgentCapabilityRegistry + SpecParser + PlanGenerator + planning.* coordinator caps + /v1/planning/* bridge endpoints + relix planning CLI. Shipped df88e33 + 67fdb8d + 35ccba4 + a3b9ceb + 52b5ea5 + e1f5d33. The full multi-stage Build Mode pipeline (Stage-2 orchestrator/specialist split, Stage-3 critic loop, Stage-4 approval gate, Stage-5 verification harness) remains future work and is intentionally deferred — see "NOT DONE" note below.]`
+
+> **Foundation shipped (RELIX-7.24, May 2026).** What landed is the spec-driven planning *pipeline* — operator writes a natural-language spec, the planner inspects the live capability registry, produces a structured `PlanSpec`, and emits a validated `Workflow` that runs on the existing workflow engine (Single / Sequential / Parallel topology). Six commits land the seven-part build:
+> - **P1 (df88e33)** — `crates/relix-runtime/src/planning/registry.rs`: `AgentCapabilityRegistry::from_sources` merging local manifest + `cfg.agents` + cached peer manifests; scored `find_agents_for_task` (tag/method/description). Extended `AgentSection` with optional `peer` / `description` / `capabilities` (`AgentCapabilityDecl`) so an operator can publish synthetic agents in `controller.toml` without writing Rust.
+> - **P2 (67fdb8d)** — `crates/relix-runtime/src/planning/parser.rs`: `SpecParser::with_known_agents` lifts a free-text spec into `PlanSpec { goal, constraints, success_criteria, preferred_agents, forbidden_agents, max_steps, budget_hint }`. Clause-boundary negation handles "Summarise without code-agent and use research-agent" correctly.
+> - **P3 (35ccba4)** — `crates/relix-runtime/src/planning/generator.rs`: `PlanGenerator::generate` picks `PlanTopology::Single | Sequential | Parallel` from spec keywords, selects up to `GeneratorOptions.max_agents` from the registry, and produces a fully-validated `Workflow` via `workflow::parse_str` + `workflow::validate`.
+> - **P4 (a3b9ceb)** — `crates/relix-runtime/src/planning/coordinator.rs`: registers four caps on the coordinator's `DispatchBridge` (`planning.list_agents`, `planning.find_agents`, `planning.validate_spec`, `planning.create_plan`). `create_plan` with `dry_run=false` executes the generated workflow inline through the shared `WorkflowDispatcherCell`. Auto-wired from `controller_runtime.rs` for any coordinator-typed node.
+> - **P5 (52b5ea5)** — `crates/relix-web-bridge/src/planning.rs`: `POST /v1/planning/plan`, `GET /v1/planning/agents`, `POST /v1/planning/agents/search`, `POST /v1/planning/validate`. Error mapping mirrors `confidence` / `knowledge` / `metrics` (INVALID_ARGS→400, missing peer→404, responder fault→502, mesh down→503). `planning_mini_mesh_test.rs` drives all four through a real `DispatchBridge` + canned responder, six scenarios.
+> - **P6 (e1f5d33)** — `crates/relix-cli/src/planning.rs`: `relix planning agents` / `search --task` / `validate --spec` / `plan --spec [--execute]` operator surface. `--spec-file` reads from disk; `--raw` dumps JSON for piping.
+>
+> **NOT DONE — intentionally deferred from this milestone.** The §7.24 design above describes a much larger Build Mode pipeline with multiple specialist roles (orchestrator agent, parallel planning specialists, critic agent, approval gate, verification harness, conflict-resolution protocol, distinct Build-Mode vs Quick-Mode entry points). RELIX-7.24 ships the *spec → plan → workflow* foundation that every later stage will sit on, but the following are explicitly future work and were NOT shipped:
+> - Stage-1 orchestrator splitting a goal into parallel sub-plans across specialist planner agents.
+> - Stage-3 critic agent that adversarially reviews the generated plan and forces revision before approval.
+> - Stage-4 human-in-the-loop approval gate on the spec itself (separate from any workflow-execution approval flow).
+> - Stage-5 verification harness that re-checks every completed step against the approved spec, with automatic rollback on drift.
+> - The `relix build "..."` operator entry point and the explicit Build-Mode / Quick-Mode bifurcation in the CLI.
+> - Inter-agent conflict resolution when two specialists produce contradicting plans for overlapping concerns.
+> - Spec format hardening (versioned schema, signature, change-tracking) beyond the heuristic `PlanSpec` shipped in P2.
+>
+> Those stages assume the foundation that just landed — they extend the planner from "one agent picks a workflow" into "a graph of agents collaborates to produce, critique, and verify against an approved spec." Each is a multi-commit milestone in its own right and should be scoped as its own roadmap section when picked up.
 
 This is the planning architecture for Relix. Inspired by GitHub Spec Kit's spec-driven development concept but built as a native multi-agent pipeline where every stage is a separate agent with a specific role, and the approved spec is the single source of truth that every downstream agent verifies against.
 
