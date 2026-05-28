@@ -21,6 +21,7 @@ mod metrics;
 mod ops;
 mod os_secure;
 mod ping;
+mod planning;
 mod router;
 mod setup;
 mod skills;
@@ -166,6 +167,19 @@ enum Cmd {
     Confidence {
         #[command(subcommand)]
         cmd: confidence::Cmd,
+    },
+    /// RELIX-7.24: spec-driven multi-agent planning pipeline.
+    /// `planning agents` lists the agents visible to the
+    /// coordinator's capability registry. `planning search
+    /// --task "..."` scores the registry against a task.
+    /// `planning validate --spec "..."` parses a spec into
+    /// the structured PlanSpec. `planning plan --spec "..."`
+    /// generates a workflow (and optionally executes it with
+    /// `--execute`). Talks to the local bridge over HTTP
+    /// (default `http://127.0.0.1:19791`).
+    Planning {
+        #[command(subcommand)]
+        cmd: planning::Cmd,
     },
     /// Operate the Router Node — mesh observability + health
     /// control plane. Each subcommand dials the router peer
@@ -393,6 +407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Training { cmd } => training::run(cmd).await,
         Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
         Cmd::Confidence { cmd } => confidence::run(cmd).await,
+        Cmd::Planning { cmd } => planning::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,
         Cmd::Fs { cmd } => fs::run(cmd).await,

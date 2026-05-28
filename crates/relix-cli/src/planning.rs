@@ -1,0 +1,404 @@
+//! `relix-cli planning ...` — RELIX-7.24 operator surface.
+//!
+//! Four subcommands, each a thin HTTP forwarder onto the
+//! `/v1/planning/*` bridge endpoints:
+//!
+//! - `planning agents` — list every agent in the capability
+//!   registry visible to the coordinator.
+//! - `planning search --task "..."` — score the registry against
+//!   a free-text task and print the best matches.
+//! - `planning validate --spec "..."` (or `--spec-file <path>`) —
+//!   parse a spec into a structured PlanSpec and print it.
+//! - `planning plan --spec "..."` (or `--spec-file <path>`) — run
+//!   the full spec → workflow generation and either print the
+//!   generated workflow (`--dry-run`) or execute it via the
+//!   coordinator's WorkflowDispatcher.
+//!
+//! Every subcommand accepts `--bridge <url>` (default
+//! `http://127.0.0.1:19791`) and `--raw` to dump the JSON body
+//! verbatim.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use clap::Subcommand;
+use serde_json::Value;
+
+const DEFAULT_BRIDGE: &str = "http://127.0.0.1:19791";
+
+#[derive(Subcommand, Debug)]
+pub enum Cmd {
+    /// List every agent visible to the planning capability
+    /// registry on the coordinator.
+    Agents {
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// Score the registry against a free-text task. Prints
+    /// matches ordered by descending score with the
+    /// capabilities that contributed.
+    Search {
+        /// Free-text task description.
+        #[arg(long)]
+        task: String,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// Parse a natural-language spec into a structured
+    /// PlanSpec (goal, constraints, success criteria,
+    /// preferred/forbidden agents, max steps, budget hint).
+    /// Pass the spec inline via `--spec` or from a file via
+    /// `--spec-file`.
+    Validate {
+        #[arg(long)]
+        spec: Option<String>,
+        #[arg(long)]
+        spec_file: Option<PathBuf>,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// Generate a workflow from a spec. With `--dry-run` (the
+    /// default) only prints the generated workflow YAML +
+    /// topology + selected agents. Without `--dry-run`,
+    /// schedules the workflow on the coordinator and prints
+    /// the execution summary.
+    Plan {
+        #[arg(long)]
+        spec: Option<String>,
+        #[arg(long)]
+        spec_file: Option<PathBuf>,
+        /// Maximum number of agents to include in the
+        /// generated workflow.
+        #[arg(long)]
+        max_agents: Option<usize>,
+        /// When true (the default), only print the generated
+        /// workflow without executing it.
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        /// Execute the generated workflow on the coordinator.
+        /// Short-hand for `--dry-run=false`.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+}
+
+pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        Cmd::Agents { bridge, raw } => agents(&bridge, raw).await,
+        Cmd::Search { task, bridge, raw } => search(&bridge, &task, raw).await,
+        Cmd::Validate {
+            spec,
+            spec_file,
+            bridge,
+            raw,
+        } => {
+            let spec = resolve_spec(spec, spec_file)?;
+            validate(&bridge, &spec, raw).await
+        }
+        Cmd::Plan {
+            spec,
+            spec_file,
+            max_agents,
+            dry_run,
+            execute,
+            bridge,
+            raw,
+        } => {
+            let spec = resolve_spec(spec, spec_file)?;
+            let effective_dry_run = !execute && dry_run;
+            plan(&bridge, &spec, max_agents, effective_dry_run, raw).await
+        }
+    }
+}
+
+async fn agents(bridge: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/planning/agents", bridge.trim_end_matches('/'));
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("decode agents response: {e} (body={body})"))?;
+    let list = v
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if list.is_empty() {
+        println!("(no agents registered)");
+        return Ok(());
+    }
+    for a in list {
+        let name = a.get("name").and_then(Value::as_str).unwrap_or("?");
+        let peer = a.get("peer").and_then(Value::as_str).unwrap_or("(local)");
+        let caps = a
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        let desc = a.get("description").and_then(Value::as_str).unwrap_or("");
+        if desc.is_empty() {
+            println!("{name:<28} peer={peer:<18} caps={caps}");
+        } else {
+            println!("{name:<28} peer={peer:<18} caps={caps}  {desc}");
+        }
+    }
+    Ok(())
+}
+
+async fn search(bridge: &str, task: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if task.trim().is_empty() {
+        return Err("--task is required".into());
+    }
+    let url = format!("{}/v1/planning/agents/search", bridge.trim_end_matches('/'));
+    let body = serde_json::json!({ "task": task });
+    let resp = http_post_json(&url, &body).await?;
+    if raw {
+        println!("{resp}");
+        return Ok(());
+    }
+    let v: Value =
+        serde_json::from_str(&resp).map_err(|e| format!("decode search: {e} (body={resp})"))?;
+    let matches = v
+        .get("matches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if matches.is_empty() {
+        println!("(no matching agents for task)");
+        return Ok(());
+    }
+    for m in matches {
+        let agent = m.get("agent").and_then(Value::as_str).unwrap_or("?");
+        let score = m.get("score").and_then(Value::as_u64).unwrap_or(0);
+        let caps = m
+            .get("matched_capabilities")
+            .and_then(Value::as_array)
+            .map(|c| {
+                c.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        println!("{agent:<28} score={score:<4} caps=[{caps}]");
+    }
+    Ok(())
+}
+
+async fn validate(bridge: &str, spec: &str, raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/planning/validate", bridge.trim_end_matches('/'));
+    let body = serde_json::json!({ "spec": spec });
+    let resp = http_post_json(&url, &body).await?;
+    if raw {
+        println!("{resp}");
+        return Ok(());
+    }
+    let v: Value =
+        serde_json::from_str(&resp).map_err(|e| format!("decode validate: {e} (body={resp})"))?;
+    let goal = v.get("goal").and_then(Value::as_str).unwrap_or("");
+    println!("goal:               {goal}");
+    print_str_list("constraints:       ", v.get("constraints"));
+    print_str_list("success_criteria:  ", v.get("success_criteria"));
+    print_str_list("preferred_agents:  ", v.get("preferred_agents"));
+    print_str_list("forbidden_agents:  ", v.get("forbidden_agents"));
+    match v.get("max_steps").and_then(Value::as_u64) {
+        Some(n) => println!("max_steps:          {n}"),
+        None => println!("max_steps:          (none)"),
+    }
+    match v.get("budget_hint").and_then(Value::as_str) {
+        Some(b) if !b.is_empty() => println!("budget_hint:        {b}"),
+        _ => println!("budget_hint:        (none)"),
+    }
+    Ok(())
+}
+
+async fn plan(
+    bridge: &str,
+    spec: &str,
+    max_agents: Option<usize>,
+    dry_run: bool,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/planning/plan", bridge.trim_end_matches('/'));
+    let mut body = serde_json::Map::new();
+    body.insert("spec".into(), Value::from(spec.to_string()));
+    body.insert("dry_run".into(), Value::from(dry_run));
+    if let Some(n) = max_agents {
+        body.insert("max_agents".into(), Value::from(n));
+    }
+    let resp = http_post_json(&url, &Value::Object(body)).await?;
+    if raw {
+        println!("{resp}");
+        return Ok(());
+    }
+    let v: Value =
+        serde_json::from_str(&resp).map_err(|e| format!("decode plan: {e} (body={resp})"))?;
+    let topology = v.get("topology").and_then(Value::as_str).unwrap_or("?");
+    let name = v
+        .get("workflow_name")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    println!("workflow_name:  {name}");
+    println!("topology:       {topology}");
+    print_str_list("agents_selected:", v.get("agents_selected"));
+    if let Some(yaml) = v.get("workflow_yaml").and_then(Value::as_str) {
+        println!("\n--- workflow_yaml ---\n{yaml}");
+    }
+    if let Some(exec) = v.get("execution")
+        && !exec.is_null()
+    {
+        println!("\n--- execution ---");
+        let exec_id = exec
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let status = exec.get("status").and_then(Value::as_str).unwrap_or("");
+        let latency = exec
+            .get("total_latency_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        println!("execution_id:   {exec_id}");
+        println!("status:         {status}");
+        println!("total_latency:  {latency}ms");
+        if let Some(result) = exec.get("result")
+            && !result.is_null()
+        {
+            println!("result:         {result}");
+        }
+    }
+    Ok(())
+}
+
+fn resolve_spec(
+    inline: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match (inline, file) {
+        (Some(s), None) => {
+            if s.trim().is_empty() {
+                Err("--spec must not be empty".into())
+            } else {
+                Ok(s)
+            }
+        }
+        (None, Some(p)) => {
+            let txt = std::fs::read_to_string(&p)
+                .map_err(|e| format!("read --spec-file {}: {e}", p.display()))?;
+            if txt.trim().is_empty() {
+                Err(format!("--spec-file {} is empty", p.display()).into())
+            } else {
+                Ok(txt)
+            }
+        }
+        (Some(_), Some(_)) => Err("pass either --spec or --spec-file, not both".into()),
+        (None, None) => Err("one of --spec or --spec-file is required".into()),
+    }
+}
+
+fn print_str_list(label: &str, v: Option<&Value>) {
+    let items: Vec<String> = v
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        println!("{label} (none)");
+    } else {
+        println!("{label} {}", items.join(", "));
+    }
+}
+
+async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}").into());
+    }
+    Ok(body)
+}
+
+async fn http_post_json(url: &str, payload: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?
+        .post(url)
+        .json(payload)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}").into());
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_spec_requires_one_of_inline_or_file() {
+        let err = resolve_spec(None, None).unwrap_err().to_string();
+        assert!(err.contains("--spec"));
+    }
+
+    #[test]
+    fn resolve_spec_rejects_both_inline_and_file() {
+        let err = resolve_spec(Some("x".into()), Some("/tmp/x.txt".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not both"));
+    }
+
+    #[test]
+    fn resolve_spec_rejects_empty_inline() {
+        let err = resolve_spec(Some("   ".into()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn resolve_spec_returns_inline_when_present() {
+        assert_eq!(resolve_spec(Some("hi".into()), None).unwrap(), "hi");
+    }
+
+    #[test]
+    fn resolve_spec_reads_file_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("spec.txt");
+        std::fs::write(&p, "from-file").unwrap();
+        assert_eq!(resolve_spec(None, Some(p)).unwrap(), "from-file");
+    }
+
+    #[test]
+    fn resolve_spec_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("empty.txt");
+        std::fs::write(&p, "   \n").unwrap();
+        let err = resolve_spec(None, Some(p)).unwrap_err().to_string();
+        assert!(err.contains("empty"));
+    }
+}
