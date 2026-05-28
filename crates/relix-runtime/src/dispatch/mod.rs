@@ -289,6 +289,18 @@ pub struct DispatchBridge {
     /// engine. Typically a `CompositeAlertSink` over the
     /// chronicle + multi-channel fan-out.
     alert_sink: Option<Arc<dyn crate::metrics::AlertDeliver>>,
+    /// RELIX-7.28 Part 1: pre-dispatch cost-control gate.
+    /// `None` keeps the bridge in pre-7.28 mode (no budget
+    /// enforcement). When wired, the bridge consults
+    /// `enforcer.check(agent, method)` after admission and
+    /// before handler invocation.
+    budget_enforcer: Option<Arc<crate::metrics::BudgetEnforcer>>,
+    /// RELIX-7.28 Part 3: mesh-level PII gate. `None` keeps
+    /// the bridge in pre-7.28 mode (no PII scanning). When
+    /// wired, the bridge scans inbound request args (and
+    /// optionally outbound response bodies) at the mesh
+    /// boundary.
+    pii_gate: Option<Arc<crate::nodes::pii_gate::MeshPiiGate>>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -459,7 +471,34 @@ impl DispatchBridge {
             last_confidence_cell: None,
             alert_engine: None,
             alert_sink: None,
+            budget_enforcer: None,
+            pii_gate: None,
         })
+    }
+
+    /// RELIX-7.28 Part 1: wire the budget enforcer. Idempotent —
+    /// calling twice replaces the prior enforcer. `None` opts back
+    /// to "no budget gate" behaviour.
+    pub fn set_budget_enforcer(&mut self, enforcer: Arc<crate::metrics::BudgetEnforcer>) {
+        self.budget_enforcer = Some(enforcer);
+    }
+
+    /// Cheap-clone handle on the budget enforcer. Used by the
+    /// `budget.*` coordinator caps so the handlers can call
+    /// `status()` / `reset()` without holding the bridge.
+    pub fn budget_enforcer_handle(&self) -> Option<Arc<crate::metrics::BudgetEnforcer>> {
+        self.budget_enforcer.clone()
+    }
+
+    /// RELIX-7.28 Part 3: wire the mesh PII gate. Idempotent.
+    pub fn set_pii_gate(&mut self, gate: Arc<crate::nodes::pii_gate::MeshPiiGate>) {
+        self.pii_gate = Some(gate);
+    }
+
+    /// Cheap-clone handle on the PII gate. Used by the `pii.*`
+    /// coordinator capabilities to read scan stats + recent events.
+    pub fn pii_gate_handle(&self) -> Option<Arc<crate::nodes::pii_gate::MeshPiiGate>> {
+        self.pii_gate.clone()
     }
 
     /// RELIX-7.19: wire confidence scoring + fallback. Both
@@ -1002,12 +1041,78 @@ impl DispatchBridge {
             }
         }
 
+        // === RELIX-7.28 Part 3: mesh-level PII gate (inbound) ===
+        // Runs after the access broker so we don't pay scan cost
+        // for calls policy already denied. Block / redact actions
+        // can short-circuit the dispatch entirely.
+        let mut args_for_dispatch: Vec<u8> = req.args.to_vec();
+        if let Some(gate) = self.pii_gate.as_ref()
+            && let Some(outcome) = gate.scan_inbound(
+                req.rid.to_string().as_str(),
+                &verified.name,
+                &req.method,
+                &mut args_for_dispatch,
+            )
+        {
+            use crate::nodes::pii_gate::GateOutcome;
+            match outcome {
+                GateOutcome::Blocked { cause } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    return self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            format!("pii_gate:block:{cause}"),
+                            error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                }
+                GateOutcome::Redacted | GateOutcome::Logged => {}
+            }
+        }
+
+        // === RELIX-7.28 Part 1: budget enforcement gate ===
+        // Pre-dispatch cost-control. Throttle sleeps; reject
+        // short-circuits with RESOURCE_EXHAUSTED. AlertOnly returns
+        // Allow but fires a BudgetExceeded alert as a side effect.
+        if let Some(enforcer) = self.budget_enforcer.as_ref() {
+            match enforcer.check(&verified.name, &req.method) {
+                crate::metrics::BudgetDecision::Allow => {}
+                crate::metrics::BudgetDecision::Throttle { delay, info } => {
+                    tracing::warn!(
+                        agent = %verified.name,
+                        method = %req.method,
+                        delay_ms = delay.as_millis() as u64,
+                        window = %info.window,
+                        scope = %info.scope,
+                        "budget enforcer: throttling call"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                crate::metrics::BudgetDecision::Reject { info } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    return self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            format!("budget:reject:{}", info.cause),
+                            error_kinds::RESOURCE_EXHAUSTED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                }
+            }
+        }
+
         // === Admission step 10: dispatch ===
         let ctx = InvocationCtx {
             caller: verified.clone(),
             trace_id: req.tid,
             request_id: req.rid,
-            args: req.args.to_vec(),
+            args: args_for_dispatch,
         };
         // W2-006a: capture per-call elapsed_ms. Instant::now
         // straddles only the handler invocation — admission /
@@ -1662,12 +1767,74 @@ impl DispatchBridge {
             }
         }
 
+        // === RELIX-7.28 Part 3: mesh-level PII gate (inbound) ===
+        let mut args_for_dispatch_stream: Vec<u8> = req.args.to_vec();
+        if let Some(gate) = self.pii_gate.as_ref()
+            && let Some(outcome) = gate.scan_inbound(
+                req.rid.to_string().as_str(),
+                &verified.name,
+                &req.method,
+                &mut args_for_dispatch_stream,
+            )
+        {
+            use crate::nodes::pii_gate::GateOutcome;
+            match outcome {
+                GateOutcome::Blocked { cause } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    let full_cause = format!("pii_gate:block:{cause}");
+                    let _ = writer
+                        .write_err(error_kinds::POLICY_DENIED, full_cause.clone())
+                        .await;
+                    let _ = self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            full_cause,
+                            error_kinds::POLICY_DENIED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                    return;
+                }
+                GateOutcome::Redacted | GateOutcome::Logged => {}
+            }
+        }
+
+        // === RELIX-7.28 Part 1: budget enforcement gate (streaming) ===
+        if let Some(enforcer) = self.budget_enforcer.as_ref() {
+            match enforcer.check(&verified.name, &req.method) {
+                crate::metrics::BudgetDecision::Allow => {}
+                crate::metrics::BudgetDecision::Throttle { delay, info: _ } => {
+                    tokio::time::sleep(delay).await;
+                }
+                crate::metrics::BudgetDecision::Reject { info } => {
+                    self.bump_stats(&req.method, StatBucket::Denied, now);
+                    let cause = format!("budget:reject:{}", info.cause);
+                    let _ = writer
+                        .write_err(error_kinds::RESOURCE_EXHAUSTED, cause.clone())
+                        .await;
+                    let _ = self
+                        .audit_and_err_with_id(
+                            &req,
+                            &verified,
+                            started_at,
+                            cause,
+                            error_kinds::RESOURCE_EXHAUSTED,
+                            AuditStatus::Denied,
+                        )
+                        .await;
+                    return;
+                }
+            }
+        }
+
         // === Admission step 10: dispatch ===
         let ctx = InvocationCtx {
             caller: verified.clone(),
             trace_id: req.tid,
             request_id: req.rid,
-            args: req.args.to_vec(),
+            args: args_for_dispatch_stream,
         };
         let dispatch_started = std::time::Instant::now();
 
@@ -1869,6 +2036,9 @@ pub(crate) fn error_kind_to_str(kind: u32) -> &'static str {
         k::CANCELLED => "CANCELLED",
         k::MANIFEST_STALE => "MANIFEST_STALE",
         k::APPROVAL_REQUIRED => "APPROVAL_REQUIRED",
+        k::APPROVAL_TOKEN_INVALID => "APPROVAL_TOKEN_INVALID",
+        k::SECURITY_DENIED => "SECURITY_DENIED",
+        k::RESOURCE_EXHAUSTED => "RESOURCE_EXHAUSTED",
         // Higher kinds (gate-token / security-denied / etc.)
         // and unknown values: surface the numeric code so an
         // operator can still spot trends. Static strs only —
@@ -3328,6 +3498,209 @@ mod tests {
             "expected exactly one Fired event despite three calls: {:?}",
             *g
         );
+    }
+
+    // ── RELIX-7.28 Part 1: BudgetEnforcer wired into the bridge ──
+
+    fn make_budget_enforcer(
+        agent: &str,
+        daily_usd: Option<f64>,
+        action: crate::metrics::BudgetAction,
+        backoff_ms: u64,
+    ) -> Arc<crate::metrics::BudgetEnforcer> {
+        use crate::metrics::{
+            AgentBudget, BudgetConfig, BudgetEnforcer, MetricsQuery, MetricsStore,
+        };
+        let store = MetricsStore::in_memory().unwrap();
+        let q = MetricsQuery::new(store);
+        Arc::new(BudgetEnforcer::new(
+            BudgetConfig {
+                agents: vec![AgentBudget {
+                    agent: agent.into(),
+                    daily_limit_usd: daily_usd,
+                    hourly_limit_usd: None,
+                    action_on_exceed: action,
+                }],
+                deployment: None,
+                throttle_backoff_ms: backoff_ms,
+                cache_refresh_secs: 60,
+                exempt_methods: vec![],
+            },
+            Some(q),
+        ))
+    }
+
+    #[tokio::test]
+    async fn budget_enforcer_rejects_call_when_daily_limit_exceeded() {
+        use crate::metrics::BudgetAction;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        let enf = make_budget_enforcer("alice", Some(0.0001), BudgetAction::Reject, 50);
+        // Seed the in-memory cache above the limit.
+        enf.set_cached_for_test(
+            "agent:alice",
+            crate::metrics::BudgetWindow::Daily,
+            1_000_000,
+        );
+        bridge.set_budget_enforcer(enf);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::RESOURCE_EXHAUSTED),
+            other => panic!("expected RESOURCE_EXHAUSTED, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_enforcer_allows_call_when_within_limit() {
+        use crate::metrics::BudgetAction;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        let enf = make_budget_enforcer("alice", Some(1.0), BudgetAction::Reject, 50);
+        enf.set_cached_for_test("agent:alice", crate::metrics::BudgetWindow::Daily, 100_000);
+        bridge.set_budget_enforcer(enf);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert!(matches!(resp.res, ResponseResult::Ok(_)));
+    }
+
+    #[tokio::test]
+    async fn budget_enforcer_throttle_introduces_delay_then_admits() {
+        use crate::metrics::BudgetAction;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        // 200ms throttle backoff so the test can observe it.
+        let enf = make_budget_enforcer("alice", Some(0.0001), BudgetAction::Throttle, 200);
+        enf.set_cached_for_test(
+            "agent:alice",
+            crate::metrics::BudgetWindow::Daily,
+            1_000_000,
+        );
+        bridge.set_budget_enforcer(enf);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let start = std::time::Instant::now();
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let elapsed = start.elapsed();
+        let resp = decode_response(&resp_bytes).unwrap();
+        // Call still succeeds (throttle admits) but the backoff
+        // ate at least the configured delay.
+        assert!(matches!(resp.res, ResponseResult::Ok(_)));
+        assert!(
+            elapsed >= std::time::Duration::from_millis(180),
+            "throttle should sleep ≥ ~180ms, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_alert_only_does_not_block_call() {
+        use crate::metrics::BudgetAction;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        let enf = make_budget_enforcer("alice", Some(0.0001), BudgetAction::AlertOnly, 50);
+        enf.set_cached_for_test(
+            "agent:alice",
+            crate::metrics::BudgetWindow::Daily,
+            1_000_000,
+        );
+        bridge.set_budget_enforcer(enf);
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"x".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        // alert_only must not block.
+        assert!(matches!(resp.res, ResponseResult::Ok(_)));
+    }
+
+    // ── RELIX-7.28 Part 3: MeshPiiGate wired into the bridge ──
+
+    fn make_pii_gate(
+        action: crate::nodes::pii_gate::MeshPiiAction,
+    ) -> Arc<crate::nodes::pii_gate::MeshPiiGate> {
+        Arc::new(
+            crate::nodes::pii_gate::MeshPiiGate::in_memory(crate::nodes::pii_gate::MeshPiiConfig {
+                enabled: true,
+                action,
+                scan_args: true,
+                scan_responses: false,
+                exempt_methods: vec![],
+                chronicle_path: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn pii_gate_blocks_request_with_pii_when_action_is_block() {
+        use crate::nodes::pii_gate::MeshPiiAction;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        bridge.set_pii_gate(make_pii_gate(MeshPiiAction::Block));
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request(
+            "node.health",
+            b"my email is jane@example.com".to_vec(),
+            bundle,
+            30,
+        );
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(e) => assert_eq!(e.kind, error_kinds::POLICY_DENIED),
+            other => panic!("expected POLICY_DENIED, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pii_gate_redacts_args_before_invoking_handler() {
+        use crate::nodes::pii_gate::MeshPiiAction;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        // Echo handler echoes whatever args it sees — used to
+        // confirm the bridge handed the handler the redacted form.
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        bridge.set_pii_gate(make_pii_gate(MeshPiiAction::Redact));
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request(
+            "node.health",
+            b"please email jane@example.com".to_vec(),
+            bundle,
+            30,
+        );
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        let ResponseResult::Ok(body) = resp.res else {
+            panic!("expected Ok");
+        };
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("[EMAIL]"), "expected redacted args: {text}");
+        assert!(!text.contains("jane@example.com"));
+    }
+
+    #[tokio::test]
+    async fn pii_gate_passes_clean_args_through_unchanged() {
+        use crate::nodes::pii_gate::MeshPiiAction;
+        let dir = TempDir::new().unwrap();
+        let (mut bridge, org_root) = fresh_bridge(&dir);
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+        bridge.set_pii_gate(make_pii_gate(MeshPiiAction::Block));
+        let bundle = mk_identity(&org_root, "alice", &["chat-users"]);
+        let envelope = build_request("node.health", b"hello world".to_vec(), bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        let ResponseResult::Ok(body) = resp.res else {
+            panic!("clean args should pass through");
+        };
+        assert_eq!(body.as_slice(), b"hello world");
     }
 
     #[tokio::test]

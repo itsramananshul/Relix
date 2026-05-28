@@ -25,9 +25,12 @@
 
 pub mod alert;
 pub mod alert_delivery;
+pub mod budget;
+pub mod budget_coordinator;
 pub mod collector;
 pub mod config;
 pub mod coordinator;
+pub mod observability;
 pub mod pricing;
 pub mod query;
 pub mod store;
@@ -41,6 +44,11 @@ pub use alert_delivery::{
     AlertChronicle, AlertChronicleRow, AlertDeliveryConfig, AlertMeshCell, AlertMeshContext,
     AlertTarget, ChronicleAlertSink, ChronicleError as AlertChronicleError, CompositeAlertSink,
     MultiChannelAlertSink,
+};
+pub use budget::{
+    AgentBudget, AgentStatusRow, BudgetAction, BudgetBreach, BudgetConfig, BudgetDecision,
+    BudgetEnforcer, BudgetStatus, DeploymentBudget, DeploymentStatusRow, Window as BudgetWindow,
+    parse_window as parse_budget_window,
 };
 pub use collector::{
     MetricsCollector, MetricsSink, MetricsWorkerHandles, NullMetricsSink, RetentionConfig,

@@ -19,8 +19,10 @@ mod mcp;
 mod memory_inspect;
 mod mesh;
 mod metrics;
+mod observe;
 mod ops;
 mod os_secure;
+mod pii;
 mod ping;
 mod planning;
 mod router;
@@ -127,6 +129,18 @@ enum Cmd {
     Metrics {
         #[command(subcommand)]
         cmd: metrics::Cmd,
+    },
+    /// RELIX-7.28 Part 2 — live observability dashboard.
+    /// `relix observe` runs a refreshing terminal UI; `--once`
+    /// prints one snapshot; `--alerts` / `--health` render
+    /// individual panels for scripting.
+    Observe(observe::ObserveArgs),
+    /// RELIX-7.28 Part 3 — mesh-level PII detection surface.
+    /// `relix pii stats [--hours N]` and
+    /// `relix pii events [--method M] [--limit N]`.
+    Pii {
+        #[command(subcommand)]
+        cmd: pii::Cmd,
     },
     /// RELIX-7.15 training data pipeline surface.
     /// `training stats` — aggregate counters + score histogram.
@@ -417,6 +431,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Ops { cmd } => ops::run(cmd).await,
         Cmd::Email { cmd } => email::run(cmd).await,
         Cmd::Metrics { cmd } => metrics::run(cmd).await,
+        Cmd::Observe(args) => observe::run(args).await,
+        Cmd::Pii { cmd } => pii::run(cmd).await,
         Cmd::Training { cmd } => training::run(cmd).await,
         Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
         Cmd::Confidence { cmd } => confidence::run(cmd).await,

@@ -133,6 +133,12 @@ fn format_fired(a: &ActiveAlert) -> String {
     if a.kind == AlertKind::LowConfidence {
         return format_low_confidence_fired(a);
     }
+    // RELIX-7.28 Part 1: BudgetExceeded carries the cause /
+    // window / scope inside `message`; the alert layer renders
+    // a dedicated panel so operators see the cap they tripped.
+    if a.kind == AlertKind::BudgetExceeded {
+        return format_budget_exceeded_fired(a);
+    }
     let (badge, header) = match a.severity {
         AlertSeverity::Warning => ("⚠️", "Relix Alert — WARNING"),
         AlertSeverity::Critical => ("🚨", "Relix Alert — CRITICAL"),
@@ -157,6 +163,9 @@ fn format_fired(a: &ActiveAlert) -> String {
 fn format_recovered(a: &ActiveAlert) -> String {
     if a.kind == AlertKind::LowConfidence {
         return format_low_confidence_recovered(a);
+    }
+    if a.kind == AlertKind::BudgetExceeded {
+        return format_budget_exceeded_recovered(a);
     }
     format!(
         "✅ Relix Alert — RECOVERED\n\
@@ -226,6 +235,59 @@ fn format_low_confidence_recovered(a: &ActiveAlert) -> String {
     )
 }
 
+/// RELIX-7.28 Part 1: BudgetExceeded fired-alert formatter.
+fn format_budget_exceeded_fired(a: &ActiveAlert) -> String {
+    let limit_usd = a.threshold / 1_000_000.0;
+    let actual_usd = a.actual / 1_000_000.0;
+    let descriptor = a
+        .method
+        .clone()
+        .unwrap_or_else(|| "budget:agent:daily".to_string());
+    let agent_label = if a.agent.is_empty() {
+        "(deployment)".to_string()
+    } else {
+        a.agent.clone()
+    };
+    format!(
+        "🚨 Relix Alert — BUDGET EXCEEDED\n\
+         Agent: {agent}\n\
+         Budget: {descriptor}\n\
+         Limit: ${limit:.4} USD\n\
+         Current: ${actual:.4} USD\n\
+         {message}\n\
+         Time: {ts}",
+        agent = agent_label,
+        descriptor = descriptor,
+        limit = limit_usd,
+        actual = actual_usd,
+        message = a.message,
+        ts = iso_ms(a.triggered_at_ms),
+    )
+}
+
+fn format_budget_exceeded_recovered(a: &ActiveAlert) -> String {
+    let agent_label = if a.agent.is_empty() {
+        "(deployment)".to_string()
+    } else {
+        a.agent.clone()
+    };
+    let descriptor = a
+        .method
+        .clone()
+        .unwrap_or_else(|| "budget:agent:daily".to_string());
+    format!(
+        "✅ Relix Alert — BUDGET WINDOW RESET\n\
+         Agent: {agent}\n\
+         Budget: {descriptor}\n\
+         Window reset (current spend ${actual:.4} USD)\n\
+         Time: {ts}",
+        agent = agent_label,
+        descriptor = descriptor,
+        actual = a.actual / 1_000_000.0,
+        ts = iso_ms(unix_now_ms()),
+    )
+}
+
 /// Render a metric value with units appropriate to the metric.
 fn format_value(metric: &str, value: f64) -> String {
     match metric {
@@ -236,6 +298,9 @@ fn format_value(metric: &str, value: f64) -> String {
         // RELIX-7.19 GAP 2: confidence renders as a fixed
         // 3-decimal float in `[0, 1]`.
         "low_confidence" => format!("{value:.3}"),
+        // RELIX-7.28 Part 1: budget values are stored in
+        // micro-USD; convert to dollars at the rendering edge.
+        "budget_exceeded" => format!("${:.4}", value / 1_000_000.0),
         _ => format!("{value:.2}"),
     }
 }
@@ -474,7 +539,7 @@ impl AlertChronicle {
                 recovered_at: None,
                 recorded_at_ms: now_ms,
                 method: a.method.clone(),
-                message: if a.kind == AlertKind::LowConfidence {
+                message: if matches!(a.kind, AlertKind::LowConfidence | AlertKind::BudgetExceeded) {
                     Some(a.message.clone())
                 } else {
                     None

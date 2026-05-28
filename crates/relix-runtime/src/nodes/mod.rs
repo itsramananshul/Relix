@@ -13,6 +13,8 @@ pub mod discord;
 pub mod email;
 pub mod execution;
 pub mod memory;
+pub mod pii_gate;
+pub mod pii_gate_coordinator;
 pub mod router;
 pub mod slack;
 pub mod telegram;

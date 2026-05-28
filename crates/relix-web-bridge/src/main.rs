@@ -96,6 +96,7 @@ mod auth;
 mod blocklist;
 mod browser_captures;
 mod browser_sessions;
+mod budget;
 mod capabilities;
 mod chat;
 mod confidence;
@@ -130,8 +131,12 @@ mod memory_pii;
 mod memory_pii_mini_mesh_test;
 mod messaging;
 mod metrics;
+mod observability;
+#[cfg(test)]
+mod observability_mini_mesh_test;
 mod openai;
 mod os_secure;
+mod pii;
 mod planning;
 #[cfg(test)]
 mod planning_mini_mesh_test;
@@ -647,6 +652,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/metrics/alerts", get(agent_metrics::alerts))
         .route("/v1/metrics/cost", get(agent_metrics::cost))
+        // RELIX-7.28 Part 2: observability dashboard surface.
+        .route(
+            "/v1/observability/alerts",
+            get(observability::active_alerts),
+        )
+        .route(
+            "/v1/observability/alerts/history",
+            get(observability::alert_history),
+        )
+        .route("/v1/observability/health", get(observability::health))
+        // RELIX-7.28 Part 1: budget surface.
+        .route("/v1/budget/status", get(budget::status))
+        .route("/v1/budget/reset", post(budget::reset))
+        // RELIX-7.28 Part 3: PII detection surface.
+        .route("/v1/pii/stats", get(pii::stats))
+        .route("/v1/pii/events", get(pii::events))
         // RELIX-7.15: training data pipeline. Six routes onto
         // the coordinator's `training.*` capabilities.
         .route(

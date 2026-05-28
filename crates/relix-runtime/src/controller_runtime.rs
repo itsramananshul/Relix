@@ -107,6 +107,18 @@ pub struct ControllerConfig {
     /// the only data surface.
     #[serde(default)]
     pub metrics: Option<crate::metrics::MetricsConfig>,
+    /// `[budget]` — RELIX-7.28 Part 1 cost-control caps. The
+    /// per-agent + deployment limits the dispatch bridge
+    /// enforces before invoking a handler. Absent / empty
+    /// means the budget enforcer is dormant and the bridge
+    /// keeps pre-7.28 dispatch behaviour.
+    #[serde(default)]
+    pub budget: Option<crate::metrics::BudgetConfig>,
+    /// `[mesh_pii]` — RELIX-7.28 Part 3 PII gate. Absent /
+    /// disabled keeps the bridge in pre-7.28 mode (zero
+    /// scanning overhead).
+    #[serde(default)]
+    pub mesh_pii: Option<crate::nodes::pii_gate::MeshPiiConfig>,
     /// `[training]` — RELIX-7.15 training data pipeline. Absent
     /// / disabled keeps the AI handler running without an
     /// interaction sink — no `training.sqlite` file is opened
@@ -410,6 +422,43 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(b) = metrics_bundle.as_ref() {
         bridge.set_metrics_sink(b.sink.clone(), cfg.controller.name.clone());
     }
+    // RELIX-7.28 Part 1: budget enforcer. Built on top of the
+    // metrics query engine so its in-memory cache can refresh
+    // accumulated spend from the metrics SQLite store. When
+    // [budget] is absent / inactive (no caps configured), the
+    // bundle returns None and the dispatch path stays pre-7.28.
+    let budget_bundle = build_budget_bundle(&cfg, metrics_bundle.as_ref());
+    if let Some(b) = budget_bundle.as_ref() {
+        bridge.set_budget_enforcer(b.enforcer.clone());
+        // Wire the same alert pipeline used by the §7.19 alerts
+        // so BudgetExceeded events ride through the chronicle +
+        // multi-channel fan-out exactly like other alerts.
+        if let Some(m) = metrics_bundle.as_ref() {
+            let chronicle = crate::metrics::ChronicleAlertSink::new(m.alert_chronicle.clone());
+            let multi = crate::metrics::MultiChannelAlertSink::new(
+                m.alert_mesh_cell.clone(),
+                m.alert_targets.clone(),
+            );
+            let composite = crate::metrics::CompositeAlertSink::new(vec![
+                std::sync::Arc::new(chronicle),
+                std::sync::Arc::new(multi),
+            ]);
+            b.enforcer.set_alert_sink(std::sync::Arc::new(composite));
+            // Force-invalidate the cache on every cost-bearing
+            // row so a single expensive call can't escape a cap
+            // by being the last call before the next check.
+            m.collector.set_budget_enforcer(b.enforcer.clone());
+        }
+    }
+    // RELIX-7.28 Part 3: mesh PII gate. Built independently of
+    // the metrics bundle — the gate has its own SQLite chronicle
+    // (or shares the metrics dir). When [mesh_pii] is absent /
+    // disabled, the bundle returns None and the dispatch path
+    // skips the gate entirely.
+    let pii_gate_bundle = build_pii_gate_bundle(&cfg, &data_dir)?;
+    if let Some(gate) = pii_gate_bundle.as_ref() {
+        bridge.set_pii_gate(gate.clone());
+    }
     // RELIX-7.15: training-data pipeline. Returns Ok(None) when
     // the `[training]` section is absent / disabled — the AI
     // handler then runs with `interaction_sink = None` and
@@ -504,6 +553,8 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             &mut startup_wiring,
             metrics_bundle.as_ref(),
             training_bundle.as_ref(),
+            budget_bundle.as_ref(),
+            pii_gate_bundle.as_ref(),
         )?;
         None
     };
@@ -3741,6 +3792,11 @@ pub(crate) fn build_otel_config(
 /// engine all see the same store + query handle + price table.
 pub(crate) struct MetricsBundle {
     pub sink: std::sync::Arc<dyn crate::metrics::MetricsSink>,
+    /// RELIX-7.28 Part 1: cheap-clone handle on the concrete
+    /// collector behind `sink`. Used by the controller wiring
+    /// path to call `set_budget_enforcer` without resorting to
+    /// trait-object downcasts.
+    pub collector: crate::metrics::MetricsCollector,
     pub query: crate::metrics::MetricsQuery,
     pub alert_engine: crate::metrics::AlertEngine,
     pub alert_interval_secs: u64,
@@ -3998,7 +4054,8 @@ pub(crate) fn build_metrics_bundle(
         "metrics: collector + query + alert engine + chronicle online"
     );
     Ok(Some(MetricsBundle {
-        sink: std::sync::Arc::new(collector),
+        sink: std::sync::Arc::new(collector.clone()),
+        collector,
         query,
         alert_engine,
         alert_interval_secs: m_cfg.alert_interval_secs,
@@ -4006,6 +4063,61 @@ pub(crate) fn build_metrics_bundle(
         alert_targets: m_cfg.alerts.targets.clone(),
         alert_mesh_cell: std::sync::Arc::new(tokio::sync::OnceCell::new()),
     }))
+}
+
+/// RELIX-7.28 Part 1 — boot-time bundle for the budget enforcer. The
+/// enforcer is cheap to clone (`Arc<BudgetInner>`); we wrap it once so
+/// the dispatch bridge + the coordinator's `budget.*` capabilities see
+/// the same instance.
+pub(crate) struct BudgetBundle {
+    pub enforcer: std::sync::Arc<crate::metrics::BudgetEnforcer>,
+}
+
+/// Build the budget bundle. Returns `None` when:
+///
+/// - `[budget]` is absent.
+/// - The config has no agent OR deployment cap configured.
+///
+/// In either case the dispatch path skips the enforcer entirely.
+pub(crate) fn build_budget_bundle(
+    cfg: &ControllerConfig,
+    metrics: Option<&MetricsBundle>,
+) -> Option<BudgetBundle> {
+    let bcfg = cfg.budget.clone()?;
+    if !bcfg.is_active() {
+        return None;
+    }
+    let query = metrics.map(|m| m.query.clone());
+    let enforcer = std::sync::Arc::new(crate::metrics::BudgetEnforcer::new(bcfg, query));
+    tracing::info!(
+        active = enforcer.is_active(),
+        throttle_backoff_ms = enforcer.throttle_backoff().as_millis() as u64,
+        "budget: enforcer online (RELIX-7.28 Part 1)"
+    );
+    Some(BudgetBundle { enforcer })
+}
+
+/// RELIX-7.28 Part 3 — open the mesh PII gate when `[mesh_pii]` is
+/// configured + enabled. Returns `Ok(None)` for the default-off case.
+pub(crate) fn build_pii_gate_bundle(
+    cfg: &ControllerConfig,
+    data_dir: &std::path::Path,
+) -> Result<Option<std::sync::Arc<crate::nodes::pii_gate::MeshPiiGate>>, Box<dyn std::error::Error>>
+{
+    let pcfg = match cfg.mesh_pii.clone() {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    if !pcfg.enabled {
+        return Ok(None);
+    }
+    let path = pcfg
+        .chronicle_path
+        .clone()
+        .unwrap_or_else(|| crate::nodes::pii_gate::default_pii_chronicle_path(data_dir));
+    let gate = crate::nodes::pii_gate::MeshPiiGate::from_config(pcfg, &path)
+        .map_err(|e| format!("[mesh_pii] open {}: {e}", path.display()))?;
+    Ok(gate.map(std::sync::Arc::new))
 }
 
 /// Static descriptor list for the six metrics capabilities
@@ -4153,6 +4265,7 @@ fn open_layered_memory(
 ///   their handlers ship in later milestones; the controller still serves
 ///   the default `node.health` capability so it can participate in chained
 ///   orchestration today.
+#[allow(clippy::too_many_arguments)]
 fn register_node_type_handlers(
     bridge: &mut DispatchBridge,
     cfg: &ControllerConfig,
@@ -4161,6 +4274,8 @@ fn register_node_type_handlers(
     out: &mut Vec<StartupWiring>,
     metrics: Option<&MetricsBundle>,
     training: Option<&TrainingBundle>,
+    budget: Option<&BudgetBundle>,
+    pii_gate: Option<&std::sync::Arc<crate::nodes::pii_gate::MeshPiiGate>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
 
@@ -5323,6 +5438,24 @@ fn register_node_type_handlers(
                         .with_categories(["metrics".into(), "read".into()]),
                 );
             }
+            // RELIX-7.28 Part 2 — observability dashboard capabilities.
+            let alert_engine_arc = std::sync::Arc::new(alert_engine.clone());
+            crate::metrics::observability::register(
+                bridge,
+                b.query.clone(),
+                b.alert_chronicle.clone(),
+                alert_engine_arc.clone(),
+                budget.as_ref().map(|b| b.enforcer.clone()),
+            );
+            for (method, doc) in
+                crate::metrics::observability::observability_capability_descriptors()
+            {
+                manifest.add_capability(
+                    CapabilityDescriptor::unary(*method)
+                        .with_description(*doc)
+                        .with_categories(["observability".into(), "read".into()]),
+                );
+            }
             // RELIX-7.11 GAP 3+4: compose the alert delivery
             // sinks. The chronicle sink ALWAYS runs so an
             // operator without configured channel targets
@@ -5369,6 +5502,38 @@ fn register_node_type_handlers(
         } else {
             tracing::info!(
                 "coordinator: [metrics] disabled — metrics.* capabilities not registered"
+            );
+        }
+
+        // ── RELIX-7.28 Part 1: budget.* capabilities.
+        if let Some(b) = budget.as_ref() {
+            crate::metrics::budget_coordinator::register(bridge, b.enforcer.clone());
+            for (method, doc) in crate::metrics::budget_coordinator::budget_capability_descriptors()
+            {
+                manifest.add_capability(
+                    CapabilityDescriptor::unary(*method)
+                        .with_description(*doc)
+                        .with_categories(["budget".into(), "observability".into()]),
+                );
+            }
+            tracing::info!(
+                "coordinator node: registered budget.status / budget.reset capabilities"
+            );
+        }
+
+        // ── RELIX-7.28 Part 3: pii.* capabilities.
+        if let Some(gate) = pii_gate.as_ref() {
+            crate::nodes::pii_gate_coordinator::register(bridge, (*gate).clone());
+            for (method, doc) in crate::nodes::pii_gate_coordinator::pii_capability_descriptors() {
+                manifest.add_capability(
+                    CapabilityDescriptor::unary(*method)
+                        .with_description(*doc)
+                        .with_categories(["pii".into(), "observability".into(), "read".into()]),
+                );
+            }
+            tracing::info!(
+                action = %gate.action().as_str(),
+                "coordinator node: registered pii.scan_stats / pii.recent_events capabilities"
             );
         }
 

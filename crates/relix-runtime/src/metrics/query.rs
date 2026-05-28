@@ -396,6 +396,59 @@ impl MetricsQuery {
         Ok(n as u64)
     }
 
+    /// RELIX-7.28 Part 2 — average per-call confidence score for one
+    /// agent over the last `hours` hours. `Ok(None)` when no scored
+    /// invocations are present in the window.
+    pub fn avg_confidence_for(
+        &self,
+        agent: &str,
+        hours: u32,
+    ) -> Result<Option<f64>, MetricsQueryError> {
+        if agent.is_empty() {
+            return Err(MetricsQueryError::Arg(
+                "agent name must be non-empty".into(),
+            ));
+        }
+        let hours = sanitize_hours(hours);
+        let cutoff = window_start_ms(hours);
+        let raw: Option<f64> = self.store.with_conn(|c| {
+            c.query_row(
+                "SELECT AVG(confidence_score) FROM metrics_invocations \
+                 WHERE agent_name = ?1 AND timestamp_ms >= ?2 \
+                 AND confidence_score IS NOT NULL",
+                rusqlite::params![agent, cutoff],
+                |r| r.get::<_, Option<f64>>(0),
+            )
+        })?;
+        Ok(raw)
+    }
+
+    /// RELIX-7.28 Part 1 — sum of `cost_micros` since a given
+    /// unix-ms timestamp. `agent = Some(name)` filters to one
+    /// agent; `None` sums every row in the window. Used by the
+    /// `BudgetEnforcer` to refresh its in-memory cache.
+    pub fn cost_since(&self, agent: Option<&str>, since_ms: i64) -> Result<u64, MetricsQueryError> {
+        self.store
+            .with_conn(|c| {
+                let n: i64 = match agent {
+                    Some(a) => c.query_row(
+                        "SELECT COALESCE(SUM(cost_micros), 0) FROM metrics_invocations \
+                     WHERE agent_name = ?1 AND timestamp_ms >= ?2",
+                        rusqlite::params![a, since_ms],
+                        |r| r.get(0),
+                    )?,
+                    None => c.query_row(
+                        "SELECT COALESCE(SUM(cost_micros), 0) FROM metrics_invocations \
+                     WHERE timestamp_ms >= ?1",
+                        rusqlite::params![since_ms],
+                        |r| r.get(0),
+                    )?,
+                };
+                Ok(n.max(0) as u64)
+            })
+            .map_err(MetricsQueryError::from)
+    }
+
     /// Total invocation count (any outcome) for an agent over
     /// the last N minutes. Companion to the call above —
     /// the AlertEngine fires the zero-success alert ONLY when
@@ -810,6 +863,70 @@ mod tests {
         assert_eq!(rows[0].agent, "bob");
         assert_eq!(rows[0].total_cost_micros, 500_000);
         assert_eq!(rows[1].agent, "alice");
+    }
+
+    #[test]
+    fn cost_since_sums_filtered_window() {
+        let store = MetricsStore::in_memory().unwrap();
+        let now = now_ms();
+        // Two recent rows for alice + one old row outside the window.
+        store
+            .insert(&metric(
+                "alice",
+                "ai.chat",
+                now,
+                10,
+                true,
+                None,
+                Some(100),
+                Some(50_000),
+            ))
+            .unwrap();
+        store
+            .insert(&metric(
+                "alice",
+                "ai.chat",
+                now,
+                10,
+                true,
+                None,
+                Some(100),
+                Some(150_000),
+            ))
+            .unwrap();
+        store
+            .insert(&metric(
+                "alice",
+                "ai.chat",
+                0,
+                10,
+                true,
+                None,
+                Some(100),
+                Some(999_999),
+            ))
+            .unwrap();
+        // Bob in the same window.
+        store
+            .insert(&metric(
+                "bob",
+                "ai.chat",
+                now,
+                10,
+                true,
+                None,
+                Some(100),
+                Some(400_000),
+            ))
+            .unwrap();
+        let q = MetricsQuery::new(store);
+        // Window starts 5 minutes ago; alice's two recent rows = 200_000.
+        let cutoff = now - 5 * 60_000;
+        assert_eq!(q.cost_since(Some("alice"), cutoff).unwrap(), 200_000);
+        // Deployment-wide sum: alice's 200_000 + bob's 400_000 = 600_000.
+        assert_eq!(q.cost_since(None, cutoff).unwrap(), 600_000);
+        // Filtering to a non-existent agent returns 0 cleanly.
+        assert_eq!(q.cost_since(Some("nobody"), cutoff).unwrap(), 0);
     }
 
     #[test]

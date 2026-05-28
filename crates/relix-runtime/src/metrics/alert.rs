@@ -103,6 +103,14 @@ pub enum AlertKind {
     /// `tool.*` and a chatty `ai.chat` don't suppress each
     /// other.
     LowConfidence,
+    /// RELIX-7.28 Part 1: emitted by the dispatch bridge's
+    /// `BudgetEnforcer` when an agent or the deployment crosses
+    /// a configured spend cap. Dedup is keyed by
+    /// `(agent, "budget:<scope>:<window>", BudgetExceeded)` so
+    /// daily / hourly trips at the same agent stay distinct,
+    /// and agent-level breaches don't suppress the deployment
+    /// roll-up.
+    BudgetExceeded,
 }
 
 impl AlertKind {
@@ -113,6 +121,7 @@ impl AlertKind {
             AlertKind::CostPerHour => "cost_per_hour",
             AlertKind::ZeroSuccess => "zero_success",
             AlertKind::LowConfidence => "low_confidence",
+            AlertKind::BudgetExceeded => "budget_exceeded",
         }
     }
 }

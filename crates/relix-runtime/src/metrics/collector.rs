@@ -73,6 +73,13 @@ pub struct MetricsCollector {
     provider_signals: Arc<Mutex<HashMap<RequestId, AiProviderSignalsHint>>>,
     prices: Arc<PriceTable>,
     store: MetricsStore,
+    /// RELIX-7.28 Part 1: optional budget enforcer the collector
+    /// invalidates whenever a cost-bearing metric lands. The
+    /// enforcer's in-memory cache is otherwise refreshed every
+    /// 60s; immediate invalidation closes that gap so a single
+    /// expensive call cannot escape a same-window cap by being
+    /// the last call before a check.
+    budget: Arc<Mutex<Option<Arc<super::budget::BudgetEnforcer>>>>,
 }
 
 /// How many pending AI usage hints we hold in memory while
@@ -101,6 +108,7 @@ impl MetricsCollector {
             provider_signals: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
             prices: Arc::new(prices),
             store: store.clone(),
+            budget: Arc::new(Mutex::new(None)),
         };
         let handles = MetricsWorkerHandles {
             store,
@@ -131,11 +139,38 @@ impl MetricsCollector {
             m.enrich_with_hint(&hint, &self.prices);
         }
     }
+
+    /// RELIX-7.28 Part 1: wire the budget enforcer so cost-bearing
+    /// metrics force-invalidate the enforcer's cache for the
+    /// agent (and the deployment-level cache, since deployment
+    /// totals reflect every agent's spend).
+    pub fn set_budget_enforcer(&self, enforcer: Arc<super::budget::BudgetEnforcer>) {
+        let mut g = match self.budget.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g = Some(enforcer);
+    }
 }
 
 impl MetricsSink for MetricsCollector {
     fn record_invocation(&self, mut m: InvocationMetric) {
         self.enrich_inline(&mut m);
+        // RELIX-7.28 Part 1: invalidate the BudgetEnforcer's cache
+        // immediately when this row contributes spend. The cache's
+        // 60-second refresh tick is otherwise the upper bound on
+        // how stale the in-memory accumulated cost can be.
+        if let Some(cost) = m.cost_micros
+            && cost > 0
+        {
+            let enforcer = match self.budget.lock() {
+                Ok(g) => g.clone(),
+                Err(p) => p.into_inner().clone(),
+            };
+            if let Some(e) = enforcer {
+                e.invalidate_agent(&m.agent_name);
+            }
+        }
         match self.tx.send(m) {
             Ok(()) => {}
             Err(_) => {

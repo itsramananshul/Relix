@@ -210,6 +210,12 @@ pub mod error_kinds {
     /// `memory.write_turn` raises it via
     /// `crate::nodes::memory::guard::MemoryGuard`.
     pub const SECURITY_DENIED: u32 = 21;
+    /// RELIX-7.28 Part 1: budget enforcer rejected the call.
+    /// The caller exceeded an agent or deployment cost cap and
+    /// the cap is configured with `action_on_exceed = "reject"`.
+    /// The error envelope's `cause` carries the limit + actual +
+    /// reset time so the caller can surface a useful message.
+    pub const RESOURCE_EXHAUSTED: u32 = 22;
 }
 
 #[cfg(test)]
