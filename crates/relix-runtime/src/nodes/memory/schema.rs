@@ -790,6 +790,24 @@ impl LayeredMemoryStore {
         Ok(())
     }
 
+    /// GAP 7: rewrite the `observed_at` column for one record.
+    /// Used by `memory.request_model_refresh` to age the latest
+    /// Layer-4 model past the promoter's throttle so the next
+    /// curator tick regenerates it on demand.
+    pub fn touch_observed_at(&self, id: &str, observed_at: i64) -> Result<(), LayeredMemoryError> {
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let n = conn.execute(
+            "UPDATE memory_records SET observed_at = ?1 WHERE id = ?2",
+            params![observed_at, id],
+        )?;
+        if n == 0 {
+            return Err(LayeredMemoryError::Serialization(format!(
+                "memory record {id} not found"
+            )));
+        }
+        Ok(())
+    }
+
     /// GAP 7: bulk-export every record for `subject_id`,
     /// optionally filtered to a single layer. Returns the
     /// records as a Vec (bridge wraps as JSON / JSONL).

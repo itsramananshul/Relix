@@ -573,6 +573,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/memory/quarantine/reject",
             post(memory_gap5::quarantine_reject),
         )
+        // GAP 7: memory inspector editing surface.
+        .route("/v1/memory/records/edit", post(memory_gap5::edit_record))
+        .route(
+            "/v1/memory/records/freeze",
+            post(memory_gap5::freeze_record),
+        )
+        .route(
+            "/v1/memory/records/unfreeze",
+            post(memory_gap5::unfreeze_record),
+        )
+        .route("/v1/memory/export", post(memory_gap5::bulk_export))
+        .route(
+            "/v1/memory/refresh_model",
+            post(memory_gap5::request_model_refresh),
+        )
         // RELIX-7.16 knowledge transfer.
         .route("/v1/knowledge/share", post(knowledge::share))
         .route("/v1/knowledge/shared/:agent", get(knowledge::list_shared))

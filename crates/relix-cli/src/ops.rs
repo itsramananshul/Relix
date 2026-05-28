@@ -497,6 +497,61 @@ pub enum MemoryCmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// GAP 7: edit one memory record's text. Hits POST
+    /// /v1/memory/records/edit.
+    EditRecord {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 7: freeze a memory record. Hits POST
+    /// /v1/memory/records/freeze.
+    FreezeRecord {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 7: unfreeze a memory record. Hits POST
+    /// /v1/memory/records/unfreeze.
+    UnfreezeRecord {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 7: bulk-export every record for one source. Hits
+    /// POST /v1/memory/export.
+    Export {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        layer: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// GAP 7: force the next promoter tick to regenerate the
+    /// Layer-4 model for one source. Hits POST
+    /// /v1/memory/refresh_model.
+    RefreshModel {
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -1007,7 +1062,104 @@ async fn memory_run(cmd: MemoryCmd) -> Result<(), Box<dyn std::error::Error>> {
         MemoryCmd::QuarantineReject { bridge, id, json } => {
             memory_quarantine_reject_cmd(&bridge, &id, json).await
         }
+        MemoryCmd::EditRecord {
+            bridge,
+            id,
+            text,
+            json,
+        } => memory_edit_record_cmd(&bridge, &id, &text, json).await,
+        MemoryCmd::FreezeRecord { bridge, id, json } => {
+            memory_freeze_record_cmd(&bridge, &id, true, json).await
+        }
+        MemoryCmd::UnfreezeRecord { bridge, id, json } => {
+            memory_freeze_record_cmd(&bridge, &id, false, json).await
+        }
+        MemoryCmd::Export {
+            bridge,
+            source,
+            layer,
+            json,
+        } => memory_bulk_export_cmd(&bridge, &source, layer.as_deref(), json).await,
+        MemoryCmd::RefreshModel {
+            bridge,
+            source,
+            json,
+        } => memory_refresh_model_cmd(&bridge, &source, json).await,
     }
+}
+
+async fn memory_edit_record_cmd(
+    bridge: &str,
+    id: &str,
+    text: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::json!({ "id": id, "text": text });
+    post_json_to_bridge(bridge, "/v1/memory/records/edit", &body, json_out).await
+}
+
+async fn memory_freeze_record_cmd(
+    bridge: &str,
+    id: &str,
+    freeze: bool,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::json!({ "id": id });
+    let path = if freeze {
+        "/v1/memory/records/freeze"
+    } else {
+        "/v1/memory/records/unfreeze"
+    };
+    post_json_to_bridge(bridge, path, &body, json_out).await
+}
+
+async fn memory_bulk_export_cmd(
+    bridge: &str,
+    source: &str,
+    layer: Option<&str>,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut body = serde_json::json!({ "source": source });
+    if let Some(l) = layer {
+        body.as_object_mut()
+            .unwrap()
+            .insert("layer".into(), serde_json::Value::from(l));
+    }
+    post_json_to_bridge(bridge, "/v1/memory/export", &body, json_out).await
+}
+
+async fn memory_refresh_model_cmd(
+    bridge: &str,
+    source: &str,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::json!({ "source": source });
+    post_json_to_bridge(bridge, "/v1/memory/refresh_model", &body, json_out).await
+}
+
+async fn post_json_to_bridge(
+    bridge: &str,
+    path: &str,
+    body: &serde_json::Value,
+    json_out: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = bridge.trim_end_matches('/');
+    let url = format!("{base}{path}");
+    let client = reqwest::Client::new();
+    let r = client.post(&url).json(body).send().await?;
+    let status = r.status();
+    let resp_body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {resp_body}");
+        std::process::exit(1);
+    }
+    if json_out {
+        println!("{resp_body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp_body)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
 }
 
 async fn memory_quarantine_list_cmd(

@@ -4683,6 +4683,56 @@ fn register_node_type_handlers(
                 &["mutate", "memory", "quarantine"],
                 &["mutate:memory"],
             ),
+            // ── GAP 7: memory inspector editing surface ──────
+            (
+                "memory.edit_record",
+                "GAP 7: replace one record's text. Args JSON \
+                 `{id, text}`. The new text runs through the \
+                 standard PII anonymizer before insert and the \
+                 embedding pointer is cleared so the background \
+                 pipeline re-embeds on its next tick. Returns \
+                 `{ok, id, last_edited_ms}`.",
+                &["mutate", "memory", "inspector"],
+                &["mutate:memory"],
+            ),
+            (
+                "memory.freeze_record",
+                "GAP 7: pin a record so the curator never \
+                 overwrites it, the context-flush archiver \
+                 never invalidates it, and the consolidation \
+                 pipeline never archives it. Args JSON `{id}`. \
+                 Returns `{ok, id, frozen: true}`.",
+                &["mutate", "memory", "inspector"],
+                &["mutate:memory"],
+            ),
+            (
+                "memory.unfreeze_record",
+                "GAP 7: undo memory.freeze_record. Args JSON \
+                 `{id}`. Returns `{ok, id, frozen: false}`.",
+                &["mutate", "memory", "inspector"],
+                &["mutate:memory"],
+            ),
+            (
+                "memory.bulk_export",
+                "GAP 7: export every record for one source as \
+                 JSON. Args JSON `{source, layer?}` where layer \
+                 is optional ('raw' / 'semantic' / \
+                 'observation' / 'model'). Returns `{source, \
+                 records, count}`.",
+                &["read", "memory", "inspector", "export"],
+                &["reads:internal"],
+            ),
+            (
+                "memory.request_model_refresh",
+                "GAP 7: force the next promoter tick to \
+                 regenerate the Layer-4 model for one source. \
+                 Args JSON `{source}`. Mechanism: age the \
+                 latest model's observed_at past the throttle \
+                 window. Returns `{ok, source, \
+                 aged_existing_model}`.",
+                &["mutate", "memory", "inspector", "promoter"],
+                &["mutate:memory"],
+            ),
         ];
         for (m, desc, cats, tags) in memory_caps {
             // PH-CAP-RISK: memory caps are either reads (Safe) or

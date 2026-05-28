@@ -81,6 +81,7 @@ pub mod embedder;
 pub mod embeddings;
 pub mod guard;
 pub mod ingest;
+pub mod inspect_edit;
 pub mod integrity;
 pub mod promoter;
 pub mod qdrant;
@@ -1087,6 +1088,57 @@ pub fn register(
                 Arc::new(FnHandler(move |ictx: InvocationCtx| {
                     let layered = layered.clone();
                     async move { quarantine::handle_reject(&layered, &ictx).await }
+                })),
+            );
+        }
+        // ── GAP 7: memory inspector editing surface ─────────
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.edit_record",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { inspect_edit::handle_edit(&layered, &ictx).await }
+                })),
+            );
+        }
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.freeze_record",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { inspect_edit::handle_freeze(&layered, &ictx).await }
+                })),
+            );
+        }
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.unfreeze_record",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { inspect_edit::handle_unfreeze(&layered, &ictx).await }
+                })),
+            );
+        }
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.bulk_export",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { inspect_edit::handle_bulk_export(&layered, &ictx).await }
+                })),
+            );
+        }
+        {
+            let layered = ctx.clone();
+            bridge.register(
+                "memory.request_model_refresh",
+                Arc::new(FnHandler(move |ictx: InvocationCtx| {
+                    let layered = layered.clone();
+                    async move { inspect_edit::handle_request_model_refresh(&layered, &ictx).await }
                 })),
             );
         }

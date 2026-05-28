@@ -85,6 +85,48 @@ pub async fn quarantine_reject(
     proxy_json(&state, req, "memory.quarantine_reject").await
 }
 
+// ── GAP 7: inspector editing surface ──────────────────────
+
+/// `POST /v1/memory/records/edit` — forwards to `memory.edit_record`.
+pub async fn edit_record(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.edit_record").await
+}
+
+/// `POST /v1/memory/records/freeze` — forwards to `memory.freeze_record`.
+pub async fn freeze_record(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.freeze_record").await
+}
+
+/// `POST /v1/memory/records/unfreeze` — forwards to `memory.unfreeze_record`.
+pub async fn unfreeze_record(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.unfreeze_record").await
+}
+
+/// `POST /v1/memory/export` — forwards to `memory.bulk_export`.
+pub async fn bulk_export(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.bulk_export").await
+}
+
+/// `POST /v1/memory/refresh_model` — forwards to `memory.request_model_refresh`.
+pub async fn request_model_refresh(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> axum::response::Response {
+    proxy_json(&state, req, "memory.request_model_refresh").await
+}
+
 // ── helpers ──────────────────────────────────────────────
 
 async fn proxy_json(state: &AppState, mut req: Value, method: &str) -> axum::response::Response {
