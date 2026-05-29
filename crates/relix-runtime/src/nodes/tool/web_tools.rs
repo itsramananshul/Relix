@@ -290,6 +290,18 @@ impl GetMode {
     }
 }
 
+/// Crate-public alias the `tool.web_read` cap uses to share
+/// the exact same fetch + extract path as `tool.web_get`. Same
+/// wire format, same SSRF / DNS-pin / redirect / body-cap
+/// posture — `tool.web_read` is literally `tool.web_get` under
+/// the spec-named alias.
+pub(crate) async fn handle_web_get_public(
+    backend: Arc<ToolBackend>,
+    ctx: InvocationCtx,
+) -> HandlerOutcome {
+    handle_web_get(backend, ctx).await
+}
+
 async fn handle_web_get(backend: Arc<ToolBackend>, ctx: InvocationCtx) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,

@@ -211,7 +211,7 @@ fn handle(cfg: &PdfConfig, ctx: &InvocationCtx) -> HandlerOutcome {
 
 /// Render document metadata one `name\tvalue` per line, omitting
 /// absent fields. Keys come from the PDF `/Info` dictionary.
-fn render_meta_lines(doc: &lopdf::Document) -> String {
+pub(crate) fn render_meta_lines(doc: &lopdf::Document) -> String {
     let mut out = String::new();
     let fields = [
         ("title", "Title"),
@@ -276,7 +276,7 @@ fn bytes_to_text(bytes: &[u8]) -> String {
 
 /// Walk the document page-by-page, pulling the content stream and
 /// rendering text-show operators.
-fn extract_text(
+pub(crate) fn extract_text(
     doc: &lopdf::Document,
     pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
     max_chars: usize,

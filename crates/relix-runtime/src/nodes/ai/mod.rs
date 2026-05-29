@@ -59,6 +59,7 @@ pub mod failover;
 pub mod guardrails;
 pub mod judge;
 pub mod memory_dispatcher;
+pub mod perception_security;
 pub mod provenance_hooks;
 pub mod provider;
 pub mod reasoning_status;
@@ -152,6 +153,16 @@ pub struct AiConfig {
     /// `judge.stats`.
     #[serde(default)]
     pub judge: Option<judge::JudgeConfig>,
+    /// `[ai.perception_security]` — RELIX-7.23 two-stage
+    /// isolation. When `enabled = true`, the
+    /// `ai.perception_extract` cap dispatches against the
+    /// configured `extraction_model` with a hardened system
+    /// prompt that treats every byte of input as untrusted
+    /// data. Absent / `enabled = false` keeps the cap
+    /// registered but in a documented-disabled mode that
+    /// signals callers to fall through to plain `ai.chat`.
+    #[serde(default)]
+    pub perception_security: Option<perception_security::PerceptionSecurityConfig>,
 }
 
 /// `[ai.agent]` config — operator-supplied persona pointer for
@@ -180,6 +191,7 @@ impl Default for AiConfig {
             routing: None,
             belief_state: None,
             judge: None,
+            perception_security: None,
         }
     }
 }
@@ -340,6 +352,7 @@ pub fn register(
     // persistence. `None` keeps the tracker process-local.
     belief_persistence_store: Option<Arc<crate::nodes::memory::schema::LayeredMemoryStore>>,
     judge_runtime_config: Option<judge::JudgeConfig>,
+    perception_security_config: Option<perception_security::PerceptionSecurityConfig>,
 ) -> (belief_state::BeliefStateTracker, judge::JudgeRecorder) {
     // RELIX-7.29 PART 1: build the spec'd `[ai.routing]` tier
     // router. The registry maps provider names to the active
@@ -394,6 +407,16 @@ pub fn register(
     // of whether `[ai.routing] enabled` is true) so operators
     // can dry-run the classifier even when routing is off.
     tier_routing::caps::register(bridge, routing_router_shared.clone());
+    // RELIX-GAP-10 / §7.23: register `ai.perception_extract`.
+    // Always registered; disabled config returns a documented
+    // "isolated=false" envelope so callers know to fall
+    // through to plain `ai.chat`.
+    perception_security::register(
+        bridge,
+        provider.clone(),
+        default_model.clone(),
+        perception_security_config.unwrap_or_default(),
+    );
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let memory_for_chat = memory_dispatcher.clone();
@@ -3783,6 +3806,7 @@ mod tests {
             routing: None,
             belief_state: None,
             judge: None,
+            perception_security: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3804,6 +3828,7 @@ mod tests {
             routing: None,
             belief_state: None,
             judge: None,
+            perception_security: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3832,6 +3857,7 @@ mod tests {
             routing: None,
             belief_state: None,
             judge: None,
+            perception_security: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3860,6 +3886,7 @@ mod tests {
             routing: None,
             belief_state: None,
             judge: None,
+            perception_security: None,
         };
         match build_provider(&cfg) {
             Ok(p) => assert_eq!(p.provider_name(), "local"),

@@ -58,6 +58,7 @@ pub mod mcp_http;
 pub mod mcp_stdio;
 pub mod output_guard;
 pub mod pdf;
+pub mod perception;
 pub mod registry;
 pub mod sanitize;
 pub mod security;
@@ -963,6 +964,20 @@ pub fn register(
     // re-validation all apply. Pure safety surface — does NOT enforce.
     tracing::info!("tool node: registering tool.web.robots_check (PH-WEB-ROBOTS)");
     web_robots::register(bridge, backend.clone());
+
+    // RELIX-GAP-10: tool.parse_document + tool.web_read — the
+    // spec-named perception caps. parse_document dispatches by
+    // content kind (text/markdown/code direct; pdf via the same
+    // lopdf pipeline tool.pdf uses); web_read shares the
+    // tool.web_get fetch+extract path under the spec-named
+    // alias. The cloud + local tiers
+    // (LlamaParse / Docling / PyMuPDF / Crawl4AI / Jina /
+    // Firecrawl) remain EXTERNAL-INFRASTRUCTURE-DEFERRED.
+    tracing::info!(
+        "tool node: registering tool.parse_document + tool.web_read (GAP 10 simple tier)"
+    );
+    let pdf_cfg_for_perception = backend.pdf_config().map(Arc::new);
+    perception::register(bridge, backend.clone(), pdf_cfg_for_perception);
 
     // PH-PDF-CHUNK: tool.text.chunk — pure CPU text chunker. No
     // config gating; always registered alongside the parsing

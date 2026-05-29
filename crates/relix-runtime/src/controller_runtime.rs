@@ -6007,6 +6007,11 @@ fn register_node_type_handlers(
             // surface already serves `judge.recent_verdicts` /
             // `judge.stats` from the same shared instance.
             ai_cfg.judge.clone(),
+            // RELIX-GAP-10 / §7.23 perception security two-stage
+            // isolation config. Absent / `enabled = false`
+            // keeps the `ai.perception_extract` cap registered
+            // in the documented-disabled mode.
+            ai_cfg.perception_security.clone(),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
