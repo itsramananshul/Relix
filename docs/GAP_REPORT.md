@@ -37,7 +37,7 @@ Closure with explicit deferrals (see per-gap entries for the rationale):
 
 CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL (cannot be closed from this codebase without standing up the external dependency):
 
-- **GAP 17** — Research-backed identity needs a paid web-search API (Tavily / Perplexity / Brave / equivalent). No in-process closure is possible.
+- ~~**GAP 17** — closed by commits `5c18f41` + `2bde84d` + `34465a5` + `061634a` (research-backed identity pipeline; operators paste a Tavily / Brave / Perplexity key via `scripts/setup.{sh,ps1}`)~~
 - **GAP 19** — Plugin marketplace needs a hosted registry server + a signing CA + a payment processor + a web frontend. The on-host SDK + loader (`c5af764`, `054e7b4`) are the buildable portion; the marketplace itself stays out of scope for the OSS codebase.
 - **GAP 20** — WebRTC needs STUN/TURN/signalling infrastructure; Relix Cloud is a hosted multi-tenant service. Both stay out of scope for the OSS codebase.
 - **GAP 21** — Warm sandbox needs Linux namespaces + cgroups + CRIU OR Windows Job Objects + Hyper-V snapshots, plus cross-platform process-state preservation. Each piece is a multi-week kernel-level integration with its own security review.
@@ -340,11 +340,30 @@ Tests: 47 reasoning-lib unit tests (commit d645040) + 3 belief cap tests + 4 mod
 
 ---
 
-## GAP 17 — §7.18 Research-Backed Identity System — CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL
+## GAP 17 — §7.18 Research-Backed Identity System — CLOSED
 
-The §7.18 feature is a research + synthesis pipeline that pulls open-web context about a target subject (their public writings, GitHub, blog posts) and produces a synthesised identity card. It explicitly requires external web-search API access (Tavily, Perplexity, Brave Search, or equivalent), each of which is a paid third-party service.
+**Closed in commits `5c18f41` (PART 1), `2bde84d` (PART 2 modules), `34465a5` (PART 2 wire-up), `061634a` (PART 3 setup).** The §7.18 spec is now a working five-stage pipeline. The earlier deferral assumed no operator would ever supply a paid API key; the actual deployment model is that operators paste a Tavily, Brave Search, or Perplexity key at install time via `scripts/setup.{sh,ps1}` and the controller resolves the first non-empty key from env vars at startup.
 
-**Final status:** No in-process closure is possible from this codebase. Building this feature without access to one of those APIs would produce a non-functional skeleton — exactly the kind of stub the codebase prohibits. The roadmap correctly tags this as SKIPPED; the external dependency is a paid hosted-API contract that lives outside the OSS surface. A future deployment that holds the API key can wire `tool.web_read` + `ai.perception_extract` (both shipped in `cf9759c`) into an `identity.research` cap; the runtime primitives are in place.
+- **PART 1 — WebSearchProvider abstraction** (`crates/relix-runtime/src/nodes/tool/web_search.rs`, 5c18f41): an async `WebSearchProvider` trait with three production implementations.
+  - **Tavily** (`POST https://api.tavily.com/search`, `api_key` in JSON body, `search_depth = "advanced"`) parses `results[].{title, url, content, published_date}`.
+  - **Brave Search** (`GET https://api.search.brave.com/res/v1/web/search`, `X-Subscription-Token` header) parses `web.results[].{title, url, description, age}`.
+  - **Perplexity** (`POST https://api.perplexity.ai/chat/completions`, Bearer auth, `model = "sonar"`) parses the JSON array out of the assistant message content (markdown-fence-stripping).
+  - `auto` selection precedence: Tavily → Brave → Perplexity. A pure-function `ApiKeys` bundle threads keys through `build_provider(cfg, keys)` so unit tests don't touch process env (the crate `#![forbid(unsafe_code)]`); the production constructor `build_provider_from_env(cfg)` reads `TAVILY_API_KEY`, `BRAVE_SEARCH_API_KEY`, `PERPLEXITY_API_KEY`. 16 unit tests cover auto-precedence, empty-key-as-missing, unknown-provider error, max-results clamp, and parser shape for all three providers.
+- **PART 2 — ResearchPipeline** (`crates/relix-runtime/src/identity/research.rs` + `research_caps.rs`, 2bde84d): five stages end-to-end.
+  1. **Query generation** — `ai.chat` mints 3-5 web search queries (clamped 1-10).
+  2. **Parallel web search** — `tokio::join_all` over the queries, dedup by URL (case + trailing-slash), capped at 20 results.
+  3. **LLM synthesis** — structured-extraction prompt parsed into `IdentityProfile` (display_name / professional_role / organization / location / expertise_areas / public_profiles[] / sources_used / confidence / synthesis_notes).
+  4. **Human approval gate** — §7.30 PART 1 `ApprovalDeliveryService` dispatches the request and the pipeline polls the store synchronously until verdict or `approval_wait_timeout_secs` (default 300s).
+  5. **Memory write** — Layer-4 `Model` record on the `LayeredMemoryStore` with deterministic blake3 id (so re-running upserts the same row) + tags `[research_identity, confidence:{:.2}, source:web_research]`.
+  - 21 unit + integration tests cover: config defaults, prompt builders (with/without context), query array parsing (bare / fenced / garbage rejection), URL dedup edge cases (case + trailing-slash + empty + 20-cap), synthesis prompt structure, profile decode (full + missing optionals), deterministic id stability, approval verdict matrix (NotRequired / Pending / Approved / Rejected), memory record shape on write, and error paths (Disabled / SubjectMissing / MemoryUnavailable). The approval matrix tests spawn the pipeline on a tokio task, poke `record_decision` from the same test, and assert the awaited result.
+- **PART 2 wire-up — controller_runtime + bridge + CLI** (34465a5):
+  - **Coordinator branch** of `controller_runtime` builds the pipeline when `[session_identity.research] enabled = true`. Chat provider comes from the shared `[ai]` block, web search comes from env + `[session_identity.web_search]`, the approval service is cloned from the already-wired §7.30 PART 1 instance (no second store), and the layered memory store opens against the same SQLite path the memory node uses (SQLite WAL handles concurrent access). Missing handles produce a structured warn log naming exactly which piece is unwired — no silent fallback.
+  - **Cap `identity.research`** registered + advertised in the manifest with categories `[mutate, identity, research]`.
+  - **HTTP** `POST /v1/identity/research { subject_name, context?, peer? }` routes to the cap with a 600s mesh deadline (vs. the standard 120s) so the synchronous approval wait doesn't get capped.
+  - **CLI** `relix identity research --subject "<name>" [--context "<text>"] [--bridge URL] [--raw]` formats the result into operator-friendly fields (verdict, confidence, sources, memory_record_id, approval_id).
+- **PART 3 — setup scripts** (`scripts/setup.sh` + `scripts/setup.ps1`, 061634a): idempotent prompt-once installer that asks the operator to pick one of {Tavily, Brave Search, Perplexity}, paste a key, and writes `<VAR>=<key>` to `<project-root>/.env` (mode 600 on POSIX). Re-running detects an existing value for the chosen var and asks before overwriting; every other line in `.env` is preserved verbatim. The closing banner shows the exact TOML the operator needs to enable the pipeline (`[session_identity.research]` + `[session_identity.web_search]`).
+
+**Final status:** the §7.18 research-backed identity feature ships end-to-end as a cap + bridge route + CLI + idempotent setup script. The "external dependency" framing was correct (the runtime cannot mint search results out of nothing) but operationally trivial: one prompt at install time. The pipeline is gated behind `enabled = false` by default so existing controllers stay unchanged.
 
 ---
 
@@ -528,10 +547,11 @@ Other closures from later sessions:
 - ~~**GAP 10** (three of four sub-bullets) — closed by commit cf9759c (`tool.parse_document` + `tool.web_read` + perception-security `ai.perception_extract`); `tool.screen` stays CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL~~
 - ~~**GAP 15** — closed by commits 17bffe8 + af18b41 + 74c8be4 + 873e16e (§7.30 Identity & Permissions across always-require allowlist + OOB approval + credentials + session tokens)~~
 - ~~**GAP 16** — rebuilt to spec by 0fef9cc + c9d5327 + 3d8862d + bf005dd + b36e3c1 (§7.29 reasoning engine), follow-ups 2ffc41e + b589c36 + 565ff8a~~
+- ~~**GAP 17** — closed by commits 5c18f41 (PART 1: WebSearchProvider trait + Tavily / Brave / Perplexity) + 2bde84d (PART 2 modules: five-stage ResearchPipeline) + 34465a5 (PART 2 wire-up: coordinator + bridge + CLI) + 061634a (PART 3 setup scripts)~~
 - ~~**GAP 18** — closed by commit 40c82d4 (bi-temporal validity helpers)~~
 - ~~**GAP 22 Feature 2** — closed by commit 6216d98 (provider-cost-spike + ask-human-rate drift alerts)~~
 
-Remaining items are CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL with documented external dependencies: GAP 10 partial (`tool.screen`), GAP 17, GAP 19, GAP 20, GAP 21, GAP 22 partial (Features 1 + 4). Each has its own per-gap entry explaining the specific external dependency.
+Remaining items are CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL with documented external dependencies: GAP 10 partial (`tool.screen`), GAP 19, GAP 20, GAP 21, GAP 22 partial (Features 1 + 4). Each has its own per-gap entry explaining the specific external dependency. GAP 17 has been moved out of this set — closed via the operator-supplied search-API-key model in commits `5c18f41` + `2bde84d` + `34465a5` + `061634a`.
 
 ---
 
