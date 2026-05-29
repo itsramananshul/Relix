@@ -20,6 +20,8 @@
 //! TOP for per-session capability scoping.
 
 pub mod caps;
+pub mod research;
+pub mod research_caps;
 pub mod session;
 
 pub use session::{
