@@ -120,6 +120,12 @@ pub struct AiConfig {
     /// [`crate::nodes::ai::soul`].
     #[serde(default)]
     pub agent: Option<AgentConfig>,
+    /// `[ai.reasoning]` — GAP 16 §7.29 reasoning engine
+    /// (smart routing, judge, belief, self-consistency).
+    /// Absent / every sub-component disabled keeps the AI
+    /// handler at pre-7.29 behaviour byte-for-byte.
+    #[serde(default)]
+    pub reasoning: Option<reasoning::ReasoningConfig>,
 }
 
 /// `[ai.agent]` config — operator-supplied persona pointer for
@@ -145,6 +151,7 @@ impl Default for AiConfig {
             providers: ProviderEntries::new(),
             memory_peer: None,
             agent: None,
+            reasoning: None,
         }
     }
 }
@@ -296,7 +303,23 @@ pub fn register(
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
     skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
+    reasoning_config: Option<reasoning::ReasoningConfig>,
 ) {
+    // GAP 16 §7.29: build the four reasoning components from the
+    // optional config. Every component defaults to off when its
+    // sub-section is absent, so existing deployments remain
+    // byte-for-byte identical.
+    let reasoning_cfg = reasoning_config.unwrap_or_default();
+    let tier_router_shared = reasoning_cfg
+        .router
+        .clone()
+        .map(reasoning::TierRouter::new)
+        .unwrap_or_default();
+    let judge_cfg_shared = reasoning_cfg.judge.clone().unwrap_or_default();
+    let self_consistency_cfg_shared = reasoning_cfg.self_consistency.clone().unwrap_or_default();
+    let tier_router_for_chat = tier_router_shared.clone();
+    let judge_cfg_for_chat = judge_cfg_shared.clone();
+    let self_consistency_cfg_for_chat = self_consistency_cfg_shared.clone();
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let memory_for_chat = memory_dispatcher.clone();
@@ -326,6 +349,9 @@ pub fn register(
             let training = interaction_for_chat.clone();
             let extractor = extractor_for_chat.clone();
             let obs = observability_for_chat.clone();
+            let router = tier_router_for_chat.clone();
+            let judge_cfg = judge_cfg_for_chat.clone();
+            let sc_cfg = self_consistency_cfg_for_chat.clone();
             async move {
                 handle_chat(
                     p,
@@ -341,6 +367,9 @@ pub fn register(
                     extractor,
                     obs,
                     provider_name,
+                    router,
+                    judge_cfg,
+                    sc_cfg,
                     ctx,
                 )
                 .await
@@ -367,6 +396,9 @@ pub fn register(
     let interaction_for_chat_stream = interaction_sink.clone();
     let provider_name_for_chat_stream: String = provider.provider_name().to_string();
     let observability_for_stream = observability.clone();
+    let router_for_chat_stream = tier_router_shared.clone();
+    let judge_cfg_for_chat_stream = judge_cfg_shared.clone();
+    let sc_cfg_for_chat_stream = self_consistency_cfg_shared.clone();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -381,6 +413,9 @@ pub fn register(
                 let training = interaction_for_chat_stream.clone();
                 let provider_name = provider_name_for_chat_stream.clone();
                 let obs = observability_for_stream.clone();
+                let router = router_for_chat_stream.clone();
+                let judge_cfg = judge_cfg_for_chat_stream.clone();
+                let sc_cfg = sc_cfg_for_chat_stream.clone();
                 async move {
                     handle_chat_stream(
                         p,
@@ -393,6 +428,9 @@ pub fn register(
                         training,
                         obs,
                         provider_name,
+                        router,
+                        judge_cfg,
+                        sc_cfg,
                         ctx,
                     )
                     .await
@@ -872,8 +910,16 @@ async fn handle_chat_stream(
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
     provider_name: String,
+    tier_router: reasoning::TierRouter,
+    judge_cfg: reasoning::JudgeConfig,
+    self_consistency_cfg: reasoning::SelfConsistencyConfig,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
+    // GAP 16 Component 1: same tier classification +
+    // resolution as `handle_chat`. Falls back to the
+    // provider's default when the router is disabled OR the
+    // tier is unmapped + fallback_to_default = true.
+    let _ = (&judge_cfg, &self_consistency_cfg);
     let stream_started_at = std::time::Instant::now();
     let preflight = build_chat_preflight(
         &ctx.args,
@@ -888,7 +934,39 @@ async fn handle_chat_stream(
     .await?;
     let session_id = preflight.session_id.clone();
     let _ = preflight.approval_token;
-    let input = preflight.input;
+    let mut input = preflight.input;
+    // GAP 16 Component 1: streaming tier override. Mirrors the
+    // unary `handle_chat` logic so a smart-router operator
+    // sees the same per-tier model on streaming + unary.
+    if tier_router.enabled() {
+        let classifier = reasoning::ComplexityClassifier::new();
+        let tier = classifier.classify(&input.prompt, false);
+        match tier_router.resolve(tier) {
+            Ok(Some(m)) => {
+                tracing::info!(
+                    session_id,
+                    tier = tier.as_str(),
+                    model = %m,
+                    "ai.chat.stream: smart router resolved tier -> model"
+                );
+                input.model = m;
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    session_id,
+                    tier = tier.as_str(),
+                    "ai.chat.stream: smart router fell back to default model"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "ai.chat.stream: smart router refused tier; falling back to default"
+                );
+            }
+        }
+    }
     // Snapshot fields the training-record build path needs
     // BEFORE we move `input` into `generate_reply_stream`. The
     // streaming path doesn't run the planner so there are no
@@ -1077,6 +1155,9 @@ async fn handle_chat(
     skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
     provider_name: String,
+    tier_router: reasoning::TierRouter,
+    judge_cfg: reasoning::JudgeConfig,
+    self_consistency_cfg: reasoning::SelfConsistencyConfig,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let chat_started_at = std::time::Instant::now();
@@ -1215,17 +1296,65 @@ async fn handle_chat(
         None => system_prompt,
     };
 
+    // GAP 16 Component 1: smart router. Classify the prompt into
+    // a tier (cheap rule-based — no LLM call) and ask the
+    // configured TierRouter for the model id mapped to that
+    // tier. When the router is disabled OR the tier has no
+    // override (and fallback_to_default is on, the spec
+    // default), we fall through to `default_model` and dispatch
+    // exactly as pre-7.29.
+    //
+    // Errors are non-fatal — a misconfigured tier never aborts
+    // the call; it logs a warning and falls back to the default.
+    let classifier = reasoning::ComplexityClassifier::new();
+    let reasoning_tier = classifier.classify(prompt, false);
+    let resolved_model = if tier_router.enabled() {
+        match tier_router.resolve(reasoning_tier) {
+            Ok(Some(m)) => {
+                tracing::info!(
+                    session_id,
+                    tier = reasoning_tier.as_str(),
+                    model = %m,
+                    "ai.chat: smart router resolved tier -> model"
+                );
+                m
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    session_id,
+                    tier = reasoning_tier.as_str(),
+                    "ai.chat: smart router fell back to default model"
+                );
+                default_model.clone()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "ai.chat: smart router refused tier; falling back to default model"
+                );
+                default_model.clone()
+            }
+        }
+    } else {
+        default_model.clone()
+    };
+
     let input = ChatInput {
         session_id: session_id.to_string(),
         prompt: prompt.to_string(),
         history: merged_history,
-        model: default_model,
+        model: resolved_model,
         // Clone for the GAP 13 provenance hook below — the
         // ChatInput consumes the original Option.
         system_prompt: system_prompt.clone(),
         ..ChatInput::default()
     };
     let system_prompt_for_obs = system_prompt;
+    // Suppress unused-variable warnings on the two reasoning
+    // configs this commit doesn't yet auto-call (judge +
+    // self-consistency wiring lands in follow-up commits).
+    let _ = (&judge_cfg, &self_consistency_cfg);
     // Extract an optional `approval_token=<value>` field
     // from the request args. The token presence flips
     // `RequiresApproval` plans to `Approved` so an operator
@@ -1727,6 +1856,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1744,6 +1876,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1765,6 +1900,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -1797,6 +1935,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -1823,6 +1964,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"|hello|"),
         )
         .await;
@@ -1870,6 +2014,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1915,6 +2062,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1951,6 +2101,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -1988,6 +2141,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -2031,6 +2187,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2071,6 +2230,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2134,6 +2296,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -2178,6 +2343,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -2225,6 +2393,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2355,6 +2526,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2403,6 +2577,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2449,6 +2626,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2496,6 +2676,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2564,6 +2747,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2672,6 +2858,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2746,6 +2935,7 @@ mod tests {
             providers: ProviderEntries::new(),
             memory_peer: None,
             agent: None,
+            reasoning: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -2764,6 +2954,7 @@ mod tests {
             providers: ProviderEntries::new(),
             memory_peer: None,
             agent: None,
+            reasoning: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -2789,6 +2980,7 @@ mod tests {
             providers,
             memory_peer: None,
             agent: None,
+            reasoning: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -2814,6 +3006,7 @@ mod tests {
             providers,
             memory_peer: None,
             agent: None,
+            reasoning: None,
         };
         match build_provider(&cfg) {
             Ok(p) => assert_eq!(p.provider_name(), "local"),
@@ -2875,6 +3068,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -2912,6 +3108,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -3040,6 +3239,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -3080,6 +3282,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -3126,6 +3331,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
@@ -3231,6 +3439,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"session-1|hello|"),
         )
         .await
@@ -3262,6 +3473,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -3296,6 +3510,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(prompt.as_bytes()),
         )
         .await;
@@ -3319,6 +3536,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"session-1|hello|"),
         )
         .await;
@@ -3444,6 +3664,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
         .await;
@@ -3476,6 +3699,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess2|hi|"),
         )
         .await;
@@ -3649,6 +3875,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx_with_request_id(b"sess1|please reply|", rid),
         )
         .await
@@ -3690,6 +3919,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess2|hi|"),
         )
         .await
@@ -3734,6 +3966,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx_with_request_id(b"sess|hi|", rid),
         )
         .await
@@ -3795,6 +4030,9 @@ mod tests {
             None,
             Some(obs.clone()),
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess-obs|hello|"),
         )
         .await;
@@ -3826,6 +4064,9 @@ mod tests {
             None,
             None,
             "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
             ctx(b"sess-noobs|hi|"),
         )
         .await;

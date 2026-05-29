@@ -5852,6 +5852,11 @@ fn register_node_type_handlers(
             training.map(|b| b.sink.clone()),
             skill_extractor,
             ai_observability.clone(),
+            // GAP 16 §7.29: per-controller reasoning config.
+            // Absent → every component stays at its disabled
+            // default and ai.chat runs pre-7.29 behaviour
+            // byte-for-byte.
+            ai_cfg.reasoning.clone(),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
