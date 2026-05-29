@@ -5899,6 +5899,13 @@ fn register_node_type_handlers(
             // serves `belief.get` / `belief.reset` from the same
             // shared instance the AI handler holds.
             ai_cfg.belief_state.clone(),
+            // RELIX-7.29 PART 4: `[ai.judge]` judge model config.
+            // Absent / disabled keeps the AI handler byte-
+            // identical to its pre-judge behaviour. The returned
+            // JudgeRecorder is currently ignored — the dispatch
+            // surface already serves `judge.recent_verdicts` /
+            // `judge.stats` from the same shared instance.
+            ai_cfg.judge.clone(),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when

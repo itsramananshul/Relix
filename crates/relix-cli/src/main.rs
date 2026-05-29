@@ -16,6 +16,7 @@ mod flow_run;
 mod fs;
 mod identity;
 mod install;
+mod judge;
 mod knowledge;
 mod mcp;
 mod memory_inspect;
@@ -198,6 +199,16 @@ enum Cmd {
     Belief {
         #[command(subcommand)]
         cmd: belief::Cmd,
+    },
+    /// RELIX-7.29 PART 4: judge model inspector. `judge
+    /// verdicts [--limit N]` prints the rolling ring of judge
+    /// verdicts; `judge stats` prints proceed/modify/block/
+    /// timeout counters with a per-agent breakdown. Talks to
+    /// the local bridge over HTTP (default
+    /// `http://127.0.0.1:19791`).
+    Judge {
+        #[command(subcommand)]
+        cmd: judge::Cmd,
     },
     /// RELIX-7.29 PART 1: smart-routing inspector.
     /// `routing explain --message "<text>" [--session-turns N]`
@@ -502,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
         Cmd::Confidence { cmd } => confidence::run(cmd).await,
         Cmd::Belief { cmd } => belief::run(cmd).await,
+        Cmd::Judge { cmd } => judge::run(cmd).await,
         Cmd::Routing { cmd } => routing::run(cmd).await,
         Cmd::Planning { cmd } => planning::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,

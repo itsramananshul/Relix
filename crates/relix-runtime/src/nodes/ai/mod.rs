@@ -58,6 +58,7 @@ pub mod complexity;
 pub mod execution;
 pub mod failover;
 pub mod guardrails;
+pub mod judge;
 pub mod memory_dispatcher;
 pub mod provenance_hooks;
 pub mod provider;
@@ -149,6 +150,16 @@ pub struct AiConfig {
     /// handler byte-identical.
     #[serde(default)]
     pub belief_state: Option<belief_state::BeliefStateConfig>,
+    /// `[ai.judge]` — RELIX-7.29 PART 4 judge model. When
+    /// `enabled = true` AND the activation gate (low
+    /// confidence + tool/structured response + ≥2 prior
+    /// turns) fires, the AI handler dispatches a second
+    /// provider call to a judge model with a 5-question
+    /// prompt. The judge's verdict is recorded in a ring
+    /// buffer surfaced by `judge.recent_verdicts` and
+    /// `judge.stats`.
+    #[serde(default)]
+    pub judge: Option<judge::JudgeConfig>,
 }
 
 /// `[ai.agent]` config — operator-supplied persona pointer for
@@ -177,6 +188,7 @@ impl Default for AiConfig {
             reasoning: None,
             routing: None,
             belief_state: None,
+            judge: None,
         }
     }
 }
@@ -333,7 +345,8 @@ pub fn register(
     self_consistency_config: Option<crate::confidence::SelfConsistencyConfig>,
     self_consistency_stats: Option<crate::confidence::SelfConsistencyStats>,
     belief_state_config: Option<belief_state::BeliefStateConfig>,
-) -> belief_state::BeliefStateTracker {
+    judge_runtime_config: Option<judge::JudgeConfig>,
+) -> (belief_state::BeliefStateTracker, judge::JudgeRecorder) {
     // GAP 16 §7.29: build the four reasoning components from the
     // optional config. Every component defaults to off when its
     // sub-section is absent, so existing deployments remain
@@ -379,6 +392,17 @@ pub fn register(
     let belief_tracker_shared =
         belief_state::BeliefStateTracker::new(belief_state_config.unwrap_or_default());
     let belief_tracker_for_chat = belief_tracker_shared.clone();
+    // RELIX-7.29 PART 4: judge config + recorder + turn
+    // counter. The AI handler bumps the turn counter once per
+    // call; the recorder buffers verdicts for the
+    // `judge.recent_verdicts` cap.
+    let judge_runtime_cfg_shared = judge_runtime_config.unwrap_or_default();
+    let judge_recorder_shared =
+        judge::JudgeRecorder::new(judge_runtime_cfg_shared.recent_buffer_size);
+    let judge_turns_shared = judge::SessionTurnCounter::new();
+    let judge_runtime_cfg_for_chat = judge_runtime_cfg_shared.clone();
+    let judge_recorder_for_chat = judge_recorder_shared.clone();
+    let judge_turns_for_chat = judge_turns_shared.clone();
     // RELIX-7.29 PART 1: register the `routing.explain`
     // coordinator cap. The cap is always registered (regardless
     // of whether `[ai.routing] enabled` is true) so operators
@@ -459,6 +483,9 @@ pub fn register(
             let sc_runtime_cfg = sc_cfg_for_chat.clone();
             let sc_runtime_stats = sc_stats_for_chat.clone();
             let belief_tracker = belief_tracker_for_chat.clone();
+            let judge_runtime_cfg = judge_runtime_cfg_for_chat.clone();
+            let judge_recorder = judge_recorder_for_chat.clone();
+            let judge_turns = judge_turns_for_chat.clone();
             async move {
                 handle_chat(
                     p,
@@ -481,6 +508,9 @@ pub fn register(
                     sc_runtime_cfg,
                     sc_runtime_stats,
                     belief_tracker,
+                    judge_runtime_cfg,
+                    judge_recorder,
+                    judge_turns,
                     ctx,
                 )
                 .await
@@ -514,6 +544,9 @@ pub fn register(
     let sc_cfg_for_chat_stream_runtime = sc_cfg_shared.clone();
     let sc_stats_for_chat_stream = sc_stats_shared.clone();
     let belief_tracker_for_chat_stream = belief_tracker_shared.clone();
+    let judge_runtime_cfg_for_chat_stream = judge_runtime_cfg_shared.clone();
+    let judge_recorder_for_chat_stream = judge_recorder_shared.clone();
+    let judge_turns_for_chat_stream = judge_turns_shared.clone();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -535,6 +568,9 @@ pub fn register(
                 let sc_runtime_cfg = sc_cfg_for_chat_stream_runtime.clone();
                 let sc_runtime_stats = sc_stats_for_chat_stream.clone();
                 let belief_tracker = belief_tracker_for_chat_stream.clone();
+                let judge_runtime_cfg = judge_runtime_cfg_for_chat_stream.clone();
+                let judge_recorder = judge_recorder_for_chat_stream.clone();
+                let judge_turns = judge_turns_for_chat_stream.clone();
                 async move {
                     handle_chat_stream(
                         p,
@@ -554,6 +590,9 @@ pub fn register(
                         sc_runtime_cfg,
                         sc_runtime_stats,
                         belief_tracker,
+                        judge_runtime_cfg,
+                        judge_recorder,
+                        judge_turns,
                         ctx,
                     )
                     .await
@@ -574,7 +613,10 @@ pub fn register(
     // tracker through the dispatch bridge. Always registered;
     // caps return `enabled: false` when the tracker is off.
     belief_state::caps::register(bridge, belief_tracker_shared.clone());
-    belief_tracker_shared
+    // RELIX-7.29 PART 4: register `judge.recent_verdicts` +
+    // `judge.stats` against the shared recorder.
+    judge::caps::register(bridge, judge_recorder_shared.clone());
+    (belief_tracker_shared, judge_recorder_shared)
 }
 
 /// Render an `f32` array as standard base64 of the little-endian
@@ -1046,6 +1088,9 @@ async fn handle_chat_stream(
     sc_cfg: crate::confidence::SelfConsistencyConfig,
     sc_stats: crate::confidence::SelfConsistencyStats,
     belief_tracker: belief_state::BeliefStateTracker,
+    judge_runtime_cfg: judge::JudgeConfig,
+    judge_recorder: judge::JudgeRecorder,
+    judge_turns: judge::SessionTurnCounter,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
     // GAP 16 Component 1: same tier classification +
@@ -1065,6 +1110,9 @@ async fn handle_chat_stream(
         &sc_cfg,
         &sc_stats,
         &belief_tracker,
+        &judge_runtime_cfg,
+        &judge_recorder,
+        &judge_turns,
     );
     let stream_started_at = std::time::Instant::now();
     let preflight = build_chat_preflight(
@@ -1309,6 +1357,9 @@ async fn handle_chat(
     sc_cfg: crate::confidence::SelfConsistencyConfig,
     sc_stats: crate::confidence::SelfConsistencyStats,
     belief_tracker: belief_state::BeliefStateTracker,
+    judge_runtime_cfg: judge::JudgeConfig,
+    judge_recorder: judge::JudgeRecorder,
+    judge_turns: judge::SessionTurnCounter,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let chat_started_at = std::time::Instant::now();
@@ -1706,6 +1757,110 @@ async fn handle_chat(
             // is fire-and-forget so the caller never waits on
             // it; any failure (provider error, JSON parse) logs
             // a warning and leaves the previous beliefs intact.
+            // RELIX-7.29 PART 4: judge model. Activation gate
+            // requires ALL of:
+            //   * `[ai.judge] enabled = true`
+            //   * final confidence < `judge_threshold`
+            //   * response has tool call OR structured marker
+            //   * session has ≥ 2 prior turns
+            // When the gate fires, we dispatch a second
+            // provider call against `judge_model_name` capped
+            // at `max_judge_latency_ms` and record the verdict
+            // in the recorder. A timeout produces a synthetic
+            // `proceed` verdict so the handler never stalls.
+            let prior_turns = judge_turns.bump(session_id);
+            let chat_confidence = baseline_confidence(&output.text);
+            if judge::should_invoke(
+                &judge_runtime_cfg,
+                chat_confidence,
+                &output.text,
+                prior_turns,
+            ) {
+                let judge_input = judge::build_judge_input(
+                    &judge_runtime_cfg,
+                    session_id,
+                    &training_user_message,
+                    &output.text,
+                );
+                let judge_provider = provider.clone();
+                let timeout = judge::timeout_for(&judge_runtime_cfg);
+                let judged =
+                    tokio::time::timeout(timeout, judge_provider.generate_reply(judge_input)).await;
+                let (verdict, timed_out) = match judged {
+                    Ok(Ok(reply)) => match judge::parse_judge_response(&reply.text) {
+                        Ok(v) => (v, false),
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id,
+                                error = %e,
+                                "ai.chat: judge response parse failed; falling back to proceed"
+                            );
+                            (judge::JudgeVerdict::proceed_default("parse-failed"), false)
+                        }
+                    },
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            session_id,
+                            error = %e,
+                            "ai.chat: judge call failed; falling back to proceed"
+                        );
+                        (
+                            judge::JudgeVerdict::proceed_default("provider-error"),
+                            false,
+                        )
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            session_id,
+                            timeout_ms = judge_runtime_cfg.max_judge_latency_ms,
+                            "ai.chat: judge call timed out; falling back to proceed"
+                        );
+                        (judge::JudgeVerdict::proceed_default("timeout"), true)
+                    }
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let block_decision = matches!(verdict.verdict, judge::JudgeAction::Block);
+                let modify_decision = matches!(verdict.verdict, judge::JudgeAction::Modify);
+                judge_recorder.record(judge::VerdictRecord {
+                    agent: ctx.caller.name.clone(),
+                    session_id: session_id.to_string(),
+                    timestamp_ms: now_ms,
+                    final_confidence: chat_confidence,
+                    timed_out,
+                    verdict: verdict.clone(),
+                });
+                tracing::info!(
+                    session_id,
+                    verdict = verdict.verdict.as_str(),
+                    timed_out,
+                    "ai.chat: judge verdict recorded"
+                );
+                if block_decision {
+                    return HandlerOutcome::Err(ErrorEnvelope {
+                        kind: error_kinds::POLICY_DENIED,
+                        cause: format!(
+                            "ai.chat: judge blocked response (factual_errors={:?})",
+                            verdict.factual_errors
+                        ),
+                        retry_hint: 0,
+                        retry_after: None,
+                    });
+                }
+                if modify_decision {
+                    let mut combined = output.text;
+                    combined.push_str("\n\n[Judge: please revise — ");
+                    if verdict.factual_errors.is_empty() {
+                        combined.push_str("see verdict log");
+                    } else {
+                        combined.push_str(&verdict.factual_errors.join("; "));
+                    }
+                    combined.push(']');
+                    output.text = combined;
+                }
+            }
             if belief_tracker.enabled() {
                 let provider_for_belief = provider.clone();
                 let tracker_for_belief = belief_tracker.clone();
@@ -2350,6 +2505,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2374,6 +2532,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2402,6 +2563,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -2441,6 +2605,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -2474,6 +2641,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"|hello|"),
         )
         .await;
@@ -2528,6 +2698,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2580,6 +2753,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2623,6 +2799,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2667,6 +2846,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -2717,6 +2899,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2764,6 +2949,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2834,6 +3022,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -2885,6 +3076,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -2939,6 +3133,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3076,6 +3273,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3131,6 +3331,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3184,6 +3387,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3238,6 +3444,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3313,6 +3522,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3428,6 +3640,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -3505,6 +3720,7 @@ mod tests {
             reasoning: None,
             routing: None,
             belief_state: None,
+            judge: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3526,6 +3742,7 @@ mod tests {
             reasoning: None,
             routing: None,
             belief_state: None,
+            judge: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3554,6 +3771,7 @@ mod tests {
             reasoning: None,
             routing: None,
             belief_state: None,
+            judge: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3582,6 +3800,7 @@ mod tests {
             reasoning: None,
             routing: None,
             belief_state: None,
+            judge: None,
         };
         match build_provider(&cfg) {
             Ok(p) => assert_eq!(p.provider_name(), "local"),
@@ -3650,6 +3869,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -3694,6 +3916,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -3829,6 +4054,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -3876,6 +4104,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -3929,6 +4160,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
@@ -4041,6 +4275,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"session-1|hello|"),
         )
         .await
@@ -4079,6 +4316,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -4120,6 +4360,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(prompt.as_bytes()),
         )
         .await;
@@ -4150,6 +4393,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"session-1|hello|"),
         )
         .await;
@@ -4282,6 +4528,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
         .await;
@@ -4321,6 +4570,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess2|hi|"),
         )
         .await;
@@ -4503,6 +4755,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx_with_request_id(b"sess1|please reply|", rid),
         )
         .await
@@ -4551,6 +4806,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess2|hi|"),
         )
         .await
@@ -4602,6 +4860,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx_with_request_id(b"sess|hi|", rid),
         )
         .await
@@ -4671,6 +4932,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess-obs|hello|"),
         )
         .await;
@@ -4709,6 +4973,9 @@ mod tests {
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
             belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
             ctx(b"sess-noobs|hi|"),
         )
         .await;

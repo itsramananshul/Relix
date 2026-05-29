@@ -120,6 +120,7 @@ mod flow;
 mod fs_audit;
 mod guardrails;
 mod intervention_audit;
+mod judge;
 mod knowledge;
 #[cfg(test)]
 mod knowledge_mini_mesh_test;
@@ -627,6 +628,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // reset surface.
         .route("/v1/belief/:session_id", get(belief::get))
         .route("/v1/belief/:session_id", post(belief::post))
+        // RELIX-7.29 PART 4: judge verdict + stats surface.
+        .route("/v1/judge/verdicts", get(judge::verdicts))
+        .route("/v1/judge/stats", get(judge::stats))
         // RELIX-7.24: spec-driven multi-agent planning surface.
         .route("/v1/planning/plan", post(planning::create_plan))
         .route("/v1/planning/agents", get(planning::list_agents))
