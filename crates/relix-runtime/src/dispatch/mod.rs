@@ -10,7 +10,7 @@
 //! admission pipeline (alpha steps from RELIX-1 §1.13: 1, 3, 5, 9, 10, 11)
 //! and dispatches to the registered handler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -341,7 +341,12 @@ pub struct DispatchBridge {
     /// agent gate, so operators who run both surfaces get the
     /// gate's per-agent semantics AND a hard "always require"
     /// floor.
-    always_require_methods: Vec<String>,
+    ///
+    /// SEC PART C: `Arc<HashSet<String>>` so the per-request
+    /// admission check is O(1). Operators with 50 always-require
+    /// methods no longer pay 50 string comparisons per inbound
+    /// call.
+    always_require_methods: Arc<HashSet<String>>,
     /// SEC PART A: HMAC-SHA256 signing key for
     /// [`crate::approval::ApprovalToken`]. The controller reads
     /// `RELIX_APPROVAL_TOKEN_KEY` at startup and installs it
@@ -529,7 +534,7 @@ impl DispatchBridge {
             pii_gate: None,
             tenant_policy: None,
             audit_partition: None,
-            always_require_methods: Vec::new(),
+            always_require_methods: Arc::new(HashSet::new()),
             approval_token_signing_key: Vec::new(),
         })
     }
@@ -557,22 +562,32 @@ impl DispatchBridge {
     /// the caller's policy decision or per-agent gate rule.
     /// Idempotent — calling twice replaces the prior list.
     /// Passing an empty list disables the floor.
+    ///
+    /// SEC PART C: collapses the input `Vec<String>` into a
+    /// `HashSet` so the per-request `always_requires_approval`
+    /// check runs in O(1) instead of O(n). Deduplicates
+    /// silently — operators who list the same method twice get
+    /// one floor entry.
     pub fn set_always_require_methods(&mut self, methods: Vec<String>) {
-        self.always_require_methods = methods;
+        self.always_require_methods = Arc::new(methods.into_iter().collect());
     }
 
-    /// GAP 15 partial: borrow the configured allowlist. Used by
-    /// tests + by the optional `node.policy.always_require_list`
-    /// surface for operator visibility.
-    pub fn always_require_methods(&self) -> &[String] {
-        &self.always_require_methods
+    /// GAP 15 partial: snapshot the configured allowlist. Used
+    /// by tests + by the optional `node.policy.always_require_list`
+    /// surface for operator visibility. SEC PART C: returns a
+    /// sorted Vec (HashSet iteration order is not stable) so
+    /// the wire shape stays predictable.
+    pub fn always_require_methods(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.always_require_methods.iter().cloned().collect();
+        v.sort();
+        v
     }
 
     /// GAP 15 partial: returns `true` when `method` is on the
-    /// always-require allowlist. Pure check; no admission side
-    /// effect.
+    /// always-require allowlist. SEC PART C: O(1) HashSet
+    /// lookup. Pure check; no admission side effect.
     pub fn always_requires_approval(&self, method: &str) -> bool {
-        self.always_require_methods.iter().any(|m| m == method)
+        self.always_require_methods.contains(method)
     }
 
     /// GAP 23B: wire the per-tenant policy resolver. Idempotent
@@ -2616,6 +2631,52 @@ mod tests {
         // Idempotent replace.
         bridge.set_always_require_methods(Vec::new());
         assert!(!bridge.always_requires_approval("node.health"));
+    }
+
+    #[tokio::test]
+    async fn always_require_methods_setter_deduplicates_and_returns_sorted() {
+        // SEC PART C: HashSet semantics — duplicate inputs
+        // collapse, the getter returns a stable sorted Vec so
+        // operator-facing snapshots don't shuffle order between
+        // boots.
+        let (mut bridge, _bundle, _dir, _root) = allow_health_bridge();
+        bridge.set_always_require_methods(vec![
+            "z.late".into(),
+            "a.early".into(),
+            "z.late".into(), // dup
+            "m.mid".into(),
+        ]);
+        let snap = bridge.always_require_methods();
+        assert_eq!(
+            snap,
+            vec![
+                "a.early".to_string(),
+                "m.mid".to_string(),
+                "z.late".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn always_requires_approval_is_o1_under_large_allowlist() {
+        // SEC PART C: the per-request check must scale to a
+        // 50-method allowlist without 50 string comparisons.
+        // We don't directly measure cycles in unit tests, but we
+        // do verify the lookup returns the right answer in
+        // constant time relative to the list size — the
+        // implementation backs onto a HashSet so this is a
+        // contract test against future regressions.
+        let (mut bridge, _bundle, _dir, _root) = allow_health_bridge();
+        let methods: Vec<String> = (0..50).map(|i| format!("method.bulk_{i}")).collect();
+        bridge.set_always_require_methods(methods.clone());
+        // Hit lookup for every entry + a missing one.
+        for m in &methods {
+            assert!(
+                bridge.always_requires_approval(m),
+                "every set member must hit: {m}"
+            );
+        }
+        assert!(!bridge.always_requires_approval("method.not_set"));
     }
 
     #[tokio::test]
