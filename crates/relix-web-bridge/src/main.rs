@@ -107,6 +107,7 @@ mod confidence;
 mod confidence_mini_mesh_test;
 mod config;
 mod config_api;
+mod credentials;
 mod cron;
 mod dashboard;
 mod delegate;
@@ -628,6 +629,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/routing/explain", post(routing::explain))
         // RELIX-7.30 PART 1: out-of-band approval delivery status.
         .route("/v1/approval/:id/delivery", get(approval::delivery_status))
+        // RELIX-7.30 PART 2: credential vault.
+        .route(
+            "/v1/credentials",
+            post(credentials::store).get(credentials::list),
+        )
+        .route("/v1/credentials/:name", get(credentials::get))
+        .route("/v1/credentials/:name/rotate", post(credentials::rotate))
+        .route("/v1/credentials/:name/revoke", post(credentials::revoke))
+        .route("/v1/credentials/:name/audit", get(credentials::audit))
         // RELIX-7.29 PART 3: belief-tracker inspection +
         // reset surface.
         .route("/v1/belief/:session_id", get(belief::get))

@@ -7,6 +7,7 @@ mod build;
 mod capability;
 mod confidence;
 mod config;
+mod credentials;
 mod doctor;
 mod email;
 mod eval;
@@ -210,6 +211,15 @@ enum Cmd {
     Approval {
         #[command(subcommand)]
         cmd: approval::Cmd,
+    },
+    /// RELIX-7.30 PART 2: credential vault. `credentials store
+    /// --name <n> --value <v>` encrypts + persists; `list`,
+    /// `rotate`, `revoke`, `audit` exercise the lifecycle.
+    /// Talks to the local bridge over HTTP (default
+    /// `http://127.0.0.1:19791`).
+    Credentials {
+        #[command(subcommand)]
+        cmd: credentials::Cmd,
     },
     /// RELIX-7.29 PART 4: judge model inspector. `judge
     /// verdicts [--limit N]` prints the rolling ring of judge
@@ -535,6 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Confidence { cmd } => confidence::run(cmd).await,
         Cmd::Belief { cmd } => belief::run(cmd).await,
         Cmd::Approval { cmd } => approval::run(cmd).await,
+        Cmd::Credentials { cmd } => credentials::run(cmd).await,
         Cmd::Judge { cmd } => judge::run(cmd).await,
         Cmd::Reasoning { cmd } => reasoning::run(cmd).await,
         Cmd::Routing { cmd } => routing::run(cmd).await,

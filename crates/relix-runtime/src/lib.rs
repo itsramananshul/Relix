@@ -20,6 +20,7 @@ pub mod audit_partition;
 pub mod confidence;
 pub mod controller_runtime;
 pub mod coordinator;
+pub mod credentials;
 pub mod db;
 pub mod dispatch;
 pub mod flow_runner;

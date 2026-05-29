@@ -180,6 +180,11 @@ pub struct ControllerConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub session: std::collections::BTreeMap<String, SessionConfig>,
+    /// `[credentials]` — RELIX-7.30 PART 2 credential vault.
+    /// Absent / `enabled = false` keeps the controller
+    /// credential-less.
+    #[serde(default)]
+    pub credentials: Option<crate::credentials::CredentialsConfig>,
 }
 
 /// `[agents.<name>]` config section. Operators add one of
@@ -6232,6 +6237,96 @@ fn register_node_type_handlers(
                         error = %e,
                         "approval delivery store open failed; caps NOT registered"
                     );
+                }
+            }
+        }
+        // RELIX-7.30 PART 2: credential vault. Opens iff
+        // `[credentials] enabled = true` AND the master-key env
+        // var is set. Spawns the rotation scheduler when both
+        // are wired.
+        if let Some(cred_cfg) = cfg.credentials.clone()
+            && cred_cfg.enabled
+        {
+            let master = std::env::var(&cred_cfg.master_key_env).unwrap_or_default();
+            if master.is_empty() {
+                tracing::warn!(
+                    env_var = %cred_cfg.master_key_env,
+                    "credentials: master key env var unset; vault NOT registered"
+                );
+            } else {
+                let path = cred_cfg.db_path.clone().unwrap_or_else(|| {
+                    let mut p = coord_cfg.db_path.clone();
+                    p.set_file_name("credentials.db");
+                    p
+                });
+                match crate::credentials::CredentialStore::open(&path, &master) {
+                    Ok(store) => {
+                        crate::credentials::caps::register(bridge, store.clone());
+                        let notifier: std::sync::Arc<dyn crate::credentials::RotationNotifier> =
+                            std::sync::Arc::new(crate::credentials::scheduler::LogRotationNotifier);
+                        let scheduler = crate::credentials::RotationScheduler::new(
+                            store,
+                            notifier,
+                            crate::credentials::RotationSchedulerConfig {
+                                check_interval_secs: cred_cfg.rotation_check_interval_secs,
+                            },
+                        );
+                        scheduler.spawn();
+                        for (method, doc, mutate) in [
+                            (
+                                "credentials.store",
+                                "Store + encrypt a credential value.",
+                                true,
+                            ),
+                            (
+                                "credentials.get",
+                                "Decrypt a credential when caller is the owner.",
+                                false,
+                            ),
+                            (
+                                "credentials.rotate",
+                                "Replace a credential value + bump version.",
+                                true,
+                            ),
+                            ("credentials.revoke", "Mark a credential revoked.", true),
+                            (
+                                "credentials.list",
+                                "List credential summaries (no values).",
+                                false,
+                            ),
+                            (
+                                "credentials.audit",
+                                "Read the audit trail for one credential.",
+                                false,
+                            ),
+                        ] {
+                            manifest.add_capability(
+                                CapabilityDescriptor::unary(method)
+                                    .with_description(doc)
+                                    .with_categories(
+                                        if mutate {
+                                            ["mutate", "credentials"]
+                                        } else {
+                                            ["read", "credentials"]
+                                        }
+                                        .iter()
+                                        .map(|s| (*s).into()),
+                                    ),
+                            );
+                        }
+                        tracing::info!(
+                            path = %path.display(),
+                            check_interval_secs = cred_cfg.rotation_check_interval_secs,
+                            "credentials vault online (RELIX-7.30 PART 2)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "credentials vault open failed; caps NOT registered"
+                        );
+                    }
                 }
             }
         }
