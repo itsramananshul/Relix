@@ -58,6 +58,7 @@ pub mod guardrails;
 pub mod memory_dispatcher;
 pub mod provenance_hooks;
 pub mod provider;
+pub mod reasoning;
 pub mod router;
 pub mod skill_caps;
 pub mod skill_extractor;
