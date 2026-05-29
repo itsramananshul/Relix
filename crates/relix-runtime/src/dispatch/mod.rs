@@ -734,6 +734,50 @@ impl DispatchBridge {
         sink.record_invocation(metric);
     }
 
+    /// GAP 22 Feature 2: record a minimal denial metric so the
+    /// AlertEngine's ask-human-rate drift detector has a
+    /// time-series signal to read.
+    ///
+    /// The existing `record_metric` path skips admission
+    /// denials by design (POLICY_DENIED + UNKNOWN_METHOD are
+    /// already counted by the dispatch-stats lifetime
+    /// counters). APPROVAL_REQUIRED is in a different category
+    /// though — it's a "this call was real and would have run
+    /// but needs an operator approval" signal that the
+    /// drift detector specifically wants. This helper writes
+    /// the minimum row needed for the per-agent ratio query
+    /// (`success = false`, `error_kind` populated, no token /
+    /// cost / model).
+    fn record_admission_denial_metric(
+        &self,
+        method: &str,
+        agent_name: &str,
+        request_id: relix_core::types::RequestId,
+        started: Instant,
+        error_kind_str: &'static str,
+    ) {
+        let Some(sink) = self.metrics_sink.as_ref() else {
+            return;
+        };
+        let metric = crate::metrics::InvocationMetric {
+            agent_name: agent_name.to_string(),
+            peer_alias: self.peer_alias.clone(),
+            method: method.to_string(),
+            timestamp_ms: unix_now_ms(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            success: false,
+            error_kind: Some(error_kind_str.to_string()),
+            token_count: None,
+            cost_micros: None,
+            input_bytes: 0,
+            output_bytes: 0,
+            model: None,
+            confidence_score: None,
+            request_id: Some(request_id),
+        };
+        sink.record_invocation(metric);
+    }
+
     /// Wire the agent-employee gate. Called by the coordinator
     /// binary after the [`crate::nodes::coordinator::agent::AgentStore`]
     /// is open. No-op on nodes that don't host an agent store.
@@ -1023,6 +1067,16 @@ impl DispatchBridge {
                         Ok(approval_id) => format!("approval_required:{approval_id}"),
                         Err(e) => format!("approval_required (create failed: {e})"),
                     };
+                    // GAP 22 Feature 2: stamp the denial onto the
+                    // metrics time series so the ask-human-rate
+                    // drift detector has a signal to read.
+                    self.record_admission_denial_metric(
+                        &req.method,
+                        &verified.name,
+                        req.rid,
+                        started_at,
+                        "APPROVAL_REQUIRED",
+                    );
                     return self
                         .audit_and_err_with_id(
                             &req,
@@ -1053,6 +1107,14 @@ impl DispatchBridge {
         if self.always_requires_approval(&req.method) && req.approval_token.is_none() {
             self.bump_stats(&req.method, StatBucket::Denied, now);
             let cause = "always_require_methods".to_string();
+            // GAP 22 Feature 2: see the agent_gate branch above.
+            self.record_admission_denial_metric(
+                &req.method,
+                &verified.name,
+                req.rid,
+                started_at,
+                "APPROVAL_REQUIRED",
+            );
             return self
                 .audit_and_err_with_id(
                     &req,
@@ -1778,6 +1840,15 @@ impl DispatchBridge {
                         Ok(approval_id) => format!("approval_required:{approval_id}"),
                         Err(e) => format!("approval_required (create failed: {e})"),
                     };
+                    // GAP 22 Feature 2: stamp the denial onto the
+                    // metrics time series.
+                    self.record_admission_denial_metric(
+                        &req.method,
+                        &verified.name,
+                        req.rid,
+                        started_at,
+                        "APPROVAL_REQUIRED",
+                    );
                     let _ = writer
                         .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
                         .await;
@@ -1802,6 +1873,15 @@ impl DispatchBridge {
         if self.always_requires_approval(&req.method) && req.approval_token.is_none() {
             self.bump_stats(&req.method, StatBucket::Denied, now);
             let cause = "always_require_methods".to_string();
+            // GAP 22 Feature 2: stamp the denial onto the
+            // metrics time series.
+            self.record_admission_denial_metric(
+                &req.method,
+                &verified.name,
+                req.rid,
+                started_at,
+                "APPROVAL_REQUIRED",
+            );
             let _ = writer
                 .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
                 .await;

@@ -449,6 +449,88 @@ impl MetricsQuery {
             .map_err(MetricsQueryError::from)
     }
 
+    /// GAP 22 Feature 2: aggregate cost + invocation count for
+    /// one `model` over a window. Used by the
+    /// provider-cost-spike alert to compare a recent (1h)
+    /// rate against a longer (24h) rolling baseline.
+    ///
+    /// Skips rows whose `model` column is NULL or empty so the
+    /// numerator is always meaningful. Returns
+    /// `(cost_micros, invocations)`.
+    pub fn model_cost_summary(
+        &self,
+        model: &str,
+        hours: u32,
+    ) -> Result<(u64, u64), MetricsQueryError> {
+        let cutoff = window_start_ms(hours);
+        let row: (i64, i64) = self.store.with_conn(|c| {
+            c.query_row(
+                "SELECT COALESCE(SUM(cost_micros), 0), COUNT(*) \
+                 FROM metrics_invocations \
+                 WHERE model = ?1 AND timestamp_ms >= ?2",
+                rusqlite::params![model, cutoff],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })?;
+        Ok((row.0.max(0) as u64, row.1.max(0) as u64))
+    }
+
+    /// GAP 22 Feature 2: list distinct `model` values seen in
+    /// the last `hours` window. Empty / NULL model values are
+    /// dropped so the alert evaluator never bucket-keys on a
+    /// blank string. Newest-first by last invocation.
+    pub fn list_models(&self, hours: u32) -> Result<Vec<String>, MetricsQueryError> {
+        let cutoff = window_start_ms(hours);
+        let out: Vec<String> = self.store.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT model FROM metrics_invocations \
+                 WHERE timestamp_ms >= ?1 AND model IS NOT NULL AND model != '' \
+                 GROUP BY model \
+                 ORDER BY MAX(timestamp_ms) DESC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![cutoff], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(out)
+    }
+
+    /// GAP 22 Feature 2: ask-human rate for an agent over a
+    /// window, defined as
+    /// `count(error_kind = "APPROVAL_REQUIRED") / count(*)`.
+    /// Used by the ask-human-rate drift alert to compare a
+    /// recent rate against a longer rolling baseline.
+    ///
+    /// `error_kind = "APPROVAL_REQUIRED"` is the canonical
+    /// signal — both the agent_gate (`crate::admission::agent_gate`)
+    /// and the GAP 15 always-require allowlist record it on
+    /// every denied-pending-approval row. Returns
+    /// `(approval_required_count, total_count)` so the caller
+    /// computes the ratio explicitly and applies its own
+    /// noise-floor minimum-attempts check.
+    pub fn ask_human_rate(&self, agent: &str, hours: u32) -> Result<(u64, u64), MetricsQueryError> {
+        let cutoff = window_start_ms(hours);
+        let row: (i64, i64) = self.store.with_conn(|c| {
+            c.query_row(
+                "SELECT \
+                   SUM(CASE WHEN error_kind = 'APPROVAL_REQUIRED' THEN 1 ELSE 0 END), \
+                   COUNT(*) \
+                 FROM metrics_invocations \
+                 WHERE agent_name = ?1 AND timestamp_ms >= ?2",
+                rusqlite::params![agent, cutoff],
+                |r| {
+                    let approvals: Option<i64> = r.get(0)?;
+                    let total: i64 = r.get(1)?;
+                    Ok((approvals.unwrap_or(0), total))
+                },
+            )
+        })?;
+        Ok((row.0.max(0) as u64, row.1.max(0) as u64))
+    }
+
     /// Total invocation count (any outcome) for an agent over
     /// the last N minutes. Companion to the call above —
     /// the AlertEngine fires the zero-success alert ONLY when
