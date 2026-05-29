@@ -11,6 +11,10 @@
 //! - [`eventlog`] — append-only hash-chained flow event log (RELIX-3).
 //! - [`audit`] — per-responder audit record format and writer.
 //! - [`capability`] — capability descriptor types (RELIX-6).
+//! - [`approval`] — shared approval-delivery primitives (`ChannelKind`,
+//!   `SingleChannelDispatch`, channel configs) — lives here so the
+//!   channel crates can implement the trait without depending on
+//!   `relix-runtime`.
 //!
 //! ## DETERMINISM
 //!
@@ -26,6 +30,7 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 #![cfg_attr(not(test), warn(clippy::expect_used))]
 
+pub mod approval;
 pub mod audit;
 pub mod bundle;
 pub mod capability;

@@ -11,8 +11,12 @@
 //!   non-ASCII).
 //! - `get_updates` uses Telegram's long-poll: `timeout=30`,
 //!   `allowed_updates=["message", "callback_query"]`. The
-//!   reqwest call is given a hard timeout of 35s so a stuck
-//!   socket can't wedge the receive loop forever.
+//!   `callback_query` entry is what makes inline-button
+//!   replies (approve / deny) actually flow back to the
+//!   controller — Telegram drops every update type that is
+//!   not in the allowlist. The reqwest call is given a hard
+//!   timeout of 35s so a stuck socket can't wedge the receive
+//!   loop forever.
 //! - Retry posture follows the Bot API guidance: 429
 //!   (rate-limited) honours `retry_after`; 5xx uses exponential
 //!   backoff (1s, 2s, 4s — max 3 retries); 4xx other than 429
@@ -246,14 +250,30 @@ struct TgGetUpdatesReq<'a> {
     allowed_updates: &'a [&'a str],
 }
 
-/// Raw shape of a Telegram update. We only model the subset
-/// the channel cares about today (text messages); other
-/// update kinds are silently skipped.
+/// Raw shape of a Telegram update. Models the two update kinds
+/// the channel acts on:
+///
+/// - `message` — text / voice / photo etc. We surface text and
+///   voice only.
+/// - `callback_query` — operator pressed an inline button on a
+///   message we previously sent. We surface the press as an
+///   [`IncomingMessage`] whose `text` is the button's
+///   `callback_data` verbatim so the existing slash-command
+///   routing (`/approve <id>`, `/deny <id>`) picks it up.
+///
+/// All other update kinds (edited messages, polls, channel
+/// posts, …) are silently skipped — `update_to_incoming`
+/// returns `None`.
 #[derive(Debug, Deserialize)]
 struct TgUpdate {
     update_id: i64,
     #[serde(default)]
     message: Option<TgMessage>,
+    /// Set when this update is a callback_query rather than a
+    /// regular message — `update_to_incoming` routes it to the
+    /// callback path.
+    #[serde(default)]
+    callback_query: Option<TgCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,14 +306,62 @@ struct TgChat {
     id: i64,
 }
 
+/// Telegram `callback_query` envelope. `id` is what we echo
+/// back to `answerCallbackQuery` to clear the operator's
+/// spinning button indicator. `message` is the message that
+/// carried the inline keyboard the operator pressed — set on
+/// every callback_query from a bot-authored message. `data`
+/// is the opaque payload we stamped on the button at send
+/// time; for approval flows this is `/approve <id>` or
+/// `/deny <id>`.
+#[derive(Debug, Deserialize)]
+struct TgCallbackQuery {
+    id: String,
+    from: TgUser,
+    #[serde(default)]
+    message: Option<TgMessage>,
+    #[serde(default)]
+    data: Option<String>,
+}
+
 /// Convert a raw Telegram update into the channel's
 /// [`IncomingMessage`]. Returns `None` for updates we don't
-/// model yet (callback queries, photos, stickers) — the caller
-/// skips silently. Text messages keep their existing shape;
-/// voice messages produce an [`IncomingMessage`] with an empty
-/// `text` body and a populated `voice_file_id` so the
-/// controller can transcribe before dispatching the chat flow.
+/// model yet (edited messages, polls, channel posts, …) — the
+/// caller skips silently.
+///
+/// - **Text messages**: `text` carries the body, `voice_file_id`
+///   is `None`, `callback_query_id` is `None`.
+/// - **Voice messages**: `text` is empty, `voice_file_id` is
+///   the Telegram `file_id`, `callback_query_id` is `None`.
+/// - **Callback-query updates** (operator pressed an inline
+///   button): `text` carries the button's `callback_data`
+///   verbatim, `callback_query_id` is `Some` so the controller
+///   can ack via `answerCallbackQuery`. `chat_id` /
+///   `message_id` are inherited from the message that carried
+///   the keyboard so the controller can edit-in-place the
+///   approval banner.
 fn update_to_incoming(u: TgUpdate) -> Option<IncomingMessage> {
+    if let Some(cb) = u.callback_query {
+        let data = cb.data.unwrap_or_default();
+        if data.is_empty() {
+            return None;
+        }
+        let (chat_id, message_id) = cb
+            .message
+            .as_ref()
+            .map(|m| (m.chat.id, m.message_id))
+            .unwrap_or((0, 0));
+        return Some(IncomingMessage {
+            update_id: u.update_id,
+            chat_id,
+            user_id: cb.from.id,
+            message_id,
+            username: cb.from.username.unwrap_or_default(),
+            text: data,
+            voice_file_id: None,
+            callback_query_id: Some(cb.id),
+        });
+    }
     let m = u.message?;
     let from = m.from?;
     let text = m.text.unwrap_or_default();
@@ -309,6 +377,7 @@ fn update_to_incoming(u: TgUpdate) -> Option<IncomingMessage> {
         username: from.username.unwrap_or_default(),
         text,
         voice_file_id,
+        callback_query_id: None,
     })
 }
 
@@ -327,10 +396,11 @@ impl BotApi for LiveBotApi {
         let body = serde_json::to_value(TgGetUpdatesReq {
             offset,
             timeout: LONG_POLL_TIMEOUT_SECS,
-            // `message` covers text + voice; callback queries
-            // are still skipped server-side until the inline-
-            // button surface ships.
-            allowed_updates: &["message"],
+            // `message` covers text + voice; `callback_query`
+            // surfaces inline-button presses (approve / deny
+            // on approval banners). Telegram drops any update
+            // type not in this allowlist server-side.
+            allowed_updates: &["message", "callback_query"],
         })
         .map_err(|e| BotApiError::Transient(format!("getUpdates: build body: {e}")))?;
         let raw: Vec<TgUpdate> = self.post("getUpdates", &body).await?;
@@ -347,6 +417,23 @@ impl BotApi for LiveBotApi {
         }
         if let Some(pm) = out.parse_mode {
             body["parse_mode"] = serde_json::json!(pm.as_wire());
+        }
+        if let Some(markup) = out.reply_markup.as_ref() {
+            // `serde_json::to_value` on `InlineKeyboardMarkup`
+            // is infallible — the struct only contains
+            // strings and `Vec`. We still match defensively so
+            // a future schema change can never panic the
+            // sender.
+            match serde_json::to_value(markup) {
+                Ok(v) => {
+                    body["reply_markup"] = v;
+                }
+                Err(e) => {
+                    return Err(BotApiError::Transient(format!(
+                        "sendMessage: encode reply_markup: {e}"
+                    )));
+                }
+            }
         }
         let _: TgIgnoredResult = self.post("sendMessage", &body).await?;
         Ok(())
@@ -515,14 +602,67 @@ mod tests {
     }
 
     #[test]
-    fn update_to_incoming_drops_callback_queries() {
-        // Callback queries arrive without a `message` field.
+    fn update_to_incoming_surfaces_callback_query_data_as_text() {
+        // Callback query without an embedded message still
+        // surfaces; chat_id / message_id default to 0 so the
+        // caller can detect that the source message can't be
+        // edited in place.
         let raw = serde_json::json!({
             "update_id": 2,
             "callback_query": {
                 "id": "cb1",
-                "from": { "id": 42 },
+                "from": { "id": 42, "username": "alice" },
                 "data": "/approve task-1"
+            }
+        });
+        let u: TgUpdate = serde_json::from_value(raw).unwrap();
+        let inc = update_to_incoming(u).expect("callback_query must produce an IncomingMessage");
+        assert_eq!(inc.update_id, 2);
+        assert_eq!(inc.user_id, 42);
+        assert_eq!(inc.username, "alice");
+        assert_eq!(inc.text, "/approve task-1");
+        assert_eq!(inc.callback_query_id.as_deref(), Some("cb1"));
+        assert!(inc.is_callback_query());
+        // No embedded message → chat_id / message_id are 0.
+        assert_eq!(inc.chat_id, 0);
+        assert_eq!(inc.message_id, 0);
+    }
+
+    #[test]
+    fn update_to_incoming_callback_query_with_message_inherits_chat() {
+        // The common case — Telegram includes the originating
+        // message so the controller can edit-in-place.
+        let raw = serde_json::json!({
+            "update_id": 3,
+            "callback_query": {
+                "id": "cb2",
+                "from": { "id": 42 },
+                "message": {
+                    "message_id": 99,
+                    "chat": { "id": 100 }
+                },
+                "data": "/deny task-2"
+            }
+        });
+        let u: TgUpdate = serde_json::from_value(raw).unwrap();
+        let inc = update_to_incoming(u).expect("callback_query must produce an IncomingMessage");
+        assert_eq!(inc.chat_id, 100);
+        assert_eq!(inc.message_id, 99);
+        assert_eq!(inc.text, "/deny task-2");
+        assert_eq!(inc.callback_query_id.as_deref(), Some("cb2"));
+    }
+
+    #[test]
+    fn update_to_incoming_drops_callback_query_without_data() {
+        // Defensive — Telegram should always include `data`
+        // for inline-button callbacks but we drop the update
+        // rather than emit an empty-text message that would
+        // confuse the slash-command router.
+        let raw = serde_json::json!({
+            "update_id": 4,
+            "callback_query": {
+                "id": "cb3",
+                "from": { "id": 42 }
             }
         });
         let u: TgUpdate = serde_json::from_value(raw).unwrap();

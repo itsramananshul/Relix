@@ -471,6 +471,7 @@ async fn send_text(api: &dyn BotApi, chat_id: i64, reply_to: i64, text: &str) ->
         reply_to_message_id: reply_to,
         text: formatted,
         parse_mode: Some(ParseMode::MarkdownV2),
+        reply_markup: None,
     };
     if let Err(e) = api.send_message(&msg).await {
         // Fallback: if the rich-text send failed (Bot API
@@ -484,6 +485,7 @@ async fn send_text(api: &dyn BotApi, chat_id: i64, reply_to: i64, text: &str) ->
             reply_to_message_id: reply_to,
             text: text.to_string(),
             parse_mode: None,
+            reply_markup: None,
         };
         if let Err(e2) = api.send_message(&fallback).await {
             tracing::warn!(error = %e2, chat_id = chat_id,
@@ -526,6 +528,7 @@ async fn run_approval_notifier(
                 reply_to_message_id: 0,
                 text: body,
                 parse_mode: Some(ParseMode::MarkdownV2),
+                reply_markup: None,
             };
             if let Err(e) = api.send_message(&out_msg).await {
                 tracing::warn!(error = %e, "telegram: approval notify send failed");
@@ -584,6 +587,7 @@ mod tests {
             username: "alice".into(),
             text: text.into(),
             voice_file_id: None,
+            callback_query_id: None,
         }
     }
 
@@ -596,6 +600,7 @@ mod tests {
             username: "alice".into(),
             text: String::new(),
             voice_file_id: Some(file_id.into()),
+            callback_query_id: None,
         }
     }
 

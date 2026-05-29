@@ -1,12 +1,24 @@
 //! Approval delivery matrix + service.
 //!
 //! See [`super`] for the module-level overview.
+//!
+//! The wire-shared primitive types ([`ChannelKind`],
+//! [`ChannelsConfig`], per-channel config structs,
+//! [`ApprovalRequest`], [`SingleChannelDispatch`]) live in
+//! `relix_core::approval` so the channel crates can implement
+//! the trait without depending on this crate. We re-export them
+//! through this module so existing callers keep working.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use relix_core::approval::{
+    ApprovalRequest, ChannelDispatchError, ChannelKind, ChannelsConfig, DashboardChannelCfg,
+    DiscordChannelCfg, EmailChannelCfg, SingleChannelDispatch, SlackChannelCfg, TelegramChannelCfg,
+};
 
 use super::store::{ApprovalDeliveryRow, ApprovalRequestStore, ApprovalStoreError};
 
@@ -56,151 +68,47 @@ pub struct DeliveryRule {
     pub escalation_channel: Option<String>,
 }
 
-/// `[approval.delivery.channels]` body. Each variant carries
-/// channel-specific wire metadata; `enabled = false` (or the
-/// section being absent) keeps the channel dormant.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct ChannelsConfig {
-    #[serde(default)]
-    pub telegram: Option<TelegramChannelCfg>,
-    #[serde(default)]
-    pub slack: Option<SlackChannelCfg>,
-    #[serde(default)]
-    pub email: Option<EmailChannelCfg>,
-    #[serde(default)]
-    pub dashboard: Option<DashboardChannelCfg>,
-}
-
-/// `[approval.delivery.channels.telegram]`.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct TelegramChannelCfg {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Chat id to post into. Numeric Telegram ids are passed
-    /// as strings so operator TOML stays readable.
-    #[serde(default)]
-    pub chat_id: String,
-    /// Optional peer alias to dispatch the message through.
-    /// Defaults to `"telegram"` so single-controller
-    /// deployments don't need to repeat the value.
-    #[serde(default = "default_peer_telegram")]
-    pub peer: String,
-}
-
-fn default_peer_telegram() -> String {
-    "telegram".into()
-}
-
-/// `[approval.delivery.channels.slack]`.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct SlackChannelCfg {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Incoming-webhook URL. Required when `enabled = true`;
-    /// dispatcher logs a warning and drops the message
-    /// otherwise.
-    #[serde(default)]
-    pub webhook_url: String,
-    #[serde(default = "default_peer_slack")]
-    pub peer: String,
-}
-
-fn default_peer_slack() -> String {
-    "slack".into()
-}
-
-/// `[approval.delivery.channels.email]`.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct EmailChannelCfg {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Recipient mailbox. SMTP details come from the existing
-    /// email channel config the operator already wired for the
-    /// alert-delivery system.
-    #[serde(default)]
-    pub to: String,
-    #[serde(default = "default_peer_email")]
-    pub peer: String,
-}
-
-fn default_peer_email() -> String {
-    "email".into()
-}
-
-/// `[approval.delivery.channels.dashboard]`.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct DashboardChannelCfg {
-    #[serde(default)]
-    pub enabled: bool,
-}
-
-/// Channel an approval message is dispatched on. Stored on
-/// the row as the lowercase tag string so operators can
-/// `SELECT * WHERE delivery_channel = 'slack'` without joining.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChannelKind {
-    Telegram,
-    Slack,
-    Email,
-    Dashboard,
-}
-
-impl ChannelKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Telegram => "telegram",
-            Self::Slack => "slack",
-            Self::Email => "email",
-            Self::Dashboard => "dashboard",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "telegram" => Some(Self::Telegram),
-            "slack" => Some(Self::Slack),
-            "email" => Some(Self::Email),
-            "dashboard" => Some(Self::Dashboard),
-            _ => None,
-        }
-    }
-}
-
 /// What the matrix decided for one request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleMatch {
     /// 0-based index of the rule that matched, or `None`
     /// when the default_channel was used.
     pub rule_index: Option<usize>,
+    /// Channel resolved for the initial delivery.
     pub channel: ChannelKind,
     /// `0` when the matched rule disables escalation OR the
     /// default channel was used.
     pub escalation_timeout_secs: u64,
+    /// Channel resolved for escalation, when escalation is
+    /// enabled.
     pub escalation_channel: Option<ChannelKind>,
-}
-
-/// One approval request flowing into the delivery service.
-/// Caller-supplied state; the service decorates it with the
-/// resolver + persists it under `approval_id`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ApprovalRequest {
-    pub approval_id: String,
-    pub agent_name: String,
-    pub capability: String,
-    pub request_summary: String,
-    pub session_id: String,
 }
 
 /// Errors surfaced by the dispatch service.
 #[derive(Debug, Error)]
 pub enum DeliveryError {
+    /// Failure persisting the delivery row to SQLite.
     #[error("approval delivery: store error: {0}")]
     Store(#[from] ApprovalStoreError),
+    /// Channel resolved but the per-channel config is absent
+    /// or `enabled = false`.
     #[error("approval delivery: channel `{0}` is not enabled or not configured")]
     ChannelDisabled(String),
+    /// Underlying per-channel dispatcher returned an error.
+    /// The channel name is included so operators see which
+    /// channel failed without having to correlate via logs.
     #[error("approval delivery: channel dispatch failed: {0}")]
     Dispatch(String),
+}
+
+impl From<ChannelDispatchError> for DeliveryError {
+    fn from(value: ChannelDispatchError) -> Self {
+        match value {
+            ChannelDispatchError::Disabled(ch) => DeliveryError::ChannelDisabled(ch),
+            ChannelDispatchError::Transport(msg) => DeliveryError::Dispatch(msg),
+            ChannelDispatchError::Other(msg) => DeliveryError::Dispatch(msg),
+        }
+    }
 }
 
 /// Outcome returned by `ApprovalDeliveryService::dispatch_request`.
@@ -277,6 +185,13 @@ impl ApprovalDeliveryMatrix {
                 .cfg
                 .channels
                 .slack
+                .as_ref()
+                .map(|c| c.enabled)
+                .unwrap_or(false),
+            ChannelKind::Discord => self
+                .cfg
+                .channels
+                .discord
                 .as_ref()
                 .map(|c| c.enabled)
                 .unwrap_or(false),
@@ -586,11 +501,16 @@ mod tests {
                 slack: Some(SlackChannelCfg {
                     enabled: true,
                     webhook_url: "https://hooks.slack.com/x".into(),
+                    channel_id: "C0X".into(),
+                    signing_secret: "test-secret".into(),
                     peer: "slack".into(),
                 }),
+                discord: None,
                 email: Some(EmailChannelCfg {
                     enabled: true,
                     to: "ops@x.com".into(),
+                    from: "relix@x.com".into(),
+                    reply_to: "approvals@x.com".into(),
                     peer: "email".into(),
                 }),
                 dashboard: Some(DashboardChannelCfg { enabled: true }),

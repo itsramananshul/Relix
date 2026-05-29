@@ -284,6 +284,7 @@ fn msg_from(chat_id: i64, user_id: i64, text: &str) -> IncomingMessage {
         username: "alice".into(),
         text: text.into(),
         voice_file_id: None,
+        callback_query_id: None,
     }
 }
 

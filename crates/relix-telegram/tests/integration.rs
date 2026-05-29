@@ -24,6 +24,7 @@ async fn inbound_message_maps_to_subject_and_session() {
         username: "alice".into(),
         text: "do the thing".into(),
         voice_file_id: None,
+        callback_query_id: None,
     };
     api.push_update(inbound.clone());
 
@@ -53,6 +54,7 @@ async fn inbound_message_maps_to_subject_and_session() {
         reply_to_message_id: msg.message_id,
         text: "done!".into(),
         parse_mode: None,
+        reply_markup: None,
     })
     .await
     .unwrap();

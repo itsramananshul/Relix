@@ -222,6 +222,7 @@ async fn handle_send(api: Arc<dyn BotApi>, args: Vec<u8>) -> HandlerOutcome {
         reply_to_message_id: 0,
         text: parsed.text,
         parse_mode: None,
+        reply_markup: None,
     };
     match api.send_message(&msg).await {
         Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),

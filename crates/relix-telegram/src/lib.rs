@@ -20,6 +20,7 @@
 //! reads that config and wires this scaffold to the existing
 //! controller startup path.
 
+pub mod approval;
 pub mod config;
 pub mod identity;
 pub mod live;
@@ -27,10 +28,13 @@ pub mod messages;
 pub mod mock;
 pub mod session_store;
 
+pub use approval::TelegramChannelDispatch;
 pub use config::{TelegramConfig, TelegramError};
 pub use identity::{ChannelSubject, derive_channel_subject};
 pub use live::{BotIdentity, LiveBotApi};
-pub use messages::{IncomingMessage, OutgoingMessage, ParseMode};
+pub use messages::{
+    IncomingMessage, InlineKeyboardButton, InlineKeyboardMarkup, OutgoingMessage, ParseMode,
+};
 pub use session_store::{InMemorySessionStore, SessionStorage, SessionStore, SqliteSessionStore};
 
 use async_trait::async_trait;

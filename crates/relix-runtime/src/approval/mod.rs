@@ -36,7 +36,8 @@ pub mod store;
 
 pub use delivery::{
     ApprovalDeliveryConfig, ApprovalDeliveryMatrix, ApprovalDeliveryService, ApprovalRequest,
-    ChannelDispatch, ChannelKind, ChannelsConfig, DashboardChannelCfg, DeliveryOutcome,
-    DeliveryRule, EmailChannelCfg, RuleMatch, SlackChannelCfg, TelegramChannelCfg,
+    ChannelDispatch, ChannelDispatchError, ChannelKind, ChannelsConfig, DashboardChannelCfg,
+    DeliveryOutcome, DeliveryRule, DiscordChannelCfg, EmailChannelCfg, RuleMatch,
+    SingleChannelDispatch, SlackChannelCfg, TelegramChannelCfg,
 };
 pub use store::{ApprovalDeliveryRow, ApprovalRequestStore, ApprovalStoreError};

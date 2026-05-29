@@ -207,6 +207,7 @@ async fn send_message_succeeds_on_first_try() {
         reply_to_message_id: 5,
         text: "hi".into(),
         parse_mode: None,
+        reply_markup: None,
     };
     api.send_message(&out).await.unwrap();
     assert_eq!(s.send_calls.load(Ordering::SeqCst), 1);
@@ -228,6 +229,7 @@ async fn send_message_retries_5xx_then_succeeds() {
         reply_to_message_id: 0,
         text: "retry me".into(),
         parse_mode: None,
+        reply_markup: None,
     };
     // Patch backoff via tokio's time pause is fiddly across
     // reqwest's blocking I/O; instead, this test runs in real
@@ -254,6 +256,7 @@ async fn send_message_honours_429_retry_after_zero_succeeds() {
         reply_to_message_id: 0,
         text: "rate-limited then ok".into(),
         parse_mode: None,
+        reply_markup: None,
     };
     tokio::time::timeout(Duration::from_secs(10), api.send_message(&out))
         .await
@@ -276,6 +279,7 @@ async fn send_message_does_not_retry_unauthorized() {
         reply_to_message_id: 0,
         text: "x".into(),
         parse_mode: None,
+        reply_markup: None,
     };
     let err = api.send_message(&out).await.unwrap_err();
     match err {

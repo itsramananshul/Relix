@@ -178,6 +178,7 @@ mod tests {
             username: "alice".into(),
             text: format!("u{update_id}"),
             voice_file_id: None,
+            callback_query_id: None,
         }
     }
 
@@ -208,6 +209,7 @@ mod tests {
             reply_to_message_id: 5,
             text: "hello back".into(),
             parse_mode: None,
+            reply_markup: None,
         };
         m.send_message(&out).await.unwrap();
         assert_eq!(m.sent_messages().len(), 1);
@@ -223,6 +225,7 @@ mod tests {
             reply_to_message_id: 5,
             text: "x".into(),
             parse_mode: None,
+            reply_markup: None,
         };
         let r = m.send_message(&out).await;
         assert!(matches!(r, Err(BotApiError::Transient(_))));
