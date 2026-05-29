@@ -52,7 +52,6 @@
 //! Provider keys live ONLY here on the AI node — never in `relix-web-bridge`
 //! or any presentation peer.
 
-pub mod belief_caps;
 pub mod belief_state;
 pub mod complexity;
 pub mod execution;
@@ -62,8 +61,6 @@ pub mod judge;
 pub mod memory_dispatcher;
 pub mod provenance_hooks;
 pub mod provider;
-pub mod reasoning;
-pub mod reasoning_caps;
 pub mod reasoning_status;
 pub mod router;
 pub mod skill_caps;
@@ -127,12 +124,6 @@ pub struct AiConfig {
     /// [`crate::nodes::ai::soul`].
     #[serde(default)]
     pub agent: Option<AgentConfig>,
-    /// `[ai.reasoning]` — GAP 16 §7.29 reasoning engine
-    /// (smart routing, judge, belief, self-consistency).
-    /// Absent / every sub-component disabled keeps the AI
-    /// handler at pre-7.29 behaviour byte-for-byte.
-    #[serde(default)]
-    pub reasoning: Option<reasoning::ReasoningConfig>,
     /// `[ai.routing]` — RELIX-7.29 PART 1 smart model routing.
     /// When present and `enabled = true`, every chat request
     /// is classified via [`complexity::ComplexityClassifier`]
@@ -186,7 +177,6 @@ impl Default for AiConfig {
             providers: ProviderEntries::new(),
             memory_peer: None,
             agent: None,
-            reasoning: None,
             routing: None,
             belief_state: None,
             judge: None,
@@ -341,7 +331,6 @@ pub fn register(
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
     skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
-    reasoning_config: Option<reasoning::ReasoningConfig>,
     routing_config: Option<tier_routing::RoutingConfig>,
     self_consistency_config: Option<crate::confidence::SelfConsistencyConfig>,
     self_consistency_stats: Option<crate::confidence::SelfConsistencyStats>,
@@ -352,21 +341,6 @@ pub fn register(
     belief_persistence_store: Option<Arc<crate::nodes::memory::schema::LayeredMemoryStore>>,
     judge_runtime_config: Option<judge::JudgeConfig>,
 ) -> (belief_state::BeliefStateTracker, judge::JudgeRecorder) {
-    // GAP 16 §7.29: build the four reasoning components from the
-    // optional config. Every component defaults to off when its
-    // sub-section is absent, so existing deployments remain
-    // byte-for-byte identical.
-    let reasoning_cfg = reasoning_config.unwrap_or_default();
-    let tier_router_shared = reasoning_cfg
-        .router
-        .clone()
-        .map(reasoning::TierRouter::new)
-        .unwrap_or_default();
-    let judge_cfg_shared = reasoning_cfg.judge.clone().unwrap_or_default();
-    let self_consistency_cfg_shared = reasoning_cfg.self_consistency.clone().unwrap_or_default();
-    let tier_router_for_chat = tier_router_shared.clone();
-    let judge_cfg_for_chat = judge_cfg_shared.clone();
-    let self_consistency_cfg_for_chat = self_consistency_cfg_shared.clone();
     // RELIX-7.29 PART 1: build the spec'd `[ai.routing]` tier
     // router. The registry maps provider names to the active
     // provider Arc — single-provider deployments register only
@@ -420,45 +394,6 @@ pub fn register(
     // of whether `[ai.routing] enabled` is true) so operators
     // can dry-run the classifier even when routing is off.
     tier_routing::caps::register(bridge, routing_router_shared.clone());
-    // GAP 16 Component 3: open the belief store + register the
-    // six `memory.belief_*` caps when the operator turned the
-    // section on.
-    if let Some(belief_cfg) = reasoning_cfg.belief.as_ref()
-        && belief_cfg.enabled
-        && let Some(db_path) = belief_cfg.db_path.as_ref()
-    {
-        match reasoning::BeliefStore::open(db_path) {
-            Ok(store) => {
-                belief_caps::register(bridge, Arc::new(store));
-                tracing::info!(
-                    db_path = %db_path.display(),
-                    "ai.reasoning.belief: store opened, memory.belief_* caps registered"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    db_path = %db_path.display(),
-                    error = %e,
-                    "ai.reasoning.belief: store open failed; caps NOT registered"
-                );
-            }
-        }
-    }
-    // GAP 16 Components 2 + 4: register the three reasoning
-    // caps (`ai.judge_eval`, `ai.self_consistency`,
-    // `ai.confidence_aggregate`) so operators / SOL flows can
-    // invoke them explicitly. Always registered (regardless of
-    // judge.enabled / self_consistency.enabled flags) because
-    // the caps THEMSELVES are the opt-in surface — calling
-    // them costs N provider invocations, so the gating is at
-    // call time.
-    reasoning_caps::register(
-        bridge,
-        provider.clone(),
-        default_model.clone(),
-        judge_cfg_shared.clone(),
-        self_consistency_cfg_shared.clone(),
-    );
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let memory_for_chat = memory_dispatcher.clone();
@@ -488,9 +423,6 @@ pub fn register(
             let training = interaction_for_chat.clone();
             let extractor = extractor_for_chat.clone();
             let obs = observability_for_chat.clone();
-            let router = tier_router_for_chat.clone();
-            let judge_cfg = judge_cfg_for_chat.clone();
-            let sc_cfg = self_consistency_cfg_for_chat.clone();
             let routing_router = routing_router_for_chat.clone();
             let sc_runtime_cfg = sc_cfg_for_chat.clone();
             let sc_runtime_stats = sc_stats_for_chat.clone();
@@ -513,9 +445,6 @@ pub fn register(
                     extractor,
                     obs,
                     provider_name,
-                    router,
-                    judge_cfg,
-                    sc_cfg,
                     routing_router,
                     sc_runtime_cfg,
                     sc_runtime_stats,
@@ -549,9 +478,6 @@ pub fn register(
     let interaction_for_chat_stream = interaction_sink.clone();
     let provider_name_for_chat_stream: String = provider.provider_name().to_string();
     let observability_for_stream = observability.clone();
-    let router_for_chat_stream = tier_router_shared.clone();
-    let judge_cfg_for_chat_stream = judge_cfg_shared.clone();
-    let sc_cfg_for_chat_stream = self_consistency_cfg_shared.clone();
     let routing_router_for_chat_stream = routing_router_shared.clone();
     let sc_cfg_for_chat_stream_runtime = sc_cfg_shared.clone();
     let sc_stats_for_chat_stream = sc_stats_shared.clone();
@@ -573,9 +499,6 @@ pub fn register(
                 let training = interaction_for_chat_stream.clone();
                 let provider_name = provider_name_for_chat_stream.clone();
                 let obs = observability_for_stream.clone();
-                let router = router_for_chat_stream.clone();
-                let judge_cfg = judge_cfg_for_chat_stream.clone();
-                let sc_cfg = sc_cfg_for_chat_stream.clone();
                 let routing_router = routing_router_for_chat_stream.clone();
                 let sc_runtime_cfg = sc_cfg_for_chat_stream_runtime.clone();
                 let sc_runtime_stats = sc_stats_for_chat_stream.clone();
@@ -595,9 +518,6 @@ pub fn register(
                         training,
                         obs,
                         provider_name,
-                        router,
-                        judge_cfg,
-                        sc_cfg,
                         routing_router,
                         sc_runtime_cfg,
                         sc_runtime_stats,
@@ -1105,9 +1025,6 @@ async fn handle_chat_stream(
     interaction_sink: Option<Arc<dyn crate::training::InteractionSink>>,
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
     provider_name: String,
-    tier_router: reasoning::TierRouter,
-    judge_cfg: reasoning::JudgeConfig,
-    self_consistency_cfg: reasoning::SelfConsistencyConfig,
     routing_router: tier_routing::TierRouter,
     sc_cfg: crate::confidence::SelfConsistencyConfig,
     sc_stats: crate::confidence::SelfConsistencyStats,
@@ -1117,21 +1034,14 @@ async fn handle_chat_stream(
     judge_turns: judge::SessionTurnCounter,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
-    // GAP 16 Component 1: same tier classification +
-    // resolution as `handle_chat`. Falls back to the
-    // provider's default when the router is disabled OR the
-    // tier is unmapped + fallback_to_default = true.
-    //
-    // RELIX-7.29 (post-rebuild): self-consistency now runs on
-    // the streaming path by dispatching N unary samples in
-    // parallel, scoring them, and chunk-streaming the winner.
-    // The legacy reasoning configs (judge_cfg,
-    // self_consistency_cfg, routing_router) stay on the
-    // signature for back-compat with the old wiring; they're
-    // consumed by the unary-path setup, not the stream.
+    // RELIX-7.29 (post-rebuild): the streaming variant uses
+    // the new spec'd modules (tier_routing, confidence::SC,
+    // belief_state, judge). Belief + judge are consumed
+    // implicitly through the unary path called by the SC
+    // sampler; on the pure-stream fallback they don't apply
+    // because the streaming flow lacks the synchronous
+    // post-response hooks.
     let _ = (
-        &judge_cfg,
-        &self_consistency_cfg,
         &routing_router,
         &belief_tracker,
         &judge_runtime_cfg,
@@ -1153,36 +1063,24 @@ async fn handle_chat_stream(
     let session_id = preflight.session_id.clone();
     let _ = preflight.approval_token;
     let mut input = preflight.input;
-    // GAP 16 Component 1: streaming tier override. Mirrors the
-    // unary `handle_chat` logic so a smart-router operator
-    // sees the same per-tier model on streaming + unary.
-    if tier_router.enabled() {
-        let classifier = reasoning::ComplexityClassifier::new();
-        let tier = classifier.classify(&input.prompt, false);
-        match tier_router.resolve(tier) {
-            Ok(Some(m)) => {
-                tracing::info!(
-                    session_id,
-                    tier = tier.as_str(),
-                    model = %m,
-                    "ai.chat.stream: smart router resolved tier -> model"
-                );
-                input.model = m;
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    session_id,
-                    tier = tier.as_str(),
-                    "ai.chat.stream: smart router fell back to default model"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_id,
-                    error = %e,
-                    "ai.chat.stream: smart router refused tier; falling back to default"
-                );
-            }
+    // RELIX-7.29 PART 1: streaming tier override via the
+    // spec'd `[ai.routing]` tier router. Mirrors the unary
+    // `handle_chat` logic so a smart-router operator sees the
+    // same per-tier model on streaming + unary. Disabled
+    // routers and unmapped tiers fall through to `input.model`
+    // unchanged.
+    if routing_router.enabled() {
+        let score = complexity::ComplexityClassifier::new().classify(&input.prompt, 0);
+        let decision = routing_router.resolve(&score);
+        if let Some(m) = decision.model.as_deref() {
+            tracing::info!(
+                session_id,
+                tier = decision.tier.as_str(),
+                model = m,
+                fell_back = decision.fell_back,
+                "ai.chat.stream: ai.routing tier resolved"
+            );
+            input.model = m.to_string();
         }
     }
     // Snapshot fields the training-record build path needs
@@ -1502,9 +1400,6 @@ async fn handle_chat(
     skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
     provider_name: String,
-    tier_router: reasoning::TierRouter,
-    judge_cfg: reasoning::JudgeConfig,
-    self_consistency_cfg: reasoning::SelfConsistencyConfig,
     routing_router: tier_routing::TierRouter,
     sc_cfg: crate::confidence::SelfConsistencyConfig,
     sc_stats: crate::confidence::SelfConsistencyStats,
@@ -1674,50 +1569,6 @@ async fn handle_chat(
         system_prompt
     };
 
-    // GAP 16 Component 1: smart router. Classify the prompt into
-    // a tier (cheap rule-based — no LLM call) and ask the
-    // configured TierRouter for the model id mapped to that
-    // tier. When the router is disabled OR the tier has no
-    // override (and fallback_to_default is on, the spec
-    // default), we fall through to `default_model` and dispatch
-    // exactly as pre-7.29.
-    //
-    // Errors are non-fatal — a misconfigured tier never aborts
-    // the call; it logs a warning and falls back to the default.
-    let classifier = reasoning::ComplexityClassifier::new();
-    let reasoning_tier = classifier.classify(prompt, false);
-    let mut resolved_model = if tier_router.enabled() {
-        match tier_router.resolve(reasoning_tier) {
-            Ok(Some(m)) => {
-                tracing::info!(
-                    session_id,
-                    tier = reasoning_tier.as_str(),
-                    model = %m,
-                    "ai.chat: smart router resolved tier -> model"
-                );
-                m
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    session_id,
-                    tier = reasoning_tier.as_str(),
-                    "ai.chat: smart router fell back to default model"
-                );
-                default_model.clone()
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_id,
-                    error = %e,
-                    "ai.chat: smart router refused tier; falling back to default model"
-                );
-                default_model.clone()
-            }
-        }
-    } else {
-        default_model.clone()
-    };
-
     // RELIX-7.29 PART 1: spec'd `[ai.routing]` tier resolution.
     // Runs AFTER memory + RAG + skills (those use the existing
     // `provider` Arc for embedding etc.) and BEFORE building
@@ -1726,6 +1577,7 @@ async fn handle_chat(
     // enabled = false` or all tiers fail health, the resolver
     // returns Unrouted and behaviour is byte-identical to the
     // pre-routing path.
+    let mut resolved_model = default_model.clone();
     let mut provider: Arc<dyn ChatProvider> = provider;
     let mut routing_tier_label: Option<&'static str> = None;
     if routing_router.enabled() {
@@ -1768,10 +1620,6 @@ async fn handle_chat(
         ..ChatInput::default()
     };
     let system_prompt_for_obs = system_prompt;
-    // Suppress unused-variable warnings on the two reasoning
-    // configs this commit doesn't yet auto-call (judge +
-    // self-consistency wiring lands in follow-up commits).
-    let _ = (&judge_cfg, &self_consistency_cfg);
     // Extract an optional `approval_token=<value>` field
     // from the request args. The token presence flips
     // `RequiresApproval` plans to `Approved` so an operator
@@ -2773,9 +2621,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -2800,9 +2645,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -2831,9 +2673,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -2873,9 +2712,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -2909,9 +2745,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -2966,9 +2799,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3021,9 +2851,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3067,9 +2894,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3114,9 +2938,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3167,9 +2988,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3217,9 +3035,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3290,9 +3105,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3344,9 +3156,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3401,9 +3210,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3541,9 +3347,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3599,9 +3402,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3655,9 +3455,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3712,9 +3509,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3790,9 +3584,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3908,9 +3699,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -3992,7 +3780,6 @@ mod tests {
             providers: ProviderEntries::new(),
             memory_peer: None,
             agent: None,
-            reasoning: None,
             routing: None,
             belief_state: None,
             judge: None,
@@ -4014,7 +3801,6 @@ mod tests {
             providers: ProviderEntries::new(),
             memory_peer: None,
             agent: None,
-            reasoning: None,
             routing: None,
             belief_state: None,
             judge: None,
@@ -4043,7 +3829,6 @@ mod tests {
             providers,
             memory_peer: None,
             agent: None,
-            reasoning: None,
             routing: None,
             belief_state: None,
             judge: None,
@@ -4072,7 +3857,6 @@ mod tests {
             providers,
             memory_peer: None,
             agent: None,
-            reasoning: None,
             routing: None,
             belief_state: None,
             judge: None,
@@ -4137,9 +3921,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4184,9 +3965,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4322,9 +4100,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4372,9 +4147,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4428,9 +4200,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4543,9 +4312,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4584,9 +4350,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4628,9 +4391,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4661,9 +4421,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4796,9 +4553,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -4838,9 +4592,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5023,9 +4774,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5074,9 +4822,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5128,9 +4873,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5200,9 +4942,6 @@ mod tests {
             None,
             Some(obs.clone()),
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5241,9 +4980,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5360,9 +5096,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             sc_streaming_cfg(3),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5422,9 +5155,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             sc_streaming_cfg(1),
             crate::confidence::SelfConsistencyStats::new(),
@@ -5472,9 +5202,6 @@ mod tests {
             None,
             None,
             "mock".to_string(),
-            reasoning::TierRouter::default(),
-            reasoning::JudgeConfig::default(),
-            reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
             cfg,
             crate::confidence::SelfConsistencyStats::new(),

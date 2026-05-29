@@ -5936,11 +5936,6 @@ fn register_node_type_handlers(
             training.map(|b| b.sink.clone()),
             skill_extractor,
             ai_observability.clone(),
-            // GAP 16 §7.29: per-controller reasoning config.
-            // Absent → every component stays at its disabled
-            // default and ai.chat runs pre-7.29 behaviour
-            // byte-for-byte.
-            ai_cfg.reasoning.clone(),
             // RELIX-7.29 PART 1: per-controller `[ai.routing]`
             // smart routing config. Absent / disabled keeps the
             // AI handler byte-identical to the pre-routing path.

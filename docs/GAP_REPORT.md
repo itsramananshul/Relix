@@ -286,9 +286,15 @@ The 4 missing sub-tools each depend on third-party integrations that cannot be s
 
 ---
 
-## GAP 16 — §7.29 Reasoning Engine — CLOSED (rebuilt 2026-05-28)
+## GAP 16 — §7.29 Reasoning Engine — CLOSED (rebuilt 2026-05-28, deferrals closed 2026-05-29)
 
-**Closed across the RELIX-7.29 rebuild: 0fef9cc (PART 1 smart routing) + c9d5327 (PART 2 self-consistency sampling) + 3d8862d (PART 3 LLM-driven belief tracker) + bf005dd (PART 4 judge) + b36e3c1 (PART 5 wire-up: `reasoning.status` cap + endpoint + CLI).** The prior five commits (ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d) shipped scaffolding that did not match the §7.29 spec; the rebuild's six new modules — `complexity`, `tier_routing`, `confidence::self_consistency`, `belief_state`, `judge`, `reasoning_status` — replace that work end-to-end. The pre-rebuild `nodes/ai/reasoning/` tree is left in place to keep the build green; a follow-up cleanup commit removes it after the new modules have soaked.
+**Closed across the RELIX-7.29 rebuild: 0fef9cc (PART 1 smart routing) + c9d5327 (PART 2 self-consistency sampling) + 3d8862d (PART 3 LLM-driven belief tracker) + bf005dd (PART 4 judge) + b36e3c1 (PART 5 wire-up: `reasoning.status` cap + endpoint + CLI).** The prior five commits (ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d) shipped scaffolding that did not match the §7.29 spec; the rebuild's six new modules — `complexity`, `tier_routing`, `confidence::self_consistency`, `belief_state`, `judge`, `reasoning_status` — replace that work end-to-end.
+
+**Deferred follow-ups CLOSED (2026-05-29):**
+
+- **Self-consistency on streaming (`2ffc41e`)** — `handle_chat_stream` now runs the spec's N-sample pipeline by dispatching N unary samples in parallel via `tokio::spawn`, scoring them, and chunk-streaming the winning text. Activation gate: enabled + capability matches `"ai.chat.stream"` + `sample_count >= 2`. Skip cases drop through to the original `generate_reply_stream` path with zero observable change.
+- **Belief cross-restart persistence (`b589c36`)** — `BeliefStateTracker::with_store(cfg, store)` upserts every belief list to a deterministic Layer-4 `Model` record (id = `blake3("belief_state|<subject>|<session>")`, tags `belief_state` + `session:<id>`). `get()` lazy-loads on cache miss; `reset()` upserts an empty list (auditable). `controller_runtime::build_belief_persistence_store` wires the store on combined AI+memory deployments.
+- **Pre-rebuild cleanup ((cleanup commit))** — deleted `crates/relix-runtime/src/nodes/ai/reasoning/` (mod, config, classifier, tier_router, belief, judge, confidence_signals), `nodes/ai/reasoning_caps.rs`, and `nodes/ai/belief_caps.rs`. Removed every `reasoning::*` import, the `[ai.reasoning]` `AiConfig` field, the legacy GAP-16 smart-router blocks inside `handle_chat` + `handle_chat_stream`, and every test site that passed the pre-rebuild types.
 
 All five §7.29 sub-bullets ship:
 
