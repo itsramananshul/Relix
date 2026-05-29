@@ -735,6 +735,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/email/send", post(email::send))
         .route("/v1/email/send_template", post(email::send_template))
         .route("/v1/email/status", get(email::status))
+        // RELIX-GAP-9: recent inbound messages (dashboard tile).
+        .route("/v1/email/messages/recent", get(email::messages_recent))
         // RELIX-7.11: agent performance metrics. All six routes
         // proxy onto the coordinator's `metrics.*` capabilities.
         .route("/v1/metrics/agents", get(agent_metrics::list_agents))

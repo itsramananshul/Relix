@@ -151,6 +151,43 @@ pub async fn send_template(
     }
 }
 
+/// `GET /v1/email/messages/recent?limit=20` — recent inbound
+/// message ring snapshot (newest-first). Proxies `email.messages_recent`.
+pub async fn messages_recent(
+    State(state): State<AppState>,
+    Query(q): Query<RecentQuery>,
+) -> Result<Json<RecentResponse>, (StatusCode, Json<ApiError>)> {
+    let peer = q.peer.unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let args = limit.to_string().into_bytes();
+    let body = call_peer_string(&state, &peer, "email.messages_recent", &args).await?;
+    let mut messages: Vec<RecentMessage> = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(6, '\t');
+        let ts = parts
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let message_id = parts.next().unwrap_or("").to_string();
+        let from = parts.next().unwrap_or("").to_string();
+        let subject = parts.next().unwrap_or("").to_string();
+        let session_id = parts.next().unwrap_or("").to_string();
+        let preview = parts.next().unwrap_or("").to_string();
+        messages.push(RecentMessage {
+            ts,
+            message_id,
+            from,
+            subject,
+            session_id,
+            preview,
+        });
+    }
+    Ok(Json(RecentResponse { peer, messages }))
+}
+
 /// `GET /v1/email/status` — SMTP + IMAP connection state.
 pub async fn status(
     State(state): State<AppState>,
@@ -188,6 +225,30 @@ pub async fn status(
 pub struct StatusQuery {
     #[serde(default)]
     pub peer: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RecentQuery {
+    #[serde(default)]
+    pub peer: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RecentMessage {
+    pub ts: i64,
+    pub message_id: String,
+    pub from: String,
+    pub subject: String,
+    pub session_id: String,
+    pub preview: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RecentResponse {
+    pub peer: String,
+    pub messages: Vec<RecentMessage>,
 }
 
 #[derive(Debug, Deserialize, Default)]
