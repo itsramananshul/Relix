@@ -30,6 +30,7 @@ mod pii;
 mod ping;
 mod planning;
 mod provenance;
+mod reasoning;
 mod router;
 mod routing;
 mod sessions;
@@ -209,6 +210,16 @@ enum Cmd {
     Judge {
         #[command(subcommand)]
         cmd: judge::Cmd,
+    },
+    /// RELIX-7.29 PART 5: full §7.29 reasoning-engine status.
+    /// `reasoning status` prints a per-component summary
+    /// (routing, self_consistency, belief_state, judge) so
+    /// operators can see at a glance which of the four
+    /// components are configured + live. Talks to the local
+    /// bridge over HTTP (default `http://127.0.0.1:19791`).
+    Reasoning {
+        #[command(subcommand)]
+        cmd: reasoning::Cmd,
     },
     /// RELIX-7.29 PART 1: smart-routing inspector.
     /// `routing explain --message "<text>" [--session-turns N]`
@@ -514,6 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Confidence { cmd } => confidence::run(cmd).await,
         Cmd::Belief { cmd } => belief::run(cmd).await,
         Cmd::Judge { cmd } => judge::run(cmd).await,
+        Cmd::Reasoning { cmd } => reasoning::run(cmd).await,
         Cmd::Routing { cmd } => routing::run(cmd).await,
         Cmd::Planning { cmd } => planning::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,

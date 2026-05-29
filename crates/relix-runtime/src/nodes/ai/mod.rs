@@ -64,6 +64,7 @@ pub mod provenance_hooks;
 pub mod provider;
 pub mod reasoning;
 pub mod reasoning_caps;
+pub mod reasoning_status;
 pub mod router;
 pub mod skill_caps;
 pub mod skill_extractor;
@@ -616,6 +617,18 @@ pub fn register(
     // RELIX-7.29 PART 4: register `judge.recent_verdicts` +
     // `judge.stats` against the shared recorder.
     judge::caps::register(bridge, judge_recorder_shared.clone());
+    // RELIX-7.29 PART 5: register `reasoning.status` against
+    // every shared component handle so the cap snapshots the
+    // SAME instances the AI handler reads + writes to.
+    let status = reasoning_status::ReasoningStatus::new(
+        routing_router_shared.clone(),
+        sc_cfg_shared.clone(),
+        sc_stats_shared.clone(),
+        belief_tracker_shared.clone(),
+        judge_runtime_cfg_shared.clone(),
+        judge_recorder_shared.clone(),
+    );
+    reasoning_status::register(bridge, status);
     (belief_tracker_shared, judge_recorder_shared)
 }
 

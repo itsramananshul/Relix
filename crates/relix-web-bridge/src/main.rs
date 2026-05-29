@@ -151,6 +151,7 @@ mod policy_simulate;
 mod policy_tenants;
 mod provenance;
 mod rate_limit;
+mod reasoning;
 mod routing;
 mod schema;
 mod secrets;
@@ -631,6 +632,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // RELIX-7.29 PART 4: judge verdict + stats surface.
         .route("/v1/judge/verdicts", get(judge::verdicts))
         .route("/v1/judge/stats", get(judge::stats))
+        // RELIX-7.29 PART 5: full reasoning-engine status.
+        .route("/v1/reasoning/status", get(reasoning::status))
         // RELIX-7.24: spec-driven multi-agent planning surface.
         .route("/v1/planning/plan", post(planning::create_plan))
         .route("/v1/planning/agents", get(planning::list_agents))

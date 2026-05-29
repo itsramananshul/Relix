@@ -31,7 +31,7 @@ Closed gaps: **3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 18, 23, 24, 25** (full closure)
 
 Partial closures: **15** (always-require allowlist sub-bullet; other §7.30 items remain SKIPPED), **22** (Feature 2 CLOSED in `6216d98`; Features 1 + 4 remain EXTERNAL-INFRASTRUCTURE-DEFERRED).
 
-GAP 16 is now FULLY CLOSED across commits ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d.
+GAP 16 has been REBUILT to the §7.29 spec across commits 0fef9cc (PART 1 routing) + c9d5327 (PART 2 self-consistency) + 3d8862d (PART 3 belief state) + bf005dd (PART 4 judge) + the PART 5 wire-up commit (`reasoning.status` cap + endpoint + CLI). The prior 5 commits (ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d) shipped scaffolding that did not match the spec; the new modules (`complexity`, `tier_routing`, `confidence::self_consistency`, `belief_state`, `judge`, `reasoning_status`) replace them. The pre-rebuild `nodes/ai/reasoning/` tree is left in place to keep the build green; a follow-up cleanup commit removes it once the new modules have soaked.
 
 EXTERNAL-INFRASTRUCTURE-DEFERRED: **9** (dashboard tile blocks on multi-week dashboard redesign), **10** (4 missing perception sub-tools need Stagehand / LlamaParse / Crawl4AI / computer-use), **17** (research-backed identity needs external web-search API), **19** (plugin marketplace needs hosted registry + signing CA), **20** (WebRTC + Relix Cloud), **21** (warm sandbox needs OS-level kernel primitives), **22 partial** (Features 1 + 4 remain blocked on GAP 21 + Presidio sidecar respectively).
 
@@ -286,9 +286,9 @@ The 4 missing sub-tools each depend on third-party integrations that cannot be s
 
 ---
 
-## GAP 16 — §7.29 Reasoning Engine — CLOSED
+## GAP 16 — §7.29 Reasoning Engine — CLOSED (rebuilt 2026-05-28)
 
-**Closed across five commits: ac301e4 (relix models list/health) + d645040 (reasoning lib) + 6cea54d (smart router integration) + a9a294c (belief caps + model fetching) + a8a3d9d (judge + self-consistency caps).**
+**Closed across the RELIX-7.29 rebuild: 0fef9cc (PART 1 smart routing) + c9d5327 (PART 2 self-consistency sampling) + 3d8862d (PART 3 LLM-driven belief tracker) + bf005dd (PART 4 judge) + the PART 5 wire-up commit (`reasoning.status` cap + endpoint + CLI).** The prior five commits (ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d) shipped scaffolding that did not match the §7.29 spec; the rebuild's six new modules — `complexity`, `tier_routing`, `confidence::self_consistency`, `belief_state`, `judge`, `reasoning_status` — replace that work end-to-end. The pre-rebuild `nodes/ai/reasoning/` tree is left in place to keep the build green; a follow-up cleanup commit removes it after the new modules have soaked.
 
 All five §7.29 sub-bullets ship:
 
