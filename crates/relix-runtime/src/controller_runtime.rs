@@ -343,6 +343,16 @@ pub struct ApprovalSection {
     /// for membership only.
     #[serde(default)]
     pub always_require_methods: Vec<String>,
+    /// `[approval.delivery]` — RELIX-7.30 PART 1: out-of-band
+    /// approval delivery matrix. Absent keeps every approval
+    /// request on the default in-process logging-only path so
+    /// existing deployments stay byte-identical.
+    #[serde(default)]
+    pub delivery: Option<crate::approval::ApprovalDeliveryConfig>,
+    /// SQLite path for the delivery store. Defaults to
+    /// `{data_dir}/approval_delivery.db` when unset.
+    #[serde(default)]
+    pub delivery_db_path: Option<PathBuf>,
 }
 
 /// GAP 23C: `[audit]` section. Wires the per-tenant audit
@@ -6156,6 +6166,75 @@ fn register_node_type_handlers(
             drift_cfg.clone(),
             drift_embedder_cell,
         );
+        // RELIX-7.30 PART 1: out-of-band approval delivery
+        // matrix. Wired when `[approval.delivery]` is present;
+        // absent keeps the bridge on the pre-7.30 admission
+        // path with no delivery store and no
+        // `approval.delivery_status` cap.
+        if let Some(approval_section) = cfg.approval.as_ref()
+            && let Some(delivery_cfg) = approval_section.delivery.clone()
+        {
+            let store_path = approval_section
+                .delivery_db_path
+                .clone()
+                .unwrap_or_else(|| {
+                    let mut p = coord_cfg.db_path.clone();
+                    p.set_file_name("approval_delivery.db");
+                    p
+                });
+            match crate::approval::ApprovalRequestStore::open(&store_path) {
+                Ok(delivery_store) => {
+                    let matrix = crate::approval::ApprovalDeliveryMatrix::new(delivery_cfg);
+                    let dispatch: std::sync::Arc<dyn crate::approval::ChannelDispatch> =
+                        std::sync::Arc::new(crate::approval::delivery::LogChannelDispatch);
+                    let service = crate::approval::ApprovalDeliveryService::new(
+                        matrix,
+                        delivery_store,
+                        dispatch,
+                    );
+                    crate::approval::caps::register(bridge, service);
+                    for (method, doc) in [
+                        (
+                            "approval.delivery_status",
+                            "Read the delivery state for one approval id.",
+                        ),
+                        (
+                            "approval.deliver",
+                            "Dispatch an approval request through the configured channel.",
+                        ),
+                        (
+                            "approval.record_decision",
+                            "Record an operator decision so the escalation timer can stand down.",
+                        ),
+                    ] {
+                        manifest.add_capability(
+                            CapabilityDescriptor::unary(method)
+                                .with_description(doc)
+                                .with_categories(
+                                    if method == "approval.delivery_status" {
+                                        ["read", "approval"]
+                                    } else {
+                                        ["mutate", "approval"]
+                                    }
+                                    .iter()
+                                    .map(|s| (*s).into()),
+                                ),
+                        );
+                    }
+                    tracing::info!(
+                        path = %store_path.display(),
+                        "approval delivery matrix online (RELIX-7.30 PART 1)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %store_path.display(),
+                        error = %e,
+                        "approval delivery store open failed; caps NOT registered"
+                    );
+                }
+            }
+        }
         // Park the cell + the coord_cfg ai-peer alias on
         // StartupWiring so the run() loop can populate it after
         // the rpc::Client is up. Falls back to the canonical

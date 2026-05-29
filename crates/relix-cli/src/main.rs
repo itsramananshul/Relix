@@ -1,5 +1,6 @@
 //! relix-cli — developer and operator CLI.
 
+mod approval;
 mod belief;
 mod browser;
 mod build;
@@ -200,6 +201,15 @@ enum Cmd {
     Belief {
         #[command(subcommand)]
         cmd: belief::Cmd,
+    },
+    /// RELIX-7.30 PART 1: out-of-band approval delivery
+    /// inspector. `approval delivery-status <id>` prints the
+    /// matched channel + escalation state + operator decision
+    /// (if any) for one approval id. Talks to the local
+    /// bridge over HTTP (default `http://127.0.0.1:19791`).
+    Approval {
+        #[command(subcommand)]
+        cmd: approval::Cmd,
     },
     /// RELIX-7.29 PART 4: judge model inspector. `judge
     /// verdicts [--limit N]` prints the rolling ring of judge
@@ -524,6 +534,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
         Cmd::Confidence { cmd } => confidence::run(cmd).await,
         Cmd::Belief { cmd } => belief::run(cmd).await,
+        Cmd::Approval { cmd } => approval::run(cmd).await,
         Cmd::Judge { cmd } => judge::run(cmd).await,
         Cmd::Reasoning { cmd } => reasoning::run(cmd).await,
         Cmd::Routing { cmd } => routing::run(cmd).await,

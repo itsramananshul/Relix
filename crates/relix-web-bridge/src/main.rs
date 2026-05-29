@@ -92,6 +92,7 @@ mod agent_metrics_mini_mesh_test;
 mod agents_access;
 #[cfg(test)]
 mod alert_dispatch_mini_mesh_test;
+mod approval;
 mod audit_tenants;
 mod auth;
 mod belief;
@@ -625,6 +626,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/confidence/reset", post(confidence::reset))
         // RELIX-7.29 PART 1: smart-routing dry-run surface.
         .route("/v1/routing/explain", post(routing::explain))
+        // RELIX-7.30 PART 1: out-of-band approval delivery status.
+        .route("/v1/approval/:id/delivery", get(approval::delivery_status))
         // RELIX-7.29 PART 3: belief-tracker inspection +
         // reset surface.
         .route("/v1/belief/:session_id", get(belief::get))

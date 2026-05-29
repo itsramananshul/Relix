@@ -91,6 +91,13 @@ rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sh
 # `sha2` is also needed by the workspace's other crates; the
 # email DKIM signer uses it for the RSA-SHA256 message digest.
 sha2.workspace = true
+# RELIX-7.30 PART 2: AES-256-GCM authenticated encryption for
+# the credential store. Encrypts each credential value at rest
+# with a 32-byte key derived from the configured master secret.
+aes-gcm.workspace = true
+# RELIX-7.30 PART 3: HMAC-SHA256 for the per-session identity
+# token signature.
+hmac.workspace = true
 # `async-trait` already in deps above. base64 already in deps above.
 # Globally-unique Message-ID generation.
 uuid = { version = "1", default-features = false, features = ["v4"] }
