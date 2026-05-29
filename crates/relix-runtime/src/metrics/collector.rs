@@ -41,7 +41,7 @@ use super::pricing::PriceTable;
 use super::store::MetricsStore;
 #[cfg(test)]
 use super::store::MetricsStoreError;
-use super::types::{AiProviderSignalsHint, AiUsageHint, InvocationMetric};
+use super::types::{AiProviderSignalsHint, AiSelfConsistencyHint, AiUsageHint, InvocationMetric};
 
 /// Trait the dispatch bridge holds. Stripped down so the
 /// dispatch tests can stub it without pulling in sqlite.
@@ -60,6 +60,18 @@ pub trait MetricsSink: Send + Sync {
     fn take_provider_signals(&self, _request_id: RequestId) -> Option<AiProviderSignalsHint> {
         None
     }
+    /// RELIX-7.29 PART 2: attach the self-consistency score
+    /// hint emitted by the AI handler when adaptive SC
+    /// sampling has been run for this `request_id`. The
+    /// dispatch bridge's `ConfidenceScorer` pops it during
+    /// scoring and REPLACES the `provider_signal` sub-score
+    /// with `hint.score`. Default no-op.
+    fn attach_self_consistency(&self, _hint: AiSelfConsistencyHint) {}
+    /// RELIX-7.29 PART 2: pop the self-consistency hint
+    /// matching `request_id`. Default returns `None`.
+    fn take_self_consistency(&self, _request_id: RequestId) -> Option<AiSelfConsistencyHint> {
+        None
+    }
 }
 
 /// Production sink. Cheap to clone (couple of `Arc`s).
@@ -71,6 +83,10 @@ pub struct MetricsCollector {
     /// cache. Bounded by [`HINT_CACHE_CAP`]; FIFO-cleared on
     /// overflow same as [`MetricsCollector::hints`].
     provider_signals: Arc<Mutex<HashMap<RequestId, AiProviderSignalsHint>>>,
+    /// RELIX-7.29 PART 2: per-request self-consistency hint
+    /// cache. Same bounded-FIFO discipline as the other join
+    /// caches.
+    self_consistency: Arc<Mutex<HashMap<RequestId, AiSelfConsistencyHint>>>,
     prices: Arc<PriceTable>,
     store: MetricsStore,
     /// RELIX-7.28 Part 1: optional budget enforcer the collector
@@ -106,6 +122,7 @@ impl MetricsCollector {
             tx,
             hints: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
             provider_signals: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
+            self_consistency: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
             prices: Arc::new(prices),
             store: store.clone(),
             budget: Arc::new(Mutex::new(None)),
@@ -214,6 +231,25 @@ impl MetricsSink for MetricsCollector {
 
     fn take_provider_signals(&self, request_id: RequestId) -> Option<AiProviderSignalsHint> {
         let mut g = match self.provider_signals.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.remove(&request_id)
+    }
+
+    fn attach_self_consistency(&self, hint: AiSelfConsistencyHint) {
+        let mut g = match self.self_consistency.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if g.len() >= HINT_CACHE_CAP {
+            g.clear();
+        }
+        g.insert(hint.request_id, hint);
+    }
+
+    fn take_self_consistency(&self, request_id: RequestId) -> Option<AiSelfConsistencyHint> {
+        let mut g = match self.self_consistency.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };

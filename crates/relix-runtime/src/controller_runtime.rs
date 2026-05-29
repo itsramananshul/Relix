@@ -706,7 +706,13 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // Register confidence.* coordinator caps so operators
         // can call confidence.policy_list / score_history /
         // reset_history through the dispatch bridge.
-        crate::confidence::register(&mut bridge, b.scorer.clone(), b.engine.clone());
+        crate::confidence::register(
+            &mut bridge,
+            b.scorer.clone(),
+            b.engine.clone(),
+            b.sc_stats.clone(),
+            b.sc_cfg.clone(),
+        );
         for (method, doc) in crate::confidence::confidence_capability_descriptors() {
             manifest.add_capability(
                 relix_core::capability::CapabilityDescriptor::unary(*method)
@@ -762,6 +768,7 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             training_bundle.as_ref(),
             budget_bundle.as_ref(),
             pii_gate_bundle.as_ref(),
+            confidence_bundle.as_ref(),
         )?;
         None
     };
@@ -4302,6 +4309,13 @@ pub(crate) struct ConfidenceBundle {
     pub scorer: std::sync::Arc<crate::confidence::ConfidenceScorer>,
     pub engine: std::sync::Arc<crate::confidence::FallbackEngine>,
     pub cell: crate::confidence::LastConfidenceCell,
+    /// RELIX-7.29 PART 2: process-wide self-consistency
+    /// counters surfaced by `confidence.self_consistency_stats`.
+    pub sc_stats: crate::confidence::SelfConsistencyStats,
+    /// RELIX-7.29 PART 2: the configured SC block (or its
+    /// default when none was set) — surfaced verbatim by the
+    /// stats cap so operators can confirm what's live.
+    pub sc_cfg: crate::confidence::SelfConsistencyConfig,
 }
 
 /// RELIX-7.19 GAP 4: construct the confidence bundle from
@@ -4340,6 +4354,8 @@ pub(crate) fn build_confidence_bundle_from(
         scorer,
         engine,
         cell,
+        sc_stats: crate::confidence::SelfConsistencyStats::new(),
+        sc_cfg: c_cfg.self_consistency.clone().unwrap_or_default(),
     }))
 }
 
@@ -4986,6 +5002,7 @@ fn register_node_type_handlers(
     training: Option<&TrainingBundle>,
     budget: Option<&BudgetBundle>,
     pii_gate: Option<&std::sync::Arc<crate::nodes::pii_gate::MeshPiiGate>>,
+    confidence_bundle: Option<&ConfidenceBundle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
 
@@ -5861,6 +5878,19 @@ fn register_node_type_handlers(
             // smart routing config. Absent / disabled keeps the
             // AI handler byte-identical to the pre-routing path.
             ai_cfg.routing.clone(),
+            // RELIX-7.29 PART 2: per-controller
+            // `[confidence.self_consistency]` adaptive sampling
+            // config. The AI handler READS this even though it's
+            // a confidence-section field — SC has to run inside
+            // the AI handler because it needs the provider Arc
+            // for parallel sample dispatch.
+            cfg.confidence
+                .as_ref()
+                .and_then(|c| c.self_consistency.clone()),
+            // RELIX-7.29 PART 2: shared SC stats counters. The
+            // `confidence.self_consistency_stats` cap reads from
+            // the same instance the AI handler writes to.
+            confidence_bundle.as_ref().map(|b| b.sc_stats.clone()),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
@@ -8182,6 +8212,7 @@ mod confidence_wiring_tests {
             logprob: None,
             latency_ms: 50,
             success: true,
+            self_consistency: None,
         };
         let v = b.scorer.score("alice", "ai.chat", &inputs);
         assert!(v.final_score > 0.0);

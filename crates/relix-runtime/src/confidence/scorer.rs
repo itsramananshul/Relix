@@ -58,6 +58,14 @@ pub struct ScoringInputs<'a> {
     /// short-circuit `latency_signal` to 0.0 and bypass
     /// `response_length`/`coherence` (since there's no body).
     pub success: bool,
+    /// RELIX-7.29 PART 2: self-consistency score. When
+    /// `Some`, this value REPLACES the `provider_signal`
+    /// sub-score before the weighted sum is computed. The AI
+    /// handler emits the hint via
+    /// [`crate::metrics::AiSelfConsistencyHint`]; the
+    /// dispatch bridge reads it from the sink's join cache
+    /// and threads it through here.
+    pub self_consistency: Option<f32>,
 }
 
 /// Per-call scoring verdict.
@@ -218,7 +226,15 @@ impl ConfidenceScorer {
         let text = std::str::from_utf8(inputs.response_body).unwrap_or("");
         let len_score = response_length_score(text);
         let coh_score = response_coherence_score(text);
-        let prov_score = provider_signal_score(inputs.finish_reason, inputs.logprob);
+        // RELIX-7.29 PART 2: when self-consistency sampling has
+        // been run for this call, its score REPLACES the
+        // `provider_signal` sub-score per spec — finish_reason /
+        // logprob lose to the stronger N-sample agreement
+        // signal whenever it's available.
+        let prov_score = match inputs.self_consistency {
+            Some(sc) => sc.clamp(0.0, 1.0),
+            None => provider_signal_score(inputs.finish_reason, inputs.logprob),
+        };
         let err_rate = self.peek_error_rate(agent, method);
         let err_score = 1.0 - err_rate;
         let lat_score = latency_score(inputs.latency_ms, self.p95_baseline_ms);

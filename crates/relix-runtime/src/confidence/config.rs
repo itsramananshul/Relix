@@ -82,6 +82,20 @@ pub struct ConfidenceConfig {
     /// wins; configure narrower patterns first.
     #[serde(default)]
     pub policies: Vec<ConfidencePolicy>,
+    /// RELIX-7.29 PART 2 — `[confidence.self_consistency]`
+    /// adaptive sampling block. When `enabled = true` AND the
+    /// dispatched capability matches `capability_patterns`
+    /// AND the baseline confidence drops below
+    /// `min_score_to_enable`, the AI handler fires
+    /// `sample_count` parallel `ai.chat` retries via
+    /// `tokio::join_all`, embeds each sample's core answer,
+    /// averages pairwise cosine similarity, and feeds the
+    /// score into the scorer where it REPLACES the
+    /// `provider_signal` sub-score. Absent / `enabled = false`
+    /// keeps the AI handler byte-identical to its pre-SC
+    /// behaviour.
+    #[serde(default)]
+    pub self_consistency: Option<super::self_consistency::SelfConsistencyConfig>,
 }
 
 impl Default for ConfidenceConfig {
@@ -93,6 +107,7 @@ impl Default for ConfidenceConfig {
             error_rate_discount: default_error_rate_discount(),
             weights: ConfidenceWeights::default(),
             policies: Vec::new(),
+            self_consistency: None,
         }
     }
 }

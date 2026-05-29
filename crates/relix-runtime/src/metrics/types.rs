@@ -151,6 +151,25 @@ pub struct AiProviderSignalsHint {
     pub logprob: Option<f32>,
 }
 
+/// RELIX-7.29 PART 2: side-channel hint emitted by the AI
+/// handler when self-consistency sampling has been run for a
+/// call. Keyed by `request_id`; the dispatch bridge's scorer
+/// reads it during scoring and REPLACES the `provider_signal`
+/// sub-score with `score` before applying weights.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiSelfConsistencyHint {
+    pub request_id: RequestId,
+    /// The average pairwise cosine similarity across the N
+    /// samples — already clamped to `[0, 1]`. This is the
+    /// value that REPLACES `provider_signal`.
+    pub score: f32,
+    /// How many samples were generated (incl. the baseline).
+    pub sample_count: u32,
+    /// Zero-based index of the highest-coherence sample. The
+    /// AI handler returns that sample's body to the caller.
+    pub best_sample_index: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -473,12 +473,17 @@ fn score_outcome(
     let hint = sink.and_then(|s| s.take_provider_signals(request_id));
     let finish_reason = hint.as_ref().and_then(|h| h.finish_reason.clone());
     let logprob = hint.as_ref().and_then(|h| h.logprob);
+    // RELIX-7.29 PART 2: pop the self-consistency hint when
+    // the AI handler ran adaptive sampling for this call. The
+    // scorer will substitute it for `provider_signal`.
+    let sc_hint = sink.and_then(|s| s.take_self_consistency(request_id));
     let inputs = crate::confidence::ScoringInputs {
         response_body: body,
         finish_reason: finish_reason.as_deref(),
         logprob,
         latency_ms: elapsed_ms,
         success,
+        self_consistency: sc_hint.as_ref().map(|h| h.score),
     };
     scorer.score_and_record(agent, method, &inputs)
 }

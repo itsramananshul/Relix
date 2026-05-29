@@ -29,6 +29,7 @@ pub mod config;
 pub mod coordinator;
 pub mod fallback;
 pub mod scorer;
+pub mod self_consistency;
 
 pub use cell::LastConfidenceCell;
 pub use config::{
@@ -38,3 +39,7 @@ pub use config::{
 pub use coordinator::register;
 pub use fallback::{ActionVerdict, FallbackAction, FallbackEngine};
 pub use scorer::{ConfidenceScore, ConfidenceScorer, HistorySnapshot, ScoringInputs};
+pub use self_consistency::{
+    SampleEvaluation, SelfConsistencyConfig, SelfConsistencyOutcome, SelfConsistencyStats,
+    SelfConsistencyStatsSnapshot, cosine_similarity, evaluate_samples, extract_core_answer,
+};

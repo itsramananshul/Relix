@@ -25,12 +25,15 @@ use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 use super::fallback::FallbackEngine;
 use super::scorer::ConfidenceScorer;
+use super::self_consistency::SelfConsistencyStats;
 
 /// Wire every `confidence.*` cap onto `bridge`.
 pub fn register(
     bridge: &mut DispatchBridge,
     scorer: Arc<ConfidenceScorer>,
     engine: Arc<FallbackEngine>,
+    sc_stats: SelfConsistencyStats,
+    sc_cfg: super::self_consistency::SelfConsistencyConfig,
 ) {
     {
         let engine = engine.clone();
@@ -61,6 +64,35 @@ pub fn register(
             })),
         );
     }
+    {
+        let sc_stats = sc_stats.clone();
+        let sc_cfg = sc_cfg.clone();
+        bridge.register(
+            "confidence.self_consistency_stats",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let sc_stats = sc_stats.clone();
+                let sc_cfg = sc_cfg.clone();
+                async move { handle_self_consistency_stats(&sc_stats, &sc_cfg) }
+            })),
+        );
+    }
+}
+
+fn handle_self_consistency_stats(
+    stats: &SelfConsistencyStats,
+    cfg: &super::self_consistency::SelfConsistencyConfig,
+) -> HandlerOutcome {
+    let snap = stats.snapshot();
+    let body = serde_json::json!({
+        "config": {
+            "enabled": cfg.enabled,
+            "sample_count": cfg.sample_count,
+            "min_score_to_enable": cfg.min_score_to_enable,
+            "capability_patterns": cfg.capability_patterns,
+        },
+        "stats": snap,
+    });
+    ok_json(&body)
 }
 
 fn handle_policy_list(engine: &FallbackEngine) -> HandlerOutcome {
@@ -229,7 +261,13 @@ mod tests {
     async fn caps_register_without_panic() {
         let (mut bridge, _dir) = fresh_bridge();
         let (scorer, engine) = make_scorer_and_engine();
-        register(&mut bridge, scorer, engine);
+        register(
+            &mut bridge,
+            scorer,
+            engine,
+            crate::confidence::SelfConsistencyStats::new(),
+            crate::confidence::SelfConsistencyConfig::default(),
+        );
         let _snapshot = bridge.capability_stats_snapshot();
     }
 

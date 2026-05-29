@@ -319,6 +319,8 @@ pub fn register(
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
     reasoning_config: Option<reasoning::ReasoningConfig>,
     routing_config: Option<tier_routing::RoutingConfig>,
+    self_consistency_config: Option<crate::confidence::SelfConsistencyConfig>,
+    self_consistency_stats: Option<crate::confidence::SelfConsistencyStats>,
 ) {
     // GAP 16 §7.29: build the four reasoning components from the
     // optional config. Every component defaults to off when its
@@ -351,6 +353,13 @@ pub fn register(
     let routing_router_shared =
         tier_routing::TierRouter::new(routing_cfg_shared.clone(), routing_registry, Vec::new());
     let routing_router_for_chat = routing_router_shared.clone();
+    // RELIX-7.29 PART 2: per-controller `[confidence.self_consistency]`
+    // config. Absent / `enabled = false` keeps the AI handler
+    // byte-identical to its pre-SC behaviour.
+    let sc_cfg_shared = self_consistency_config.unwrap_or_default();
+    let sc_cfg_for_chat = sc_cfg_shared.clone();
+    let sc_stats_shared = self_consistency_stats.unwrap_or_default();
+    let sc_stats_for_chat = sc_stats_shared.clone();
     // RELIX-7.29 PART 1: register the `routing.explain`
     // coordinator cap. The cap is always registered (regardless
     // of whether `[ai.routing] enabled` is true) so operators
@@ -428,6 +437,8 @@ pub fn register(
             let judge_cfg = judge_cfg_for_chat.clone();
             let sc_cfg = self_consistency_cfg_for_chat.clone();
             let routing_router = routing_router_for_chat.clone();
+            let sc_runtime_cfg = sc_cfg_for_chat.clone();
+            let sc_runtime_stats = sc_stats_for_chat.clone();
             async move {
                 handle_chat(
                     p,
@@ -447,6 +458,8 @@ pub fn register(
                     judge_cfg,
                     sc_cfg,
                     routing_router,
+                    sc_runtime_cfg,
+                    sc_runtime_stats,
                     ctx,
                 )
                 .await
@@ -477,6 +490,8 @@ pub fn register(
     let judge_cfg_for_chat_stream = judge_cfg_shared.clone();
     let sc_cfg_for_chat_stream = self_consistency_cfg_shared.clone();
     let routing_router_for_chat_stream = routing_router_shared.clone();
+    let sc_cfg_for_chat_stream_runtime = sc_cfg_shared.clone();
+    let sc_stats_for_chat_stream = sc_stats_shared.clone();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -495,6 +510,8 @@ pub fn register(
                 let judge_cfg = judge_cfg_for_chat_stream.clone();
                 let sc_cfg = sc_cfg_for_chat_stream.clone();
                 let routing_router = routing_router_for_chat_stream.clone();
+                let sc_runtime_cfg = sc_cfg_for_chat_stream_runtime.clone();
+                let sc_runtime_stats = sc_stats_for_chat_stream.clone();
                 async move {
                     handle_chat_stream(
                         p,
@@ -511,6 +528,8 @@ pub fn register(
                         judge_cfg,
                         sc_cfg,
                         routing_router,
+                        sc_runtime_cfg,
+                        sc_runtime_stats,
                         ctx,
                     )
                     .await
@@ -994,13 +1013,27 @@ async fn handle_chat_stream(
     judge_cfg: reasoning::JudgeConfig,
     self_consistency_cfg: reasoning::SelfConsistencyConfig,
     routing_router: tier_routing::TierRouter,
+    sc_cfg: crate::confidence::SelfConsistencyConfig,
+    sc_stats: crate::confidence::SelfConsistencyStats,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
     // GAP 16 Component 1: same tier classification +
     // resolution as `handle_chat`. Falls back to the
     // provider's default when the router is disabled OR the
     // tier is unmapped + fallback_to_default = true.
-    let _ = (&judge_cfg, &self_consistency_cfg, &routing_router);
+    //
+    // RELIX-7.29 PART 2: SC sampling is intentionally NOT
+    // wired into the streaming variant — the spec sampling
+    // pattern (`tokio::join_all` of N full responses) is
+    // antithetical to token-by-token streaming. Operators who
+    // want SC on a workflow use unary `ai.chat`.
+    let _ = (
+        &judge_cfg,
+        &self_consistency_cfg,
+        &routing_router,
+        &sc_cfg,
+        &sc_stats,
+    );
     let stream_started_at = std::time::Instant::now();
     let preflight = build_chat_preflight(
         &ctx.args,
@@ -1241,6 +1274,8 @@ async fn handle_chat(
     judge_cfg: reasoning::JudgeConfig,
     self_consistency_cfg: reasoning::SelfConsistencyConfig,
     routing_router: tier_routing::TierRouter,
+    sc_cfg: crate::confidence::SelfConsistencyConfig,
+    sc_stats: crate::confidence::SelfConsistencyStats,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let chat_started_at = std::time::Instant::now();
@@ -1500,8 +1535,19 @@ async fn handle_chat(
     // for the training record when the provider doesn't echo
     // back a model.
     let training_model_default = input.model.clone();
+    // RELIX-7.29 PART 2: clone the input template BEFORE the
+    // baseline call consumes it. Used as the seed for the N
+    // parallel SC samples when SC fires for this method.
+    let sc_template = ChatInput {
+        session_id: input.session_id.clone(),
+        prompt: input.prompt.clone(),
+        history: input.history.clone(),
+        model: input.model.clone(),
+        system_prompt: input.system_prompt.clone(),
+        ..ChatInput::default()
+    };
     match provider.generate_reply(input).await {
-        Ok(output) => {
+        Ok(mut output) => {
             // RELIX-7.11: hand the provider-reported token usage
             // to the metrics collector. The dispatch bridge
             // records the metric row AFTER this handler returns;
@@ -1546,6 +1592,53 @@ async fn handle_chat(
                     finish_reason: output.finish_reason.clone(),
                     logprob: output.logprob,
                 });
+            }
+            // RELIX-7.29 PART 2: adaptive self-consistency. Fires
+            // only when:
+            //   1) `[confidence.self_consistency] enabled = true`,
+            //   2) the capability matches `capability_patterns`,
+            //   3) the baseline confidence (cheap length + coherence
+            //      heuristic) is BELOW `min_score_to_enable`.
+            // When it fires, the handler:
+            //   * runs `sample_count - 1` extra `generate_reply`s
+            //     in parallel,
+            //   * embeds each sample's "core answer",
+            //   * averages pairwise cosine into the SC score,
+            //   * REPLACES the response body with the highest-
+            //     coherence sample (spec),
+            //   * attaches an [`AiSelfConsistencyHint`] so the
+            //     dispatch bridge's `ConfidenceScorer` substitutes
+            //     the score for `provider_signal`.
+            if sc_cfg.matches_capability("ai.chat")
+                && sc_cfg.should_trigger(baseline_confidence(&output.text))
+            {
+                let baseline_text = output.text.clone();
+                if let Some((outcome, sample_texts)) =
+                    run_self_consistency(&provider, baseline_text, sc_template.clone(), &sc_cfg)
+                        .await
+                {
+                    let best_index = outcome.best_index.min(sample_texts.len() - 1);
+                    if best_index != 0 {
+                        // Swap to the highest-coherence sample.
+                        output.text = sample_texts[best_index].clone();
+                    }
+                    if let Some(sink) = metrics_sink.as_ref() {
+                        sink.attach_self_consistency(crate::metrics::AiSelfConsistencyHint {
+                            request_id: ctx.request_id,
+                            score: outcome.score,
+                            sample_count: outcome.samples.len() as u32,
+                            best_sample_index: best_index as u32,
+                        });
+                    }
+                    sc_stats.record(outcome.score, outcome.samples.len());
+                    tracing::info!(
+                        session_id,
+                        sc_score = outcome.score,
+                        sample_count = outcome.samples.len(),
+                        best_sample = best_index,
+                        "ai.chat: self-consistency outcome recorded"
+                    );
+                }
             }
             let plan = execution::Planner::parse_response(&output.text);
             let policy = execution::PolicyEngine::default_policy();
@@ -1879,6 +1972,154 @@ async fn handle_chat(
     }
 }
 
+/// RELIX-7.29 PART 2: dispatch N parallel `generate_reply`
+/// calls with the *same* prompt, embed each sample's core
+/// answer, and return the [`crate::confidence::SelfConsistencyOutcome`].
+///
+/// The caller pre-supplies sample 0 (the baseline already
+/// produced by `handle_chat`). This function adds
+/// `sample_count.saturating_sub(1)` more parallel samples,
+/// embeds all N answers in a single batched call, and runs
+/// the pairwise evaluation.
+///
+/// Failures inside the join are tolerated: if any sample
+/// fails, it's dropped from the evaluation. With fewer than
+/// two surviving samples the function returns `None` —
+/// caller treats that as "SC could not run" and proceeds
+/// with the baseline.
+async fn run_self_consistency(
+    provider: &Arc<dyn ChatProvider>,
+    baseline_text: String,
+    baseline_input_template: ChatInput,
+    sc_cfg: &crate::confidence::SelfConsistencyConfig,
+) -> Option<(crate::confidence::SelfConsistencyOutcome, Vec<String>)> {
+    let extra = sc_cfg.sample_count.saturating_sub(1);
+    if extra == 0 {
+        return None;
+    }
+    let mut tasks: Vec<_> = Vec::with_capacity(extra);
+    for _ in 0..extra {
+        let p = provider.clone();
+        let input = ChatInput {
+            session_id: baseline_input_template.session_id.clone(),
+            prompt: baseline_input_template.prompt.clone(),
+            history: baseline_input_template.history.clone(),
+            model: baseline_input_template.model.clone(),
+            system_prompt: baseline_input_template.system_prompt.clone(),
+            ..ChatInput::default()
+        };
+        tasks.push(tokio::spawn(async move {
+            p.generate_reply(input).await.ok().map(|o| o.text)
+        }));
+    }
+    let mut sample_texts: Vec<String> = Vec::with_capacity(sc_cfg.sample_count);
+    sample_texts.push(baseline_text);
+    for jh in tasks {
+        if let Ok(Some(text)) = jh.await {
+            sample_texts.push(text);
+        }
+    }
+    if sample_texts.len() < 2 {
+        return None;
+    }
+    let core_answers: Vec<String> = sample_texts
+        .iter()
+        .map(|t| crate::confidence::extract_core_answer(t, 100))
+        .collect();
+    let embed_input = EmbedInput {
+        model: String::new(),
+        texts: core_answers.clone(),
+    };
+    let embed_output = match provider.generate_embeddings(embed_input).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ai.chat: self-consistency embed failed; skipping SC"
+            );
+            return None;
+        }
+    };
+    if embed_output.vectors.len() != core_answers.len() {
+        tracing::warn!(
+            got = embed_output.vectors.len(),
+            want = core_answers.len(),
+            "ai.chat: embed vector count mismatch; skipping SC"
+        );
+        return None;
+    }
+    let outcome = crate::confidence::evaluate_samples(&core_answers, &embed_output.vectors);
+    Some((outcome, sample_texts))
+}
+
+/// RELIX-7.29 PART 2: cheap baseline confidence approximation
+/// used to gate the adaptive SC trigger. Mirrors the scorer's
+/// `response_length` × `response_coherence` shape but skips
+/// the rolling-window history (we haven't recorded this call
+/// yet). The result is in `[0, 1]`.
+fn baseline_confidence(text: &str) -> f32 {
+    let len = response_length_for_sc(text);
+    let coh = response_coherence_for_sc(text);
+    ((len * 0.45) + (coh * 0.55)).clamp(0.0, 1.0)
+}
+
+/// Simplified copy of the scorer's `response_length_score` —
+/// kept inline so the SC trigger doesn't take the scorer's
+/// lock or pay the trait-object overhead. The exact ramp shape
+/// matches the scorer's so the trigger threshold stays
+/// meaningful.
+fn response_length_for_sc(text: &str) -> f32 {
+    let chars = text.trim().chars().count();
+    if chars == 0 {
+        return 0.0;
+    }
+    let est_tokens = (chars / 4).max(1);
+    if est_tokens < 10 {
+        return 0.3 + 0.7 * (est_tokens as f32 / 10.0);
+    }
+    if est_tokens <= 500 {
+        return 1.0;
+    }
+    if est_tokens >= 2000 {
+        return 0.7;
+    }
+    let frac = (est_tokens as f32 - 500.0) / (2000.0 - 500.0);
+    1.0 - 0.3 * frac
+}
+
+/// Simplified copy of the scorer's `response_coherence_score`
+/// for the SC trigger. Two heuristics: ends-with-punctuation +
+/// repeated-trigram-ratio penalty.
+fn response_coherence_for_sc(text: &str) -> f32 {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    let ends_well = trimmed
+        .chars()
+        .last()
+        .map(|c| matches!(c, '.' | '!' | '?'))
+        .unwrap_or(false);
+    let punct_bonus: f32 = if ends_well { 0.0 } else { -0.2 };
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.len() < 3 {
+        return (1.0 + punct_bonus).clamp(0.0, 1.0);
+    }
+    let mut trigrams = std::collections::HashMap::<(String, String, String), u32>::new();
+    for w in tokens.windows(3) {
+        let k = (w[0].to_string(), w[1].to_string(), w[2].to_string());
+        *trigrams.entry(k).or_insert(0) += 1;
+    }
+    let total: u32 = trigrams.values().sum();
+    let repeated: u32 = trigrams.values().filter(|c| **c > 1).sum();
+    let ratio = if total > 0 {
+        repeated as f32 / total as f32
+    } else {
+        0.0
+    };
+    (1.0 - ratio + punct_bonus).clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1997,6 +2238,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2018,6 +2261,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2043,6 +2288,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -2079,6 +2326,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -2109,6 +2358,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"|hello|"),
         )
         .await;
@@ -2160,6 +2411,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2209,6 +2462,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2249,6 +2504,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2290,6 +2547,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -2337,6 +2596,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2381,6 +2642,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2448,6 +2711,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -2496,6 +2761,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -2547,6 +2814,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2681,6 +2950,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2733,6 +3004,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2783,6 +3056,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2834,6 +3109,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2906,6 +3183,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3018,6 +3297,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -3233,6 +3514,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -3274,6 +3557,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -3406,6 +3691,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -3450,6 +3737,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -3500,6 +3789,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
@@ -3609,6 +3900,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"session-1|hello|"),
         )
         .await
@@ -3644,6 +3937,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -3682,6 +3977,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(prompt.as_bytes()),
         )
         .await;
@@ -3709,6 +4006,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"session-1|hello|"),
         )
         .await;
@@ -3838,6 +4137,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
         .await;
@@ -3874,6 +4175,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess2|hi|"),
         )
         .await;
@@ -4053,6 +4356,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx_with_request_id(b"sess1|please reply|", rid),
         )
         .await
@@ -4098,6 +4403,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess2|hi|"),
         )
         .await
@@ -4146,6 +4453,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx_with_request_id(b"sess|hi|", rid),
         )
         .await
@@ -4212,6 +4521,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess-obs|hello|"),
         )
         .await;
@@ -4247,6 +4558,8 @@ mod tests {
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
             tier_routing::TierRouter::default(),
+            crate::confidence::SelfConsistencyConfig::default(),
+            crate::confidence::SelfConsistencyStats::new(),
             ctx(b"sess-noobs|hi|"),
         )
         .await;
