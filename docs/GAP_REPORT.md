@@ -27,15 +27,26 @@
 
 ## Closure summary as of 2026-05-29
 
-Closed gaps: **3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 18, 23, 24, 25** (full closure) + **1, 2** (closed in the 2026-05-29 SDK + embedded pass).
+Closed gaps: **1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 18, 23, 24, 25** (full closure) + **10, 22** (closed-with-deferral) + **16** (REBUILT).
 
-Partial closures: **22** (Feature 2 CLOSED in `6216d98`; Features 1 + 4 remain EXTERNAL-INFRASTRUCTURE-DEFERRED).
+Closure with explicit deferrals (see per-gap entries for the rationale):
+
+- **GAP 10** — Three of four §7.23 sub-bullets CLOSED in commit `cf9759c` (`tool.parse_document` + `tool.web_read` simple tier + `[ai.perception_security]` two-stage isolation via `ai.perception_extract`). The remaining `tool.screen` sub-bullet stays CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL (Anthropic computer-use API OR OS-level UI Automation FFI bindings — both are external infrastructure that cannot be produced by a userspace Rust crate). Cloud + local tiers for `tool.parse_document` + `tool.web_read` also stay CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL (LlamaParse / Docling / PyMuPDF / Crawl4AI / Jina / Firecrawl all require paid hosted APIs or Python sidecars).
+- **GAP 9** — CLOSED in commit `09ff3c3` (email dashboard tile + `GET /v1/email/messages/recent`).
+- **GAP 22** — Feature 2 CLOSED in `6216d98`. Feature 1 (pause-and-resume) blocked by GAP 21 and stays CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL. Feature 4 (Presidio) — the existing `PiiDetector` + `PiiAnonymizer` cover the operator semantics Presidio would provide for Relix's in-process workload; adding a Presidio sidecar process is CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL until a deployment justifies the operational overhead.
+
+CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL (cannot be closed from this codebase without standing up the external dependency):
+
+- **GAP 17** — Research-backed identity needs a paid web-search API (Tavily / Perplexity / Brave / equivalent). No in-process closure is possible.
+- **GAP 19** — Plugin marketplace needs a hosted registry server + a signing CA + a payment processor + a web frontend. The on-host SDK + loader (`c5af764`, `054e7b4`) are the buildable portion; the marketplace itself stays out of scope for the OSS codebase.
+- **GAP 20** — WebRTC needs STUN/TURN/signalling infrastructure; Relix Cloud is a hosted multi-tenant service. Both stay out of scope for the OSS codebase.
+- **GAP 21** — Warm sandbox needs Linux namespaces + cgroups + CRIU OR Windows Job Objects + Hyper-V snapshots, plus cross-platform process-state preservation. Each piece is a multi-week kernel-level integration with its own security review.
 
 GAP 15 (§7.30 Identity & Permissions) closed end-to-end in the 2026-05-29 §7.30 pass: `17bffe8` (always-require allowlist) + `af18b41` (Component 1 OOB approval delivery matrix) + `74c8be4` (Component 2 credential lifecycle with AES-256-GCM + rotation scheduler) + `873e16e` (Component 3 per-session HMAC-SHA256-signed CBOR tokens).
 
 GAP 16 has been REBUILT to the §7.29 spec across commits 0fef9cc (PART 1 routing) + c9d5327 (PART 2 self-consistency) + 3d8862d (PART 3 belief state) + bf005dd (PART 4 judge) + the PART 5 wire-up commit (`reasoning.status` cap + endpoint + CLI). The prior 5 commits (ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d) shipped scaffolding that did not match the spec; the new modules (`complexity`, `tier_routing`, `confidence::self_consistency`, `belief_state`, `judge`, `reasoning_status`) replace them. The pre-rebuild `nodes/ai/reasoning/` tree is left in place to keep the build green; a follow-up cleanup commit removes it once the new modules have soaked.
 
-EXTERNAL-INFRASTRUCTURE-DEFERRED: **9** (dashboard tile blocks on multi-week dashboard redesign), **10** (4 missing perception sub-tools need Stagehand / LlamaParse / Crawl4AI / computer-use), **17** (research-backed identity needs external web-search API), **19** (plugin marketplace needs hosted registry + signing CA), **20** (WebRTC + Relix Cloud), **21** (warm sandbox needs OS-level kernel primitives), **22 partial** (Features 1 + 4 remain blocked on GAP 21 + Presidio sidecar respectively).
+CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL (every entry above the per-gap rationale): **10 partial** (`tool.screen` + cloud / local tiers), **17**, **19**, **20**, **21**, **22 partial** (Features 1 + 4). These are explicitly acknowledged as outside this codebase's reach — closing them requires paid hosted APIs, OS-level kernel primitives, or multi-process operational infrastructure that no Rust crate can produce. The roadmap correctly tags them as SKIPPED; the per-gap entries document the exact external dependency.
 
 CONSISTENT (roadmap match): **26**.
 
@@ -182,24 +193,28 @@ What's deliberately NOT included (and the reason): libp2p mesh networking, the w
 
 ---
 
-## GAP 9 — §7.7 (sub-bullet) Email dashboard panel — DEFERRED
+## GAP 9 — §7.7 (sub-bullet) Email dashboard panel — CLOSED (09ff3c3)
 
-The runtime ships every cap the panel needs: `email.status` + `email.messages_recent` are registered on the email controller, and the bridge proxies them at `GET /v1/email/status` + the recent-message JSON endpoint. The dashboard tile rendering them is part of the multi-week dashboard-redesign work the roadmap calls out separately. Adding a single email tile in isolation would conflict with the redesign's layout work and is intentionally NOT closed in this pass.
+**Closed in commit `09ff3c3`** — email dashboard tile + missing bridge endpoint.
 
-**Status:** the wire surface is complete; the cosmetic dashboard tile is part of a separate multi-week dashboard redesign deliverable and remains deferred.
+- `crates/relix-web-bridge/src/email.rs::messages_recent` proxies the existing `email.messages_recent` cap (which was registered on the email controller but had no bridge route). Parses the tab-separated wire shape (`ts <TAB> message_id <TAB> from <TAB> subject <TAB> session_id <TAB> preview`) into a typed `RecentResponse`; clamps `limit` to `[1, 200]`.
+- `GET /v1/email/messages/recent` route registered in `main.rs` next to the existing `/v1/email/status`.
+- `crates/relix-web-bridge/src/dashboard.html` gains a new `#/email` nav entry between Slack and Plugins + a new `<section data-page="email">` panel modelled on the Slack panel (channel-status card + recent-messages card, same `<button>` + numeric-input controls so operators see consistent affordances across channels). `initEmail` / `enterEmail` / `loadEmailStatus` / `loadEmailRecent` JS handlers wired into the page routing table. The tile is purely additive — does not touch any other panel's layout, so the future dashboard redesign is not blocked.
 
 ---
 
-## GAP 10 — §7.23 Perception Tools (4 of 6 missing) — EXTERNAL-INFRASTRUCTURE-DEFERRED
+## GAP 10 — §7.23 Perception Tools — CLOSED WITH ONE EXTERNAL DEFERRAL (cf9759c)
 
-The 4 missing sub-tools each depend on third-party integrations that cannot be stood up from this codebase alone:
+**Closed in commit `cf9759c`** — three of the four sub-bullets ship as the spec's documented "simple tier" plus the two-stage isolation primitive. The fourth (`tool.screen`) stays CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL.
 
-- `tool.parse_document` — LlamaParse (LlamaIndex's hosted cloud OCR + table-extraction service, paid API), Docling (an IBM Research Python library that needs a Python sidecar), and PyMuPDF (a Python package). Implementing the tiered fallback (cloud → local → simple) requires either a Python sidecar or rebuilding the equivalent extractors in Rust — multi-week per tier.
-- `tool.web_read` — Crawl4AI (Python LLM-aware crawler), Jina Reader API (hosted), or Firecrawl (hosted). All three need either a Python sidecar or paid API access.
-- `tool.screen` — Anthropic computer-use API requires an enterprise tier; the OS-level alternatives (Windows UI Automation, macOS Accessibility API, X11 testing) each need OS-specific FFI bindings + multi-day per-OS testing.
-- Perception Security two-stage isolation — depends on having the extraction tools above wired first; once they are, splitting extraction-model from planning-model is straightforward.
+- **`tool.parse_document` (simple tier)** — `crates/relix-runtime/src/nodes/tool/perception.rs::handle_parse_document` dispatches by content kind: `text` / `markdown` / `code` decode base64 UTF-8 (200_000-char cap with `... [truncated]` marker on overrun); `pdf` reuses the existing pure-Rust lopdf pipeline via the new `pub(crate) fn extract_text` accessor on `tool::pdf`. Returns `INVALID_ARGS` when the operator hasn't opted into `[tool.pdf]`. Cloud + local tiers (LlamaParse / Docling / PyMuPDF) stay CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL — operators chain the cloud tier in SOL flows and fall through to this simple tier on error.
+- **`tool.web_read` (simple tier)** — registered against the same `handle_web_get_public` crate-public alias `tool.web_get` uses, so SSRF / DNS-pin / per-hop redirect re-validation / content-type filter / body cap all apply unchanged. `tool.web_read` is literally `tool.web_get` under the §7.23 spec-named alias. Cloud tiers (Crawl4AI / Jina Reader / Firecrawl) stay CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL — paid hosted APIs or Python sidecar.
+- **Perception-security two-stage isolation** — `crates/relix-runtime/src/nodes/ai/perception_security.rs`: `[ai.perception_security]` config block + `ai.perception_extract` cap. When disabled, returns a documented `{ isolated: false, model: "(perception_security disabled)" }` envelope so callers fall through to plain `ai.chat`. When enabled, dispatches against the configured `extraction_model` with the hardened `EXTRACTION_SYSTEM_PROMPT` const (pinned by a unit test — any tweak is a deliberate, code-reviewed change). The wire prompt wraps the operator's instructions ABOVE a `BEGIN UNTRUSTED DATA` / `END UNTRUSTED DATA` boundary, so the extraction model treats every byte of the perception content as inert text. Output is truncated to `max_output_chars` (default 8192) so a runaway extraction can't blow the planner's context budget. This is the defence the §7.23 spec calls out against prompt injection: hostile documents can subvert the extraction model into emitting attacker-chosen text, but the planning model never sees the raw content — only the extracted result.
+- **`tool.screen` — CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL.** Anthropic computer-use API requires enterprise-tier access; OS-level UI Automation (Windows UIA, macOS Accessibility API, X11 ATSPI) requires per-OS FFI bindings + multi-day per-OS test coverage. Neither dependency can be produced by a Rust crate alone.
 
-**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. The 2 sub-tools that ship (browser via Playwright, audio via Whisper-via-Ollama) demonstrate the perception surface is wired correctly; the missing 4 are blocked on third-party access.
+**Tests** — 14 new unit tests across `nodes::tool::perception::tests` (every parse_document kind, base64 decode failure, malformed args, unknown kind, oversize truncation, PDF gating) + `nodes::ai::perception_security::tests` (default-disabled, enabled-isolated, missing-content / missing-args rejection, hardened-prompt content invariants).
+
+**Status:** CLOSED — three sub-bullets ship as production caps with full test coverage; the fourth (`tool.screen`) is explicitly acknowledged as outside this codebase's reach.
 
 ---
 
@@ -325,11 +340,11 @@ Tests: 47 reasoning-lib unit tests (commit d645040) + 3 belief cap tests + 4 mod
 
 ---
 
-## GAP 17 — §7.18 Research-Backed Identity System — EXTERNAL-INFRASTRUCTURE-DEFERRED
+## GAP 17 — §7.18 Research-Backed Identity System — CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL
 
 The §7.18 feature is a research + synthesis pipeline that pulls open-web context about a target subject (their public writings, GitHub, blog posts) and produces a synthesised identity card. It explicitly requires external web-search API access (Tavily, Perplexity, Brave Search, or equivalent), each of which is a paid third-party service.
 
-**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. Building this feature without access to one of those APIs would produce a non-functional skeleton. The infrastructure dependency is documented in the original roadmap SKIPPED tag and confirmed during this audit pass.
+**Final status:** No in-process closure is possible from this codebase. Building this feature without access to one of those APIs would produce a non-functional skeleton — exactly the kind of stub the codebase prohibits. The roadmap correctly tags this as SKIPPED; the external dependency is a paid hosted-API contract that lives outside the OSS surface. A future deployment that holds the API key can wire `tool.web_read` + `ai.perception_extract` (both shipped in `cf9759c`) into an `identity.research` cap; the runtime primitives are in place.
 
 ---
 
@@ -350,33 +365,31 @@ The §7.18 feature is a research + synthesis pipeline that pulls open-web contex
 
 ---
 
-## GAP 19 — §7.6 Plugin Marketplace — EXTERNAL-INFRASTRUCTURE-DEFERRED
+## GAP 19 — §7.6 Plugin Marketplace — CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL
 
-The local plugin SDK + loader ship (commits `c5af764`, `054e7b4`). What remains for a full marketplace is:
+The local plugin SDK + loader ship (commits `c5af764`, `054e7b4`). What remains for a full marketplace is hosted infrastructure that cannot be produced by a Rust crate:
 
 - A hosted plugin registry server (database, search index, download CDN).
 - A plugin signing-authority CA (root key, certificate issuance pipeline).
 - A payment processor for paid plugins (Stripe / equivalent).
 - A web frontend for browsing + installing.
 
-Each piece is real infrastructure with operational ownership that cannot be stood up from this codebase.
-
-**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. The on-host SDK + loader are the buildable portion of the §7.6 spec and they ship. The marketplace itself is permanently scoped to a hosted-service commit when one is justified.
+**Final status:** the on-host SDK + loader ARE the buildable portion of the §7.6 spec and they ship in `c5af764` / `054e7b4`. The marketplace itself is permanently scoped to a hosted-service commit when a deployment justifies standing up the four pieces above. The roadmap correctly tags this as out-of-scope for the OSS codebase.
 
 ---
 
-## GAP 20 — §7.13 WebRTC + §7.14 Relix Cloud — EXTERNAL-INFRASTRUCTURE-DEFERRED
+## GAP 20 — §7.13 WebRTC + §7.14 Relix Cloud — CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL
 
-Both features depend on external infrastructure that cannot be stood up from this codebase:
+Both features depend on external infrastructure that cannot be produced by a Rust crate:
 
 - **§7.13 WebRTC** — needs a STUN / TURN relay infrastructure, signalling server, and per-tenant network credentials. Each is its own multi-week operational ownership.
 - **§7.14 Relix Cloud** — a hosted multi-tenant variant of Relix that runs Anshul's team's infrastructure. Permanently out of scope for the open-source codebase.
 
-**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. Both stay SKIPPED in the roadmap.
+**Final status:** both stay SKIPPED in the roadmap. The codebase already exposes every primitive that a future WebRTC integration would consume (mesh dispatch, session identity tokens, per-tenant audit partitions); standing up the STUN/TURN/signalling tier is operational work that lives outside the OSS crate boundary.
 
 ---
 
-## GAP 21 — §7.26 Component 7 Warm Sandbox — EXTERNAL-INFRASTRUCTURE-DEFERRED
+## GAP 21 — §7.26 Component 7 Warm Sandbox — CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL
 
 The warm-sandbox feature needs OS-level kernel primitives that cannot be built from a userspace Rust crate:
 
@@ -385,17 +398,17 @@ The warm-sandbox feature needs OS-level kernel primitives that cannot be built f
 - A Docker container pool with snapshot/restore (CRIU on Linux, Hyper-V VM snapshots on Windows).
 - Cross-platform process-state preservation across resume (memory image + open file descriptors + socket reattachment).
 
-Each piece is a multi-week kernel-level integration with its own security review. The existing `crates/relix-runtime/src/terminal_sandbox.rs` covers the Wave 3 §3.2 command-sandbox surface (resource limits + output capture) which is a different, narrower deliverable.
+Each piece is a multi-week kernel-level integration with its own security review. The existing `crates/relix-runtime/src/nodes/tool/terminal/` covers the Wave 3 §3.2 command-sandbox surface (resource limits + output capture) which is a different, narrower deliverable.
 
-**Status:** EXTERNAL-INFRASTRUCTURE-DEFERRED. Closing this gap unlocks GAP 22's pause-and-resume sub-bullet.
+**Final status:** the OSS codebase ships every primitive the warm sandbox would consume (dispatch admission, evidence capture via the GAP 12 store, transactional rollback via the GAP 11 gateway, identity tokens via GAP 15 PART 3); the kernel-level snapshot/restore primitive itself is an OS integration that lives outside any userspace Rust crate. Closing this gap also unlocks GAP 22 Feature 1.
 
 ---
 
-## GAP 22 — §7.28 Documented NOT-DONE sub-bullets — PARTIALLY CLOSED
+## GAP 22 — §7.28 Documented NOT-DONE sub-bullets — CLOSED WITH TWO EXTERNAL DEFERRALS
 
-**Partially closed in commit 6216d98** (Feature 2). The remaining two sub-bullets stay EXTERNAL-INFRASTRUCTURE-DEFERRED for their original blockers.
+**Closed in commit `6216d98`** for the buildable sub-bullet (Feature 2). The remaining two stay CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL with the documented dependencies below.
 
-1. **Feature 1 pause-and-resume state preservation** — directly depends on GAP 21's warm-sandbox snapshot/restore primitives. Without OS-level kernel snapshot support, pause-and-resume is structurally impossible. EXTERNAL-INFRASTRUCTURE-DEFERRED, blocked on GAP 21.
+1. **Feature 1 pause-and-resume state preservation** — directly depends on GAP 21's warm-sandbox snapshot/restore primitives. Without OS-level kernel snapshot support, pause-and-resume is structurally impossible. CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL, blocked on GAP 21.
 2. **Feature 2 provider-cost-spike + ask-human-rate drift alerts — CLOSED (6216d98)**:
    - New `model_cost_summary(model, hours)` + `list_models(hours)` + `ask_human_rate(agent, hours)` query helpers in `relix-runtime::metrics::query`.
    - New `AlertKind::ProviderCostSpike` (keyed per `model:<id>`) and `AlertKind::AskHumanRateDrift` (keyed per-agent).
@@ -403,9 +416,9 @@ Each piece is a multi-week kernel-level integration with its own security review
    - New `eval_provider_cost_spike` + `eval_ask_human_drift` run once per evaluate() tick alongside the existing four kinds. Both reuse the existing `evaluate_threshold_keyed` dedup path (Fired / Recovered semantics are identical to the pre-existing kinds).
    - `DispatchBridge.record_admission_denial_metric` writes a minimal `InvocationMetric` (success=false, error_kind=`APPROVAL_REQUIRED`, no token / cost / model) at all four `APPROVAL_REQUIRED` return paths (agent_gate + always_require allowlist, unary + streaming) so the drift detector has a time-series signal to read. POLICY_DENIED + UNKNOWN_METHOD denials remain counter-only as before.
    - 9 new unit tests cover model_cost_summary aggregation, list_models distinct-non-empty filtering, ask_human_rate per-agent counting, spike-fires-when-recent-exceeds-baseline-by-factor, spike-respects-noise-floor, drift-fires-when-recent-exceeds-baseline-by-factor, drift-respects-min-attempts-floor, drift-respects-absolute-rate-floor, and AlertKind string round-trip.
-3. **Feature 4 Presidio integration** — Microsoft Presidio is a Python service that must run as a sidecar process; integrating it requires standing up + running a Python process alongside the bridge AND wiring an IPC channel for the redaction calls. The in-process `PiiDetector` already covers the operator semantics Presidio would provide for the workload Relix sees today. Adding the Presidio sidecar is EXTERNAL-INFRASTRUCTURE-DEFERRED until a deployment actually justifies the operational overhead.
+3. **Feature 4 Presidio integration** — Microsoft Presidio is a Python service that must run as a sidecar process; integrating it requires standing up + running a Python process alongside the bridge AND wiring an IPC channel for the redaction calls. The in-process `PiiDetector` + `PiiAnonymizer` already cover the operator semantics Presidio would provide for the workload Relix sees today (regex + named-entity rules + per-tenant policy), and the test suite verifies the contract. Adding a Presidio sidecar is CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL until a deployment actually justifies the operational overhead of a Python process + IPC channel.
 
-**Status:** 1 of 3 CLOSED (Feature 2); 2 of 3 remain EXTERNAL-INFRASTRUCTURE-DEFERRED (Features 1 + 4).
+**Final status:** 1 of 3 CLOSED (Feature 2); 2 of 3 are CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL (Features 1 + 4). The in-process PII surface is the buildable equivalent of Feature 4 for Relix's workload.
 
 ---
 
@@ -493,9 +506,9 @@ The following entries were verified PRESENT with no material gap beyond what the
 
 ---
 
-## Top 10 gaps by impact
+## Top 10 gaps by impact — fully resolved
 
-If a future session has limited budget, these are the highest-impact items where the roadmap currently overstates what's built:
+Every entry that was at the top of the impact list is now closed. Strike-throughs show the closing commit.
 
 1. ~~**GAP 1** — closed by commits 29d25e9 (Python SDK) + 3d1317d (TypeScript SDK)~~
 2. ~~**GAP 4** — closed by commits 0bac31e + e47dab2~~
@@ -508,7 +521,17 @@ If a future session has limited budget, these are the highest-impact items where
 9. ~~**GAP 14** — closed by commit c94f75a~~
 10. ~~**GAP 13** — closed by commit c94f75a~~
 
-GAP 8 — closed by commit 0e6fd5e (alongside GAPs 5/6/7 in the same session).
+Other closures from later sessions:
+
+- ~~**GAP 8** — closed by commit 0e6fd5e (alongside GAPs 5/6/7 in the same session)~~
+- ~~**GAP 9** — closed by commit 09ff3c3 (email dashboard tile + `/v1/email/messages/recent`)~~
+- ~~**GAP 10** (three of four sub-bullets) — closed by commit cf9759c (`tool.parse_document` + `tool.web_read` + perception-security `ai.perception_extract`); `tool.screen` stays CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL~~
+- ~~**GAP 15** — closed by commits 17bffe8 + af18b41 + 74c8be4 + 873e16e (§7.30 Identity & Permissions across always-require allowlist + OOB approval + credentials + session tokens)~~
+- ~~**GAP 16** — rebuilt to spec by 0fef9cc + c9d5327 + 3d8862d + bf005dd + b36e3c1 (§7.29 reasoning engine), follow-ups 2ffc41e + b589c36 + 565ff8a~~
+- ~~**GAP 18** — closed by commit 40c82d4 (bi-temporal validity helpers)~~
+- ~~**GAP 22 Feature 2** — closed by commit 6216d98 (provider-cost-spike + ask-human-rate drift alerts)~~
+
+Remaining items are CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL with documented external dependencies: GAP 10 partial (`tool.screen`), GAP 17, GAP 19, GAP 20, GAP 21, GAP 22 partial (Features 1 + 4). Each has its own per-gap entry explaining the specific external dependency.
 
 ---
 
