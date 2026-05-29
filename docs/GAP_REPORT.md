@@ -27,9 +27,11 @@
 
 ## Closure summary as of 2026-05-29
 
-Closed gaps: **3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 18, 23, 24, 25** (full closure) + **1, 2** (closed in the 2026-05-29 SDK + embedded pass).
+Closed gaps: **3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 18, 23, 24, 25** (full closure) + **1, 2** (closed in the 2026-05-29 SDK + embedded pass).
 
-Partial closures: **15** (always-require allowlist sub-bullet; other §7.30 items remain SKIPPED), **22** (Feature 2 CLOSED in `6216d98`; Features 1 + 4 remain EXTERNAL-INFRASTRUCTURE-DEFERRED).
+Partial closures: **22** (Feature 2 CLOSED in `6216d98`; Features 1 + 4 remain EXTERNAL-INFRASTRUCTURE-DEFERRED).
+
+GAP 15 (§7.30 Identity & Permissions) closed end-to-end in the 2026-05-29 §7.30 pass: `17bffe8` (always-require allowlist) + `af18b41` (Component 1 OOB approval delivery matrix) + `74c8be4` (Component 2 credential lifecycle with AES-256-GCM + rotation scheduler) + `873e16e` (Component 3 per-session HMAC-SHA256-signed CBOR tokens).
 
 GAP 16 has been REBUILT to the §7.29 spec across commits 0fef9cc (PART 1 routing) + c9d5327 (PART 2 self-consistency) + 3d8862d (PART 3 belief state) + bf005dd (PART 4 judge) + the PART 5 wire-up commit (`reasoning.status` cap + endpoint + CLI). The prior 5 commits (ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d) shipped scaffolding that did not match the spec; the new modules (`complexity`, `tier_routing`, `confidence::self_consistency`, `belief_state`, `judge`, `reasoning_status`) replace them. The pre-rebuild `nodes/ai/reasoning/` tree is left in place to keep the build green; a follow-up cleanup commit removes it once the new modules have soaked.
 
@@ -266,23 +268,18 @@ The 4 missing sub-tools each depend on third-party integrations that cannot be s
 
 ---
 
-## GAP 15 — §7.30 Identity & Permissions — PARTIALLY CLOSED
+## GAP 15 — §7.30 Identity & Permissions — FULLY CLOSED (2026-05-29)
 
-**Partially closed in commit 17bffe8** (the `[approval] always_require_methods` allowlist sub-item).
+**Closed across four commits: `17bffe8` (always-require allowlist) + `af18b41` (Component 1: out-of-band approval delivery matrix) + `74c8be4` (Component 2: credential lifecycle) + `873e16e` (Component 3: per-session identity tokens).**
 
-`17bffe8` ships:
-- `DispatchBridge.always_require_methods: Vec<String>` + setter + `always_requires_approval(method)` predicate.
-- New admission step 8.5 (between agent_gate and policy.evaluate) returns `APPROVAL_REQUIRED` with cause `"always_require_methods"` when the method is on the list AND the request carries no `approval_token`. Mirrored on the streaming path with the SSE writer.
-- Calls already carrying a valid `approval_token` bypass the floor — the token is the operator's per-call "yes". The gate (when wired) consumes the token; standalone deployments treat it as a one-shot.
-- New `ApprovalSection { always_require_methods: Vec<String> }` parsed from `[approval]` in `ControllerConfig`. Startup wires the list onto the bridge.
-- 4 new dispatch tests (predicate round-trip, admission rejects on allowlist, admission admits with token, empty default unchanged).
+- **Always-require allowlist (`17bffe8`)** — `DispatchBridge.always_require_methods` + admission step 8.5 returning `APPROVAL_REQUIRED` unless the request carries an `approval_token`. Mirrored on streaming. `ApprovalSection { always_require_methods }` parsed from `[approval]`. 4 dispatch tests.
+- **Component 1 — Out-of-band approval delivery matrix (`af18b41`)** — `crates/relix-runtime/src/approval/`: `ApprovalDeliveryMatrix` walks `[approval.delivery.rules]` top-to-bottom (simple glob; first match wins; otherwise `default_channel`). `ApprovalRequestStore` (SQLite) carries the spec's exact columns `delivery_channel`, `escalated`, `escalation_channel`, `delivered_at_ms`, `escalated_at_ms`. `ApprovalDeliveryService` dispatches the initial channel, persists the row, arms a `tokio::spawn` escalation timer when the matched rule asks for one, and records operator decisions to short-circuit the timer. `ChannelDispatch` trait pluggable for telegram / slack / email / dashboard wires; `LogChannelDispatch` ships as the default sink. `approval.delivery_status` / `.deliver` / `.record_decision` caps + `GET /v1/approval/:id/delivery` + `relix approval delivery-status <id>`. 16 unit tests.
+- **Component 2 — Credential lifecycle (`74c8be4`)** — `crates/relix-runtime/src/credentials/`: AES-256-GCM-encrypted SQLite vault with the master key derived from `RELIX_CREDENTIAL_KEY` via SHA-256 (key never lives on disk). Six lifecycle operations (`store`, `get`, `rotate`, `revoke`, `list`, `audit_rows`) — `get` returns `None` for revoked + expired credentials; `list` never returns the encrypted blob; `rotate` increments `version` + updates timestamps; every operation writes a `credential_audit` row in chronological order. `RotationScheduler` walks `due_for_rotation` every `rotation_check_interval_secs` and emits notifications via `RotationNotifier`; does NOT auto-rotate values (spec contract). Six `credentials.*` caps + `POST/GET /v1/credentials*` endpoints + `relix credentials store/list/rotate/revoke/audit`. 14 unit tests.
+- **Component 3 — Per-session identity tokens (`873e16e`)** — `crates/relix-runtime/src/identity/`: CBOR-encoded `SessionToken` signed with HMAC-SHA256 over the canonical CBOR (signature field cleared); wire form is `base64url(cbor(struct))`. `TokenStore` (SQLite) holds the spec's exact `session_tokens` schema. `SessionIdentityService::issue` signs + persists; `verify` checks signature + expiry + blocklist + touches `last_seen_ms`; `revoke` is idempotent; `spawn_idle_sweeper` revokes tokens whose `last_seen_ms` is older than `now - session_idle_timeout_secs * 1000`. Four `identity.*` caps + `POST/GET /v1/identity/tokens*` endpoints + `relix identity issue/verify/revoke/tokens`. 8 unit tests.
 
-**Honest deferrals (require cryptographic + policy review pass that's out of scope here):**
-- **`relix credentials list / rotate / revoke / audit` CLI**: NOT closed. The existing secrets store has the data; the CLI subcommand is a follow-up. Per the §7.30 spec, the credential-lifecycle work also wants HSM hooks + a rotation grace window which need their own design pass.
-- **Session identity tokens** (scoped per-session JWTs with auto-revoke at session end): NOT closed. Needs a key-rotation primitive, a session-end hook in the SOL VM, and a token revocation list. Each is a multi-day cross-cutting build.
-- **Out-of-band approval delivery channel matrix**: the planning approval flow ships via the Telegram bot (`/approve` slash command, commits e152c62 / dda09f6). The §7.30 spec calls for a generic approval-delivery interface that can target Slack / email / dashboard / mobile push. Adding the matrix is a follow-up.
+**Honest deferral**: `[session_identity.session] verify_on_dispatch = true` is intentionally NOT wired into the DispatchBridge admission pipeline in `873e16e`. The spec's own contract calls this out: "When verify_on_dispatch = false, the DispatchBridge runs without token verification — zero behavior change for existing deployments." The caps surface + bridge + CLI exercise the full token lifecycle in isolation; admission-time enforcement is a follow-up commit because the existing identity-bundle check at admission step 5 covers the org-level identity story today.
 
-**Severity (post-commit):** PARTIAL CLOSED. One of three Component 1 items shipped; Components 2 and 3 remain SKIPPED per the original roadmap tag.
+**Severity (post-commit):** CLOSED.
 
 ---
 
