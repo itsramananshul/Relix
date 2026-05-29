@@ -5,6 +5,10 @@
 //! - `POST /v1/identity/tokens/verify` → `identity.verify_token`
 //! - `POST /v1/identity/tokens/revoke` → `identity.revoke_token`
 //! - `GET  /v1/identity/tokens`        → `identity.active_tokens`
+//!
+//! RELIX-7.18 / GAP 17 PART 2 — research-backed identity:
+//!
+//! - `POST /v1/identity/research`      → `identity.research`
 
 use axum::{
     Json,
@@ -58,6 +62,15 @@ pub struct VerifyBody {
 #[derive(Debug, Deserialize)]
 pub struct RevokeBody {
     pub session_id: String,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResearchBody {
+    pub subject_name: String,
+    #[serde(default)]
+    pub context: Option<String>,
     #[serde(default)]
     pub peer: Option<String>,
 }
@@ -119,6 +132,37 @@ pub async fn revoke(
     }
 }
 
+pub async fn research(
+    State(state): State<AppState>,
+    Json(req): Json<ResearchBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.subject_name.trim().is_empty() {
+        return bad_request("subject_name is required");
+    }
+    let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let mut body = serde_json::Map::new();
+    body.insert("subject_name".into(), Value::from(req.subject_name));
+    if let Some(c) = req.context {
+        body.insert("context".into(), Value::from(c));
+    }
+    // The pipeline's approval gate can wait up to 5 minutes;
+    // give the mesh call a 600s envelope so a slow operator
+    // doesn't cap the synthesis before the gate finishes.
+    match call_peer_json_with_deadline(
+        &state,
+        &peer,
+        "identity.research",
+        &Value::Object(body),
+        600_i64,
+    )
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     Query(q): Query<ListQuery>,
@@ -159,6 +203,17 @@ async fn call_peer_json(
     method: &str,
     args: &Value,
 ) -> Result<Value, axum::response::Response> {
+    let deadline = state.cfg.transport.deadline_secs.clamp(5, 120);
+    call_peer_json_with_deadline(state, alias, method, args, deadline).await
+}
+
+async fn call_peer_json_with_deadline(
+    state: &AppState,
+    alias: &str,
+    method: &str,
+    args: &Value,
+    deadline_secs: i64,
+) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
         Some(m) => m,
@@ -184,7 +239,6 @@ async fn call_peer_json(
                 .into_response());
         }
     };
-    let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 120);
     let envelope = build_request(
         method,
         arg_bytes,

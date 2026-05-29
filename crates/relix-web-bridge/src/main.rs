@@ -646,6 +646,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/identity/tokens/verify", post(identity_session::verify))
         .route("/v1/identity/tokens/revoke", post(identity_session::revoke))
+        // RELIX-7.18 / GAP 17 PART 2: research-backed identity.
+        .route("/v1/identity/research", post(identity_session::research))
         // RELIX-7.29 PART 3: belief-tracker inspection +
         // reset surface.
         .route("/v1/belief/:session_id", get(belief::get))

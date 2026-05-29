@@ -112,6 +112,22 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// RELIX-7.18 / GAP 17 PART 2: research a subject via web
+    /// search + LLM synthesis and persist the resulting
+    /// IdentityProfile to layered memory.
+    Research {
+        /// Subject name (e.g., "Anshul Raman").
+        #[arg(long)]
+        subject: String,
+        /// Optional disambiguating context (e.g., "engineer at
+        /// Acme, located in Berlin").
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -164,6 +180,12 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             raw,
         } => revoke_token(&bridge, &session, raw).await,
         Cmd::Tokens { agent, bridge, raw } => list_tokens(&bridge, agent.as_deref(), raw).await,
+        Cmd::Research {
+            subject,
+            context,
+            bridge,
+            raw,
+        } => research(&bridge, &subject, context.as_deref(), raw).await,
     }
 }
 
@@ -301,6 +323,122 @@ async fn list_tokens(
         println!("{tid:<24} {sid:<24} {agent:<14} {tenant:<14} {status}");
     }
     Ok(())
+}
+
+async fn research(
+    bridge: &str,
+    subject: &str,
+    context: Option<&str>,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/identity/research", bridge.trim_end_matches('/'));
+    let mut payload = serde_json::Map::new();
+    payload.insert("subject_name".into(), serde_json::Value::from(subject));
+    if let Some(c) = context {
+        payload.insert("context".into(), serde_json::Value::from(c));
+    }
+    let body = http_post_json_long(&url, &serde_json::Value::Object(payload)).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("decode research: {e} (body={body})"))?;
+    let approved = v.get("approved").and_then(|x| x.as_bool()).unwrap_or(false);
+    let verdict = v
+        .get("approval_verdict")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown");
+    let provider = v
+        .get("provider_used")
+        .and_then(|x| x.as_str())
+        .unwrap_or("?");
+    let consulted = v
+        .get("results_consulted")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let queries = v
+        .get("queries_generated")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    println!("subject:           {subject}");
+    println!("approval_verdict:  {verdict}");
+    println!("approved:          {approved}");
+    println!("search_provider:   {provider}");
+    println!("results_consulted: {consulted}");
+    println!("queries_generated: {}", queries.len());
+    for q in &queries {
+        if let Some(s) = q.as_str() {
+            println!("  - {s}");
+        }
+    }
+    if let Some(profile) = v.get("profile") {
+        if let Some(s) = profile.get("display_name").and_then(|x| x.as_str()) {
+            println!("display_name:      {s}");
+        }
+        if let Some(s) = profile.get("professional_role").and_then(|x| x.as_str()) {
+            println!("professional_role: {s}");
+        }
+        if let Some(s) = profile.get("organization").and_then(|x| x.as_str()) {
+            println!("organization:      {s}");
+        }
+        if let Some(s) = profile.get("location").and_then(|x| x.as_str()) {
+            println!("location:          {s}");
+        }
+        if let Some(c) = profile.get("confidence").and_then(|x| x.as_f64()) {
+            println!("confidence:        {c:.2}");
+        }
+        if let Some(arr) = profile.get("expertise_areas").and_then(|x| x.as_array()) {
+            let joined: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            if !joined.is_empty() {
+                println!("expertise_areas:   {}", joined.join(", "));
+            }
+        }
+        if let Some(arr) = profile.get("public_profiles").and_then(|x| x.as_array()) {
+            for p in arr {
+                let plat = p.get("platform").and_then(|x| x.as_str()).unwrap_or("?");
+                let u = p.get("url").and_then(|x| x.as_str()).unwrap_or("?");
+                println!("  profile:         {plat} {u}");
+            }
+        }
+        if let Some(arr) = profile.get("sources_used").and_then(|x| x.as_array()) {
+            for s in arr {
+                if let Some(u) = s.as_str() {
+                    println!("  source:          {u}");
+                }
+            }
+        }
+    }
+    if let Some(id) = v.get("memory_record_id").and_then(|x| x.as_str()) {
+        println!("memory_record_id:  {id}");
+    }
+    if let Some(id) = v.get("approval_id").and_then(|x| x.as_str()) {
+        println!("approval_id:       {id}");
+    }
+    Ok(())
+}
+
+async fn http_post_json_long(
+    url: &str,
+    payload: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // The bridge endpoint allows the pipeline up to ~10 minutes
+    // to wait for an operator approval; mirror that on the
+    // client so we don't drop the request early.
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(660))
+        .build()?
+        .post(url)
+        .json(payload)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}").into());
+    }
+    Ok(body)
 }
 
 async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {

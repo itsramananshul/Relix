@@ -174,7 +174,10 @@ async fn list(
         println!("(no credentials)");
         return Ok(());
     }
-    println!("{:<24} {:<10} {:<14} {:<3} status", "name", "kind", "owner", "ver");
+    println!(
+        "{:<24} {:<10} {:<14} {:<3} status",
+        "name", "kind", "owner", "ver"
+    );
     for r in arr {
         let name = r.get("name").and_then(|x| x.as_str()).unwrap_or("?");
         let kind = r.get("kind").and_then(|x| x.as_str()).unwrap_or("?");

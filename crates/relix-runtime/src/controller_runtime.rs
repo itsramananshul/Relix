@@ -200,6 +200,16 @@ pub struct ControllerConfig {
 pub struct SessionIdentitySection {
     #[serde(default)]
     pub session: Option<crate::identity::SessionIdentityConfig>,
+    /// `[session_identity.research]` — RELIX-7.18 / GAP 17
+    /// research-backed identity pipeline. Absent / `enabled =
+    /// false` leaves the `identity.research` cap unregistered.
+    #[serde(default)]
+    pub research: Option<crate::identity::research::ResearchConfig>,
+    /// `[session_identity.web_search]` — search-provider
+    /// surface used by the research pipeline. Required when
+    /// `[session_identity.research] enabled = true`.
+    #[serde(default)]
+    pub web_search: Option<crate::nodes::tool::web_search::WebSearchConfig>,
 }
 
 /// `[agents.<name>]` config section. Operators add one of
@@ -6196,6 +6206,11 @@ fn register_node_type_handlers(
         // absent keeps the bridge on the pre-7.30 admission
         // path with no delivery store and no
         // `approval.delivery_status` cap.
+        //
+        // The constructed service is kept in scope so the
+        // RELIX-7.18 research pipeline can reuse it (instead
+        // of opening a second delivery store on the same path).
+        let mut research_approval: Option<crate::approval::ApprovalDeliveryService> = None;
         if let Some(approval_section) = cfg.approval.as_ref()
             && let Some(delivery_cfg) = approval_section.delivery.clone()
         {
@@ -6217,7 +6232,8 @@ fn register_node_type_handlers(
                         delivery_store,
                         dispatch,
                     );
-                    crate::approval::caps::register(bridge, service);
+                    crate::approval::caps::register(bridge, service.clone());
+                    research_approval = Some(service);
                     for (method, doc) in [
                         (
                             "approval.delivery_status",
@@ -6433,6 +6449,136 @@ fn register_node_type_handlers(
                             "session-token store open failed; caps NOT registered"
                         );
                     }
+                }
+            }
+        }
+        // RELIX-7.18 / GAP 17 PART 2: research-backed identity
+        // pipeline. Wired when `[session_identity.research]
+        // enabled = true` AND `[ai]` is present AND a search
+        // provider key resolves (Tavily / Brave / Perplexity).
+        // Memory writes land on a LayeredMemoryStore opened on
+        // the coordinator's sidecar (or the operator-specified
+        // path), SQLite WAL handling concurrent writes if the
+        // memory node holds the same file open.
+        if let Some(id_section) = cfg.session_identity.as_ref()
+            && let Some(research_cfg) = id_section.research.clone()
+            && research_cfg.enabled
+        {
+            let ai_cfg: crate::nodes::ai::AiConfig = match &cfg.ai {
+                Some(raw) => raw.clone().try_into().map_err(|e: toml::de::Error| {
+                    format!("[ai] parse for identity.research: {e}")
+                })?,
+                None => crate::nodes::ai::AiConfig::default(),
+            };
+            let chat_provider = match crate::nodes::ai::build_provider(&ai_cfg) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "identity.research: AI provider build failed; cap NOT registered"
+                    );
+                    None
+                }
+            };
+            let search_cfg = id_section.web_search.clone().unwrap_or_default();
+            let search_provider = if search_cfg.enabled {
+                match crate::nodes::tool::web_search::build_provider_from_env(&search_cfg) {
+                    Ok(Some(p)) => Some(p),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "identity.research: no search provider key resolved \
+                             (set TAVILY_API_KEY, BRAVE_SEARCH_API_KEY, or \
+                             PERPLEXITY_API_KEY); cap NOT registered"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "identity.research: search-provider construction failed; \
+                             cap NOT registered"
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "identity.research: [session_identity.web_search] enabled = false; \
+                     cap NOT registered"
+                );
+                None
+            };
+            let memory_store = if let Some(mem_raw) = cfg.memory.clone() {
+                let mem_cfg: crate::nodes::memory::MemoryConfig = match mem_raw.try_into() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "identity.research: [memory] parse failed; \
+                             cap NOT registered"
+                        );
+                        crate::nodes::memory::MemoryConfig::default()
+                    }
+                };
+                match open_layered_memory(&mem_cfg) {
+                    Ok(Some(ctx)) => Some(ctx.store.clone()),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "identity.research: layered memory not configured; \
+                             cap NOT registered"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "identity.research: layered memory open failed; \
+                             cap NOT registered"
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!("identity.research: [memory] section absent; cap NOT registered");
+                None
+            };
+            if let (Some(chat), Some(search), Some(memory)) =
+                (chat_provider, search_provider, memory_store)
+            {
+                if research_cfg.require_approval && research_approval.is_none() {
+                    tracing::warn!(
+                        "identity.research: require_approval = true but \
+                         [approval.delivery] is unwired; cap NOT registered"
+                    );
+                } else {
+                    let pipeline = crate::identity::research::ResearchPipeline::new(
+                        research_cfg.clone(),
+                        chat,
+                        ai_cfg.model.clone(),
+                        search,
+                        research_approval.clone(),
+                        Some(memory),
+                    );
+                    crate::identity::research_caps::register(bridge, pipeline);
+                    manifest.add_capability(
+                        CapabilityDescriptor::unary("identity.research")
+                            .with_description(
+                                "Research a subject via web search + LLM synthesis, \
+                                 with optional human approval, and persist the \
+                                 IdentityProfile to layered memory.",
+                            )
+                            .with_categories(
+                                ["mutate", "identity", "research"]
+                                    .iter()
+                                    .map(|s| (*s).into()),
+                            ),
+                    );
+                    tracing::info!(
+                        require_approval = research_cfg.require_approval,
+                        max_queries = research_cfg.max_queries,
+                        max_results_per_query = research_cfg.max_results_per_query,
+                        "identity.research pipeline online (RELIX-7.18 / GAP 17)"
+                    );
                 }
             }
         }
