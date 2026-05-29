@@ -32,6 +32,8 @@
 
 pub mod caps;
 pub mod delivery;
+pub mod email_dispatch;
+pub mod email_reply;
 pub mod store;
 
 pub use delivery::{
@@ -39,5 +41,13 @@ pub use delivery::{
     ChannelDispatch, ChannelDispatchError, ChannelKind, ChannelsConfig, DashboardChannelCfg,
     DeliveryOutcome, DeliveryRule, DiscordChannelCfg, EmailChannelCfg, RuleMatch,
     SingleChannelDispatch, SlackChannelCfg, TelegramChannelCfg,
+};
+pub use email_dispatch::{
+    ApprovalEmailSender, EmailChannelDispatch, render_body as render_email_body,
+    render_subject as render_email_subject,
+};
+pub use email_reply::{
+    EmailProvider, EmailReplyAction, EmailReplyError, ParsedReply, SubjectDecision, lift_decision,
+    parse_inbound_webhook, parse_subject_for_decision, verify_mailgun_signature,
 };
 pub use store::{ApprovalDeliveryRow, ApprovalRequestStore, ApprovalStoreError};

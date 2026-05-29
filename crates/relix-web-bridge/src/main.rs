@@ -657,6 +657,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/channels/discord/interact",
             post(channels::discord_interact),
         )
+        // PART 4: inbound email reply webhook (Mailgun /
+        // SendGrid / Postmark). Detects provider from the
+        // body shape, HMAC-verifies Mailgun against
+        // `RELIX_BRIDGE_MAILGUN_SIGNING_KEY`, parses the
+        // operator's `APPROVE` / `DENY` subject token, and
+        // routes to `approval.record_decision`.
+        .route("/v1/channels/email/reply", post(channels::email_reply))
         // RELIX-7.30 PART 2: credential vault.
         .route(
             "/v1/credentials",

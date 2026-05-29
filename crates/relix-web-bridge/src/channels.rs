@@ -52,6 +52,10 @@ use axum::{
 use serde::Serialize;
 
 use relix_discord::{self, InteractionKind};
+use relix_runtime::approval::{
+    EmailProvider, EmailReplyError, SubjectDecision, parse_inbound_webhook,
+    parse_subject_for_decision, verify_mailgun_signature,
+};
 use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use relix_slack::{
@@ -74,6 +78,12 @@ pub const SLACK_SIGNING_SECRET_ENV: &str = "RELIX_BRIDGE_SLACK_SIGNING_SECRET";
 /// clear error so the wire reason surfaces in the Discord
 /// developer portal's interaction logs.
 pub const DISCORD_PUBLIC_KEY_ENV: &str = "RELIX_BRIDGE_DISCORD_PUBLIC_KEY";
+
+/// PART 4: env var the bridge reads the Mailgun signing key
+/// from. When set, Mailgun-shaped inbound webhooks are HMAC-
+/// verified before processing. When unset, Mailgun inbound is
+/// still accepted but the handler logs a warning.
+pub const MAILGUN_SIGNING_KEY_ENV: &str = "RELIX_BRIDGE_MAILGUN_SIGNING_KEY";
 
 const COORDINATOR_ALIAS: &str = "coordinator";
 
@@ -399,6 +409,149 @@ pub async fn discord_interact(
     }
 }
 
+// ────────────────────────────────────────────────────────────
+// PART 4 — Email reply webhook (Mailgun / SendGrid / Postmark)
+// ────────────────────────────────────────────────────────────
+
+/// `POST /v1/channels/email/reply`
+///
+/// Accepts inbound webhooks from any of the three supported
+/// providers. The handler:
+///
+/// 1. Reads the `Content-Type` header to bias provider
+///    detection (`application/json` ⇒ Postmark;
+///    `application/x-www-form-urlencoded` ⇒ Mailgun or SendGrid).
+/// 2. For Mailgun (detected by the `signature` + `token`
+///    form fields), HMAC-verifies the body against
+///    `RELIX_BRIDGE_MAILGUN_SIGNING_KEY` when set.
+/// 3. For SendGrid and Postmark, accepts the body — these
+///    providers don't sign requests server-side; deployments
+///    should put the route behind a reverse-proxy basic-auth
+///    layer or a hard-to-guess path.
+/// 4. Extracts the operator's vote from the reply subject
+///    (`APPROVE` / `DENY` / `REJECTED` etc. as the first
+///    word, plus the bracketed approval id).
+/// 5. Forwards `approved` / `rejected` to
+///    `approval.record_decision` via mesh, with the
+///    operator's `From:` address in the decision note for
+///    attribution.
+///
+/// Always returns 200 to the provider on a successful parse —
+/// providers retry on non-2xx and we don't want duplicate
+/// decisions on transient coordinator failures.
+pub async fn email_reply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let parsed = match parse_inbound_webhook(&content_type, &body) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "email reply: parse failed");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("email reply: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Mailgun: HMAC-verify when the operator pasted the
+    // signing key into the env var. Unset ⇒ log a warning and
+    // accept (operators may be running behind a reverse proxy
+    // that already enforces).
+    if parsed.provider == EmailProvider::Mailgun {
+        match std::env::var(MAILGUN_SIGNING_KEY_ENV) {
+            Ok(key) if !key.trim().is_empty() => {
+                if let Err(e) = verify_mailgun_signature(&key, &body) {
+                    match e {
+                        EmailReplyError::MailgunSignatureMismatch => {
+                            tracing::warn!("email reply: Mailgun HMAC mismatch — rejecting");
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(ApiError {
+                                    error: "mailgun signature mismatch".into(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        other => {
+                            tracing::warn!(error = %other, "email reply: Mailgun signature malformed");
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ApiError {
+                                    error: format!("mailgun signature: {other}"),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "email reply: {MAILGUN_SIGNING_KEY_ENV} unset; accepting Mailgun webhook \
+                     without HMAC verification — wire a signing key for production"
+                );
+            }
+        }
+    }
+
+    let action = parse_subject_for_decision(&parsed.subject);
+    let decision = match action.decision {
+        SubjectDecision::Approved => "approved",
+        SubjectDecision::Rejected => "rejected",
+        SubjectDecision::Unknown => {
+            tracing::info!(
+                subject = %parsed.subject,
+                from = %parsed.from,
+                "email reply: subject did not carry a recognised decision — ignoring"
+            );
+            // Still return 200 so the provider doesn't retry.
+            return (StatusCode::OK, Json(EmptyResponse::default())).into_response();
+        }
+    };
+    if action.approval_id.is_empty() {
+        tracing::warn!(
+            subject = %parsed.subject,
+            from = %parsed.from,
+            "email reply: missing approval id in subject — ignoring"
+        );
+        return (StatusCode::OK, Json(EmptyResponse::default())).into_response();
+    }
+
+    let note = if parsed.from.is_empty() {
+        format!("email:{}", provider_tag(parsed.provider))
+    } else {
+        format!(
+            "email:{}:{}",
+            provider_tag(parsed.provider),
+            parsed.from.replace([' ', '\n', '\r'], "")
+        )
+    };
+
+    forward_record_decision(&state, &action.approval_id, decision, &note, "email").await;
+    (StatusCode::OK, Json(EmptyResponse::default())).into_response()
+}
+
+fn provider_tag(p: EmailProvider) -> &'static str {
+    match p {
+        EmailProvider::Mailgun => "mailgun",
+        EmailProvider::SendGrid => "sendgrid",
+        EmailProvider::Postmark => "postmark",
+    }
+}
+
 /// Shared helper: invoke `approval.record_decision` on the
 /// coordinator with the decision lifted from a channel
 /// interaction. Logs on failure — channels expect a fast
@@ -557,5 +710,32 @@ mod tests {
             username: "u".into(),
         });
         let _ = InteractionKind::Other(42);
+    }
+
+    // ── PART 4 — Email reply route ─────────────────────────
+
+    #[test]
+    fn mailgun_env_var_name_matches_documented_constant() {
+        // Pin the env var name — operator docs reference it
+        // directly.
+        assert_eq!(MAILGUN_SIGNING_KEY_ENV, "RELIX_BRIDGE_MAILGUN_SIGNING_KEY");
+    }
+
+    #[test]
+    fn provider_tag_returns_lowercase_label_per_variant() {
+        assert_eq!(provider_tag(EmailProvider::Mailgun), "mailgun");
+        assert_eq!(provider_tag(EmailProvider::SendGrid), "sendgrid");
+        assert_eq!(provider_tag(EmailProvider::Postmark), "postmark");
+    }
+
+    #[test]
+    fn note_attribution_format_strips_whitespace_in_from_address() {
+        // Defensive — providers should not include CR/LF in
+        // the From header but we strip them anyway so the
+        // decision row can't carry header-injection-shaped
+        // values.
+        let from = "ops@example.com\r\n";
+        let cleaned: String = from.replace([' ', '\n', '\r'], "");
+        assert_eq!(cleaned, "ops@example.com");
     }
 }
