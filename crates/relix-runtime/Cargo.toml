@@ -98,6 +98,9 @@ aes-gcm.workspace = true
 # RELIX-7.30 PART 3: HMAC-SHA256 for the per-session identity
 # token signature.
 hmac.workspace = true
+# SEC PART A: constant-time HMAC compare for the signed
+# ApprovalToken signature verification path.
+subtle.workspace = true
 # `async-trait` already in deps above. base64 already in deps above.
 # Globally-unique Message-ID generation.
 uuid = { version = "1", default-features = false, features = ["v4"] }

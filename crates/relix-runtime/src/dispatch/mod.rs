@@ -342,6 +342,14 @@ pub struct DispatchBridge {
     /// gate's per-agent semantics AND a hard "always require"
     /// floor.
     always_require_methods: Vec<String>,
+    /// SEC PART A: HMAC-SHA256 signing key for
+    /// [`crate::approval::ApprovalToken`]. The controller reads
+    /// `RELIX_APPROVAL_TOKEN_KEY` at startup and installs it
+    /// here; the admission gate threads it through
+    /// `GateInputs::signing_key`. Empty bytes (default) cause
+    /// every token-bearing call to fail with
+    /// `approval_token_missing_key`.
+    approval_token_signing_key: Vec<u8>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -522,7 +530,25 @@ impl DispatchBridge {
             tenant_policy: None,
             audit_partition: None,
             always_require_methods: Vec::new(),
+            approval_token_signing_key: Vec::new(),
         })
+    }
+
+    /// SEC PART A: install the HMAC-SHA256 signing key the
+    /// admission gate uses to verify
+    /// [`crate::approval::ApprovalToken`] signatures. Idempotent
+    /// — calling twice replaces the prior key. Passing an empty
+    /// byte slice resets the bridge to the "no key"
+    /// configuration, in which case every token-bearing call
+    /// fails with `approval_token_missing_key`.
+    pub fn set_approval_token_signing_key(&mut self, key: Vec<u8>) {
+        self.approval_token_signing_key = key;
+    }
+
+    /// SEC PART A: borrow the configured signing key. Used by
+    /// unit tests and the controller's startup-self-check log.
+    pub fn approval_token_signing_key(&self) -> &[u8] {
+        &self.approval_token_signing_key
     }
 
     /// GAP 15 partial: set the global "always require approval"
@@ -1017,6 +1043,7 @@ impl DispatchBridge {
         // === Admission step 8: agent-employee gate (categorical / surface / risk / approval) ===
         if let Some(bindings) = self.agent_gate.as_ref() {
             let descriptor = (bindings.describe)(&req.method);
+            let now_ms = unix_now_ms();
             let gate_decision = crate::admission::agent_gate::evaluate(
                 Some(&bindings.store),
                 crate::admission::agent_gate::GateInputs {
@@ -1024,22 +1051,18 @@ impl DispatchBridge {
                     envelope: &req,
                     capability: descriptor.as_ref(),
                     now,
+                    now_ms,
+                    signing_key: &self.approval_token_signing_key,
                 },
             );
             match gate_decision {
-                crate::admission::agent_gate::GateDecision::Allow(a) => {
-                    if let Some(approval_id) = a.consumed_approval_id.as_deref() {
-                        // Token admit → consume the one-shot.
-                        if let Some(token) = req.approval_token.as_deref()
-                            && let Err(e) = bindings.store.consume_approval_token(token)
-                        {
-                            tracing::warn!(
-                                approval_id = %approval_id,
-                                error = %e,
-                                "agent_gate: approval token consume failed"
-                            );
-                        }
-                    }
+                crate::admission::agent_gate::GateDecision::Allow(_a) => {
+                    // SEC PART A: token consumption is atomic
+                    // INSIDE evaluate_token now (via
+                    // try_consume_token_atomic). No follow-up
+                    // call here — the previous post-allow
+                    // consume_approval_token call was racy and
+                    // is gone.
                 }
                 crate::admission::agent_gate::GateDecision::Deny(deny) => {
                     self.bump_stats(&req.method, StatBucket::Denied, now);
@@ -1105,33 +1128,71 @@ impl DispatchBridge {
         // `tool.fs.write` against production paths, payment
         // emissions, or destructive infra calls.
         //
-        // Calls that already carry an approval_token are
-        // exempt — the token is the operator's "yes" for this
-        // specific call. We do NOT consume the token here; if
-        // the agent_gate is wired it has already consumed it
-        // above, otherwise it's a one-shot the operator
-        // accepts is paired to this request.
-        if self.always_requires_approval(&req.method) && req.approval_token.is_none() {
-            self.bump_stats(&req.method, StatBucket::Denied, now);
-            let cause = "always_require_methods".to_string();
-            // GAP 22 Feature 2: see the agent_gate branch above.
-            self.record_admission_denial_metric(
-                &req.method,
-                &verified.name,
-                req.rid,
-                started_at,
-                "APPROVAL_REQUIRED",
-            );
-            return self
-                .audit_and_err_with_id(
-                    &req,
-                    &verified,
+        // SEC PART A: a non-empty approval_token field is NOT a
+        // free pass any more. To bypass the always-require
+        // floor:
+        //
+        // - When the agent gate is wired, the gate has ALREADY
+        //   parsed + verified + atomically consumed the token
+        //   at step 8 and returned `Allow` — control reached
+        //   here only if the gate admitted, so re-verifying
+        //   would just burn a second blocklist row attempt.
+        //   The token is trusted.
+        // - When the agent gate is NOT wired, there is no
+        //   store backing the blocklist. We CANNOT verify the
+        //   token atomically without the store. Fail closed
+        //   with `approval_token_unverifiable` so the operator
+        //   sees the missing infrastructure in audit logs.
+        if self.always_requires_approval(&req.method) {
+            let token_present = req.approval_token.is_some();
+            let gate_wired = self.agent_gate.is_some();
+            if !token_present {
+                self.bump_stats(&req.method, StatBucket::Denied, now);
+                let cause = "always_require_methods".to_string();
+                self.record_admission_denial_metric(
+                    &req.method,
+                    &verified.name,
+                    req.rid,
                     started_at,
-                    cause,
-                    relix_core::types::error_kinds::APPROVAL_REQUIRED,
-                    AuditStatus::Denied,
-                )
-                .await;
+                    "APPROVAL_REQUIRED",
+                );
+                return self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        cause,
+                        relix_core::types::error_kinds::APPROVAL_REQUIRED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+            }
+            if token_present && !gate_wired {
+                self.bump_stats(&req.method, StatBucket::Denied, now);
+                self.record_admission_denial_metric(
+                    &req.method,
+                    &verified.name,
+                    req.rid,
+                    started_at,
+                    "SECURITY_DENIED",
+                );
+                return self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        "approval_token_unverifiable: no agent gate wired \
+                         to verify + consume the token atomically — operator \
+                         must wire `[[execution.agents]]` or remove the \
+                         always_require_methods entry"
+                            .to_string(),
+                        relix_core::types::error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+            }
+            // Token was already verified + consumed by the agent
+            // gate at step 8; reaching here means it admitted.
         }
 
         // === Admission step 9: policy ===
@@ -1792,6 +1853,7 @@ impl DispatchBridge {
         // === Admission step 8: agent gate ===
         if let Some(bindings) = self.agent_gate.as_ref() {
             let descriptor = (bindings.describe)(&req.method);
+            let now_ms = unix_now_ms();
             let gate_decision = crate::admission::agent_gate::evaluate(
                 Some(&bindings.store),
                 crate::admission::agent_gate::GateInputs {
@@ -1799,20 +1861,14 @@ impl DispatchBridge {
                     envelope: &req,
                     capability: descriptor.as_ref(),
                     now,
+                    now_ms,
+                    signing_key: &self.approval_token_signing_key,
                 },
             );
             match gate_decision {
-                crate::admission::agent_gate::GateDecision::Allow(a) => {
-                    if let Some(approval_id) = a.consumed_approval_id.as_deref()
-                        && let Some(token) = req.approval_token.as_deref()
-                        && let Err(e) = bindings.store.consume_approval_token(token)
-                    {
-                        tracing::warn!(
-                            approval_id = %approval_id,
-                            error = %e,
-                            "agent_gate: approval token consume failed (streaming path)"
-                        );
-                    }
+                crate::admission::agent_gate::GateDecision::Allow(_a) => {
+                    // SEC PART A: atomic consume happens inside
+                    // evaluate_token. No follow-up call here.
                 }
                 crate::admission::agent_gate::GateDecision::Deny(deny) => {
                     self.bump_stats(&req.method, StatBucket::Denied, now);
@@ -1875,34 +1931,66 @@ impl DispatchBridge {
         }
 
         // === Admission step 8.5 (GAP 15, streaming path) ===
-        // Sends the approval-required frame to the SSE writer
-        // before finalising the audit row.
-        if self.always_requires_approval(&req.method) && req.approval_token.is_none() {
-            self.bump_stats(&req.method, StatBucket::Denied, now);
-            let cause = "always_require_methods".to_string();
-            // GAP 22 Feature 2: stamp the denial onto the
-            // metrics time series.
-            self.record_admission_denial_metric(
-                &req.method,
-                &verified.name,
-                req.rid,
-                started_at,
-                "APPROVAL_REQUIRED",
-            );
-            let _ = writer
-                .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
-                .await;
-            let _ = self
-                .audit_and_err_with_id(
-                    &req,
-                    &verified,
+        // SEC PART A: same structured-token contract as the
+        // unary path. Token-bearing calls reach here only when
+        // the agent gate already verified + atomically
+        // consumed the token at step 8; absent gate + present
+        // token = SECURITY_DENIED.
+        if self.always_requires_approval(&req.method) {
+            let token_present = req.approval_token.is_some();
+            let gate_wired = self.agent_gate.is_some();
+            if !token_present {
+                self.bump_stats(&req.method, StatBucket::Denied, now);
+                let cause = "always_require_methods".to_string();
+                self.record_admission_denial_metric(
+                    &req.method,
+                    &verified.name,
+                    req.rid,
                     started_at,
-                    cause,
-                    error_kinds::APPROVAL_REQUIRED,
-                    AuditStatus::Denied,
-                )
-                .await;
-            return;
+                    "APPROVAL_REQUIRED",
+                );
+                let _ = writer
+                    .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
+                    .await;
+                let _ = self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        cause,
+                        error_kinds::APPROVAL_REQUIRED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+                return;
+            }
+            if token_present && !gate_wired {
+                self.bump_stats(&req.method, StatBucket::Denied, now);
+                self.record_admission_denial_metric(
+                    &req.method,
+                    &verified.name,
+                    req.rid,
+                    started_at,
+                    "SECURITY_DENIED",
+                );
+                let cause = "approval_token_unverifiable: no agent gate wired \
+                             to verify + consume the token atomically"
+                    .to_string();
+                let _ = writer
+                    .write_err(error_kinds::SECURITY_DENIED, cause.clone())
+                    .await;
+                let _ = self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        cause,
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+                return;
+            }
         }
 
         // === Admission step 9: policy ===
@@ -2554,7 +2642,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_admits_an_allowlist_method_when_request_carries_an_approval_token() {
+    async fn admission_denies_allowlist_call_with_token_when_no_gate_is_wired() {
+        // SEC PART A: a non-empty approval_token string is NO
+        // LONGER a free pass at step 8.5. When the agent gate is
+        // not wired, there is no atomic-consume store available;
+        // we MUST fail closed with SECURITY_DENIED. Previously
+        // this test passed with an arbitrary token because the
+        // gate was unconditionally bypassed.
         let (mut bridge, bundle, _dir, _root) = allow_health_bridge();
         bridge.set_always_require_methods(vec!["node.health".into()]);
         let envelope = build_request_with_tenant(
@@ -2570,8 +2664,15 @@ mod tests {
         let resp_bytes = bridge.handle_inbound(envelope).await;
         let resp = decode_response(&resp_bytes).unwrap();
         match resp.res {
-            ResponseResult::Ok(b) => assert_eq!(b.as_ref(), b"hi"),
-            other => panic!("expected Ok with token attached; got {:?}", other),
+            ResponseResult::Err(env) => {
+                assert_eq!(env.kind, error_kinds::SECURITY_DENIED);
+                assert!(
+                    env.cause.contains("approval_token_unverifiable"),
+                    "cause should name the failure mode: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected SECURITY_DENIED, got {other:?}"),
         }
     }
 

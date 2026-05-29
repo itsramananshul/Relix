@@ -28,9 +28,8 @@ use std::sync::Arc;
 use relix_core::capability::CapabilityDescriptor;
 use relix_core::identity::VerifiedIdentity;
 
-use crate::nodes::coordinator::agent::store::{
-    AgentGateView, AgentStore, AgentStoreError, ApprovalRecord, ApprovalStatus,
-};
+use crate::approval::{ApprovalToken, TokenError};
+use crate::nodes::coordinator::agent::store::{AgentGateView, AgentStore, ApprovalStatus};
 use crate::transport::envelope::RequestEnvelope;
 
 /// What the gate decides about one inbound call.
@@ -103,6 +102,9 @@ pub mod deny_reasons {
     pub const AGENT_SENSITIVITY_DENIED: &str = "agent_sensitivity_denied";
     pub const AGENT_CATEGORY_NOT_ALLOWED: &str = "agent_category_not_allowed";
     pub const AGENT_SENSITIVITY_NOT_ALLOWED: &str = "agent_sensitivity_not_allowed";
+    /// SEC PART A: legacy catchall — kept for log compatibility
+    /// when a non-token-specific failure happens. Specific
+    /// token failure rules come from [`TokenError::matched_rule`].
     pub const APPROVAL_TOKEN_INVALID: &str = "approval_token_invalid";
 }
 
@@ -114,6 +116,18 @@ pub struct GateInputs<'a> {
     /// Unix seconds at gate entry. Caller-supplied so tests
     /// can drive time deterministically.
     pub now: i64,
+    /// Unix milliseconds at gate entry. Used for token TTL
+    /// checks (the token's `expires_at_ms` field is in ms;
+    /// converting `now` to ms loses sub-second precision so
+    /// the caller supplies both — admission paths read
+    /// `unix_ms()` once and pass both).
+    pub now_ms: i64,
+    /// SEC PART A: HMAC-SHA256 signing key for
+    /// [`crate::approval::ApprovalToken`]. Sourced from
+    /// `RELIX_APPROVAL_TOKEN_KEY` at controller startup.
+    /// Empty / absent = the gate refuses every token-bearing
+    /// call with `approval_token_missing_key`.
+    pub signing_key: &'a [u8],
 }
 
 /// Live store dependency. Wrapped in `Arc` so the dispatch
@@ -131,29 +145,21 @@ pub fn evaluate(store: Option<&AgentStoreHandle>, inputs: GateInputs<'_>) -> Gat
         return allow("no_agent_store");
     };
 
-    // 1. Token-bearing call: token check is the only path
-    //    that admits an APPROVAL_REQUIRED-category call.
-    if let Some(token) = inputs.envelope.approval_token.as_deref() {
-        match store.get_approval_by_token(token) {
-            Ok(Some(record)) => {
-                return evaluate_token(&record, inputs.envelope.method.as_str(), inputs.now);
-            }
-            Ok(None) | Err(AgentStoreError::NotFound(_)) => {
-                return GateDecision::Deny(GateDeny {
-                    reason: format!("unknown approval_token: {token}"),
-                    matched_rule: deny_reasons::APPROVAL_TOKEN_INVALID.into(),
-                    agent_id: None,
-                });
-            }
-            Err(e) => {
-                // Storage hiccup — fail closed.
-                return GateDecision::Deny(GateDeny {
-                    reason: format!("approval token lookup: {e}"),
-                    matched_rule: deny_reasons::APPROVAL_TOKEN_INVALID.into(),
-                    agent_id: None,
-                });
-            }
-        }
+    // 1. Token-bearing call: structured signed token is the
+    //    only path that admits an APPROVAL_REQUIRED-category
+    //    call. The verify_and_consume helper handles parse +
+    //    HMAC verify (constant-time) + method scope + subject
+    //    scope + expiry + atomic consume; failures map 1:1 to
+    //    a specific [`TokenError`] variant.
+    if let Some(token_wire) = inputs.envelope.approval_token.as_deref() {
+        return evaluate_token(
+            store,
+            token_wire,
+            inputs.envelope.method.as_str(),
+            &inputs.identity.subject_id.to_string(),
+            inputs.signing_key,
+            inputs.now_ms,
+        );
     }
 
     // 2. Categorical checks against the agent profile.
@@ -176,34 +182,98 @@ pub fn evaluate(store: Option<&AgentStoreHandle>, inputs: GateInputs<'_>) -> Gat
     evaluate_against_view(&view, inputs, store)
 }
 
-fn evaluate_token(record: &ApprovalRecord, request_method: &str, now: i64) -> GateDecision {
+/// SEC PART A: full structured-token admission path.
+///
+/// 1. Parse the wire token.
+/// 2. Verify the HMAC-SHA256 signature with constant-time
+///    compare. Bad signatures are rejected at this step;
+///    nothing else is consulted (so a forged token does not
+///    leak metadata about whether the approval row exists).
+/// 3. Check the method binding — token issued for
+///    `tool.web_read` is denied when used against
+///    `tool.terminal`.
+/// 4. Check the subject binding — caller's verified
+///    subject_id MUST match the token's bound subject_id.
+/// 5. Check expiry — `now_ms < token.expires_at_ms`.
+/// 6. Fetch the approval row by id (NOT by token value) and
+///    verify it is in `Approved` status. A row that has been
+///    revoked / consumed / expired post-issue is denied here.
+/// 7. Atomically claim the blocklist row via
+///    [`AgentStore::try_consume_token_atomic`]. Two
+///    concurrent requests with the same token: the loser
+///    fails the UNIQUE-key insert and gets
+///    `TokenError::AlreadyConsumed`.
+pub fn evaluate_token(
+    store: &AgentStoreHandle,
+    token_wire: &str,
+    request_method: &str,
+    caller_subject_id: &str,
+    signing_key: &[u8],
+    now_ms: i64,
+) -> GateDecision {
+    let tok = match ApprovalToken::parse(token_wire) {
+        Ok(t) => t,
+        Err(e) => return token_deny(&e, None),
+    };
+    if let Err(e) = tok.verify_signature(signing_key) {
+        return token_deny(&e, None);
+    }
+    if let Err(e) = tok.check_method(request_method) {
+        return token_deny(&e, None);
+    }
+    if let Err(e) = tok.check_subject(caller_subject_id) {
+        return token_deny(&e, None);
+    }
+    if let Err(e) = tok.check_not_expired(now_ms) {
+        return token_deny(&e, None);
+    }
+    // Approval-row state check. The token is structurally
+    // valid; the operator-side row may have been revoked or
+    // already consumed via the legacy path.
+    let record = match store.get_approval(&tok.approval_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            // Token signature was valid AND we cannot find
+            // the row. Treat as Store error so the audit log
+            // surfaces a clear "approval not found" signal —
+            // the signature already passed so this is not an
+            // oracle for the caller.
+            return token_deny(
+                &TokenError::Store(format!("approval not found: {}", tok.approval_id)),
+                None,
+            );
+        }
+        Err(e) => {
+            return token_deny(&TokenError::Store(e.to_string()), None);
+        }
+    };
     if record.status != ApprovalStatus::Approved {
-        return GateDecision::Deny(GateDeny {
-            reason: format!("approval_token status={}", record.status.as_wire()),
-            matched_rule: deny_reasons::APPROVAL_TOKEN_INVALID.into(),
-            agent_id: Some(record.agent_id.clone()),
-        });
+        return token_deny(&TokenError::AlreadyConsumed, Some(record.agent_id.clone()));
     }
-    if record.method != request_method {
-        return GateDecision::Deny(GateDeny {
-            reason: format!(
-                "approval_token method mismatch: token=`{}` request=`{}`",
-                record.method, request_method
-            ),
-            matched_rule: deny_reasons::APPROVAL_TOKEN_INVALID.into(),
-            agent_id: Some(record.agent_id.clone()),
-        });
-    }
-    if record.expires_at <= now {
-        return GateDecision::Deny(GateDeny {
-            reason: format!("approval_token expired at {}", record.expires_at),
-            matched_rule: deny_reasons::APPROVAL_TOKEN_INVALID.into(),
-            agent_id: Some(record.agent_id.clone()),
-        });
+    let blocklist_key = tok.blocklist_key();
+    let claimed = match store.try_consume_token_atomic(&blocklist_key, &tok.approval_id, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return token_deny(
+                &TokenError::Store(format!("consume: {e}")),
+                Some(record.agent_id.clone()),
+            );
+        }
+    };
+    if !claimed {
+        return token_deny(&TokenError::AlreadyConsumed, Some(record.agent_id.clone()));
     }
     GateDecision::Allow(GateAllow {
         matched_rule: "approval_token".into(),
-        consumed_approval_id: Some(record.approval_id.clone()),
+        consumed_approval_id: Some(tok.approval_id),
+    })
+}
+
+fn token_deny(err: &TokenError, agent_id: Option<String>) -> GateDecision {
+    GateDecision::Deny(GateDeny {
+        reason: err.to_string(),
+        matched_rule: err.matched_rule().to_string(),
+        agent_id,
     })
 }
 
@@ -486,12 +556,20 @@ mod tests {
         c
     }
 
+    /// Signing key the test suite uses for structured-token
+    /// minting + verification. Stable so tests can issue +
+    /// replay against the same byte sequence.
+    fn test_key() -> Vec<u8> {
+        b"agent-gate-test-key-32-bytes-okx".to_vec()
+    }
+
     fn run(
         store: &AgentStoreHandle,
         identity: &VerifiedIdentity,
         envelope: &RequestEnvelope,
         cap: Option<&CapabilityDescriptor>,
     ) -> GateDecision {
+        let key = test_key();
         evaluate(
             Some(store),
             GateInputs {
@@ -499,6 +577,8 @@ mod tests {
                 envelope,
                 capability: cap,
                 now: 1_700_000_000,
+                now_ms: 1_700_000_000_000,
+                signing_key: &key,
             },
         )
     }
@@ -522,6 +602,7 @@ mod tests {
     fn store_handle_none_admits() {
         let id = ident(b"x");
         let e = env("m", None);
+        let key = test_key();
         let d = evaluate(
             None,
             GateInputs {
@@ -529,6 +610,8 @@ mod tests {
                 envelope: &e,
                 capability: None,
                 now: 0,
+                now_ms: 0,
+                signing_key: &key,
             },
         );
         assert!(matches!(d, GateDecision::Allow(_)));
@@ -772,31 +855,25 @@ mod tests {
         }
     }
 
-    // ── approval token ──────────────────────────────────
+    // ── SEC PART A — structured approval token ──────────
 
-    #[test]
-    fn unknown_approval_token_denies_with_token_invalid_matched_rule() {
-        let (s, id) = setup_with_profile("high", "active", &[], &[], &[]);
-        let mut e = env("tool.x", None);
-        e.approval_token = Some("totally-fake".into());
-        let c = cap(&["fetch"], &[], RiskLevel::Low);
-        match run(&s, &id, &e, Some(&c)) {
-            GateDecision::Deny(d) => {
-                assert_eq!(d.matched_rule, deny_reasons::APPROVAL_TOKEN_INVALID);
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn approved_token_for_matching_method_admits() {
-        let s = store();
+    /// Test helper: mint an approved approval + return its
+    /// freshly-signed wire token + subject_id bytes used to
+    /// derive the matching VerifiedIdentity.
+    fn approve_and_mint_token(
+        s: &AgentStoreHandle,
+        method: &str,
+        subject_seed: &[u8],
+        ttl_ms: i64,
+        issued_at_ms: i64,
+    ) -> (String, String) {
+        let subject_id_hex = relix_core::types::NodeId::from_pubkey(subject_seed).to_string();
         let approval_id = s
             .create_approval(
                 "agt-1",
-                "subj-1",
-                "tool.payments.charge",
-                "payments",
+                &subject_id_hex,
+                method,
+                "cat",
                 "",
                 "",
                 &[],
@@ -804,13 +881,55 @@ mod tests {
                 9_999_999_999,
             )
             .unwrap();
-        let token = s
+        let meta = s
             .decide_approval(&approval_id, ApprovalStatus::Approved, "alice", "")
             .unwrap()
-            .unwrap();
+            .expect("approved -> metadata");
+        let wire = ApprovalToken::issue(
+            &meta.approval_id,
+            &meta.method,
+            &meta.subject_id,
+            meta.task_id.as_deref().unwrap_or(""),
+            issued_at_ms,
+            ttl_ms,
+            &test_key(),
+        )
+        .unwrap();
+        (wire, approval_id)
+    }
+
+    #[test]
+    fn malformed_approval_token_is_denied_with_specific_matched_rule() {
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &[]);
+        let mut e = env("tool.x", None);
+        e.approval_token = Some("totally-fake".into());
+        let c = cap(&["fetch"], &[], RiskLevel::Low);
+        match run(&s, &id, &e, Some(&c)) {
+            GateDecision::Deny(d) => {
+                // MalformedEncoding folds into the "malformed"
+                // matched_rule (the operator does not need to
+                // distinguish base64 vs JSON failures at audit
+                // time).
+                assert_eq!(d.matched_rule, "approval_token_malformed");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_token_for_matching_method_and_subject_admits() {
+        let s = store();
+        let (wire, approval_id) = approve_and_mint_token(
+            &s,
+            "tool.payments.charge",
+            b"subj-1",
+            60_000,
+            1_700_000_000_000,
+        );
         let id = ident(b"subj-1");
         let mut e = env("tool.payments.charge", None);
-        e.approval_token = Some(token);
+        e.approval_token = Some(wire);
+        let key = test_key();
         let d = evaluate(
             Some(&s),
             GateInputs {
@@ -818,6 +937,8 @@ mod tests {
                 envelope: &e,
                 capability: None,
                 now: 1_700_000_000,
+                now_ms: 1_700_000_000_500,
+                signing_key: &key,
             },
         );
         match d {
@@ -833,38 +954,207 @@ mod tests {
     }
 
     #[test]
-    fn approved_token_for_other_method_is_denied() {
+    fn structured_token_scope_mismatch_is_denied() {
+        // Token issued for tool.web_read rejected when used
+        // against tool.terminal. Surface the specific
+        // matched_rule so operators can filter logs.
         let s = store();
-        let id = s
-            .create_approval(
-                "agt-1",
-                "subj-1",
-                "tool.payments.charge",
-                "payments",
-                "",
-                "",
-                &[],
-                None,
-                9_999_999_999,
-            )
-            .unwrap();
-        let token = s
-            .decide_approval(&id, ApprovalStatus::Approved, "alice", "")
-            .unwrap()
-            .unwrap();
-        let i = ident(b"subj-1");
-        let mut e = env("tool.web_fetch", None);
-        e.approval_token = Some(token);
+        let (wire, _) =
+            approve_and_mint_token(&s, "tool.web_read", b"subj-1", 60_000, 1_700_000_000_000);
+        let id = ident(b"subj-1");
+        let mut e = env("tool.terminal", None);
+        e.approval_token = Some(wire);
+        let key = test_key();
         let d = evaluate(
             Some(&s),
             GateInputs {
-                identity: &i,
+                identity: &id,
                 envelope: &e,
                 capability: None,
                 now: 1_700_000_000,
+                now_ms: 1_700_000_000_500,
+                signing_key: &key,
             },
         );
-        assert!(matches!(d, GateDecision::Deny(_)));
+        match d {
+            GateDecision::Deny(d) => {
+                assert_eq!(d.matched_rule, "approval_token_scope_mismatch");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_token_subject_mismatch_is_denied() {
+        // Token issued to subj-A → caller subj-B is denied.
+        let s = store();
+        let (wire, _) = approve_and_mint_token(&s, "tool.x", b"subj-A", 60_000, 1_700_000_000_000);
+        let id = ident(b"subj-B");
+        let mut e = env("tool.x", None);
+        e.approval_token = Some(wire);
+        let key = test_key();
+        let d = evaluate(
+            Some(&s),
+            GateInputs {
+                identity: &id,
+                envelope: &e,
+                capability: None,
+                now: 1_700_000_000,
+                now_ms: 1_700_000_000_500,
+                signing_key: &key,
+            },
+        );
+        match d {
+            GateDecision::Deny(d) => {
+                assert_eq!(d.matched_rule, "approval_token_subject_mismatch");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_token_expired_is_denied() {
+        let s = store();
+        // Mint with issued_at_ms a long way back + small TTL.
+        let (wire, _) = approve_and_mint_token(&s, "tool.x", b"subj-1", 1_000, 1_700_000_000_000);
+        let id = ident(b"subj-1");
+        let mut e = env("tool.x", None);
+        e.approval_token = Some(wire);
+        let key = test_key();
+        // now_ms is well past expires_at_ms.
+        let d = evaluate(
+            Some(&s),
+            GateInputs {
+                identity: &id,
+                envelope: &e,
+                capability: None,
+                now: 1_700_000_500,
+                now_ms: 1_700_000_500_000,
+                signing_key: &key,
+            },
+        );
+        match d {
+            GateDecision::Deny(d) => {
+                assert_eq!(d.matched_rule, "approval_token_expired");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_token_bad_signature_is_denied() {
+        let s = store();
+        let (wire, _) = approve_and_mint_token(&s, "tool.x", b"subj-1", 60_000, 1_700_000_000_000);
+        let id = ident(b"subj-1");
+        let mut e = env("tool.x", None);
+        e.approval_token = Some(wire);
+        let other_key = b"a-completely-different-key-32-by".to_vec();
+        let d = evaluate(
+            Some(&s),
+            GateInputs {
+                identity: &id,
+                envelope: &e,
+                capability: None,
+                now: 1_700_000_000,
+                now_ms: 1_700_000_000_500,
+                signing_key: &other_key,
+            },
+        );
+        match d {
+            GateDecision::Deny(d) => {
+                assert_eq!(d.matched_rule, "approval_token_bad_signature");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn consumed_token_cannot_be_replayed() {
+        // Two requests with the same token: first wins, second
+        // hits the SQLite blocklist row and is denied.
+        let s = store();
+        let (wire, _) = approve_and_mint_token(&s, "tool.x", b"subj-1", 60_000, 1_700_000_000_000);
+        let id = ident(b"subj-1");
+        let mut e = env("tool.x", None);
+        e.approval_token = Some(wire);
+        let key = test_key();
+        let first = evaluate(
+            Some(&s),
+            GateInputs {
+                identity: &id,
+                envelope: &e,
+                capability: None,
+                now: 1_700_000_000,
+                now_ms: 1_700_000_000_500,
+                signing_key: &key,
+            },
+        );
+        assert!(matches!(first, GateDecision::Allow(_)));
+        let replay = evaluate(
+            Some(&s),
+            GateInputs {
+                identity: &id,
+                envelope: &e,
+                capability: None,
+                now: 1_700_000_000,
+                now_ms: 1_700_000_000_600,
+                signing_key: &key,
+            },
+        );
+        match replay {
+            GateDecision::Deny(d) => {
+                assert_eq!(d.matched_rule, "approval_token_consumed");
+            }
+            other => panic!("expected consumed denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_compare_is_constant_time_under_tampered_signature_byte() {
+        // Defence-in-depth assertion: the gate must reject ALL
+        // tampered-signature tokens regardless of WHERE the
+        // tampering happened. We can't measure timing in unit
+        // tests reliably, so we verify the *behavioural*
+        // contract: a single-byte signature flip in any
+        // position yields BadSignature. The implementation
+        // uses subtle::ConstantTimeEq so the underlying
+        // primitive is constant-time by construction; this
+        // test prevents a future refactor that drops the
+        // contract.
+        let s = store();
+        let (wire, _) = approve_and_mint_token(&s, "tool.x", b"subj-1", 60_000, 1_700_000_000_000);
+        let parsed = ApprovalToken::parse(&wire).unwrap();
+        for i in 0..parsed.signature.len() {
+            let mut tampered = parsed.clone();
+            let mut sig_bytes: Vec<u8> = parsed.signature.bytes().collect();
+            sig_bytes[i] ^= 0x01;
+            tampered.signature = String::from_utf8(sig_bytes).unwrap();
+            let tampered_wire = tampered.to_wire().unwrap();
+            let id = ident(b"subj-1");
+            let mut e = env("tool.x", None);
+            e.approval_token = Some(tampered_wire);
+            let key = test_key();
+            let d = evaluate(
+                Some(&s),
+                GateInputs {
+                    identity: &id,
+                    envelope: &e,
+                    capability: None,
+                    now: 1_700_000_000,
+                    now_ms: 1_700_000_000_500,
+                    signing_key: &key,
+                },
+            );
+            match d {
+                GateDecision::Deny(d) => {
+                    assert_eq!(
+                        d.matched_rule, "approval_token_bad_signature",
+                        "byte {i} flip must yield bad_signature"
+                    );
+                }
+                other => panic!("byte {i} flip yielded {other:?}"),
+            }
+        }
     }
 
     // ── policy-floor invariant ───────────────────────────

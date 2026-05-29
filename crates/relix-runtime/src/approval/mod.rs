@@ -38,6 +38,7 @@ pub mod email_reply;
 pub mod mirror;
 pub mod multi_dispatch;
 pub mod store;
+pub mod token;
 
 pub use dashboard_dispatch::DashboardChannelDispatch;
 pub use delivery::{
@@ -59,3 +60,4 @@ pub use multi_dispatch::{
     ApprovalSendArgs, MeshSingleChannelDispatch, MultiChannelDispatch, approval_send_method,
 };
 pub use store::{ApprovalDeliveryRow, ApprovalRequestStore, ApprovalStoreError};
+pub use token::{ApprovalToken, SIGNING_KEY_ENV, TokenError, signing_key_from_env};

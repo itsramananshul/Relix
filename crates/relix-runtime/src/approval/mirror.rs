@@ -152,11 +152,11 @@ pub fn wire_dual_write(service: &ApprovalDeliveryService, planning: &PlanningSto
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::delivery::DeliveryError;
     use crate::approval::{
         ApprovalDeliveryConfig, ApprovalDeliveryMatrix, ApprovalDeliveryService, ApprovalRequest,
         ApprovalRequestStore, ChannelDispatch, ChannelKind, ChannelsConfig,
     };
-    use crate::approval::delivery::DeliveryError;
     use crate::planning::PlanSpec;
     use crate::planning::approval::ApprovalRecord;
     use std::sync::Mutex;

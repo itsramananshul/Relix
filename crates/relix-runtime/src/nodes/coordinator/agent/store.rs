@@ -144,6 +144,30 @@ impl ApprovalStatus {
     }
 }
 
+/// SEC PART A — metadata returned by [`AgentStore::decide_approval`]
+/// when an approval is approved. Carries the fields the cap
+/// handler needs to mint a structured signed
+/// [`crate::approval::ApprovalToken`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecidedApprovalMetadata {
+    /// Same as `ApprovalRecord::approval_id`. The token binds
+    /// to this id and the SQLite blocklist row is keyed off it.
+    pub approval_id: String,
+    /// Subject id (NodeId hex) the approval was filed for —
+    /// the token binds to this so agent A cannot replay agent
+    /// B's token.
+    pub subject_id: String,
+    /// Capability method the approval was filed for — the
+    /// token binds to this so a token for `tool.web_read` does
+    /// not admit `tool.terminal`.
+    pub method: String,
+    /// Optional task correlation id from the approval row.
+    /// Used as the token's `session_id` binding so the
+    /// admission audit can correlate the approval with the
+    /// task it was filed against.
+    pub task_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalRecord {
     pub approval_id: String,
@@ -502,39 +526,27 @@ impl AgentStore {
         Ok(row)
     }
 
-    /// Lookup an approval by its one-shot token. The
-    /// admission gate calls this on every inbound that
-    /// carries an `approval_token` header.
-    pub fn get_approval_by_token(
-        &self,
-        token: &str,
-    ) -> Result<Option<ApprovalRecord>, AgentStoreError> {
-        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        let row = conn
-            .query_row(
-                "SELECT approval_id, agent_id, subject_id, method, capability_category,
-                        args_redacted_hash, reason, approver_groups,
-                        requested_at, expires_at, status,
-                        decided_at, decided_by, decision_note,
-                        task_id, approval_token
-                 FROM approval_requests WHERE approval_token = ?1",
-                params![token],
-                row_to_approval,
-            )
-            .optional()?;
-        Ok(row)
-    }
-
-    /// Approve: stamp decided_at/by/note + generate the one-shot
-    /// token. Returns the new token. Refuses to act on a
-    /// terminal status.
+    /// SEC PART A: approve or reject a pending approval.
+    /// Returns `Some(DecidedApprovalMetadata)` when the
+    /// decision is `Approved` so the caller can mint a
+    /// structured [`crate::approval::ApprovalToken`] from the
+    /// returned metadata. Returns `Ok(None)` on `Rejected`.
+    /// Refuses to act on a terminal status.
+    ///
+    /// The legacy random `approval_token` column is left
+    /// untouched (NULL on new rows) — the structured token's
+    /// HMAC signature is the proof, and the consumption
+    /// blocklist lives in [`approval_token_blocklist`]. The
+    /// admission gate calls
+    /// [`Self::try_consume_token_atomic`] on the token's
+    /// blocklist key, NOT on the `approval_token` column.
     pub fn decide_approval(
         &self,
         approval_id: &str,
         decision: ApprovalStatus,
         decided_by: &str,
         note: &str,
-    ) -> Result<Option<String>, AgentStoreError> {
+    ) -> Result<Option<DecidedApprovalMetadata>, AgentStoreError> {
         if !matches!(
             decision,
             ApprovalStatus::Approved | ApprovalStatus::Rejected
@@ -544,62 +556,121 @@ impl AgentStore {
             ));
         }
         let now = unix_now();
-        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        let current: Option<String> = conn
+        let mut conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, String, Option<String>)> = tx
             .query_row(
-                "SELECT status FROM approval_requests WHERE approval_id = ?1",
+                "SELECT status, subject_id, method, task_id
+                 FROM approval_requests WHERE approval_id = ?1",
                 params![approval_id],
-                |r| r.get::<_, String>(0),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
             )
             .optional()?;
-        match current {
+        let (status_str, subject_id, method, task_id) = match row {
             None => return Err(AgentStoreError::NotFound(approval_id.into())),
-            Some(s) if s != "pending" => {
-                return Err(AgentStoreError::BadInput(format!(
-                    "approval is {s}, not pending"
-                )));
-            }
-            _ => {}
-        }
-        let token = if decision == ApprovalStatus::Approved {
-            Some(new_approval_token())
-        } else {
-            None
+            Some(t) => t,
         };
-        conn.execute(
+        if status_str != "pending" {
+            return Err(AgentStoreError::BadInput(format!(
+                "approval is {status_str}, not pending"
+            )));
+        }
+        let changed = tx.execute(
             "UPDATE approval_requests SET
                  status = ?1,
                  decided_at = ?2,
                  decided_by = ?3,
-                 decision_note = ?4,
-                 approval_token = ?5
-             WHERE approval_id = ?6",
-            params![
-                decision.as_wire(),
-                now,
-                decided_by,
-                note,
-                token,
-                approval_id,
-            ],
+                 decision_note = ?4
+             WHERE approval_id = ?5 AND status = 'pending'",
+            params![decision.as_wire(), now, decided_by, note, approval_id,],
         )?;
-        Ok(token)
+        // The `status = 'pending'` guard defends against a
+        // concurrent decide() that ran between our SELECT and
+        // UPDATE. Both transactions can't both UPDATE; the
+        // BEGIN IMMEDIATE acquires the reserved lock so this
+        // is the safety belt for a hypothetical future
+        // refactor that drops the lock.
+        if changed == 0 {
+            return Err(AgentStoreError::BadInput(format!(
+                "approval {approval_id} was decided concurrently"
+            )));
+        }
+        tx.commit()?;
+        Ok(if decision == ApprovalStatus::Approved {
+            Some(DecidedApprovalMetadata {
+                approval_id: approval_id.into(),
+                subject_id,
+                method,
+                task_id,
+            })
+        } else {
+            None
+        })
     }
 
-    /// Consume an approved approval's token. The admission gate
-    /// calls this once it has admitted the call so a replay can't
-    /// reuse the same token.
-    pub fn consume_approval_token(&self, token: &str) -> Result<(), AgentStoreError> {
-        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        let changed = conn.execute(
-            "UPDATE approval_requests SET status = 'consumed'
-             WHERE approval_token = ?1 AND status = 'approved'",
-            params![token],
+    /// SEC PART A: atomically claim a one-shot
+    /// [`ApprovalToken`](crate::approval::ApprovalToken) blocklist
+    /// row. Returns `Ok(true)` when this call was the FIRST to
+    /// consume `token_id`; returns `Ok(false)` when the token
+    /// was already consumed (PRIMARY KEY collision).
+    ///
+    /// Wrapped in a single `BEGIN IMMEDIATE` transaction so
+    /// two concurrent admission paths cannot both see "not yet
+    /// consumed". SQLite's `BEGIN IMMEDIATE` acquires the
+    /// reserved lock up front; the contender blocks until the
+    /// winner commits, at which point its INSERT sees the
+    /// existing row and the UNIQUE constraint fires.
+    ///
+    /// `approval_id` is stored alongside so operators can
+    /// `SELECT * FROM approval_token_blocklist WHERE
+    /// approval_id = ?` for audit forensics.
+    pub fn try_consume_token_atomic(
+        &self,
+        token_id: &str,
+        approval_id: &str,
+        consumed_at_ms: i64,
+    ) -> Result<bool, AgentStoreError> {
+        let mut conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // INSERT OR IGNORE: the PRIMARY KEY collision on
+        // re-use translates to a 0-row change. The transaction
+        // commits either way — operator history of repeat
+        // attempts is not interesting, only "did this attempt
+        // win the race?".
+        let changes = tx.execute(
+            "INSERT OR IGNORE INTO approval_token_blocklist (token_id, approval_id, consumed_at)
+             VALUES (?1, ?2, ?3)",
+            params![token_id, approval_id, consumed_at_ms],
         )?;
-        if changed == 0 {
-            return Err(AgentStoreError::NotFound(format!("token: {token}")));
-        }
-        Ok(())
+        tx.commit()?;
+        Ok(changes > 0)
+    }
+
+    /// Read the audit row for a consumed token. Returns
+    /// `Ok(Some(consumed_at_ms))` when the token has been
+    /// consumed, `Ok(None)` otherwise. Used by the bridge's
+    /// debug surface only — the admission gate does not
+    /// consult this on the hot path.
+    pub fn token_blocklist_consumed_at(
+        &self,
+        token_id: &str,
+    ) -> Result<Option<i64>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let row: Option<i64> = conn
+            .query_row(
+                "SELECT consumed_at FROM approval_token_blocklist WHERE token_id = ?1",
+                params![token_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Newest-first pending approvals, capped at `limit`.
@@ -835,7 +906,21 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              created_at      INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS standing_approvals_agent
-             ON standing_approvals(agent_id, match_category, expires_at);",
+             ON standing_approvals(agent_id, match_category, expires_at);
+
+         -- SEC PART A: one-shot approval-token consumption
+         -- blocklist. The admission gate atomically INSERTs a
+         -- row here when it admits a token-bearing call; the
+         -- PRIMARY KEY constraint makes a concurrent re-use a
+         -- guaranteed UNIQUE-violation, so two requests with
+         -- the same token cannot both pass.
+         CREATE TABLE IF NOT EXISTS approval_token_blocklist (
+             token_id     TEXT PRIMARY KEY,
+             approval_id  TEXT NOT NULL,
+             consumed_at  INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS approval_token_blocklist_approval
+             ON approval_token_blocklist(approval_id);",
     )
 }
 
@@ -956,13 +1041,6 @@ fn new_standing_id() -> String {
     let mut bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
     format!("std_{}", hex::encode(bytes))
-}
-
-fn new_approval_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
 }
 
 fn unix_now() -> i64 {
@@ -1126,7 +1204,12 @@ mod tests {
     }
 
     #[test]
-    fn decide_approved_mints_a_token_and_consume_invalidates_replay() {
+    fn decide_approved_returns_metadata_for_signed_token_mint() {
+        // SEC PART A: decide_approval no longer mints a random
+        // string token. It returns the metadata the cap handler
+        // needs to mint a structured signed
+        // `ApprovalToken`. The legacy `approval_token` column is
+        // left NULL on new rows.
         let s = store();
         let id = s
             .create_approval(
@@ -1137,25 +1220,45 @@ mod tests {
                 "",
                 "",
                 &[],
-                None,
+                Some("task-7"),
                 unix_now() + 60,
             )
             .unwrap();
-        let token = s
+        let meta = s
             .decide_approval(&id, ApprovalStatus::Approved, "alice", "ok")
             .unwrap()
-            .expect("approved -> Some(token)");
-        let by_token = s.get_approval_by_token(&token).unwrap().unwrap();
-        assert_eq!(by_token.status, ApprovalStatus::Approved);
-        s.consume_approval_token(&token).unwrap();
-        // Replay fails.
-        assert!(matches!(
-            s.consume_approval_token(&token),
-            Err(AgentStoreError::NotFound(_))
-        ));
+            .expect("approved -> Some(metadata)");
+        assert_eq!(meta.approval_id, id);
+        assert_eq!(meta.subject_id, "subj-1");
+        assert_eq!(meta.method, "tool.x");
+        assert_eq!(meta.task_id.as_deref(), Some("task-7"));
+        // Legacy column is NOT written.
+        let row = s.get_approval(&id).unwrap().unwrap();
+        assert_eq!(row.status, ApprovalStatus::Approved);
+        assert!(row.approval_token.is_none());
+    }
+
+    #[test]
+    fn token_blocklist_first_claim_wins_replay_loses() {
+        // SEC PART A: replay defense lives on the
+        // approval_token_blocklist (PRIMARY KEY on token_id).
+        // The first atomic INSERT wins; the second sees the
+        // existing row and returns false.
+        let s = store();
+        let claimed_first = s
+            .try_consume_token_atomic("token-id-aaa", "apr-1", 100)
+            .unwrap();
+        assert!(claimed_first);
+        let claimed_again = s
+            .try_consume_token_atomic("token-id-aaa", "apr-1", 200)
+            .unwrap();
+        assert!(!claimed_again, "replay must lose");
         assert_eq!(
-            s.get_approval(&id).unwrap().unwrap().status,
-            ApprovalStatus::Consumed
+            s.token_blocklist_consumed_at("token-id-aaa")
+                .unwrap()
+                .unwrap(),
+            100,
+            "first-claim timestamp must NOT regress on replay"
         );
     }
 
@@ -1165,10 +1268,10 @@ mod tests {
         let id = s
             .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60)
             .unwrap();
-        let token = s
+        let meta = s
             .decide_approval(&id, ApprovalStatus::Rejected, "alice", "nope")
             .unwrap();
-        assert!(token.is_none());
+        assert!(meta.is_none());
         assert_eq!(
             s.get_approval(&id).unwrap().unwrap().status,
             ApprovalStatus::Rejected

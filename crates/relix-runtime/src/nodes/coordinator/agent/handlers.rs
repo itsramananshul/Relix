@@ -283,16 +283,36 @@ pub fn handle_approval_pending(store: &AgentStore, ctx: &InvocationCtx) -> Handl
 
 pub type TaskResumeFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// SEC PART A: lifetime (in milliseconds) the cap handler
+/// stamps on every freshly-minted [`crate::approval::ApprovalToken`].
+/// 5 minutes is the spec's documented default. Operators that
+/// need a different TTL can tune the env via wrapper script —
+/// the cap surface itself does not parameterise TTL because
+/// operators routinely default to forever-long tokens
+/// otherwise, which defeats the purpose.
+pub const APPROVAL_TOKEN_TTL_MS: i64 = 5 * 60 * 1000;
+
 /// Wire arg: `approval_id|decision|decided_by|note`.
 /// `decision` is `approved` or `rejected`.
-/// On `approved`, returns `ok|<token>\n` and calls
-/// `resume_task` to flip the waiting task back to `running`.
-/// On `rejected`, returns `ok\n` and calls `fail_task`.
+/// On `approved`, returns `ok|<wire_token>\n` (where
+/// `<wire_token>` is the structured base64url-encoded
+/// [`crate::approval::ApprovalToken`]) and calls `resume_task`
+/// to flip the waiting task back to `running`. On `rejected`,
+/// returns `ok\n` and calls `fail_task`.
+///
+/// SEC PART A: `signing_key` is the HMAC-SHA256 key the cap
+/// handler signs the token with. The controller wires it from
+/// `RELIX_APPROVAL_TOKEN_KEY` at startup. An empty slice means
+/// "no key configured" — the decision still completes (status
+/// flips on the row) but no token is returned, so operators see
+/// `ok\n` and the caller cannot mint admission-time proof.
+/// Fail-loud: the controller logs the missing env var at boot.
 pub fn handle_approval_decide(
     store: &AgentStore,
     ctx: &InvocationCtx,
     resume_task: &TaskResumeFn,
     fail_task: &TaskResumeFn,
+    signing_key: &[u8],
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
@@ -322,7 +342,7 @@ pub fn handle_approval_decide(
         Err(e) => return internal(format!("coord.approval.decide: {e}")),
     };
     let task_id = record.task_id.clone();
-    let token = match store.decide_approval(approval_id, decision, decided_by, note) {
+    let metadata = match store.decide_approval(approval_id, decision, decided_by, note) {
         Ok(t) => t,
         Err(AgentStoreError::NotFound(_)) => {
             return invalid(format!("coord.approval.decide: not found: {approval_id}"));
@@ -340,10 +360,44 @@ pub fn handle_approval_decide(
             tracing::warn!(task_id = %tid, error = %e, "coord.approval.decide: task hop failed");
         }
     }
-    let body = if let Some(t) = token {
-        format!("ok|{t}\n")
-    } else {
-        "ok\n".to_string()
+    // SEC PART A: mint the structured signed token when the
+    // approval was approved. The legacy `ok|<random>\n` wire
+    // shape is preserved — only the contents change to a
+    // base64url(json)-encoded `ApprovalToken`.
+    let body = match metadata {
+        Some(meta) if !signing_key.is_empty() => {
+            let issued_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            match crate::approval::ApprovalToken::issue(
+                &meta.approval_id,
+                &meta.method,
+                &meta.subject_id,
+                meta.task_id.as_deref().unwrap_or(""),
+                issued_at_ms,
+                APPROVAL_TOKEN_TTL_MS,
+                signing_key,
+            ) {
+                Ok(wire) => format!("ok|{wire}\n"),
+                Err(e) => {
+                    tracing::error!(
+                        approval_id = %meta.approval_id,
+                        error = %e,
+                        "coord.approval.decide: token mint failed"
+                    );
+                    return internal(format!("coord.approval.decide: token mint: {e}"));
+                }
+            }
+        }
+        Some(meta) => {
+            tracing::warn!(
+                approval_id = %meta.approval_id,
+                "coord.approval.decide: signing key not configured; approving without token"
+            );
+            "ok\n".to_string()
+        }
+        None => "ok\n".to_string(),
     };
     HandlerOutcome::Ok(body.into_bytes())
 }
@@ -660,8 +714,12 @@ mod tests {
         assert!(body.contains("count=2"));
     }
 
+    fn test_signing_key() -> Vec<u8> {
+        b"handlers-test-signing-key-32bytx".to_vec()
+    }
+
     #[test]
-    fn approval_decide_approves_and_mints_token() {
+    fn approval_decide_approves_and_mints_structured_token() {
         let s = store();
         let id = s
             .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
@@ -674,10 +732,40 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
+            &test_signing_key(),
         ));
         assert!(body.starts_with("ok|"));
-        let token = body.trim_start_matches("ok|").trim();
-        assert_eq!(token.len(), 32);
+        let wire = body.trim_start_matches("ok|").trim();
+        // SEC PART A: the wire token must parse + verify with
+        // the same key the handler signed it with.
+        let tok = crate::approval::ApprovalToken::parse(wire).unwrap();
+        tok.verify_signature(&test_signing_key())
+            .expect("token signature must verify");
+        assert_eq!(tok.approval_id, id);
+        assert_eq!(tok.method, "m");
+        assert_eq!(tok.subject_id, "s");
+    }
+
+    #[test]
+    fn approval_decide_approves_without_key_omits_token() {
+        // SEC PART A fail-loud path: empty signing key returns
+        // `ok\n` so operators noticing missing tokens reach the
+        // controller boot log warning.
+        let s = store();
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .unwrap();
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{id}|approved|alice|ok");
+        let body = ok_body(handle_approval_decide(
+            &s,
+            &fake_ctx(arg.as_bytes()),
+            &resume,
+            &fail,
+            &[],
+        ));
+        assert_eq!(body, "ok\n");
     }
 
     #[test]
@@ -694,6 +782,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
+            &test_signing_key(),
         ));
         assert_eq!(body, "ok\n");
     }
@@ -720,7 +809,13 @@ mod tests {
             Ok(())
         });
         let arg = format!("{id}|approved|alice|ok");
-        let _ = handle_approval_decide(&s, &fake_ctx(arg.as_bytes()), &resume, &fail);
+        let _ = handle_approval_decide(
+            &s,
+            &fake_ctx(arg.as_bytes()),
+            &resume,
+            &fail,
+            &test_signing_key(),
+        );
         assert_eq!(resumed.lock().unwrap().as_deref(), Some("task-42"));
         assert!(failed.lock().unwrap().is_none());
     }
@@ -739,7 +834,13 @@ mod tests {
             Ok(())
         });
         let arg = format!("{id}|rejected|alice|nope");
-        let _ = handle_approval_decide(&s, &fake_ctx(arg.as_bytes()), &resume, &fail);
+        let _ = handle_approval_decide(
+            &s,
+            &fake_ctx(arg.as_bytes()),
+            &resume,
+            &fail,
+            &test_signing_key(),
+        );
         assert_eq!(failed.lock().unwrap().as_deref(), Some("task-99"));
     }
 
@@ -771,9 +872,10 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
+            &test_signing_key(),
         ));
-        // Cleanly approves (returns the one-shot token) but
-        // never invokes either closure.
+        // Cleanly approves (returns the one-shot signed
+        // token) but never invokes either closure.
         assert!(body.starts_with("ok|"));
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }

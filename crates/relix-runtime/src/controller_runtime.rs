@@ -648,6 +648,30 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
         bridge.set_always_require_methods(methods);
     }
+    // SEC PART A: install the HMAC-SHA256 signing key for
+    // structured ApprovalTokens. Sourced from
+    // `RELIX_APPROVAL_TOKEN_KEY`. Missing env var leaves the
+    // bridge in the no-key configuration — every token-bearing
+    // call hits `approval_token_missing_key`. We log loudly so
+    // operators see the missing config at boot.
+    match crate::approval::signing_key_from_env() {
+        Ok(key) => {
+            tracing::info!(
+                key_bytes = key.len(),
+                "approval: structured-token signing key loaded from {} (SEC PART A)",
+                crate::approval::SIGNING_KEY_ENV
+            );
+            bridge.set_approval_token_signing_key(key);
+        }
+        Err(_) => {
+            tracing::warn!(
+                env = crate::approval::SIGNING_KEY_ENV,
+                "approval: signing key env var unset; ALL token-bearing \
+                 admission calls will be denied with approval_token_missing_key. \
+                 Set the env var to a 32+ byte secret to enable structured tokens."
+            );
+        }
+    }
     // W2: build the per-controller access broker from
     // `[[execution.agents]]`. Absent / empty config produces
     // an empty broker — every check returns Allow so
@@ -2351,13 +2375,24 @@ fn register_agent_capabilities(
             let _ = ts_fail.append_event(task_id, "task.approval_decided", "decision=rejected");
             r.map_err(|e| e.to_string())
         });
+        // SEC PART A: capture the structured-token signing key
+        // at register time so the cap handler can mint
+        // approval tokens without consulting env on every
+        // invocation. Empty bytes when the operator did not
+        // set `RELIX_APPROVAL_TOKEN_KEY` — handler gracefully
+        // omits the token in that case.
+        let signing_key: Vec<u8> =
+            crate::approval::signing_key_from_env().unwrap_or_default();
         bridge.register(
             "coord.approval.decide",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
                 let s = s.clone();
                 let resume = resume.clone();
                 let fail = fail.clone();
-                async move { handlers::handle_approval_decide(&s, &ctx, &resume, &fail) }
+                let signing_key = signing_key.clone();
+                async move {
+                    handlers::handle_approval_decide(&s, &ctx, &resume, &fail, &signing_key)
+                }
             })),
         );
     }
