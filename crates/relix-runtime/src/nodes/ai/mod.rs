@@ -1111,17 +1111,17 @@ async fn handle_chat_stream(
     // provider's default when the router is disabled OR the
     // tier is unmapped + fallback_to_default = true.
     //
-    // RELIX-7.29 PART 2: SC sampling is intentionally NOT
-    // wired into the streaming variant — the spec sampling
-    // pattern (`tokio::join_all` of N full responses) is
-    // antithetical to token-by-token streaming. Operators who
-    // want SC on a workflow use unary `ai.chat`.
+    // RELIX-7.29 (post-rebuild): self-consistency now runs on
+    // the streaming path by dispatching N unary samples in
+    // parallel, scoring them, and chunk-streaming the winner.
+    // The legacy reasoning configs (judge_cfg,
+    // self_consistency_cfg, routing_router) stay on the
+    // signature for back-compat with the old wiring; they're
+    // consumed by the unary-path setup, not the stream.
     let _ = (
         &judge_cfg,
         &self_consistency_cfg,
         &routing_router,
-        &sc_cfg,
-        &sc_stats,
         &belief_tracker,
         &judge_runtime_cfg,
         &judge_recorder,
@@ -1186,6 +1186,134 @@ async fn handle_chat_stream(
         input.model.clone()
     };
     let training_agent = ctx.caller.name.clone();
+
+    // RELIX-7.29 (post-rebuild) — self-consistency on
+    // streaming. Activation: enabled + capability matches +
+    // sample_count >= 2. When the gate fires we run N unary
+    // samples in parallel, score them, and chunk-stream the
+    // winner instead of calling `generate_reply_stream`.
+    // Failures (embed error, < 2 samples returned) fall back
+    // to the normal streaming path with no observable change.
+    if sc_cfg.matches_capability("ai.chat.stream") && sc_cfg.sample_count >= 2 {
+        let sc_template = ChatInput {
+            session_id: input.session_id.clone(),
+            prompt: input.prompt.clone(),
+            history: input.history.clone(),
+            model: input.model.clone(),
+            system_prompt: input.system_prompt.clone(),
+            ..ChatInput::default()
+        };
+        if let Some(result) = run_self_consistency_stream(&provider, sc_template, &sc_cfg).await {
+            // Attach the SC hint so the dispatch bridge's
+            // ConfidenceScorer substitutes the score for
+            // `provider_signal`.
+            let request_id = ctx.request_id;
+            if let Some(sink) = metrics_sink.as_ref() {
+                sink.attach_self_consistency(crate::metrics::AiSelfConsistencyHint {
+                    request_id,
+                    score: result.outcome.score,
+                    sample_count: result.outcome.samples.len() as u32,
+                    best_sample_index: result.best_index as u32,
+                });
+                // Attach aggregated usage from every sample so
+                // the metrics row reflects the true cost of the
+                // SC fan-out, not just the winning sample.
+                sink.attach_ai_usage(crate::metrics::AiUsageHint {
+                    request_id,
+                    prompt_tokens: result.total_prompt_tokens.min(u32::MAX as u64) as u32,
+                    completion_tokens: result.total_completion_tokens.min(u32::MAX as u64) as u32,
+                    model: result.model.clone(),
+                    routing_tier: None,
+                });
+            }
+            sc_stats.record(result.outcome.score, result.outcome.samples.len());
+            tracing::info!(
+                session_id,
+                sc_score = result.outcome.score,
+                sample_count = result.outcome.samples.len(),
+                best_sample = result.best_index,
+                "ai.chat.stream: self-consistency outcome recorded"
+            );
+            // Chunk the winning text into wire-sized frames
+            // and stream them through. Mirror the normal-path
+            // training + observability writes so the record
+            // shape stays identical.
+            let chunks = chunk_for_stream(&result.winner_text);
+            let winner_text = result.winner_text.clone();
+            let model_used = if result.model.is_empty() {
+                training_model.clone()
+            } else {
+                result.model.clone()
+            };
+            let total_prompt = result.total_prompt_tokens.min(u32::MAX as u64) as u32;
+            let total_completion = result.total_completion_tokens.min(u32::MAX as u64) as u32;
+            let training_session = session_id.clone();
+            let provider_name_owned = provider_name.clone();
+            let training_system_prompt = training_system_prompt.clone();
+            let training_user_message = training_user_message.clone();
+            let training_agent = training_agent.clone();
+            let interaction_sink = interaction_sink.clone();
+            let observability = observability.clone();
+            let mapped = async_stream::stream! {
+                for c in chunks {
+                    yield Ok(c);
+                }
+                if let Some(sink) = interaction_sink.as_ref() {
+                    let rec = crate::training::InteractionRecord::new(
+                        crate::training::InteractionId::from_request(&request_id),
+                        training_session.clone(),
+                        training_agent.clone(),
+                        model_used.clone(),
+                        provider_name_owned.clone(),
+                        training_system_prompt.clone(),
+                        training_user_message.clone(),
+                        winner_text.clone(),
+                        vec![],
+                        Some(total_prompt),
+                        Some(total_completion),
+                        stream_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        true,
+                        None,
+                        0,
+                    );
+                    sink.record_interaction(rec);
+                }
+                if let Some(obs) = observability.as_ref() {
+                    let trace_id = format!("{:032x}", u128::from_le_bytes(request_id.0));
+                    let system_hash = if training_system_prompt.is_empty() {
+                        String::new()
+                    } else {
+                        crate::nodes::ai::provenance_hooks::hash_blake3(&training_system_prompt)
+                    };
+                    crate::nodes::ai::provenance_hooks::record_chat_provenance(
+                        obs.as_ref(),
+                        &training_session,
+                        &trace_id,
+                        &model_used,
+                        &system_hash,
+                        Some(&training_agent),
+                    );
+                    let duration_ms =
+                        stream_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    crate::nodes::ai::provenance_hooks::record_chat_metadata(
+                        obs.as_ref(),
+                        &training_session,
+                        &trace_id,
+                        &training_agent,
+                        "ai.chat.stream.complete",
+                        &model_used,
+                        duration_ms,
+                        Some(total_prompt as u64 + total_completion as u64),
+                        true,
+                    );
+                }
+            };
+            return Ok(Box::pin(mapped));
+        }
+        // SC pipeline failed (provider error / embed error /
+        // single sample returned). Drop through to the normal
+        // streaming path so the caller still gets a response.
+    }
 
     let provider_stream = provider.generate_reply_stream(input).await.map_err(|e| {
         let (kind, retry_hint) = match &e {
@@ -2327,6 +2455,129 @@ async fn run_self_consistency(
     }
     let outcome = crate::confidence::evaluate_samples(&core_answers, &embed_output.vectors);
     Some((outcome, sample_texts))
+}
+
+/// RELIX-7.29 (post-rebuild) — self-consistency for the
+/// streaming path. Runs N unary `generate_reply` calls in
+/// parallel via `tokio::spawn`, embeds each sample's core
+/// answer, scores them, and returns the winning text +
+/// outcome + aggregated token counts.
+///
+/// Returns `None` when fewer than two samples survive (the
+/// caller falls back to the normal streaming path), the embed
+/// step fails, or the vector count doesn't line up.
+async fn run_self_consistency_stream(
+    provider: &Arc<dyn ChatProvider>,
+    template: ChatInput,
+    sc_cfg: &crate::confidence::SelfConsistencyConfig,
+) -> Option<StreamSelfConsistencyResult> {
+    let n = sc_cfg.sample_count.max(2);
+    let mut tasks: Vec<_> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let p = provider.clone();
+        let input = ChatInput {
+            session_id: template.session_id.clone(),
+            prompt: template.prompt.clone(),
+            history: template.history.clone(),
+            model: template.model.clone(),
+            system_prompt: template.system_prompt.clone(),
+            ..ChatInput::default()
+        };
+        tasks.push(tokio::spawn(
+            async move { p.generate_reply(input).await.ok() },
+        ));
+    }
+    let mut sample_texts: Vec<String> = Vec::with_capacity(n);
+    let mut total_prompt: u64 = 0;
+    let mut total_completion: u64 = 0;
+    let mut model_used: String = template.model.clone();
+    for jh in tasks {
+        if let Ok(Some(output)) = jh.await {
+            if let Some(u) = output.usage.as_ref() {
+                total_prompt = total_prompt.saturating_add(u.prompt_tokens as u64);
+                total_completion = total_completion.saturating_add(u.completion_tokens as u64);
+            }
+            if !output.model.is_empty() {
+                model_used = output.model.clone();
+            }
+            sample_texts.push(output.text);
+        }
+    }
+    if sample_texts.len() < 2 {
+        return None;
+    }
+    let core_answers: Vec<String> = sample_texts
+        .iter()
+        .map(|t| crate::confidence::extract_core_answer(t, 100))
+        .collect();
+    let embed_input = EmbedInput {
+        model: String::new(),
+        texts: core_answers.clone(),
+    };
+    let embed_output = match provider.generate_embeddings(embed_input).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ai.chat.stream: self-consistency embed failed; falling back to normal stream"
+            );
+            return None;
+        }
+    };
+    if embed_output.vectors.len() != core_answers.len() {
+        tracing::warn!(
+            got = embed_output.vectors.len(),
+            want = core_answers.len(),
+            "ai.chat.stream: embed vector count mismatch; falling back to normal stream"
+        );
+        return None;
+    }
+    let outcome = crate::confidence::evaluate_samples(&core_answers, &embed_output.vectors);
+    let best_index = outcome.best_index.min(sample_texts.len() - 1);
+    let winner = sample_texts[best_index].clone();
+    Some(StreamSelfConsistencyResult {
+        outcome,
+        winner_text: winner,
+        best_index,
+        total_prompt_tokens: total_prompt,
+        total_completion_tokens: total_completion,
+        model: model_used,
+    })
+}
+
+/// Bundle returned by [`run_self_consistency_stream`] —
+/// surfaces both the SC outcome and the aggregated usage so
+/// the streaming handler can attach a single AiUsageHint with
+/// the total token cost of all N samples.
+struct StreamSelfConsistencyResult {
+    outcome: crate::confidence::SelfConsistencyOutcome,
+    winner_text: String,
+    best_index: usize,
+    total_prompt_tokens: u64,
+    total_completion_tokens: u64,
+    model: String,
+}
+
+/// RELIX-7.29 (post-rebuild) — chunk a winning self-
+/// consistency response into wire-sized frames so the caller
+/// receives a streaming experience even though the underlying
+/// SC pipeline runs unary. Yields one chunk per
+/// whitespace-separated token plus the trailing whitespace.
+/// `into_bytes` is fine because we control the source string
+/// and never split inside a UTF-8 code point.
+pub(crate) fn chunk_for_stream(text: &str) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut acc = String::new();
+    for ch in text.chars() {
+        acc.push(ch);
+        if ch.is_whitespace() {
+            out.push(std::mem::take(&mut acc).into_bytes());
+        }
+    }
+    if !acc.is_empty() {
+        out.push(acc.into_bytes());
+    }
+    out
 }
 
 /// RELIX-7.29 PART 2: cheap baseline confidence approximation
@@ -4996,5 +5247,257 @@ mod tests {
         // No panic, no overhead beyond the existing pipeline —
         // this test is the regression guard that an absent
         // ObservabilityContext is a true no-op.
+    }
+
+    // ── RELIX-7.29 (post-rebuild) — SC on streaming ─────
+
+    /// Sink that records SC + usage hints for assertion.
+    #[derive(Default)]
+    struct ScStreamSink {
+        usage: std::sync::Mutex<Vec<crate::metrics::AiUsageHint>>,
+        sc: std::sync::Mutex<Vec<crate::metrics::AiSelfConsistencyHint>>,
+    }
+    impl crate::metrics::MetricsSink for ScStreamSink {
+        fn record_invocation(&self, _: crate::metrics::InvocationMetric) {}
+        fn attach_ai_usage(&self, hint: crate::metrics::AiUsageHint) {
+            self.usage.lock().unwrap().push(hint);
+        }
+        fn attach_self_consistency(&self, hint: crate::metrics::AiSelfConsistencyHint) {
+            self.sc.lock().unwrap().push(hint);
+        }
+    }
+
+    /// Deterministic provider for the SC-streaming tests:
+    /// every call returns the same body + usage. Embeddings
+    /// are flat-1 so cosine = 1 and best_index = 0.
+    struct ScSampleProvider {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for ScSampleProvider {
+        async fn generate_reply(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatOutput, ProviderError> {
+            Ok(provider::ChatOutput {
+                text: self.text.clone(),
+                provider: "sc-sample",
+                model: "sc-sample-model".to_string(),
+                usage: Some(provider::TokenUsage {
+                    prompt_tokens: 7,
+                    completion_tokens: 11,
+                    total_tokens: 18,
+                }),
+                finish_reason: None,
+                logprob: None,
+            })
+        }
+        fn provider_name(&self) -> &'static str {
+            "sc-sample"
+        }
+        async fn generate_reply_stream(
+            &self,
+            _input: ChatInput,
+        ) -> Result<provider::ChatStream, ProviderError> {
+            // Fallback path emits a distinct token so a test can
+            // detect when SC was skipped vs fired.
+            let owned = vec!["STREAM-FALLBACK".to_string()];
+            let s = futures::stream::iter(
+                owned
+                    .into_iter()
+                    .map(|t| Ok(provider::StreamingChunk::Text(t))),
+            );
+            Ok(Box::pin(s))
+        }
+        async fn generate_embeddings(
+            &self,
+            input: provider::EmbedInput,
+        ) -> Result<provider::EmbedOutput, ProviderError> {
+            let vectors: Vec<Vec<f32>> = input.texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect();
+            Ok(provider::EmbedOutput {
+                model: "sc-embed".into(),
+                vectors,
+            })
+        }
+    }
+
+    fn sc_streaming_cfg(sample_count: usize) -> crate::confidence::SelfConsistencyConfig {
+        crate::confidence::SelfConsistencyConfig {
+            enabled: true,
+            sample_count,
+            min_score_to_enable: 1.0,
+            capability_patterns: vec!["ai.chat.stream".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_runs_sc_when_enabled_and_sample_count_three() {
+        let sink_typed: Arc<ScStreamSink> = Arc::new(ScStreamSink::default());
+        let sink: Arc<dyn crate::metrics::MetricsSink> = sink_typed.clone();
+        let provider: Arc<dyn ChatProvider> = Arc::new(ScSampleProvider {
+            text: "winning sample text".to_string(),
+        });
+        let stream = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(sink),
+            None,
+            None,
+            "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
+            sc_streaming_cfg(3),
+            crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
+            ctx(b"sess-sc-stream|hello|"),
+        )
+        .await
+        .expect("stream init");
+        use futures::StreamExt;
+        let collected: Vec<String> = stream
+            .map(|item| match item {
+                Ok(bytes) => String::from_utf8(bytes).expect("utf-8 chunk"),
+                Err(e) => panic!("unexpected stream error: {}", e.cause),
+            })
+            .collect()
+            .await;
+        let joined: String = collected.join("");
+        assert_eq!(joined, "winning sample text");
+        assert!(
+            !collected.iter().any(|c| c.contains("STREAM-FALLBACK")),
+            "SC should have fired; got {collected:?}"
+        );
+        let recorded_sc = sink_typed.sc.lock().unwrap().clone();
+        let recorded_usage = sink_typed.usage.lock().unwrap().clone();
+        assert_eq!(recorded_sc.len(), 1, "expected exactly one SC hint");
+        assert_eq!(recorded_sc[0].sample_count, 3);
+        assert_eq!(recorded_sc[0].best_sample_index, 0);
+        assert!((recorded_sc[0].score - 1.0).abs() < 1e-5);
+        assert_eq!(
+            recorded_usage.len(),
+            1,
+            "expected one aggregated usage hint"
+        );
+        assert_eq!(recorded_usage[0].prompt_tokens, 21);
+        assert_eq!(recorded_usage[0].completion_tokens, 33);
+        assert_eq!(recorded_usage[0].model, "sc-sample-model");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_skips_sc_when_sample_count_one() {
+        let sink_typed: Arc<ScStreamSink> = Arc::new(ScStreamSink::default());
+        let sink: Arc<dyn crate::metrics::MetricsSink> = sink_typed.clone();
+        let provider: Arc<dyn ChatProvider> = Arc::new(ScSampleProvider {
+            text: "irrelevant".to_string(),
+        });
+        let stream = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(sink),
+            None,
+            None,
+            "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
+            sc_streaming_cfg(1),
+            crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
+            ctx(b"sess-sc-skip|hi|"),
+        )
+        .await
+        .expect("stream init");
+        use futures::StreamExt;
+        let collected: Vec<String> = stream
+            .map(|item| match item {
+                Ok(bytes) => String::from_utf8(bytes).expect("utf-8"),
+                Err(e) => panic!("stream err: {}", e.cause),
+            })
+            .collect()
+            .await;
+        assert_eq!(collected, vec!["STREAM-FALLBACK".to_string()]);
+        let recorded_sc = sink_typed.sc.lock().unwrap().clone();
+        assert!(
+            recorded_sc.is_empty(),
+            "SC must NOT fire with sample_count=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_skips_sc_when_disabled() {
+        let sink_typed: Arc<ScStreamSink> = Arc::new(ScStreamSink::default());
+        let sink: Arc<dyn crate::metrics::MetricsSink> = sink_typed.clone();
+        let provider: Arc<dyn ChatProvider> = Arc::new(ScSampleProvider {
+            text: "irrelevant".to_string(),
+        });
+        let mut cfg = sc_streaming_cfg(5);
+        cfg.enabled = false;
+        let stream = handle_chat_stream(
+            provider,
+            String::new(),
+            empty_mem(),
+            SoulCache::no_op(),
+            skills::SkillMatcher::keyword_only(skills::SkillsCache::empty()),
+            guardrails::InputGuardrail::permissive(),
+            Some(sink),
+            None,
+            None,
+            "mock".to_string(),
+            reasoning::TierRouter::default(),
+            reasoning::JudgeConfig::default(),
+            reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
+            cfg,
+            crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
+            judge::JudgeConfig::default(),
+            judge::JudgeRecorder::default(),
+            judge::SessionTurnCounter::new(),
+            ctx(b"sess-sc-disabled|hi|"),
+        )
+        .await
+        .expect("stream init");
+        use futures::StreamExt;
+        let collected: Vec<String> = stream
+            .map(|item| match item {
+                Ok(bytes) => String::from_utf8(bytes).expect("utf-8"),
+                Err(e) => panic!("stream err: {}", e.cause),
+            })
+            .collect()
+            .await;
+        assert_eq!(collected, vec!["STREAM-FALLBACK".to_string()]);
+        let recorded_sc = sink_typed.sc.lock().unwrap().clone();
+        assert!(recorded_sc.is_empty());
+    }
+
+    #[test]
+    fn chunk_for_stream_splits_on_whitespace_and_preserves_text() {
+        let chunks = chunk_for_stream("hello world");
+        let joined: String = chunks
+            .iter()
+            .map(|c| std::str::from_utf8(c).unwrap().to_string())
+            .collect();
+        assert_eq!(joined, "hello world");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], b"hello ");
+        assert_eq!(chunks[1], b"world");
     }
 }
