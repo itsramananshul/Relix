@@ -60,6 +60,7 @@ pub mod memory_dispatcher;
 pub mod provenance_hooks;
 pub mod provider;
 pub mod reasoning;
+pub mod reasoning_caps;
 pub mod router;
 pub mod skill_caps;
 pub mod skill_extractor;
@@ -345,6 +346,21 @@ pub fn register(
             }
         }
     }
+    // GAP 16 Components 2 + 4: register the three reasoning
+    // caps (`ai.judge_eval`, `ai.self_consistency`,
+    // `ai.confidence_aggregate`) so operators / SOL flows can
+    // invoke them explicitly. Always registered (regardless of
+    // judge.enabled / self_consistency.enabled flags) because
+    // the caps THEMSELVES are the opt-in surface — calling
+    // them costs N provider invocations, so the gating is at
+    // call time.
+    reasoning_caps::register(
+        bridge,
+        provider.clone(),
+        default_model.clone(),
+        judge_cfg_shared.clone(),
+        self_consistency_cfg_shared.clone(),
+    );
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let memory_for_chat = memory_dispatcher.clone();
