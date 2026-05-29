@@ -421,6 +421,7 @@ mod tests {
             output_bytes: 20,
             model: None,
             confidence_score: confidence,
+            routing_tier: None,
             request_id: None,
         }
     }

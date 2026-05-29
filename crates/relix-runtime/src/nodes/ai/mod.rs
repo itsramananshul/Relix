@@ -53,6 +53,7 @@
 //! or any presentation peer.
 
 pub mod belief_caps;
+pub mod complexity;
 pub mod execution;
 pub mod failover;
 pub mod guardrails;
@@ -68,6 +69,7 @@ pub mod skill_refinement;
 pub mod skill_store;
 pub mod skills;
 pub mod soul;
+pub mod tier_routing;
 
 pub use memory_dispatcher::{MemoryDispatcher, MemoryFetcher};
 
@@ -128,6 +130,15 @@ pub struct AiConfig {
     /// handler at pre-7.29 behaviour byte-for-byte.
     #[serde(default)]
     pub reasoning: Option<reasoning::ReasoningConfig>,
+    /// `[ai.routing]` — RELIX-7.29 PART 1 smart model routing.
+    /// When present and `enabled = true`, every chat request
+    /// is classified via [`complexity::ComplexityClassifier`]
+    /// and dispatched against the per-tier provider + model
+    /// configured under `[ai.routing.tiers.<simple|medium|complex>]`.
+    /// Absent / `enabled = false` keeps the AI handler byte-
+    /// identical to its pre-routing behaviour.
+    #[serde(default)]
+    pub routing: Option<tier_routing::RoutingConfig>,
 }
 
 /// `[ai.agent]` config — operator-supplied persona pointer for
@@ -154,6 +165,7 @@ impl Default for AiConfig {
             memory_peer: None,
             agent: None,
             reasoning: None,
+            routing: None,
         }
     }
 }
@@ -306,6 +318,7 @@ pub fn register(
     skill_extractor: Option<Arc<skill_extractor::SkillExtractor>>,
     observability: Option<Arc<crate::observability::ObservabilityContext>>,
     reasoning_config: Option<reasoning::ReasoningConfig>,
+    routing_config: Option<tier_routing::RoutingConfig>,
 ) {
     // GAP 16 §7.29: build the four reasoning components from the
     // optional config. Every component defaults to off when its
@@ -322,6 +335,27 @@ pub fn register(
     let tier_router_for_chat = tier_router_shared.clone();
     let judge_cfg_for_chat = judge_cfg_shared.clone();
     let self_consistency_cfg_for_chat = self_consistency_cfg_shared.clone();
+    // RELIX-7.29 PART 1: build the spec'd `[ai.routing]` tier
+    // router. The registry maps provider names to the active
+    // provider Arc — single-provider deployments register only
+    // their own name. Multi-provider tier routing is honoured
+    // when operators wire additional providers via
+    // `[ai.providers.<name>]`; a tier whose `provider` field
+    // does not match any registered name falls back to the
+    // default provider per the resolver's policy.
+    let mut routing_registry_map: std::collections::HashMap<String, Arc<dyn ChatProvider>> =
+        std::collections::HashMap::new();
+    routing_registry_map.insert(provider.provider_name().to_string(), provider.clone());
+    let routing_registry = tier_routing::ProviderRegistry::new(routing_registry_map);
+    let routing_cfg_shared = routing_config.unwrap_or_default();
+    let routing_router_shared =
+        tier_routing::TierRouter::new(routing_cfg_shared.clone(), routing_registry, Vec::new());
+    let routing_router_for_chat = routing_router_shared.clone();
+    // RELIX-7.29 PART 1: register the `routing.explain`
+    // coordinator cap. The cap is always registered (regardless
+    // of whether `[ai.routing] enabled` is true) so operators
+    // can dry-run the classifier even when routing is off.
+    tier_routing::caps::register(bridge, routing_router_shared.clone());
     // GAP 16 Component 3: open the belief store + register the
     // six `memory.belief_*` caps when the operator turned the
     // section on.
@@ -393,6 +427,7 @@ pub fn register(
             let router = tier_router_for_chat.clone();
             let judge_cfg = judge_cfg_for_chat.clone();
             let sc_cfg = self_consistency_cfg_for_chat.clone();
+            let routing_router = routing_router_for_chat.clone();
             async move {
                 handle_chat(
                     p,
@@ -411,6 +446,7 @@ pub fn register(
                     router,
                     judge_cfg,
                     sc_cfg,
+                    routing_router,
                     ctx,
                 )
                 .await
@@ -440,6 +476,7 @@ pub fn register(
     let router_for_chat_stream = tier_router_shared.clone();
     let judge_cfg_for_chat_stream = judge_cfg_shared.clone();
     let sc_cfg_for_chat_stream = self_consistency_cfg_shared.clone();
+    let routing_router_for_chat_stream = routing_router_shared.clone();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -457,6 +494,7 @@ pub fn register(
                 let router = router_for_chat_stream.clone();
                 let judge_cfg = judge_cfg_for_chat_stream.clone();
                 let sc_cfg = sc_cfg_for_chat_stream.clone();
+                let routing_router = routing_router_for_chat_stream.clone();
                 async move {
                     handle_chat_stream(
                         p,
@@ -472,6 +510,7 @@ pub fn register(
                         router,
                         judge_cfg,
                         sc_cfg,
+                        routing_router,
                         ctx,
                     )
                     .await
@@ -954,13 +993,14 @@ async fn handle_chat_stream(
     tier_router: reasoning::TierRouter,
     judge_cfg: reasoning::JudgeConfig,
     self_consistency_cfg: reasoning::SelfConsistencyConfig,
+    routing_router: tier_routing::TierRouter,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
     // GAP 16 Component 1: same tier classification +
     // resolution as `handle_chat`. Falls back to the
     // provider's default when the router is disabled OR the
     // tier is unmapped + fallback_to_default = true.
-    let _ = (&judge_cfg, &self_consistency_cfg);
+    let _ = (&judge_cfg, &self_consistency_cfg, &routing_router);
     let stream_started_at = std::time::Instant::now();
     let preflight = build_chat_preflight(
         &ctx.args,
@@ -1067,6 +1107,7 @@ async fn handle_chat_stream(
                             prompt_tokens: u.prompt_tokens,
                             completion_tokens: u.completion_tokens,
                             model: u.model.clone(),
+                            routing_tier: None,
                         });
                     }
                     accumulated_usage = Some((u.prompt_tokens, u.completion_tokens, u.model));
@@ -1199,6 +1240,7 @@ async fn handle_chat(
     tier_router: reasoning::TierRouter,
     judge_cfg: reasoning::JudgeConfig,
     self_consistency_cfg: reasoning::SelfConsistencyConfig,
+    routing_router: tier_routing::TierRouter,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let chat_started_at = std::time::Instant::now();
@@ -1349,7 +1391,7 @@ async fn handle_chat(
     // the call; it logs a warning and falls back to the default.
     let classifier = reasoning::ComplexityClassifier::new();
     let reasoning_tier = classifier.classify(prompt, false);
-    let resolved_model = if tier_router.enabled() {
+    let mut resolved_model = if tier_router.enabled() {
         match tier_router.resolve(reasoning_tier) {
             Ok(Some(m)) => {
                 tracing::info!(
@@ -1380,6 +1422,45 @@ async fn handle_chat(
     } else {
         default_model.clone()
     };
+
+    // RELIX-7.29 PART 1: spec'd `[ai.routing]` tier resolution.
+    // Runs AFTER memory + RAG + skills (those use the existing
+    // `provider` Arc for embedding etc.) and BEFORE building
+    // ChatInput, so the provider Arc + model id swap only
+    // affects the actual dispatch call. When `[ai.routing]
+    // enabled = false` or all tiers fail health, the resolver
+    // returns Unrouted and behaviour is byte-identical to the
+    // pre-routing path.
+    let mut provider: Arc<dyn ChatProvider> = provider;
+    let mut routing_tier_label: Option<&'static str> = None;
+    if routing_router.enabled() {
+        // session_turns is plumbed via the routing.explain cap +
+        // CLI for operator inspection; the hot path treats every
+        // ai.chat call as turn 0 because the dispatcher doesn't
+        // carry per-session turn counts. The seven other signals
+        // (length, code, multi-step, technical, explicit, multi-
+        // topic) dominate tier assignment in practice.
+        let score = complexity::ComplexityClassifier::new().classify(prompt, 0);
+        let decision = routing_router.resolve(&score);
+        routing_tier_label = Some(tier_routing::metrics_tier_label(decision.tier));
+        if let Some(p_name) = decision.provider.as_deref()
+            && let Some(p_arc) = routing_router.registry().get(p_name)
+        {
+            provider = p_arc;
+        }
+        if let Some(m) = decision.model.as_deref() {
+            resolved_model = m.to_string();
+        }
+        tracing::info!(
+            session_id,
+            tier = decision.tier.as_str(),
+            provider = decision.provider.as_deref().unwrap_or("default"),
+            model = decision.model.as_deref().unwrap_or("default"),
+            fell_back = decision.fell_back,
+            reasoning = %decision.reasoning,
+            "ai.chat: ai.routing tier resolved"
+        );
+    }
 
     let input = ChatInput {
         session_id: session_id.to_string(),
@@ -1436,6 +1517,21 @@ async fn handle_chat(
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     model: output.model.clone(),
+                    routing_tier: routing_tier_label.map(|s| s.to_string()),
+                });
+            } else if let Some(sink) = metrics_sink.as_ref()
+                && let Some(label) = routing_tier_label
+            {
+                // RELIX-7.29 PART 1: even when the provider
+                // didn't ship a usage row, attach the routing tier
+                // so the dispatch metric still records WHICH tier
+                // serviced the call.
+                sink.attach_ai_usage(crate::metrics::AiUsageHint {
+                    request_id: ctx.request_id,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    model: String::new(),
+                    routing_tier: Some(label.to_string()),
                 });
             }
             // RELIX-7.19 GAP 3: side-channel provider signals
@@ -1900,6 +1996,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1920,6 +2017,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -1944,6 +2042,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -1979,6 +2078,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -2008,6 +2108,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"|hello|"),
         )
         .await;
@@ -2058,6 +2159,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2106,6 +2208,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2145,6 +2248,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2185,6 +2289,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -2231,6 +2336,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2274,6 +2380,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2340,6 +2447,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -2387,6 +2495,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -2437,6 +2546,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2570,6 +2680,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2621,6 +2732,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2670,6 +2782,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2720,6 +2833,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2791,6 +2905,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2902,6 +3017,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2977,6 +3093,7 @@ mod tests {
             memory_peer: None,
             agent: None,
             reasoning: None,
+            routing: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -2996,6 +3113,7 @@ mod tests {
             memory_peer: None,
             agent: None,
             reasoning: None,
+            routing: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3022,6 +3140,7 @@ mod tests {
             memory_peer: None,
             agent: None,
             reasoning: None,
+            routing: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3048,6 +3167,7 @@ mod tests {
             memory_peer: None,
             agent: None,
             reasoning: None,
+            routing: None,
         };
         match build_provider(&cfg) {
             Ok(p) => assert_eq!(p.provider_name(), "local"),
@@ -3112,6 +3232,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -3152,6 +3273,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -3283,6 +3405,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -3326,6 +3449,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -3375,6 +3499,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
@@ -3483,6 +3608,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"session-1|hello|"),
         )
         .await
@@ -3517,6 +3643,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -3554,6 +3681,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(prompt.as_bytes()),
         )
         .await;
@@ -3580,6 +3708,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"session-1|hello|"),
         )
         .await;
@@ -3708,6 +3837,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
         .await;
@@ -3743,6 +3873,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess2|hi|"),
         )
         .await;
@@ -3779,6 +3910,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 200,
             model: "gpt-4o-mini".into(),
+            routing_tier: None,
         });
         // Simulate the dispatch hot path: record the metric.
         col.record_invocation(InvocationMetric {
@@ -3795,6 +3927,7 @@ mod tests {
             output_bytes: 64,
             model: None,
             confidence_score: None,
+            routing_tier: None,
             request_id: Some(rid),
         });
         // Let the drain loop flush.
@@ -3919,6 +4052,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx_with_request_id(b"sess1|please reply|", rid),
         )
         .await
@@ -3963,6 +4097,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess2|hi|"),
         )
         .await
@@ -4010,6 +4145,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx_with_request_id(b"sess|hi|", rid),
         )
         .await
@@ -4034,6 +4170,7 @@ mod tests {
             output_bytes: 1,
             model: None,
             confidence_score: None,
+            routing_tier: None,
             request_id: Some(rid),
         });
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -4074,6 +4211,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess-obs|hello|"),
         )
         .await;
@@ -4108,6 +4246,7 @@ mod tests {
             reasoning::TierRouter::default(),
             reasoning::JudgeConfig::default(),
             reasoning::SelfConsistencyConfig::default(),
+            tier_routing::TierRouter::default(),
             ctx(b"sess-noobs|hi|"),
         )
         .await;

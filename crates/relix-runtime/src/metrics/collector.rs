@@ -410,6 +410,7 @@ mod tests {
             output_bytes: 32,
             model: None,
             confidence_score: None,
+            routing_tier: None,
             request_id: Some(req),
         }
     }
@@ -481,6 +482,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 200,
             model: "gpt-4o-mini".into(),
+            routing_tier: None,
         });
         col.record_invocation(metric(req, "alice", "ai.chat", 100));
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -546,6 +548,7 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 20,
             model: "mock".into(),
+            routing_tier: None,
         });
     }
 
@@ -569,6 +572,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 model: "mock".into(),
+                routing_tier: None,
             });
         }
         // After overflow + 10 more inserts the cache should

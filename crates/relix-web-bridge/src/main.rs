@@ -149,6 +149,7 @@ mod policy_simulate;
 mod policy_tenants;
 mod provenance;
 mod rate_limit;
+mod routing;
 mod schema;
 mod secrets;
 mod secrets_available;
@@ -619,6 +620,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/confidence/policies", get(confidence::policies))
         .route("/v1/confidence/history/:agent", get(confidence::history))
         .route("/v1/confidence/reset", post(confidence::reset))
+        // RELIX-7.29 PART 1: smart-routing dry-run surface.
+        .route("/v1/routing/explain", post(routing::explain))
         // RELIX-7.24: spec-driven multi-agent planning surface.
         .route("/v1/planning/plan", post(planning::create_plan))
         .route("/v1/planning/agents", get(planning::list_agents))

@@ -729,6 +729,7 @@ impl DispatchBridge {
             output_bytes,
             model: None,
             confidence_score,
+            routing_tier: None,
             request_id: Some(request_id),
         };
         sink.record_invocation(metric);
@@ -773,6 +774,7 @@ impl DispatchBridge {
             output_bytes: 0,
             model: None,
             confidence_score: None,
+            routing_tier: None,
             request_id: Some(request_id),
         };
         sink.record_invocation(metric);

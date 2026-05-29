@@ -29,6 +29,7 @@ mod ping;
 mod planning;
 mod provenance;
 mod router;
+mod routing;
 mod sessions;
 mod setup;
 mod skills;
@@ -186,6 +187,16 @@ enum Cmd {
     Confidence {
         #[command(subcommand)]
         cmd: confidence::Cmd,
+    },
+    /// RELIX-7.29 PART 1: smart-routing inspector.
+    /// `routing explain --message "<text>" [--session-turns N]`
+    /// classifies a message with the §7.29 ComplexityClassifier
+    /// and prints what the coordinator's tier router would pick
+    /// for it. Talks to the local bridge over HTTP (default
+    /// `http://127.0.0.1:19791`).
+    Routing {
+        #[command(subcommand)]
+        cmd: routing::Cmd,
     },
     /// RELIX-7.24: spec-driven multi-agent planning pipeline.
     /// `planning agents` lists the agents visible to the
@@ -479,6 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Training { cmd } => training::run(cmd).await,
         Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
         Cmd::Confidence { cmd } => confidence::run(cmd).await,
+        Cmd::Routing { cmd } => routing::run(cmd).await,
         Cmd::Planning { cmd } => planning::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,
         Cmd::Mcp { cmd } => mcp::run(cmd).await,

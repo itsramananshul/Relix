@@ -746,6 +746,7 @@ mod tests {
             output_bytes: 200,
             model: tokens.map(|_| "gpt-4o-mini".to_string()),
             confidence_score: None,
+            routing_tier: None,
             request_id: None,
         }
     }

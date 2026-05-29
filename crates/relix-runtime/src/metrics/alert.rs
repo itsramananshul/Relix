@@ -844,6 +844,7 @@ mod tests {
             output_bytes: 200,
             model: None,
             confidence_score: None,
+            routing_tier: None,
             request_id: None,
         }
     }
@@ -1146,6 +1147,7 @@ mod tests {
             output_bytes: 0,
             model: model.map(|s| s.to_string()),
             confidence_score: None,
+            routing_tier: None,
             request_id: None,
         }
     }

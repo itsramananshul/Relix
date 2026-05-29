@@ -751,6 +751,7 @@ mod tests {
             output_bytes: 20,
             model: Some("gpt-4o-mini".into()),
             confidence_score: None,
+            routing_tier: None,
             request_id: None,
         }
     }

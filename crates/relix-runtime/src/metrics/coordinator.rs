@@ -310,6 +310,7 @@ mod tests {
             output_bytes: 20,
             model: None,
             confidence_score: None,
+            routing_tier: None,
             request_id: None,
         }
     }

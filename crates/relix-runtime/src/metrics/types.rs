@@ -72,6 +72,14 @@ pub struct InvocationMetric {
     /// trends per (agent, method).
     #[serde(default)]
     pub confidence_score: Option<f32>,
+    /// RELIX-7.29 PART 1: classified tier (`simple` / `medium` /
+    /// `complex`) when the AI handler's `[ai.routing]` tier
+    /// router resolved a tier for this call. `None` for
+    /// non-AI methods or when routing is disabled. Dashboards
+    /// slice cost + latency by this column to expose how much
+    /// traffic each tier is carrying.
+    #[serde(default)]
+    pub routing_tier: Option<String>,
     /// Original `RequestId`. Carried through the collector's
     /// in-memory join cache so an [`AiUsageHint`] arriving
     /// before the dispatcher's record can be matched. The
@@ -91,6 +99,9 @@ impl InvocationMetric {
         }
         if !hint.model.is_empty() {
             self.model = Some(hint.model.clone());
+        }
+        if hint.routing_tier.is_some() {
+            self.routing_tier = hint.routing_tier.clone();
         }
         if let (Some(_), Some(model)) = (self.token_count, self.model.as_ref())
             && let Some(cost) = prices.estimate_cost_micros(
@@ -115,6 +126,10 @@ pub struct AiUsageHint {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub model: String,
+    /// RELIX-7.29 PART 1: classified tier (`simple` / `medium` /
+    /// `complex`) when the AI handler's `[ai.routing]` tier
+    /// router resolved this call. `None` for non-routed calls.
+    pub routing_tier: Option<String>,
 }
 
 /// RELIX-7.19 GAP 3: side-channel hint emitted by an AI
@@ -159,6 +174,7 @@ mod tests {
             output_bytes: 96,
             model: None,
             confidence_score: None,
+            routing_tier: None,
             request_id: Some(rid()),
         }
     }
@@ -171,6 +187,7 @@ mod tests {
             prompt_tokens: 30,
             completion_tokens: 70,
             model: "gpt-4o-mini".into(),
+            routing_tier: None,
         };
         let prices = super::super::pricing::PriceTable::with_defaults();
         m.enrich_with_hint(&hint, &prices);
@@ -188,6 +205,7 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 20,
             model: String::new(),
+            routing_tier: None,
         };
         let prices = super::super::pricing::PriceTable::with_defaults();
         m.enrich_with_hint(&hint, &prices);
@@ -203,6 +221,7 @@ mod tests {
             prompt_tokens: 0,
             completion_tokens: 0,
             model: "mock".into(),
+            routing_tier: None,
         };
         let prices = super::super::pricing::PriceTable::with_defaults();
         m.enrich_with_hint(&hint, &prices);

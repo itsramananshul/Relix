@@ -3640,6 +3640,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "relix-embedded"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "relix-core",
+ "relix-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "relix-flow-inspect"
 version = "0.1.0"
 dependencies = [

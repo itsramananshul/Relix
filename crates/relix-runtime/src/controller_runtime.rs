@@ -5857,6 +5857,10 @@ fn register_node_type_handlers(
             // default and ai.chat runs pre-7.29 behaviour
             // byte-for-byte.
             ai_cfg.reasoning.clone(),
+            // RELIX-7.29 PART 1: per-controller `[ai.routing]`
+            // smart routing config. Absent / disabled keeps the
+            // AI handler byte-identical to the pre-routing path.
+            ai_cfg.routing.clone(),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
