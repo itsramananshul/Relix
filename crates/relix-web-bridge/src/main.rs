@@ -173,6 +173,7 @@ mod tasks;
 mod telegram;
 mod tenant;
 mod term_audit;
+mod tool_screen;
 mod tools;
 mod topology;
 mod training;
@@ -721,6 +722,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/tools/search", post(tools::search))
         // Signed tool manifest (read-only).
         .route("/v1/tools/manifest", get(tools::manifest))
+        // GAP 10 PART 3: tool.screen — proxy to the tool peer.
+        .route("/v1/tools/screen", post(tool_screen::capture))
         // PH-TG-BRIDGE: proxy reads of the telegram channel
         // node. The bridge does not stand up its own bot
         // client; both routes call the telegram peer's

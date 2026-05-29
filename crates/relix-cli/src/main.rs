@@ -42,6 +42,7 @@ mod sol;
 mod souls;
 mod task;
 mod terminal;
+mod tool;
 mod topology;
 mod training;
 mod update;
@@ -397,6 +398,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: terminal::Cmd,
     },
+    /// GAP 10 PART 3: tool-node caps that don't fit the existing
+    /// per-cap subcommands. `tool screen [--region "x,y,w,h"]
+    /// [--out <file.png>]` captures the host's screen via
+    /// `POST /v1/tools/screen` onto `tool.screen`.
+    Tool {
+        #[command(subcommand)]
+        cmd: tool::Cmd,
+    },
     /// Guided interactive setup wizard.
     ///
     /// Prompts for AI provider + API key, optional messaging
@@ -568,6 +577,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Sessions { cmd } => sessions::run(cmd).await,
         Cmd::Models { cmd } => models::run(cmd).await,
         Cmd::Terminal { cmd } => terminal::run(cmd).await,
+        Cmd::Tool { cmd } => tool::run(cmd).await,
         Cmd::Ping {
             peer,
             identity,
