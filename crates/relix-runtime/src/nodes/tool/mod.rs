@@ -57,10 +57,12 @@ pub mod mcp;
 pub mod mcp_http;
 pub mod mcp_stdio;
 pub mod output_guard;
+pub mod parse_document;
 pub mod pdf;
 pub mod perception;
 pub mod registry;
 pub mod sanitize;
+pub mod screen;
 pub mod security;
 pub mod session_search_proxy;
 pub mod terminal;
@@ -149,6 +151,22 @@ pub struct ToolConfig {
     /// See `crates/relix-runtime/src/nodes/tool/mcp.rs`.
     #[serde(default)]
     pub mcp: Option<mcp::McpConfig>,
+    /// GAP 10 PART 1: tiered document-parsing pipeline. `None`
+    /// uses [`parse_document::ParseDocumentConfig::default()`] which
+    /// enables every cloud tier when its env var is set (Tavily-style
+    /// opt-in via `scripts/setup.{sh,ps1}`).
+    #[serde(default)]
+    pub parse_document: Option<parse_document::ParseDocumentConfig>,
+    /// GAP 10 PART 2: tiered web-read pipeline. Same env vars as the
+    /// document pipeline (Jina / Firecrawl); LlamaParse is
+    /// document-only.
+    #[serde(default)]
+    pub web_read: Option<parse_document::WebReadConfig>,
+    /// GAP 10 PART 3: screen-capture surface. Default is `enabled =
+    /// false` — operators must opt in explicitly because the tool
+    /// captures the host's screen.
+    #[serde(default)]
+    pub screen: Option<screen::ScreenConfig>,
     /// PH-WEB-BLOCKLIST: operator-curated hostname blocklist.
     /// Every URL passed to `tool.web_fetch` / `tool.web_get` /
     /// `tool.web_extract` / `tool.web.post` / `tool.web.robots_check`
@@ -179,6 +197,9 @@ impl Default for ToolConfig {
             terminal: None,
             browser: None,
             mcp: None,
+            parse_document: None,
+            web_read: None,
+            screen: None,
             blocked_hosts: Vec::new(),
         }
     }
@@ -502,6 +523,13 @@ impl ToolBackend {
     /// `None`, [`register`] does not register `tool.pdf`.
     pub fn pdf_config(&self) -> Option<pdf::PdfConfig> {
         self.cfg.pdf.clone()
+    }
+
+    /// Borrow the full `[tool]` config. Used by the GAP 10 register
+    /// path so it can read `[tool.parse_document]` / `[tool.web_read]`
+    /// / `[tool.screen]` without an extra plumbing arg.
+    pub fn tool_config(&self) -> &ToolConfig {
+        &self.cfg
     }
 
     /// Accessor for the optional `[tool.terminal]` subsystem config
@@ -967,18 +995,44 @@ pub fn register(
     web_robots::register(bridge, backend.clone());
 
     // RELIX-GAP-10: tool.parse_document + tool.web_read — the
-    // spec-named perception caps. parse_document dispatches by
-    // content kind (text/markdown/code direct; pdf via the same
-    // lopdf pipeline tool.pdf uses); web_read shares the
-    // tool.web_get fetch+extract path under the spec-named
-    // alias. The cloud + local tiers
-    // (LlamaParse / Docling / PyMuPDF / Crawl4AI / Jina /
-    // Firecrawl) remain EXTERNAL-INFRASTRUCTURE-DEFERRED.
-    tracing::info!(
-        "tool node: registering tool.parse_document + tool.web_read (GAP 10 simple tier)"
-    );
+    // spec-named perception caps with the cloud → local tier
+    // fallthrough (LlamaParse / Jina Reader / Firecrawl). When a
+    // tier's env var is unset or returns an error, the pipeline
+    // silently falls through to the next tier and ultimately to
+    // the always-on local tier (lopdf for PDFs, ToolBackend
+    // fetch+extract for URLs). See
+    // `nodes/tool/parse_document.rs` module docs.
+    tracing::info!("tool node: registering tool.parse_document + tool.web_read (GAP 10 tiered)");
     let pdf_cfg_for_perception = backend.pdf_config().map(Arc::new);
-    perception::register(bridge, backend.clone(), pdf_cfg_for_perception);
+    let parse_cfg = Arc::new(
+        backend
+            .tool_config()
+            .parse_document
+            .clone()
+            .unwrap_or_default(),
+    );
+    parse_document::register(bridge, backend.clone(), pdf_cfg_for_perception, parse_cfg);
+    let web_read_cfg = Arc::new(backend.tool_config().web_read.clone().unwrap_or_default());
+    parse_document::register_web_read(bridge, backend.clone(), web_read_cfg);
+
+    // RELIX-GAP-10 PART 3: tool.screen — cross-platform screen
+    // capture (scrot/imagemagick on Linux, screencapture on macOS,
+    // PowerShell on Windows). Default is `enabled = false` — the
+    // surface is opt-in because it captures the host's screen.
+    if let Some(screen_cfg) = backend.tool_config().screen.clone() {
+        if screen_cfg.enabled {
+            tracing::info!("tool node: registering tool.screen (GAP 10 PART 3)");
+        } else {
+            tracing::debug!(
+                "tool node: tool.screen registered but [tool.screen] enabled = false; calls will surface a disabled error"
+            );
+        }
+        screen::register(bridge, Arc::new(screen_cfg));
+    } else {
+        // Register a default-disabled instance so calls get a
+        // structured error instead of UNKNOWN_METHOD.
+        screen::register(bridge, Arc::new(screen::ScreenConfig::default()));
+    }
 
     // PH-PDF-CHUNK: tool.text.chunk — pure CPU text chunker. No
     // config gating; always registered alongside the parsing

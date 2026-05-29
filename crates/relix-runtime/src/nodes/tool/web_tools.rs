@@ -290,18 +290,11 @@ impl GetMode {
     }
 }
 
-/// Crate-public alias the `tool.web_read` cap uses to share
-/// the exact same fetch + extract path as `tool.web_get`. Same
-/// wire format, same SSRF / DNS-pin / redirect / body-cap
-/// posture — `tool.web_read` is literally `tool.web_get` under
-/// the spec-named alias.
-pub(crate) async fn handle_web_get_public(
-    backend: Arc<ToolBackend>,
-    ctx: InvocationCtx,
-) -> HandlerOutcome {
-    handle_web_get(backend, ctx).await
-}
-
+// `handle_web_get_public` was the bridge used by `perception::register`
+// to expose `tool.web_get`'s pipeline under the `tool.web_read` alias.
+// GAP 10 PART 2 replaced that shim with the tiered pipeline in
+// `parse_document::register_web_read`, which keeps the local fallback
+// in-house. The shim was removed alongside the perception delegation.
 async fn handle_web_get(backend: Arc<ToolBackend>, ctx: InvocationCtx) -> HandlerOutcome {
     let raw = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
