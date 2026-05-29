@@ -53,6 +53,7 @@
 //! or any presentation peer.
 
 pub mod belief_caps;
+pub mod belief_state;
 pub mod complexity;
 pub mod execution;
 pub mod failover;
@@ -139,6 +140,15 @@ pub struct AiConfig {
     /// identical to its pre-routing behaviour.
     #[serde(default)]
     pub routing: Option<tier_routing::RoutingConfig>,
+    /// `[ai.belief_state]` — RELIX-7.29 PART 3 LLM-driven
+    /// belief tracker. When `enabled = true`, every `ai.chat`
+    /// prepends the current beliefs for `(subject, session)`
+    /// to the system prompt and asynchronously updates them
+    /// via a structured belief-model prompt after the
+    /// response is delivered. Absent / disabled keeps the AI
+    /// handler byte-identical.
+    #[serde(default)]
+    pub belief_state: Option<belief_state::BeliefStateConfig>,
 }
 
 /// `[ai.agent]` config — operator-supplied persona pointer for
@@ -166,6 +176,7 @@ impl Default for AiConfig {
             agent: None,
             reasoning: None,
             routing: None,
+            belief_state: None,
         }
     }
 }
@@ -321,7 +332,8 @@ pub fn register(
     routing_config: Option<tier_routing::RoutingConfig>,
     self_consistency_config: Option<crate::confidence::SelfConsistencyConfig>,
     self_consistency_stats: Option<crate::confidence::SelfConsistencyStats>,
-) {
+    belief_state_config: Option<belief_state::BeliefStateConfig>,
+) -> belief_state::BeliefStateTracker {
     // GAP 16 §7.29: build the four reasoning components from the
     // optional config. Every component defaults to off when its
     // sub-section is absent, so existing deployments remain
@@ -360,6 +372,13 @@ pub fn register(
     let sc_cfg_for_chat = sc_cfg_shared.clone();
     let sc_stats_shared = self_consistency_stats.unwrap_or_default();
     let sc_stats_for_chat = sc_stats_shared.clone();
+    // RELIX-7.29 PART 3: shared belief tracker. The AI handler
+    // reads + writes through this Arc; the coordinator
+    // `belief.*` caps are constructed against the same
+    // instance so operator reads / resets see the same store.
+    let belief_tracker_shared =
+        belief_state::BeliefStateTracker::new(belief_state_config.unwrap_or_default());
+    let belief_tracker_for_chat = belief_tracker_shared.clone();
     // RELIX-7.29 PART 1: register the `routing.explain`
     // coordinator cap. The cap is always registered (regardless
     // of whether `[ai.routing] enabled` is true) so operators
@@ -439,6 +458,7 @@ pub fn register(
             let routing_router = routing_router_for_chat.clone();
             let sc_runtime_cfg = sc_cfg_for_chat.clone();
             let sc_runtime_stats = sc_stats_for_chat.clone();
+            let belief_tracker = belief_tracker_for_chat.clone();
             async move {
                 handle_chat(
                     p,
@@ -460,6 +480,7 @@ pub fn register(
                     routing_router,
                     sc_runtime_cfg,
                     sc_runtime_stats,
+                    belief_tracker,
                     ctx,
                 )
                 .await
@@ -492,6 +513,7 @@ pub fn register(
     let routing_router_for_chat_stream = routing_router_shared.clone();
     let sc_cfg_for_chat_stream_runtime = sc_cfg_shared.clone();
     let sc_stats_for_chat_stream = sc_stats_shared.clone();
+    let belief_tracker_for_chat_stream = belief_tracker_shared.clone();
     bridge.register_streaming(
         "ai.chat.stream",
         Arc::new(crate::dispatch::FnStreamingHandler(
@@ -512,6 +534,7 @@ pub fn register(
                 let routing_router = routing_router_for_chat_stream.clone();
                 let sc_runtime_cfg = sc_cfg_for_chat_stream_runtime.clone();
                 let sc_runtime_stats = sc_stats_for_chat_stream.clone();
+                let belief_tracker = belief_tracker_for_chat_stream.clone();
                 async move {
                     handle_chat_stream(
                         p,
@@ -530,6 +553,7 @@ pub fn register(
                         routing_router,
                         sc_runtime_cfg,
                         sc_runtime_stats,
+                        belief_tracker,
                         ctx,
                     )
                     .await
@@ -545,6 +569,12 @@ pub fn register(
             async move { handle_embed(p, ctx).await }
         })),
     );
+    // RELIX-7.29 PART 3: register `belief.get` + `belief.reset`
+    // coordinator caps so operators can inspect / clear the
+    // tracker through the dispatch bridge. Always registered;
+    // caps return `enabled: false` when the tracker is off.
+    belief_state::caps::register(bridge, belief_tracker_shared.clone());
+    belief_tracker_shared
 }
 
 /// Render an `f32` array as standard base64 of the little-endian
@@ -1015,6 +1045,7 @@ async fn handle_chat_stream(
     routing_router: tier_routing::TierRouter,
     sc_cfg: crate::confidence::SelfConsistencyConfig,
     sc_stats: crate::confidence::SelfConsistencyStats,
+    belief_tracker: belief_state::BeliefStateTracker,
     ctx: InvocationCtx,
 ) -> Result<crate::dispatch::HandlerStream, ErrorEnvelope> {
     // GAP 16 Component 1: same tier classification +
@@ -1033,6 +1064,7 @@ async fn handle_chat_stream(
         &routing_router,
         &sc_cfg,
         &sc_stats,
+        &belief_tracker,
     );
     let stream_started_at = std::time::Instant::now();
     let preflight = build_chat_preflight(
@@ -1276,6 +1308,7 @@ async fn handle_chat(
     routing_router: tier_routing::TierRouter,
     sc_cfg: crate::confidence::SelfConsistencyConfig,
     sc_stats: crate::confidence::SelfConsistencyStats,
+    belief_tracker: belief_state::BeliefStateTracker,
     ctx: InvocationCtx,
 ) -> HandlerOutcome {
     let chat_started_at = std::time::Instant::now();
@@ -1412,6 +1445,30 @@ async fn handle_chat(
             None => hint,
         }),
         None => system_prompt,
+    };
+
+    // RELIX-7.29 PART 3: prepend the LLM-driven belief block
+    // for this (subject_id, session_id) when the tracker is
+    // enabled AND `inject_into_prompt` is true. Skipped when
+    // the tracker is off or the block is empty.
+    let belief_subject = ctx.caller.subject_id.to_string();
+    let system_prompt = if belief_tracker.enabled() && belief_tracker.config().inject_into_prompt {
+        let beliefs = belief_tracker.get(&belief_subject, session_id);
+        let block = belief_state::format_for_system_prompt(&beliefs);
+        if block.is_empty() {
+            system_prompt
+        } else {
+            Some(match system_prompt {
+                Some(existing) => {
+                    let mut combined = block;
+                    combined.push_str(&existing);
+                    combined
+                }
+                None => block,
+            })
+        }
+    } else {
+        system_prompt
     };
 
     // GAP 16 Component 1: smart router. Classify the prompt into
@@ -1639,6 +1696,58 @@ async fn handle_chat(
                         "ai.chat: self-consistency outcome recorded"
                     );
                 }
+            }
+            // RELIX-7.29 PART 3: non-blocking belief update. The
+            // belief tracker reads existing beliefs for
+            // (subject_id, session_id), spawns a task that calls
+            // the belief model with the structured update prompt,
+            // parses the JSON response, and writes the new
+            // belief list back to the tracker. The spawned task
+            // is fire-and-forget so the caller never waits on
+            // it; any failure (provider error, JSON parse) logs
+            // a warning and leaves the previous beliefs intact.
+            if belief_tracker.enabled() {
+                let provider_for_belief = provider.clone();
+                let tracker_for_belief = belief_tracker.clone();
+                let subject_for_belief = belief_subject.clone();
+                let session_for_belief = session_id.to_string();
+                let user_msg_for_belief = training_user_message.clone();
+                let assistant_for_belief = output.text.clone();
+                tokio::spawn(async move {
+                    let existing = tracker_for_belief.get(&subject_for_belief, &session_for_belief);
+                    let update_input = belief_state::build_update_input(
+                        tracker_for_belief.config(),
+                        &session_for_belief,
+                        &existing,
+                        &user_msg_for_belief,
+                        &assistant_for_belief,
+                    );
+                    match provider_for_belief.generate_reply(update_input).await {
+                        Ok(reply) => match belief_state::parse_update_response(&reply.text) {
+                            Ok(items) => {
+                                tracker_for_belief.set(
+                                    &subject_for_belief,
+                                    &session_for_belief,
+                                    items,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %session_for_belief,
+                                    error = %e,
+                                    "ai.chat: belief update parse failed; keeping previous beliefs"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %session_for_belief,
+                                error = %e,
+                                "ai.chat: belief model call failed; keeping previous beliefs"
+                            );
+                        }
+                    }
+                });
             }
             let plan = execution::Planner::parse_response(&output.text);
             let policy = execution::PolicyEngine::default_policy();
@@ -2240,6 +2349,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2263,6 +2373,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2290,6 +2401,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hello|user: prior\n"),
         )
         .await;
@@ -2328,6 +2440,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -2360,6 +2473,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"|hello|"),
         )
         .await;
@@ -2413,6 +2527,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2464,6 +2579,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2506,6 +2622,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hi|"),
         )
         .await;
@@ -2549,6 +2666,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|please deploy staging now|"),
         )
         .await;
@@ -2598,6 +2716,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2644,6 +2763,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -2713,6 +2833,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|new question|"),
         )
         .await;
@@ -2763,6 +2884,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|q|user: caller-1\n"),
         )
         .await;
@@ -2816,6 +2938,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -2952,6 +3075,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3006,6 +3130,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3058,6 +3183,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3111,6 +3237,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3185,6 +3312,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess1|hi|"),
         )
         .await;
@@ -3299,6 +3427,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"s1|hello|"),
         )
         .await;
@@ -3375,6 +3504,7 @@ mod tests {
             agent: None,
             reasoning: None,
             routing: None,
+            belief_state: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3395,6 +3525,7 @@ mod tests {
             agent: None,
             reasoning: None,
             routing: None,
+            belief_state: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3422,6 +3553,7 @@ mod tests {
             agent: None,
             reasoning: None,
             routing: None,
+            belief_state: None,
         };
         match build_provider(&cfg) {
             Ok(_) => panic!("expected error"),
@@ -3449,6 +3581,7 @@ mod tests {
             agent: None,
             reasoning: None,
             routing: None,
+            belief_state: None,
         };
         match build_provider(&cfg) {
             Ok(p) => assert_eq!(p.provider_name(), "local"),
@@ -3516,6 +3649,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess-1|please email ops|"),
         )
         .await;
@@ -3559,6 +3693,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess-1|please email ops|approval_token=abc123"),
         )
         .await;
@@ -3693,6 +3828,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess-1|fetch the example|"),
         )
         .await;
@@ -3739,6 +3875,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess-1|delete everything|approval_token=ok"),
         )
         .await;
@@ -3791,6 +3928,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess-1|fetch with auth|approval_token=ok"),
         )
         .await;
@@ -3902,6 +4040,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"session-1|hello|"),
         )
         .await
@@ -3939,6 +4078,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"only-session-id"),
         )
         .await;
@@ -3979,6 +4119,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(prompt.as_bytes()),
         )
         .await;
@@ -4008,6 +4149,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"session-1|hello|"),
         )
         .await;
@@ -4139,6 +4281,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx_with_request_id(b"sess1|please respond|", rid),
         )
         .await;
@@ -4177,6 +4320,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess2|hi|"),
         )
         .await;
@@ -4358,6 +4502,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx_with_request_id(b"sess1|please reply|", rid),
         )
         .await
@@ -4405,6 +4550,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess2|hi|"),
         )
         .await
@@ -4455,6 +4601,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx_with_request_id(b"sess|hi|", rid),
         )
         .await
@@ -4523,6 +4670,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess-obs|hello|"),
         )
         .await;
@@ -4560,6 +4708,7 @@ mod tests {
             tier_routing::TierRouter::default(),
             crate::confidence::SelfConsistencyConfig::default(),
             crate::confidence::SelfConsistencyStats::new(),
+            belief_state::BeliefStateTracker::default(),
             ctx(b"sess-noobs|hi|"),
         )
         .await;

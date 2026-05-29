@@ -1,5 +1,6 @@
 //! relix-cli — developer and operator CLI.
 
+mod belief;
 mod browser;
 mod build;
 mod capability;
@@ -187,6 +188,16 @@ enum Cmd {
     Confidence {
         #[command(subcommand)]
         cmd: confidence::Cmd,
+    },
+    /// RELIX-7.29 PART 3: belief tracker inspector. `belief
+    /// show --session <id>` prints the LLM-driven belief list
+    /// the AI handler has accumulated for a session. `belief
+    /// reset --session <id>` clears it. `--subject` defaults
+    /// to the bridge identity's subject. Talks to the local
+    /// bridge over HTTP (default `http://127.0.0.1:19791`).
+    Belief {
+        #[command(subcommand)]
+        cmd: belief::Cmd,
     },
     /// RELIX-7.29 PART 1: smart-routing inspector.
     /// `routing explain --message "<text>" [--session-turns N]`
@@ -490,6 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Training { cmd } => training::run(cmd).await,
         Cmd::Knowledge { cmd } => knowledge::run(cmd).await,
         Cmd::Confidence { cmd } => confidence::run(cmd).await,
+        Cmd::Belief { cmd } => belief::run(cmd).await,
         Cmd::Routing { cmd } => routing::run(cmd).await,
         Cmd::Planning { cmd } => planning::run(cmd).await,
         Cmd::Router { cmd } => router::run(cmd).await,

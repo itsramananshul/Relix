@@ -5891,6 +5891,14 @@ fn register_node_type_handlers(
             // `confidence.self_consistency_stats` cap reads from
             // the same instance the AI handler writes to.
             confidence_bundle.as_ref().map(|b| b.sc_stats.clone()),
+            // RELIX-7.29 PART 3: `[ai.belief_state]` LLM-driven
+            // belief tracker config. Absent / disabled keeps the
+            // AI handler byte-identical to its pre-belief
+            // behaviour. The returned BeliefStateTracker is
+            // currently ignored — the dispatch surface already
+            // serves `belief.get` / `belief.reset` from the same
+            // shared instance the AI handler holds.
+            ai_cfg.belief_state.clone(),
         );
         // Hand back to run() so the post-rpc::Client setup can
         // build a MemoryDispatcher into the cell when
