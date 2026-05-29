@@ -244,6 +244,34 @@ pub enum ChannelDispatchError {
     Other(String),
 }
 
+/// PART 9 — mirror trait for the decision-unification surface.
+///
+/// Relix has two parallel approval systems that need to stay in
+/// lock-step: `planning::approval` (gates planning workflows
+/// keyed by `plan_id`) and `runtime::approval` (generic operator
+/// approvals keyed by `approval_id`). Operators get confused
+/// when a decision recorded in one system doesn't show up in
+/// the other. The dual-write contract closes that gap: after a
+/// decision lands in the primary store, the parent calls
+/// [`DecisionMirror::mirror_decision`] which writes the SAME
+/// decision into the secondary store best-effort.
+///
+/// Recursion is avoided by the "only-flip-pending" semantics of
+/// both backing stores — the mirror call on a non-pending row
+/// is a no-op, so a → b → a re-entry short-circuits on the
+/// second hop. Failures are NOT propagated to the primary
+/// decision — operators see a one-shot WARN log and can fix the
+/// systems-out-of-sync state via the standard reconciliation
+/// caps (`approval.failed_deliveries`, `planning.list_approvals`).
+pub trait DecisionMirror: Send + Sync {
+    /// Best-effort mirror write. `id` is the shared identifier
+    /// the two stores agree on (today: `plan_id == approval_id`
+    /// for plan approvals). `decision` is the wire-string
+    /// (`approved | rejected | expired`). `note` is the
+    /// operator-supplied free-form note from the primary side.
+    fn mirror_decision(&self, id: &str, decision: &str, note: Option<&str>);
+}
+
 /// Plumbing trait every per-channel dispatcher implements.
 /// The runtime's multi-channel router calls into this when
 /// it has resolved a [`ChannelKind`] to a concrete sink.

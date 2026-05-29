@@ -19,7 +19,8 @@ use tokio::sync::oneshot;
 
 pub use relix_core::approval::{
     ApprovalRequest, ChannelDispatchError, ChannelKind, ChannelsConfig, DashboardChannelCfg,
-    DiscordChannelCfg, EmailChannelCfg, SingleChannelDispatch, SlackChannelCfg, TelegramChannelCfg,
+    DecisionMirror, DiscordChannelCfg, EmailChannelCfg, SingleChannelDispatch, SlackChannelCfg,
+    TelegramChannelCfg,
 };
 
 use super::store::{ApprovalDeliveryRow, ApprovalRequestStore, ApprovalStoreError};
@@ -415,6 +416,11 @@ pub struct ApprovalDeliveryService {
     /// short-circuits instead of waking from `sleep` to find a
     /// decided row. Keyed by `approval_id`.
     escalation_cancels: Arc<Mutex<HashMap<String, CancelSender>>>,
+    /// PART 9: best-effort decision mirror. When set,
+    /// `record_decision` invokes it AFTER the primary store
+    /// write so the planning approval store can be flipped to
+    /// the same decision. Empty cell = no mirror; never panics.
+    decision_mirror: Arc<tokio::sync::OnceCell<Arc<dyn DecisionMirror>>>,
 }
 
 impl ApprovalDeliveryService {
@@ -429,7 +435,17 @@ impl ApprovalDeliveryService {
             store,
             dispatch,
             escalation_cancels: Arc::new(Mutex::new(HashMap::new())),
+            decision_mirror: Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    /// PART 9: install a [`DecisionMirror`]. Idempotent; later
+    /// calls are silently ignored. Wired by the controller
+    /// startup so the planning approval store can be flipped to
+    /// the same decision when the operator votes via the
+    /// generic delivery surface.
+    pub fn install_decision_mirror(&self, mirror: Arc<dyn DecisionMirror>) {
+        let _ = self.decision_mirror.set(mirror);
     }
 
     /// Borrow the wrapped matrix (read-only view for caps).
@@ -624,6 +640,14 @@ impl ApprovalDeliveryService {
             && let Some(tx) = map.remove(approval_id)
         {
             let _ = tx.send(());
+        }
+        // PART 9: best-effort decision mirror. Recursion is
+        // bounded by the mirror's "only-flip-pending" semantics
+        // — when the planning side has already decided, the
+        // mirror is a no-op, so a ↔ b reentry stops on the
+        // second hop.
+        if let Some(mirror) = self.decision_mirror.get() {
+            mirror.mirror_decision(approval_id, decision, note);
         }
         Ok(())
     }

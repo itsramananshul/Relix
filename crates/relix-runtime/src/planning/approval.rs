@@ -169,6 +169,12 @@ pub enum ApprovalError {
 #[derive(Clone)]
 pub struct ApprovalStore {
     conn: Arc<Mutex<Connection>>,
+    /// PART 9: best-effort decision mirror. When set, `decide`
+    /// invokes it AFTER the primary write so the generic
+    /// `ApprovalDeliveryService` store can be flipped to the
+    /// same decision. `OnceCell` keeps the wiring race-free in
+    /// the controller startup path.
+    decision_mirror: Arc<tokio::sync::OnceCell<Arc<dyn relix_core::approval::DecisionMirror>>>,
 }
 
 impl ApprovalStore {
@@ -190,6 +196,7 @@ impl ApprovalStore {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            decision_mirror: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -202,7 +209,17 @@ impl ApprovalStore {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            decision_mirror: Arc::new(tokio::sync::OnceCell::new()),
         })
+    }
+
+    /// PART 9: install a [`DecisionMirror`]. Idempotent; later
+    /// calls are silently ignored. Wired by the controller
+    /// startup so a `planning.approve_plan` /
+    /// `planning.reject_plan` call also flips the matching row
+    /// in the generic `approval_delivery` store (when present).
+    pub fn install_decision_mirror(&self, mirror: Arc<dyn relix_core::approval::DecisionMirror>) {
+        let _ = self.decision_mirror.set(mirror);
     }
 
     fn migrate(conn: &Connection) -> Result<(), ApprovalError> {
@@ -438,6 +455,13 @@ impl ApprovalStore {
             params![new_status.as_str(), decided_at_ms, note, plan_id],
         )?;
         drop(conn);
+        // PART 9: best-effort decision mirror. Re-entry into
+        // the generic store is bounded by the
+        // `record_decision`-only-flips-pending semantics, so a
+        // ↔ b loop stops on the second hop.
+        if let Some(mirror) = self.decision_mirror.get() {
+            mirror.mirror_decision(plan_id, new_status.as_str(), note);
+        }
         // Re-read so we return the canonical row.
         match self.get(plan_id)? {
             Some(r) => Ok(r),

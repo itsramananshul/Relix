@@ -6994,6 +6994,16 @@ fn register_node_type_handlers(
             } else {
                 None
             };
+        // PART 9: wire the dual-write decision mirror. When BOTH
+        // the generic `ApprovalDeliveryService` and the planning
+        // `ApprovalStore` are alive, a decision recorded on
+        // either side flips the matching row in the other store
+        // automatically. The pair shares the `id` column
+        // (plan_id ↔ approval_id) so operators don't have to
+        // teach two different systems to stay in sync.
+        if let (Some(svc), Some(ps)) = (research_approval.as_ref(), approval_store.as_ref()) {
+            crate::approval::wire_dual_write(svc, ps);
+        }
         crate::planning::register(
             bridge,
             planning_registry.clone(),

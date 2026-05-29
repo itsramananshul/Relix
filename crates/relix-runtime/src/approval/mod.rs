@@ -35,6 +35,7 @@ pub mod dashboard_dispatch;
 pub mod delivery;
 pub mod email_dispatch;
 pub mod email_reply;
+pub mod mirror;
 pub mod multi_dispatch;
 pub mod store;
 
@@ -42,7 +43,7 @@ pub use dashboard_dispatch::DashboardChannelDispatch;
 pub use delivery::{
     ApprovalDeliveryConfig, ApprovalDeliveryMatrix, ApprovalDeliveryService, ApprovalRequest,
     ChannelDispatch, ChannelDispatchError, ChannelKind, ChannelsConfig, DashboardChannelCfg,
-    DeliveryOutcome, DeliveryRule, DiscordChannelCfg, EmailChannelCfg, RuleMatch,
+    DecisionMirror, DeliveryOutcome, DeliveryRule, DiscordChannelCfg, EmailChannelCfg, RuleMatch,
     SingleChannelDispatch, SlackChannelCfg, TelegramChannelCfg,
 };
 pub use email_dispatch::{
@@ -53,6 +54,7 @@ pub use email_reply::{
     EmailProvider, EmailReplyAction, EmailReplyError, ParsedReply, SubjectDecision, lift_decision,
     parse_inbound_webhook, parse_subject_for_decision, verify_mailgun_signature,
 };
+pub use mirror::{ApprovalDeliveryServiceMirror, PlanningStoreMirror, wire_dual_write};
 pub use multi_dispatch::{
     ApprovalSendArgs, MeshSingleChannelDispatch, MultiChannelDispatch, approval_send_method,
 };
