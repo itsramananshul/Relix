@@ -29,9 +29,9 @@
 
 Closed gaps: **3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 18, 23, 24, 25** (full closure) + **1, 2** (closed in the 2026-05-29 SDK + embedded pass).
 
-Partial closures: **15** (always-require allowlist sub-bullet; other §7.30 items remain SKIPPED), **16** (`relix models` CLI sub-bullet; other §7.29 reasoning-engine items remain SKIPPED), **22** (Feature 2 is achievable in a future commit; Features 1 + 4 are EXTERNAL-INFRASTRUCTURE-DEFERRED).
+Partial closures: **15** (always-require allowlist sub-bullet; other §7.30 items remain SKIPPED), **16** (`relix models` CLI sub-bullet; other §7.29 reasoning-engine items remain SKIPPED), **22** (Feature 2 CLOSED in `6216d98`; Features 1 + 4 remain EXTERNAL-INFRASTRUCTURE-DEFERRED).
 
-EXTERNAL-INFRASTRUCTURE-DEFERRED: **9** (dashboard tile blocks on multi-week dashboard redesign), **10** (4 missing perception sub-tools need Stagehand / LlamaParse / Crawl4AI / computer-use), **17** (research-backed identity needs external web-search API), **19** (plugin marketplace needs hosted registry + signing CA), **20** (WebRTC + Relix Cloud), **21** (warm sandbox needs OS-level kernel primitives), **22 partial** (Features 1 + 4).
+EXTERNAL-INFRASTRUCTURE-DEFERRED: **9** (dashboard tile blocks on multi-week dashboard redesign), **10** (4 missing perception sub-tools need Stagehand / LlamaParse / Crawl4AI / computer-use), **17** (research-backed identity needs external web-search API), **19** (plugin marketplace needs hosted registry + signing CA), **20** (WebRTC + Relix Cloud), **21** (warm sandbox needs OS-level kernel primitives), **22 partial** (Features 1 + 4 remain blocked on GAP 21 + Presidio sidecar respectively).
 
 CONSISTENT (roadmap match): **26**.
 
@@ -370,15 +370,21 @@ Each piece is a multi-week kernel-level integration with its own security review
 
 ---
 
-## GAP 22 — §7.28 Documented NOT-DONE sub-bullets — EXTERNAL-INFRASTRUCTURE-DEFERRED
+## GAP 22 — §7.28 Documented NOT-DONE sub-bullets — PARTIALLY CLOSED
 
-Each of the three explicitly-NOT-DONE sub-bullets remains permanently scoped out for a specific external reason:
+**Partially closed in commit 6216d98** (Feature 2). The remaining two sub-bullets stay EXTERNAL-INFRASTRUCTURE-DEFERRED for their original blockers.
 
 1. **Feature 1 pause-and-resume state preservation** — directly depends on GAP 21's warm-sandbox snapshot/restore primitives. Without OS-level kernel snapshot support, pause-and-resume is structurally impossible. EXTERNAL-INFRASTRUCTURE-DEFERRED, blocked on GAP 21.
-2. **Feature 2 provider-cost-spike + ask-human-rate drift alerts** — building a rolling-baseline metric store + spike-detection alert pipeline is achievable in scope (the existing metrics store already buckets per-agent + per-method; extending it to per-provider cost time series is the missing piece). NOT external-infrastructure-blocked; this is the achievable remaining sub-bullet of GAP 22 and is documented here as a future commit rather than as a permanent deferral.
+2. **Feature 2 provider-cost-spike + ask-human-rate drift alerts — CLOSED (6216d98)**:
+   - New `model_cost_summary(model, hours)` + `list_models(hours)` + `ask_human_rate(agent, hours)` query helpers in `relix-runtime::metrics::query`.
+   - New `AlertKind::ProviderCostSpike` (keyed per `model:<id>`) and `AlertKind::AskHumanRateDrift` (keyed per-agent).
+   - 9 new threshold knobs with sensible defaults: `provider_cost_spike_factor` (3.0), `provider_cost_baseline_hours` (24), `provider_cost_recent_hours` (1), `provider_cost_min_baseline_micros` (10_000 = $0.01); `ask_human_drift_factor` (3.0), `ask_human_baseline_hours` (24), `ask_human_recent_hours` (1), `ask_human_min_attempts` (10), `ask_human_min_recent_rate` (0.05 = 5%).
+   - New `eval_provider_cost_spike` + `eval_ask_human_drift` run once per evaluate() tick alongside the existing four kinds. Both reuse the existing `evaluate_threshold_keyed` dedup path (Fired / Recovered semantics are identical to the pre-existing kinds).
+   - `DispatchBridge.record_admission_denial_metric` writes a minimal `InvocationMetric` (success=false, error_kind=`APPROVAL_REQUIRED`, no token / cost / model) at all four `APPROVAL_REQUIRED` return paths (agent_gate + always_require allowlist, unary + streaming) so the drift detector has a time-series signal to read. POLICY_DENIED + UNKNOWN_METHOD denials remain counter-only as before.
+   - 9 new unit tests cover model_cost_summary aggregation, list_models distinct-non-empty filtering, ask_human_rate per-agent counting, spike-fires-when-recent-exceeds-baseline-by-factor, spike-respects-noise-floor, drift-fires-when-recent-exceeds-baseline-by-factor, drift-respects-min-attempts-floor, drift-respects-absolute-rate-floor, and AlertKind string round-trip.
 3. **Feature 4 Presidio integration** — Microsoft Presidio is a Python service that must run as a sidecar process; integrating it requires standing up + running a Python process alongside the bridge AND wiring an IPC channel for the redaction calls. The in-process `PiiDetector` already covers the operator semantics Presidio would provide for the workload Relix sees today. Adding the Presidio sidecar is EXTERNAL-INFRASTRUCTURE-DEFERRED until a deployment actually justifies the operational overhead.
 
-**Status:** 2 of 3 EXTERNAL-INFRASTRUCTURE-DEFERRED; 1 of 3 (Feature 2) achievable in a future commit.
+**Status:** 1 of 3 CLOSED (Feature 2); 2 of 3 remain EXTERNAL-INFRASTRUCTURE-DEFERRED (Features 1 + 4).
 
 ---
 

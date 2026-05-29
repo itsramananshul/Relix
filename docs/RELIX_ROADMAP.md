@@ -3695,7 +3695,16 @@ log_all_calls          = true        # every call in audit trail
 ---
 
 
-### 7.28 Observability — Cost Control, Alerting, Dashboard, and PII Detection `[DONE — commit 717d156]`
+### 7.28 Observability — Cost Control, Alerting, Dashboard, and PII Detection `[DONE — commit 717d156 + Feature 2 follow-up 6216d98]`
+
+> **GAP-FOLLOWUP (2026-05-29):** GAP 22 in `docs/GAP_REPORT.md` listed three explicitly-NOT-DONE sub-bullets. Feature 2 (provider-cost-spike + ask-human-rate drift alerts) is now closed in `6216d98`:
+> - New `model_cost_summary` + `list_models` + `ask_human_rate` query helpers in `relix-runtime::metrics::query`.
+> - New `AlertKind::ProviderCostSpike` (keyed per `model:<id>`) and `AlertKind::AskHumanRateDrift` (keyed per-agent).
+> - 9 new threshold knobs with sensible defaults (3× factor; 24h baseline; 1h recent; noise floors on absolute rate + min attempts + min baseline cost).
+> - `DispatchBridge.record_admission_denial_metric` stamps `APPROVAL_REQUIRED` denials onto the metrics time series so the drift detector has a signal to read; POLICY_DENIED + UNKNOWN_METHOD remain counter-only as before.
+> - 9 new unit tests; workspace runtime tests went 2778 → 2787.
+>
+> Features 1 + 4 stay NOT DONE for their original reasons: Feature 1 pause/resume blocks on §7.26 Component 7 warm-sandbox snapshot primitives, Feature 4 Presidio integration needs a Python sidecar that's deferred as an ops decision.
 
 Four observability features that give operators full visibility and control over what Relix is doing, how much it's costing, and whether sensitive data is being handled safely.
 
