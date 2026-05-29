@@ -67,6 +67,7 @@ pub mod terminal;
 pub mod text_chunk;
 pub mod web_extract;
 pub mod web_robots;
+pub mod web_search;
 pub mod web_tools;
 
 use std::collections::HashMap;
