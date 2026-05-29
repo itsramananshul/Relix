@@ -16,12 +16,18 @@
 //! See [`SlackApi`] for the surface area + [`live::LiveSlackApi`] for
 //! the production reqwest+rustls implementation.
 
+pub mod approval;
 pub mod config;
 pub mod identity;
 pub mod live;
 pub mod messages;
 pub mod mock;
 
+pub use approval::{
+    APPROVE_VALUE_PREFIX, DENY_VALUE_PREFIX, InteractionAction, InteractionParseError,
+    MAX_SIGNATURE_AGE_SECS, SignatureCheck, SlackChannelDispatch, parse_interaction_payload,
+    verify_request_signature,
+};
 pub use config::{SlackConfig, SlackError};
 pub use identity::{ChannelSubject, derive_channel_subject};
 pub use live::{BotIdentity, LiveSlackApi};

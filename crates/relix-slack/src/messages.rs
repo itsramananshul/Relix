@@ -40,14 +40,31 @@ pub struct IncomingMessage {
 
 /// A reply the channel wants to send. `thread_ts` empty means a
 /// top-level message; non-empty produces a Slack threaded reply.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+///
+/// `blocks` carries an optional Block Kit layout — when non-
+/// empty it is sent through `chat.postMessage` alongside
+/// `text` (Slack uses `text` as the fallback / notification
+/// preview when blocks render). Approval messages stamp this
+/// with a `section` + `actions` block carrying the Approve /
+/// Deny buttons.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct OutgoingMessage {
+    /// Slack channel id (`C…` public, `G…` private, `D…` IM).
     pub channel_id: String,
     /// Empty == "do not thread". Non-empty == "post in this
     /// thread."
     #[serde(default)]
     pub thread_ts: String,
+    /// Plain-text body. Sent verbatim AND used as the
+    /// fallback / notification preview when `blocks` is
+    /// non-empty.
     pub text: String,
+    /// Optional Block Kit layout. Each element is one block in
+    /// Slack's Block Kit shape (`section`, `actions`,
+    /// `divider`, etc.). When empty the message is sent as
+    /// plain text only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<serde_json::Value>,
 }
 
 impl IncomingMessage {

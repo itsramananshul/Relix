@@ -273,6 +273,7 @@ async fn send_text(api: &dyn SlackApi, channel_id: &str, thread_ts: &str, text: 
         channel_id: channel_id.to_string(),
         thread_ts: thread_ts.to_string(),
         text: formatted,
+        blocks: Vec::new(),
     };
     if let Err(e) = api.chat_post_message(&msg).await {
         tracing::warn!(error = %e, channel_id = channel_id, "slack: chat.postMessage failed");

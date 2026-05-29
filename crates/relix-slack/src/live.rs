@@ -266,6 +266,13 @@ struct SlackPostMessage<'a> {
     text: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     thread_ts: &'a str,
+    /// PART 2: Block Kit layout. Slack accepts `blocks` as a
+    /// JSON array on the same `chat.postMessage` body that
+    /// carries `text`; clients that can't render blocks fall
+    /// back to the `text` field, which is what makes
+    /// notifications work on desktop / mobile pre-launch.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    blocks: &'a [serde_json::Value],
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -328,6 +335,7 @@ impl SlackApi for LiveSlackApi {
             channel: &out.channel_id,
             text: &out.text,
             thread_ts: &out.thread_ts,
+            blocks: &out.blocks,
         })
         .map_err(|e| SlackApiError::Transient(format!("chat.postMessage body: {e}")))?;
         let _: SlackPostResp = self.request("chat.postMessage", &body).await?;

@@ -194,6 +194,7 @@ async fn handle_send(api: Arc<dyn SlackApi>, args: Vec<u8>) -> HandlerOutcome {
         // No thread reference on outbound coordinator messages.
         thread_ts: String::new(),
         text: rendered,
+        blocks: Vec::new(),
     };
     match api.chat_post_message(&msg).await {
         Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),

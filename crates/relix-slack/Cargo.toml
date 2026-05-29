@@ -19,6 +19,11 @@ async-trait.workspace = true
 tokio                = { workspace = true, features = ["sync", "macros", "time", "rt", "net"] }
 tracing.workspace    = true
 reqwest.workspace    = true
+# PART 2: HMAC-SHA256 for `x-slack-signature` verification on
+# inbound interactivity payloads.
+hmac.workspace       = true
+sha2.workspace       = true
+hex.workspace        = true
 
 [dev-dependencies]
 tempfile.workspace = true

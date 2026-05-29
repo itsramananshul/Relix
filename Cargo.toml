@@ -43,6 +43,11 @@ authors = ["Anshul Raman <ramanal@mail.uc.edu>"]
 relix-core        = { path = "crates/relix-core",        version = "0.1.0" }
 relix-runtime     = { path = "crates/relix-runtime",     version = "0.1.0" }
 relix-web-bridge  = { path = "crates/relix-web-bridge",  version = "0.1.0" }
+# Channel crates — declared at the workspace level so binaries and the
+# bridge can opt in to one with `<crate>.workspace = true`.
+relix-telegram    = { path = "crates/relix-telegram",    version = "0.1.0" }
+relix-discord     = { path = "crates/relix-discord",     version = "0.1.0" }
+relix-slack       = { path = "crates/relix-slack",       version = "0.1.0" }
 # Cryptography
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core", "zeroize"] }
 blake3        = { version = "1.5", default-features = false, features = ["std"] }

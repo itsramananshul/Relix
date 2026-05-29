@@ -167,6 +167,7 @@ mod tests {
             channel_id: "C0".into(),
             thread_ts: "1700000000.000100".into(),
             text: "hello back".into(),
+            blocks: Vec::new(),
         };
         m.chat_post_message(&out).await.unwrap();
         assert_eq!(m.sent_messages().len(), 1);
@@ -181,6 +182,7 @@ mod tests {
             channel_id: "C0".into(),
             thread_ts: String::new(),
             text: "x".into(),
+            blocks: Vec::new(),
         };
         let r = m.chat_post_message(&out).await;
         assert!(matches!(r, Err(SlackApiError::Transient(_))));

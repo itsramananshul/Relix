@@ -193,6 +193,7 @@ async fn post_message_posts_to_chat_endpoint() {
         channel_id: "C0".into(),
         thread_ts: "1700000000.000100".into(),
         text: "hello".into(),
+        blocks: Vec::new(),
     })
     .await
     .expect("post");
@@ -224,6 +225,7 @@ async fn post_message_retries_on_429_then_succeeds() {
         channel_id: "C0".into(),
         thread_ts: String::new(),
         text: "x".into(),
+        blocks: Vec::new(),
     })
     .await
     .expect("must succeed after retry");
@@ -243,6 +245,7 @@ async fn post_message_retries_on_5xx_then_succeeds() {
         channel_id: "C0".into(),
         thread_ts: String::new(),
         text: "y".into(),
+        blocks: Vec::new(),
     })
     .await
     .expect("must succeed after backoff");
@@ -263,6 +266,7 @@ async fn post_message_ok_false_is_client_error_not_retried() {
             channel_id: "C0".into(),
             thread_ts: String::new(),
             text: "z".into(),
+            blocks: Vec::new(),
         })
         .await
         .expect_err("must error on ok=false");

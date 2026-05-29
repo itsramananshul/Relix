@@ -101,6 +101,7 @@ mod browser_captures;
 mod browser_sessions;
 mod budget;
 mod capabilities;
+mod channels;
 mod chat;
 mod confidence;
 #[cfg(test)]
@@ -636,6 +637,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v1/approval/failed-deliveries",
             get(approval::failed_deliveries),
+        )
+        // PART 2: inbound Slack interactivity webhook. Verifies
+        // `x-slack-signature` HMAC against the signing secret
+        // (`RELIX_BRIDGE_SLACK_SIGNING_SECRET`), parses the
+        // Block Kit `block_actions` payload, and forwards the
+        // lifted decision to `approval.record_decision`.
+        .route(
+            "/v1/channels/slack/interact",
+            post(channels::slack_interact),
         )
         // RELIX-7.30 PART 2: credential vault.
         .route(
