@@ -6236,12 +6236,108 @@ fn register_node_type_handlers(
             match crate::approval::ApprovalRequestStore::open(&store_path) {
                 Ok(delivery_store) => {
                     let matrix = crate::approval::ApprovalDeliveryMatrix::new(delivery_cfg);
+                    // PART 8: matrix validation — log any issue so the
+                    // operator sees the problem at startup rather than
+                    // at the first approval. The matrix still wires
+                    // (with the dashboard fallback) so the controller
+                    // boots; the operator gets a hard signal in logs.
+                    for issue in matrix.validate() {
+                        tracing::warn!(
+                            issue = %issue,
+                            "approval delivery: matrix validation issue"
+                        );
+                    }
+                    // PART 8: build the multi-channel router. The
+                    // dashboard slot is always in-process; the four
+                    // remote slots dispatch via the shared
+                    // `AlertMeshCell` to `<channel>.approval_send` on
+                    // the operator-configured peer. The mesh cell is
+                    // populated post-startup by the `CoordAlertMesh`
+                    // wiring; until then the remote slots return
+                    // `Disabled("mesh client not initialised")` and
+                    // the dispatcher fails-soft on those approvals
+                    // (logged in `delivery_failed`).
+                    let cfg_channels = matrix.config().channels.clone();
+                    let mut multi = crate::approval::MultiChannelDispatch::new().with_channel(
+                        crate::approval::ChannelKind::Dashboard,
+                        std::sync::Arc::new(crate::approval::DashboardChannelDispatch::enabled()),
+                    );
+                    // Reuse the metrics fan-out's mesh cell so operators
+                    // don't have to wire two cells. When metrics is
+                    // absent the cell is freshly minted — the remote
+                    // slots will then permanently `Disabled` since
+                    // nothing populates it, but the dashboard slot keeps
+                    // working.
+                    let alert_mesh_cell_for_approval: crate::metrics::AlertMeshCell = metrics
+                        .map(|m| m.alert_mesh_cell.clone())
+                        .unwrap_or_else(|| std::sync::Arc::new(tokio::sync::OnceCell::new()));
+                    if let Some(tg) = cfg_channels.telegram.as_ref()
+                        && tg.enabled
+                    {
+                        multi = multi.with_channel(
+                            crate::approval::ChannelKind::Telegram,
+                            std::sync::Arc::new(crate::approval::MeshSingleChannelDispatch::new(
+                                alert_mesh_cell_for_approval.clone(),
+                                tg.peer.clone(),
+                                crate::approval::ChannelKind::Telegram,
+                                tg.chat_id.clone(),
+                                String::new(),
+                            )),
+                        );
+                    }
+                    if let Some(sl) = cfg_channels.slack.as_ref()
+                        && sl.enabled
+                    {
+                        multi = multi.with_channel(
+                            crate::approval::ChannelKind::Slack,
+                            std::sync::Arc::new(crate::approval::MeshSingleChannelDispatch::new(
+                                alert_mesh_cell_for_approval.clone(),
+                                sl.peer.clone(),
+                                crate::approval::ChannelKind::Slack,
+                                sl.channel_id.clone(),
+                                String::new(),
+                            )),
+                        );
+                    }
+                    if let Some(dc) = cfg_channels.discord.as_ref()
+                        && dc.enabled
+                    {
+                        multi = multi.with_channel(
+                            crate::approval::ChannelKind::Discord,
+                            std::sync::Arc::new(crate::approval::MeshSingleChannelDispatch::new(
+                                alert_mesh_cell_for_approval.clone(),
+                                dc.peer.clone(),
+                                crate::approval::ChannelKind::Discord,
+                                dc.channel_id.clone(),
+                                String::new(),
+                            )),
+                        );
+                    }
+                    if let Some(em) = cfg_channels.email.as_ref()
+                        && em.enabled
+                    {
+                        multi = multi.with_channel(
+                            crate::approval::ChannelKind::Email,
+                            std::sync::Arc::new(crate::approval::MeshSingleChannelDispatch::new(
+                                alert_mesh_cell_for_approval.clone(),
+                                em.peer.clone(),
+                                crate::approval::ChannelKind::Email,
+                                em.to.clone(),
+                                em.reply_to.clone(),
+                            )),
+                        );
+                    }
+                    let configured_count = multi.configured_channel_count();
                     let dispatch: std::sync::Arc<dyn crate::approval::ChannelDispatch> =
-                        std::sync::Arc::new(crate::approval::delivery::LogChannelDispatch);
+                        std::sync::Arc::new(multi);
                     let service = crate::approval::ApprovalDeliveryService::new(
                         matrix,
                         delivery_store,
                         dispatch,
+                    );
+                    tracing::info!(
+                        configured_channels = configured_count,
+                        "approval delivery: wired MultiChannelDispatch (PART 8)"
                     );
                     crate::approval::caps::register(bridge, service.clone());
                     research_approval = Some(service);
@@ -6258,12 +6354,25 @@ fn register_node_type_handlers(
                             "approval.record_decision",
                             "Record an operator decision so the escalation timer can stand down.",
                         ),
+                        (
+                            "approval.failed_deliveries",
+                            "List rows in delivery_failed status for operator reconciliation (PART 6).",
+                        ),
+                        (
+                            "approval.list_pending",
+                            "List rows in pending status for the dashboard surface (PART 5).",
+                        ),
                     ] {
                         manifest.add_capability(
                             CapabilityDescriptor::unary(method)
                                 .with_description(doc)
                                 .with_categories(
-                                    if method == "approval.delivery_status" {
+                                    if matches!(
+                                        method,
+                                        "approval.delivery_status"
+                                            | "approval.failed_deliveries"
+                                            | "approval.list_pending"
+                                    ) {
                                         ["read", "approval"]
                                     } else {
                                         ["mutate", "approval"]
@@ -7890,6 +7999,17 @@ fn register_node_type_handlers(
                 &["write", "telegram", "send"],
                 &["sends:external"],
             ),
+            (
+                "telegram.approval_send",
+                "Render + send an approval request via the rich \
+                 InlineKeyboardMarkup dispatcher. Args: JSON shape of \
+                 ApprovalSendArgs (approval_id, agent_name, capability, \
+                 request_summary, session_id, is_escalation, target_id). \
+                 Returns {ok:true} on success. Routed via the coordinator's \
+                 ApprovalDeliveryService.",
+                &["write", "telegram", "approval"],
+                &["sends:external"],
+            ),
         ];
         for (method, doc, cats, sensitivities) in telegram_caps {
             let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
@@ -7976,6 +8096,15 @@ fn register_node_type_handlers(
                  Returns {ok:true} on success. Used by the alert fan-out \
                  + any coordinator code that needs to push a message.",
                 &["write", "discord", "send"],
+                &["sends:external"],
+            ),
+            (
+                "discord.approval_send",
+                "Render + send an approval request via the rich \
+                 component-button dispatcher. Args: JSON shape of \
+                 ApprovalSendArgs (target_id = channel snowflake). Returns \
+                 {ok:true} on success.",
+                &["write", "discord", "approval"],
                 &["sends:external"],
             ),
         ];
@@ -8065,6 +8194,14 @@ fn register_node_type_handlers(
                 &["write", "slack", "send"],
                 &["sends:external"],
             ),
+            (
+                "slack.approval_send",
+                "Render + send an approval request via the rich Block Kit \
+                 dispatcher. Args: JSON shape of ApprovalSendArgs \
+                 (target_id = channel id `C…`). Returns {ok:true} on success.",
+                &["write", "slack", "approval"],
+                &["sends:external"],
+            ),
         ];
         for (method, doc, cats, sensitivities) in slack_caps {
             let mut desc = CapabilityDescriptor::unary(*method).with_description(*doc);
@@ -8152,6 +8289,17 @@ fn register_node_type_handlers(
                  Templates resolve from `RELIX_EMAIL_TEMPLATES_DIR` or the built-in \
                  registry (welcome / reset_password / task_completed / task_failed).",
                 &["write", "email", "send_template"],
+                &["sends:external"],
+            ),
+            (
+                "email.approval_send",
+                "Render + send an approval email. Args: JSON shape of \
+                 ApprovalSendArgs (target_id = recipient mailbox, \
+                 target_extra = Reply-To address). Subject is \
+                 `Approval Required: <cap> [<id>]` so the bridge's \
+                 /v1/channels/email/reply route can route the operator's \
+                 reply back to record_decision.",
+                &["write", "email", "approval"],
                 &["sends:external"],
             ),
         ];

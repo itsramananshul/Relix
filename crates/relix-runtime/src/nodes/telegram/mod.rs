@@ -168,6 +168,22 @@ pub fn register(
             })),
         );
     }
+    // PART 8: rich approval dispatch. Hosts the operator-facing
+    // interactive message (InlineKeyboardMarkup) so the
+    // coordinator's `ApprovalDeliveryService` can route approval
+    // requests through Telegram without rebuilding the wire-level
+    // bot client. Args are the JSON shape of
+    // `relix_runtime::approval::ApprovalSendArgs`.
+    {
+        let api = api.clone();
+        bridge.register(
+            "telegram.approval_send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let api = api.clone();
+                async move { handle_approval_send(api, ctx.args).await }
+            })),
+        );
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -246,6 +262,52 @@ async fn handle_send(api: Arc<dyn BotApi>, args: Vec<u8>) -> HandlerOutcome {
                 retry_after: None,
             })
         }
+    }
+}
+
+/// PART 8: dispatch one approval request via the rich
+/// `TelegramChannelDispatch` (`InlineKeyboardMarkup` buttons,
+/// callback_query reply path). Args are JSON shape of
+/// [`crate::approval::ApprovalSendArgs`]; `target_id` is parsed
+/// as the numeric chat id (Telegram's wire type).
+async fn handle_approval_send(api: Arc<dyn BotApi>, args: Vec<u8>) -> HandlerOutcome {
+    let parsed: crate::approval::ApprovalSendArgs = match serde_json::from_slice(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("telegram.approval_send: decode args: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    let chat_id: i64 = match parsed.target_id.trim().parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!(
+                    "telegram.approval_send: target_id must be a numeric chat id, got {:?}",
+                    parsed.target_id
+                ),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    let request = parsed.to_request();
+    let is_escalation = parsed.is_escalation;
+    let dispatch = relix_telegram::TelegramChannelDispatch::new(api, chat_id);
+    use relix_core::approval::SingleChannelDispatch;
+    match dispatch.send(&request, is_escalation).await {
+        Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("telegram.approval_send: {e}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
     }
 }
 

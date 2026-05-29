@@ -170,6 +170,94 @@ impl ApprovalDeliveryMatrix {
         }
     }
 
+    /// PART 8 — validate the matrix against the channel
+    /// configuration. Returns one [`String`] per issue
+    /// detected; an empty Vec means the matrix is wire-clean.
+    ///
+    /// Checks performed:
+    ///
+    /// 1. `default_channel` parses to a [`ChannelKind`].
+    /// 2. Every `rules[i].channel` parses to a [`ChannelKind`].
+    /// 3. When `rules[i].escalation_timeout_secs > 0`, the rule
+    ///    MUST set `escalation_channel` (otherwise the timer
+    ///    fires but has nowhere to escalate to).
+    /// 4. When `rules[i].escalation_channel = Some(s)`, `s`
+    ///    parses to a [`ChannelKind`].
+    /// 5. The default channel + every rule's resolved channel
+    ///    must be `channel_enabled` per the matrix's channels
+    ///    config (a rule pointing at a channel without an
+    ///    `[approval.delivery.channels.<name>]` block surfaces
+    ///    `ChannelDisabled` at dispatch — better to flag at
+    ///    startup).
+    ///
+    /// The controller logs each issue and refuses to register
+    /// caps when the list is non-empty so operators see the
+    /// problem at startup rather than at the first approval.
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues: Vec<String> = Vec::new();
+        let default_kind = ChannelKind::parse(&self.cfg.default_channel);
+        if default_kind.is_none() {
+            issues.push(format!(
+                "default_channel `{}` is not a valid channel kind \
+                 (expected one of telegram, slack, discord, email, dashboard)",
+                self.cfg.default_channel
+            ));
+        }
+        if let Some(k) = default_kind
+            && !self.channel_enabled(k)
+        {
+            issues.push(format!(
+                "default_channel `{}` is not enabled / not configured \
+                 (add an `[approval.delivery.channels.{}]` block with \
+                 `enabled = true` and the required credentials)",
+                k.as_str(),
+                k.as_str()
+            ));
+        }
+        for (i, rule) in self.cfg.rules.iter().enumerate() {
+            let kind = ChannelKind::parse(&rule.channel);
+            if kind.is_none() {
+                issues.push(format!(
+                    "rules[{i}].channel `{}` is not a valid channel kind",
+                    rule.channel
+                ));
+            }
+            if let Some(k) = kind
+                && !self.channel_enabled(k)
+            {
+                issues.push(format!(
+                    "rules[{i}].channel `{}` is not enabled / not configured",
+                    k.as_str()
+                ));
+            }
+            if rule.escalation_timeout_secs > 0 && rule.escalation_channel.is_none() {
+                issues.push(format!(
+                    "rules[{i}].escalation_timeout_secs={} is set but \
+                     escalation_channel is missing — escalation timers must \
+                     have a destination",
+                    rule.escalation_timeout_secs
+                ));
+            }
+            if let Some(esc) = rule.escalation_channel.as_deref() {
+                let esc_kind = ChannelKind::parse(esc);
+                if esc_kind.is_none() {
+                    issues.push(format!(
+                        "rules[{i}].escalation_channel `{esc}` is not a valid channel kind"
+                    ));
+                }
+                if let Some(k) = esc_kind
+                    && !self.channel_enabled(k)
+                {
+                    issues.push(format!(
+                        "rules[{i}].escalation_channel `{}` is not enabled / not configured",
+                        k.as_str()
+                    ));
+                }
+            }
+        }
+        issues
+    }
+
     /// `true` when the channel is enabled in the config.
     /// Disabled channels return a `DeliveryError::ChannelDisabled`
     /// at dispatch time so operators see the wire reason
@@ -689,6 +777,95 @@ mod tests {
         let m = ApprovalDeliveryMatrix::new(cfg);
         let r = m.resolve("a", "b");
         assert_eq!(r.channel, ChannelKind::Dashboard);
+    }
+
+    // ── PART 8 — matrix validation ───────────────────────
+
+    #[test]
+    fn validate_clean_matrix_returns_no_issues() {
+        let m = ApprovalDeliveryMatrix::new(fixture_cfg());
+        // fixture_cfg uses telegram (enabled), slack (enabled),
+        // email (enabled), dashboard (enabled). Discord is None,
+        // but no rule references it.
+        let issues = m.validate();
+        assert!(issues.is_empty(), "expected no issues, got {issues:?}");
+    }
+
+    #[test]
+    fn validate_flags_unparseable_default_channel() {
+        let mut cfg = fixture_cfg();
+        cfg.default_channel = "smoke-signal".into();
+        let m = ApprovalDeliveryMatrix::new(cfg);
+        let issues = m.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("default_channel `smoke-signal`")),
+            "expected default_channel issue, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_escalation_timeout_without_channel() {
+        let mut cfg = fixture_cfg();
+        cfg.rules[0].escalation_channel = None;
+        let m = ApprovalDeliveryMatrix::new(cfg);
+        let issues = m.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("escalation_timeout_secs=300")
+                    && s.contains("escalation_channel is missing")),
+            "expected escalation-without-channel issue, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_unparseable_rule_channel() {
+        let mut cfg = fixture_cfg();
+        cfg.rules[0].channel = "carrier-pigeon".into();
+        let m = ApprovalDeliveryMatrix::new(cfg);
+        let issues = m.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("rules[0].channel `carrier-pigeon`")),
+            "expected rule channel issue, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_rule_pointing_at_disabled_channel() {
+        let mut cfg = fixture_cfg();
+        cfg.rules.push(DeliveryRule {
+            agent_pattern: "*".into(),
+            action_pattern: "tool.discord_only.*".into(),
+            channel: "discord".into(),
+            escalation_timeout_secs: 0,
+            escalation_channel: None,
+        });
+        let m = ApprovalDeliveryMatrix::new(cfg);
+        let issues = m.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("rules[2].channel `discord`") && s.contains("not enabled")),
+            "expected disabled-channel issue, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_flags_unparseable_escalation_channel() {
+        let mut cfg = fixture_cfg();
+        cfg.rules[0].escalation_channel = Some("snail-mail".into());
+        let m = ApprovalDeliveryMatrix::new(cfg);
+        let issues = m.validate();
+        assert!(
+            issues
+                .iter()
+                .any(|s| s.contains("rules[0].escalation_channel `snail-mail`")),
+            "expected escalation-channel parse issue, got {issues:?}"
+        );
     }
 
     #[test]

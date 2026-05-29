@@ -151,6 +151,20 @@ pub fn register(
             })),
         );
     }
+    // PART 8: rich approval dispatch. Routes operator approval
+    // requests through the component-rendering
+    // `DiscordChannelDispatch` so buttons fire back to the
+    // bridge's interactions endpoint.
+    {
+        let api = api.clone();
+        bridge.register(
+            "discord.approval_send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let api = api.clone();
+                async move { handle_approval_send(api, ctx.args).await }
+            })),
+        );
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -218,6 +232,45 @@ async fn handle_send(api: Arc<dyn DiscordApi>, args: Vec<u8>) -> HandlerOutcome 
                 retry_after: None,
             })
         }
+    }
+}
+
+/// PART 8: dispatch one approval request via the component-rich
+/// `DiscordChannelDispatch`. `target_id` is the channel snowflake
+/// the operator configured in
+/// `[approval.delivery.channels.discord] channel_id`.
+async fn handle_approval_send(api: Arc<dyn DiscordApi>, args: Vec<u8>) -> HandlerOutcome {
+    let parsed: crate::approval::ApprovalSendArgs = match serde_json::from_slice(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("discord.approval_send: decode args: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    if parsed.target_id.trim().is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "discord.approval_send: target_id (channel id) must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    let request = parsed.to_request();
+    let is_escalation = parsed.is_escalation;
+    let dispatch = relix_discord::DiscordChannelDispatch::new(api, parsed.target_id);
+    use relix_core::approval::SingleChannelDispatch;
+    match dispatch.send(&request, is_escalation).await {
+        Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("discord.approval_send: {e}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
     }
 }
 

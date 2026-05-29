@@ -35,6 +35,7 @@ pub mod dashboard_dispatch;
 pub mod delivery;
 pub mod email_dispatch;
 pub mod email_reply;
+pub mod multi_dispatch;
 pub mod store;
 
 pub use dashboard_dispatch::DashboardChannelDispatch;
@@ -51,5 +52,8 @@ pub use email_dispatch::{
 pub use email_reply::{
     EmailProvider, EmailReplyAction, EmailReplyError, ParsedReply, SubjectDecision, lift_decision,
     parse_inbound_webhook, parse_subject_for_decision, verify_mailgun_signature,
+};
+pub use multi_dispatch::{
+    ApprovalSendArgs, MeshSingleChannelDispatch, MultiChannelDispatch, approval_send_method,
 };
 pub use store::{ApprovalDeliveryRow, ApprovalRequestStore, ApprovalStoreError};

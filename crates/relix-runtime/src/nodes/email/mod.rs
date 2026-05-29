@@ -195,6 +195,62 @@ pub fn register(
             })),
         );
     }
+    // PART 8: rich approval dispatch. Hosts the approval-rendering
+    // `EmailChannelDispatch` so the coordinator can route approval
+    // emails (subject `Approval Required: <cap> [<id>]`) through
+    // the email node's SmtpSender.
+    {
+        let smtp = smtp.clone();
+        bridge.register(
+            "email.approval_send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let smtp = smtp.clone();
+                async move { handle_approval_send(ctx.args, smtp).await }
+            })),
+        );
+    }
+}
+
+/// PART 8: dispatch one approval request via the rendering
+/// `EmailChannelDispatch`. `target_id` is the recipient mailbox
+/// (`[approval.delivery.channels.email] to`); `target_extra`
+/// carries the `Reply-To:` header so the operator's reply lands
+/// on the bridge's `/v1/channels/email/reply` route.
+pub async fn handle_approval_send(args: Vec<u8>, smtp: Arc<SmtpSender>) -> HandlerOutcome {
+    let parsed: crate::approval::ApprovalSendArgs = match serde_json::from_slice(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("email.approval_send: decode args: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    if parsed.target_id.trim().is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "email.approval_send: target_id (recipient mailbox) must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    let request = parsed.to_request();
+    let is_escalation = parsed.is_escalation;
+    let sender: Arc<dyn crate::approval::ApprovalEmailSender> = smtp;
+    let dispatch =
+        crate::approval::EmailChannelDispatch::new(sender, parsed.target_id, parsed.target_extra);
+    use relix_core::approval::SingleChannelDispatch;
+    match dispatch.send(&request, is_escalation).await {
+        Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("email.approval_send: {e}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+    }
 }
 
 /// Decode the JSON args for `email.send`, dispatch via SMTP, and

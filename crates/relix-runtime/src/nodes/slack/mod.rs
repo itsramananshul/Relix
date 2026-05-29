@@ -147,6 +147,20 @@ pub fn register(
             })),
         );
     }
+    // PART 8: rich approval dispatch. Routes operator approval
+    // requests through the Block-Kit-rendering
+    // `SlackChannelDispatch` so the dashboard's approve / deny
+    // buttons show up in the workspace.
+    {
+        let api = api.clone();
+        bridge.register(
+            "slack.approval_send",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let api = api.clone();
+                async move { handle_approval_send(api, ctx.args).await }
+            })),
+        );
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -213,6 +227,45 @@ async fn handle_send(api: Arc<dyn SlackApi>, args: Vec<u8>) -> HandlerOutcome {
         Err(relix_slack::SlackApiError::MissingCredentials) => HandlerOutcome::Err(ErrorEnvelope {
             kind: error_kinds::RESPONDER_INTERNAL,
             cause: "slack.send: bot credentials missing".into(),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+    }
+}
+
+/// PART 8: dispatch one approval request via the Block-Kit-rich
+/// `SlackChannelDispatch`. `target_id` is the channel id
+/// (`C…`) the operator configured in
+/// `[approval.delivery.channels.slack] channel_id`.
+async fn handle_approval_send(api: Arc<dyn SlackApi>, args: Vec<u8>) -> HandlerOutcome {
+    let parsed: crate::approval::ApprovalSendArgs = match serde_json::from_slice(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("slack.approval_send: decode args: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    if parsed.target_id.trim().is_empty() {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "slack.approval_send: target_id (channel id) must be non-empty".into(),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
+    let request = parsed.to_request();
+    let is_escalation = parsed.is_escalation;
+    let dispatch = relix_slack::SlackChannelDispatch::new(api, parsed.target_id);
+    use relix_core::approval::SingleChannelDispatch;
+    match dispatch.send(&request, is_escalation).await {
+        Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("slack.approval_send: {e}"),
             retry_hint: 0,
             retry_after: None,
         }),
