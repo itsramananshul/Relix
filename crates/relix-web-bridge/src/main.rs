@@ -631,6 +631,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/routing/explain", post(routing::explain))
         // RELIX-7.30 PART 1: out-of-band approval delivery status.
         .route("/v1/approval/:id/delivery", get(approval::delivery_status))
+        // PART 6: rows the dispatcher failed to deliver — operators
+        // reconcile these via the dashboard before retrying.
+        .route(
+            "/v1/approval/failed-deliveries",
+            get(approval::failed_deliveries),
+        )
         // RELIX-7.30 PART 2: credential vault.
         .route(
             "/v1/credentials",

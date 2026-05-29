@@ -9,11 +9,13 @@
 //! the trait without depending on this crate. We re-export them
 //! through this module so existing callers keep working.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 pub use relix_core::approval::{
     ApprovalRequest, ChannelDispatchError, ChannelKind, ChannelsConfig, DashboardChannelCfg,
@@ -307,15 +309,28 @@ impl ChannelDispatch for LogChannelDispatch {
     }
 }
 
+/// Per-approval cancellation handle for the escalation
+/// timer. The receive end lives in the spawned timer task; the
+/// send end lives in [`ApprovalDeliveryService::escalation_cancels`]
+/// and is taken when the operator records a decision.
+type CancelSender = oneshot::Sender<()>;
+
 /// Service. Cheap to clone (a couple of Arcs).
 #[derive(Clone)]
 pub struct ApprovalDeliveryService {
     matrix: ApprovalDeliveryMatrix,
     store: ApprovalRequestStore,
     dispatch: Arc<dyn ChannelDispatch>,
+    /// PART 7: per-approval cancellation senders for spawned
+    /// escalation timers. `record_decision` takes and fires
+    /// the sender so the timer task wakes up early and
+    /// short-circuits instead of waking from `sleep` to find a
+    /// decided row. Keyed by `approval_id`.
+    escalation_cancels: Arc<Mutex<HashMap<String, CancelSender>>>,
 }
 
 impl ApprovalDeliveryService {
+    /// Build a new delivery service.
     pub fn new(
         matrix: ApprovalDeliveryMatrix,
         store: ApprovalRequestStore,
@@ -325,13 +340,16 @@ impl ApprovalDeliveryService {
             matrix,
             store,
             dispatch,
+            escalation_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Borrow the wrapped matrix (read-only view for caps).
     pub fn matrix(&self) -> &ApprovalDeliveryMatrix {
         &self.matrix
     }
 
+    /// Borrow the wrapped store (read-only view for caps).
     pub fn store(&self) -> &ApprovalRequestStore {
         &self.store
     }
@@ -339,15 +357,30 @@ impl ApprovalDeliveryService {
     /// End-to-end dispatch:
     ///
     /// 1. Resolve the rule + channel via the matrix.
-    /// 2. Persist a `pending` row in the store stamped with
-    ///    the chosen channel + `delivered_at_ms = now`.
+    /// 2. Persist a `pending` row stamped with the chosen
+    ///    channel BUT with `delivered_at_ms = None` —
+    ///    "delivered" means "the per-channel send returned
+    ///    Ok," not "we wrote a row." (PART 6)
     /// 3. Call `ChannelDispatch::send` for the initial channel.
-    /// 4. When the matched rule asks for escalation, spawn a
+    /// 4. On Ok: stamp `delivered_at_ms` via
+    ///    `mark_delivered`; the dashboard now reports the row
+    ///    as delivered.
+    /// 5. On Err: flip the row to `delivery_failed`, stash the
+    ///    error message in `delivery_error`, and return
+    ///    `Err`. The row is surfaced via
+    ///    `list_failed_deliveries` / the bridge's
+    ///    `/v1/approval/failed-deliveries` route so operators
+    ///    can reconcile without grepping logs.
+    /// 6. When the matched rule asks for escalation, spawn a
     ///    timer task that re-checks the row after
     ///    `escalation_timeout_secs`; if the row is still
     ///    `pending`, mark `escalated = 1`, stamp
     ///    `escalated_at_ms`, and call `ChannelDispatch::send`
-    ///    on the escalation channel.
+    ///    on the escalation channel. (PART 7) The timer
+    ///    awaits both a `oneshot::Receiver<()>` cancel signal
+    ///    AND the sleep timeout; `record_decision` fires the
+    ///    cancel signal so the timer exits cleanly the
+    ///    moment a decision lands.
     pub async fn dispatch_request(
         &self,
         request: ApprovalRequest,
@@ -360,7 +393,10 @@ impl ApprovalDeliveryService {
                 r.channel.as_str().to_string(),
             ));
         }
-        let now = unix_ms();
+        // PART 6: queue the row as `pending` with
+        // delivered_at_ms = None so a concurrent failure can't
+        // leave the dashboard reporting "delivered" for an
+        // attempted-but-failed send.
         let row = ApprovalDeliveryRow {
             approval_id: request.approval_id.clone(),
             agent_name: request.agent_name.clone(),
@@ -371,43 +407,118 @@ impl ApprovalDeliveryService {
             delivery_channel: r.channel.as_str().to_string(),
             escalated: false,
             escalation_channel: r.escalation_channel.map(|c| c.as_str().to_string()),
-            delivered_at_ms: Some(now),
+            delivered_at_ms: None,
             escalated_at_ms: None,
             decided_at_ms: None,
             decision: None,
             decision_note: None,
+            delivery_error: None,
         };
         self.store.upsert(&row)?;
-        self.dispatch
+        let send_result = self
+            .dispatch
             .send(r.channel, &self.matrix.cfg.channels, &request, false)
-            .await?;
-        let escalation_scheduled = r.escalation_timeout_secs > 0 && r.escalation_channel.is_some();
-        if escalation_scheduled {
-            let svc = self.clone();
-            let req = request.clone();
-            let timeout = Duration::from_secs(r.escalation_timeout_secs);
-            let esc_channel = r.escalation_channel.expect("checked above");
-            tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                if let Err(e) = svc.maybe_escalate(req, esc_channel).await {
-                    tracing::warn!(error = %e, "approval delivery: escalation failed");
+            .await;
+        match send_result {
+            Ok(()) => {
+                // Best-effort: if the operator decided in the
+                // microsecond between send returning and us
+                // marking delivered, the operator's decision
+                // wins and we leave delivered_at_ms None.
+                let delivered_at = unix_ms();
+                let _ = self
+                    .store
+                    .mark_delivered(&request.approval_id, delivered_at)?;
+                let escalation_scheduled =
+                    r.escalation_timeout_secs > 0 && r.escalation_channel.is_some();
+                if escalation_scheduled && let Some(esc_channel) = r.escalation_channel {
+                    self.spawn_escalation_timer(
+                        request.clone(),
+                        r.escalation_timeout_secs,
+                        esc_channel,
+                    );
                 }
-            });
+                Ok(DeliveryOutcome {
+                    approval_id: request.approval_id,
+                    delivery_channel: r.channel,
+                    escalation_scheduled,
+                    escalation_channel: r.escalation_channel,
+                    escalation_timeout_secs: r.escalation_timeout_secs,
+                    delivered_at_ms: delivered_at,
+                })
+            }
+            Err(e) => {
+                let failed_at = unix_ms();
+                let err_msg = format!("{e}");
+                // Persist the failure on the row so operators
+                // can list it via the dashboard's "failed
+                // deliveries" surface. Swallow the store error
+                // here — we have to surface the original
+                // dispatch error to the caller regardless.
+                if let Err(store_err) =
+                    self.store
+                        .mark_delivery_failed(&request.approval_id, &err_msg, failed_at)
+                {
+                    tracing::error!(
+                        approval_id = %request.approval_id,
+                        store_err = %store_err,
+                        dispatch_err = %err_msg,
+                        "approval delivery: send failed AND mark_delivery_failed failed"
+                    );
+                }
+                Err(e)
+            }
         }
-        Ok(DeliveryOutcome {
-            approval_id: request.approval_id,
-            delivery_channel: r.channel,
-            escalation_scheduled,
-            escalation_channel: r.escalation_channel,
-            escalation_timeout_secs: r.escalation_timeout_secs,
-            delivered_at_ms: now,
-        })
     }
 
-    /// Record an operator decision. Called by the existing
-    /// approval cap when the operator approves or rejects;
-    /// the escalation timer reads this state to decide
-    /// whether to fire.
+    /// PART 7: spawn the cancellable escalation timer. The
+    /// receive end of the cancel channel lives in the spawned
+    /// task; the send end goes into
+    /// `self.escalation_cancels` so `record_decision` can
+    /// fire it. A second insert for the same `approval_id`
+    /// drops the previous sender (and the previous timer
+    /// exits via the closed channel), so a re-dispatch
+    /// supersedes any in-flight timer cleanly.
+    fn spawn_escalation_timer(
+        &self,
+        request: ApprovalRequest,
+        timeout_secs: u64,
+        esc_channel: ChannelKind,
+    ) {
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        if let Ok(mut map) = self.escalation_cancels.lock() {
+            map.insert(request.approval_id.clone(), cancel_tx);
+        }
+        let svc = self.clone();
+        let timeout = Duration::from_secs(timeout_secs);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(timeout) => {
+                    // Timer fired before the operator decided.
+                    if let Err(e) = svc.maybe_escalate(request.clone(), esc_channel).await {
+                        tracing::warn!(error = %e, "approval delivery: escalation failed");
+                    }
+                }
+                _ = cancel_rx => {
+                    // Cancelled — operator decided (or the
+                    // service is shutting down). Nothing to do
+                    // beyond letting the task exit cleanly.
+                }
+            }
+            // Drop the cancel sender from the map so we
+            // don't leak entries for completed timers.
+            if let Ok(mut map) = svc.escalation_cancels.lock() {
+                let _ = map.remove(&request.approval_id);
+            }
+        });
+    }
+
+    /// Record an operator decision. Called by the
+    /// `approval.record_decision` cap when the operator
+    /// approves or rejects. (PART 7) Atomically also fires
+    /// the cancel signal on any in-flight escalation timer
+    /// for the same `approval_id` so the timer task does not
+    /// wake into a decided row.
     pub fn record_decision(
         &self,
         approval_id: &str,
@@ -417,6 +528,15 @@ impl ApprovalDeliveryService {
         let now = unix_ms();
         self.store
             .record_decision(approval_id, decision, note, now)?;
+        // Best-effort cancellation. The cancel sender is only
+        // present when an escalation timer is in flight; we
+        // ignore the absent / poisoned-lock cases because the
+        // decision has already landed in the store.
+        if let Ok(mut map) = self.escalation_cancels.lock()
+            && let Some(tx) = map.remove(approval_id)
+        {
+            let _ = tx.send(());
+        }
         Ok(())
     }
 
@@ -439,12 +559,16 @@ impl ApprovalDeliveryService {
             );
             return Ok(());
         }
-        let now = unix_ms();
-        self.store
-            .mark_escalated(&request.approval_id, channel.as_str(), now)?;
+        // PART 6: dispatch first; only stamp `escalated_at_ms`
+        // when the escalation channel's send actually
+        // returns Ok. A failure here logs (the row stays in
+        // pending state for the next reconciliation cycle).
         self.dispatch
             .send(channel, &self.matrix.cfg.channels, &request, true)
             .await?;
+        let now = unix_ms();
+        self.store
+            .mark_escalated(&request.approval_id, channel.as_str(), now)?;
         Ok(())
     }
 }
@@ -695,6 +819,172 @@ mod tests {
         assert_eq!(row.status, "approved");
         let log_snapshot = log.log.lock().unwrap().clone();
         assert_eq!(log_snapshot.len(), 1, "only initial dispatch should fire");
+    }
+
+    // ── PART 6 — delivery-status ordering ─────────────────
+
+    /// PART 6: a recording dispatcher that lets tests script
+    /// an Err for the next send call (initial OR escalation).
+    /// Distinct from `RecordingDispatch` above so the existing
+    /// happy-path tests stay readable.
+    #[derive(Default)]
+    struct ScriptedDispatch {
+        log: Mutex<Vec<(ChannelKind, String, bool)>>,
+        fail_next: Mutex<Option<DeliveryError>>,
+    }
+
+    impl ScriptedDispatch {
+        fn fail_next(&self, err: DeliveryError) {
+            *self.fail_next.lock().unwrap() = Some(err);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelDispatch for ScriptedDispatch {
+        async fn send(
+            &self,
+            channel: ChannelKind,
+            _cfg: &ChannelsConfig,
+            request: &ApprovalRequest,
+            is_escalation: bool,
+        ) -> Result<(), DeliveryError> {
+            if let Some(err) = self.fail_next.lock().unwrap().take() {
+                return Err(err);
+            }
+            self.log
+                .lock()
+                .unwrap()
+                .push((channel, request.approval_id.clone(), is_escalation));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_does_not_set_delivered_at_ms_when_send_fails() {
+        let matrix = ApprovalDeliveryMatrix::new(fixture_cfg());
+        let store = ApprovalRequestStore::open_in_memory().expect("store");
+        let dispatch = Arc::new(ScriptedDispatch::default());
+        dispatch.fail_next(DeliveryError::Dispatch("telegram: HTTP 502".into()));
+        let svc = ApprovalDeliveryService::new(matrix, store, dispatch.clone());
+        let req = fixture_request("f1", "finance_alice", "tool.stripe.charge");
+        let err = svc.dispatch_request(req).await.unwrap_err();
+        match err {
+            DeliveryError::Dispatch(msg) => assert!(msg.contains("HTTP 502")),
+            other => panic!("expected Dispatch, got {other:?}"),
+        }
+        // Row exists, marked delivery_failed, error stashed,
+        // delivered_at_ms left None.
+        let row = svc.store().get("f1").unwrap().unwrap();
+        assert_eq!(row.status, "delivery_failed");
+        assert!(row.delivered_at_ms.is_none());
+        assert_eq!(
+            row.delivery_error.as_deref(),
+            Some("approval delivery: channel dispatch failed: telegram: HTTP 502")
+        );
+        // Dispatcher's success log stays empty (the failure
+        // short-circuited before we recorded the entry).
+        assert!(dispatch.log.lock().unwrap().is_empty());
+        // failed_deliveries list surfaces the row.
+        let failed = svc.store().list_failed_deliveries(10).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].approval_id, "f1");
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_sets_delivered_at_ms_after_successful_send() {
+        let (svc, _log) = fresh_service(fixture_cfg());
+        let req = fixture_request("d1", "finance_alice", "tool.stripe.charge");
+        let outcome = svc.dispatch_request(req).await.unwrap();
+        let row = svc.store().get("d1").unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert!(row.delivered_at_ms.is_some());
+        assert!(row.delivery_error.is_none());
+        // Outcome delivered_at_ms matches the row.
+        assert_eq!(outcome.delivered_at_ms, row.delivered_at_ms.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_does_not_arm_escalation_timer() {
+        // Rule 0 wants Slack with email escalation. Force the
+        // initial send to fail; the spawn_escalation_timer
+        // path must not run, so no escalation row should ever
+        // land.
+        let matrix = ApprovalDeliveryMatrix::new(fixture_cfg());
+        let store = ApprovalRequestStore::open_in_memory().expect("store");
+        let dispatch = Arc::new(ScriptedDispatch::default());
+        dispatch.fail_next(DeliveryError::Dispatch("slack: 500".into()));
+        let svc = ApprovalDeliveryService::new(matrix, store, dispatch.clone());
+        let req = fixture_request("f2", "finance_alice", "tool.stripe.charge");
+        let _ = svc.dispatch_request(req).await.unwrap_err();
+        // Wait longer than the escalation window — escalation
+        // timer must not have armed because the initial send
+        // failed.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let row = svc.store().get("f2").unwrap().unwrap();
+        assert!(!row.escalated);
+        assert!(row.escalated_at_ms.is_none());
+    }
+
+    // ── PART 7 — escalation-timer cancellation ────────────
+
+    #[tokio::test]
+    async fn record_decision_cancels_escalation_timer() {
+        // Build a service where the matched rule sets a 1s
+        // escalation timeout; the test fires the decision
+        // immediately and waits past the timeout — the
+        // escalation row must NOT escalate.
+        let mut cfg = fixture_cfg();
+        cfg.rules.clear();
+        cfg.rules.push(DeliveryRule {
+            agent_pattern: "*".into(),
+            action_pattern: "x.*".into(),
+            channel: "telegram".into(),
+            escalation_timeout_secs: 1,
+            escalation_channel: Some("slack".into()),
+        });
+        let (svc, log) = fresh_service(cfg);
+        let req = fixture_request("c1", "alice", "x.do");
+        svc.dispatch_request(req).await.unwrap();
+        // PART 7: cancellation token is alive in the service
+        // map right now.
+        assert_eq!(svc.escalation_cancels.lock().unwrap().len(), 1);
+        svc.record_decision("c1", "approved", Some("ok")).unwrap();
+        // Cancellation should remove the entry from the map
+        // synchronously.
+        assert!(svc.escalation_cancels.lock().unwrap().is_empty());
+        // Now sleep past the original timeout — the timer
+        // task should have exited via the cancel branch.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let row = svc.store().get("c1").unwrap().unwrap();
+        assert!(!row.escalated, "decided row must not escalate: {row:?}");
+        assert_eq!(row.status, "approved");
+        let log_snapshot = log.log.lock().unwrap().clone();
+        // Only the initial dispatch entry — escalation never
+        // landed.
+        assert_eq!(log_snapshot.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_map_is_empty_after_natural_escalation() {
+        // When the escalation timer fires naturally (no
+        // decision before timeout) the map entry should still
+        // be cleaned up so we don't leak senders.
+        let mut cfg = fixture_cfg();
+        cfg.rules.clear();
+        cfg.rules.push(DeliveryRule {
+            agent_pattern: "*".into(),
+            action_pattern: "y.*".into(),
+            channel: "telegram".into(),
+            escalation_timeout_secs: 1,
+            escalation_channel: Some("slack".into()),
+        });
+        let (svc, _log) = fresh_service(cfg);
+        let req = fixture_request("n1", "alice", "y.do");
+        svc.dispatch_request(req).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_400)).await;
+        let row = svc.store().get("n1").unwrap().unwrap();
+        assert!(row.escalated);
+        assert!(svc.escalation_cancels.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -12,21 +12,57 @@ use thiserror::Error;
 /// One row in `approval_delivery`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDeliveryRow {
+    /// Stable identifier — used by the operator's response path
+    /// to route the decision back to the right pending row.
     pub approval_id: String,
+    /// Friendly name of the agent that asked for approval.
     pub agent_name: String,
+    /// Capability / method the agent asked to invoke.
     pub capability: String,
+    /// Operator-readable summary of the request.
     pub request_summary: String,
+    /// Originating session id.
     pub session_id: String,
-    /// `pending` | `approved` | `rejected` | `expired`.
+    /// `pending` | `approved` | `rejected` | `expired` |
+    /// `delivery_failed`. The last state is set by
+    /// `ApprovalDeliveryService::dispatch_request` when the
+    /// per-channel send returns an error so operators can
+    /// reconcile failed notifications via
+    /// `GET /v1/approval/failed-deliveries`.
     pub status: String,
+    /// Wire-string tag of the channel resolved for the initial
+    /// delivery (`telegram`, `slack`, `discord`, `email`,
+    /// `dashboard`).
     pub delivery_channel: String,
+    /// `true` once the escalation timer has fired and the
+    /// escalation channel has been notified.
     pub escalated: bool,
+    /// Wire-string tag of the escalation channel — set on the
+    /// row at dispatch time so it survives a controller
+    /// restart between the initial delivery and the timer
+    /// firing.
     pub escalation_channel: Option<String>,
+    /// Set AFTER the initial dispatcher returns Ok. `None`
+    /// while the row is still queued / mid-send and on rows
+    /// that landed in `delivery_failed`.
     pub delivered_at_ms: Option<i64>,
+    /// Set once the escalation timer fires and the escalation
+    /// channel has been notified.
     pub escalated_at_ms: Option<i64>,
+    /// Set when the operator records a decision (or the
+    /// expiry sweep marks the row expired).
     pub decided_at_ms: Option<i64>,
+    /// `approved` | `rejected` | `expired` — `None` while the
+    /// row is still pending.
     pub decision: Option<String>,
+    /// Free-form note the operator may attach to their
+    /// decision.
     pub decision_note: Option<String>,
+    /// Error message from the most-recent failed dispatcher
+    /// call. Only set when `status = "delivery_failed"`; the
+    /// schema column carries the message so operators can
+    /// triage without grepping log files.
+    pub delivery_error: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -84,7 +120,8 @@ impl ApprovalRequestStore {
                  escalated_at_ms    INTEGER,\
                  decided_at_ms      INTEGER,\
                  decision           TEXT,\
-                 decision_note      TEXT\
+                 decision_note      TEXT,\
+                 delivery_error     TEXT\
              );\
              CREATE INDEX IF NOT EXISTS approval_delivery_status_idx \
                  ON approval_delivery(status);\
@@ -100,6 +137,11 @@ impl ApprovalRequestStore {
         Self::ensure_column(conn, "escalation_channel", "TEXT")?;
         Self::ensure_column(conn, "delivered_at_ms", "INTEGER")?;
         Self::ensure_column(conn, "escalated_at_ms", "INTEGER")?;
+        // PART 6: `delivery_error` carries the most-recent failed
+        // dispatcher message so operators can triage without
+        // grepping log files. Nullable — only populated when
+        // `status = "delivery_failed"`.
+        Self::ensure_column(conn, "delivery_error", "TEXT")?;
         Ok(())
     }
 
@@ -123,15 +165,19 @@ impl ApprovalRequestStore {
         Ok(())
     }
 
-    /// Insert OR replace the row keyed by `approval_id`.
+    /// Insert OR replace the row keyed by `approval_id`. New
+    /// rows from `dispatch_request` go in with `status =
+    /// "pending"` and `delivered_at_ms = None`; the timestamp
+    /// is stamped via [`Self::mark_delivered`] AFTER the
+    /// per-channel send actually succeeds.
     pub fn upsert(&self, row: &ApprovalDeliveryRow) -> Result<(), ApprovalStoreError> {
         let conn = self.lock()?;
         conn.execute(
             "INSERT OR REPLACE INTO approval_delivery \
              (approval_id, agent_name, capability, request_summary, session_id, status, \
               delivery_channel, escalated, escalation_channel, delivered_at_ms, escalated_at_ms, \
-              decided_at_ms, decision, decision_note) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              decided_at_ms, decision, decision_note, delivery_error) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 row.approval_id,
                 row.agent_name,
@@ -147,11 +193,52 @@ impl ApprovalRequestStore {
                 row.decided_at_ms,
                 row.decision,
                 row.decision_note,
+                row.delivery_error,
             ],
         )?;
         Ok(())
     }
 
+    /// PART 6: stamp `delivered_at_ms` AFTER the per-channel
+    /// send returned Ok. Only updates rows whose status is
+    /// still `pending` so a later decision (or an
+    /// already-failed delivery) does not get its delivery
+    /// timestamp re-written.
+    pub fn mark_delivered(
+        &self,
+        approval_id: &str,
+        delivered_at_ms: i64,
+    ) -> Result<bool, ApprovalStoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE approval_delivery \
+             SET delivered_at_ms = ?1, delivery_error = NULL \
+             WHERE approval_id = ?2 AND status = 'pending'",
+            params![delivered_at_ms, approval_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// PART 6: flip the row to `delivery_failed` when the
+    /// per-channel send returns Err. Stamps the error message
+    /// + the timestamp the failure was observed.
+    pub fn mark_delivery_failed(
+        &self,
+        approval_id: &str,
+        error: &str,
+        failed_at_ms: i64,
+    ) -> Result<bool, ApprovalStoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE approval_delivery \
+             SET status = 'delivery_failed', delivery_error = ?1, decided_at_ms = ?2 \
+             WHERE approval_id = ?3 AND status = 'pending'",
+            params![error, failed_at_ms, approval_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Fetch one row by id.
     pub fn get(
         &self,
         approval_id: &str,
@@ -160,7 +247,7 @@ impl ApprovalRequestStore {
         conn.query_row(
             "SELECT approval_id, agent_name, capability, request_summary, session_id, status, \
                     delivery_channel, escalated, escalation_channel, delivered_at_ms, \
-                    escalated_at_ms, decided_at_ms, decision, decision_note \
+                    escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error \
              FROM approval_delivery WHERE approval_id = ?1",
             params![approval_id],
             row_to_record,
@@ -169,6 +256,9 @@ impl ApprovalRequestStore {
         .map_err(Into::into)
     }
 
+    /// Return all rows matching `status_filter` (or every row
+    /// when `None`), newest-first. `limit` is clamped to
+    /// `[1, 5000]`.
     pub fn list(
         &self,
         status_filter: Option<&str>,
@@ -180,17 +270,19 @@ impl ApprovalRequestStore {
             conn.prepare(
                 "SELECT approval_id, agent_name, capability, request_summary, session_id, status, \
                         delivery_channel, escalated, escalation_channel, delivered_at_ms, \
-                        escalated_at_ms, decided_at_ms, decision, decision_note \
+                        escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error \
                  FROM approval_delivery WHERE status = ?1 \
-                 ORDER BY delivered_at_ms DESC, approval_id ASC LIMIT ?2",
+                 ORDER BY COALESCE(delivered_at_ms, decided_at_ms, 0) DESC, approval_id ASC \
+                 LIMIT ?2",
             )?
         } else {
             conn.prepare(
                 "SELECT approval_id, agent_name, capability, request_summary, session_id, status, \
                         delivery_channel, escalated, escalation_channel, delivered_at_ms, \
-                        escalated_at_ms, decided_at_ms, decision, decision_note \
+                        escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error \
                  FROM approval_delivery \
-                 ORDER BY delivered_at_ms DESC, approval_id ASC LIMIT ?1",
+                 ORDER BY COALESCE(delivered_at_ms, decided_at_ms, 0) DESC, approval_id ASC \
+                 LIMIT ?1",
             )?
         };
         let rows: Vec<ApprovalDeliveryRow> = if let Some(s) = status_filter {
@@ -201,6 +293,17 @@ impl ApprovalRequestStore {
                 .collect::<Result<_, _>>()?
         };
         Ok(rows)
+    }
+
+    /// PART 6: shortcut around `list` for the failed-deliveries
+    /// reconciliation endpoint. Equivalent to
+    /// `list(Some("delivery_failed"), limit)` but documents
+    /// the call-site intent.
+    pub fn list_failed_deliveries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ApprovalDeliveryRow>, ApprovalStoreError> {
+        self.list(Some("delivery_failed"), limit)
     }
 
     pub fn mark_escalated(
@@ -257,6 +360,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalDeliveryRo
         decided_at_ms: row.get(11)?,
         decision: row.get(12)?,
         decision_note: row.get(13)?,
+        delivery_error: row.get(14)?,
     })
 }
 
@@ -280,6 +384,31 @@ mod tests {
             decided_at_ms: None,
             decision: None,
             decision_note: None,
+            delivery_error: None,
+        }
+    }
+
+    /// PART 6 fixture: row in the "pending, not yet
+    /// delivered" state that mirrors what
+    /// `dispatch_request` inserts before calling
+    /// `dispatch.send()`.
+    fn pending_row(id: &str) -> ApprovalDeliveryRow {
+        ApprovalDeliveryRow {
+            approval_id: id.into(),
+            agent_name: "alice".into(),
+            capability: "tool.fs.write".into(),
+            request_summary: "writes a sensitive file".into(),
+            session_id: "sess1".into(),
+            status: "pending".into(),
+            delivery_channel: "telegram".into(),
+            escalated: false,
+            escalation_channel: Some("slack".into()),
+            delivered_at_ms: None,
+            escalated_at_ms: None,
+            decided_at_ms: None,
+            decision: None,
+            decision_note: None,
+            delivery_error: None,
         }
     }
 
@@ -350,5 +479,102 @@ mod tests {
         let approved = s.list(Some("approved"), 10).unwrap();
         assert_eq!(approved.len(), 1);
         assert_eq!(approved[0].approval_id, "a1");
+    }
+
+    // ── PART 6 — delivery-status ordering ─────────────────
+
+    #[test]
+    fn pending_row_round_trips_with_null_delivered_at_ms() {
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        let r = pending_row("a1");
+        s.upsert(&r).unwrap();
+        let got = s.get("a1").unwrap().unwrap();
+        assert_eq!(got, r);
+        assert!(got.delivered_at_ms.is_none());
+        assert!(got.delivery_error.is_none());
+    }
+
+    #[test]
+    fn mark_delivered_stamps_timestamp_on_pending_row() {
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        let r = pending_row("a1");
+        s.upsert(&r).unwrap();
+        let changed = s.mark_delivered("a1", 12_345).unwrap();
+        assert!(changed);
+        let row = s.get("a1").unwrap().unwrap();
+        assert_eq!(row.delivered_at_ms, Some(12_345));
+        assert!(row.delivery_error.is_none());
+        assert_eq!(row.status, "pending");
+    }
+
+    #[test]
+    fn mark_delivered_does_not_touch_decided_rows() {
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        let r = pending_row("a1");
+        s.upsert(&r).unwrap();
+        s.mark_delivered("a1", 100).unwrap();
+        s.record_decision("a1", "approved", None, 200).unwrap();
+        // Try to re-mark — the row is no longer pending so the
+        // delivered_at_ms timestamp must NOT regress.
+        let changed = s.mark_delivered("a1", 999).unwrap();
+        assert!(!changed);
+        let row = s.get("a1").unwrap().unwrap();
+        assert_eq!(row.delivered_at_ms, Some(100));
+        assert_eq!(row.status, "approved");
+    }
+
+    #[test]
+    fn mark_delivery_failed_flips_status_and_records_error() {
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        let r = pending_row("a1");
+        s.upsert(&r).unwrap();
+        let changed = s
+            .mark_delivery_failed("a1", "telegram: HTTP 502", 9_999)
+            .unwrap();
+        assert!(changed);
+        let row = s.get("a1").unwrap().unwrap();
+        assert_eq!(row.status, "delivery_failed");
+        assert_eq!(row.delivery_error.as_deref(), Some("telegram: HTTP 502"));
+        assert_eq!(row.decided_at_ms, Some(9_999));
+        // delivered_at_ms STAYS None — a failed send did not
+        // produce a delivery, so any later reconciliation
+        // can distinguish "sent" from "tried and failed".
+        assert!(row.delivered_at_ms.is_none());
+    }
+
+    #[test]
+    fn mark_delivery_failed_does_not_overwrite_decided_rows() {
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        let r = pending_row("a1");
+        s.upsert(&r).unwrap();
+        s.mark_delivered("a1", 100).unwrap();
+        s.record_decision("a1", "approved", None, 200).unwrap();
+        let changed = s.mark_delivery_failed("a1", "spurious", 300).unwrap();
+        assert!(!changed);
+        let row = s.get("a1").unwrap().unwrap();
+        assert_eq!(row.status, "approved");
+        assert!(row.delivery_error.is_none());
+    }
+
+    #[test]
+    fn list_failed_deliveries_returns_only_failed_rows() {
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        s.upsert(&pending_row("a1")).unwrap();
+        s.upsert(&pending_row("a2")).unwrap();
+        s.upsert(&pending_row("a3")).unwrap();
+        s.mark_delivered("a1", 100).unwrap();
+        s.mark_delivery_failed("a2", "telegram: 502", 200).unwrap();
+        s.mark_delivery_failed("a3", "slack: not_in_channel", 300)
+            .unwrap();
+        let failed = s.list_failed_deliveries(10).unwrap();
+        assert_eq!(failed.len(), 2);
+        // Newest-first ordering — a3's decided_at_ms (300) is
+        // newer than a2's (200).
+        assert_eq!(failed[0].approval_id, "a3");
+        assert_eq!(
+            failed[0].delivery_error.as_deref(),
+            Some("slack: not_in_channel")
+        );
+        assert_eq!(failed[1].approval_id, "a2");
     }
 }

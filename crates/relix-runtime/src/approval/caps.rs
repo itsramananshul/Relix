@@ -10,8 +10,14 @@ use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 
 use super::delivery::ApprovalDeliveryService;
 
-/// Wire `approval.delivery_status` (read) +
-/// `approval.deliver` (dispatch) onto `bridge`.
+/// Wire the approval-delivery caps onto `bridge`:
+///
+/// - `approval.delivery_status` (read one row)
+/// - `approval.deliver` (dispatch a new approval)
+/// - `approval.record_decision` (operator approve / reject)
+/// - `approval.failed_deliveries` (PART 6 — list the rows
+///   that landed in `delivery_failed` so operators can
+///   reconcile via the dashboard / `/v1/approval/failed-deliveries`)
 pub fn register(bridge: &mut DispatchBridge, service: ApprovalDeliveryService) {
     {
         let svc = service.clone();
@@ -34,11 +40,21 @@ pub fn register(bridge: &mut DispatchBridge, service: ApprovalDeliveryService) {
         );
     }
     {
+        let svc = service.clone();
         bridge.register(
             "approval.record_decision",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
-                let svc = service.clone();
+                let svc = svc.clone();
                 async move { handle_record_decision(&svc, &ctx) }
+            })),
+        );
+    }
+    {
+        bridge.register(
+            "approval.failed_deliveries",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let svc = service.clone();
+                async move { handle_failed_deliveries(&svc, &ctx) }
             })),
         );
     }
@@ -166,6 +182,48 @@ fn handle_record_decision(
         Err(e) => HandlerOutcome::Err(ErrorEnvelope {
             kind: error_kinds::RESPONDER_INTERNAL,
             cause: format!("approval delivery: {e}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+    }
+}
+
+/// PART 6: list the rows in `delivery_failed` state newest-
+/// first. Returns up to `limit` rows; defaults to 50 when
+/// args are absent or `limit` is omitted. Capped server-side
+/// at 500.
+#[derive(Debug, Deserialize, Default)]
+struct FailedDeliveriesArgs {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn handle_failed_deliveries(
+    service: &ApprovalDeliveryService,
+    ctx: &InvocationCtx,
+) -> HandlerOutcome {
+    // Args are optional — an empty body is equivalent to the
+    // default limit.
+    let args: FailedDeliveriesArgs = if ctx.args.is_empty() {
+        FailedDeliveriesArgs::default()
+    } else {
+        match serde_json::from_slice(&ctx.args) {
+            Ok(v) => v,
+            Err(e) => return invalid(&format!("decode args: {e}")),
+        }
+    };
+    let limit = args.limit.unwrap_or(50).clamp(1, 500);
+    match service.store().list_failed_deliveries(limit) {
+        Ok(rows) => {
+            let body = serde_json::json!({
+                "count": rows.len(),
+                "rows": rows,
+            });
+            ok_json(&body)
+        }
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("approval delivery: list failed-deliveries: {e}"),
             retry_hint: 0,
             retry_after: None,
         }),

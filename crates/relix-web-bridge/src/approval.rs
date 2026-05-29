@@ -1,6 +1,9 @@
-//! RELIX-7.30 PART 1 — HTTP proxy for `approval.delivery_status`.
+//! HTTP proxies for the approval-delivery surface.
 //!
 //! - `GET /v1/approval/:id/delivery` → `approval.delivery_status`
+//!   (RELIX-7.30 PART 1)
+//! - `GET /v1/approval/failed-deliveries` →
+//!   `approval.failed_deliveries` (PART 6)
 
 use axum::{
     Json,
@@ -47,6 +50,41 @@ pub async fn delivery_status(
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "approval_id": approval_id });
     match call_peer_json(&state, &peer, "approval.delivery_status", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// PART 6 — `GET /v1/approval/failed-deliveries?limit=...&peer=...`
+///
+/// Lists the rows that landed in `delivery_failed` state on
+/// the coordinator's delivery store, newest-first. `limit`
+/// defaults to 50; the coordinator caps it at 500. Operators
+/// use this to reconcile approvals whose channel send
+/// returned an error (Telegram 5xx, Slack `not_in_channel`,
+/// SMTP refused, …).
+#[derive(Debug, Deserialize, Default)]
+pub struct FailedDeliveriesQuery {
+    /// Override the responder peer. Defaults to `coordinator`.
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// Max rows to return. Server-side clamp `[1, 500]`.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Handler for `GET /v1/approval/failed-deliveries`.
+pub async fn failed_deliveries(
+    State(state): State<AppState>,
+    Query(q): Query<FailedDeliveriesQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = match q.limit {
+        Some(l) => serde_json::json!({ "limit": l }),
+        None => serde_json::json!({}),
+    };
+    match call_peer_json(&state, &peer, "approval.failed_deliveries", &body).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
