@@ -136,6 +136,7 @@ mod tests {
             capability: "tool.stripe.charge".into(),
             request_summary: format!("charge $100 to customer Bob {escalation_label}"),
             session_id: "sess-7".into(),
+            authorized_approvers: Vec::new(),
         }
     }
 

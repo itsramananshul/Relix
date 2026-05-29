@@ -87,6 +87,7 @@ mod tests {
             capability: "tool.fs.write".into(),
             request_summary: "writes a sensitive file".into(),
             session_id: "sess1".into(),
+            authorized_approvers: Vec::new(),
         }
     }
 

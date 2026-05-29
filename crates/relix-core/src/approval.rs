@@ -204,7 +204,7 @@ pub struct DashboardChannelCfg {
 /// One approval request flowing into the delivery service.
 /// Caller-supplied state; the service decorates it with the
 /// resolver + persists it under `approval_id`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// Stable identifier — used by the operator's response
     /// path to route their `approve` / `deny` reply back to
@@ -219,6 +219,16 @@ pub struct ApprovalRequest {
     /// Originating session id — operators use this to
     /// correlate the request with the agent's conversation.
     pub session_id: String,
+    /// SEC PART B: explicit allow-list of subjects authorised
+    /// to record a decision on this approval (subject id hex
+    /// per [`crate::types::NodeId::to_string`]). Empty list ⇒
+    /// the dispatch cap falls back to the role-based check
+    /// (an `operator` / `admin` role can decide); any non-empty
+    /// list narrows the allowed approvers to that exact set.
+    /// Defends against an agent that knows an `approval_id`
+    /// approving its own request.
+    #[serde(default)]
+    pub authorized_approvers: Vec<String>,
 }
 
 /// Errors surfaced by a [`SingleChannelDispatch`]

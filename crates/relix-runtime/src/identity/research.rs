@@ -269,6 +269,7 @@ impl ResearchPipeline {
                         capability: "identity.research".into(),
                         request_summary: summary,
                         session_id: session_id.clone(),
+                        authorized_approvers: Vec::new(),
                     };
                     let _ = svc.dispatch_request(req).await?;
                     let verdict = self.wait_for_approval(svc, &approval_id).await;

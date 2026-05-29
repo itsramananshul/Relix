@@ -63,6 +63,12 @@ pub struct ApprovalDeliveryRow {
     /// schema column carries the message so operators can
     /// triage without grepping log files.
     pub delivery_error: Option<String>,
+    /// SEC PART B: explicit authorised approver allow-list
+    /// (subject id hex). Empty ⇒ caps fall back to
+    /// role-based admission (`operator` / `admin`). Stored as
+    /// a JSON-encoded string column.
+    #[serde(default)]
+    pub authorized_approvers: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +77,18 @@ pub enum ApprovalStoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("approval store: lock poisoned")]
     Lock,
+    /// SEC PART B: the `record_decision` write found the row
+    /// is no longer pending. Returned instead of a silent
+    /// no-op so callers can surface "already decided" to the
+    /// operator.
+    #[error("approval store: approval `{0}` is not pending (already decided)")]
+    AlreadyDecided(String),
+    /// SEC PART B: an internal JSON encode / decode failure on
+    /// the `authorized_approvers` column. Should never reach
+    /// production — the column is round-tripped through
+    /// `serde_json` with a well-formed Vec source.
+    #[error("approval store: authorized_approvers encode/decode: {0}")]
+    Json(String),
 }
 
 /// Cheap-to-clone SQLite-backed store.
@@ -121,7 +139,8 @@ impl ApprovalRequestStore {
                  decided_at_ms      INTEGER,\
                  decision           TEXT,\
                  decision_note      TEXT,\
-                 delivery_error     TEXT\
+                 delivery_error     TEXT,\
+                 authorized_approvers TEXT NOT NULL DEFAULT '[]'\
              );\
              CREATE INDEX IF NOT EXISTS approval_delivery_status_idx \
                  ON approval_delivery(status);\
@@ -142,6 +161,11 @@ impl ApprovalRequestStore {
         // grepping log files. Nullable — only populated when
         // `status = "delivery_failed"`.
         Self::ensure_column(conn, "delivery_error", "TEXT")?;
+        // SEC PART B: `authorized_approvers` carries the
+        // JSON-encoded allow-list of subject ids that may
+        // record a decision on the row. NOT NULL with default
+        // `'[]'` so legacy rows back-fill cleanly.
+        Self::ensure_column(conn, "authorized_approvers", "TEXT NOT NULL DEFAULT '[]'")?;
         Ok(())
     }
 
@@ -172,12 +196,14 @@ impl ApprovalRequestStore {
     /// per-channel send actually succeeds.
     pub fn upsert(&self, row: &ApprovalDeliveryRow) -> Result<(), ApprovalStoreError> {
         let conn = self.lock()?;
+        let approvers_json = serde_json::to_string(&row.authorized_approvers)
+            .map_err(|e| ApprovalStoreError::Json(e.to_string()))?;
         conn.execute(
             "INSERT OR REPLACE INTO approval_delivery \
              (approval_id, agent_name, capability, request_summary, session_id, status, \
               delivery_channel, escalated, escalation_channel, delivered_at_ms, escalated_at_ms, \
-              decided_at_ms, decision, decision_note, delivery_error) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              decided_at_ms, decision, decision_note, delivery_error, authorized_approvers) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 row.approval_id,
                 row.agent_name,
@@ -194,6 +220,7 @@ impl ApprovalRequestStore {
                 row.decision,
                 row.decision_note,
                 row.delivery_error,
+                approvers_json,
             ],
         )?;
         Ok(())
@@ -247,7 +274,8 @@ impl ApprovalRequestStore {
         conn.query_row(
             "SELECT approval_id, agent_name, capability, request_summary, session_id, status, \
                     delivery_channel, escalated, escalation_channel, delivered_at_ms, \
-                    escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error \
+                    escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error, \
+                    authorized_approvers \
              FROM approval_delivery WHERE approval_id = ?1",
             params![approval_id],
             row_to_record,
@@ -270,7 +298,8 @@ impl ApprovalRequestStore {
             conn.prepare(
                 "SELECT approval_id, agent_name, capability, request_summary, session_id, status, \
                         delivery_channel, escalated, escalation_channel, delivered_at_ms, \
-                        escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error \
+                        escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error, \
+                        authorized_approvers \
                  FROM approval_delivery WHERE status = ?1 \
                  ORDER BY COALESCE(delivered_at_ms, decided_at_ms, 0) DESC, approval_id ASC \
                  LIMIT ?2",
@@ -279,7 +308,8 @@ impl ApprovalRequestStore {
             conn.prepare(
                 "SELECT approval_id, agent_name, capability, request_summary, session_id, status, \
                         delivery_channel, escalated, escalation_channel, delivered_at_ms, \
-                        escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error \
+                        escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error, \
+                        authorized_approvers \
                  FROM approval_delivery \
                  ORDER BY COALESCE(delivered_at_ms, decided_at_ms, 0) DESC, approval_id ASC \
                  LIMIT ?1",
@@ -322,6 +352,14 @@ impl ApprovalRequestStore {
         Ok(())
     }
 
+    /// SEC PART B: flip a `pending` row to a terminal
+    /// `approved` / `rejected` / `expired` state.
+    ///
+    /// The `WHERE status = 'pending'` guard prevents a decided
+    /// row from being re-decided silently. When 0 rows are
+    /// affected we return [`ApprovalStoreError::AlreadyDecided`]
+    /// so the cap layer can surface "already decided" to the
+    /// operator instead of pretending the write succeeded.
     pub fn record_decision(
         &self,
         approval_id: &str,
@@ -330,12 +368,15 @@ impl ApprovalRequestStore {
         decided_at_ms: i64,
     ) -> Result<(), ApprovalStoreError> {
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE approval_delivery \
              SET status = ?1, decision = ?1, decision_note = ?2, decided_at_ms = ?3 \
-             WHERE approval_id = ?4",
+             WHERE approval_id = ?4 AND status = 'pending'",
             params![decision, note, decided_at_ms, approval_id],
         )?;
+        if changed == 0 {
+            return Err(ApprovalStoreError::AlreadyDecided(approval_id.to_string()));
+        }
         Ok(())
     }
 
@@ -345,6 +386,9 @@ impl ApprovalRequestStore {
 }
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalDeliveryRow> {
+    let approvers_json: String = row.get(15)?;
+    let authorized_approvers: Vec<String> =
+        serde_json::from_str(&approvers_json).unwrap_or_default();
     Ok(ApprovalDeliveryRow {
         approval_id: row.get(0)?,
         agent_name: row.get(1)?,
@@ -361,6 +405,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalDeliveryRo
         decision: row.get(12)?,
         decision_note: row.get(13)?,
         delivery_error: row.get(14)?,
+        authorized_approvers,
     })
 }
 
@@ -385,6 +430,7 @@ mod tests {
             decision: None,
             decision_note: None,
             delivery_error: None,
+            authorized_approvers: Vec::new(),
         }
     }
 
@@ -409,6 +455,7 @@ mod tests {
             decision: None,
             decision_note: None,
             delivery_error: None,
+            authorized_approvers: Vec::new(),
         }
     }
 
@@ -460,6 +507,57 @@ mod tests {
         assert_eq!(row.decision.as_deref(), Some("rejected"));
         assert_eq!(row.decision_note.as_deref(), Some("nope"));
         assert_eq!(row.decided_at_ms, Some(9_000));
+    }
+
+    #[test]
+    fn record_decision_refuses_to_redecide_a_decided_row() {
+        // SEC PART B: the UPDATE has `WHERE status = 'pending'`
+        // so a re-decide cannot silently overwrite. The cap
+        // surfaces this as INVALID_ARGS so operators see
+        // "already decided" instead of a phantom success.
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        let mut r = fixture_row("a-redec");
+        r.status = "pending".into();
+        r.decision = None;
+        r.decision_note = None;
+        r.decided_at_ms = None;
+        s.upsert(&r).unwrap();
+        s.record_decision("a-redec", "approved", Some("first"), 1_000)
+            .unwrap();
+        match s.record_decision("a-redec", "rejected", Some("second"), 2_000) {
+            Err(ApprovalStoreError::AlreadyDecided(id)) => assert_eq!(id, "a-redec"),
+            other => panic!("expected AlreadyDecided, got {other:?}"),
+        }
+        // First decision is preserved.
+        let row = s.get("a-redec").unwrap().unwrap();
+        assert_eq!(row.status, "approved");
+        assert_eq!(row.decision_note.as_deref(), Some("first"));
+        assert_eq!(row.decided_at_ms, Some(1_000));
+    }
+
+    #[test]
+    fn authorized_approvers_round_trip_through_store() {
+        // SEC PART B: the JSON-encoded approver list is the
+        // proof the dispatch cap consults. Round-trip via
+        // upsert → get → list to lock the column.
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        let mut r = fixture_row("a-approvers");
+        r.authorized_approvers = vec!["subj-alice".into(), "subj-bob".into()];
+        s.upsert(&r).unwrap();
+        let row = s.get("a-approvers").unwrap().unwrap();
+        assert_eq!(
+            row.authorized_approvers,
+            vec!["subj-alice".to_string(), "subj-bob".to_string()]
+        );
+        let listed = s.list(Some("pending"), 50).unwrap();
+        let found = listed
+            .iter()
+            .find(|r| r.approval_id == "a-approvers")
+            .expect("row must be listed");
+        assert_eq!(
+            found.authorized_approvers,
+            vec!["subj-alice".to_string(), "subj-bob".to_string()]
+        );
     }
 
     #[test]

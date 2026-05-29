@@ -517,6 +517,11 @@ impl ApprovalDeliveryService {
             decision: None,
             decision_note: None,
             delivery_error: None,
+            // SEC PART B: forward the caller-supplied
+            // authorised-approver allow-list from the request to
+            // the persistent row so `record_decision` can check
+            // it later.
+            authorized_approvers: request.authorized_approvers.clone(),
         };
         self.store.upsert(&row)?;
         let send_result = self
@@ -943,6 +948,7 @@ mod tests {
             capability: action.into(),
             request_summary: "test".into(),
             session_id: "sess1".into(),
+            authorized_approvers: Vec::new(),
         }
     }
 

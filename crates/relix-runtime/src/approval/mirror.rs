@@ -248,6 +248,7 @@ mod tests {
                 decision: None,
                 decision_note: None,
                 delivery_error: None,
+                authorized_approvers: Vec::new(),
             })
             .unwrap();
         service
@@ -301,6 +302,7 @@ mod tests {
                 decision: None,
                 decision_note: None,
                 delivery_error: None,
+                authorized_approvers: Vec::new(),
             })
             .unwrap();
         planning
@@ -337,6 +339,7 @@ mod tests {
                 decision: None,
                 decision_note: None,
                 delivery_error: None,
+                authorized_approvers: Vec::new(),
             })
             .unwrap();
         planning
@@ -381,6 +384,7 @@ mod tests {
                 decision: None,
                 decision_note: None,
                 delivery_error: None,
+                authorized_approvers: Vec::new(),
             })
             .unwrap();
         planning

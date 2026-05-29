@@ -2381,8 +2381,7 @@ fn register_agent_capabilities(
         // invocation. Empty bytes when the operator did not
         // set `RELIX_APPROVAL_TOKEN_KEY` — handler gracefully
         // omits the token in that case.
-        let signing_key: Vec<u8> =
-            crate::approval::signing_key_from_env().unwrap_or_default();
+        let signing_key: Vec<u8> = crate::approval::signing_key_from_env().unwrap_or_default();
         bridge.register(
             "coord.approval.decide",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {

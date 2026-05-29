@@ -190,6 +190,12 @@ impl ApprovalSendArgs {
             capability: self.capability.clone(),
             request_summary: self.request_summary.clone(),
             session_id: self.session_id.clone(),
+            // SEC PART B: the channel-node cap never decides
+            // approvals; the authorised approver list lives on
+            // the coordinator's persisted row. Leaving this
+            // empty here just keeps the lifted ApprovalRequest
+            // shape-compatible.
+            authorized_approvers: Vec::new(),
         }
     }
 }
@@ -270,6 +276,7 @@ mod tests {
             capability: "tool.fs.write".into(),
             request_summary: "writes a sensitive file".into(),
             session_id: "sess1".into(),
+            authorized_approvers: Vec::new(),
         }
     }
 
