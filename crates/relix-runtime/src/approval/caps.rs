@@ -18,6 +18,9 @@ use super::delivery::ApprovalDeliveryService;
 /// - `approval.failed_deliveries` (PART 6 — list the rows
 ///   that landed in `delivery_failed` so operators can
 ///   reconcile via the dashboard / `/v1/approval/failed-deliveries`)
+/// - `approval.list_pending` (PART 5 — list rows in `pending`
+///   status for the dashboard surface backing
+///   `GET /v1/approval/pending`)
 pub fn register(bridge: &mut DispatchBridge, service: ApprovalDeliveryService) {
     {
         let svc = service.clone();
@@ -50,11 +53,21 @@ pub fn register(bridge: &mut DispatchBridge, service: ApprovalDeliveryService) {
         );
     }
     {
+        let svc = service.clone();
         bridge.register(
             "approval.failed_deliveries",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
-                let svc = service.clone();
+                let svc = svc.clone();
                 async move { handle_failed_deliveries(&svc, &ctx) }
+            })),
+        );
+    }
+    {
+        bridge.register(
+            "approval.list_pending",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let svc = service.clone();
+                async move { handle_list_pending(&svc, &ctx) }
             })),
         );
     }
@@ -224,6 +237,43 @@ fn handle_failed_deliveries(
         Err(e) => HandlerOutcome::Err(ErrorEnvelope {
             kind: error_kinds::RESPONDER_INTERNAL,
             cause: format!("approval delivery: list failed-deliveries: {e}"),
+            retry_hint: 0,
+            retry_after: None,
+        }),
+    }
+}
+
+/// PART 5: list the rows in `pending` status newest-first.
+/// Backs the dashboard's "approvals waiting on me" surface
+/// (`GET /v1/approval/pending`). `limit` defaults to 50, capped
+/// at 500.
+#[derive(Debug, Deserialize, Default)]
+struct ListPendingArgs {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn handle_list_pending(service: &ApprovalDeliveryService, ctx: &InvocationCtx) -> HandlerOutcome {
+    let args: ListPendingArgs = if ctx.args.is_empty() {
+        ListPendingArgs::default()
+    } else {
+        match serde_json::from_slice(&ctx.args) {
+            Ok(v) => v,
+            Err(e) => return invalid(&format!("decode args: {e}")),
+        }
+    };
+    let limit = args.limit.unwrap_or(50).clamp(1, 500);
+    match service.store().list(Some("pending"), limit) {
+        Ok(rows) => {
+            let body = serde_json::json!({
+                "count": rows.len(),
+                "rows": rows,
+            });
+            ok_json(&body)
+        }
+        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::RESPONDER_INTERNAL,
+            cause: format!("approval delivery: list pending: {e}"),
             retry_hint: 0,
             retry_after: None,
         }),

@@ -257,30 +257,25 @@ impl CostSpikeDetector {
         // Pull per-call costs from the metrics store. The query
         // method is bounded by the (model, timestamp) index so it
         // stays sub-100ms even on a busy node.
-        let rows: Vec<u64> = self
-            .query
-            .store()
-            .with_conn(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT cost_micros FROM metrics_invocations
+        let rows: Vec<u64> = self.query.store().with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT cost_micros FROM metrics_invocations
                      WHERE model = ?1
                        AND timestamp_ms >= ?2
                        AND timestamp_ms < ?3
                        AND cost_micros IS NOT NULL",
-                )?;
-                let it = stmt
-                    .query_map(rusqlite::params![model, window_start, window_end], |r| {
-                        r.get::<_, Option<i64>>(0)
-                    })?;
-                let mut v: Vec<u64> = Vec::new();
-                for r in it {
-                    if let Some(n) = r? {
-                        v.push(n.max(0) as u64);
-                    }
+            )?;
+            let it = stmt.query_map(rusqlite::params![model, window_start, window_end], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?;
+            let mut v: Vec<u64> = Vec::new();
+            for r in it {
+                if let Some(n) = r? {
+                    v.push(n.max(0) as u64);
                 }
-                Ok(v)
-            })
-?;
+            }
+            Ok(v)
+        })?;
         let invocation_count = rows.len() as u64;
         let total_cost: u64 = rows.iter().copied().sum();
         let avg = total_cost.checked_div(invocation_count).unwrap_or(0);
@@ -309,27 +304,23 @@ impl CostSpikeDetector {
         window_start: i64,
         window_end: i64,
     ) -> Result<AskHumanRateWindow, SpikeDetectorError> {
-        let (approval, total): (u64, u64) = self
-            .query
-            .store()
-            .with_conn(|c| {
-                c.query_row(
-                    "SELECT
+        let (approval, total): (u64, u64) = self.query.store().with_conn(|c| {
+            c.query_row(
+                "SELECT
                          SUM(CASE WHEN error_kind = 'APPROVAL_REQUIRED' THEN 1 ELSE 0 END),
                          COUNT(*)
                      FROM metrics_invocations
                      WHERE agent_name = ?1
                        AND timestamp_ms >= ?2
                        AND timestamp_ms < ?3",
-                    rusqlite::params![agent, window_start, window_end],
-                    |r| {
-                        let a: Option<i64> = r.get(0)?;
-                        let t: i64 = r.get(1)?;
-                        Ok((a.unwrap_or(0).max(0) as u64, t.max(0) as u64))
-                    },
-                )
-            })
-?;
+                rusqlite::params![agent, window_start, window_end],
+                |r| {
+                    let a: Option<i64> = r.get(0)?;
+                    let t: i64 = r.get(1)?;
+                    Ok((a.unwrap_or(0).max(0) as u64, t.max(0) as u64))
+                },
+            )
+        })?;
         let rate = if total > 0 {
             approval as f64 / total as f64
         } else {
@@ -598,11 +589,17 @@ mod tests {
         // First tick: writes a 1000-avg baseline.
         det.tick().unwrap();
         // Insert a spike: 10 calls at 5000 micros each (5× the baseline).
+        // Stamp at `now - 1` so the spike rows fall strictly INSIDE
+        // tick #2's window — the cost-window SQL is half-open
+        // (`timestamp_ms < window_end`), and on a fast host tick #2's
+        // internal `now` can land in the same millisecond as the
+        // test's `now`. Using `now - 1` keeps the assertion
+        // deterministic regardless of scheduler jitter.
         for _ in 0..10 {
             ms.insert(&metric(
                 "alice",
                 "ai.chat",
-                now,
+                now - 1,
                 true,
                 None,
                 Some(5_000),

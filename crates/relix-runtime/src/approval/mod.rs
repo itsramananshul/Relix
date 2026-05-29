@@ -31,11 +31,13 @@
 //! workflows specifically.
 
 pub mod caps;
+pub mod dashboard_dispatch;
 pub mod delivery;
 pub mod email_dispatch;
 pub mod email_reply;
 pub mod store;
 
+pub use dashboard_dispatch::DashboardChannelDispatch;
 pub use delivery::{
     ApprovalDeliveryConfig, ApprovalDeliveryMatrix, ApprovalDeliveryService, ApprovalRequest,
     ChannelDispatch, ChannelDispatchError, ChannelKind, ChannelsConfig, DashboardChannelCfg,

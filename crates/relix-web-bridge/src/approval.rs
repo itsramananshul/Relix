@@ -4,6 +4,11 @@
 //!   (RELIX-7.30 PART 1)
 //! - `GET /v1/approval/failed-deliveries` →
 //!   `approval.failed_deliveries` (PART 6)
+//! - `GET /v1/approval/pending` → `approval.list_pending`
+//!   (PART 5 — dashboard surface)
+//! - `POST /v1/approval/:id/decision` →
+//!   `approval.record_decision` (PART 5 — dashboard vote
+//!   buttons + CLI / programmatic clients)
 
 use axum::{
     Json,
@@ -85,6 +90,105 @@ pub async fn failed_deliveries(
         None => serde_json::json!({}),
     };
     match call_peer_json(&state, &peer, "approval.failed_deliveries", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// PART 5 — `GET /v1/approval/pending?limit=...&peer=...`
+///
+/// Dashboard surface for "approvals waiting on me." Returns
+/// every row in `pending` status on the coordinator's
+/// delivery store, newest-first. `limit` defaults to 50; the
+/// coordinator caps at 500. The dashboard UI polls this on a
+/// short interval and renders one card per row with
+/// approve / deny buttons that POST to
+/// `/v1/approval/:id/decision`.
+#[derive(Debug, Deserialize, Default)]
+pub struct PendingListQuery {
+    /// Override the responder peer. Defaults to `coordinator`.
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// Max rows to return. Server-side clamp `[1, 500]`.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Handler for `GET /v1/approval/pending`.
+pub async fn pending_list(
+    State(state): State<AppState>,
+    Query(q): Query<PendingListQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = match q.limit {
+        Some(l) => serde_json::json!({ "limit": l }),
+        None => serde_json::json!({}),
+    };
+    match call_peer_json(&state, &peer, "approval.list_pending", &body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// PART 5 — `POST /v1/approval/:id/decision`
+///
+/// Dashboard / CLI vote endpoint. Body is
+/// `{"decision":"approved|rejected|expired", "note":"…"}`.
+/// Forwards to `approval.record_decision` on the coordinator,
+/// which atomically updates the store row and cancels any
+/// in-flight escalation timer for the approval id (PART 7).
+#[derive(Debug, Deserialize, Default)]
+pub struct DecisionQuery {
+    /// Override the responder peer. Defaults to `coordinator`.
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DecisionBody {
+    /// Operator's decision. Coordinator-side validation enforces
+    /// the `approved | rejected | expired` set.
+    pub decision: String,
+    /// Free-form operator note. Optional; persisted alongside
+    /// the decision.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Handler for `POST /v1/approval/:id/decision`.
+pub async fn record_decision(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    Query(q): Query<DecisionQuery>,
+    Json(body): Json<DecisionBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if approval_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "approval_id is required".into(),
+            }),
+        )
+            .into_response();
+    }
+    if body.decision.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "decision is required".into(),
+            }),
+        )
+            .into_response();
+    }
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let args = serde_json::json!({
+        "approval_id": approval_id,
+        "decision": body.decision,
+        "note": body.note,
+    });
+    match call_peer_json(&state, &peer, "approval.record_decision", &args).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }

@@ -638,6 +638,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/approval/failed-deliveries",
             get(approval::failed_deliveries),
         )
+        // PART 5: dashboard surface — list every approval in
+        // `pending` status so the dashboard UI can render
+        // operator-facing approve / deny cards.
+        .route("/v1/approval/pending", get(approval::pending_list))
+        // PART 5: dashboard / CLI vote endpoint. Body carries
+        // `{decision, note}`; the coordinator validates the
+        // decision set and cancels any escalation timer for the
+        // approval id atomically (PART 7).
+        .route("/v1/approval/:id/decision", post(approval::record_decision))
         // PART 2: inbound Slack interactivity webhook. Verifies
         // `x-slack-signature` HMAC against the signing secret
         // (`RELIX_BRIDGE_SLACK_SIGNING_SECRET`), parses the
