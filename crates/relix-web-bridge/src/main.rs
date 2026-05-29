@@ -121,6 +121,7 @@ mod export;
 mod flow;
 mod fs_audit;
 mod guardrails;
+mod identity_session;
 mod intervention_audit;
 mod judge;
 mod knowledge;
@@ -638,6 +639,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/credentials/:name/rotate", post(credentials::rotate))
         .route("/v1/credentials/:name/revoke", post(credentials::revoke))
         .route("/v1/credentials/:name/audit", get(credentials::audit))
+        // RELIX-7.30 PART 3: session-identity tokens.
+        .route(
+            "/v1/identity/tokens",
+            post(identity_session::issue).get(identity_session::list),
+        )
+        .route("/v1/identity/tokens/verify", post(identity_session::verify))
+        .route("/v1/identity/tokens/revoke", post(identity_session::revoke))
         // RELIX-7.29 PART 3: belief-tracker inspection +
         // reset surface.
         .route("/v1/belief/:session_id", get(belief::get))

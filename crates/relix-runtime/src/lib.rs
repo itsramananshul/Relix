@@ -24,6 +24,7 @@ pub mod credentials;
 pub mod db;
 pub mod dispatch;
 pub mod flow_runner;
+pub mod identity;
 pub mod knowledge;
 pub mod manifest;
 pub mod metrics;

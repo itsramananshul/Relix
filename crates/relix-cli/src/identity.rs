@@ -65,9 +65,56 @@ pub enum Cmd {
         #[arg(long)]
         root_key: PathBuf,
     },
+    /// RELIX-7.30 PART 3: issue a per-session token.
+    Issue {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Comma-separated capability scopes.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        scopes: Vec<String>,
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// RELIX-7.30 PART 3: verify a wire-encoded session token.
+    Verify {
+        #[arg(long)]
+        token: String,
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// RELIX-7.30 PART 3: revoke every active token for a
+    /// session.
+    Revoke {
+        #[arg(long)]
+        session: String,
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// RELIX-7.30 PART 3: list active session tokens,
+    /// optionally filtered by agent.
+    Tokens {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
-pub fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Cmd::InitOrg { root_key, org } => init_org(&root_key, &org),
         Cmd::Mint {
@@ -90,7 +137,204 @@ pub fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             subject_key.as_deref(),
         ),
         Cmd::Inspect { bundle, root_key } => inspect(&bundle, &root_key),
+        Cmd::Issue {
+            session,
+            agent,
+            tenant,
+            scopes,
+            ttl_secs,
+            bridge,
+            raw,
+        } => {
+            issue_token(
+                &bridge,
+                &session,
+                &agent,
+                tenant.as_deref(),
+                scopes,
+                ttl_secs,
+                raw,
+            )
+            .await
+        }
+        Cmd::Verify { token, bridge, raw } => verify_token(&bridge, &token, raw).await,
+        Cmd::Revoke {
+            session,
+            bridge,
+            raw,
+        } => revoke_token(&bridge, &session, raw).await,
+        Cmd::Tokens { agent, bridge, raw } => list_tokens(&bridge, agent.as_deref(), raw).await,
     }
+}
+
+async fn issue_token(
+    bridge: &str,
+    session: &str,
+    agent: &str,
+    tenant: Option<&str>,
+    scopes: Vec<String>,
+    ttl_secs: Option<u64>,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/identity/tokens", bridge.trim_end_matches('/'));
+    let mut payload = serde_json::Map::new();
+    payload.insert("session_id".into(), serde_json::Value::from(session));
+    payload.insert("agent_name".into(), serde_json::Value::from(agent));
+    if let Some(t) = tenant {
+        payload.insert("tenant_id".into(), serde_json::Value::from(t));
+    }
+    payload.insert("scopes".into(), serde_json::Value::from(scopes));
+    if let Some(ttl) = ttl_secs {
+        payload.insert("ttl_secs".into(), serde_json::Value::from(ttl));
+    }
+    let body = http_post_json(&url, &serde_json::Value::Object(payload)).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("decode issue: {e} (body={body})"))?;
+    let wire = v
+        .get("wire")
+        .and_then(|x| x.as_str())
+        .unwrap_or("(missing wire)");
+    let tok = v.get("token");
+    println!("wire_token:    {wire}");
+    if let Some(t) = tok {
+        if let Some(s) = t.get("session_id").and_then(|x| x.as_str()) {
+            println!("session_id:    {s}");
+        }
+        if let Some(s) = t.get("agent_name").and_then(|x| x.as_str()) {
+            println!("agent:         {s}");
+        }
+        if let Some(s) = t.get("tenant_id").and_then(|x| x.as_str()) {
+            println!("tenant:        {s}");
+        }
+        if let Some(s) = t.get("expires_at_ms").and_then(|x| x.as_i64()) {
+            println!("expires_at_ms: {s}");
+        }
+    }
+    Ok(())
+}
+
+async fn verify_token(
+    bridge: &str,
+    token: &str,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/identity/tokens/verify", bridge.trim_end_matches('/'));
+    let body = http_post_json(&url, &serde_json::json!({ "token": token })).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("decode verify: {e} (body={body})"))?;
+    let valid = v.get("valid").and_then(|x| x.as_bool()).unwrap_or(false);
+    println!("valid:        {valid}");
+    if valid {
+        if let Some(s) = v.get("session_id").and_then(|x| x.as_str()) {
+            println!("session_id:   {s}");
+        }
+        if let Some(s) = v.get("agent_name").and_then(|x| x.as_str()) {
+            println!("agent:        {s}");
+        }
+        if let Some(s) = v.get("expires_at_ms").and_then(|x| x.as_i64()) {
+            println!("expires_at_ms:{s}");
+        }
+    } else if let Some(r) = v.get("reason").and_then(|x| x.as_str()) {
+        println!("reason:       {r}");
+    }
+    Ok(())
+}
+
+async fn revoke_token(
+    bridge: &str,
+    session: &str,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("{}/v1/identity/tokens/revoke", bridge.trim_end_matches('/'));
+    let body = http_post_json(&url, &serde_json::json!({ "session_id": session })).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("decode revoke: {e} (body={body})"))?;
+    let n = v.get("revoked_count").and_then(|x| x.as_u64()).unwrap_or(0);
+    println!("revoked {n} token(s) for session {session}");
+    Ok(())
+}
+
+async fn list_tokens(
+    bridge: &str,
+    agent: Option<&str>,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut url = format!("{}/v1/identity/tokens", bridge.trim_end_matches('/'));
+    if let Some(a) = agent {
+        url.push_str(&format!("?agent_name={a}"));
+    }
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("decode tokens: {e} (body={body})"))?;
+    let arr = v.as_array().cloned().unwrap_or_default();
+    if arr.is_empty() {
+        println!("(no active tokens)");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<24} {:<14} {:<14} status",
+        "token_id", "session", "agent", "tenant"
+    );
+    for r in arr {
+        let tid = r.get("token_id").and_then(|x| x.as_str()).unwrap_or("?");
+        let sid = r.get("session_id").and_then(|x| x.as_str()).unwrap_or("?");
+        let agent = r.get("agent_name").and_then(|x| x.as_str()).unwrap_or("?");
+        let tenant = r.get("tenant_id").and_then(|x| x.as_str()).unwrap_or("-");
+        let revoked = r.get("revoked").and_then(|x| x.as_bool()).unwrap_or(false);
+        let status = if revoked { "revoked" } else { "active" };
+        println!("{tid:<24} {sid:<24} {agent:<14} {tenant:<14} {status}");
+    }
+    Ok(())
+}
+
+async fn http_get(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}").into());
+    }
+    Ok(body)
+}
+
+async fn http_post_json(
+    url: &str,
+    payload: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?
+        .post(url)
+        .json(payload)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}").into());
+    }
+    Ok(body)
 }
 
 fn init_org(root_key_path: &Path, org_label: &str) -> Result<(), Box<dyn std::error::Error>> {

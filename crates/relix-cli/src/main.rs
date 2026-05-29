@@ -531,7 +531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     match args.cmd {
-        Cmd::Identity { cmd } => identity::run(cmd),
+        Cmd::Identity { cmd } => identity::run(cmd).await,
         Cmd::Task { cmd } => task::run(cmd).await,
         Cmd::Capability { cmd } => capability::run(cmd).await,
         Cmd::Topology { cmd } => topology::run(cmd).await,

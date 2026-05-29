@@ -185,6 +185,21 @@ pub struct ControllerConfig {
     /// credential-less.
     #[serde(default)]
     pub credentials: Option<crate::credentials::CredentialsConfig>,
+    /// `[session_identity]` — RELIX-7.30 PART 3 per-session
+    /// token container. Holds `[session_identity.session]`.
+    /// Absent leaves the DispatchBridge token-less. Named
+    /// `session_identity` (not `identity`) to avoid collision
+    /// with the existing org-level `[identity]` section.
+    #[serde(default)]
+    pub session_identity: Option<SessionIdentitySection>,
+}
+
+/// `[session_identity]` container so future commits can grow
+/// this surface without breaking the TOML shape.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SessionIdentitySection {
+    #[serde(default)]
+    pub session: Option<crate::identity::SessionIdentityConfig>,
 }
 
 /// `[agents.<name>]` config section. Operators add one of
@@ -6325,6 +6340,92 @@ fn register_node_type_handlers(
                             path = %path.display(),
                             error = %e,
                             "credentials vault open failed; caps NOT registered"
+                        );
+                    }
+                }
+            }
+        }
+        // RELIX-7.30 PART 3: session-identity token service.
+        // Wired when `[identity.session] enabled = true` AND
+        // the signing-key env var is set with at least 32
+        // bytes of entropy.
+        if let Some(id_section) = cfg.session_identity.as_ref()
+            && let Some(sess_cfg) = id_section.session.clone()
+            && sess_cfg.enabled
+        {
+            let key_material = std::env::var(&sess_cfg.signing_key_env).unwrap_or_default();
+            if key_material.len() < 32 {
+                tracing::warn!(
+                    env_var = %sess_cfg.signing_key_env,
+                    got = key_material.len(),
+                    "identity: signing key env unset or shorter than 32 bytes; service NOT registered"
+                );
+            } else {
+                let path = sess_cfg.db_path.clone().unwrap_or_else(|| {
+                    let mut p = coord_cfg.db_path.clone();
+                    p.set_file_name("session_tokens.db");
+                    p
+                });
+                match crate::identity::TokenStore::open(&path) {
+                    Ok(store) => {
+                        match crate::identity::SessionIdentityService::new(
+                            store,
+                            sess_cfg.clone(),
+                            key_material.as_bytes().to_vec(),
+                        ) {
+                            Ok(service) => {
+                                crate::identity::caps::register(bridge, service.clone());
+                                if sess_cfg.session_idle_timeout_secs > 0 {
+                                    service.clone().spawn_idle_sweeper();
+                                }
+                                for (method, doc, mutate) in [
+                                    (
+                                        "identity.issue_token",
+                                        "Issue a signed session token.",
+                                        true,
+                                    ),
+                                    ("identity.verify_token", "Verify a session token.", false),
+                                    ("identity.revoke_token", "Revoke a session's tokens.", true),
+                                    (
+                                        "identity.active_tokens",
+                                        "List active session tokens.",
+                                        false,
+                                    ),
+                                ] {
+                                    manifest.add_capability(
+                                        CapabilityDescriptor::unary(method)
+                                            .with_description(doc)
+                                            .with_categories(
+                                                if mutate {
+                                                    ["mutate", "identity"]
+                                                } else {
+                                                    ["read", "identity"]
+                                                }
+                                                .iter()
+                                                .map(|s| (*s).into()),
+                                            ),
+                                    );
+                                }
+                                tracing::info!(
+                                    path = %path.display(),
+                                    ttl_secs = sess_cfg.session_ttl_secs,
+                                    idle_timeout_secs = sess_cfg.session_idle_timeout_secs,
+                                    "session identity service online (RELIX-7.30 PART 3)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "identity: service construction failed; caps NOT registered"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "session-token store open failed; caps NOT registered"
                         );
                     }
                 }
