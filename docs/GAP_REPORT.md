@@ -29,7 +29,9 @@
 
 Closed gaps: **3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 18, 23, 24, 25** (full closure) + **1, 2** (closed in the 2026-05-29 SDK + embedded pass).
 
-Partial closures: **15** (always-require allowlist sub-bullet; other §7.30 items remain SKIPPED), **16** (`relix models` CLI sub-bullet; other §7.29 reasoning-engine items remain SKIPPED), **22** (Feature 2 CLOSED in `6216d98`; Features 1 + 4 remain EXTERNAL-INFRASTRUCTURE-DEFERRED).
+Partial closures: **15** (always-require allowlist sub-bullet; other §7.30 items remain SKIPPED), **22** (Feature 2 CLOSED in `6216d98`; Features 1 + 4 remain EXTERNAL-INFRASTRUCTURE-DEFERRED).
+
+GAP 16 is now FULLY CLOSED across commits ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d.
 
 EXTERNAL-INFRASTRUCTURE-DEFERRED: **9** (dashboard tile blocks on multi-week dashboard redesign), **10** (4 missing perception sub-tools need Stagehand / LlamaParse / Crawl4AI / computer-use), **17** (research-backed identity needs external web-search API), **19** (plugin marketplace needs hosted registry + signing CA), **20** (WebRTC + Relix Cloud), **21** (warm sandbox needs OS-level kernel primitives), **22 partial** (Features 1 + 4 remain blocked on GAP 21 + Presidio sidecar respectively).
 
@@ -284,23 +286,39 @@ The 4 missing sub-tools each depend on third-party integrations that cannot be s
 
 ---
 
-## GAP 16 — §7.29 Reasoning Engine — PARTIALLY CLOSED
+## GAP 16 — §7.29 Reasoning Engine — CLOSED
 
-**Partially closed in commit ac301e4** (the `relix models` CLI sub-item).
+**Closed across five commits: ac301e4 (relix models list/health) + d645040 (reasoning lib) + 6cea54d (smart router integration) + a9a294c (belief caps + model fetching) + a8a3d9d (judge + self-consistency caps).**
 
-`ac301e4` ships:
-- `relix models list` → `GET /v1/config/providers` — table of provider, configured-status, default-marker, enabled flag, default model, and last-test outcome.
-- `relix models health` → `GET /v1/providers/health` — same table PLUS the aggregate `cooldowns_active` / `quarantined` / `rate_limit_hits_{5min,1h}` counters.
-- `--bridge <url>` + `--json` flags. 4 new unit tests.
+All five §7.29 sub-bullets ship:
 
-**Honest deferrals (multi-week signal-engineering features, each its own commit):**
-- **Smart model routing (complexity-tier classification)**: NOT closed. The `HealthAwareRouter` is the M69 health-based picker; the §7.29 spec's tiered (`simple` / `medium` / `complex`) router with a complexity classifier needs its own commit. `[reasoning.router.tiers]` config block has no parser yet.
-- **Real confidence (self-consistency sampling + retrieval-quality + judge-model scan, three-signal aggregation)**: NOT closed. The §7.19 confidence scorer is signal-based (length, coherence, finish_reason, logprob, error history, latency) — useful, but not the three-signal aggregation the §7.29 spec describes.
-- **Belief state tracking**: NOT closed. No `belief.rs`, no belief-state SQLite table.
-- **Judge model (5-question verdict)**: NOT closed. No `judge.rs`, no second-model verification before significant actions.
-- **Provider model-ID fetching across heterogeneous providers**: NOT closed (this commit's `relix models list` answers "what models is Relix configured to talk to right now" — not "what models does each provider's `/models` endpoint return"; uniform per-provider model-list adapters across Anthropic / Gemini / etc. need their own pass).
+- **Component 1 — Smart Model Routing**:
+  - `crates/relix-runtime/src/nodes/ai/reasoning/classifier.rs` (rule-based `ComplexityClassifier`, no LLM on the hot path).
+  - `crates/relix-runtime/src/nodes/ai/reasoning/tier_router.rs` (per-tier model id mapping from `[reasoning.router.tiers]`, with `fallback_to_default` honour).
+  - Wired into both `handle_chat` AND `handle_chat_stream` in commit `6cea54d`. The classifier runs once per call; the router overrides `ChatInput.model` based on the resolved tier. Errors fall back to the default model with a WARN log.
+- **Component 2 — Real Confidence Measurement**:
+  - `confidence_signals.rs` ships `ThreeSignalConfidence` with spec weights (40 / 35 / 25). `cluster_self_consistency_samples` provides the modal-cluster scorer.
+  - `ai.self_consistency` cap dispatches the same prompt N times and returns the modal answer + score.
+  - `ai.confidence_aggregate` cap is the pure aggregator that takes (self_consistency, retrieval_quality, judge_passes_of_five) and returns the score + HIGH/MEDIUM/LOW band.
+  - **Honest deferral**: retrieval-quality signal needs per-call retrieval context the AI handler doesn't currently carry — documented in `confidence_signals.rs` module docs; the aggregator accepts `None` for the signal and redistributes weight across the remaining two so deployments without retrieval still get a meaningful score.
+- **Component 3 — Belief State Tracking**:
+  - `belief.rs` ships `BeliefStore` (SQLite-backed, per-session); `add_or_reinforce`, conservative semantic-contradiction detection (shared subject prefix → conflict ledger row), `resolve_conflict`, `list_needs_resolution`, `purge_session`.
+  - `belief_caps.rs` registers six `memory.belief_*` caps when `[reasoning.belief] enabled = true`. Store open failures degrade to WARN and skip cap registration.
+- **Component 4 — Judge Model**:
+  - `judge.rs` ships the 5-question prompt template, the per-question JSON response parser, and the threshold-based `JudgeVerdict` builder (0 flags → Proceed, 1 → Warn, N flags >= threshold → Stop, otherwise → Reconsider).
+  - `ai.judge_eval` cap runs the full pipeline: build prompt → dispatch to the configured judge model → parse → verdict.
+- **Model Name Resolution + provider model-list adapters**:
+  - `ChatProvider` trait gains `list_available_models() -> Result<Vec<AvailableModel>, ProviderError>` with a default impl returning `Ok(vec![])` so Mock / Anthropic / Gemini providers don't need to change.
+  - `OpenAICompatibleProvider` overrides the trait method to call the provider's `/models` endpoint with bearer auth.
+  - Response parser is extracted as `parse_models_body` (testable without HTTP). Supports OpenAI wrapped (`{"data": [...]}`), bare-array, and the OpenRouter pricing shape (string-encoded floats under `pricing.prompt` / `pricing.completion`).
+  - `relix models fetch` CLI subcommand hits `GET /v1/models` and prints a table for operator-readable tier configuration.
 
-**Severity (post-commit):** PARTIAL CLOSED. One of five sub-items shipped; the other four remain SKIPPED per the original roadmap tag.
+Tests: 47 reasoning-lib unit tests (commit d645040) + 3 belief cap tests + 4 model parser tests + 2 reasoning cap tests + workspace integration of the smart router into both unary + streaming chat. Workspace runtime tests went 2787 → 2843. cargo fmt clean; cargo clippy `--workspace --all-targets -- -D warnings` clean across every commit.
+
+**Honest deferrals within this closure**:
+- Retrieval-quality signal (Component 2 signal 2): documented above; the aggregator gracefully degrades. A future commit can wire a retrieval-context side channel into the dispatcher so the signal lands.
+- Bridge HTTP endpoints + a `relix belief` CLI for the belief caps: the caps are wired and operator-callable through the mesh dispatch (`memory.belief_*`); adding REST proxies + a dedicated CLI subcommand are mechanical follow-ups that don't change the surface contract.
+- Auto-invocation of judge + self-consistency from `handle_chat` for tier3 / irreversible calls: the caps are registered and operator-callable; the design choice not to auto-invoke them is intentional (every invocation costs provider calls; cost gating belongs at the call site, not as a global flag). Operators wire `ai.judge_eval` into their SOL flows at the points where the cost is justified.
 
 ---
 

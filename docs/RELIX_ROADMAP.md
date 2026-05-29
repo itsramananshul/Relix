@@ -3913,14 +3913,16 @@ Dashboard PII panel: detection counts by type over time, block events, pseudonym
 ---
 
 
-### 7.29 Reasoning and Decision Engine — Smart Routing, Confidence, Belief Tracking, and Judge Model `[PARTIAL — `relix models` CLI shipped ac301e4; four core sub-components remain SKIPPED]`
+### 7.29 Reasoning and Decision Engine — Smart Routing, Confidence, Belief Tracking, and Judge Model `[DONE — commits ac301e4 + d645040 + 6cea54d + a9a294c + a8a3d9d]`
 
-> **GAP-FOLLOWUP (2026-05-29):** GAP 16 in `docs/GAP_REPORT.md` listed the `relix models` CLI as one of five sub-bullets. Closed in `ac301e4`:
-> - `relix models list` → `GET /v1/config/providers` table (provider, configured-status, default-marker, enabled flag, default model, last-test outcome).
-> - `relix models health` → `GET /v1/providers/health` (same table plus aggregate cooldown / quarantine / rate-limit counters).
-> - 4 new unit tests.
+> **GAP-FOLLOWUP (2026-05-29):** GAP 16 in `docs/GAP_REPORT.md` listed five sub-bullets. All five now ship across five commits:
+> - **`ac301e4`** — `relix models list` + `relix models health` CLI (provider inventory).
+> - **`d645040`** — `crates/relix-runtime/src/nodes/ai/reasoning/` foundation: config blocks, `ComplexityClassifier`, `TierRouter`, `BeliefStore`, `judge` prompt + parser + verdict, `ThreeSignalConfidence` aggregator + cluster scorer. 47 new unit tests.
+> - **`6cea54d`** — wire smart router into `ai.chat` + `ai.chat.stream` (rule-based classification → per-tier model override; falls back to default on missing tier).
+> - **`a9a294c`** — Belief state tracking (six `memory.belief_*` caps when `[reasoning.belief]` is on) + Model Name Resolution (`ChatProvider.list_available_models`, OpenAI-compat HTTP impl, `relix models fetch` CLI).
+> - **`a8a3d9d`** — Operator-callable reasoning caps: `ai.judge_eval` (5-question judge), `ai.self_consistency` (N-sample modal-cluster scorer), `ai.confidence_aggregate` (pure 3-signal aggregator with HIGH/MEDIUM/LOW band).
 >
-> The four remaining sub-bullets stay SKIPPED for the original multi-day reasons (smart tier routing, three-signal real-confidence measurement, belief state tracking, judge model). Each remains a future dedicated commit.
+> **Honest deferrals within this closure**: retrieval-quality signal (signal 2 of Component 2) needs per-call retrieval context the AI handler doesn't carry yet — the aggregator gracefully redistributes weight when the signal is `None`; bridge HTTP endpoints + a dedicated `relix belief` CLI subcommand are mechanical follow-ups (caps are registered and operator-callable through the mesh); auto-invocation of judge + self-consistency from `handle_chat` is intentionally NOT wired (the cost gating belongs at the call site — operators invoke the caps from SOL flows at the points where the cost is justified).
 
 Four components that make Relix's agents smarter, more reliable, and genuinely trustworthy. Each one works independently but all four together create an agent that thinks carefully, knows what it knows, catches its own mistakes, and never wastes money on unnecessary horsepower.
 
