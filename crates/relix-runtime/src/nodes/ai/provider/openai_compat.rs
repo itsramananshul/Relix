@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{
-    ChatInput, ChatOutput, ChatProvider, ChatStream, EmbedInput, EmbedOutput, ProviderEntry,
-    ProviderError, StreamingChunk, StreamingUsage, TokenUsage, load_api_key,
+    AvailableModel, ChatInput, ChatOutput, ChatProvider, ChatStream, EmbedInput, EmbedOutput,
+    ProviderEntry, ProviderError, StreamingChunk, StreamingUsage, TokenUsage, load_api_key,
 };
 
 const DEFAULT_EMBED_MODEL: &str = "text-embedding-3-small";
@@ -66,6 +66,32 @@ impl OpenAICompatibleProvider {
 
 #[async_trait]
 impl ChatProvider for OpenAICompatibleProvider {
+    /// GAP 16 §7.29 Model Name Resolution — hit the provider's
+    /// `GET /models` endpoint and return the live catalogue.
+    /// OpenAI / OpenRouter / xAI all expose this; Ollama does
+    /// too (since v0.1.30). The bearer is sent when configured.
+    async fn list_available_models(&self) -> Result<Vec<AvailableModel>, ProviderError> {
+        let url = format!("{}/models", self.base_url);
+        let mut req = self.http.get(&url);
+        if let Some(key) = self.api_key.as_deref() {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transient(format!("{}: list_models: {e}", self.name)))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(ProviderError::Permanent(format!(
+                "{}: list_models HTTP {status}: {body}",
+                self.name
+            )));
+        }
+        parse_models_body(&body)
+            .map_err(|e| ProviderError::Permanent(format!("{}: list_models: {e}", self.name)))
+    }
+
     async fn generate_reply(&self, input: ChatInput) -> Result<ChatOutput, ProviderError> {
         let model = if input.model.is_empty() {
             self.default_model.clone()
@@ -503,6 +529,45 @@ enum SseLine {
     Skip,
 }
 
+/// GAP 16 §7.29: parse the upstream `/models` JSON body into a
+/// list of [`AvailableModel`]. Pulled out as a free function so
+/// tests can exercise the shape variants without spinning up an
+/// HTTP server.
+fn parse_models_body(body: &str) -> Result<Vec<AvailableModel>, String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let entries = parsed
+        .get("data")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .or_else(|| parsed.as_array().cloned())
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let Some(id) = e.get("id").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        out.push(AvailableModel {
+            id: id.to_string(),
+            label: e.get("name").and_then(|x| x.as_str()).map(str::to_string),
+            context_window: e
+                .get("context_length")
+                .and_then(|x| x.as_u64())
+                .map(|n| n.min(u32::MAX as u64) as u32),
+            input_price_micros_per_mtoken: e
+                .pointer("/pricing/prompt")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|p| (p * 1_000_000.0 * 1_000_000.0) as u64),
+            output_price_micros_per_mtoken: e
+                .pointer("/pricing/completion")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|p| (p * 1_000_000.0 * 1_000_000.0) as u64),
+        });
+    }
+    Ok(out)
+}
+
 /// Parse a single line from the upstream `/v1/chat/completions`
 /// SSE stream.
 fn parse_sse_line(line: &str) -> SseLine {
@@ -621,6 +686,57 @@ pub(crate) fn extract_openai_logprob(parsed: &serde_json::Value) -> Option<f32> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_models_body_handles_openai_wrapped_shape() {
+        let body = r#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-4o-mini" },
+                { "id": "o1", "context_length": 128000 }
+            ]
+        }"#;
+        let models = parse_models_body(body).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-4o-mini");
+        assert_eq!(models[1].id, "o1");
+        assert_eq!(models[1].context_window, Some(128_000));
+    }
+
+    #[test]
+    fn parse_models_body_handles_bare_array_shape() {
+        let body = r#"[
+            { "id": "claude-haiku-4-5" },
+            { "id": "claude-opus-4" }
+        ]"#;
+        let models = parse_models_body(body).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn parse_models_body_drops_entries_without_an_id() {
+        let body = r#"{ "data": [ {}, { "id": "good" }, { "name": "no id" } ] }"#;
+        let models = parse_models_body(body).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "good");
+    }
+
+    #[test]
+    fn parse_models_body_parses_openrouter_pricing_shape() {
+        let body = r#"{
+            "data": [{
+                "id": "openrouter/claude-sonnet-4",
+                "context_length": 200000,
+                "pricing": { "prompt": "0.000003", "completion": "0.000015" }
+            }]
+        }"#;
+        let models = parse_models_body(body).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_window, Some(200_000));
+        assert!(models[0].input_price_micros_per_mtoken.is_some());
+        assert!(models[0].output_price_micros_per_mtoken.is_some());
+    }
 
     #[test]
     fn parse_sse_line_extracts_delta_content() {

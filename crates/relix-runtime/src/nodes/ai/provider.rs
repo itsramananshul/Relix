@@ -110,6 +110,36 @@ pub struct ChatOutput {
     pub logprob: Option<f32>,
 }
 
+/// GAP 16 §7.29 Model Name Resolution — one row from a
+/// provider's live model catalogue.
+///
+/// Fields beyond `id` are best-effort; not every provider's
+/// `/models` endpoint surfaces pricing or context window, and
+/// the spec calls for showing what's actually available rather
+/// than synthesising values. `id` is required so a future tier
+/// router config can validate against it.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct AvailableModel {
+    /// Provider-canonical model id (e.g.
+    /// `"anthropic/claude-opus-4"` for OpenRouter or
+    /// `"gpt-4o-mini-2024-07-18"` for OpenAI direct).
+    pub id: String,
+    /// Optional human-friendly label when the provider ships
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optional context window size (tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// Optional price per million input tokens, in micro-USD.
+    /// `1_000` = $0.001 per million tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price_micros_per_mtoken: Option<u64>,
+    /// Optional price per million output tokens, in micro-USD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_price_micros_per_mtoken: Option<u64>,
+}
+
 /// Best-effort token accounting.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TokenUsage {
@@ -127,6 +157,24 @@ pub trait ChatProvider: Send + Sync {
 
     /// Short identifier shown in startup logs and audit metadata.
     fn provider_name(&self) -> &'static str;
+
+    /// GAP 16 §7.29 Model Name Resolution — fetch the live
+    /// model catalogue from the provider. Each entry carries
+    /// the provider's canonical model id; future commits may
+    /// extend [`AvailableModel`] with pricing + context-window
+    /// metadata.
+    ///
+    /// The default impl returns `Ok(vec![])` so providers that
+    /// have no `/models` endpoint (Anthropic without the new
+    /// `/v1/models` route; mock) don't need to override.
+    /// Operators reading `Ok(vec![])` should interpret it as
+    /// "this provider doesn't expose its model list; configure
+    /// model IDs manually" — distinct from `Err(_)` which
+    /// signals an actual API failure they should retry or
+    /// investigate.
+    async fn list_available_models(&self) -> Result<Vec<AvailableModel>, ProviderError> {
+        Ok(Vec::new())
+    }
 
     /// Generate embeddings for a batch of texts. Default impl returns
     /// `Permanent("not supported")` so providers that have no

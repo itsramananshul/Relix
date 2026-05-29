@@ -33,6 +33,11 @@ pub enum Cmd {
     /// Same list as `list` plus the aggregate health counters
     /// the bridge exposes. Hits `GET /v1/providers/health`.
     Health(HealthArgs),
+    /// GAP 16 §7.29 Model Name Resolution — fetch the bridge's
+    /// active AI provider's live model catalogue. Hits
+    /// `GET /v1/models`. Operators use this to discover real
+    /// model IDs before configuring `[reasoning.router.tiers]`.
+    Fetch(FetchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -51,11 +56,54 @@ pub struct HealthArgs {
     pub json: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct FetchArgs {
+    #[arg(long, default_value = DEFAULT_BRIDGE)]
+    pub bridge: String,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Cmd::List(a) => list(a).await,
         Cmd::Health(a) => health(a).await,
+        Cmd::Fetch(a) => fetch(a).await,
     }
+}
+
+async fn fetch(args: FetchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let base = args.bridge.trim_end_matches('/');
+    let url = format!("{base}/v1/models");
+    let r = reqwest::Client::new().get(&url).send().await?;
+    let status = r.status();
+    let body = r.text().await?;
+    if !status.is_success() {
+        eprintln!("error: HTTP {status}: {body}");
+        std::process::exit(1);
+    }
+    if args.json {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let models = v.get("data").and_then(|x| x.as_array()).unwrap_or(&empty);
+    if models.is_empty() {
+        println!("(provider returned no models; configure model IDs manually)");
+        return Ok(());
+    }
+    println!("{:<48}  CTX_WINDOW", "MODEL_ID");
+    for m in models {
+        let id = m.get("id").and_then(|x| x.as_str()).unwrap_or("?");
+        let ctx = m
+            .get("context_length")
+            .and_then(|x| x.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        println!("{id:<48}  {ctx}");
+    }
+    Ok(())
 }
 
 async fn list(args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {

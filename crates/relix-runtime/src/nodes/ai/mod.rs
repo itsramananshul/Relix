@@ -52,6 +52,7 @@
 //! Provider keys live ONLY here on the AI node — never in `relix-web-bridge`
 //! or any presentation peer.
 
+pub mod belief_caps;
 pub mod execution;
 pub mod failover;
 pub mod guardrails;
@@ -320,6 +321,30 @@ pub fn register(
     let tier_router_for_chat = tier_router_shared.clone();
     let judge_cfg_for_chat = judge_cfg_shared.clone();
     let self_consistency_cfg_for_chat = self_consistency_cfg_shared.clone();
+    // GAP 16 Component 3: open the belief store + register the
+    // six `memory.belief_*` caps when the operator turned the
+    // section on.
+    if let Some(belief_cfg) = reasoning_cfg.belief.as_ref()
+        && belief_cfg.enabled
+        && let Some(db_path) = belief_cfg.db_path.as_ref()
+    {
+        match reasoning::BeliefStore::open(db_path) {
+            Ok(store) => {
+                belief_caps::register(bridge, Arc::new(store));
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    "ai.reasoning.belief: store opened, memory.belief_* caps registered"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    db_path = %db_path.display(),
+                    error = %e,
+                    "ai.reasoning.belief: store open failed; caps NOT registered"
+                );
+            }
+        }
+    }
     let provider_for_chat = provider.clone();
     let model_for_chat = default_model.clone();
     let memory_for_chat = memory_dispatcher.clone();
