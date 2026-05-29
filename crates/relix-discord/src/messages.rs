@@ -30,14 +30,31 @@ pub struct IncomingMessage {
 /// A reply the channel wants to send. `reply_to_message_id` empty
 /// means a top-level message; non-empty produces a Discord reply
 /// reference rendered inline by clients.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+///
+/// `components` carries an optional Discord components array —
+/// Action Rows + Buttons / Select Menus per the
+/// [`Message Components`](https://discord.com/developers/docs/interactions/message-components)
+/// spec. Approval messages stamp this with a single Action Row
+/// carrying Approve / Deny buttons; the buttons' `custom_id`
+/// encodes the approval id so the bridge's interaction handler
+/// can lift the decision in one parse.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct OutgoingMessage {
+    /// Discord channel snowflake (kept as string — Discord
+    /// emits snowflakes as strings on the wire because they
+    /// exceed JS's safe-integer range).
     pub channel_id: String,
     /// Empty == "do not reference". Non-empty produces a reply
     /// reference.
     #[serde(default)]
     pub reply_to_message_id: String,
+    /// Plain-text message body.
     pub content: String,
+    /// Optional Discord components array. Empty == "do not
+    /// attach components". Each element is one component
+    /// object (typically an Action Row containing buttons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<serde_json::Value>,
 }
 
 impl IncomingMessage {

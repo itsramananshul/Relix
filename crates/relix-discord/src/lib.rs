@@ -14,12 +14,23 @@
 //! See [`DiscordApi`] for the surface area + [`live::LiveDiscordApi`] for
 //! the production reqwest+rustls implementation.
 
+pub mod approval;
 pub mod config;
 pub mod identity;
 pub mod live;
 pub mod messages;
 pub mod mock;
 
+pub use approval::{
+    APPROVE_CUSTOM_ID_PREFIX, BUTTON_STYLE_DANGER, BUTTON_STYLE_PRIMARY, COMPONENT_TYPE_ACTION_ROW,
+    COMPONENT_TYPE_BUTTON, DENY_CUSTOM_ID_PREFIX, DiscordChannelDispatch,
+    INTERACTION_TYPE_APPLICATION_COMMAND, INTERACTION_TYPE_MESSAGE_COMPONENT,
+    INTERACTION_TYPE_PING, InteractionAction, InteractionKind, InteractionParseError,
+    MESSAGE_FLAG_EPHEMERAL, RESPONSE_TYPE_CHANNEL_MESSAGE_WITH_SOURCE,
+    RESPONSE_TYPE_DEFERRED_UPDATE_MESSAGE, RESPONSE_TYPE_PONG, SignatureCheck, ack_response,
+    deferred_update_response, parse_interaction_payload, pong_response,
+    verify_interaction_signature,
+};
 pub use config::{DiscordConfig, DiscordError};
 pub use identity::{ChannelSubject, derive_channel_subject};
 pub use live::{BotIdentity, LiveDiscordApi};
@@ -30,7 +41,9 @@ use async_trait::async_trait;
 /// Network surface a Discord channel needs from the Bot API.
 ///
 /// The trait is small but covers every operation the live controller
-/// actually performs: token verification (`get_me`), the polling cursor
+/// actually performs: token verification (`get_me`), the first-boot
+/// watermark seed (`bootstrap_watermark` — PART 3, prevents replaying
+/// historical channel content on startup), the polling cursor
 /// (`get_messages`), text reply (`send_message`), typing indicator
 /// (`send_typing`), and the cleanup primitive (`delete_message`).
 ///
@@ -44,6 +57,18 @@ pub trait DiscordApi: Send + Sync + 'static {
     /// than crashing the process, so a misconfigured token shows up
     /// as `online=false` on the dashboard.
     async fn get_me(&self) -> Result<BotIdentity, DiscordApiError>;
+
+    /// PART 3: fetch the snowflake of the channel's MOST RECENT
+    /// message without surfacing the content. Used by the
+    /// controller's first-boot path to seed the polling
+    /// watermark so historical channel content is NOT replayed
+    /// the first time the bot connects to a busy channel.
+    ///
+    /// Returns `None` when the channel is empty.
+    async fn bootstrap_watermark(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<String>, DiscordApiError>;
 
     /// Fetch messages newer than `after_message_id`. The empty string
     /// means "start from the most recent" — that's how an operator-

@@ -66,6 +66,23 @@ impl DiscordApi for MockDiscordApi {
         Ok(self.bot_identity.lock().unwrap().clone())
     }
 
+    async fn bootstrap_watermark(
+        &self,
+        _channel_id: &str,
+    ) -> Result<Option<String>, DiscordApiError> {
+        // PART 3: return the snowflake of the newest enqueued
+        // message — same shape the real Discord
+        // `GET /channels/:id/messages?limit=1` returns. Does
+        // NOT drain the queue (the controller seeds the
+        // watermark and continues to poll from the same set).
+        let q = self.inbound.lock().unwrap();
+        let max = q
+            .iter()
+            .map(|m| m.message_id.parse::<u128>().unwrap_or(0))
+            .max();
+        Ok(max.map(|n| n.to_string()))
+    }
+
     async fn get_messages(
         &self,
         _channel_id: &str,
@@ -76,6 +93,9 @@ impl DiscordApi for MockDiscordApi {
         let mut take: Vec<IncomingMessage> = q
             .iter()
             .filter(|m| m.message_id.parse::<u128>().unwrap_or(0) > after_num)
+            // PART 3: bot-authored messages MUST NOT surface,
+            // mirroring the live parse-layer filter.
+            .filter(|m| !m.is_bot)
             .cloned()
             .collect();
         // Oldest-first, mimicking Discord's `after` semantics with
@@ -165,6 +185,7 @@ mod tests {
             channel_id: "100".into(),
             reply_to_message_id: "9000".into(),
             content: "hello back".into(),
+            components: Vec::new(),
         };
         m.send_message(&out).await.unwrap();
         assert_eq!(m.sent_messages().len(), 1);
@@ -179,11 +200,40 @@ mod tests {
             channel_id: "100".into(),
             reply_to_message_id: String::new(),
             content: "x".into(),
+            components: Vec::new(),
         };
         let r = m.send_message(&out).await;
         assert!(matches!(r, Err(DiscordApiError::Transient(_))));
         m.send_message(&out).await.unwrap();
         assert_eq!(m.sent_messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_watermark_returns_newest_message_id() {
+        let m = MockDiscordApi::new();
+        assert_eq!(m.bootstrap_watermark("100").await.unwrap(), None);
+        m.push_message(mk(7));
+        m.push_message(mk(2));
+        m.push_message(mk(9));
+        let wm = m.bootstrap_watermark("100").await.unwrap();
+        assert_eq!(wm.as_deref(), Some("9"));
+        // bootstrap_watermark must NOT drain — a subsequent
+        // get_messages with the watermark as `after` returns
+        // nothing (already-seen messages).
+        let after = m.get_messages("100", "9").await.unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bot_authored_messages_never_surface_through_mock() {
+        let m = MockDiscordApi::new();
+        let mut bot_msg = mk(1);
+        bot_msg.is_bot = true;
+        m.push_message(bot_msg);
+        m.push_message(mk(2));
+        let batch = m.get_messages("100", "").await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].message_id, "2");
     }
 
     #[tokio::test]

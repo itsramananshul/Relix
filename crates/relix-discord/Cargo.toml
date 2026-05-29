@@ -19,6 +19,10 @@ async-trait.workspace = true
 tokio                = { workspace = true, features = ["sync", "macros", "time", "rt", "net"] }
 tracing.workspace    = true
 reqwest.workspace    = true
+# PART 3: Ed25519 verification for Discord's
+# `X-Signature-Ed25519` interaction header.
+ed25519-dalek.workspace = true
+hex.workspace           = true
 
 [dev-dependencies]
 tempfile.workspace = true

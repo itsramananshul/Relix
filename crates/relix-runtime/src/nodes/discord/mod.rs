@@ -194,6 +194,7 @@ async fn handle_send(api: Arc<dyn DiscordApi>, args: Vec<u8>) -> HandlerOutcome 
         // No reply reference for outbound coordinator messages.
         reply_to_message_id: String::new(),
         content: parsed.text,
+        components: Vec::new(),
     };
     match api.send_message(&msg).await {
         Ok(()) => HandlerOutcome::Ok(b"{\"ok\":true}".to_vec()),

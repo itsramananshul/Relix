@@ -20,6 +20,7 @@ path = "src/main.rs"
 relix-core.workspace    = true
 relix-runtime.workspace = true
 relix-slack.workspace   = true
+relix-discord.workspace = true
 
 axum.workspace               = true
 tower.workspace              = true

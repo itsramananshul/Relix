@@ -232,19 +232,31 @@ struct DcAuthor {
     bot: bool,
 }
 
-fn dc_message_to_incoming(m: DcMessage) -> IncomingMessage {
+/// PART 3: lift one Discord message to the channel's
+/// [`IncomingMessage`] shape, OR drop it when the author is a
+/// bot.
+///
+/// Filtering at the parse layer (rather than at every call site)
+/// is the only safe shape — if any downstream caller forgets the
+/// `is_bot` check, the bot can end up replying to its own message
+/// in a tight loop. Returning `Option` here makes the filter
+/// invariant local to the wire-decode path.
+fn dc_message_to_incoming(m: DcMessage) -> Option<IncomingMessage> {
     let (user_id, username, is_bot) = match m.author {
         Some(a) => (a.id, a.username.unwrap_or_default(), a.bot),
         None => (String::new(), String::new(), false),
     };
-    IncomingMessage {
+    if is_bot {
+        return None;
+    }
+    Some(IncomingMessage {
         message_id: m.id,
         channel_id: m.channel_id,
         user_id,
         username,
         is_bot,
         content: m.content,
-    }
+    })
 }
 
 // ── sendMessage ──────────────────────────────────────────────
@@ -254,6 +266,11 @@ struct DcSendMessage<'a> {
     content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_reference: Option<DcMessageReference<'a>>,
+    /// PART 3: Discord components array. Approval messages
+    /// stamp this with an Action Row carrying two buttons; the
+    /// buttons' `custom_id` encodes the approval id.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    components: &'a [serde_json::Value],
 }
 
 #[derive(Debug, Serialize)]
@@ -273,6 +290,20 @@ impl DiscordApi for LiveDiscordApi {
         })
     }
 
+    async fn bootstrap_watermark(
+        &self,
+        channel_id: &str,
+    ) -> Result<Option<String>, DiscordApiError> {
+        // Fetch just the most-recent message; we don't surface
+        // its content, only its snowflake. limit=1 keeps the
+        // payload tiny.
+        let path = format!("/channels/{channel_id}/messages?limit=1");
+        let raw: Vec<DcMessage> = self
+            .request(reqwest::Method::GET, &path, None, true)
+            .await?;
+        Ok(raw.into_iter().next().map(|m| m.id))
+    }
+
     async fn get_messages(
         &self,
         channel_id: &str,
@@ -290,8 +321,12 @@ impl DiscordApi for LiveDiscordApi {
             .await?;
         // Discord returns newest-first. Reverse so the controller
         // processes in chronological order — matches Telegram's
-        // long-poll contract.
-        let mut out: Vec<IncomingMessage> = raw.into_iter().map(dc_message_to_incoming).collect();
+        // long-poll contract. PART 3: `dc_message_to_incoming`
+        // now returns `Option` so bot-authored messages are
+        // dropped at the parse layer; we filter_map before the
+        // reverse so the chronological order survives.
+        let mut out: Vec<IncomingMessage> =
+            raw.into_iter().filter_map(dc_message_to_incoming).collect();
         out.reverse();
         Ok(out)
     }
@@ -307,6 +342,7 @@ impl DiscordApi for LiveDiscordApi {
                     message_id: &out.reply_to_message_id,
                 })
             },
+            components: &out.components,
         })
         .map_err(|e| DiscordApiError::Transient(format!("sendMessage build body: {e}")))?;
         let _: EmptyResponse = self
@@ -349,7 +385,7 @@ mod tests {
             "author": { "id": "42", "username": "alice", "bot": false }
         });
         let m: DcMessage = serde_json::from_value(raw).unwrap();
-        let inc = dc_message_to_incoming(m);
+        let inc = dc_message_to_incoming(m).expect("non-bot author must surface");
         assert_eq!(inc.message_id, "9000");
         assert_eq!(inc.channel_id, "100");
         assert_eq!(inc.user_id, "42");
@@ -366,13 +402,13 @@ mod tests {
             "content": "system message"
         });
         let m: DcMessage = serde_json::from_value(raw).unwrap();
-        let inc = dc_message_to_incoming(m);
+        let inc = dc_message_to_incoming(m).expect("missing author => non-bot");
         assert!(inc.user_id.is_empty());
         assert!(!inc.is_bot);
     }
 
     #[test]
-    fn bot_author_flag_propagates() {
+    fn bot_authored_message_is_dropped_at_parse_layer() {
         let raw = serde_json::json!({
             "id": "9000",
             "channel_id": "100",
@@ -380,9 +416,11 @@ mod tests {
             "author": { "id": "999", "username": "relixbot", "bot": true }
         });
         let m: DcMessage = serde_json::from_value(raw).unwrap();
-        let inc = dc_message_to_incoming(m);
-        assert!(inc.is_bot);
-        assert_eq!(inc.user_id, "999");
+        assert!(
+            dc_message_to_incoming(m).is_none(),
+            "bot-authored messages must NEVER reach IncomingMessage — otherwise the \
+             channel can reply to itself in a loop"
+        );
     }
 
     #[test]

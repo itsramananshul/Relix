@@ -647,6 +647,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/channels/slack/interact",
             post(channels::slack_interact),
         )
+        // PART 3: inbound Discord interactions endpoint.
+        // Verifies the `X-Signature-Ed25519` +
+        // `X-Signature-Timestamp` pair against the application
+        // public key (`RELIX_BRIDGE_DISCORD_PUBLIC_KEY`),
+        // PONGs the verification PING, and routes
+        // MESSAGE_COMPONENT clicks to `approval.record_decision`.
+        .route(
+            "/v1/channels/discord/interact",
+            post(channels::discord_interact),
+        )
         // RELIX-7.30 PART 2: credential vault.
         .route(
             "/v1/credentials",

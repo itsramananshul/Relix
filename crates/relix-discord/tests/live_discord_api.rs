@@ -202,6 +202,7 @@ async fn send_message_posts_to_channel_endpoint() {
         channel_id: "100".into(),
         reply_to_message_id: "9000".into(),
         content: "hello".into(),
+        components: Vec::new(),
     })
     .await
     .expect("send_message");
@@ -244,6 +245,7 @@ async fn send_message_retries_on_429_then_succeeds() {
         channel_id: "100".into(),
         reply_to_message_id: String::new(),
         content: "x".into(),
+        components: Vec::new(),
     })
     .await
     .expect("must succeed after retry");
@@ -263,6 +265,7 @@ async fn send_message_retries_on_5xx_then_succeeds() {
         channel_id: "100".into(),
         reply_to_message_id: String::new(),
         content: "y".into(),
+        components: Vec::new(),
     })
     .await
     .expect("must succeed after backoff");

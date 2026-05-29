@@ -309,6 +309,7 @@ async fn send_text(api: &dyn DiscordApi, channel_id: &str, reply_to: &str, text:
             channel_id: channel_id.to_string(),
             reply_to_message_id: reply.to_string(),
             content: chunk.clone(),
+            components: Vec::new(),
         };
         if let Err(e) = api.send_message(&msg).await {
             tracing::warn!(error = %e, channel_id = channel_id, chunk_idx = i,
@@ -678,13 +679,22 @@ mod tests {
         // matches the bot's identity. The polling loop skips it
         // before the handler is invoked; we exercise that path
         // by simulating one loop iteration.
+        //
+        // PART 3: the live + mock `get_messages` now filter
+        // bot-authored messages at the parse layer (primary
+        // defence). The user_id-match guard below is
+        // secondary defence — it kicks in if Discord ever
+        // returns a message whose `author.bot` flag is
+        // missing or false but whose user_id matches the
+        // bot's identity. We simulate that case by pushing an
+        // `is_bot = false` message with the matching user_id.
         let api = MockDiscordApi::new();
         let self_msg = IncomingMessage {
             message_id: "9999".into(),
             channel_id: "100".into(),
             user_id: "999".into(), // matches the bot identity below
             username: "relixbot".into(),
-            is_bot: true,
+            is_bot: false, // simulate `bot` flag missing on the wire
             content: "reply from myself".into(),
         };
         api.push_message(self_msg);
@@ -720,6 +730,9 @@ mod tests {
     impl DiscordApi for FailingApi {
         async fn get_me(&self) -> Result<BotIdentity, DiscordApiError> {
             self.inner.get_me().await
+        }
+        async fn bootstrap_watermark(&self, c: &str) -> Result<Option<String>, DiscordApiError> {
+            self.inner.bootstrap_watermark(c).await
         }
         async fn get_messages(
             &self,

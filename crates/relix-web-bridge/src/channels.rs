@@ -1,28 +1,45 @@
-//! PART 2 — inbound webhook routes for the wire-real
-//! approval channels. Each route lives behind its channel's
-//! signature-verification primitive in the corresponding
-//! channel crate (`relix-slack`, `relix-discord`, …).
+//! Inbound webhook routes for the wire-real approval
+//! channels. Each route lives behind its channel's signature-
+//! verification primitive in the corresponding channel crate
+//! (`relix-slack`, `relix-discord`, …).
 //!
-//! Slack: `POST /v1/channels/slack/interact`
-//! ----------------------------------------
+//! Slack: `POST /v1/channels/slack/interact` (PART 2)
+//! --------------------------------------------------
 //!
 //! Operators paste the Slack app's **signing secret** into
-//! `RELIX_BRIDGE_SLACK_SIGNING_SECRET` (or the
-//! `[channels.slack]` bridge config section). The handler
-//! verifies the `x-slack-signature` HMAC against the raw
-//! request body, parses the Block Kit `block_actions`
-//! interaction payload, then dispatches the lifted
-//! decision (`approved` / `rejected`) to the coordinator's
+//! `RELIX_BRIDGE_SLACK_SIGNING_SECRET`. The handler verifies
+//! the `x-slack-signature` HMAC against the raw body, parses
+//! the Block Kit `block_actions` interaction payload, then
+//! dispatches the lifted decision to the coordinator's
 //! `approval.record_decision` cap.
 //!
-//! Slack expects an HTTP 200 with an empty body within 3s of
-//! the click; the handler issues the mesh call inline because
-//! `record_decision` is fast (single SQLite UPDATE + the
-//! `oneshot::Sender::send` cancellation hop landed in PART 7).
-//! If the coordinator is unreachable we still return 200 with
-//! a logged error — the operator's UI shows the click was
-//! received and the actual decision is reconciled via the
-//! failed-deliveries surface.
+//! Discord: `POST /v1/channels/discord/interact` (PART 3)
+//! ------------------------------------------------------
+//!
+//! Operators paste the Discord application's **public key**
+//! into `RELIX_BRIDGE_DISCORD_PUBLIC_KEY`. The handler:
+//!
+//! 1. Verifies the `X-Signature-Ed25519` + `X-Signature-Timestamp`
+//!    pair against the body (Discord's required posture per
+//!    [the docs](https://discord.com/developers/docs/interactions/receiving-and-responding#security-and-authorization)).
+//! 2. Handles the verification `type=1` PING by returning a
+//!    `{"type":1}` PONG — required so Discord can validate the
+//!    interactions endpoint URL when operators paste it in
+//!    the Developer Portal.
+//! 3. For `type=3` MESSAGE_COMPONENT clicks, parses
+//!    `data.custom_id`, lifts the decision (`approved` /
+//!    `rejected`), forwards to `approval.record_decision`, and
+//!    returns an ephemeral acknowledgement message so the
+//!    operator sees the click was recorded.
+//!
+//! All approval channels expect a fast 200 response (Slack: 3s
+//! budget; Discord: 3s budget plus PING-must-be-fast). The
+//! mesh call to the coordinator is fire-and-await but
+//! `record_decision` is a single SQLite UPDATE + the cancel-
+//! sender hop landed in PART 7. If the coordinator is
+//! unreachable we still return 200 with the documented Discord
+//! / Slack interaction-response shape; the failed-deliveries
+//! surface reconciles the decision.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +51,7 @@ use axum::{
 };
 use serde::Serialize;
 
+use relix_discord::{self, InteractionKind};
 use relix_runtime::dispatch::{build_request, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use relix_slack::{
@@ -48,6 +66,14 @@ use crate::config::AppState;
 /// 503 so a misconfigured operator sees the wire reason in
 /// their Slack app's logs.
 pub const SLACK_SIGNING_SECRET_ENV: &str = "RELIX_BRIDGE_SLACK_SIGNING_SECRET";
+
+/// PART 3: env var the bridge reads the Discord application
+/// public key from at startup. Operators copy the value from
+/// the Discord Developer Portal's "General Information" tab.
+/// Unset = `/v1/channels/discord/interact` returns 503 with a
+/// clear error so the wire reason surfaces in the Discord
+/// developer portal's interaction logs.
+pub const DISCORD_PUBLIC_KEY_ENV: &str = "RELIX_BRIDGE_DISCORD_PUBLIC_KEY";
 
 const COORDINATOR_ALIAS: &str = "coordinator";
 
@@ -188,81 +214,12 @@ pub async fn slack_interact(
         }
     };
 
-    let mesh = match state.mesh_client.as_ref() {
-        Some(m) => m.clone(),
-        None => {
-            tracing::error!(
-                approval_id = %action.approval_id,
-                "slack interact: mesh client not initialized; decision lost"
-            );
-            // Still return 200 so Slack doesn't retry — the
-            // operator's UI accepted the click. Reconciliation
-            // happens via the failed-deliveries surface.
-            return (StatusCode::OK, Json(EmptyResponse::default())).into_response();
-        }
-    };
-
     let note = if action.username.is_empty() {
         format!("slack:{}", action.user_id)
     } else {
         format!("slack:@{} ({})", action.username, action.user_id)
     };
-    let args = serde_json::json!({
-        "approval_id": action.approval_id,
-        "decision": action.decision,
-        "note": note,
-    });
-    let arg_bytes = match serde_json::to_vec(&args) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(error = %e, "slack interact: encode args");
-            return (StatusCode::OK, Json(EmptyResponse::default())).into_response();
-        }
-    };
-    let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 30);
-    let envelope = build_request(
-        "approval.record_decision",
-        arg_bytes,
-        state.identity_bundle.clone(),
-        deadline_secs,
-    );
-    match mesh.call(COORDINATOR_ALIAS, envelope).await {
-        Ok(bytes) => match decode_response(&bytes) {
-            Ok(resp) => match resp.res {
-                ResponseResult::Ok(_) => {
-                    tracing::info!(
-                        approval_id = %action.approval_id,
-                        decision = %action.decision,
-                        slack_user = %action.user_id,
-                        "slack interact: decision recorded"
-                    );
-                }
-                ResponseResult::Err(env) => {
-                    tracing::error!(
-                        approval_id = %action.approval_id,
-                        err_kind = env.kind,
-                        cause = %env.cause,
-                        "slack interact: approval.record_decision returned error"
-                    );
-                }
-                ResponseResult::StreamHandle(_) => {
-                    tracing::error!(
-                        "slack interact: unexpected stream response from approval.record_decision"
-                    );
-                }
-            },
-            Err(e) => {
-                tracing::error!(error = %e, "slack interact: decode coordinator response");
-            }
-        },
-        Err(e) => {
-            tracing::error!(
-                approval_id = %action.approval_id,
-                error = %e,
-                "slack interact: mesh call to coordinator failed"
-            );
-        }
-    }
+    forward_record_decision(&state, &action.approval_id, action.decision, &note, "slack").await;
 
     // Slack expects empty 200 on success. We honour that even
     // when the coordinator round trip failed so Slack does not
@@ -282,6 +239,247 @@ pub(crate) fn format_decision_note(user_id: &str, username: &str) -> String {
         format!("slack:{user_id}")
     } else {
         format!("slack:@{username} ({user_id})")
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// PART 3 — Discord interactions endpoint
+// ────────────────────────────────────────────────────────────
+
+/// `POST /v1/channels/discord/interact`
+///
+/// Verifies the `X-Signature-Ed25519` + `X-Signature-Timestamp`
+/// pair against the raw body, then either:
+///
+/// - Returns Discord's `{"type": 1}` PONG for the verification
+///   PING (`type=1`) so the operator can paste the URL into the
+///   Discord Developer Portal and the validation passes.
+/// - Parses a MESSAGE_COMPONENT (`type=3`) click, forwards the
+///   decision to `approval.record_decision`, and returns an
+///   ephemeral acknowledgement message.
+/// - Logs and returns the deferred-update response for any
+///   other interaction type (Discord retries on non-2xx so a
+///   silent 4xx would loop forever).
+pub async fn discord_interact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let public_key = match std::env::var(DISCORD_PUBLIC_KEY_ENV) {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => {
+            tracing::warn!("discord interact: {DISCORD_PUBLIC_KEY_ENV} unset; rejecting webhook");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError {
+                    error: format!(
+                        "discord interactivity disabled: set {DISCORD_PUBLIC_KEY_ENV} \
+                         to the Discord application's public key to enable"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let ts = match headers
+        .get("x-signature-timestamp")
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiError {
+                    error: "missing X-Signature-Timestamp header".into(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let sig = match headers
+        .get("x-signature-ed25519")
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiError {
+                    error: "missing X-Signature-Ed25519 header".into(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let check = relix_discord::verify_interaction_signature(&public_key, &ts, &sig, &body);
+    match check {
+        relix_discord::SignatureCheck::Valid => {}
+        relix_discord::SignatureCheck::Mismatch => {
+            tracing::warn!("discord interact: Ed25519 signature mismatch");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiError {
+                    error: "X-Signature-Ed25519: verification failed".into(),
+                }),
+            )
+                .into_response();
+        }
+        relix_discord::SignatureCheck::Malformed(reason) => {
+            tracing::warn!(reason = reason, "discord interact: signature malformed");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("X-Signature-Ed25519 malformed: {reason}"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let kind = match relix_discord::parse_interaction_payload(&body) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(error = %e, "discord interact: payload parse failed");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("discord interaction payload: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match kind {
+        InteractionKind::Ping => {
+            // Discord developer portal pastes the URL and
+            // expects the PONG back to prove ownership.
+            (StatusCode::OK, Json(relix_discord::pong_response())).into_response()
+        }
+        InteractionKind::Component(action) => {
+            // Decision lifted from the button click.
+            let note = if action.username.is_empty() {
+                format!("discord:{}", action.user_id)
+            } else {
+                format!("discord:@{} ({})", action.username, action.user_id)
+            };
+            let ack_text = match action.decision {
+                "approved" => format!("✅ Approval `{}` recorded.", action.approval_id),
+                _ => format!("❌ Approval `{}` denied.", action.approval_id),
+            };
+            // Forward to the coordinator. We log on failure
+            // but still return an ack so the operator sees a
+            // confirmation. Reconciliation flows through
+            // failed-deliveries.
+            forward_record_decision(
+                &state,
+                &action.approval_id,
+                action.decision,
+                &note,
+                "discord",
+            )
+            .await;
+            (StatusCode::OK, Json(relix_discord::ack_response(&ack_text))).into_response()
+        }
+        InteractionKind::Other(ty) => {
+            tracing::info!(
+                interaction_type = ty,
+                "discord interact: unhandled interaction type — returning deferred update"
+            );
+            (
+                StatusCode::OK,
+                Json(relix_discord::deferred_update_response()),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Shared helper: invoke `approval.record_decision` on the
+/// coordinator with the decision lifted from a channel
+/// interaction. Logs on failure — channels expect a fast
+/// success response so we never propagate the error to the
+/// HTTP layer.
+async fn forward_record_decision(
+    state: &AppState,
+    approval_id: &str,
+    decision: &str,
+    note: &str,
+    channel_tag: &str,
+) {
+    let mesh = match state.mesh_client.as_ref() {
+        Some(m) => m.clone(),
+        None => {
+            tracing::error!(
+                channel = channel_tag,
+                approval_id = approval_id,
+                "channel interact: mesh client not initialized; decision lost"
+            );
+            return;
+        }
+    };
+    let args = serde_json::json!({
+        "approval_id": approval_id,
+        "decision": decision,
+        "note": note,
+    });
+    let arg_bytes = match serde_json::to_vec(&args) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(channel = channel_tag, error = %e, "channel interact: encode args");
+            return;
+        }
+    };
+    let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 30);
+    let envelope = build_request(
+        "approval.record_decision",
+        arg_bytes,
+        state.identity_bundle.clone(),
+        deadline_secs,
+    );
+    match mesh.call(COORDINATOR_ALIAS, envelope).await {
+        Ok(bytes) => match decode_response(&bytes) {
+            Ok(resp) => match resp.res {
+                ResponseResult::Ok(_) => {
+                    tracing::info!(
+                        channel = channel_tag,
+                        approval_id = approval_id,
+                        decision = decision,
+                        "channel interact: decision recorded"
+                    );
+                }
+                ResponseResult::Err(env) => {
+                    tracing::error!(
+                        channel = channel_tag,
+                        approval_id = approval_id,
+                        err_kind = env.kind,
+                        cause = %env.cause,
+                        "channel interact: approval.record_decision returned error"
+                    );
+                }
+                ResponseResult::StreamHandle(_) => {
+                    tracing::error!(
+                        channel = channel_tag,
+                        "channel interact: unexpected stream response"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::error!(channel = channel_tag, error = %e, "channel interact: decode coordinator response");
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                channel = channel_tag,
+                approval_id = approval_id,
+                error = %e,
+                "channel interact: mesh call to coordinator failed"
+            );
+        }
     }
 }
 
@@ -334,5 +532,30 @@ mod tests {
         // refactor that renames it fails this assertion.
         let v = InteractionParseError::NotBlockActions;
         assert!(matches!(v, InteractionParseError::NotBlockActions));
+    }
+
+    // ── PART 3 — Discord constants pin ─────────────────────
+
+    #[test]
+    fn discord_env_var_name_matches_documented_constant() {
+        // Pin the env var name — operator docs reference it
+        // directly so accidental renames here would silently
+        // break deployments.
+        assert_eq!(DISCORD_PUBLIC_KEY_ENV, "RELIX_BRIDGE_DISCORD_PUBLIC_KEY");
+    }
+
+    #[test]
+    fn discord_interaction_kind_variants_route_distinctly() {
+        // Compile-test — the bridge dispatches on these three
+        // variants. A future refactor that renames them must
+        // also rename the dispatch branches.
+        let _ = InteractionKind::Ping;
+        let _ = InteractionKind::Component(relix_discord::InteractionAction {
+            approval_id: "x".into(),
+            decision: "approved",
+            user_id: "U".into(),
+            username: "u".into(),
+        });
+        let _ = InteractionKind::Other(42);
     }
 }
