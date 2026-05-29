@@ -346,6 +346,10 @@ pub fn register(
     self_consistency_config: Option<crate::confidence::SelfConsistencyConfig>,
     self_consistency_stats: Option<crate::confidence::SelfConsistencyStats>,
     belief_state_config: Option<belief_state::BeliefStateConfig>,
+    // RELIX-7.29 follow-up — optional layered store handle the
+    // belief tracker writes through for cross-restart
+    // persistence. `None` keeps the tracker process-local.
+    belief_persistence_store: Option<Arc<crate::nodes::memory::schema::LayeredMemoryStore>>,
     judge_runtime_config: Option<judge::JudgeConfig>,
 ) -> (belief_state::BeliefStateTracker, judge::JudgeRecorder) {
     // GAP 16 §7.29: build the four reasoning components from the
@@ -390,8 +394,15 @@ pub fn register(
     // reads + writes through this Arc; the coordinator
     // `belief.*` caps are constructed against the same
     // instance so operator reads / resets see the same store.
-    let belief_tracker_shared =
-        belief_state::BeliefStateTracker::new(belief_state_config.unwrap_or_default());
+    //
+    // RELIX-7.29 follow-up: when an in-process LayeredMemoryStore
+    // handle is wired, the tracker upserts every belief list to
+    // a Layer-4 record so beliefs survive a controller restart.
+    let belief_cfg_resolved = belief_state_config.unwrap_or_default();
+    let belief_tracker_shared = match belief_persistence_store {
+        Some(store) => belief_state::BeliefStateTracker::with_store(belief_cfg_resolved, store),
+        None => belief_state::BeliefStateTracker::new(belief_cfg_resolved),
+    };
     let belief_tracker_for_chat = belief_tracker_shared.clone();
     // RELIX-7.29 PART 4: judge config + recorder + turn
     // counter. The AI handler bumps the turn counter once per

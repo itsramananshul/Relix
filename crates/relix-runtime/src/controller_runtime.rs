@@ -4926,6 +4926,73 @@ fn build_drift_config(cfg: &ControllerConfig) -> Option<crate::nodes::ai::guardr
     parsed.drift.filter(|c| c.enabled)
 }
 
+/// RELIX-7.29 follow-up — open a layered store handle for the
+/// belief tracker's cross-restart persistence. Wired ONLY when
+/// `[ai.belief_state] enabled = true` AND the AI controller's
+/// process also has `[memory]` configured with a layered store
+/// path (typical for combined AI+memory single-process
+/// deployments). Multi-process deployments leave this `None`
+/// and the tracker stays process-local.
+///
+/// Note: this opens a SECOND in-process handle to the same
+/// SQLite file the memory node uses. SQLite handles multiple
+/// handles via WAL mode (the default Relix uses); both handles
+/// see the same rows and writes from one are visible to the
+/// other after commit.
+fn build_belief_persistence_store(
+    cfg: &ControllerConfig,
+    ai_cfg: &crate::nodes::ai::AiConfig,
+) -> Option<std::sync::Arc<crate::nodes::memory::schema::LayeredMemoryStore>> {
+    use crate::nodes::memory::schema::LayeredMemoryStore;
+    let belief_enabled = ai_cfg
+        .belief_state
+        .as_ref()
+        .map(|b| b.enabled)
+        .unwrap_or(false);
+    if !belief_enabled {
+        return None;
+    }
+    let raw_mem = cfg.memory.as_ref()?;
+    let mem_cfg: crate::nodes::memory::MemoryConfig = match raw_mem.clone().try_into() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let want_qdrant = mem_cfg
+        .qdrant
+        .as_ref()
+        .is_some_and(|q| !q.url.trim().is_empty());
+    if !want_qdrant && mem_cfg.layered_db_path.is_none() {
+        return None;
+    }
+    let path = mem_cfg.layered_db_path.clone().unwrap_or_else(|| {
+        // Same sidecar derivation as `open_layered_memory` so
+        // the belief tracker writes to the same file the
+        // memory node owns.
+        let mut p = mem_cfg.db_path.clone();
+        let stem = p.file_stem().map(|s| s.to_owned()).unwrap_or_default();
+        let new_name = format!("{}.layered.db", stem.to_string_lossy());
+        p.set_file_name(new_name);
+        p
+    });
+    match LayeredMemoryStore::open(&path) {
+        Ok(store) => {
+            tracing::info!(
+                path = %path.display(),
+                "belief tracker: layered store handle wired for cross-restart persistence"
+            );
+            Some(std::sync::Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "belief tracker: failed to open layered store; persistence disabled"
+            );
+            None
+        }
+    }
+}
+
 // Open the four-layer LayeredMemoryStore when the operator opted
 // in via [memory.qdrant] OR an explicit layered_db_path. Returns
 // None when neither is configured — the layered surface is purely
@@ -5899,6 +5966,15 @@ fn register_node_type_handlers(
             // serves `belief.get` / `belief.reset` from the same
             // shared instance the AI handler holds.
             ai_cfg.belief_state.clone(),
+            // RELIX-7.29 follow-up: cross-restart belief
+            // persistence. Wired when the AI controller has a
+            // local `[memory]` section with a layered store
+            // path AND `[ai.belief_state] enabled = true`. The
+            // tracker writes every belief list to a Layer-4
+            // record under a deterministic id so beliefs
+            // survive restarts. Absent on multi-process
+            // deployments where memory lives on a separate node.
+            build_belief_persistence_store(cfg, &ai_cfg),
             // RELIX-7.29 PART 4: `[ai.judge]` judge model config.
             // Absent / disabled keeps the AI handler byte-
             // identical to its pre-judge behaviour. The returned

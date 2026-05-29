@@ -17,19 +17,24 @@
 //!    return a JSON array of `{ text, confidence }` items.
 //!    Items below `min_confidence_to_retain` are dropped; the
 //!    list is truncated to `max_beliefs`.
-//! 3. The store is keyed by `(subject_id, session_id)` and
-//!    persists for the controller's lifetime. Operators read
-//!    it via the `belief.get` cap and the
-//!    `GET /v1/belief/:session_id` bridge endpoint; they
-//!    clear it via `belief.reset` and
+//! 3. The store is keyed by `(subject_id, session_id)`.
+//!    Reads + writes flow through an in-memory `HashMap` for
+//!    O(1) hot-path access. When a [`LayeredMemoryStore`]
+//!    handle is wired (post-RELIX-7.29 follow-up), every
+//!    `set()` ALSO writes the belief list to the four-layer
+//!    store as a Layer 4 `Model` record with deterministic
+//!    id `blake3("belief_state|<subject>|<session>")` and the
+//!    tags `belief_state` + `session:<session_id>`. Every
+//!    `get()` that finds nothing in memory lazy-loads from the
+//!    same store, so beliefs survive a controller restart for
+//!    every `(subject_id, session_id)` pair that has ever
+//!    been updated.
+//! 4. Operators read the live state via the `belief.get` cap
+//!    and the `GET /v1/belief/:session_id` bridge endpoint;
+//!    they clear it via `belief.reset` and
 //!    `POST /v1/belief/:session_id` (with `action=reset`).
-//!
-//! The store is intentionally process-local: spec calls for a
-//! Layer 4 memory record stamped with the tag `belief_state`,
-//! and the in-memory ring is the functional equivalent for
-//! controller-scoped state. Persisting it across restarts is a
-//! follow-up that plugs in via the existing memory peer (out
-//! of scope for the §7.29 closure).
+//!    Resets remove BOTH the in-memory entry AND the
+//!    persisted record when a store is wired.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -37,6 +42,28 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use super::provider::ChatInput;
+use crate::nodes::memory::schema::{LayeredMemoryStore, MemoryLayer, MemoryRecord};
+
+/// Tag stamped on every belief Layer-4 record. Filterable in
+/// memory searches so beliefs do NOT show up in normal RAG
+/// retrieval.
+pub const BELIEF_TAG: &str = "belief_state";
+
+/// Deterministic id used to upsert the belief record in the
+/// [`LayeredMemoryStore`]. blake3 of
+/// `"belief_state|{subject_id}|{session_id}"` encoded as
+/// lowercase hex. Stable across restarts so re-writes are
+/// upserts not duplicates.
+pub fn persisted_belief_id(subject_id: &str, session_id: &str) -> String {
+    super::provenance_hooks::hash_blake3(&format!("belief_state|{subject_id}|{session_id}"))
+}
+
+/// Build the session-scope tag stamped on the belief record so
+/// operators can find every belief for a session via the same
+/// vocabulary the rest of the memory pipeline already uses.
+pub fn session_tag(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
 
 /// `[ai.belief_state]` config block.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -114,14 +141,25 @@ struct SessionKey {
 }
 
 /// Process-local belief tracker. Cheap to clone (one
-/// `Arc<Mutex<HashMap>>`). The AI handler shares one instance
-/// across every `ai.chat` invocation; the coordinator caps
-/// share the same instance so reads + resets see the same
-/// store the handler writes to.
+/// `Arc<Mutex<HashMap>>` plus an optional `Arc<LayeredMemoryStore>`).
+/// The AI handler shares one instance across every `ai.chat`
+/// invocation; the coordinator caps share the same instance
+/// so reads + resets see the same store the handler writes to.
+///
+/// When constructed via [`BeliefStateTracker::with_store`], the
+/// tracker also persists every update to the four-layer memory
+/// store as a Layer 4 record. Failures on the store side are
+/// logged at WARN and never propagate to the caller — beliefs
+/// continue to live in the in-memory map regardless.
 #[derive(Clone, Default)]
 pub struct BeliefStateTracker {
     inner: Arc<Mutex<HashMap<SessionKey, Vec<Belief>>>>,
     cfg: BeliefStateConfig,
+    /// RELIX-7.29 follow-up — optional persistence handle.
+    /// `None` keeps the tracker process-local for back-compat.
+    /// `Some` upserts a deterministic Layer-4 record on every
+    /// `set` and lazy-loads on every `get` cache miss.
+    store: Option<Arc<LayeredMemoryStore>>,
 }
 
 impl BeliefStateTracker {
@@ -129,6 +167,18 @@ impl BeliefStateTracker {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             cfg,
+            store: None,
+        }
+    }
+
+    /// Same as [`Self::new`] but additionally persists every
+    /// update to the supplied [`LayeredMemoryStore`]. Cross-
+    /// restart durability for beliefs.
+    pub fn with_store(cfg: BeliefStateConfig, store: Arc<LayeredMemoryStore>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            cfg,
+            store: Some(store),
         }
     }
 
@@ -142,20 +192,67 @@ impl BeliefStateTracker {
         self.cfg.enabled
     }
 
+    /// `true` when the tracker has a persistence store wired.
+    /// Exposed for dashboards + the `reasoning.status` cap.
+    pub fn has_persistence(&self) -> bool {
+        self.store.is_some()
+    }
+
     /// Read the current beliefs for `(subject_id, session_id)`.
-    /// Returns an empty Vec when no beliefs have been recorded.
+    /// When the in-memory entry is missing AND a persistence
+    /// store is wired, lazy-loads the persisted record so the
+    /// first message in a resumed session sees the prior
+    /// beliefs. Returns an empty `Vec` when no beliefs are
+    /// stored anywhere.
     pub fn get(&self, subject_id: &str, session_id: &str) -> Vec<Belief> {
         let key = SessionKey {
             subject_id: subject_id.to_string(),
             session_id: session_id.to_string(),
         };
-        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.get(&key).cloned().unwrap_or_default()
+        {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(v) = g.get(&key) {
+                return v.clone();
+            }
+        }
+        // Cache miss — try lazy load from the persistence store.
+        if let Some(store) = self.store.as_ref() {
+            let id = persisted_belief_id(subject_id, session_id);
+            match store.get(&id) {
+                Ok(Some(rec)) => match serde_json::from_str::<Vec<Belief>>(&rec.text) {
+                    Ok(beliefs) => {
+                        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                        g.insert(key.clone(), beliefs.clone());
+                        return beliefs;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            subject_id,
+                            session_id,
+                            error = %e,
+                            "belief tracker: persisted record present but JSON decode failed"
+                        );
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        subject_id,
+                        session_id,
+                        error = %e,
+                        "belief tracker: persistence read failed"
+                    );
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Replace the belief list. The list is filtered by
     /// `min_confidence_to_retain` and truncated to
-    /// `max_beliefs` before being stored.
+    /// `max_beliefs` before being stored. When a persistence
+    /// store is wired, the filtered + truncated list is ALSO
+    /// upserted into the Layer-4 store.
     pub fn set(&self, subject_id: &str, session_id: &str, mut beliefs: Vec<Belief>) {
         beliefs.retain(|b| b.confidence >= self.cfg.min_confidence_to_retain);
         beliefs.sort_by(|a, b| {
@@ -168,23 +265,70 @@ impl BeliefStateTracker {
             subject_id: subject_id.to_string(),
             session_id: session_id.to_string(),
         };
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.insert(key, beliefs);
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.insert(key, beliefs.clone());
+        }
+        if let Some(store) = self.store.as_ref()
+            && let Err(e) = persist_beliefs(store, subject_id, session_id, &beliefs)
+        {
+            tracing::warn!(
+                subject_id,
+                session_id,
+                error = %e,
+                "belief tracker: persistence write failed; in-memory state unchanged"
+            );
+        }
     }
 
     /// Clear the belief list for `(subject_id, session_id)`.
-    /// Returns `true` when an entry existed.
+    /// Returns `true` when an entry existed in memory OR was
+    /// removed from the persistence store. When the store is
+    /// wired, the persisted record is upserted to an empty
+    /// belief list rather than deleted so the row stays
+    /// auditable. Operators who need a hard delete should use
+    /// the existing `memory.delete_record` cap directly.
     pub fn reset(&self, subject_id: &str, session_id: &str) -> bool {
         let key = SessionKey {
             subject_id: subject_id.to_string(),
             session_id: session_id.to_string(),
         };
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.remove(&key).is_some()
+        let mut removed = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.remove(&key).is_some()
+        };
+        if let Some(store) = self.store.as_ref() {
+            let id = persisted_belief_id(subject_id, session_id);
+            match store.get(&id) {
+                Ok(Some(_)) => {
+                    if let Err(e) = persist_beliefs(store, subject_id, session_id, &[]) {
+                        tracing::warn!(
+                            subject_id,
+                            session_id,
+                            error = %e,
+                            "belief tracker: persistence reset failed"
+                        );
+                    } else {
+                        removed = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        subject_id,
+                        session_id,
+                        error = %e,
+                        "belief tracker: persistence read on reset failed"
+                    );
+                }
+            }
+        }
+        removed
     }
 
-    /// Number of `(subject, session)` entries currently held —
-    /// dashboards use this to track per-controller memory use.
+    /// Number of `(subject, session)` entries currently held
+    /// IN MEMORY (does not eagerly count persisted records).
+    /// Dashboards use this to track per-controller memory use.
     pub fn len(&self) -> usize {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.len()
@@ -193,6 +337,48 @@ impl BeliefStateTracker {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Upsert one belief list into the four-layer store as a
+/// deterministic Layer-4 record. The id is stable per
+/// `(subject_id, session_id)` pair so re-writes overwrite the
+/// previous record rather than accumulating history rows.
+fn persist_beliefs(
+    store: &LayeredMemoryStore,
+    subject_id: &str,
+    session_id: &str,
+    beliefs: &[Belief],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id = persisted_belief_id(subject_id, session_id);
+    let text = serde_json::to_string(beliefs)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let rec = MemoryRecord {
+        id,
+        layer: MemoryLayer::Model,
+        text,
+        source: subject_id.to_string(),
+        tags: vec![BELIEF_TAG.to_string(), session_tag(session_id)],
+        created_at: now,
+        valid_from: now,
+        valid_to: None,
+        observed_at: now,
+        embedding: None,
+        shareable: false,
+        shared_with: Vec::new(),
+        shared_by: None,
+        share_policy: crate::nodes::memory::schema::SharePolicy::None,
+        source_trust: crate::nodes::memory::schema::SourceTrust::Internal,
+        frozen: false,
+        last_edited_ms: None,
+        consolidated: false,
+        tenant_id: None,
+        superseded_by: None,
+    };
+    store.insert(&rec)?;
+    Ok(())
 }
 
 /// Build the system-prompt prefix from a belief list. Returns
@@ -572,5 +758,149 @@ mod tests {
         assert_eq!(input.session_id, "sess1::belief");
         assert_eq!(input.model, "cheap-model");
         assert!(input.system_prompt.is_some());
+    }
+
+    // ── RELIX-7.29 follow-up — cross-restart persistence ──
+
+    fn open_store() -> Arc<LayeredMemoryStore> {
+        Arc::new(LayeredMemoryStore::in_memory().expect("open in-memory store"))
+    }
+
+    fn enabled_cfg() -> BeliefStateConfig {
+        BeliefStateConfig {
+            enabled: true,
+            min_confidence_to_retain: 0.0,
+            max_beliefs: 10,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn persisted_belief_id_is_deterministic_per_subject_session() {
+        let a = persisted_belief_id("subj", "sess");
+        let b = persisted_belief_id("subj", "sess");
+        let c = persisted_belief_id("subj", "other");
+        let d = persisted_belief_id("other-subj", "sess");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+        // blake3 hex encoding is 64 chars.
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn set_writes_layer_4_record_with_belief_tag_and_session_tag() {
+        let store = open_store();
+        let tracker = BeliefStateTracker::with_store(enabled_cfg(), store.clone());
+        tracker.set(
+            "subj",
+            "sess",
+            vec![Belief {
+                text: "user is debugging".into(),
+                confidence: 0.82,
+            }],
+        );
+        let id = persisted_belief_id("subj", "sess");
+        let rec = store.get(&id).expect("store get").expect("record present");
+        assert_eq!(rec.layer, MemoryLayer::Model);
+        assert_eq!(rec.source, "subj");
+        assert!(rec.tags.iter().any(|t| t == BELIEF_TAG));
+        assert!(rec.tags.iter().any(|t| t == &session_tag("sess")));
+        let beliefs: Vec<Belief> = serde_json::from_str(&rec.text).expect("decode");
+        assert_eq!(beliefs.len(), 1);
+        assert_eq!(beliefs[0].text, "user is debugging");
+    }
+
+    #[test]
+    fn get_lazy_loads_beliefs_from_store_on_cold_tracker() {
+        let store = open_store();
+        // First tracker writes the record.
+        let writer = BeliefStateTracker::with_store(enabled_cfg(), store.clone());
+        writer.set(
+            "subj",
+            "sess",
+            vec![
+                Belief {
+                    text: "alpha".into(),
+                    confidence: 0.9,
+                },
+                Belief {
+                    text: "beta".into(),
+                    confidence: 0.7,
+                },
+            ],
+        );
+        // Second tracker simulates a controller restart: same
+        // store, fresh in-memory map.
+        let reader = BeliefStateTracker::with_store(enabled_cfg(), store.clone());
+        assert!(reader.is_empty(), "fresh tracker must start empty");
+        let got = reader.get("subj", "sess");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text, "alpha");
+        // After the lazy load, the in-memory map should hold
+        // the same entry so subsequent reads avoid the store.
+        assert_eq!(reader.len(), 1);
+    }
+
+    #[test]
+    fn fresh_session_with_no_record_returns_empty_without_panic() {
+        let store = open_store();
+        let tracker = BeliefStateTracker::with_store(enabled_cfg(), store);
+        let got = tracker.get("subj-never-seen", "sess-never-seen");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn no_store_keeps_tracker_process_local() {
+        let tracker = BeliefStateTracker::new(enabled_cfg());
+        assert!(!tracker.has_persistence());
+        tracker.set(
+            "a",
+            "b",
+            vec![Belief {
+                text: "x".into(),
+                confidence: 0.9,
+            }],
+        );
+        let got = tracker.get("a", "b");
+        assert_eq!(got.len(), 1);
+        // Fresh tracker without store sees nothing.
+        let other = BeliefStateTracker::new(enabled_cfg());
+        assert!(other.get("a", "b").is_empty());
+    }
+
+    #[test]
+    fn reset_clears_persisted_record_text_to_empty_array() {
+        let store = open_store();
+        let tracker = BeliefStateTracker::with_store(enabled_cfg(), store.clone());
+        tracker.set(
+            "subj",
+            "sess",
+            vec![Belief {
+                text: "x".into(),
+                confidence: 0.9,
+            }],
+        );
+        assert!(tracker.reset("subj", "sess"));
+        // After reset, the row is still present (auditable)
+        // but its belief list is empty.
+        let id = persisted_belief_id("subj", "sess");
+        let rec = store.get(&id).expect("ok").expect("row present");
+        let parsed: Vec<Belief> = serde_json::from_str(&rec.text).expect("decode");
+        assert!(parsed.is_empty());
+        // A new reader does NOT pick up beliefs — empty is empty.
+        let reader = BeliefStateTracker::with_store(enabled_cfg(), store);
+        assert!(reader.get("subj", "sess").is_empty());
+    }
+
+    #[test]
+    fn belief_records_carry_filterable_tag_for_memory_search_isolation() {
+        // The BELIEF_TAG constant is the single source of truth
+        // operators filter against to keep beliefs out of normal
+        // memory search surfaces. Stability matters — this is the
+        // canary that the tag string never silently drifts.
+        assert_eq!(BELIEF_TAG, "belief_state");
+        // session_tag uses a stable namespace prefix.
+        assert_eq!(session_tag("sess1"), "session:sess1");
     }
 }
