@@ -57,6 +57,34 @@ pub struct CommonQuery {
     pub peer: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct CostBaselinesQuery {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub windows: Option<u32>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AskHumanBaselinesQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub windows: Option<u32>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SpikeHistoryQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
 /// `GET /v1/metrics/agents` — list every agent with metrics in
 /// the last `hours` window (default 24).
 pub async fn list_agents(
@@ -194,6 +222,76 @@ pub async fn alerts(
     )
     .await
     {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/metrics/cost-baselines` — GAP 22 Feature 2 baselines.
+pub async fn cost_baselines(
+    State(state): State<AppState>,
+    Query(q): Query<CostBaselinesQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let mut body = serde_json::Map::new();
+    if let Some(p) = q.provider {
+        body.insert("provider".into(), Value::from(p));
+    }
+    body.insert(
+        "last_n_windows".into(),
+        Value::from(q.windows.unwrap_or(24)),
+    );
+    match call_peer_json(
+        &state,
+        &peer,
+        "metrics.cost_baselines",
+        &Value::Object(body),
+    )
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/metrics/ask-human-baselines` — GAP 22 Feature 2 baselines.
+pub async fn ask_human_baselines(
+    State(state): State<AppState>,
+    Query(q): Query<AskHumanBaselinesQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let mut body = serde_json::Map::new();
+    if let Some(a) = q.agent {
+        body.insert("agent".into(), Value::from(a));
+    }
+    body.insert(
+        "last_n_windows".into(),
+        Value::from(q.windows.unwrap_or(24)),
+    );
+    match call_peer_json(
+        &state,
+        &peer,
+        "metrics.ask_human_baselines",
+        &Value::Object(body),
+    )
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `GET /v1/metrics/cost-spikes` — GAP 22 Feature 2 spike history.
+pub async fn cost_spikes(
+    State(state): State<AppState>,
+    Query(q): Query<SpikeHistoryQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    let body = serde_json::json!({ "limit": q.limit.unwrap_or(20) });
+    match call_peer_json(&state, &peer, "metrics.cost_spike_history", &body).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }

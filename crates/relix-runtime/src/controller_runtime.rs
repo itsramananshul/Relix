@@ -4334,6 +4334,15 @@ pub(crate) struct MetricsBundle {
     pub alert_chronicle: crate::metrics::AlertChronicle,
     pub alert_targets: Vec<crate::metrics::AlertTarget>,
     pub alert_mesh_cell: crate::metrics::AlertMeshCell,
+    /// GAP 22 Feature 2 follow-up: parsed `[metrics.cost_alerts]`.
+    /// Carried in the bundle so the coordinator branch reads it
+    /// without re-parsing the controller TOML.
+    pub cost_alerts_cfg: crate::metrics::spike_detector::CostAlertsConfig,
+    /// GAP 22 Feature 2 follow-up: resolved metrics SQLite path —
+    /// used by the spike detector to derive a sibling
+    /// `cost_baselines.db` when the operator hasn't set an
+    /// explicit override.
+    pub metrics_db_path: std::path::PathBuf,
 }
 
 /// RELIX-7.19 GAP 4 — boot-time bundle of every piece the
@@ -4598,6 +4607,8 @@ pub(crate) fn build_metrics_bundle(
         alert_chronicle,
         alert_targets: m_cfg.alerts.targets.clone(),
         alert_mesh_cell: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        cost_alerts_cfg: m_cfg.cost_alerts.clone(),
+        metrics_db_path: db_path,
     }))
 }
 
@@ -7046,6 +7057,72 @@ fn register_node_type_handlers(
                 alert_targets = b.alert_targets.len(),
                 "coordinator node: registered metrics.* capabilities + spawned alert engine + chronicle"
             );
+
+            // ── GAP 22 Feature 2 follow-up: cost-baseline store +
+            // spike detector. Wired when `[metrics.cost_alerts]
+            // enabled = true`. The detector runs on its own tick
+            // alongside the existing AlertEngine; the two paths
+            // are complementary (engine fires live; detector
+            // archives + checks against the persistent baseline).
+            if b.cost_alerts_cfg.enabled {
+                let path = b.cost_alerts_cfg.db_path.clone().unwrap_or_else(|| {
+                    let mut p = b.metrics_db_path.clone();
+                    p.set_file_name("cost_baselines.db");
+                    p
+                });
+                match crate::metrics::cost_baseline::CostBaselineStore::open(&path) {
+                    Ok(baseline_store) => {
+                        crate::metrics::coordinator::register_baseline_caps(
+                            bridge,
+                            baseline_store.clone(),
+                        );
+                        for (method, doc) in [
+                            (
+                                "metrics.cost_baselines",
+                                "List persisted per-model cost baseline windows.",
+                            ),
+                            (
+                                "metrics.ask_human_baselines",
+                                "List persisted per-agent ask-human-rate baseline windows.",
+                            ),
+                            (
+                                "metrics.cost_spike_history",
+                                "List the most recent archived cost-spike fire events.",
+                            ),
+                        ] {
+                            manifest.add_capability(
+                                CapabilityDescriptor::unary(method)
+                                    .with_description(doc)
+                                    .with_categories([
+                                        "read".into(),
+                                        "metrics".into(),
+                                        "observability".into(),
+                                    ]),
+                            );
+                        }
+                        let detector_sink = crate::metrics::alert::AlertSink::new(
+                            crate::metrics::alert::LoggingAlertSink,
+                        );
+                        let detector = crate::metrics::spike_detector::CostSpikeDetector::new(
+                            b.cost_alerts_cfg.clone(),
+                            b.query.clone(),
+                            baseline_store,
+                            detector_sink,
+                        );
+                        let _detector_handle = detector.spawn();
+                        tracing::info!(
+                            path = %path.display(),
+                            "coordinator node: GAP 22 Feature 2 spike detector online"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "coordinator: cost baseline store open failed; spike detector NOT spawned"
+                        );
+                    }
+                }
+            }
         } else {
             tracing::info!(
                 "coordinator: [metrics] disabled — metrics.* capabilities not registered"

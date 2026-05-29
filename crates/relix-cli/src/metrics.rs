@@ -61,6 +61,40 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// GAP 22 Feature 2: persisted per-provider cost baselines.
+    /// `--provider` filters to one model id; `--windows` caps the
+    /// returned window count (default 24).
+    CostBaselines {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long, default_value_t = 24)]
+        windows: u32,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// GAP 22 Feature 2: persisted per-agent ask-human rate
+    /// baselines.
+    AskHumanBaselines {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, default_value_t = 24)]
+        windows: u32,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
+    /// GAP 22 Feature 2: archived cost-spike fire events.
+    CostSpikes {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long, default_value = DEFAULT_BRIDGE)]
+        bridge: String,
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -80,6 +114,19 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             bridge,
             raw,
         } => timeseries(&bridge, &agent, hours, bucket, raw).await,
+        Cmd::CostBaselines {
+            provider,
+            windows,
+            bridge,
+            raw,
+        } => cost_baselines(&bridge, provider.as_deref(), windows, raw).await,
+        Cmd::AskHumanBaselines {
+            agent,
+            windows,
+            bridge,
+            raw,
+        } => ask_human_baselines(&bridge, agent.as_deref(), windows, raw).await,
+        Cmd::CostSpikes { limit, bridge, raw } => cost_spikes(&bridge, limit, raw).await,
     }
 }
 
@@ -352,6 +399,170 @@ struct CostRow {
 struct TimeseriesBucket {
     #[serde(default)]
     invocations: u64,
+}
+
+// ── GAP 22 Feature 2 baseline + spike-history subcommands ──
+
+async fn cost_baselines(
+    bridge: &str,
+    provider: Option<&str>,
+    windows: u32,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut url = format!(
+        "{}/v1/metrics/cost-baselines?windows={windows}",
+        bridge.trim_end_matches('/')
+    );
+    if let Some(p) = provider {
+        url.push_str(&format!("&provider={p}"));
+    }
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = v
+        .get("windows")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no cost baselines)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:>14} {:>14} {:>10} {:>20}",
+        "provider", "avg_micros", "p95_micros", "calls", "created_at_ms"
+    );
+    for r in rows {
+        let provider = r.get("provider").and_then(|x| x.as_str()).unwrap_or("?");
+        let avg = r
+            .get("avg_cost_micros_per_call")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let p95 = r
+            .get("p95_cost_micros")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let calls = r
+            .get("invocation_count")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let created = r.get("created_at_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+        println!(
+            "{:<20} {:>14} {:>14} {:>10} {:>20}",
+            provider, avg, p95, calls, created
+        );
+    }
+    Ok(())
+}
+
+async fn ask_human_baselines(
+    bridge: &str,
+    agent: Option<&str>,
+    windows: u32,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut url = format!(
+        "{}/v1/metrics/ask-human-baselines?windows={windows}",
+        bridge.trim_end_matches('/')
+    );
+    if let Some(a) = agent {
+        url.push_str(&format!("&agent={a}"));
+    }
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = v
+        .get("windows")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no ask-human baselines)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:>10} {:>10} {:>8} {:>20}",
+        "agent", "calls", "asked", "rate%", "created_at_ms"
+    );
+    for r in rows {
+        let agent = r.get("agent").and_then(|x| x.as_str()).unwrap_or("?");
+        let total = r
+            .get("total_invocations")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let asked = r
+            .get("ask_human_count")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let rate = r
+            .get("ask_human_rate")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0);
+        let created = r.get("created_at_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+        println!(
+            "{:<20} {:>10} {:>10} {:>7.2}% {:>20}",
+            agent,
+            total,
+            asked,
+            rate * 100.0,
+            created
+        );
+    }
+    Ok(())
+}
+
+async fn cost_spikes(
+    bridge: &str,
+    limit: u32,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/v1/metrics/cost-spikes?limit={limit}",
+        bridge.trim_end_matches('/')
+    );
+    let body = http_get(&url).await?;
+    if raw {
+        println!("{body}");
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = v
+        .get("spikes")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("(no cost spikes archived)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:>14} {:>14} {:>8} {:>20}",
+        "provider", "current", "baseline", "ratio", "created_at_ms"
+    );
+    for r in rows {
+        let provider = r.get("provider").and_then(|x| x.as_str()).unwrap_or("?");
+        let cur = r
+            .get("current_avg_micros")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let base = r
+            .get("baseline_avg_micros")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let ratio = r.get("spike_ratio").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let created = r.get("created_at_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+        println!(
+            "{:<20} {:>14} {:>14} {:>7.2}x {:>20}",
+            provider, cur, base, ratio, created
+        );
+    }
+    Ok(())
 }
 
 // ── http ─────────────────────────────────────────────────

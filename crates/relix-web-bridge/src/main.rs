@@ -759,6 +759,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/metrics/alerts", get(agent_metrics::alerts))
         .route("/v1/metrics/cost", get(agent_metrics::cost))
+        // GAP 22 Feature 2 follow-up: persisted baselines.
+        .route(
+            "/v1/metrics/cost-baselines",
+            get(agent_metrics::cost_baselines),
+        )
+        .route(
+            "/v1/metrics/ask-human-baselines",
+            get(agent_metrics::ask_human_baselines),
+        )
+        .route("/v1/metrics/cost-spikes", get(agent_metrics::cost_spikes))
         // RELIX-7.28 Part 2: observability dashboard surface.
         .route(
             "/v1/observability/alerts",

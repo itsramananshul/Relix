@@ -268,6 +268,119 @@ fn err_internal<E: std::fmt::Display>(e: &E) -> HandlerOutcome {
     })
 }
 
+// ── GAP 22 Feature 2 baseline-store surface ──────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct CostBaselinesArgs {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    last_n_windows: u32,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AskHumanBaselinesArgs {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    last_n_windows: u32,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CostSpikeHistoryArgs {
+    #[serde(default)]
+    limit: u32,
+}
+
+/// Wire the three baseline + spike-history caps. Idempotent —
+/// callers register additional caps from the same store + sink
+/// elsewhere without conflict.
+pub fn register_baseline_caps(
+    bridge: &mut DispatchBridge,
+    store: super::cost_baseline::CostBaselineStore,
+) {
+    register_cost_baselines(bridge, store.clone());
+    register_ask_human_baselines(bridge, store.clone());
+    register_cost_spike_history(bridge, store);
+}
+
+fn register_cost_baselines(
+    bridge: &mut DispatchBridge,
+    store: super::cost_baseline::CostBaselineStore,
+) {
+    bridge.register(
+        "metrics.cost_baselines",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let store = store.clone();
+            async move {
+                let args = match decode::<CostBaselinesArgs>(&ctx.args) {
+                    Ok(a) => a,
+                    Err(e) => return e,
+                };
+                let limit = if args.last_n_windows == 0 {
+                    24
+                } else {
+                    args.last_n_windows
+                };
+                match store.recent_cost_baselines(args.provider.as_deref(), limit) {
+                    Ok(rows) => ok_json(&serde_json::json!({ "windows": rows })),
+                    Err(e) => err_internal(&e),
+                }
+            }
+        })),
+    );
+}
+
+fn register_ask_human_baselines(
+    bridge: &mut DispatchBridge,
+    store: super::cost_baseline::CostBaselineStore,
+) {
+    bridge.register(
+        "metrics.ask_human_baselines",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let store = store.clone();
+            async move {
+                let args = match decode::<AskHumanBaselinesArgs>(&ctx.args) {
+                    Ok(a) => a,
+                    Err(e) => return e,
+                };
+                let limit = if args.last_n_windows == 0 {
+                    24
+                } else {
+                    args.last_n_windows
+                };
+                match store.recent_ask_human_baselines(args.agent.as_deref(), limit) {
+                    Ok(rows) => ok_json(&serde_json::json!({ "windows": rows })),
+                    Err(e) => err_internal(&e),
+                }
+            }
+        })),
+    );
+}
+
+fn register_cost_spike_history(
+    bridge: &mut DispatchBridge,
+    store: super::cost_baseline::CostBaselineStore,
+) {
+    bridge.register(
+        "metrics.cost_spike_history",
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let store = store.clone();
+            async move {
+                let args = match decode::<CostSpikeHistoryArgs>(&ctx.args) {
+                    Ok(a) => a,
+                    Err(e) => return e,
+                };
+                let limit = if args.limit == 0 { 20 } else { args.limit };
+                match store.recent_spike_history(limit) {
+                    Ok(rows) => ok_json(&serde_json::json!({ "spikes": rows })),
+                    Err(e) => err_internal(&e),
+                }
+            }
+        })),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::alert::{AlertEngine, AlertThresholds};

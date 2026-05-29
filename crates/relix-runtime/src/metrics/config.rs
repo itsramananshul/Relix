@@ -62,6 +62,13 @@ pub struct MetricsConfig {
     /// fan-out stays dormant.
     #[serde(default)]
     pub alerts: AlertDeliveryConfig,
+    /// `[metrics.cost_alerts]` — GAP 22 Feature 2 persistent
+    /// baseline + spike-detector knobs. Absent / `enabled =
+    /// false` keeps the detector dormant; the existing
+    /// AlertEngine evaluators in `super::alert` continue to
+    /// run on their own poll cycle.
+    #[serde(default)]
+    pub cost_alerts: super::spike_detector::CostAlertsConfig,
 }
 
 impl Default for MetricsConfig {
@@ -75,6 +82,7 @@ impl Default for MetricsConfig {
             prices: PriceTableConfig::default(),
             alert_interval_secs: default_alert_interval_secs(),
             alerts: AlertDeliveryConfig::default(),
+            cost_alerts: super::spike_detector::CostAlertsConfig::default(),
         }
     }
 }

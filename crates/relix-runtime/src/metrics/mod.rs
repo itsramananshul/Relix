@@ -30,9 +30,11 @@ pub mod budget_coordinator;
 pub mod collector;
 pub mod config;
 pub mod coordinator;
+pub mod cost_baseline;
 pub mod observability;
 pub mod pricing;
 pub mod query;
+pub mod spike_detector;
 pub mod store;
 pub mod types;
 
