@@ -105,15 +105,29 @@ fn handle_store(store: &CredentialStore, ctx: &InvocationCtx) -> HandlerOutcome 
         .map(CredentialKind::parse)
         .unwrap_or_default();
     let actor = ctx.caller.name.clone();
-    match store.store(
-        &args.name,
-        &args.value,
-        kind,
-        args.owner_agent.as_deref(),
-        args.expires_at_ms,
-        args.rotation_interval_secs,
-        Some(&actor),
-    ) {
+    let result = if store.tenant_isolation_enabled() {
+        store.store_for_tenant(
+            &args.name,
+            &args.value,
+            kind,
+            args.owner_agent.as_deref(),
+            args.expires_at_ms,
+            args.rotation_interval_secs,
+            Some(&actor),
+            ctx.tenant_id.as_deref(),
+        )
+    } else {
+        store.store(
+            &args.name,
+            &args.value,
+            kind,
+            args.owner_agent.as_deref(),
+            args.expires_at_ms,
+            args.rotation_interval_secs,
+            Some(&actor),
+        )
+    };
+    match result {
         Ok(c) => ok_json(&super::store::CredentialSummary::from(&c)),
         Err(e) => internal(&format!("{e}")),
     }
@@ -134,7 +148,12 @@ fn handle_get(store: &CredentialStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
     // Lookup the row first so we can authorisation-check
     // caller vs owner_agent before decrypting.
-    let summary = match store.list(None) {
+    let lookup = if store.tenant_isolation_enabled() {
+        store.list_for_tenant(None, ctx.tenant_id.as_deref())
+    } else {
+        store.list(None)
+    };
+    let summary = match lookup {
         Ok(rows) => rows.into_iter().find(|r| r.name == args.name),
         Err(e) => return internal(&format!("{e}")),
     };
@@ -164,7 +183,12 @@ fn handle_get(store: &CredentialStore, ctx: &InvocationCtx) -> HandlerOutcome {
             retry_after: None,
         });
     }
-    match store.get(&args.name, Some(caller)) {
+    let decrypted = if store.tenant_isolation_enabled() {
+        store.get_for_tenant(&args.name, Some(caller), ctx.tenant_id.as_deref())
+    } else {
+        store.get(&args.name, Some(caller))
+    };
+    match decrypted {
         Ok(Some(plain)) => ok_json(&plain),
         Ok(None) => HandlerOutcome::Err(ErrorEnvelope {
             kind: error_kinds::INVALID_ARGS,
@@ -230,7 +254,12 @@ fn handle_list(store: &CredentialStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Ok(a) => a,
         Err(out) => return out,
     };
-    match store.list(args.owner_agent.as_deref()) {
+    let result = if store.tenant_isolation_enabled() {
+        store.list_for_tenant(args.owner_agent.as_deref(), ctx.tenant_id.as_deref())
+    } else {
+        store.list(args.owner_agent.as_deref())
+    };
+    match result {
         Ok(rows) => ok_json(&rows),
         Err(e) => internal(&format!("{e}")),
     }

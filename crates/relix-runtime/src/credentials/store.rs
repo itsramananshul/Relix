@@ -64,6 +64,13 @@ pub struct Credential {
     pub revoked_at_ms: Option<i64>,
     pub revoke_reason: Option<String>,
     pub version: u32,
+    /// Tenant-isolation follow-up: per-tenant scoping. `None`
+    /// on pre-migration rows + on rows written through the
+    /// tenant-blind `store` path. The `*_for_tenant` reads
+    /// filter by this column when the store was opened with
+    /// `tenant_isolation = true`.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// What `credentials.list` returns. Never carries the
@@ -175,6 +182,8 @@ pub enum CredentialError {
     Expired(String),
     #[error("credentials: master key must be 32 bytes; got {0} bytes")]
     InvalidMasterKey(usize),
+    #[error("credentials: tenant_id required in multi-tenant mode")]
+    MissingTenant,
 }
 
 /// SQLite-backed encrypted vault. Cheap to clone.
@@ -182,6 +191,7 @@ pub enum CredentialError {
 pub struct CredentialStore {
     conn: Arc<Mutex<Connection>>,
     key: Arc<[u8; 32]>,
+    tenant_isolation: bool,
 }
 
 impl CredentialStore {
@@ -190,6 +200,19 @@ impl CredentialStore {
     /// through SHA-256 to produce the 32-byte key — operators
     /// can supply any-length entropy.
     pub fn open(path: &Path, master_secret: &str) -> Result<Self, CredentialError> {
+        Self::open_with_tenant_isolation(path, master_secret, false)
+    }
+
+    /// Tenant-isolation variant: when `tenant_isolation` is
+    /// `true`, the `*_for_tenant` reads fail closed on missing
+    /// tenant ids and the write paths persist `ctx.tenant_id`
+    /// into the new column. Default (`false`) keeps the
+    /// legacy single-tenant behaviour.
+    pub fn open_with_tenant_isolation(
+        path: &Path,
+        master_secret: &str,
+        tenant_isolation: bool,
+    ) -> Result<Self, CredentialError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -203,11 +226,20 @@ impl CredentialStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             key: Arc::new(key),
+            tenant_isolation,
         })
     }
 
     /// Open an in-memory store. Tests + the dry-run cap path.
     pub fn open_in_memory(master_secret: &str) -> Result<Self, CredentialError> {
+        Self::open_in_memory_with_tenant_isolation(master_secret, false)
+    }
+
+    /// Tenant-isolation variant of [`Self::open_in_memory`].
+    pub fn open_in_memory_with_tenant_isolation(
+        master_secret: &str,
+        tenant_isolation: bool,
+    ) -> Result<Self, CredentialError> {
         let conn = Connection::open_in_memory()?;
         crate::db::apply_pragmas(&conn)?;
         Self::migrate(&conn)?;
@@ -215,45 +247,81 @@ impl CredentialStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             key: Arc::new(key),
+            tenant_isolation,
         })
     }
 
+    /// Whether this store is operating in fail-closed per-tenant
+    /// isolation mode. Cap handlers branch on this to pick the
+    /// tenant-aware read variants.
+    pub fn tenant_isolation_enabled(&self) -> bool {
+        self.tenant_isolation
+    }
+
     fn migrate(conn: &Connection) -> Result<(), CredentialError> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS credentials (\
-                 id                     TEXT PRIMARY KEY,\
-                 name                   TEXT NOT NULL UNIQUE,\
-                 value_encrypted        TEXT NOT NULL,\
-                 kind                   TEXT NOT NULL DEFAULT 'api_key',\
-                 owner_agent            TEXT,\
-                 created_at_ms          INTEGER NOT NULL,\
-                 updated_at_ms          INTEGER NOT NULL,\
-                 expires_at_ms          INTEGER,\
-                 last_rotated_at_ms     INTEGER,\
-                 rotation_interval_secs INTEGER,\
-                 next_rotation_at_ms    INTEGER,\
-                 revoked                INTEGER NOT NULL DEFAULT 0,\
-                 revoked_at_ms          INTEGER,\
-                 revoke_reason          TEXT,\
-                 version                INTEGER NOT NULL DEFAULT 1\
-             );\
-             CREATE TABLE IF NOT EXISTS credential_audit (\
-                 id              TEXT PRIMARY KEY,\
-                 credential_id   TEXT NOT NULL,\
-                 event           TEXT NOT NULL,\
-                 actor           TEXT,\
-                 timestamp_ms    INTEGER NOT NULL,\
-                 details         TEXT\
-             );\
-             CREATE INDEX IF NOT EXISTS credential_audit_cred_idx \
-                 ON credential_audit(credential_id, timestamp_ms);\
-             CREATE INDEX IF NOT EXISTS credentials_owner_idx \
-                 ON credentials(owner_agent);",
-        )?;
+        crate::db::ensure_migration_table(conn)?;
+        let current = crate::db::current_migration_version(conn)?;
+        if current < 1 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS credentials (\
+                     id                     TEXT PRIMARY KEY,\
+                     name                   TEXT NOT NULL UNIQUE,\
+                     value_encrypted        TEXT NOT NULL,\
+                     kind                   TEXT NOT NULL DEFAULT 'api_key',\
+                     owner_agent            TEXT,\
+                     created_at_ms          INTEGER NOT NULL,\
+                     updated_at_ms          INTEGER NOT NULL,\
+                     expires_at_ms          INTEGER,\
+                     last_rotated_at_ms     INTEGER,\
+                     rotation_interval_secs INTEGER,\
+                     next_rotation_at_ms    INTEGER,\
+                     revoked                INTEGER NOT NULL DEFAULT 0,\
+                     revoked_at_ms          INTEGER,\
+                     revoke_reason          TEXT,\
+                     version                INTEGER NOT NULL DEFAULT 1\
+                 );\
+                 CREATE TABLE IF NOT EXISTS credential_audit (\
+                     id              TEXT PRIMARY KEY,\
+                     credential_id   TEXT NOT NULL,\
+                     event           TEXT NOT NULL,\
+                     actor           TEXT,\
+                     timestamp_ms    INTEGER NOT NULL,\
+                     details         TEXT\
+                 );\
+                 CREATE INDEX IF NOT EXISTS credential_audit_cred_idx \
+                     ON credential_audit(credential_id, timestamp_ms);\
+                 CREATE INDEX IF NOT EXISTS credentials_owner_idx \
+                     ON credentials(owner_agent);",
+            )?;
+            crate::db::record_migration_applied(conn, 1)?;
+        }
+        if current < 2 {
+            // Tenant-isolation follow-up: add a nullable
+            // tenant_id column + partial index. Pre-migration
+            // rows keep their NULL tenant_id; the tenant-blind
+            // legacy reads (`get`/`list`) ignore the column.
+            // `*_for_tenant` variants apply `WHERE tenant_id = ?`.
+            // The existing UNIQUE(name) constraint stays — for
+            // alpha we don't allow two tenants to reuse the same
+            // credential name; operators can ALTER later if that
+            // turns out to matter.
+            if !column_exists(conn, "credentials", "tenant_id")? {
+                conn.execute("ALTER TABLE credentials ADD COLUMN tenant_id TEXT", [])?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_credentials_tenant \
+                     ON credentials(tenant_id) WHERE tenant_id IS NOT NULL;",
+            )?;
+            crate::db::record_migration_applied(conn, 2)?;
+        }
         Ok(())
     }
 
     /// Encrypt + insert a new credential. Returns the row.
+    /// The legacy entry point — writes with `tenant_id = NULL`.
+    /// Production cap handlers should call
+    /// [`Self::store_for_tenant`] when isolation is on so the
+    /// row is scoped to the right tenant.
     #[allow(clippy::too_many_arguments)]
     pub fn store(
         &self,
@@ -264,6 +332,64 @@ impl CredentialStore {
         expires_at_ms: Option<i64>,
         rotation_interval_secs: Option<u64>,
         actor: Option<&str>,
+    ) -> Result<Credential, CredentialError> {
+        self.store_inner(
+            name,
+            value,
+            kind,
+            owner_agent,
+            expires_at_ms,
+            rotation_interval_secs,
+            actor,
+            None,
+        )
+    }
+
+    /// Tenant-aware insert. Fails closed when isolation is on
+    /// and the tenant id is empty/missing; falls through to the
+    /// legacy `store` when isolation is off (`tenant_id` is
+    /// then ignored).
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_for_tenant(
+        &self,
+        name: &str,
+        value: &str,
+        kind: CredentialKind,
+        owner_agent: Option<&str>,
+        expires_at_ms: Option<i64>,
+        rotation_interval_secs: Option<u64>,
+        actor: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Credential, CredentialError> {
+        if self.tenant_isolation {
+            match tenant_id {
+                Some(t) if !t.trim().is_empty() => {}
+                _ => return Err(CredentialError::MissingTenant),
+            }
+        }
+        self.store_inner(
+            name,
+            value,
+            kind,
+            owner_agent,
+            expires_at_ms,
+            rotation_interval_secs,
+            actor,
+            tenant_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_inner(
+        &self,
+        name: &str,
+        value: &str,
+        kind: CredentialKind,
+        owner_agent: Option<&str>,
+        expires_at_ms: Option<i64>,
+        rotation_interval_secs: Option<u64>,
+        actor: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> Result<Credential, CredentialError> {
         if name.trim().is_empty() {
             return Err(CredentialError::Serialization(
@@ -282,8 +408,8 @@ impl CredentialStore {
                 "INSERT INTO credentials \
                  (id, name, value_encrypted, kind, owner_agent, created_at_ms, updated_at_ms, \
                   expires_at_ms, last_rotated_at_ms, rotation_interval_secs, next_rotation_at_ms, \
-                  revoked, revoked_at_ms, revoke_reason, version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 0, NULL, NULL, 1)",
+                  revoked, revoked_at_ms, revoke_reason, version, tenant_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 0, NULL, NULL, 1, ?11)",
                 params![
                     id,
                     name,
@@ -295,6 +421,7 @@ impl CredentialStore {
                     expires_at_ms,
                     rotation_interval_secs.map(|s| s as i64),
                     next_rot,
+                    tenant_id,
                 ],
             )?;
         }
@@ -402,6 +529,110 @@ impl CredentialStore {
             .ok_or(CredentialError::NotFound(name.to_string()))?;
         self.audit(&row.id, AuditEvent::Revoked, actor, reason)?;
         Ok(cred)
+    }
+
+    /// Tenant-aware variant of [`Self::get`]. Returns
+    /// `Ok(None)` when the credential exists but belongs to a
+    /// different tenant (does not leak existence). Falls through
+    /// to [`Self::get`] when isolation is off.
+    pub fn get_for_tenant(
+        &self,
+        name: &str,
+        actor: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<DecryptedCredential>, CredentialError> {
+        if !self.tenant_isolation {
+            return self.get(name, actor);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return Err(CredentialError::MissingTenant),
+        };
+        let row = match self.get_row_by_name_for_tenant(name, tenant)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if row.revoked {
+            return Ok(None);
+        }
+        if let Some(exp) = row.expires_at_ms
+            && exp <= unix_ms()
+        {
+            return Ok(None);
+        }
+        let encrypted: EncryptedValue = serde_json::from_str(&self.row_encrypted_json(&row.id)?)
+            .map_err(|e| CredentialError::Serialization(e.to_string()))?;
+        let plaintext = decrypt(&self.key, &encrypted)?;
+        self.audit(&row.id, AuditEvent::Accessed, actor, None)?;
+        Ok(Some(DecryptedCredential {
+            name: row.name.clone(),
+            kind: row.kind,
+            owner_agent: row.owner_agent.clone(),
+            value: plaintext,
+            version: row.version,
+        }))
+    }
+
+    /// Tenant-aware variant of [`Self::list`]. Adds
+    /// `WHERE tenant_id = ?` to the generated SQL and combines
+    /// with `owner_agent` when supplied. Same fail-closed
+    /// semantics as [`Self::get_for_tenant`].
+    pub fn list_for_tenant(
+        &self,
+        owner_agent: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<CredentialSummary>, CredentialError> {
+        if !self.tenant_isolation {
+            return self.list(owner_agent);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t.to_string(),
+            _ => return Err(CredentialError::MissingTenant),
+        };
+        let conn = self.lock()?;
+        let rows: Vec<Credential> = if let Some(o) = owner_agent {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, owner_agent, created_at_ms, updated_at_ms, \
+                        expires_at_ms, last_rotated_at_ms, rotation_interval_secs, \
+                        next_rotation_at_ms, revoked, revoked_at_ms, revoke_reason, version, \
+                        tenant_id \
+                 FROM credentials WHERE tenant_id = ?1 AND owner_agent = ?2 \
+                 ORDER BY created_at_ms DESC, name ASC",
+            )?;
+            stmt.query_map(params![tenant, o], row_to_credential_with_tenant)?
+                .collect::<Result<_, _>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, kind, owner_agent, created_at_ms, updated_at_ms, \
+                        expires_at_ms, last_rotated_at_ms, rotation_interval_secs, \
+                        next_rotation_at_ms, revoked, revoked_at_ms, revoke_reason, version, \
+                        tenant_id \
+                 FROM credentials WHERE tenant_id = ?1 \
+                 ORDER BY created_at_ms DESC, name ASC",
+            )?;
+            stmt.query_map(params![tenant], row_to_credential_with_tenant)?
+                .collect::<Result<_, _>>()?
+        };
+        Ok(rows.iter().map(CredentialSummary::from).collect())
+    }
+
+    fn get_row_by_name_for_tenant(
+        &self,
+        name: &str,
+        tenant: &str,
+    ) -> Result<Option<Credential>, CredentialError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT id, name, kind, owner_agent, created_at_ms, updated_at_ms, \
+                    expires_at_ms, last_rotated_at_ms, rotation_interval_secs, \
+                    next_rotation_at_ms, revoked, revoked_at_ms, revoke_reason, version, \
+                    tenant_id \
+             FROM credentials WHERE name = ?1 AND tenant_id = ?2",
+            params![name, tenant],
+            row_to_credential_with_tenant,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// List summaries, optionally filtered by owner_agent.
@@ -557,7 +788,29 @@ fn row_to_credential(row: &rusqlite::Row<'_>) -> rusqlite::Result<Credential> {
         revoked_at_ms: row.get(11)?,
         revoke_reason: row.get(12)?,
         version: row.get::<_, i64>(13)? as u32,
+        // Tenant-isolation legacy path: tenant-blind SELECTs
+        // don't read the column. The `*_for_tenant` reads use
+        // `row_to_credential_with_tenant` instead.
+        tenant_id: None,
     })
+}
+
+fn row_to_credential_with_tenant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Credential> {
+    let mut cred = row_to_credential(row)?;
+    cred.tenant_id = row.get(14)?;
+    Ok(cred)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, CredentialError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn row_to_audit(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRow> {
@@ -848,5 +1101,125 @@ mod tests {
         assert_eq!(a, b);
         let c = derive_key("beta");
         assert_ne!(a, c);
+    }
+
+    // ---- Tenant-isolation follow-up: per-tenant scoping.
+    // Mirrors the LayeredMemoryStore precedent (PART 4).
+
+    fn isolated_store() -> CredentialStore {
+        CredentialStore::open_in_memory_with_tenant_isolation("test-master-secret", true).unwrap()
+    }
+
+    #[test]
+    fn tenant_isolation_flag_defaults_to_false() {
+        let s = fresh_store();
+        assert!(!s.tenant_isolation_enabled());
+    }
+
+    #[test]
+    fn tenant_isolation_opt_in_enables_flag() {
+        let s = isolated_store();
+        assert!(s.tenant_isolation_enabled());
+    }
+
+    #[test]
+    fn list_for_tenant_hides_cross_tenant_rows() {
+        let s = isolated_store();
+        s.store_for_tenant(
+            "a",
+            "v",
+            CredentialKind::ApiKey,
+            None,
+            None,
+            None,
+            None,
+            Some("tenant-a"),
+        )
+        .unwrap();
+        s.store_for_tenant(
+            "b",
+            "v",
+            CredentialKind::ApiKey,
+            None,
+            None,
+            None,
+            None,
+            Some("tenant-b"),
+        )
+        .unwrap();
+        let only_a = s.list_for_tenant(None, Some("tenant-a")).unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].name, "a");
+    }
+
+    #[test]
+    fn list_for_tenant_fails_closed_on_missing_tenant() {
+        let s = isolated_store();
+        let err = s.list_for_tenant(None, None).unwrap_err();
+        assert!(matches!(err, CredentialError::MissingTenant));
+        let err = s.list_for_tenant(None, Some("   ")).unwrap_err();
+        assert!(matches!(err, CredentialError::MissingTenant));
+    }
+
+    #[test]
+    fn list_for_tenant_falls_through_when_isolation_disabled() {
+        let s = fresh_store();
+        s.store("a", "v", CredentialKind::ApiKey, None, None, None, None)
+            .unwrap();
+        let rows = s.list_for_tenant(None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn get_for_tenant_returns_none_on_cross_tenant_name() {
+        let s = isolated_store();
+        s.store_for_tenant(
+            "shared_name",
+            "alpha-secret",
+            CredentialKind::ApiKey,
+            None,
+            None,
+            None,
+            None,
+            Some("tenant-a"),
+        )
+        .unwrap();
+        // The UNIQUE(name) constraint blocks reusing the same
+        // name across tenants in the alpha — verify
+        // get_for_tenant still scopes correctly when a tenant
+        // queries an existing name they don't own.
+        let absent = s
+            .get_for_tenant("shared_name", None, Some("tenant-b"))
+            .unwrap();
+        assert!(absent.is_none());
+        let present = s
+            .get_for_tenant("shared_name", None, Some("tenant-a"))
+            .unwrap();
+        assert_eq!(present.unwrap().value, "alpha-secret");
+    }
+
+    #[test]
+    fn get_for_tenant_fails_closed_on_missing_tenant() {
+        let s = isolated_store();
+        let err = s.get_for_tenant("anything", None, None).unwrap_err();
+        assert!(matches!(err, CredentialError::MissingTenant));
+    }
+
+    #[test]
+    fn store_for_tenant_fails_closed_on_missing_tenant() {
+        let s = isolated_store();
+        let err = s
+            .store_for_tenant(
+                "a",
+                "v",
+                CredentialKind::ApiKey,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, CredentialError::MissingTenant));
     }
 }
