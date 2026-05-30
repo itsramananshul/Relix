@@ -74,9 +74,13 @@ use relix_core::identity::{IdentityBundle, issue_identity};
 use relix_core::policy::PolicyEngine;
 use relix_core::types::NodeId;
 
+use relix_runtime::audit_partition::{AuditPartitionStore, PartitionRow};
 use relix_runtime::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 use relix_runtime::nodes::memory::schema::{LayeredMemoryStore, MemoryLayer, MemoryRecord};
 use relix_runtime::transport::rpc::{self, Event, Multiaddr};
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::config::{
     AppState, AuthSection, BridgeConfig, BridgeSection, FlowSection, IdentitySection, MeshSection,
@@ -154,9 +158,84 @@ fn spawn_inbound_loop(mut events: mpsc::Receiver<Event>, bridge: Arc<DispatchBri
 ///   `tenant_isolation = true` and returns the matching
 ///   rows. Tests use this to prove cross-tenant
 ///   invisibility through the SQLite fallback path.
+// PART 8 — minimal test-only tenant-keyed KV store.
+// Stands in for SkillStore, SessionStore, CredentialStore
+// (none of which carry tenant isolation in the runtime yet).
+// The integration test proves the bridge → mesh → cap →
+// store pipeline routes the tenant id correctly; the
+// production upstream stores need the same shape once their
+// per-tenant variants ship.
+#[derive(Default)]
+struct TenantKvStore {
+    inner: Mutex<HashMap<String, Vec<(String, String)>>>,
+}
+
+impl TenantKvStore {
+    fn insert(&self, tenant: &str, key: String, value: String) {
+        let mut g = self.inner.lock().expect("kv lock");
+        g.entry(tenant.to_string()).or_default().push((key, value));
+    }
+    fn list_for(&self, tenant: &str) -> Vec<(String, String)> {
+        let g = self.inner.lock().expect("kv lock");
+        g.get(tenant).cloned().unwrap_or_default()
+    }
+}
+
+/// PART 8 — register a tenant-aware cap that lists rows
+/// from `store` keyed by `ctx.tenant_id`. Used by the
+/// skill / session / credential surface tests.
+fn register_kv_list_cap(
+    bridge: &mut DispatchBridge,
+    method: &'static str,
+    store: Arc<TenantKvStore>,
+) {
+    let s = store.clone();
+    bridge.register(
+        method,
+        Arc::new(FnHandler(move |ctx: InvocationCtx| {
+            let s = s.clone();
+            async move {
+                let tenant = match ctx.tenant_id.as_deref() {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                            kind: relix_core::types::error_kinds::SECURITY_DENIED,
+                            cause: format!("{method}: tenant_id required"),
+                            retry_hint: 0,
+                            retry_after: None,
+                        });
+                    }
+                };
+                let rows = s.list_for(tenant);
+                let body = serde_json::json!({
+                    "tenant_id": tenant,
+                    "rows": rows
+                        .iter()
+                        .map(|(k, v)| serde_json::json!({ "key": k, "value": v }))
+                        .collect::<Vec<_>>(),
+                });
+                match serde_json::to_vec(&body) {
+                    Ok(b) => HandlerOutcome::Ok(b),
+                    Err(e) => HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                        kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                        cause: format!("{method}: encode: {e}"),
+                        retry_hint: 0,
+                        retry_after: None,
+                    }),
+                }
+            }
+        })),
+    );
+}
+
 fn build_responder_bridge_with_store(
     policy_toml: &str,
     store: Arc<LayeredMemoryStore>,
+    audit_store: Arc<AuditPartitionStore>,
+    skill_store: Arc<TenantKvStore>,
+    session_store: Arc<TenantKvStore>,
+    credential_store: Arc<TenantKvStore>,
+    policy_resolver: Arc<relix_core::policy::TenantPolicyResolver>,
 ) -> (DispatchBridge, SigningKey, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let org_root = SigningKey::generate(&mut OsRng);
@@ -230,6 +309,157 @@ fn build_responder_bridge_with_store(
             })),
         );
     }
+    // PART 8 cap: tenant-aware memory ingest. Writes a row
+    // to the shared store, stamping `tenant_id` from
+    // `ctx.tenant_id`. Args wire: JSON `{ source, text }`.
+    {
+        let s = store.clone();
+        bridge.register(
+            "test.ingest",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move {
+                    #[derive(serde::Deserialize)]
+                    struct IngestArgs {
+                        source: String,
+                        text: String,
+                    }
+                    let args: IngestArgs = match serde_json::from_slice(&ctx.args) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                                kind: relix_core::types::error_kinds::INVALID_ARGS,
+                                cause: format!("ingest args: {e}"),
+                                retry_hint: 0,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    let tenant = match ctx.tenant_id.as_deref() {
+                        Some(t) if !t.is_empty() => t.to_string(),
+                        _ => {
+                            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                                kind: relix_core::types::error_kinds::SECURITY_DENIED,
+                                cause: "ingest: tenant_id required".into(),
+                                retry_hint: 0,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    let id = format!(
+                        "ingest-{tenant}-{}",
+                        uuid_like_suffix(&format!("{}{}", args.source, args.text))
+                    );
+                    let mut record = MemoryRecord::new_raw(id, &args.text, &args.source);
+                    record.layer = MemoryLayer::Raw;
+                    record.tenant_id = Some(tenant.clone());
+                    if let Err(e) = s.insert(&record) {
+                        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                            cause: format!("insert: {e}"),
+                            retry_hint: 0,
+                            retry_after: None,
+                        });
+                    }
+                    let body = serde_json::json!({ "tenant_id": tenant, "ok": true });
+                    HandlerOutcome::Ok(serde_json::to_vec(&body).unwrap_or_default())
+                }
+            })),
+        );
+    }
+    // PART 8 cap: tenant-aware audit-partition read. Wraps
+    // `AuditPartitionStore::tenant_recent(ctx.tenant_id, 50)`.
+    {
+        let s = audit_store.clone();
+        bridge.register(
+            "test.audit_recent",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move {
+                    let tenant = match ctx.tenant_id.as_deref() {
+                        Some(t) if !t.is_empty() => t.to_string(),
+                        _ => {
+                            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                                kind: relix_core::types::error_kinds::SECURITY_DENIED,
+                                cause: "audit_recent: tenant_id required".into(),
+                                retry_hint: 0,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    let rows = match s.tenant_recent(&tenant, 50) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                                kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                                cause: format!("tenant_recent: {e}"),
+                                retry_hint: 0,
+                                retry_after: None,
+                            });
+                        }
+                    };
+                    let body = serde_json::json!({
+                        "tenant_id": tenant,
+                        "methods": rows
+                            .iter()
+                            .map(|r| r.method.clone())
+                            .collect::<Vec<_>>(),
+                    });
+                    HandlerOutcome::Ok(serde_json::to_vec(&body).unwrap_or_default())
+                }
+            })),
+        );
+    }
+    // PART 8 cap: policy-resolver admission probe. Wraps
+    // `TenantPolicyResolver::evaluate(caller, method,
+    // tenant_id)` and returns the decision shape. Tests use
+    // this to prove tenant A's per-tenant policy file
+    // applies to tenant-A traffic but NOT to tenant-B
+    // traffic.
+    {
+        let resolver = policy_resolver.clone();
+        bridge.register(
+            "test.policy_admit",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let resolver = resolver.clone();
+                async move {
+                    let tenant = ctx.tenant_id.clone();
+                    let probe_method = std::str::from_utf8(&ctx.args)
+                        .unwrap_or("ai.chat")
+                        .to_string();
+                    let decision = resolver.evaluate(&ctx.caller, &probe_method, tenant.as_deref());
+                    use relix_core::policy::Decision;
+                    let (allowed, matched_rule, reason) = match &decision {
+                        Decision::Allow { matched_rule } => {
+                            (true, Some(matched_rule.clone()), String::new())
+                        }
+                        Decision::Deny {
+                            reason,
+                            matched_rule,
+                        } => (false, matched_rule.clone(), reason.clone()),
+                    };
+                    let body = serde_json::json!({
+                        "tenant_id": tenant.clone().unwrap_or_default(),
+                        "method": probe_method,
+                        "allowed": allowed,
+                        "matched_rule": matched_rule,
+                        "reason": reason,
+                    });
+                    HandlerOutcome::Ok(serde_json::to_vec(&body).unwrap_or_default())
+                }
+            })),
+        );
+    }
+    // PART 8: tenant-keyed list caps for skill / session /
+    // credential surfaces. All three share the same shape —
+    // list whatever rows the caller's tenant owns.
+    register_kv_list_cap(&mut bridge, "test.skill_list", skill_store.clone());
+    register_kv_list_cap(&mut bridge, "test.session_list", session_store.clone());
+    register_kv_list_cap(
+        &mut bridge,
+        "test.credential_list",
+        credential_store.clone(),
+    );
     (bridge, org_root, dir)
 }
 
@@ -251,6 +481,59 @@ async fn route_tenant_search(
     axum::extract::Query(q): axum::extract::Query<SearchQuery>,
 ) -> axum::response::Response {
     call_test_cap(&state, "test.search", q.q.into_bytes()).await
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct IngestQuery {
+    source: String,
+    text: String,
+}
+
+async fn route_tenant_ingest(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<IngestQuery>,
+) -> axum::response::Response {
+    let body = serde_json::json!({ "source": q.source, "text": q.text });
+    call_test_cap(
+        &state,
+        "test.ingest",
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+    .await
+}
+
+async fn route_audit_recent(State(state): State<AppState>) -> axum::response::Response {
+    call_test_cap(&state, "test.audit_recent", Vec::new()).await
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct PolicyProbeQuery {
+    #[serde(default)]
+    method: String,
+}
+
+async fn route_policy_admit(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<PolicyProbeQuery>,
+) -> axum::response::Response {
+    let probe = if q.method.is_empty() {
+        "ai.chat".to_string()
+    } else {
+        q.method
+    };
+    call_test_cap(&state, "test.policy_admit", probe.into_bytes()).await
+}
+
+async fn route_skill_list(State(state): State<AppState>) -> axum::response::Response {
+    call_test_cap(&state, "test.skill_list", Vec::new()).await
+}
+
+async fn route_session_list(State(state): State<AppState>) -> axum::response::Response {
+    call_test_cap(&state, "test.session_list", Vec::new()).await
+}
+
+async fn route_credential_list(State(state): State<AppState>) -> axum::response::Response {
+    call_test_cap(&state, "test.credential_list", Vec::new()).await
 }
 
 async fn call_test_cap(state: &AppState, method: &str, args: Vec<u8>) -> axum::response::Response {
@@ -325,6 +608,12 @@ struct Harness {
     _bridge_tmp: TempDir,
     _responder_tmp: TempDir,
     _store: Arc<LayeredMemoryStore>,
+    audit_store: Arc<AuditPartitionStore>,
+    skill_store: Arc<TenantKvStore>,
+    session_store: Arc<TenantKvStore>,
+    credential_store: Arc<TenantKvStore>,
+    _policy_resolver: Arc<relix_core::policy::TenantPolicyResolver>,
+    _policy_dir: TempDir,
 }
 
 async fn boot_harness(
@@ -355,6 +644,37 @@ async fn boot_harness(
         record.tenant_id = Some((*tenant).to_string());
         store.insert(&record).expect("seed insert");
     }
+    // PART 8: additional per-surface stores. All open in
+    // fail-closed mode where applicable so a missing tenant
+    // is caught by the production code, not the test.
+    let audit_dir = TempDir::new().expect("audit tempdir");
+    let audit_store = Arc::new(
+        AuditPartitionStore::open_with_partition(audit_dir.path().join("audit.db"), true)
+            .expect("audit partition open"),
+    );
+    let skill_store = Arc::new(TenantKvStore::default());
+    let session_store = Arc::new(TenantKvStore::default());
+    let credential_store = Arc::new(TenantKvStore::default());
+    // PART 8: tenant-isolation-enabled policy resolver. Per-
+    // tenant policy files live in `policy_dir/{tenant}.policy.toml`.
+    // Each test that exercises the policy surface seeds files
+    // there via the returned `_policy_dir`.
+    let policy_dir = TempDir::new().expect("policy tempdir");
+    let global_policy = PolicyEngine::from_toml(
+        r#"
+        [admit]
+        groups = ["operators"]
+        "#,
+    )
+    .expect("global policy parses");
+    let policy_resolver = Arc::new(
+        relix_core::policy::TenantPolicyResolver::new(
+            global_policy,
+            Some(policy_dir.path().to_path_buf()),
+            0,
+        )
+        .with_tenant_isolation(true),
+    );
     let (bridge, org_root, responder_tmp) = build_responder_bridge_with_store(
         // Permissive policy: every caller's group ("operators")
         // can hit every test method. Per-method admission is not
@@ -371,8 +691,37 @@ async fn boot_harness(
         name = "search"
         method = "test.search"
         allow_groups = ["operators"]
+        [[rules]]
+        name = "ingest"
+        method = "test.ingest"
+        allow_groups = ["operators"]
+        [[rules]]
+        name = "audit_recent"
+        method = "test.audit_recent"
+        allow_groups = ["operators"]
+        [[rules]]
+        name = "policy_admit"
+        method = "test.policy_admit"
+        allow_groups = ["operators"]
+        [[rules]]
+        name = "skill_list"
+        method = "test.skill_list"
+        allow_groups = ["operators"]
+        [[rules]]
+        name = "session_list"
+        method = "test.session_list"
+        allow_groups = ["operators"]
+        [[rules]]
+        name = "credential_list"
+        method = "test.credential_list"
+        allow_groups = ["operators"]
         "#,
         store.clone(),
+        audit_store.clone(),
+        skill_store.clone(),
+        session_store.clone(),
+        credential_store.clone(),
+        policy_resolver.clone(),
     );
     let bridge = Arc::new(bridge);
     let (_peer_client, events, peer_addr) = boot_peer(193).await;
@@ -482,6 +831,12 @@ async fn boot_harness(
     let app = Router::new()
         .route("/test/echo", get(route_tenant_echo))
         .route("/test/search", get(route_tenant_search))
+        .route("/test/ingest", get(route_tenant_ingest))
+        .route("/test/audit_recent", get(route_audit_recent))
+        .route("/test/policy_admit", get(route_policy_admit))
+        .route("/test/skill_list", get(route_skill_list))
+        .route("/test/session_list", get(route_session_list))
+        .route("/test/credential_list", get(route_credential_list))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             tenant_cfg,
@@ -509,6 +864,12 @@ async fn boot_harness(
         _bridge_tmp: bridge_tmp,
         _responder_tmp: responder_tmp,
         _store: store,
+        audit_store,
+        skill_store,
+        session_store,
+        credential_store,
+        _policy_resolver: policy_resolver,
+        _policy_dir: policy_dir,
     }
 }
 
@@ -760,3 +1121,298 @@ async fn fix_part8_search_returns_empty_for_no_match_with_correct_tenant() {
 // visible to the next-session author.
 #[allow(dead_code)]
 fn _keep_unused_imports_alive(_h: HeaderMap) {}
+
+// ─── PART 8 — surface 2: memory ingest ──────────────────────
+
+/// PART 8 surface 2 (memory ingest): tenant A ingests via
+/// the bridge; tenant B searching for the same content sees
+/// NOTHING because the responder stamped tenant A on the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_part8_surface_2_memory_ingest_stores_rows_in_writer_tenant_only() {
+    let h = boot_harness(
+        true,
+        &[("acmetokn", "acme"), ("globextn", "globex")],
+        &["127.0.0.1"],
+        &[],
+    )
+    .await;
+    // Tenant A ingests via the bridge route.
+    let resp = get_with_bearer(
+        h.addr,
+        "/test/ingest?source=user-1&text=tenant-a-secret",
+        "acmetokn-rest",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("ingest json");
+    assert_eq!(body["ok"].as_bool(), Some(true));
+    assert_eq!(body["tenant_id"].as_str(), Some("acme"));
+    // Tenant A search sees the row.
+    let resp = get_with_bearer(h.addr, "/test/search?q=tenant-a-secret", "acmetokn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let texts: Vec<String> = body["row_texts"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(texts.len(), 1);
+    assert!(texts[0].contains("tenant-a-secret"));
+    // Tenant B search returns NOTHING — the row was stamped
+    // with tenant_id="acme" so the `WHERE tenant_id = ?` on
+    // the responder filter excludes it.
+    let resp = get_with_bearer(h.addr, "/test/search?q=tenant-a-secret", "globextn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let texts = body["row_texts"].as_array().expect("array");
+    assert!(
+        texts.is_empty(),
+        "tenant B must not see tenant A's ingested row: {body}"
+    );
+}
+
+// ─── PART 8 — surface 3: audit records ──────────────────────
+
+/// PART 8 surface 3 (audit records): the partition mirror's
+/// `tenant_recent(t)` filter ships `WHERE tenant_id = ?1`.
+/// Tenant A's audit rows are never visible to tenant B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_part8_surface_3_audit_records_isolate_per_tenant() {
+    let h = boot_harness(
+        true,
+        &[("acmetokn", "acme"), ("globextn", "globex")],
+        &["127.0.0.1"],
+        &[],
+    )
+    .await;
+    // Seed the audit partition directly with rows for both
+    // tenants. The cap reads via `tenant_recent` which
+    // filters by tenant_id.
+    h.audit_store
+        .append(&PartitionRow {
+            ts_secs: 100,
+            request_id_hex: "rid-acme-1".into(),
+            tenant_id: Some("acme".into()),
+            caller_name: "alice".into(),
+            method: "acme.specific.method".into(),
+            policy_decision: "allow:r".into(),
+            status: "ok",
+            error_kind: None,
+            latency_ms: 5,
+        })
+        .expect("seed acme audit");
+    h.audit_store
+        .append(&PartitionRow {
+            ts_secs: 200,
+            request_id_hex: "rid-globex-1".into(),
+            tenant_id: Some("globex".into()),
+            caller_name: "bob".into(),
+            method: "globex.specific.method".into(),
+            policy_decision: "allow:r".into(),
+            status: "ok",
+            error_kind: None,
+            latency_ms: 7,
+        })
+        .expect("seed globex audit");
+    // Tenant A reads — sees only its method.
+    let resp = get_with_bearer(h.addr, "/test/audit_recent", "acmetokn-rest").await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    let methods: Vec<String> = body["methods"]
+        .as_array()
+        .expect("methods array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0], "acme.specific.method");
+    // Tenant B reads — sees only its method, never acme's.
+    let resp = get_with_bearer(h.addr, "/test/audit_recent", "globextn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let methods: Vec<String> = body["methods"]
+        .as_array()
+        .expect("methods array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0], "globex.specific.method");
+}
+
+// ─── PART 8 — surface 4: policy resolution ──────────────────
+
+/// PART 8 surface 4 (policy resolution): a per-tenant
+/// policy file at `<policy_dir>/<tenant>.policy.toml` is
+/// loaded ONLY for that tenant's traffic.
+/// `TenantPolicyResolver::evaluate(caller, "tenant.only",
+/// Some("acme"))` returns Allow when acme's per-tenant
+/// policy admits `tenant.only`; `evaluate(caller,
+/// "tenant.only", Some("globex"))` returns Deny because
+/// globex has no per-tenant policy file and the global
+/// engine has no rule for `tenant.only`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_part8_surface_4_policy_resolution_isolates_per_tenant_files() {
+    let h = boot_harness(
+        true,
+        &[("acmetokn", "acme"), ("globextn", "globex")],
+        &["127.0.0.1"],
+        &[],
+    )
+    .await;
+    // Write an acme-only policy that admits `tenant.only`.
+    std::fs::write(
+        h._policy_dir.path().join("acme.policy.toml"),
+        r#"
+        [admit]
+        groups = ["operators"]
+        [[rules]]
+        name = "acme_only"
+        method = "tenant.only"
+        allow_groups = ["operators"]
+        "#,
+    )
+    .expect("write acme policy");
+    // No globex.policy.toml — globex falls through to the
+    // global engine which has no rule for tenant.only.
+    let resp = get_with_bearer(
+        h.addr,
+        "/test/policy_admit?method=tenant.only",
+        "acmetokn-rest",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["allowed"].as_bool(),
+        Some(true),
+        "acme policy must admit tenant.only: {body}"
+    );
+    assert_eq!(body["matched_rule"].as_str(), Some("acme_only"));
+    let resp = get_with_bearer(
+        h.addr,
+        "/test/policy_admit?method=tenant.only",
+        "globextn-rest",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["allowed"].as_bool(),
+        Some(false),
+        "globex (no per-tenant file) must NOT inherit acme's rule: {body}"
+    );
+}
+
+// ─── PART 8 — surface 5: skill search ───────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_part8_surface_5_skill_search_isolates_per_tenant() {
+    let h = boot_harness(
+        true,
+        &[("acmetokn", "acme"), ("globextn", "globex")],
+        &["127.0.0.1"],
+        &[],
+    )
+    .await;
+    h.skill_store
+        .insert("acme", "skill-a".into(), "acme-data-classifier".into());
+    h.skill_store
+        .insert("globex", "skill-b".into(), "globex-pdf-extractor".into());
+    let resp = get_with_bearer(h.addr, "/test/skill_list", "acmetokn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["value"].as_str(), Some("acme-data-classifier"));
+    let resp = get_with_bearer(h.addr, "/test/skill_list", "globextn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["value"].as_str(), Some("globex-pdf-extractor"));
+}
+
+// ─── PART 8 — surface 6: session list ───────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_part8_surface_6_session_list_isolates_per_tenant() {
+    let h = boot_harness(
+        true,
+        &[("acmetokn", "acme"), ("globextn", "globex")],
+        &["127.0.0.1"],
+        &[],
+    )
+    .await;
+    h.session_store
+        .insert("acme", "sess-a-1".into(), "user@acme.com".into());
+    h.session_store
+        .insert("acme", "sess-a-2".into(), "ops@acme.com".into());
+    h.session_store
+        .insert("globex", "sess-b-1".into(), "admin@globex.io".into());
+    let resp = get_with_bearer(h.addr, "/test/session_list", "acmetokn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert!(
+            row["value"].as_str().unwrap_or("").contains("acme"),
+            "acme session list leaked non-acme row: {row}"
+        );
+    }
+    let resp = get_with_bearer(h.addr, "/test/session_list", "globextn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["value"].as_str().unwrap_or("").contains("globex"));
+}
+
+// ─── PART 8 — surface 7: credential list ────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_part8_surface_7_credential_list_isolates_per_tenant() {
+    let h = boot_harness(
+        true,
+        &[("acmetokn", "acme"), ("globextn", "globex")],
+        &["127.0.0.1"],
+        &[],
+    )
+    .await;
+    h.credential_store
+        .insert("acme", "openai-key".into(), "sk-acme-...".into());
+    h.credential_store
+        .insert("globex", "anthropic-key".into(), "sk-ant-globex-...".into());
+    let resp = get_with_bearer(h.addr, "/test/credential_list", "acmetokn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["key"].as_str(), Some("openai-key"));
+    assert!(rows[0]["value"].as_str().unwrap_or("").contains("acme"));
+    // globex must see ONLY its credential — never acme's.
+    let resp = get_with_bearer(h.addr, "/test/credential_list", "globextn-rest").await;
+    let body: Value = resp.json().await.expect("json");
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["key"].as_str(), Some("anthropic-key"));
+}
+
+// ─── PART 8 — surface 8: Qdrant concurrent collection
+//                          creation ───────────────────────────
+//
+// The unit-level coverage already lives in
+// `crates/relix-runtime/src/nodes/memory/qdrant.rs::tests::
+// fix_part4_concurrent_ensure_creates_collection_exactly_once`
+// where 8 concurrent `ensure_collection_in` calls produce
+// exactly one PUT against a mock Qdrant. Lifting that to a
+// bridge-level integration test would require a real (or
+// mocked-over-HTTP) Qdrant server reachable from the
+// responder. The contract under test is the per-collection
+// `tokio::sync::Mutex` inside `QdrantClient`; the
+// integration leg (bridge → mesh → coordinator →
+// memory-node → QdrantClient) adds no new failure mode the
+// unit test doesn't already exercise. This is the surface
+// where the unit test IS the integration test for the
+// concurrency contract.
+//
+// What an integration test WOULD add: proof that the
+// per-call tenant_id reaches `QdrantClient::collection_for_tenant`,
+// which is what PART 4's `resolve_collection_name`
+// fail-closed test already covers. Stacking another full
+// integration boot just to re-verify the contract is
+// duplicative.
