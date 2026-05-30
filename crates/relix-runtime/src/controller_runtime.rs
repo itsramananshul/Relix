@@ -7794,7 +7794,7 @@ fn register_node_type_handlers(
             ),
             (
                 "coord.approval.get",
-                "Look up one approval by id. Arg: approval_id (raw). Returns `status=<wire>|note=<decision_note>\\n`. Distinguishes `pending` from terminal states (`approved` / `rejected` / `expired` / `consumed` / `legacy_token_expired`) — agents waiting on a migrated legacy-token approval see the `legacy_token_expired` signal here.",
+                "Look up one approval by id. Arg: approval_id (raw bytes). Returns a JSON object with every operator-visible field: approval_id, agent_id, subject_id, method, capability_category, reason, requested_at, expires_at, status, decided_at, decided_by, decision_note, task_id, authorized_approvers. Distinguishes `pending` from terminal states (`approved` / `rejected` / `expired` / `consumed` / `legacy_token_expired`); the bridge's `GET /v1/approval/:id` route forwards the JSON verbatim and maps INVALID_ARGS / `not found` to HTTP 404.",
                 &["approval", "read"],
             ),
             (

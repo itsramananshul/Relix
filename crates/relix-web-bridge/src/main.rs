@@ -93,6 +93,8 @@ mod agents_access;
 #[cfg(test)]
 mod alert_dispatch_mini_mesh_test;
 mod approval;
+#[cfg(test)]
+mod approval_get_mini_mesh_test;
 mod audit_tenants;
 mod auth;
 mod belief;
@@ -630,6 +632,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/confidence/reset", post(confidence::reset))
         // RELIX-7.29 PART 1: smart-routing dry-run surface.
         .route("/v1/routing/explain", post(routing::explain))
+        // DEFERRED C: operator-facing read for one approval —
+        // calls `coord.approval.get` and returns the full JSON
+        // row. Distinct from `/v1/approval/:id/delivery`
+        // (which calls the §7.30 delivery store). HTTP 404
+        // when the approval id is unknown.
+        .route("/v1/approval/:id", get(approval::get_approval))
         // RELIX-7.30 PART 1: out-of-band approval delivery status.
         .route("/v1/approval/:id/delivery", get(approval::delivery_status))
         // PART 6: rows the dispatcher failed to deliver — operators

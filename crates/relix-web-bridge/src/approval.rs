@@ -9,6 +9,10 @@
 //! - `POST /v1/approval/:id/decision` →
 //!   `approval.record_decision` (PART 5 — dashboard vote
 //!   buttons + CLI / programmatic clients)
+//! - `GET /v1/approval/:id` → `coord.approval.get`
+//!   (DEFERRED C — agent-side polling + operator-facing CLI
+//!   surface). Returns HTTP 404 when the coordinator-side cap
+//!   responds with INVALID_ARGS / "not found".
 
 use axum::{
     Json,
@@ -191,6 +195,150 @@ pub async fn record_decision(
     match call_peer_json(&state, &peer, "approval.record_decision", &args).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
+    }
+}
+
+/// DEFERRED C — `GET /v1/approval/:id`
+///
+/// Per-approval status read for operator tooling. Calls
+/// `coord.approval.get` on the coordinator peer and returns the
+/// full JSON row on success. The coordinator's INVALID_ARGS
+/// "not found" cause maps to HTTP 404 so CLI / dashboard code
+/// can distinguish "no such approval" from "real error" via
+/// status code alone.
+#[derive(Debug, Deserialize, Default)]
+pub struct GetApprovalQuery {
+    /// Override the responder peer. Defaults to `coordinator`.
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+/// Handler for `GET /v1/approval/:id`.
+pub async fn get_approval(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    Query(q): Query<GetApprovalQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if approval_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "approval_id is required".into(),
+            }),
+        )
+            .into_response();
+    }
+    let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
+    // The coordinator cap takes raw `approval_id` bytes (not
+    // JSON), so we call the binary helper instead of the JSON
+    // helper for this method.
+    match call_peer_raw_to_json(&state, &peer, "coord.approval.get", approval_id.as_bytes()).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// DEFERRED C: variant of [`call_peer_json`] that sends raw
+/// bytes (no JSON encode) and parses a JSON response. Used by
+/// `coord.approval.get` whose wire arg is the raw approval id.
+/// Also maps a coordinator INVALID_ARGS / "not found" cause to
+/// HTTP 404 so CLI clients see distinct status codes for
+/// missing vs malformed inputs.
+async fn call_peer_raw_to_json(
+    state: &AppState,
+    alias: &str,
+    method: &str,
+    arg_bytes: &[u8],
+) -> Result<Value, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let mesh = match state.mesh_client.as_ref() {
+        Some(m) => m,
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError {
+                    error: "bridge mesh client not initialized".into(),
+                }),
+            )
+                .into_response());
+        }
+    };
+    let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 120);
+    let envelope = build_request(
+        method,
+        arg_bytes.to_vec(),
+        state.identity_bundle.clone(),
+        deadline_secs,
+    );
+    let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
+        let msg = e.to_string();
+        let lower = msg.to_ascii_lowercase();
+        let status = if lower.contains("unknown alias") || lower.contains("no peer") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        (status, Json(ApiError { error: msg })).into_response()
+    })?;
+    let resp = decode_response(&resp_bytes).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: format!("decode response: {e}"),
+            }),
+        )
+            .into_response()
+    })?;
+    match resp.res {
+        ResponseResult::Ok(body) => {
+            let text = String::from_utf8(body.to_vec()).map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError {
+                        error: format!("response body utf8: {e}"),
+                    }),
+                )
+                    .into_response()
+            })?;
+            serde_json::from_str::<Value>(&text).map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError {
+                        error: format!("response body not JSON: {e} (body={text:?})"),
+                    }),
+                )
+                    .into_response()
+            })
+        }
+        ResponseResult::Err(env) => {
+            // DEFERRED C: surface the cap's "not found" deny as
+            // an HTTP 404 so the CLI / dashboard can switch on
+            // status code without sniffing the cause text.
+            let status = if env.kind == relix_core::types::error_kinds::INVALID_ARGS {
+                if env.cause.contains("not found") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            Err((
+                status,
+                Json(ApiError {
+                    error: format!("responder err kind={} cause={}", env.kind, env.cause),
+                }),
+            )
+                .into_response())
+        }
+        ResponseResult::StreamHandle(_) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "unexpected stream response from coordinator".into(),
+            }),
+        )
+            .into_response()),
     }
 }
 

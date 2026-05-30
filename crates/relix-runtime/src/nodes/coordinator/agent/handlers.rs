@@ -281,13 +281,36 @@ pub fn handle_approval_pending(store: &AgentStore, ctx: &InvocationCtx) -> Handl
 
 // ── coord.approval.get ───────────────────────────────────
 
-/// DEFERRED 3: per-approval status lookup. Wire arg is the
-/// `approval_id` (raw bytes). Returns
-/// `status=<wire>|note=<sanitized decision_note>` so the
-/// waiting agent can distinguish a `pending` approval from one
-/// that was migrated to `legacy_token_expired` (or otherwise
-/// transitioned to a terminal state). Returns INVALID_ARGS
-/// when the id is empty or unknown.
+/// DEFERRED 3 + DEFERRED C: per-approval status lookup.
+///
+/// Wire arg: raw `approval_id` bytes.
+/// Wire response: JSON object with every operator-visible
+/// field on the approval row. The bridge's
+/// `GET /v1/approval/:id` route forwards the response verbatim;
+/// the CLI prints `status` prominently and the rest as a JSON
+/// dump under `--json`.
+///
+/// Fields:
+///
+/// - `approval_id`, `agent_id`, `subject_id` — caller binding.
+/// - `method`, `capability_category`, `reason` — what was
+///   requested + why.
+/// - `requested_at`, `expires_at`, `decided_at` — lifecycle
+///   timestamps in unix seconds.
+/// - `status` — `pending` / `approved` / `rejected` / `expired`
+///   / `consumed` / `legacy_token_expired`.
+/// - `decided_by`, `decision_note` — operator attribution +
+///   free-form note (sanitised; `decision_note` carries the
+///   migration explanation when status is
+///   `legacy_token_expired`).
+/// - `task_id` — parked task (when present).
+/// - `authorized_approvers` — the per-row allow-list the
+///   `coord.approval.decide` cap enforces.
+///
+/// Returns `INVALID_ARGS` with cause "not found" when the id
+/// is unknown — the bridge route maps that to HTTP 404 so
+/// operator-facing tooling can distinguish missing-id from
+/// real errors.
 pub fn handle_approval_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
     let id = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s.trim(),
@@ -298,9 +321,26 @@ pub fn handle_approval_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOu
     }
     match store.get_approval(id) {
         Ok(Some(r)) => {
-            let note = r.decision_note.as_deref().unwrap_or("");
-            let body = format!("status={}|note={}\n", r.status.as_wire(), sanitize(note),);
-            HandlerOutcome::Ok(body.into_bytes())
+            let body = serde_json::json!({
+                "approval_id": r.approval_id,
+                "agent_id": r.agent_id,
+                "subject_id": r.subject_id,
+                "method": r.method,
+                "capability_category": r.capability_category,
+                "reason": r.reason,
+                "requested_at": r.requested_at,
+                "expires_at": r.expires_at,
+                "status": r.status.as_wire(),
+                "decided_at": r.decided_at,
+                "decided_by": r.decided_by,
+                "decision_note": r.decision_note,
+                "task_id": r.task_id,
+                "authorized_approvers": r.authorized_approvers,
+            });
+            match serde_json::to_vec(&body) {
+                Ok(bytes) => HandlerOutcome::Ok(bytes),
+                Err(e) => internal(format!("coord.approval.get: encode: {e}")),
+            }
         }
         Ok(None) => invalid(format!("coord.approval.get: not found: {id}")),
         Err(e) => internal(format!("coord.approval.get: {e}")),
@@ -1137,33 +1177,59 @@ mod tests {
 
     #[test]
     fn approval_get_returns_pending_status_for_fresh_row() {
+        // DEFERRED C: the wire response is now JSON. Verify the
+        // shape carries every documented field.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9_999_999_999, &[])
+            .create_approval(
+                "a",
+                "subj-1",
+                "tool.web_read",
+                "external_api:read",
+                "",
+                "fetch user",
+                &[],
+                None,
+                9_999_999_999,
+                &["subj-op".into()],
+            )
             .unwrap();
         let body = ok_body(handle_approval_get(&s, &fake_ctx(id.as_bytes())));
-        assert!(body.starts_with("status=pending|"), "got body: {body:?}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["approval_id"], id);
+        assert_eq!(v["agent_id"], "a");
+        assert_eq!(v["subject_id"], "subj-1");
+        assert_eq!(v["method"], "tool.web_read");
+        assert_eq!(v["capability_category"], "external_api:read");
+        assert_eq!(v["reason"], "fetch user");
+        assert!(v["decided_at"].is_null());
+        assert!(v["decided_by"].is_null());
+        assert!(v["decision_note"].is_null());
+        assert!(v["task_id"].is_null());
+        assert_eq!(v["authorized_approvers"], serde_json::json!(["subj-op"]));
     }
 
     #[test]
     fn approval_get_surfaces_legacy_token_expired_for_migrated_row() {
-        // DEFERRED 3: an agent polling `coord.approval.get` on
-        // an approval that the boot migration flipped sees the
-        // `legacy_token_expired` wire string + the decision
-        // note explaining what happened.
+        // DEFERRED 3 + DEFERRED C: an agent polling
+        // `coord.approval.get` on a migrated approval sees the
+        // `legacy_token_expired` status + the explanatory
+        // decision note in the JSON body.
         let s = store();
         s.seed_legacy_token_row_for_test("leg-poll", "pending", "deadbeef")
             .unwrap();
         let n = s.run_legacy_token_migration_for_test().unwrap();
         assert_eq!(n, 1, "the seeded row must be migrated");
         let body = ok_body(handle_approval_get(&s, &fake_ctx(b"leg-poll")));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(v["status"], "legacy_token_expired");
         assert!(
-            body.starts_with("status=legacy_token_expired|"),
-            "agent must see the migration signal, got: {body:?}"
-        );
-        assert!(
-            body.contains("legacy_token_expired:"),
-            "decision note must explain the migration: {body:?}"
+            v["decision_note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("legacy_token_expired:"),
+            "decision note must explain the migration: {v}"
         );
     }
 
