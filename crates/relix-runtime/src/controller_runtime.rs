@@ -2364,6 +2364,19 @@ fn register_agent_capabilities(
         );
     }
     {
+        // DEFERRED 3: per-approval status read so a waiting
+        // agent can distinguish `pending` from
+        // `legacy_token_expired` (or any other terminal state).
+        let s = agent_store.clone();
+        bridge.register(
+            "coord.approval.get",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let s = s.clone();
+                async move { handlers::handle_approval_get(&s, &ctx) }
+            })),
+        );
+    }
+    {
         let s = agent_store.clone();
         let ts_resume = task_store.clone();
         let ts_fail = task_store.clone();
@@ -7550,6 +7563,11 @@ fn register_node_type_handlers(
             (
                 "coord.approval.pending",
                 "List pending approvals (newest first). Arg: limit (default 20).",
+                &["approval", "read"],
+            ),
+            (
+                "coord.approval.get",
+                "Look up one approval by id. Arg: approval_id (raw). Returns `status=<wire>|note=<decision_note>\\n`. Distinguishes `pending` from terminal states (`approved` / `rejected` / `expired` / `consumed` / `legacy_token_expired`) — agents waiting on a migrated legacy-token approval see the `legacy_token_expired` signal here.",
                 &["approval", "read"],
             ),
             (

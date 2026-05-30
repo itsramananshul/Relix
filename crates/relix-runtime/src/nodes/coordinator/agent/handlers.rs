@@ -279,6 +279,34 @@ pub fn handle_approval_pending(store: &AgentStore, ctx: &InvocationCtx) -> Handl
     }
 }
 
+// ── coord.approval.get ───────────────────────────────────
+
+/// DEFERRED 3: per-approval status lookup. Wire arg is the
+/// `approval_id` (raw bytes). Returns
+/// `status=<wire>|note=<sanitized decision_note>` so the
+/// waiting agent can distinguish a `pending` approval from one
+/// that was migrated to `legacy_token_expired` (or otherwise
+/// transitioned to a terminal state). Returns INVALID_ARGS
+/// when the id is empty or unknown.
+pub fn handle_approval_get(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome {
+    let id = match std::str::from_utf8(&ctx.args) {
+        Ok(s) => s.trim(),
+        Err(e) => return invalid(format!("coord.approval.get utf8: {e}")),
+    };
+    if id.is_empty() {
+        return invalid("coord.approval.get: approval_id required".into());
+    }
+    match store.get_approval(id) {
+        Ok(Some(r)) => {
+            let note = r.decision_note.as_deref().unwrap_or("");
+            let body = format!("status={}|note={}\n", r.status.as_wire(), sanitize(note),);
+            HandlerOutcome::Ok(body.into_bytes())
+        }
+        Ok(None) => invalid(format!("coord.approval.get: not found: {id}")),
+        Err(e) => internal(format!("coord.approval.get: {e}")),
+    }
+}
+
 // ── coord.approval.decide ────────────────────────────────
 
 pub type TaskResumeFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -1103,6 +1131,52 @@ mod tests {
         // pass at any time in the window).
         tok.check_not_expired(tok.issued_at_ms + 60_000)
             .expect("3600s token is still valid at issued+60s");
+    }
+
+    // ── DEFERRED 3: legacy-token migration agent-side signal ──
+
+    #[test]
+    fn approval_get_returns_pending_status_for_fresh_row() {
+        let s = store();
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9_999_999_999, &[])
+            .unwrap();
+        let body = ok_body(handle_approval_get(&s, &fake_ctx(id.as_bytes())));
+        assert!(body.starts_with("status=pending|"), "got body: {body:?}");
+    }
+
+    #[test]
+    fn approval_get_surfaces_legacy_token_expired_for_migrated_row() {
+        // DEFERRED 3: an agent polling `coord.approval.get` on
+        // an approval that the boot migration flipped sees the
+        // `legacy_token_expired` wire string + the decision
+        // note explaining what happened.
+        let s = store();
+        s.seed_legacy_token_row_for_test("leg-poll", "pending", "deadbeef")
+            .unwrap();
+        let n = s.run_legacy_token_migration_for_test().unwrap();
+        assert_eq!(n, 1, "the seeded row must be migrated");
+        let body = ok_body(handle_approval_get(&s, &fake_ctx(b"leg-poll")));
+        assert!(
+            body.starts_with("status=legacy_token_expired|"),
+            "agent must see the migration signal, got: {body:?}"
+        );
+        assert!(
+            body.contains("legacy_token_expired:"),
+            "decision note must explain the migration: {body:?}"
+        );
+    }
+
+    #[test]
+    fn approval_get_returns_invalid_args_for_unknown_id() {
+        let s = store();
+        match handle_approval_get(&s, &fake_ctx(b"nope")) {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, error_kinds::INVALID_ARGS);
+                assert!(env.cause.contains("not found"));
+            }
+            HandlerOutcome::Ok(_) => panic!("expected INVALID_ARGS"),
+        }
     }
 
     // ── DEFERRED 2: authorised-approver check on coord.approval.decide ──

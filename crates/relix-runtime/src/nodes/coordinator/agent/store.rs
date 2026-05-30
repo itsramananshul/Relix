@@ -133,6 +133,14 @@ pub enum ApprovalStatus {
     /// Distinct from `Approved` so a replay can't reuse the
     /// same approval record.
     Consumed,
+    /// DEFERRED 3: terminal status used by the boot-time
+    /// migration in [`AgentStore::migrate_legacy_opaque_tokens`].
+    /// A pre-SEC-PART-A approval that carried a random opaque
+    /// `approval_token` is flipped here at startup because the
+    /// new admission gate cannot verify the legacy token format.
+    /// The waiting agent receives a clear "retry" error on its
+    /// next `coord.approval.poll` call.
+    LegacyTokenExpired,
 }
 
 impl ApprovalStatus {
@@ -143,6 +151,7 @@ impl ApprovalStatus {
             ApprovalStatus::Rejected => "rejected",
             ApprovalStatus::Expired => "expired",
             ApprovalStatus::Consumed => "consumed",
+            ApprovalStatus::LegacyTokenExpired => "legacy_token_expired",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -152,6 +161,7 @@ impl ApprovalStatus {
             "rejected" => Some(Self::Rejected),
             "expired" => Some(Self::Expired),
             "consumed" => Some(Self::Consumed),
+            "legacy_token_expired" => Some(Self::LegacyTokenExpired),
             _ => None,
         }
     }
@@ -251,9 +261,59 @@ impl AgentStore {
         crate::db::log_integrity_warning(&conn, "agent_store");
         crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
+        // DEFERRED 3: flip pre-SEC-PART-A opaque-token rows
+        // before the cap surface is wired so the agent's next
+        // poll sees the terminal state immediately.
+        let migrated = migrate_legacy_opaque_tokens(&conn)?;
+        if migrated > 0 {
+            tracing::warn!(
+                count = migrated,
+                "approval: found {migrated} pending approvals with legacy \
+                 opaque tokens; flipped to `legacy_token_expired`. Agents \
+                 waiting on them will need to retry to mint a fresh \
+                 structured token."
+            );
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// DEFERRED 3 test-only helper. Inserts a legacy-shaped row
+    /// (status=pending|approved + non-NULL opaque
+    /// `approval_token`) so test code can exercise the
+    /// migration path without bypassing the public API. Hidden
+    /// behind `#[cfg(test)]` so it can never accidentally
+    /// re-introduce the legacy write path into production.
+    #[cfg(test)]
+    pub(crate) fn seed_legacy_token_row_for_test(
+        &self,
+        approval_id: &str,
+        status: &str,
+        token: &str,
+    ) -> Result<(), AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO approval_requests (
+                 approval_id, agent_id, subject_id, method, capability_category,
+                 args_redacted_hash, reason, approver_groups,
+                 requested_at, expires_at, status, task_id, approval_token,
+                 authorized_approvers
+             ) VALUES (?1, 'a', 's', 'm', 'c', '', '', '[]',
+                       0, 9999999999, ?2, NULL, ?3, '[]')",
+            params![approval_id, status, token],
+        )?;
+        Ok(())
+    }
+
+    /// DEFERRED 3 test-only helper. Re-runs the legacy-token
+    /// migration on the underlying connection. Used by the cap
+    /// handler tests to seed a row + migrate + observe the
+    /// agent-visible signal without exposing the raw connection.
+    #[cfg(test)]
+    pub(crate) fn run_legacy_token_migration_for_test(&self) -> Result<usize, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        migrate_legacy_opaque_tokens(&conn).map_err(AgentStoreError::Db)
     }
 
     pub fn in_memory() -> Result<Self, AgentStoreError> {
@@ -261,6 +321,11 @@ impl AgentStore {
         crate::db::apply_pragmas(&conn)?;
         crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
+        // DEFERRED 3: in-memory stores start fresh, so the
+        // migration is a no-op — but we run it anyway so tests
+        // that seed legacy rows manually then re-open the
+        // store see consistent behaviour with the on-disk path.
+        let _ = migrate_legacy_opaque_tokens(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -978,6 +1043,44 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// DEFERRED 3: flip every pre-SEC-PART-A approval row whose
+/// `approval_token` column is non-NULL AND whose status is
+/// still in a state that an agent could be polling for
+/// (`pending` or `approved`) to the new
+/// `legacy_token_expired` terminal status.
+///
+/// The pre-SEC-PART-A `decide_approval` minted a random opaque
+/// string into `approval_token`. The new admission gate
+/// requires the structured + HMAC-signed
+/// [`crate::approval::ApprovalToken`] wire format; an opaque
+/// random string fails parse with `MalformedEncoding`. Without
+/// this migration the agent's next admission attempt would
+/// fail with a confusing decode error; with the migration the
+/// operator-side cap layer can return a clear
+/// `legacy_token_expired` signal AND a `decision_note` that
+/// tells the operator what happened.
+///
+/// Returns the number of rows flipped. Idempotent — re-runs
+/// match no rows because the only states the SQL targets are
+/// `pending` / `approved`, and the migration moves rows out of
+/// both.
+pub(crate) fn migrate_legacy_opaque_tokens(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let now = unix_now();
+    let changed = conn.execute(
+        "UPDATE approval_requests
+         SET status = 'legacy_token_expired',
+             decided_at = ?1,
+             decision_note = 'legacy_token_expired: opaque approval_token \
+                              from a pre-SEC-PART-A deployment cannot be \
+                              verified by the new HMAC-signed token gate. \
+                              Retry to mint a fresh structured token.'
+         WHERE approval_token IS NOT NULL
+           AND status IN ('pending', 'approved')",
+        params![now],
+    )?;
+    Ok(changed)
+}
+
 /// Add `column` (with `column_decl`) to `table` if it does not
 /// already exist. Idempotent. Lives in this module because
 /// agent_store is the only consumer; the §7.30
@@ -1416,6 +1519,129 @@ mod tests {
         assert_eq!(
             s.get_approval(&id).unwrap().unwrap().status,
             ApprovalStatus::Expired
+        );
+    }
+
+    // ── DEFERRED 3: legacy opaque-token migration ────────
+
+    #[test]
+    fn migration_flips_pending_row_with_legacy_token() {
+        let s = store();
+        s.seed_legacy_token_row_for_test("leg-1", "pending", "deadbeefcafef00d")
+            .unwrap();
+        // open() already ran the migration on the empty store;
+        // re-run via the public test helper now that the row
+        // exists.
+        let n = s.run_legacy_token_migration_for_test().unwrap();
+        assert_eq!(n, 1, "exactly one pending+token row migrated");
+        let r = s.get_approval("leg-1").unwrap().unwrap();
+        assert_eq!(r.status, ApprovalStatus::LegacyTokenExpired);
+        assert!(
+            r.decision_note
+                .as_deref()
+                .unwrap_or("")
+                .contains("legacy_token_expired"),
+            "decision_note must name the failure mode: {:?}",
+            r.decision_note
+        );
+    }
+
+    #[test]
+    fn migration_flips_approved_row_with_legacy_token() {
+        // The common case: pre-PART-A `decide_approval` left the
+        // row in `approved` status with a random token. After
+        // upgrade the agent's wire token will never verify; the
+        // migration flips the row so the agent sees a clear
+        // signal next time.
+        let s = store();
+        s.seed_legacy_token_row_for_test("leg-2", "approved", "0a1b2c3d4e5f6789")
+            .unwrap();
+        let n = s.run_legacy_token_migration_for_test().unwrap();
+        assert_eq!(n, 1);
+        let r = s.get_approval("leg-2").unwrap().unwrap();
+        assert_eq!(r.status, ApprovalStatus::LegacyTokenExpired);
+    }
+
+    #[test]
+    fn migration_leaves_structured_token_rows_alone_when_token_is_null() {
+        // SEC-PART-A-vintage rows have approval_token = NULL
+        // (structured tokens live only on the wire). The
+        // migration must NOT touch them.
+        let s = store();
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9_999_999_999, &[])
+            .unwrap();
+        let n = s.run_legacy_token_migration_for_test().unwrap();
+        assert_eq!(n, 0, "no rows touched: pending row has no token");
+        let r = s.get_approval(&id).unwrap().unwrap();
+        assert_eq!(r.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn migration_is_idempotent_under_repeat_run() {
+        let s = store();
+        s.seed_legacy_token_row_for_test("leg-3", "pending", "ffeeddcc")
+            .unwrap();
+        s.seed_legacy_token_row_for_test("leg-4", "approved", "aabbccdd")
+            .unwrap();
+        let first = s.run_legacy_token_migration_for_test().unwrap();
+        let second = s.run_legacy_token_migration_for_test().unwrap();
+        let third = s.run_legacy_token_migration_for_test().unwrap();
+        assert_eq!(first, 2, "first run flips both rows");
+        assert_eq!(second, 0, "second run finds nothing");
+        assert_eq!(third, 0, "third run finds nothing");
+    }
+
+    #[test]
+    fn migration_does_not_touch_rejected_or_consumed_rows() {
+        // `rejected` / `expired` / `consumed` / `legacy_token_expired`
+        // are all terminal. Even a row with a stale token in those
+        // states stays put — the operator's record of the past
+        // decision must not be rewritten.
+        let s = store();
+        s.seed_legacy_token_row_for_test("leg-rej", "rejected", "abc")
+            .unwrap();
+        s.seed_legacy_token_row_for_test("leg-cons", "consumed", "def")
+            .unwrap();
+        s.seed_legacy_token_row_for_test("leg-exp", "expired", "ghi")
+            .unwrap();
+        let n = s.run_legacy_token_migration_for_test().unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            s.get_approval("leg-rej").unwrap().unwrap().status,
+            ApprovalStatus::Rejected
+        );
+        assert_eq!(
+            s.get_approval("leg-cons").unwrap().unwrap().status,
+            ApprovalStatus::Consumed
+        );
+        assert_eq!(
+            s.get_approval("leg-exp").unwrap().unwrap().status,
+            ApprovalStatus::Expired
+        );
+    }
+
+    #[test]
+    fn approval_status_parse_round_trips_legacy_token_expired() {
+        // Status enum invariants — `as_wire` must produce a
+        // string `parse` re-accepts, both for the new
+        // variant + every existing one. Locks the round-trip
+        // contract.
+        for s in [
+            ApprovalStatus::Pending,
+            ApprovalStatus::Approved,
+            ApprovalStatus::Rejected,
+            ApprovalStatus::Expired,
+            ApprovalStatus::Consumed,
+            ApprovalStatus::LegacyTokenExpired,
+        ] {
+            let wire = s.as_wire();
+            let back = ApprovalStatus::parse(wire).expect("round-trip");
+            assert_eq!(back, s, "wire = {wire:?}");
+        }
+        assert_eq!(
+            ApprovalStatus::LegacyTokenExpired.as_wire(),
+            "legacy_token_expired"
         );
     }
 
