@@ -177,12 +177,28 @@ pub struct ApprovalSendArgs {
     /// `Reply-To:` header). Other channels ignore.
     #[serde(default)]
     pub target_extra: String,
+    /// DEFERRED 2: explicit authorised-approver allow-list
+    /// (subject id hex). Carried across the channel-node hop
+    /// so the rich rendering layer can show the operator-facing
+    /// card "approvers: X, Y" AND the lift back to an
+    /// [`ApprovalRequest`] preserves the security boundary
+    /// downstream caps depend on. Empty ⇒ role-based fallback
+    /// (only `operator` / `admin` roles may decide).
+    #[serde(default)]
+    pub authorized_approvers: Vec<String>,
 }
 
 impl ApprovalSendArgs {
     /// Lift the deserialised args back into an [`ApprovalRequest`]
     /// — exposed for the channel-node cap handlers so the
     /// wire-shape contract has one source of truth.
+    ///
+    /// DEFERRED 2: `authorized_approvers` is preserved through
+    /// the lift. Previously this field was zeroed out at the
+    /// channel-node boundary, which would silently degrade
+    /// "only ops can decide" to "anyone in operator role can
+    /// decide" if a future feature ever consulted the field on
+    /// the channel side.
     pub fn to_request(&self) -> ApprovalRequest {
         ApprovalRequest {
             approval_id: self.approval_id.clone(),
@@ -190,12 +206,7 @@ impl ApprovalSendArgs {
             capability: self.capability.clone(),
             request_summary: self.request_summary.clone(),
             session_id: self.session_id.clone(),
-            // SEC PART B: the channel-node cap never decides
-            // approvals; the authorised approver list lives on
-            // the coordinator's persisted row. Leaving this
-            // empty here just keeps the lifted ApprovalRequest
-            // shape-compatible.
-            authorized_approvers: Vec::new(),
+            authorized_approvers: self.authorized_approvers.clone(),
         }
     }
 }
@@ -235,6 +246,9 @@ impl SingleChannelDispatch for MeshSingleChannelDispatch {
             is_escalation,
             target_id: self.target_id.clone(),
             target_extra: self.target_extra.clone(),
+            // DEFERRED 2: forward the authorised-approver
+            // allow-list across the channel-node boundary.
+            authorized_approvers: request.authorized_approvers.clone(),
         };
         let arg_bytes = serde_json::to_vec(&args).map_err(|e| {
             ChannelDispatchError::Other(format!("approval mesh dispatch: encode args: {e}"))
@@ -400,6 +414,7 @@ mod tests {
             is_escalation: true,
             target_id: "C0".into(),
             target_extra: "x".into(),
+            authorized_approvers: vec!["subj-A".into(), "subj-B".into()],
         };
         let r = a.to_request();
         assert_eq!(r.approval_id, "id");
@@ -407,6 +422,12 @@ mod tests {
         assert_eq!(r.capability, "cap");
         assert_eq!(r.request_summary, "summary");
         assert_eq!(r.session_id, "sess");
+        // DEFERRED 2: lifted ApprovalRequest carries the
+        // approver list (was Vec::new() before the fix).
+        assert_eq!(
+            r.authorized_approvers,
+            vec!["subj-A".to_string(), "subj-B".to_string()]
+        );
     }
 
     #[test]
@@ -420,11 +441,16 @@ mod tests {
             is_escalation: false,
             target_id: "C0".into(),
             target_extra: String::new(),
+            authorized_approvers: Vec::new(),
         };
         let bytes = serde_json::to_vec(&a).unwrap();
         let back: ApprovalSendArgs = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.approval_id, a.approval_id);
         assert_eq!(back.is_escalation, a.is_escalation);
+        // DEFERRED 2: empty allow-list round-trips cleanly via
+        // serde-default so older callers that don't set the
+        // field continue to deserialise.
+        assert!(back.authorized_approvers.is_empty());
     }
 
     #[tokio::test]

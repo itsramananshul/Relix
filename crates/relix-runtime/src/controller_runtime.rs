@@ -2484,6 +2484,13 @@ fn register_agent_capabilities(
                     &req.approver_groups,
                     task_id,
                     expires_at,
+                    // DEFERRED 2: the gate already read the
+                    // operator-allow-list out of the agent
+                    // profile (`GateApprovalRequest::authorized_approvers`);
+                    // stamp it onto the row so
+                    // `coord.approval.decide` can enforce the
+                    // check against the caller's subject id.
+                    &req.authorized_approvers,
                 )
                 .map_err(|e| e.to_string())?;
             // When the caller threaded a task_id through the

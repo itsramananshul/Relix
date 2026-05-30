@@ -45,6 +45,13 @@ pub struct AgentProfile {
     /// call is admitted. Defaults to the six categories
     /// listed in `default_approval_categories`.
     pub approval_required_categories: Vec<String>,
+    /// DEFERRED 2: explicit allow-list of operator subject ids
+    /// (hex [`relix_core::types::NodeId`] strings) authorised
+    /// to record decisions on approvals minted for this agent.
+    /// Empty ⇒ role-based fallback (only `operator` / `admin`
+    /// roles may decide); defends against agent-self-approval
+    /// for channel-originated approvals.
+    pub authorized_approvers: Vec<String>,
     pub approval_timeout_secs: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -79,6 +86,11 @@ pub struct AgentGateView {
     pub allow_sensitivity_tags: Vec<String>,
     pub deny_sensitivity_tags: Vec<String>,
     pub approval_required_categories: Vec<String>,
+    /// DEFERRED 2: mirror of [`AgentProfile::authorized_approvers`]
+    /// — surfaced on the gate view so the bridge's
+    /// `RequireApproval` flow can stamp the list on the new
+    /// approval row without a second profile lookup.
+    pub authorized_approvers: Vec<String>,
     pub approval_timeout_secs: i64,
 }
 
@@ -95,6 +107,7 @@ impl From<&AgentProfile> for AgentGateView {
             allow_sensitivity_tags: p.allow_sensitivity_tags.clone(),
             deny_sensitivity_tags: p.deny_sensitivity_tags.clone(),
             approval_required_categories: p.approval_required_categories.clone(),
+            authorized_approvers: p.authorized_approvers.clone(),
             approval_timeout_secs: p.approval_timeout_secs,
         }
     }
@@ -186,6 +199,12 @@ pub struct ApprovalRecord {
     pub decision_note: Option<String>,
     pub task_id: Option<String>,
     pub approval_token: Option<String>,
+    /// DEFERRED 2: subject-id allow-list of operators
+    /// authorised to record a decision on this row. Stamped
+    /// from the agent profile at `create_approval` time. Empty
+    /// ⇒ `coord.approval.decide` falls back to the OPERATOR
+    /// role check.
+    pub authorized_approvers: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,10 +311,11 @@ impl AgentStore {
                  created_by, status, subject_id, surface_allowlist,
                  risk_ceiling, allow_categories, deny_categories,
                  allow_sensitivity_tags, deny_sensitivity_tags,
-                 approval_required_categories, approval_timeout_secs,
+                 approval_required_categories, authorized_approvers,
+                 approval_timeout_secs,
                  created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, '[]',
-                       ?9, '[]', '[]', '[]', '[]', ?10, 86400, ?11, ?11)",
+                       ?9, '[]', '[]', '[]', '[]', ?10, '[]', 86400, ?11, ?11)",
             params![
                 agent_id,
                 name,
@@ -334,7 +354,8 @@ impl AgentStore {
                         created_by, status, subject_id, surface_allowlist,
                         risk_ceiling, allow_categories, deny_categories,
                         allow_sensitivity_tags, deny_sensitivity_tags,
-                        approval_required_categories, approval_timeout_secs,
+                        approval_required_categories, authorized_approvers,
+                        approval_timeout_secs,
                         created_at, updated_at
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
@@ -442,7 +463,8 @@ impl AgentStore {
             | "deny_categories"
             | "allow_sensitivity_tags"
             | "deny_sensitivity_tags"
-            | "approval_required_categories" => {
+            | "approval_required_categories"
+            | "authorized_approvers" => {
                 // Accept either a JSON array or a comma-separated
                 // list; normalise to JSON for storage.
                 let json = normalise_string_list(value)
@@ -486,18 +508,25 @@ impl AgentStore {
         approver_groups: &[String],
         task_id: Option<&str>,
         expires_at: i64,
+        // DEFERRED 2: stamp the operator-allow-list onto the
+        // row at create time. Sourced by the bridge from
+        // `AgentProfile::authorized_approvers`. Empty ⇒
+        // `coord.approval.decide` falls back to the role check.
+        authorized_approvers: &[String],
     ) -> Result<String, AgentStoreError> {
         let now = unix_now();
         let approval_id = new_approval_id();
         let groups_json = serde_json::to_string(approver_groups)
+            .map_err(|e| AgentStoreError::Json(e.to_string()))?;
+        let approvers_json = serde_json::to_string(authorized_approvers)
             .map_err(|e| AgentStoreError::Json(e.to_string()))?;
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
         conn.execute(
             "INSERT INTO approval_requests (
                  approval_id, agent_id, subject_id, method, capability_category,
                  args_redacted_hash, reason, approver_groups,
-                 requested_at, expires_at, status, task_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
+                 requested_at, expires_at, status, task_id, authorized_approvers
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
             params![
                 approval_id,
                 agent_id,
@@ -510,6 +539,7 @@ impl AgentStore {
                 now,
                 expires_at,
                 task_id,
+                approvers_json,
             ],
         )?;
         Ok(approval_id)
@@ -685,7 +715,7 @@ impl AgentStore {
                     args_redacted_hash, reason, approver_groups,
                     requested_at, expires_at, status,
                     decided_at, decided_by, decision_note,
-                    task_id, approval_token
+                    task_id, approval_token, authorized_approvers
              FROM approval_requests
              WHERE status = 'pending'
              ORDER BY requested_at ASC
@@ -834,7 +864,8 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         created_by, status, subject_id, surface_allowlist,
         risk_ceiling, allow_categories, deny_categories,
         allow_sensitivity_tags, deny_sensitivity_tags,
-        approval_required_categories, approval_timeout_secs,
+        approval_required_categories, authorized_approvers,
+        approval_timeout_secs,
         created_at, updated_at
  FROM agent_profiles WHERE agent_id = ?1";
 
@@ -843,7 +874,7 @@ const SELECT_APPROVAL: &str =
         args_redacted_hash, reason, approver_groups,
         requested_at, expires_at, status,
         decided_at, decided_by, decision_note,
-        task_id, approval_token
+        task_id, approval_token, authorized_approvers
  FROM approval_requests WHERE approval_id = ?1";
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -865,6 +896,7 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              allow_sensitivity_tags TEXT NOT NULL DEFAULT '[]',
              deny_sensitivity_tags  TEXT NOT NULL DEFAULT '[]',
              approval_required_categories TEXT NOT NULL DEFAULT '[]',
+             authorized_approvers TEXT NOT NULL DEFAULT '[]',
              approval_timeout_secs INTEGER NOT NULL DEFAULT 86400,
              created_at      INTEGER NOT NULL,
              updated_at      INTEGER NOT NULL
@@ -888,7 +920,8 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              decided_by      TEXT,
              decision_note   TEXT,
              task_id         TEXT,
-             approval_token  TEXT UNIQUE
+             approval_token  TEXT UNIQUE,
+             authorized_approvers TEXT NOT NULL DEFAULT '[]'
          );
          CREATE INDEX IF NOT EXISTS approval_requests_pending
              ON approval_requests(status, expires_at);
@@ -921,7 +954,54 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          );
          CREATE INDEX IF NOT EXISTS approval_token_blocklist_approval
              ON approval_token_blocklist(approval_id);",
-    )
+    )?;
+    // DEFERRED 2: agent_profiles + approval_requests both gain
+    // `authorized_approvers TEXT NOT NULL DEFAULT '[]'`. The
+    // CREATE TABLE clauses above are no-ops on existing
+    // databases — we have to ALTER the table in that case. The
+    // helper is idempotent: it inspects `PRAGMA table_info` and
+    // skips when the column already exists. The column is the
+    // only DEFERRED 2-introduced piece operators can have on
+    // disk before the upgrade.
+    ensure_column(
+        conn,
+        "agent_profiles",
+        "authorized_approvers",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "approval_requests",
+        "authorized_approvers",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    Ok(())
+}
+
+/// Add `column` (with `column_decl`) to `table` if it does not
+/// already exist. Idempotent. Lives in this module because
+/// agent_store is the only consumer; the §7.30
+/// `ApprovalRequestStore` has its own private copy.
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_decl: &str,
+) -> Result<(), rusqlite::Error> {
+    let sql_check = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql_check)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    let sql_alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_decl}");
+    conn.execute(&sql_alter, [])?;
+    Ok(())
 }
 
 fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
@@ -931,6 +1011,7 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
     let allow_sensitivity_tags: String = r.get(13)?;
     let deny_sensitivity_tags: String = r.get(14)?;
     let approval_required_categories: String = r.get(15)?;
+    let authorized_approvers: String = r.get(16)?;
     Ok(AgentProfile {
         agent_id: r.get(0)?,
         name: r.get(1)?,
@@ -948,9 +1029,10 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         allow_sensitivity_tags: parse_json_list(&allow_sensitivity_tags),
         deny_sensitivity_tags: parse_json_list(&deny_sensitivity_tags),
         approval_required_categories: parse_json_list(&approval_required_categories),
-        approval_timeout_secs: r.get(16)?,
-        created_at: r.get(17)?,
-        updated_at: r.get(18)?,
+        authorized_approvers: parse_json_list(&authorized_approvers),
+        approval_timeout_secs: r.get(17)?,
+        created_at: r.get(18)?,
+        updated_at: r.get(19)?,
     })
 }
 
@@ -958,6 +1040,7 @@ fn row_to_approval(r: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
     let groups_json: String = r.get(7)?;
     let status_str: String = r.get(10)?;
     let status = ApprovalStatus::parse(&status_str).unwrap_or(ApprovalStatus::Pending);
+    let authorized_approvers_json: String = r.get(16)?;
     Ok(ApprovalRecord {
         approval_id: r.get(0)?,
         agent_id: r.get(1)?,
@@ -975,6 +1058,7 @@ fn row_to_approval(r: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
         decision_note: r.get(13)?,
         task_id: r.get(14)?,
         approval_token: r.get(15)?,
+        authorized_approvers: parse_json_list(&authorized_approvers_json),
     })
 }
 
@@ -1194,6 +1278,7 @@ mod tests {
                 &["ops".into(), "admin".into()],
                 Some("task-1"),
                 unix_now() + 86400,
+                &[],
             )
             .unwrap();
         let r = s.get_approval(&id).unwrap().unwrap();
@@ -1222,6 +1307,7 @@ mod tests {
                 &[],
                 Some("task-7"),
                 unix_now() + 60,
+                &[],
             )
             .unwrap();
         let meta = s
@@ -1266,7 +1352,7 @@ mod tests {
     fn decide_rejected_returns_no_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
             .unwrap();
         let meta = s
             .decide_approval(&id, ApprovalStatus::Rejected, "alice", "nope")
@@ -1282,7 +1368,7 @@ mod tests {
     fn decide_refuses_terminal_approval() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
             .unwrap();
         s.decide_approval(&id, ApprovalStatus::Approved, "alice", "")
             .unwrap();
@@ -1297,10 +1383,10 @@ mod tests {
     fn list_pending_returns_only_pending_oldest_first() {
         let s = store();
         let _a = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
             .unwrap();
         let b = s
-            .create_approval("b", "s", "m", "c", "", "", &[], None, unix_now() + 60)
+            .create_approval("b", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
             .unwrap();
         // Decide b → not pending.
         s.decide_approval(&b, ApprovalStatus::Approved, "alice", "")
@@ -1313,7 +1399,7 @@ mod tests {
     fn list_expired_pending_returns_past_deadlines() {
         let s = store();
         let _id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 100)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 100, &[])
             .unwrap();
         // expires_at = 100; query with now = 1000.
         let v = s.list_expired_pending(1000).unwrap();
@@ -1324,7 +1410,7 @@ mod tests {
     fn mark_expired_flips_status() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 100)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 100, &[])
             .unwrap();
         s.mark_expired(&id).unwrap();
         assert_eq!(

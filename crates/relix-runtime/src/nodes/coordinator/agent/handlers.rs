@@ -283,6 +283,14 @@ pub fn handle_approval_pending(store: &AgentStore, ctx: &InvocationCtx) -> Handl
 
 pub type TaskResumeFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// DEFERRED 2: roles that may decide ANY approval, regardless
+/// of the per-row `authorized_approvers` allow-list. Stable
+/// strings matched against `VerifiedIdentity.role` — kept in
+/// lock-step with the matching constant in
+/// `crate::approval::caps` so both decision surfaces share one
+/// definition of "operator".
+pub(crate) const OPERATOR_ROLES: &[&str] = &["operator", "admin"];
+
 /// Default lifetime in seconds for a freshly-minted
 /// [`crate::approval::ApprovalToken`]. Used as the fallback
 /// when the operator did not configure
@@ -382,6 +390,33 @@ pub fn handle_approval_decide(
         Ok(None) => return invalid(format!("coord.approval.decide: not found: {approval_id}")),
         Err(e) => return internal(format!("coord.approval.decide: {e}")),
     };
+    // DEFERRED 2: authorised-approver check. The cap admits the
+    // caller iff:
+    //   1. the caller's verified subject_id is in
+    //      `record.authorized_approvers`, OR
+    //   2. the caller's verified role is in OPERATOR_ROLES
+    //      (operator / admin).
+    // Wire-typed `decided_by` is the operator's typed-by-hand
+    // display name; admission is keyed off the cryptographically
+    // verified `ctx.caller` instead.
+    let caller_subject = ctx.caller.subject_id.to_string();
+    let caller_role = ctx.caller.role.as_str();
+    let role_admits = OPERATOR_ROLES.contains(&caller_role);
+    let listed = record
+        .authorized_approvers
+        .iter()
+        .any(|s| s == &caller_subject);
+    if !role_admits && !listed {
+        return HandlerOutcome::Err(ErrorEnvelope {
+            kind: error_kinds::SECURITY_DENIED,
+            cause: format!(
+                "coord.approval.decide: caller `{caller_subject}` is not an \
+                 authorised approver for `{approval_id}` (role={caller_role})"
+            ),
+            retry_hint: 0,
+            retry_after: None,
+        });
+    }
     let task_id = record.task_id.clone();
     let metadata = match store.decide_approval(approval_id, decision, decided_by, note) {
         Ok(t) => t,
@@ -571,16 +606,27 @@ pub fn default_approval_required_categories() -> Vec<String> {
 
 #[cfg(test)]
 pub(crate) fn fake_ctx(args: &[u8]) -> InvocationCtx {
+    fake_ctx_with_role(args, "operator", b"caller")
+}
+
+/// DEFERRED 2: parameterised test-context builder. `fake_ctx`
+/// keeps the default `operator` role so the existing handler
+/// tests pass the new SEC PART B authorised-approver check at
+/// `coord.approval.decide`; deny-path tests use this helper
+/// directly with role = `"agent"` (or another non-operator
+/// role).
+#[cfg(test)]
+pub(crate) fn fake_ctx_with_role(args: &[u8], role: &str, subject_seed: &[u8]) -> InvocationCtx {
     use relix_core::identity::VerifiedIdentity;
     use relix_core::types::{NodeId, RequestId, TraceId};
     InvocationCtx {
         caller: VerifiedIdentity {
-            subject_id: NodeId::from_pubkey(b"caller"),
+            subject_id: NodeId::from_pubkey(subject_seed),
             name: "alice".into(),
             org_id: NodeId::from_pubkey(b"org"),
             groups: vec![],
-            role: "".into(),
-            clearance: "".into(),
+            role: role.into(),
+            clearance: String::new(),
             bundle_id: [0; 32],
         },
         trace_id: TraceId::new(),
@@ -753,9 +799,9 @@ mod tests {
     #[test]
     fn approval_pending_returns_correct_row_count() {
         let s = store();
-        s.create_approval("a", "s", "m", "c", "", "r1", &[], None, 9999999999)
+        s.create_approval("a", "s", "m", "c", "", "r1", &[], None, 9999999999, &[])
             .unwrap();
-        s.create_approval("a", "s", "m", "c", "", "r2", &[], None, 9999999999)
+        s.create_approval("a", "s", "m", "c", "", "r2", &[], None, 9999999999, &[])
             .unwrap();
         let body = ok_body(handle_approval_pending(&s, &fake_ctx(b"")));
         assert!(body.contains("count=2"));
@@ -769,7 +815,7 @@ mod tests {
     fn approval_decide_approves_and_mints_structured_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -801,7 +847,7 @@ mod tests {
         // controller boot log warning.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -821,7 +867,7 @@ mod tests {
     fn approval_decide_rejects_returns_ok_without_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -844,7 +890,18 @@ mod tests {
         let s = store();
         // Approval stamped with task_id = "task-42".
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], Some("task-42"), 9999999999)
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                Some("task-42"),
+                9999999999,
+                &[],
+            )
             .unwrap();
         let resumed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
@@ -875,7 +932,18 @@ mod tests {
     fn approval_decide_invokes_fail_closure_for_reject_with_stored_task_id() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], Some("task-99"), 9999999999)
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                Some("task-99"),
+                9999999999,
+                &[],
+            )
             .unwrap();
         let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -904,7 +972,7 @@ mod tests {
         // resume / fail closures are never called.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
             .unwrap();
         let count: Arc<std::sync::atomic::AtomicUsize> =
             Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -983,7 +1051,7 @@ mod tests {
     fn approval_decide_with_60s_ttl_mints_token_with_60s_expiry() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1013,7 +1081,7 @@ mod tests {
     fn approval_decide_with_3600s_ttl_mints_long_lived_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1035,6 +1103,150 @@ mod tests {
         // pass at any time in the window).
         tok.check_not_expired(tok.issued_at_ms + 60_000)
             .expect("3600s token is still valid at issued+60s");
+    }
+
+    // ── DEFERRED 2: authorised-approver check on coord.approval.decide ──
+
+    #[test]
+    fn approval_decide_denies_non_operator_when_not_in_authorized_approvers() {
+        // SEC PART B / DEFERRED 2: an `agent`-role caller that
+        // is NOT in the row's `authorized_approvers` cannot
+        // decide. Mirrors the §7.30 `handle_record_decision`
+        // contract for the AgentStore-backed path.
+        let s = store();
+        let approver_subject = relix_core::types::NodeId::from_pubkey(b"operator-bob").to_string();
+        let id = s
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9_999_999_999,
+                std::slice::from_ref(&approver_subject),
+            )
+            .unwrap();
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{id}|approved|alice|");
+        let ctx = fake_ctx_with_role(arg.as_bytes(), "agent", b"random-agent");
+        let out = handle_approval_decide(
+            &s,
+            &ctx,
+            &resume,
+            &fail,
+            &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+        );
+        match out {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::SECURITY_DENIED);
+                assert!(
+                    env.cause.contains("not an authorised approver"),
+                    "got cause: {}",
+                    env.cause
+                );
+            }
+            HandlerOutcome::Ok(_) => panic!("unauthorised approval must NOT admit"),
+        }
+        // Row stays pending.
+        let r = s.get_approval(&id).unwrap().unwrap();
+        assert_eq!(r.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn approval_decide_admits_listed_subject_with_non_operator_role() {
+        // Subject is in `authorized_approvers` → admission
+        // succeeds even when role is just `agent`.
+        let s = store();
+        let approver_subject = relix_core::types::NodeId::from_pubkey(b"operator-bob").to_string();
+        let id = s
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9_999_999_999,
+                &[approver_subject],
+            )
+            .unwrap();
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{id}|approved|alice|");
+        let ctx = fake_ctx_with_role(arg.as_bytes(), "agent", b"operator-bob");
+        let out = handle_approval_decide(
+            &s,
+            &ctx,
+            &resume,
+            &fail,
+            &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+        );
+        assert!(matches!(out, HandlerOutcome::Ok(_)));
+        let r = s.get_approval(&id).unwrap().unwrap();
+        assert_eq!(r.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn approval_decide_admits_operator_role_when_allow_list_empty() {
+        // Empty allow-list ⇒ role-based fallback (operator /
+        // admin only). This is the "no policy defines
+        // authorized_approvers" default the user specified.
+        let s = store();
+        let id = s
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9_999_999_999,
+                // Empty allow-list explicitly.
+                &[],
+            )
+            .unwrap();
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{id}|approved|alice|");
+        // Non-operator → denied even though the allow-list is
+        // empty, proving the empty-list ≠ open-to-everyone
+        // invariant.
+        let ctx_agent = fake_ctx_with_role(arg.as_bytes(), "agent", b"random-agent");
+        let out_deny = handle_approval_decide(
+            &s,
+            &ctx_agent,
+            &resume,
+            &fail,
+            &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+        );
+        match out_deny {
+            HandlerOutcome::Err(env) => {
+                assert_eq!(env.kind, relix_core::types::error_kinds::SECURITY_DENIED);
+            }
+            HandlerOutcome::Ok(_) => panic!("agent role + empty allow-list must NOT admit"),
+        }
+        // Operator → admits.
+        let ctx_op = fake_ctx_with_role(arg.as_bytes(), "operator", b"oncall-1");
+        let out_ok = handle_approval_decide(
+            &s,
+            &ctx_op,
+            &resume,
+            &fail,
+            &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+        );
+        assert!(matches!(out_ok, HandlerOutcome::Ok(_)));
     }
 
     #[test]

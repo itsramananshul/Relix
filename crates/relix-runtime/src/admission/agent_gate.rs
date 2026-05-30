@@ -89,6 +89,13 @@ pub struct GateApprovalRequest {
     /// can be decided through poll/decide, just without
     /// auto-pausing a task.
     pub task_id: Option<String>,
+    /// DEFERRED 2: snapshot of [`AgentGateView::authorized_approvers`]
+    /// at gate time. The coordinator's `on_require_approval`
+    /// closure stamps this on the freshly-minted approval row
+    /// so `coord.approval.decide` can later check the
+    /// operator's subject id against it. Empty ⇒ role-based
+    /// fallback only.
+    pub authorized_approvers: Vec<String>,
 }
 
 /// Reasons we surface as `matched_rule` for audit + denial
@@ -444,6 +451,11 @@ fn evaluate_against_view(
                     .as_ref()
                     .filter(|s| !s.trim().is_empty())
                     .cloned(),
+                // DEFERRED 2: snapshot the operator-allow-list
+                // from the agent profile so the coordinator's
+                // `on_require_approval` closure can stamp it
+                // on the freshly-minted approval_requests row.
+                authorized_approvers: view.authorized_approvers.clone(),
             });
         }
     }
@@ -879,6 +891,7 @@ mod tests {
                 &[],
                 None,
                 9_999_999_999,
+                &[],
             )
             .unwrap();
         let meta = s
