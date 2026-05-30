@@ -32,7 +32,16 @@ hex.workspace = true
 toml.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+# Shared per-channel proactive rate-limit tracker
+# (`channel_rate_limit.rs`) uses `tokio::time::sleep` inside
+# the `acquire` await. Time + macros only; the rest of
+# relix-core stays runtime-agnostic.
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# `test-util` enables tokio::time::pause/advance used by the
+# rate-limit tracker's `acquire_awaits_refill_when_bucket_empty`
+# test.
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
