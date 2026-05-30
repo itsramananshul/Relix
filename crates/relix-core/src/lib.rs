@@ -34,6 +34,7 @@ pub mod approval;
 pub mod audit;
 pub mod bundle;
 pub mod capability;
+pub mod clock;
 pub mod codec;
 pub mod eventlog;
 pub mod identity;

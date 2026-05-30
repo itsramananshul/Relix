@@ -421,14 +421,40 @@ pub struct ApprovalDeliveryService {
     /// write so the planning approval store can be flipped to
     /// the same decision. Empty cell = no mirror; never panics.
     decision_mirror: Arc<tokio::sync::OnceCell<Arc<dyn DecisionMirror>>>,
+    /// NOT-DONE 1: clock the service stamps `delivered_at_ms`,
+    /// `escalated_at_ms`, and `decided_at_ms` from. Production
+    /// callers wire [`relix_core::clock::SystemClock`]; tests
+    /// wire [`relix_core::clock::FakeClock`] to drive
+    /// boundary cases on the escalation timer.
+    clock: Arc<dyn relix_core::clock::Clock>,
 }
 
 impl ApprovalDeliveryService {
-    /// Build a new delivery service.
+    /// Build a new delivery service that reads wall-clock time.
+    /// Equivalent to [`Self::new_with_clock`] with
+    /// [`SystemClock`].
     pub fn new(
         matrix: ApprovalDeliveryMatrix,
         store: ApprovalRequestStore,
         dispatch: Arc<dyn ChannelDispatch>,
+    ) -> Self {
+        Self::new_with_clock(
+            matrix,
+            store,
+            dispatch,
+            Arc::new(relix_core::clock::SystemClock),
+        )
+    }
+
+    /// NOT-DONE 1: construct with an explicit clock. Used by
+    /// the escalation-timer + record_decision tests to drive
+    /// deterministic time progression via
+    /// [`relix_core::clock::FakeClock`].
+    pub fn new_with_clock(
+        matrix: ApprovalDeliveryMatrix,
+        store: ApprovalRequestStore,
+        dispatch: Arc<dyn ChannelDispatch>,
+        clock: Arc<dyn relix_core::clock::Clock>,
     ) -> Self {
         Self {
             matrix,
@@ -436,6 +462,7 @@ impl ApprovalDeliveryService {
             dispatch,
             escalation_cancels: Arc::new(Mutex::new(HashMap::new())),
             decision_mirror: Arc::new(tokio::sync::OnceCell::new()),
+            clock,
         }
     }
 
@@ -534,7 +561,7 @@ impl ApprovalDeliveryService {
                 // microsecond between send returning and us
                 // marking delivered, the operator's decision
                 // wins and we leave delivered_at_ms None.
-                let delivered_at = unix_ms();
+                let delivered_at = self.clock.now_ms();
                 let _ = self
                     .store
                     .mark_delivered(&request.approval_id, delivered_at)?;
@@ -557,7 +584,7 @@ impl ApprovalDeliveryService {
                 })
             }
             Err(e) => {
-                let failed_at = unix_ms();
+                let failed_at = self.clock.now_ms();
                 let err_msg = format!("{e}");
                 // Persist the failure on the row so operators
                 // can list it via the dashboard's "failed
@@ -634,7 +661,7 @@ impl ApprovalDeliveryService {
         decision: &str,
         note: Option<&str>,
     ) -> Result<(), DeliveryError> {
-        let now = unix_ms();
+        let now = self.clock.now_ms();
         self.store
             .record_decision(approval_id, decision, note, now)?;
         // Best-effort cancellation. The cancel sender is only
@@ -683,18 +710,11 @@ impl ApprovalDeliveryService {
         self.dispatch
             .send(channel, &self.matrix.cfg.channels, &request, true)
             .await?;
-        let now = unix_ms();
+        let now = self.clock.now_ms();
         self.store
             .mark_escalated(&request.approval_id, channel.as_str(), now)?;
         Ok(())
     }
-}
-
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1000,6 +1020,85 @@ mod tests {
         assert_eq!(log_snapshot.len(), 2);
         assert_eq!(log_snapshot[1].0, ChannelKind::Slack);
         assert!(log_snapshot[1].2);
+    }
+
+    // ── NOT-DONE 1: escalation timer boundary via FakeClock
+    //                 paired with `tokio::time::pause/advance` ──
+    //
+    // The escalation timer is driven by `tokio::time::sleep`
+    // (real-time-progression coupling), AND the `escalated_at_ms`
+    // stamp comes from the injected `Clock`. The test pauses
+    // tokio's runtime clock, advances BOTH the runtime clock
+    // and the FakeClock by the timeout boundary, and asserts:
+    //
+    //   (a) the spawned timer fires (tokio's sleep completes),
+    //   (b) `escalated_at_ms` reflects the FakeClock value at
+    //       fire time.
+    //
+    // Without the Clock injection the stamp would silently use
+    // wall-clock time and the assertion in (b) would race
+    // against the test runner.
+    #[tokio::test(start_paused = true)]
+    async fn escalation_fires_when_fake_clock_advance_crosses_timeout_boundary() {
+        let mut cfg = fixture_cfg();
+        cfg.rules.clear();
+        cfg.rules.push(DeliveryRule {
+            agent_pattern: "*".into(),
+            action_pattern: "fc_escalate.*".into(),
+            channel: "telegram".into(),
+            // Escalate after 10 seconds.
+            escalation_timeout_secs: 10,
+            escalation_channel: Some("slack".into()),
+        });
+        let matrix = ApprovalDeliveryMatrix::new(cfg);
+        let store = ApprovalRequestStore::open_in_memory().unwrap();
+        let dispatch = Arc::new(RecordingDispatch::default());
+        let fake = Arc::new(relix_core::clock::FakeClock::new(1_000_000));
+        let clock: Arc<dyn relix_core::clock::Clock> = fake.clone();
+        let svc = ApprovalDeliveryService::new_with_clock(
+            matrix,
+            store,
+            dispatch.clone() as Arc<dyn ChannelDispatch>,
+            clock,
+        );
+        let req = fixture_request("fce-1", "ops", "fc_escalate.do");
+        let outcome = svc.dispatch_request(req).await.unwrap();
+        assert!(outcome.escalation_scheduled);
+        // delivered_at_ms must come from FakeClock (1_000_000)
+        // not wall-clock.
+        let row_before = svc.store().get("fce-1").unwrap().unwrap();
+        assert_eq!(row_before.delivered_at_ms, Some(1_000_000));
+        // Yield so the spawned timer task gets a chance to
+        // register its `tokio::time::sleep` BEFORE we advance.
+        tokio::task::yield_now().await;
+        // Advance BOTH clocks past the 10s boundary by 1ms.
+        // The runtime clock wakes the timer's sleep; the
+        // FakeClock advance is what the spawned task observes
+        // when it stamps `escalated_at_ms`.
+        fake.advance(10_001);
+        tokio::time::advance(Duration::from_millis(10_001)).await;
+        // Drain the runtime so the woken timer + its async
+        // `maybe_escalate` call actually run to completion.
+        // `tokio::time::sleep(0)` under `start_paused` yields
+        // to other tasks and progresses the auto-advance
+        // machinery once more.
+        for _ in 0..16 {
+            tokio::time::sleep(Duration::from_millis(0)).await;
+            tokio::task::yield_now().await;
+        }
+        let row = svc.store().get("fce-1").unwrap().unwrap();
+        assert!(
+            row.escalated,
+            "escalation must fire when FakeClock crosses the 10s boundary: {row:?}"
+        );
+        assert_eq!(
+            row.escalated_at_ms,
+            Some(1_010_001),
+            "escalated_at_ms must come from the FakeClock value at fire time"
+        );
+        let log_snapshot = dispatch.log.lock().unwrap().clone();
+        assert_eq!(log_snapshot.len(), 2, "initial + escalation dispatched");
+        assert!(log_snapshot[1].2, "second call is the escalation");
     }
 
     #[tokio::test]

@@ -423,6 +423,12 @@ pub fn clamp_approval_token_ttl_secs(configured: Option<u64>) -> u64 {
 /// [`clamp_approval_token_ttl_secs`]. The handler does not
 /// re-clamp — the caller MUST already have done so. Passing an
 /// out-of-range value is a caller bug, not a security issue.
+///
+/// NOT-DONE 1: `clock` is the injected time source for
+/// `issued_at_ms`. Production wires
+/// [`relix_core::clock::SystemClock`]; tests wire
+/// [`relix_core::clock::FakeClock`] so the mint timestamp is
+/// deterministic.
 pub fn handle_approval_decide(
     store: &AgentStore,
     ctx: &InvocationCtx,
@@ -430,6 +436,7 @@ pub fn handle_approval_decide(
     fail_task: &TaskResumeFn,
     signing_key: &[u8],
     token_ttl_secs: u64,
+    clock: &dyn relix_core::clock::Clock,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
@@ -510,10 +517,10 @@ pub fn handle_approval_decide(
     // base64url(json)-encoded `ApprovalToken`.
     let body = match metadata {
         Some(meta) if !signing_key.is_empty() => {
-            let issued_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
+            // NOT-DONE 1: source `issued_at_ms` from the
+            // injected clock so the token's TTL window is
+            // deterministic under test.
+            let issued_at_ms = clock.now_ms();
             // DEFERRED 1: token_ttl_secs comes from the
             // operator-configured `[approval] approval_token_ttl_secs`
             // (clamped at startup). Convert to ms at the mint
@@ -895,6 +902,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         ));
         assert!(body.starts_with("ok|"));
         let wire = body.trim_start_matches("ok|").trim();
@@ -927,6 +935,7 @@ mod tests {
             &fail,
             &[],
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         ));
         assert_eq!(body, "ok\n");
     }
@@ -947,6 +956,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         ));
         assert_eq!(body, "ok\n");
     }
@@ -991,6 +1001,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         );
         assert_eq!(resumed.lock().unwrap().as_deref(), Some("task-42"));
         assert!(failed.lock().unwrap().is_none());
@@ -1028,6 +1039,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         );
         assert_eq!(failed.lock().unwrap().as_deref(), Some("task-99"));
     }
@@ -1062,6 +1074,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         ));
         // Cleanly approves (returns the one-shot signed
         // token) but never invokes either closure.
@@ -1131,6 +1144,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             60,
+            &relix_core::clock::SystemClock,
         ));
         let wire = body.trim_start_matches("ok|").trim();
         let tok = crate::approval::ApprovalToken::parse(wire).unwrap();
@@ -1161,6 +1175,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             3_600,
+            &relix_core::clock::SystemClock,
         ));
         let wire = body.trim_start_matches("ok|").trim();
         let tok = crate::approval::ApprovalToken::parse(wire).unwrap();
@@ -1280,6 +1295,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         );
         match out {
             HandlerOutcome::Err(env) => {
@@ -1328,6 +1344,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         );
         assert!(matches!(out, HandlerOutcome::Ok(_)));
         let r = s.get_approval(&id).unwrap().unwrap();
@@ -1369,6 +1386,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         );
         match out_deny {
             HandlerOutcome::Err(env) => {
@@ -1385,6 +1403,7 @@ mod tests {
             &fail,
             &test_signing_key(),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
+            &relix_core::clock::SystemClock,
         );
         assert!(matches!(out_ok, HandlerOutcome::Ok(_)));
     }

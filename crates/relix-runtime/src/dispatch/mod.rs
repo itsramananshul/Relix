@@ -355,6 +355,13 @@ pub struct DispatchBridge {
     /// every token-bearing call to fail with
     /// `approval_token_missing_key`.
     approval_token_signing_key: Vec<u8>,
+    /// NOT-DONE 1: clock injection for TTL-sensitive admission
+    /// paths (token expiry check at step 8). Defaults to
+    /// [`relix_core::clock::SystemClock`]; tests install a
+    /// [`relix_core::clock::FakeClock`] via
+    /// [`Self::set_clock`] to drive deterministic boundary
+    /// cases without sleeping.
+    clock: Arc<dyn relix_core::clock::Clock>,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -536,7 +543,26 @@ impl DispatchBridge {
             audit_partition: None,
             always_require_methods: Arc::new(HashSet::new()),
             approval_token_signing_key: Vec::new(),
+            clock: Arc::new(relix_core::clock::SystemClock),
         })
+    }
+
+    /// NOT-DONE 1: install a [`relix_core::clock::Clock`] used
+    /// by every TTL-sensitive admission path. Tests install a
+    /// [`relix_core::clock::FakeClock`] to drive deterministic
+    /// boundary cases. Idempotent; the default is
+    /// [`relix_core::clock::SystemClock`].
+    pub fn set_clock(&mut self, clock: Arc<dyn relix_core::clock::Clock>) {
+        self.clock = clock;
+    }
+
+    /// NOT-DONE 1: borrow the installed clock. Used by the
+    /// controller startup wiring so the clock shared by the
+    /// dispatch bridge is the same one
+    /// `ApprovalDeliveryService` + the background-task
+    /// migration consult.
+    pub fn clock(&self) -> Arc<dyn relix_core::clock::Clock> {
+        self.clock.clone()
     }
 
     /// SEC PART A: install the HMAC-SHA256 signing key the
@@ -1058,7 +1084,11 @@ impl DispatchBridge {
         // === Admission step 8: agent-employee gate (categorical / surface / risk / approval) ===
         if let Some(bindings) = self.agent_gate.as_ref() {
             let descriptor = (bindings.describe)(&req.method);
-            let now_ms = unix_now_ms();
+            // NOT-DONE 1: source the TTL-check `now_ms` from the
+            // injected clock instead of `unix_now_ms()` so tests
+            // can drive boundary cases via `FakeClock` without
+            // sleeping.
+            let now_ms = self.clock.now_ms();
             let gate_decision = crate::admission::agent_gate::evaluate(
                 Some(&bindings.store),
                 crate::admission::agent_gate::GateInputs {
@@ -1868,7 +1898,11 @@ impl DispatchBridge {
         // === Admission step 8: agent gate ===
         if let Some(bindings) = self.agent_gate.as_ref() {
             let descriptor = (bindings.describe)(&req.method);
-            let now_ms = unix_now_ms();
+            // NOT-DONE 1: source the TTL-check `now_ms` from the
+            // injected clock instead of `unix_now_ms()` so tests
+            // can drive boundary cases via `FakeClock` without
+            // sleeping.
+            let now_ms = self.clock.now_ms();
             let gate_decision = crate::admission::agent_gate::evaluate(
                 Some(&bindings.store),
                 crate::admission::agent_gate::GateInputs {
@@ -2699,6 +2733,196 @@ mod tests {
                 );
             }
             other => panic!("expected APPROVAL_REQUIRED, got {:?}", other),
+        }
+    }
+
+    // ── NOT-DONE 1: end-to-end FakeClock boundary tests ──
+
+    /// Boot a bridge wired with an agent gate so token-bearing
+    /// calls flow through `agent_gate::evaluate` and that
+    /// function consults the bridge's injected
+    /// `Arc<dyn Clock>`. Returns the bridge handle, the
+    /// `FakeClock` Arc (so the test can drive boundaries via
+    /// `advance`), and the minted token + caller identity.
+    async fn boot_bridge_with_fake_clock_and_token(
+        issued_at_ms: i64,
+        ttl_ms: i64,
+        subject_seed: &[u8],
+    ) -> (
+        DispatchBridge,
+        std::sync::Arc<relix_core::clock::FakeClock>,
+        String,
+        Bundle,
+    ) {
+        let (mut bridge, org_root, _dir) = {
+            let dir = TempDir::new().unwrap();
+            let org_root = SigningKey::generate(&mut OsRng);
+            let responder = SigningKey::generate(&mut OsRng);
+            // Permissive policy — the test is about the gate's
+            // TTL check on the approval token, not policy.
+            let policy = PolicyEngine::from_toml(
+                r#"
+                [[rules]]
+                name = "permissive"
+                method = "node.health"
+                allow_groups = ["chat-users"]
+                "#,
+            )
+            .unwrap();
+            let bridge = DispatchBridge::new(
+                policy,
+                org_root.verifying_key(),
+                &dir.path().join("audit.log"),
+                responder,
+            )
+            .unwrap();
+            (bridge, org_root, dir)
+        };
+        bridge.register("node.health", Arc::new(FnHandler(echo_handler)));
+
+        // Wire the agent gate against an in-memory store.
+        let store =
+            std::sync::Arc::new(crate::nodes::coordinator::agent::AgentStore::in_memory().unwrap());
+        // Mint an approved approval row + a structured token
+        // with the requested issued_at_ms + ttl_ms.
+        let subject_id_hex = NodeId::from_pubkey(subject_seed).to_string();
+        let approval_id = store
+            .create_approval(
+                "agt-1",
+                &subject_id_hex,
+                "node.health",
+                "cat",
+                "",
+                "",
+                &[],
+                None,
+                9_999_999_999,
+                &[],
+            )
+            .unwrap();
+        let meta = store
+            .decide_approval(
+                &approval_id,
+                crate::nodes::coordinator::agent::store::ApprovalStatus::Approved,
+                "alice",
+                "ok",
+            )
+            .unwrap()
+            .unwrap();
+        let signing_key = b"clock-test-signing-key-32-bytes!".to_vec();
+        let wire = crate::approval::ApprovalToken::issue(
+            &meta.approval_id,
+            &meta.method,
+            &meta.subject_id,
+            meta.task_id.as_deref().unwrap_or(""),
+            issued_at_ms,
+            ttl_ms,
+            &signing_key,
+        )
+        .unwrap();
+
+        bridge.set_approval_token_signing_key(signing_key);
+        let describe: super::CapabilityDescribeFn = Arc::new(|_method: &str| None);
+        let on_require_approval: super::OnRequireApprovalFn =
+            Arc::new(|_req, _hint| Ok(String::new()));
+        bridge.set_agent_gate(super::AgentGateBindings {
+            store,
+            describe,
+            on_require_approval,
+        });
+
+        let fake_clock = std::sync::Arc::new(relix_core::clock::FakeClock::new(0));
+        bridge.set_clock(fake_clock.clone());
+
+        // Caller bundle whose subject_id matches the token's
+        // bound subject so the gate's subject-match check
+        // passes.
+        let caller_key = SigningKey::from_bytes(
+            &subject_seed
+                .iter()
+                .copied()
+                .cycle()
+                .take(32)
+                .collect::<Vec<u8>>()
+                .try_into()
+                .unwrap(),
+        );
+        let id = IdentityBundle {
+            subject_id: NodeId::from_pubkey(subject_seed),
+            name: "alice".into(),
+            org_id: NodeId::from_pubkey(&org_root.verifying_key().to_bytes()),
+            groups: vec!["chat-users".into()],
+            role: "agent".into(),
+            clearance: "internal".into(),
+            supervisors: vec![],
+        };
+        let _ = caller_key; // silence unused — keep for parity with other tests
+        let bundle = issue_identity(id, &org_root, 3600).unwrap();
+        (bridge, fake_clock, wire, bundle)
+    }
+
+    async fn dispatch_with_token(
+        bridge: &DispatchBridge,
+        bundle: Bundle,
+        token: String,
+    ) -> ResponseResult {
+        let envelope = build_request_with_tenant(
+            "node.health",
+            b"hi".to_vec(),
+            bundle,
+            30,
+            None,
+            Some(token),
+            None,
+            None,
+        );
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        decode_response(&resp_bytes).unwrap().res
+    }
+
+    #[tokio::test]
+    async fn bridge_clock_admits_token_one_ms_before_expiry() {
+        let (bridge, fake, token, bundle) =
+            boot_bridge_with_fake_clock_and_token(1_000, 60_000, b"subj-bridge-1").await;
+        fake.set(60_999);
+        match dispatch_with_token(&bridge, bundle, token).await {
+            ResponseResult::Ok(b) => assert_eq!(b.as_ref(), b"hi"),
+            other => panic!("expected Ok at expires-1, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_clock_rejects_token_exactly_at_expiry() {
+        let (bridge, fake, token, bundle) =
+            boot_bridge_with_fake_clock_and_token(1_000, 60_000, b"subj-bridge-2").await;
+        fake.set(61_000);
+        match dispatch_with_token(&bridge, bundle, token).await {
+            ResponseResult::Err(env) => {
+                assert!(
+                    env.cause.contains("approval_token_expired") || env.cause.contains("expired"),
+                    "expected expired-at-boundary cause, got: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected Err at expires boundary, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_clock_rejects_token_one_ms_after_expiry_via_advance() {
+        let (bridge, fake, token, bundle) =
+            boot_bridge_with_fake_clock_and_token(1_000, 60_000, b"subj-bridge-3").await;
+        fake.set(60_999);
+        fake.advance(2);
+        match dispatch_with_token(&bridge, bundle, token).await {
+            ResponseResult::Err(env) => {
+                assert!(
+                    env.cause.contains("approval_token_expired") || env.cause.contains("expired"),
+                    "expected expired cause, got: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected Err at expires+1, got {other:?}"),
         }
     }
 

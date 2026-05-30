@@ -2444,15 +2444,17 @@ mod legacy_token_task_fail_tests {
 async fn run_approval_expire_loop(
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
+    clock: Arc<dyn relix_core::clock::Clock>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // NOT-DONE 1: source the expiry-window edge from the
+        // injected clock so tests can drive the legacy-token
+        // expiry sweep deterministically via `FakeClock` +
+        // `tokio::time::advance` on the interval.
+        let now = clock.now_ms() / 1_000;
         let expired = match agent_store.list_expired_pending(now) {
             Ok(v) => v,
             Err(e) => {
@@ -2498,6 +2500,7 @@ fn register_agent_capabilities(
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
     token_ttl_secs: u64,
+    clock: Arc<dyn relix_core::clock::Clock>,
 ) {
     use crate::dispatch::{FnHandler, InvocationCtx};
     use crate::nodes::coordinator::agent::handlers;
@@ -2627,6 +2630,11 @@ fn register_agent_capabilities(
         // set `RELIX_APPROVAL_TOKEN_KEY` — handler gracefully
         // omits the token in that case.
         let signing_key: Vec<u8> = crate::approval::signing_key_from_env().unwrap_or_default();
+        // NOT-DONE 1: capture the dispatch clock so the
+        // cap handler stamps `issued_at_ms` on each minted
+        // token via the same time source the admission gate
+        // verifies against.
+        let clock_for_decide = clock.clone();
         bridge.register(
             "coord.approval.decide",
             Arc::new(FnHandler(move |ctx: InvocationCtx| {
@@ -2634,6 +2642,7 @@ fn register_agent_capabilities(
                 let resume = resume.clone();
                 let fail = fail.clone();
                 let signing_key = signing_key.clone();
+                let clock = clock_for_decide.clone();
                 async move {
                     handlers::handle_approval_decide(
                         &s,
@@ -2642,6 +2651,7 @@ fn register_agent_capabilities(
                         &fail,
                         &signing_key,
                         token_ttl_secs,
+                        clock.as_ref(),
                     )
                 }
             })),
@@ -6623,10 +6633,17 @@ fn register_node_type_handlers(
                     let configured_count = multi.configured_channel_count();
                     let dispatch: std::sync::Arc<dyn crate::approval::ChannelDispatch> =
                         std::sync::Arc::new(multi);
-                    let service = crate::approval::ApprovalDeliveryService::new(
+                    // NOT-DONE 1: thread the dispatch bridge's
+                    // clock through the §7.30 delivery service
+                    // so escalation_at_ms / delivered_at_ms /
+                    // decided_at_ms stamps observe the same
+                    // time source as the admission gate.
+                    let delivery_clock = bridge.clock();
+                    let service = crate::approval::ApprovalDeliveryService::new_with_clock(
                         matrix,
                         delivery_store,
                         dispatch,
+                        delivery_clock,
                     );
                     tracing::info!(
                         configured_channels = configured_count,
@@ -6802,10 +6819,18 @@ fn register_node_type_handlers(
                 });
                 match crate::identity::TokenStore::open(&path) {
                     Ok(store) => {
-                        match crate::identity::SessionIdentityService::new(
+                        // NOT-DONE 1: thread the dispatch
+                        // bridge's clock through the session
+                        // identity service so issue / verify /
+                        // idle-sweep stamp + compare against the
+                        // same time source as the admission
+                        // gate.
+                        let session_clock = bridge.clock();
+                        match crate::identity::SessionIdentityService::new_with_clock(
                             store,
                             sess_cfg.clone(),
                             key_material.as_bytes().to_vec(),
+                            session_clock,
                         ) {
                             Ok(service) => {
                                 crate::identity::caps::register(bridge, service.clone());
@@ -7754,11 +7779,13 @@ fn register_node_type_handlers(
                 "approval: token TTL = {effective_ttl_secs}s (default; set [approval] approval_token_ttl_secs to override)"
             ),
         }
+        let agent_caps_clock = bridge.clock();
         register_agent_capabilities(
             bridge,
             agent_store.clone(),
             store.clone(),
             effective_ttl_secs,
+            agent_caps_clock,
         );
         let agent_caps: &[(&str, &str, &[&str])] = &[
             (
@@ -7831,8 +7858,17 @@ fn register_node_type_handlers(
         {
             let agent_store_for_expire = agent_store.clone();
             let task_store_for_expire = store.clone();
+            // NOT-DONE 1: pull the same clock the dispatch
+            // bridge installed so the expire sweep + every
+            // other TTL surface observe the same time source.
+            let clock_for_expire = bridge.clock();
             tokio::spawn(async move {
-                run_approval_expire_loop(agent_store_for_expire, task_store_for_expire).await;
+                run_approval_expire_loop(
+                    agent_store_for_expire,
+                    task_store_for_expire,
+                    clock_for_expire,
+                )
+                .await;
             });
             tracing::info!("coordinator node: approval auto-expire loop spawned");
         }

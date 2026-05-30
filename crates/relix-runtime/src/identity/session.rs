@@ -404,13 +404,38 @@ pub struct SessionIdentityService {
     store: TokenStore,
     cfg: Arc<SessionIdentityConfig>,
     signing_key: Arc<Vec<u8>>,
+    /// NOT-DONE 1: clock the service consults for every TTL /
+    /// last-seen comparison so the idle sweeper + verify path
+    /// are deterministically testable via
+    /// [`relix_core::clock::FakeClock`]. Production callers
+    /// wire [`relix_core::clock::SystemClock`].
+    clock: Arc<dyn relix_core::clock::Clock>,
 }
 
 impl SessionIdentityService {
+    /// Construct a service that reads wall-clock time. Equivalent
+    /// to [`Self::new_with_clock`] with [`SystemClock`].
     pub fn new(
         store: TokenStore,
         cfg: SessionIdentityConfig,
         signing_key: Vec<u8>,
+    ) -> Result<Self, TokenError> {
+        Self::new_with_clock(
+            store,
+            cfg,
+            signing_key,
+            Arc::new(relix_core::clock::SystemClock),
+        )
+    }
+
+    /// NOT-DONE 1: construct with an explicit clock. Tests
+    /// inject a [`relix_core::clock::FakeClock`] so the idle
+    /// sweeper + verify path are exercised without sleeping.
+    pub fn new_with_clock(
+        store: TokenStore,
+        cfg: SessionIdentityConfig,
+        signing_key: Vec<u8>,
+        clock: Arc<dyn relix_core::clock::Clock>,
     ) -> Result<Self, TokenError> {
         if signing_key.len() < 32 {
             return Err(TokenError::InvalidSigningKey(signing_key.len()));
@@ -419,6 +444,7 @@ impl SessionIdentityService {
             store,
             cfg: Arc::new(cfg),
             signing_key: Arc::new(signing_key),
+            clock,
         })
     }
 
@@ -434,7 +460,7 @@ impl SessionIdentityService {
     /// vault. The wire form returned by `to_wire()` is what
     /// the caller hands to verify.
     pub fn issue(&self, req: &IssueRequest) -> Result<SessionToken, TokenError> {
-        let now = unix_ms();
+        let now = self.clock.now_ms();
         let ttl = req.ttl_secs.unwrap_or(self.cfg.session_ttl_secs).max(1);
         let mut nonce_bytes = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
@@ -472,7 +498,7 @@ impl SessionIdentityService {
         if !self.verify_signature(&canonical, &tok.signature) {
             return TokenVerification::invalid("signature mismatch");
         }
-        let now = unix_ms();
+        let now = self.clock.now_ms();
         if now >= tok.expires_at_ms {
             return TokenVerification::invalid("token expired");
         }
@@ -496,7 +522,7 @@ impl SessionIdentityService {
     }
 
     pub fn revoke(&self, session_id: &str) -> Result<usize, TokenError> {
-        self.store.revoke(session_id, unix_ms())
+        self.store.revoke(session_id, self.clock.now_ms())
     }
 
     pub fn list_active(
@@ -518,8 +544,12 @@ impl SessionIdentityService {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let cutoff = unix_ms() - (self.cfg.session_idle_timeout_secs as i64) * 1000;
-                let now = unix_ms();
+                // NOT-DONE 1: source the cutoff + revoke
+                // timestamp from the injected clock so the
+                // idle sweeper is deterministically testable
+                // via `FakeClock` + `tokio::time::advance`.
+                let now = self.clock.now_ms();
+                let cutoff = now - (self.cfg.session_idle_timeout_secs as i64) * 1000;
                 match self.store.revoke_idle(cutoff, now) {
                     Ok(revoked) if !revoked.is_empty() => {
                         tracing::info!(
@@ -554,6 +584,10 @@ impl SessionIdentityService {
     }
 }
 
+/// Wall-clock helper used by `#[cfg(test)]` paths only — the
+/// production hot paths consult the injected
+/// [`relix_core::clock::Clock`] via the service handle.
+#[cfg(test)]
 pub(crate) fn unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -564,6 +598,7 @@ pub(crate) fn unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use relix_core::clock::Clock as _;
 
     fn fresh_service() -> SessionIdentityService {
         let store = TokenStore::open_in_memory().unwrap();
@@ -697,5 +732,62 @@ mod tests {
         let now_for_revoke = unix_ms() + 2;
         let revoked = svc.store.revoke_idle(cutoff, now_for_revoke).unwrap();
         assert_eq!(revoked.len(), 1);
+    }
+
+    // ── NOT-DONE 1: idle sweeper boundary via FakeClock ──
+
+    /// Build a session service with an injected `FakeClock` and
+    /// the requested `session_idle_timeout_secs`. Returns the
+    /// service handle + the Arc for direct `advance` calls.
+    fn fresh_service_with_fake_clock(
+        idle_timeout_secs: u64,
+        starting_now_ms: i64,
+    ) -> (SessionIdentityService, Arc<relix_core::clock::FakeClock>) {
+        let store = TokenStore::open_in_memory().unwrap();
+        let cfg = SessionIdentityConfig {
+            enabled: true,
+            session_ttl_secs: 86_400,
+            session_idle_timeout_secs: idle_timeout_secs,
+            sweep_interval_secs: 60,
+            verify_on_dispatch: false,
+            ..Default::default()
+        };
+        let fake = Arc::new(relix_core::clock::FakeClock::new(starting_now_ms));
+        let clock: Arc<dyn relix_core::clock::Clock> = fake.clone();
+        let svc = SessionIdentityService::new_with_clock(store, cfg, vec![7u8; 32], clock).unwrap();
+        (svc, fake)
+    }
+
+    #[test]
+    fn idle_sweeper_revokes_token_with_last_seen_older_than_idle_timeout_minus_one() {
+        // last_seen = now - idle_timeout - 1 → revoked.
+        // idle_timeout = 60s; token issued at t = 0, then we
+        // advance the clock to t = 60_001 (last_seen of 0 is
+        // older than now - 60_000 by 1ms).
+        let (svc, fake) = fresh_service_with_fake_clock(60, 0);
+        let _ = svc.issue(&fixture_request()).unwrap();
+        fake.set(60_001);
+        let now = fake.now_ms();
+        let cutoff = now - 60_000;
+        let revoked = svc.store.revoke_idle(cutoff, now).unwrap();
+        assert_eq!(revoked.len(), 1, "stale token must be revoked");
+    }
+
+    #[test]
+    fn idle_sweeper_does_not_revoke_token_with_last_seen_within_idle_window() {
+        // last_seen = now - idle_timeout + 1 → NOT revoked.
+        // idle_timeout = 60s; token issued at t = 0, advance
+        // to t = 59_999 (last_seen of 0 is younger than
+        // now - 60_000 by 1ms — cutoff is negative).
+        let (svc, fake) = fresh_service_with_fake_clock(60, 0);
+        let _ = svc.issue(&fixture_request()).unwrap();
+        fake.set(59_999);
+        let now = fake.now_ms();
+        let cutoff = now - 60_000;
+        let revoked = svc.store.revoke_idle(cutoff, now).unwrap();
+        assert!(
+            revoked.is_empty(),
+            "token still within idle window must NOT be revoked"
+        );
     }
 }

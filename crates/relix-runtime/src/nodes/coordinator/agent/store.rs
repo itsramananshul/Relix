@@ -253,6 +253,18 @@ pub struct AgentStore {
 
 impl AgentStore {
     pub fn open(path: &Path) -> Result<Self, AgentStoreError> {
+        Self::open_with_clock(path, &relix_core::clock::SystemClock)
+    }
+
+    /// NOT-DONE 1: constructor that takes an explicit clock so
+    /// the boot-time legacy-token migration's `decided_at`
+    /// stamp is deterministic under test. Production callers
+    /// use [`Self::open`] which threads
+    /// [`relix_core::clock::SystemClock`].
+    pub fn open_with_clock(
+        path: &Path,
+        clock: &dyn relix_core::clock::Clock,
+    ) -> Result<Self, AgentStoreError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| AgentStoreError::Io(e.to_string()))?;
         }
@@ -264,7 +276,7 @@ impl AgentStore {
         // DEFERRED 3: flip pre-SEC-PART-A opaque-token rows
         // before the cap surface is wired so the agent's next
         // poll sees the terminal state immediately.
-        let migrated = migrate_legacy_opaque_tokens(&conn)?;
+        let migrated = migrate_legacy_opaque_tokens(&conn, clock.now_ms())?;
         if migrated > 0 {
             tracing::warn!(
                 count = migrated,
@@ -313,7 +325,10 @@ impl AgentStore {
     #[cfg(test)]
     pub(crate) fn run_legacy_token_migration_for_test(&self) -> Result<usize, AgentStoreError> {
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
-        migrate_legacy_opaque_tokens(&conn).map_err(AgentStoreError::Db)
+        let now_ms = <relix_core::clock::SystemClock as relix_core::clock::Clock>::now_ms(
+            &relix_core::clock::SystemClock,
+        );
+        migrate_legacy_opaque_tokens(&conn, now_ms).map_err(AgentStoreError::Db)
     }
 
     /// DEFERRED B test-only helper. Stamps a task_id on an
@@ -346,7 +361,12 @@ impl AgentStore {
         // migration is a no-op — but we run it anyway so tests
         // that seed legacy rows manually then re-open the
         // store see consistent behaviour with the on-disk path.
-        let _ = migrate_legacy_opaque_tokens(&conn)?;
+        let _ = migrate_legacy_opaque_tokens(
+            &conn,
+            <relix_core::clock::SystemClock as relix_core::clock::Clock>::now_ms(
+                &relix_core::clock::SystemClock,
+            ),
+        )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -1109,8 +1129,17 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// match no rows because the only states the SQL targets are
 /// `pending` / `approved`, and the migration moves rows out of
 /// both.
-pub(crate) fn migrate_legacy_opaque_tokens(conn: &Connection) -> Result<usize, rusqlite::Error> {
-    let now = unix_now();
+///
+/// NOT-DONE 1: `now_ms` is sourced by the caller from a
+/// [`relix_core::clock::Clock`] so the `decided_at` stamp is
+/// deterministic under test.
+pub(crate) fn migrate_legacy_opaque_tokens(
+    conn: &Connection,
+    now_ms: i64,
+) -> Result<usize, rusqlite::Error> {
+    // `decided_at` on `approval_requests` is unix seconds (not
+    // millis) — preserve the column's existing precision.
+    let now_secs = now_ms / 1_000;
     let changed = conn.execute(
         "UPDATE approval_requests
          SET status = 'legacy_token_expired',
@@ -1121,7 +1150,7 @@ pub(crate) fn migrate_legacy_opaque_tokens(conn: &Connection) -> Result<usize, r
                               Retry to mint a fresh structured token.'
          WHERE approval_token IS NOT NULL
            AND status IN ('pending', 'approved')",
-        params![now],
+        params![now_secs],
     )?;
     Ok(changed)
 }
@@ -1564,6 +1593,39 @@ mod tests {
         assert_eq!(
             s.get_approval(&id).unwrap().unwrap().status,
             ApprovalStatus::Expired
+        );
+    }
+
+    // ── NOT-DONE 1: migration runs with injected clock ───
+
+    #[test]
+    fn migration_stamps_decided_at_from_injected_clock() {
+        // Seed a legacy pending row + migrate with a FakeClock
+        // pinned to a fixed time. The stamped `decided_at`
+        // (unix seconds, derived from the clock's `now_ms /
+        // 1000`) must match what the FakeClock returned at
+        // call time.
+        let s = store();
+        s.seed_legacy_token_row_for_test("leg-clock", "pending", "abc")
+            .unwrap();
+        // Pin to a clock value whose seconds equivalent is
+        // distinct from `unix_now` so we can detect a
+        // wall-clock fallback regression.
+        let clock = relix_core::clock::FakeClock::new(2_700_000_000_000);
+        let now_ms = <relix_core::clock::FakeClock as relix_core::clock::Clock>::now_ms(&clock);
+        {
+            let conn = s.conn.lock().unwrap();
+            let n = migrate_legacy_opaque_tokens(&conn, now_ms).unwrap();
+            assert_eq!(n, 1);
+        }
+        let r = s.get_approval("leg-clock").unwrap().unwrap();
+        assert_eq!(r.status, ApprovalStatus::LegacyTokenExpired);
+        // FakeClock value 2_700_000_000_000 ms → 2_700_000_000
+        // seconds.
+        assert_eq!(
+            r.decided_at,
+            Some(2_700_000_000),
+            "decided_at must come from FakeClock, not wall-clock"
         );
     }
 

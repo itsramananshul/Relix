@@ -568,6 +568,54 @@ mod tests {
         }
     }
 
+    // ── NOT-DONE 1: boundary tests via the Clock trait ──
+    //
+    // The three above exercise `check_not_expired` directly.
+    // These additionally exercise the Clock trait integration:
+    // the same boundary cases are driven by an
+    // `Arc<dyn Clock>` rather than a literal `i64` so the
+    // trait-object dispatch path is locked too.
+
+    #[test]
+    fn ttl_boundary_admits_one_ms_before_expiry_via_fake_clock() {
+        use relix_core::clock::{Clock, FakeClock};
+        use std::sync::Arc;
+        let tok = token_with_window(1_000, 60_000);
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(60_999));
+        tok.check_not_expired(clock.now_ms())
+            .expect("FakeClock at expires-1 admits");
+    }
+
+    #[test]
+    fn ttl_boundary_rejects_at_expiry_via_fake_clock() {
+        use relix_core::clock::{Clock, FakeClock};
+        use std::sync::Arc;
+        let tok = token_with_window(1_000, 60_000);
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(61_000));
+        match tok.check_not_expired(clock.now_ms()) {
+            Err(TokenError::Expired { .. }) => {}
+            other => panic!("FakeClock at expires must reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttl_boundary_rejects_one_ms_after_expiry_via_fake_clock_advance() {
+        use relix_core::clock::{Clock, FakeClock};
+        use std::sync::Arc;
+        let tok = token_with_window(1_000, 60_000);
+        // Hold both an `Arc<FakeClock>` (for `.advance`) and
+        // an `Arc<dyn Clock>` (for the trait-object dispatch
+        // path) — both share the same `AtomicI64` so a single
+        // advance is visible through both handles.
+        let fake = Arc::new(FakeClock::new(60_999));
+        let clock: Arc<dyn Clock> = fake.clone();
+        fake.advance(2);
+        match tok.check_not_expired(clock.now_ms()) {
+            Err(TokenError::Expired { .. }) => {}
+            other => panic!("FakeClock at expires+1 must reject, got {other:?}"),
+        }
+    }
+
     #[test]
     fn malformed_base64_returns_malformed_encoding() {
         match ApprovalToken::parse("!!not-base64!!") {
