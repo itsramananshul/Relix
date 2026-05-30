@@ -383,6 +383,19 @@ pub struct ApprovalSection {
     /// `{data_dir}/approval_delivery.db` when unset.
     #[serde(default)]
     pub delivery_db_path: Option<PathBuf>,
+    /// DEFERRED 1: lifetime in seconds the
+    /// `coord.approval.decide` cap stamps on each freshly-minted
+    /// [`crate::approval::ApprovalToken`]. `None` ⇒ the
+    /// runtime default
+    /// ([`crate::nodes::coordinator::agent::handlers::APPROVAL_TOKEN_TTL_DEFAULT_SECS`],
+    /// 300s = 5 minutes). The controller clamps to
+    /// `[APPROVAL_TOKEN_TTL_MIN_SECS, APPROVAL_TOKEN_TTL_MAX_SECS]`
+    /// (`[30, 86400]`) at boot — values outside the window are
+    /// quietly snapped to the nearest endpoint AND logged at
+    /// INFO so the operator sees the clamp without a config
+    /// reload loop.
+    #[serde(default)]
+    pub approval_token_ttl_secs: Option<u64>,
 }
 
 /// GAP 23C: `[audit]` section. Wires the per-tenant audit
@@ -2266,6 +2279,7 @@ fn register_agent_capabilities(
     bridge: &mut crate::dispatch::DispatchBridge,
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
+    token_ttl_secs: u64,
 ) {
     use crate::dispatch::{FnHandler, InvocationCtx};
     use crate::nodes::coordinator::agent::handlers;
@@ -2390,7 +2404,14 @@ fn register_agent_capabilities(
                 let fail = fail.clone();
                 let signing_key = signing_key.clone();
                 async move {
-                    handlers::handle_approval_decide(&s, &ctx, &resume, &fail, &signing_key)
+                    handlers::handle_approval_decide(
+                        &s,
+                        &ctx,
+                        &resume,
+                        &fail,
+                        &signing_key,
+                        token_ttl_secs,
+                    )
                 }
             })),
         );
@@ -7457,7 +7478,41 @@ fn register_node_type_handlers(
             crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
                 .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
         );
-        register_agent_capabilities(bridge, agent_store.clone(), store.clone());
+        // DEFERRED 1: resolve the operator-configured token TTL
+        // ONCE at register time so the cap closure captures a
+        // clamped value. The startup logs the effective TTL
+        // alongside the source of the value so operators can
+        // tell at a glance whether the configured value was
+        // accepted as-is or clamped.
+        let raw_ttl_secs = cfg
+            .approval
+            .as_ref()
+            .and_then(|a| a.approval_token_ttl_secs);
+        let effective_ttl_secs =
+            crate::nodes::coordinator::agent::handlers::clamp_approval_token_ttl_secs(raw_ttl_secs);
+        match raw_ttl_secs {
+            Some(v) if v == effective_ttl_secs => tracing::info!(
+                ttl_secs = effective_ttl_secs,
+                "approval: token TTL = {effective_ttl_secs}s (operator-configured)"
+            ),
+            Some(v) => tracing::info!(
+                configured = v,
+                clamped = effective_ttl_secs,
+                "approval: token TTL clamped to {effective_ttl_secs}s (configured {v}s outside [{}, {}])",
+                crate::nodes::coordinator::agent::handlers::APPROVAL_TOKEN_TTL_MIN_SECS,
+                crate::nodes::coordinator::agent::handlers::APPROVAL_TOKEN_TTL_MAX_SECS,
+            ),
+            None => tracing::info!(
+                ttl_secs = effective_ttl_secs,
+                "approval: token TTL = {effective_ttl_secs}s (default; set [approval] approval_token_ttl_secs to override)"
+            ),
+        }
+        register_agent_capabilities(
+            bridge,
+            agent_store.clone(),
+            store.clone(),
+            effective_ttl_secs,
+        );
         let agent_caps: &[(&str, &str, &[&str])] = &[
             (
                 "agent.create",

@@ -283,14 +283,48 @@ pub fn handle_approval_pending(store: &AgentStore, ctx: &InvocationCtx) -> Handl
 
 pub type TaskResumeFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
-/// SEC PART A: lifetime (in milliseconds) the cap handler
-/// stamps on every freshly-minted [`crate::approval::ApprovalToken`].
-/// 5 minutes is the spec's documented default. Operators that
-/// need a different TTL can tune the env via wrapper script —
-/// the cap surface itself does not parameterise TTL because
-/// operators routinely default to forever-long tokens
-/// otherwise, which defeats the purpose.
-pub const APPROVAL_TOKEN_TTL_MS: i64 = 5 * 60 * 1000;
+/// Default lifetime in seconds for a freshly-minted
+/// [`crate::approval::ApprovalToken`]. Used as the fallback
+/// when the operator did not configure
+/// `[approval] approval_token_ttl_secs` in the controller
+/// TOML. 5 minutes matches the spec's documented default.
+///
+/// DEFERRED 1: operators that need a longer / shorter TTL
+/// override the value via the config field. The runtime
+/// clamps the configured value to
+/// `[APPROVAL_TOKEN_TTL_MIN_SECS, APPROVAL_TOKEN_TTL_MAX_SECS]`
+/// at boot so a typo cannot mint forever-tokens or
+/// instantly-expired tokens.
+pub const APPROVAL_TOKEN_TTL_DEFAULT_SECS: u64 = 5 * 60;
+
+/// Minimum allowed token TTL after operator-config clamping.
+/// 30 seconds is the floor a real operator can vote within;
+/// values below this almost always indicate a misconfigured
+/// unit (seconds vs. milliseconds).
+pub const APPROVAL_TOKEN_TTL_MIN_SECS: u64 = 30;
+
+/// Maximum allowed token TTL after operator-config clamping.
+/// 24 hours is the spec's documented ceiling — anything longer
+/// turns the one-shot token into an effective long-lived
+/// credential, defeating the purpose of binding to a single
+/// approval.
+pub const APPROVAL_TOKEN_TTL_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// Back-compat alias for callers that want the default TTL in
+/// milliseconds. New code should call
+/// [`clamp_approval_token_ttl_secs`] on the configured value and
+/// multiply by 1000 at the mint site.
+pub const APPROVAL_TOKEN_TTL_MS: i64 = (APPROVAL_TOKEN_TTL_DEFAULT_SECS as i64) * 1000;
+
+/// DEFERRED 1: clamp an operator-supplied TTL (in seconds) to
+/// the allowed `[MIN, MAX]` window. `None` returns the default.
+/// Pure function — exposed so the controller startup logs the
+/// effective value and tests pin the contract.
+pub fn clamp_approval_token_ttl_secs(configured: Option<u64>) -> u64 {
+    configured
+        .unwrap_or(APPROVAL_TOKEN_TTL_DEFAULT_SECS)
+        .clamp(APPROVAL_TOKEN_TTL_MIN_SECS, APPROVAL_TOKEN_TTL_MAX_SECS)
+}
 
 /// Wire arg: `approval_id|decision|decided_by|note`.
 /// `decision` is `approved` or `rejected`.
@@ -307,12 +341,19 @@ pub const APPROVAL_TOKEN_TTL_MS: i64 = 5 * 60 * 1000;
 /// flips on the row) but no token is returned, so operators see
 /// `ok\n` and the caller cannot mint admission-time proof.
 /// Fail-loud: the controller logs the missing env var at boot.
+///
+/// DEFERRED 1: `token_ttl_secs` is the operator-configured TTL
+/// AFTER controller-startup clamping via
+/// [`clamp_approval_token_ttl_secs`]. The handler does not
+/// re-clamp — the caller MUST already have done so. Passing an
+/// out-of-range value is a caller bug, not a security issue.
 pub fn handle_approval_decide(
     store: &AgentStore,
     ctx: &InvocationCtx,
     resume_task: &TaskResumeFn,
     fail_task: &TaskResumeFn,
     signing_key: &[u8],
+    token_ttl_secs: u64,
 ) -> HandlerOutcome {
     let s = match std::str::from_utf8(&ctx.args) {
         Ok(s) => s,
@@ -370,13 +411,19 @@ pub fn handle_approval_decide(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
+            // DEFERRED 1: token_ttl_secs comes from the
+            // operator-configured `[approval] approval_token_ttl_secs`
+            // (clamped at startup). Convert to ms at the mint
+            // site so the token's `expires_at_ms` field stays
+            // in the wire-native unit.
+            let ttl_ms = (token_ttl_secs as i64).saturating_mul(1000);
             match crate::approval::ApprovalToken::issue(
                 &meta.approval_id,
                 &meta.method,
                 &meta.subject_id,
                 meta.task_id.as_deref().unwrap_or(""),
                 issued_at_ms,
-                APPROVAL_TOKEN_TTL_MS,
+                ttl_ms,
                 signing_key,
             ) {
                 Ok(wire) => format!("ok|{wire}\n"),
@@ -733,6 +780,7 @@ mod tests {
             &resume,
             &fail,
             &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
         ));
         assert!(body.starts_with("ok|"));
         let wire = body.trim_start_matches("ok|").trim();
@@ -764,6 +812,7 @@ mod tests {
             &resume,
             &fail,
             &[],
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
         ));
         assert_eq!(body, "ok\n");
     }
@@ -783,6 +832,7 @@ mod tests {
             &resume,
             &fail,
             &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
         ));
         assert_eq!(body, "ok\n");
     }
@@ -815,6 +865,7 @@ mod tests {
             &resume,
             &fail,
             &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
         );
         assert_eq!(resumed.lock().unwrap().as_deref(), Some("task-42"));
         assert!(failed.lock().unwrap().is_none());
@@ -840,6 +891,7 @@ mod tests {
             &resume,
             &fail,
             &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
         );
         assert_eq!(failed.lock().unwrap().as_deref(), Some("task-99"));
     }
@@ -873,11 +925,116 @@ mod tests {
             &resume,
             &fail,
             &test_signing_key(),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS,
         ));
         // Cleanly approves (returns the one-shot signed
         // token) but never invokes either closure.
         assert!(body.starts_with("ok|"));
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // ── DEFERRED 1: configurable token TTL ──────────────
+
+    #[test]
+    fn clamp_token_ttl_returns_default_when_unset() {
+        assert_eq!(
+            clamp_approval_token_ttl_secs(None),
+            APPROVAL_TOKEN_TTL_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn clamp_token_ttl_clamps_below_min_to_30s() {
+        assert_eq!(
+            clamp_approval_token_ttl_secs(Some(0)),
+            APPROVAL_TOKEN_TTL_MIN_SECS
+        );
+        assert_eq!(
+            clamp_approval_token_ttl_secs(Some(1)),
+            APPROVAL_TOKEN_TTL_MIN_SECS
+        );
+        assert_eq!(
+            clamp_approval_token_ttl_secs(Some(29)),
+            APPROVAL_TOKEN_TTL_MIN_SECS
+        );
+    }
+
+    #[test]
+    fn clamp_token_ttl_clamps_above_max_to_86400s() {
+        assert_eq!(
+            clamp_approval_token_ttl_secs(Some(86_401)),
+            APPROVAL_TOKEN_TTL_MAX_SECS
+        );
+        assert_eq!(
+            clamp_approval_token_ttl_secs(Some(u64::MAX)),
+            APPROVAL_TOKEN_TTL_MAX_SECS
+        );
+    }
+
+    #[test]
+    fn clamp_token_ttl_passes_value_through_when_in_range() {
+        assert_eq!(clamp_approval_token_ttl_secs(Some(30)), 30);
+        assert_eq!(clamp_approval_token_ttl_secs(Some(60)), 60);
+        assert_eq!(clamp_approval_token_ttl_secs(Some(3600)), 3600);
+        assert_eq!(clamp_approval_token_ttl_secs(Some(86_400)), 86_400);
+    }
+
+    #[test]
+    fn approval_decide_with_60s_ttl_mints_token_with_60s_expiry() {
+        let s = store();
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .unwrap();
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{id}|approved|alice|ok");
+        let body = ok_body(handle_approval_decide(
+            &s,
+            &fake_ctx(arg.as_bytes()),
+            &resume,
+            &fail,
+            &test_signing_key(),
+            60,
+        ));
+        let wire = body.trim_start_matches("ok|").trim();
+        let tok = crate::approval::ApprovalToken::parse(wire).unwrap();
+        // Token must expire within ~60s of issue. The handler
+        // uses wall-clock now() for `issued_at_ms`, so we
+        // verify the delta is the requested TTL converted to
+        // milliseconds.
+        let delta_ms = tok.expires_at_ms - tok.issued_at_ms;
+        assert_eq!(
+            delta_ms, 60_000,
+            "60s TTL must mint a 60_000ms-window token"
+        );
+    }
+
+    #[test]
+    fn approval_decide_with_3600s_ttl_mints_long_lived_token() {
+        let s = store();
+        let id = s
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999)
+            .unwrap();
+        let resume: TaskResumeFn = Arc::new(|_| Ok(()));
+        let fail: TaskResumeFn = Arc::new(|_| Ok(()));
+        let arg = format!("{id}|approved|alice|ok");
+        let body = ok_body(handle_approval_decide(
+            &s,
+            &fake_ctx(arg.as_bytes()),
+            &resume,
+            &fail,
+            &test_signing_key(),
+            3_600,
+        ));
+        let wire = body.trim_start_matches("ok|").trim();
+        let tok = crate::approval::ApprovalToken::parse(wire).unwrap();
+        let delta_ms = tok.expires_at_ms - tok.issued_at_ms;
+        assert_eq!(delta_ms, 3_600_000, "3600s TTL must mint a 1h-window token");
+        // And the token IS valid 60s after issue (the
+        // structural check; the gate's time check would also
+        // pass at any time in the window).
+        tok.check_not_expired(tok.issued_at_ms + 60_000)
+            .expect("3600s token is still valid at issued+60s");
     }
 
     #[test]
