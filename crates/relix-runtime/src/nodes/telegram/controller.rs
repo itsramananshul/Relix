@@ -266,90 +266,127 @@ async fn handle_one_update_inner(
             let _ = send_text(api, msg.chat_id, msg.message_id, "🧹 Memory cleared.").await;
         }
         Command::Approve(approval_id) => {
-            // Operator-only. Reject when the caller's
-            // chat isn't the configured operator chat.
-            if cfg.operator_chat_id == 0 || msg.chat_id != cfg.operator_chat_id {
-                let _ = send_text(
-                    api,
-                    msg.chat_id,
-                    msg.message_id,
-                    "Approval commands are operator-only.",
-                )
+            handle_approval_decision(api, out, cfg, msg, &approval_id, "approved", "/approve")
                 .await;
-                return;
-            }
-            let approval_id = approval_id.trim();
-            if approval_id.is_empty() {
-                let _ = send_text(
-                    api,
-                    msg.chat_id,
-                    msg.message_id,
-                    "Usage: /approve <approval_id>",
-                )
-                .await;
-                return;
-            }
-            let decided_by = format!("telegram:{}", msg.user_id);
-            let body = if let Some(o) = out {
-                match o
-                    .approval_decide(approval_id, "approved", &decided_by, "")
-                    .await
-                {
-                    Some(b) => {
-                        let trimmed = b.trim();
-                        if let Some(token) = trimmed.strip_prefix("ok|") {
-                            format!("✅ Approved {approval_id}.\nToken: {token}")
-                        } else {
-                            format!("✅ Approved {approval_id}.")
-                        }
-                    }
-                    None => format!("⚠️ Failed to decide approval {approval_id}."),
-                }
-            } else {
-                "⚠️ Coordinator unreachable.".to_string()
-            };
-            let _ = send_text(api, msg.chat_id, msg.message_id, &body).await;
         }
         Command::Reject(approval_id) => {
-            if cfg.operator_chat_id == 0 || msg.chat_id != cfg.operator_chat_id {
-                let _ = send_text(
-                    api,
-                    msg.chat_id,
-                    msg.message_id,
-                    "Approval commands are operator-only.",
-                )
-                .await;
-                return;
-            }
-            let approval_id = approval_id.trim();
-            if approval_id.is_empty() {
-                let _ = send_text(
-                    api,
-                    msg.chat_id,
-                    msg.message_id,
-                    "Usage: /reject <approval_id>",
-                )
-                .await;
-                return;
-            }
-            let decided_by = format!("telegram:{}", msg.user_id);
-            let body = if let Some(o) = out {
-                match o
-                    .approval_decide(approval_id, "rejected", &decided_by, "via=telegram")
-                    .await
-                {
-                    Some(_) => format!("❌ Rejected {approval_id}."),
-                    None => format!("⚠️ Failed to decide approval {approval_id}."),
-                }
-            } else {
-                "⚠️ Coordinator unreachable.".to_string()
-            };
-            let _ = send_text(api, msg.chat_id, msg.message_id, &body).await;
+            handle_approval_decision(api, out, cfg, msg, &approval_id, "rejected", "/reject").await;
         }
         Command::Chat(text) => {
             run_chat_flow(api, out, state, cfg, msg, &text).await;
         }
     }
+}
+
+/// FIX 7 — shared approve/deny pipeline. The new contract:
+///
+/// 1. Fetch the approval row via `coord.approval.get` so the
+///    controller can both verify it exists and read its
+///    `authorized_approvers` allow-list.
+/// 2. Verify the caller's Telegram chat_id (rendered as
+///    `telegram:<id>`) is listed in `authorized_approvers`.
+///    The legacy `operator_chat_id` config still admits when
+///    it is set + matches — backwards-compatible escape hatch
+///    so a deployment that hasn't yet populated
+///    `authorized_approvers` keeps working.
+/// 3. Call `approval.record_decision` (NOT the legacy
+///    `coord.approval.decide` path) so the documented
+///    coordinator cap flips the row + fires the escalation
+///    cancel signal.
+///
+/// Unauthorised callers get a friendly reply and the decision
+/// is NOT recorded. The function NEVER touches any store
+/// directly — every state transition goes through a cap.
+async fn handle_approval_decision(
+    api: &dyn BotApi,
+    out: Option<&dyn TelegramOutbound>,
+    cfg: &TelegramNodeConfig,
+    msg: &IncomingMessage,
+    approval_id: &str,
+    decision: &'static str, // "approved" | "rejected"
+    cmd_tag: &'static str,  // "/approve" | "/reject"
+) {
+    let approval_id = approval_id.trim();
+    if approval_id.is_empty() {
+        let _ = send_text(
+            api,
+            msg.chat_id,
+            msg.message_id,
+            &format!("Usage: {cmd_tag} <approval_id>"),
+        )
+        .await;
+        return;
+    }
+    let Some(o) = out else {
+        let _ = send_text(
+            api,
+            msg.chat_id,
+            msg.message_id,
+            "⚠️ Coordinator unreachable.",
+        )
+        .await;
+        return;
+    };
+    // Step 1: verify existence via coord.approval.get.
+    let row = match o.approval_get(approval_id).await {
+        Some(v) => v,
+        None => {
+            let _ = send_text(
+                api,
+                msg.chat_id,
+                msg.message_id,
+                &format!("⚠️ Approval {approval_id} not found."),
+            )
+            .await;
+            return;
+        }
+    };
+    // Step 2: chat_id authorisation. The legacy
+    // `operator_chat_id` config still admits as a
+    // backwards-compatible escape hatch (a deployment that
+    // hasn't migrated to `authorized_approvers` keeps
+    // working). The PRIMARY gate is the per-approval
+    // `authorized_approvers` list — operators wire this when
+    // creating approval requests destined for Telegram.
+    let caller_token = format!("telegram:{}", msg.user_id);
+    let operator_chat_admits = cfg.operator_chat_id != 0 && msg.chat_id == cfg.operator_chat_id;
+    let listed = row
+        .get("authorized_approvers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .any(|x| x.as_str() == Some(caller_token.as_str()))
+        })
+        .unwrap_or(false);
+    if !operator_chat_admits && !listed {
+        let _ = send_text(
+            api,
+            msg.chat_id,
+            msg.message_id,
+            &format!(
+                "🚫 You are not an authorised approver for {approval_id}. \
+                 Ask an operator to add `telegram:{}` to the approval's \
+                 `authorized_approvers` list.",
+                msg.user_id
+            ),
+        )
+        .await;
+        return;
+    }
+    // Step 3: record the decision via the documented cap.
+    let note = format!("via=telegram chat_id={}", msg.chat_id);
+    let body = match o
+        .approval_record_decision(approval_id, decision, &note)
+        .await
+    {
+        Some(_) => match decision {
+            "approved" => format!("✅ Approved {approval_id}."),
+            "rejected" => format!("❌ Rejected {approval_id}."),
+            other => format!("Recorded decision={other} for {approval_id}."),
+        },
+        None => format!("⚠️ Failed to record decision for {approval_id}."),
+    };
+    let _ = send_text(api, msg.chat_id, msg.message_id, &body).await;
 }
 
 /// Inline `/status` body rendered locally so the handler
@@ -656,6 +693,14 @@ mod tests {
         task_list_reply: Mutex<Vec<(String, String, String)>>,
         audio_reply: Mutex<Option<String>>,
         audio_calls: Mutex<Vec<Vec<u8>>>,
+        // FIX 7: per-approval-id `approval.get` reply staging.
+        // Empty ⇒ `approval_get` returns None (controller maps
+        // to "approval not found").
+        approval_get_replies: Mutex<std::collections::HashMap<String, serde_json::Value>>,
+        // FIX 7: recorded `approval.record_decision` calls
+        // — (approval_id, decision, note). Tests assert
+        // exactly which calls landed.
+        approval_record_calls: Mutex<Vec<(String, String, String)>>,
     }
 
     #[async_trait]
@@ -730,6 +775,26 @@ mod tests {
             } else {
                 Some("ok\n".to_string())
             }
+        }
+        async fn approval_get(&self, approval_id: &str) -> Option<serde_json::Value> {
+            self.approval_get_replies
+                .lock()
+                .unwrap()
+                .get(approval_id)
+                .cloned()
+        }
+        async fn approval_record_decision(
+            &self,
+            approval_id: &str,
+            decision: &str,
+            note: &str,
+        ) -> Option<String> {
+            self.approval_record_calls.lock().unwrap().push((
+                approval_id.into(),
+                decision.into(),
+                note.into(),
+            ));
+            Some("{\"ok\":true}".into())
         }
         async fn tool_audio_transcribe(&self, audio_bytes: Vec<u8>) -> Option<String> {
             self.audio_calls.lock().unwrap().push(audio_bytes);
@@ -949,40 +1014,167 @@ mod tests {
         assert!(api.sent_messages()[0].text.contains("Memory cleared"));
     }
 
+    /// FIX 7: a non-existent approval (no stub reply) yields
+    /// "not found" — the get-first contract.
     #[tokio::test]
-    async fn approve_command_requires_operator_chat() {
+    async fn fix7_approve_command_unknown_approval_id_returns_not_found() {
         let api = MockBotApi::new();
         let out = StubOutbound::default();
         let state = state_online();
         let ring = MessageRing::new(50);
-        // Different operator chat — caller is in 100, operator is 999.
-        let cfg = cfg_with_operator(999);
+        // operator_chat matches so the legacy escape hatch is
+        // open; the get-first contract still rejects because
+        // the approval row doesn't exist.
+        let cfg = cfg_with_operator(100);
         handle_one_update(
             &api,
             Some(&out),
             &state,
             &ring,
             &cfg,
-            &msg("/approve task-1"),
+            &msg("/approve apr-missing"),
         )
         .await;
         let sent = api.sent_messages();
-        assert!(sent[0].text.contains("operator\\-only"));
-        assert!(out.task_events.lock().unwrap().is_empty());
+        assert!(
+            sent[0].text.contains("not found"),
+            "expected `not found` in: {}",
+            sent[0].text
+        );
+        assert!(
+            out.approval_record_calls.lock().unwrap().is_empty(),
+            "no record_decision call should fire for a missing approval"
+        );
     }
 
+    /// FIX 7: chat_id NOT listed in `authorized_approvers` is
+    /// rejected with a friendly explanatory message AND no
+    /// state mutation. This is the new security gate.
     #[tokio::test]
-    async fn approve_command_from_operator_chat_calls_coord_approval_decide() {
+    async fn fix7_approve_command_unauthorized_chat_id_rejected() {
         let api = MockBotApi::new();
         let out = StubOutbound::default();
+        // Stage an approval that allow-lists a DIFFERENT chat.
+        out.approval_get_replies.lock().unwrap().insert(
+            "apr-1".into(),
+            serde_json::json!({
+                "approval_id": "apr-1",
+                "status": "pending",
+                "authorized_approvers": ["telegram:999"],
+            }),
+        );
         let state = state_online();
         let ring = MessageRing::new(50);
-        let mut cfg = cfg_with_operator(100); // matches msg.chat_id
-        cfg.allowed_users = vec![42];
-        // `/approve apr-1` — handler routes through
-        // `coord.approval.decide` via the stub. Stub returns
-        // `ok|<token>` for the "approved" decision, which the
-        // handler surfaces to the operator.
+        // No operator chat configured; only the per-approval
+        // allow-list applies. msg.user_id = 42; approval allows
+        // 999 — must be denied.
+        let cfg = cfg_default();
+        handle_one_update(
+            &api,
+            Some(&out),
+            &state,
+            &ring,
+            &cfg,
+            &msg("/approve apr-1"),
+        )
+        .await;
+        let sent = api.sent_messages();
+        assert!(
+            sent[0].text.contains("not an authorised approver"),
+            "expected authorization deny copy in: {}",
+            sent[0].text
+        );
+        assert!(
+            out.approval_record_calls.lock().unwrap().is_empty(),
+            "unauthorized caller must NEVER trigger record_decision"
+        );
+    }
+
+    /// FIX 7: chat_id LISTED in `authorized_approvers` is
+    /// admitted and calls `approval.record_decision`.
+    #[tokio::test]
+    async fn fix7_approve_command_authorized_chat_id_calls_record_decision() {
+        let api = MockBotApi::new();
+        let out = StubOutbound::default();
+        out.approval_get_replies.lock().unwrap().insert(
+            "apr-1".into(),
+            serde_json::json!({
+                "approval_id": "apr-1",
+                "status": "pending",
+                "authorized_approvers": ["telegram:42"],
+            }),
+        );
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        let cfg = cfg_default();
+        handle_one_update(
+            &api,
+            Some(&out),
+            &state,
+            &ring,
+            &cfg,
+            &msg("/approve apr-1"),
+        )
+        .await;
+        let sent = api.sent_messages();
+        assert!(
+            sent[0].text.contains("Approved apr\\-1"),
+            "expected approval ack in: {}",
+            sent[0].text
+        );
+        let calls = out.approval_record_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one record_decision call");
+        assert_eq!(calls[0].0, "apr-1");
+        assert_eq!(calls[0].1, "approved");
+        assert!(
+            calls[0].2.contains("via=telegram"),
+            "note must include via=telegram tag: {}",
+            calls[0].2
+        );
+    }
+
+    /// FIX 7: `/reject` end-to-end with an authorized chat.
+    #[tokio::test]
+    async fn fix7_reject_command_authorized_chat_id_calls_record_decision() {
+        let api = MockBotApi::new();
+        let out = StubOutbound::default();
+        out.approval_get_replies.lock().unwrap().insert(
+            "apr-1".into(),
+            serde_json::json!({
+                "approval_id": "apr-1",
+                "authorized_approvers": ["telegram:42"],
+            }),
+        );
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        let cfg = cfg_default();
+        handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("/reject apr-1")).await;
+        let sent = api.sent_messages();
+        assert!(sent[0].text.contains("Rejected apr\\-1"));
+        let calls = out.approval_record_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "rejected");
+    }
+
+    /// FIX 7: the legacy `operator_chat_id` escape hatch
+    /// still admits the operator chat even when no
+    /// `authorized_approvers` entry matches — backwards
+    /// compatibility for pre-FIX-7 deployments.
+    #[tokio::test]
+    async fn fix7_operator_chat_id_remains_a_backwards_compatible_escape_hatch() {
+        let api = MockBotApi::new();
+        let out = StubOutbound::default();
+        out.approval_get_replies.lock().unwrap().insert(
+            "apr-1".into(),
+            serde_json::json!({
+                "approval_id": "apr-1",
+                "authorized_approvers": [], // empty
+            }),
+        );
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        // msg.chat_id == 100; operator_chat_id matches.
+        let cfg = cfg_with_operator(100);
         handle_one_update(
             &api,
             Some(&out),
@@ -994,20 +1186,109 @@ mod tests {
         .await;
         let sent = api.sent_messages();
         assert!(sent[0].text.contains("Approved apr\\-1"));
-        assert!(sent[0].text.contains("Token: deadbeef"));
+        assert_eq!(out.approval_record_calls.lock().unwrap().len(), 1);
     }
 
+    /// FIX 7: empty approval_id surfaces a usage hint.
     #[tokio::test]
-    async fn reject_command_from_operator_chat_calls_coord_approval_decide() {
+    async fn fix7_approve_command_with_empty_id_surfaces_usage() {
         let api = MockBotApi::new();
         let out = StubOutbound::default();
         let state = state_online();
         let ring = MessageRing::new(50);
-        let mut cfg = cfg_with_operator(100);
-        cfg.allowed_users = vec![42];
-        handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("/reject apr-1")).await;
+        let cfg = cfg_default();
+        handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("/approve")).await;
         let sent = api.sent_messages();
-        assert!(sent[0].text.contains("Rejected apr\\-1"));
+        assert!(sent[0].text.contains("Usage"));
+        assert!(sent[0].text.contains("/approve"));
+        assert!(out.approval_record_calls.lock().unwrap().is_empty());
+    }
+
+    /// FIX 7: a transport failure on `approval.record_decision`
+    /// surfaces the friendly "Failed to record decision"
+    /// message rather than crashing.
+    #[tokio::test]
+    async fn fix7_record_decision_failure_surfaces_friendly_error() {
+        struct FailingRecord {
+            inner: StubOutbound,
+        }
+        #[async_trait]
+        impl TelegramOutbound for FailingRecord {
+            async fn memory_recent(&self, s: &str, n: usize) -> Vec<(String, String)> {
+                self.inner.memory_recent(s, n).await
+            }
+            async fn memory_write(&self, s: &str, r: &str, t: &str) {
+                self.inner.memory_write(s, r, t).await
+            }
+            async fn memory_agent_read(&self, s: &str) -> (String, String) {
+                self.inner.memory_agent_read(s).await
+            }
+            async fn memory_agent_clear(&self, s: &str) {
+                self.inner.memory_agent_clear(s).await
+            }
+            async fn ai_chat(&self, s: &str, p: &str, h: &str) -> Option<String> {
+                self.inner.ai_chat(s, p, h).await
+            }
+            async fn task_create(&self, t: &str, f: &str, p: &str, o: &str) -> Option<String> {
+                self.inner.task_create(t, f, p, o).await
+            }
+            async fn task_update_status(&self, t: &str, s: &str, r: &str) {
+                self.inner.task_update_status(t, s, r).await
+            }
+            async fn task_event(&self, t: &str, e: &str, p: &str) {
+                self.inner.task_event(t, e, p).await
+            }
+            async fn task_list(&self, f: Option<&str>, l: usize) -> Vec<(String, String, String)> {
+                self.inner.task_list(f, l).await
+            }
+            async fn approval_decide(&self, a: &str, d: &str, b: &str, n: &str) -> Option<String> {
+                self.inner.approval_decide(a, d, b, n).await
+            }
+            async fn approval_get(&self, a: &str) -> Option<serde_json::Value> {
+                self.inner.approval_get(a).await
+            }
+            async fn approval_record_decision(
+                &self,
+                _a: &str,
+                _d: &str,
+                _n: &str,
+            ) -> Option<String> {
+                // Simulate transport failure / responder
+                // INTERNAL error.
+                None
+            }
+            async fn tool_audio_transcribe(&self, b: Vec<u8>) -> Option<String> {
+                self.inner.tool_audio_transcribe(b).await
+            }
+        }
+        let api = MockBotApi::new();
+        let stub = StubOutbound::default();
+        stub.approval_get_replies.lock().unwrap().insert(
+            "apr-1".into(),
+            serde_json::json!({
+                "approval_id": "apr-1",
+                "authorized_approvers": ["telegram:42"],
+            }),
+        );
+        let out = FailingRecord { inner: stub };
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        let cfg = cfg_default();
+        handle_one_update(
+            &api,
+            Some(&out),
+            &state,
+            &ring,
+            &cfg,
+            &msg("/approve apr-1"),
+        )
+        .await;
+        let sent = api.sent_messages();
+        assert!(
+            sent[0].text.contains("Failed to record decision"),
+            "expected failure message in: {}",
+            sent[0].text
+        );
     }
 
     #[tokio::test]

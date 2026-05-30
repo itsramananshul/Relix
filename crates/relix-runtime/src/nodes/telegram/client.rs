@@ -77,6 +77,29 @@ pub trait TelegramOutbound: Send + Sync + 'static {
         decided_by: &str,
         note: &str,
     ) -> Option<String>;
+    /// FIX 7 — `coord.approval.get`: fetch the approval row
+    /// (including its `authorized_approvers` list) so the
+    /// Telegram controller can verify the caller's chat_id
+    /// before recording a decision. Returns the raw JSON body
+    /// the cap emits or `None` on transport / parse failure
+    /// (the controller maps that to "approval not found").
+    async fn approval_get(&self, _approval_id: &str) -> Option<serde_json::Value> {
+        None
+    }
+    /// FIX 7 — `approval.record_decision`: route the decision
+    /// through the documented coordinator cap that flips the
+    /// approval row + fires the cancel-escalation signal.
+    /// Returns the raw response body on success, `None` on
+    /// transport failure so the controller can surface a
+    /// friendly error.
+    async fn approval_record_decision(
+        &self,
+        _approval_id: &str,
+        _decision: &str,
+        _note: &str,
+    ) -> Option<String> {
+        None
+    }
     async fn task_list(
         &self,
         status_filter: Option<&str>,
@@ -448,6 +471,75 @@ impl TelegramOutboundClient {
         }
     }
 
+    /// FIX 7: `coord.approval.get` — fetch an approval row
+    /// by id. Returns the parsed JSON body or `None` on
+    /// transport / parse failure (the cap returns INVALID_ARGS
+    /// "not found" for missing ids, which surfaces here as a
+    /// `Mesh` error → mapped to `None` by the caller).
+    pub async fn approval_get(&self, approval_id: &str) -> Option<serde_json::Value> {
+        match self
+            .call_text(
+                &self.coord_alias,
+                "coord.approval.get",
+                self.coord_deadline_secs,
+                approval_id.as_bytes().to_vec(),
+            )
+            .await
+        {
+            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(error = %e, "telegram: coord.approval.get decode failed");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram: coord.approval.get failed");
+                None
+            }
+        }
+    }
+
+    /// FIX 7: `approval.record_decision` — flip the row + fire
+    /// the escalation cancel signal via the documented
+    /// coordinator cap (NOT the legacy `coord.approval.decide`
+    /// path). Wire args are `{ approval_id, decision, note }`
+    /// JSON per `approval/caps.rs::DecisionArgs`.
+    pub async fn approval_record_decision(
+        &self,
+        approval_id: &str,
+        decision: &str,
+        note: &str,
+    ) -> Option<String> {
+        let body = serde_json::json!({
+            "approval_id": approval_id,
+            "decision": decision,
+            "note": note,
+        });
+        let payload = match serde_json::to_vec(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram: approval.record_decision encode failed");
+                return None;
+            }
+        };
+        match self
+            .call_text(
+                &self.coord_alias,
+                "approval.record_decision",
+                self.coord_deadline_secs,
+                payload,
+            )
+            .await
+        {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram: approval.record_decision failed");
+                None
+            }
+        }
+    }
+
     /// `coord.approval.decide` — approve or reject a pending
     /// approval. Returns the response body verbatim
     /// (`ok\n` for reject, `ok|<token>\n` for approve).
@@ -636,6 +728,17 @@ impl TelegramOutbound for TelegramOutboundClient {
         note: &str,
     ) -> Option<String> {
         TelegramOutboundClient::approval_decide(self, approval_id, decision, decided_by, note).await
+    }
+    async fn approval_get(&self, approval_id: &str) -> Option<serde_json::Value> {
+        TelegramOutboundClient::approval_get(self, approval_id).await
+    }
+    async fn approval_record_decision(
+        &self,
+        approval_id: &str,
+        decision: &str,
+        note: &str,
+    ) -> Option<String> {
+        TelegramOutboundClient::approval_record_decision(self, approval_id, decision, note).await
     }
     async fn tool_audio_transcribe(&self, audio_bytes: Vec<u8>) -> Option<String> {
         TelegramOutboundClient::tool_audio_transcribe(self, audio_bytes).await
