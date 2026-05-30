@@ -40,6 +40,16 @@ pub struct TelegramConfig {
     /// Coordinator peer alias (matches a `[peers]` entry on
     /// the channel controller's TOML).
     pub coordinator_alias: String,
+
+    /// FIX 6: TTL hours for the session-mapping store. Sessions
+    /// (chat_id, message_id) -> task_id rows older than this
+    /// are deleted by the background sweep. Default 24h matches
+    /// Telegram's own conversation-staleness heuristic; raise
+    /// for long-running batch flows; lower if the dashboard's
+    /// session count is growing unbounded. The sweep runs every
+    /// hour regardless of this value.
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -59,6 +69,10 @@ fn default_rate() -> u32 {
 
 fn default_max_runtime() -> u32 {
     60
+}
+
+fn default_session_ttl_hours() -> u32 {
+    crate::session_store::DEFAULT_SESSION_TTL_HOURS
 }
 
 #[derive(Debug, thiserror::Error)]

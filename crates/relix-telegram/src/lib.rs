@@ -35,7 +35,10 @@ pub use live::{BotIdentity, LiveBotApi};
 pub use messages::{
     IncomingMessage, InlineKeyboardButton, InlineKeyboardMarkup, OutgoingMessage, ParseMode,
 };
-pub use session_store::{InMemorySessionStore, SessionStorage, SessionStore, SqliteSessionStore};
+pub use session_store::{
+    DEFAULT_SESSION_TTL_HOURS, DEFAULT_SWEEP_INTERVAL, InMemorySessionStore, SessionStorage,
+    SessionStore, SqliteSessionStore, spawn_session_sweeper,
+};
 
 use async_trait::async_trait;
 

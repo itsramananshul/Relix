@@ -33,5 +33,5 @@ rand.workspace       = true
 tempfile.workspace = true
 # Spin a localhost test server for the live-client tests.
 axum.workspace     = true
-tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "sync", "test-util"] }
 
