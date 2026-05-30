@@ -44,6 +44,7 @@ async fn chat_returns_mock_provider_reply_and_persists_turns() {
             agent_name: "assistant".into(),
             model: None,
             system_prompt: None,
+            tenant_id: None,
         })
         .await
         .expect("chat ok");
@@ -74,6 +75,7 @@ async fn chat_history_grows_across_sequential_turns_in_same_session() {
             agent_name: "alpha".into(),
             model: None,
             system_prompt: None,
+            tenant_id: None,
         })
         .await
         .expect("chat ok");
@@ -92,6 +94,7 @@ async fn chat_rejects_empty_session_id_and_empty_message() {
             agent_name: "a".into(),
             model: None,
             system_prompt: None,
+            tenant_id: None,
         })
         .await
         .expect_err("empty session_id should fail");
@@ -104,6 +107,7 @@ async fn chat_rejects_empty_session_id_and_empty_message() {
             agent_name: "a".into(),
             model: None,
             system_prompt: None,
+            tenant_id: None,
         })
         .await
         .expect_err("empty message should fail");
@@ -122,6 +126,7 @@ async fn memory_ingest_chunks_and_search_finds_a_keyword_in_the_subject() {
             content: body.into(),
             content_type: "markdown".into(),
             source: "notes.md".into(),
+            tenant_id: None,
         })
         .await
         .expect("ingest ok");
@@ -134,6 +139,7 @@ async fn memory_ingest_chunks_and_search_finds_a_keyword_in_the_subject() {
             query: "Pricing tier B".into(),
             subject_id: "u1".into(),
             limit: 5,
+            tenant_id: None,
         })
         .await
         .expect("search ok");
@@ -153,6 +159,7 @@ async fn memory_search_filters_to_subject_when_set() {
         content: "Alice loves pricing tier B".into(),
         content_type: "markdown".into(),
         source: "n.md".into(),
+        tenant_id: None,
     })
     .await
     .expect("ingest alice");
@@ -161,6 +168,7 @@ async fn memory_search_filters_to_subject_when_set() {
         content: "Bob also loves pricing tier B".into(),
         content_type: "markdown".into(),
         source: "n.md".into(),
+        tenant_id: None,
     })
     .await
     .expect("ingest bob");
@@ -170,6 +178,7 @@ async fn memory_search_filters_to_subject_when_set() {
             query: "tier B".into(),
             subject_id: "alice".into(),
             limit: 10,
+            tenant_id: None,
         })
         .await
         .expect("search ok");
@@ -187,6 +196,7 @@ async fn memory_ingest_rejects_unsupported_content_type() {
             content: "%PDF-...".into(),
             content_type: "pdf".into(),
             source: "x.pdf".into(),
+            tenant_id: None,
         })
         .await
         .expect_err("pdf is not embedded-mode supported");
@@ -202,6 +212,7 @@ async fn memory_ingest_rejects_empty_subject_or_content() {
             content: "x".into(),
             content_type: "markdown".into(),
             source: "n".into(),
+            tenant_id: None,
         })
         .await
         .is_err()
@@ -212,6 +223,7 @@ async fn memory_ingest_rejects_empty_subject_or_content() {
             content: "  ".into(),
             content_type: "markdown".into(),
             source: "n".into(),
+            tenant_id: None,
         })
         .await
         .is_err()
@@ -240,6 +252,7 @@ async fn two_runtimes_with_different_db_paths_are_isolated() {
             content: "alpha-only payload".into(),
             content_type: "markdown".into(),
             source: "n".into(),
+            tenant_id: None,
         })
         .await
         .expect("ingest alpha");
@@ -249,6 +262,7 @@ async fn two_runtimes_with_different_db_paths_are_isolated() {
             query: "alpha-only".into(),
             subject_id: "".into(),
             limit: 5,
+            tenant_id: None,
         })
         .await
         .expect("alpha search");
@@ -257,6 +271,7 @@ async fn two_runtimes_with_different_db_paths_are_isolated() {
             query: "alpha-only".into(),
             subject_id: "".into(),
             limit: 5,
+            tenant_id: None,
         })
         .await
         .expect("beta search");
@@ -282,6 +297,7 @@ async fn memory_db_persists_across_runtime_instances_at_the_same_path() {
             content: "persistent payload across restarts".into(),
             content_type: "markdown".into(),
             source: "n".into(),
+            tenant_id: None,
         })
         .await
         .expect("ingest");
@@ -298,8 +314,237 @@ async fn memory_db_persists_across_runtime_instances_at_the_same_path() {
             query: "persistent payload".into(),
             subject_id: "".into(),
             limit: 5,
+            tenant_id: None,
         })
         .await
         .expect("search");
     assert!(!hits.is_empty(), "second runtime must see first's writes");
+}
+
+// ─── PART 6: tenant-isolation in the embedded runtime ────────
+
+async fn isolated_runtime() -> RelixEmbedded {
+    RelixEmbedded::builder()
+        .provider(Arc::new(MockProvider))
+        .tenant_isolation(true)
+        .build()
+        .await
+        .expect("build embedded runtime with tenant_isolation")
+}
+
+#[tokio::test]
+async fn fix_part6_tenant_isolation_off_by_default() {
+    // Pre-PART-6 callers see no behaviour change.
+    let r = mock_runtime().await;
+    assert!(!r.tenant_isolation_enabled());
+    assert!(r.default_tenant_id().is_none());
+}
+
+#[tokio::test]
+async fn fix_part6_builder_threads_default_tenant_id_and_isolation_flag() {
+    let r = RelixEmbedded::builder()
+        .provider(Arc::new(MockProvider))
+        .default_tenant_id("acme")
+        .tenant_isolation(true)
+        .build()
+        .await
+        .expect("build");
+    assert!(r.tenant_isolation_enabled());
+    assert_eq!(r.default_tenant_id(), Some("acme"));
+}
+
+#[tokio::test]
+async fn fix_part6_default_tenant_id_filters_whitespace_only_input() {
+    // `default_tenant_id("   ")` should NOT bind an empty
+    // tenant; it's equivalent to "no default set".
+    let r = RelixEmbedded::builder()
+        .provider(Arc::new(MockProvider))
+        .default_tenant_id("   ")
+        .build()
+        .await
+        .expect("build");
+    assert!(r.default_tenant_id().is_none());
+}
+
+#[tokio::test]
+async fn fix_part6_chat_fails_closed_on_missing_tenant_in_isolation_mode() {
+    let r = isolated_runtime().await;
+    let err = r
+        .chat(ChatInput {
+            session_id: "u".into(),
+            message: "hi".into(),
+            agent_name: "alpha".into(),
+            model: None,
+            system_prompt: None,
+            tenant_id: None,
+        })
+        .await
+        .expect_err("chat should reject missing tenant");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tenant_id required") && msg.contains("chat"),
+        "expected MissingTenant chat error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn fix_part6_chat_per_call_tenant_overrides_default() {
+    let r = RelixEmbedded::builder()
+        .provider(Arc::new(MockProvider))
+        .default_tenant_id("acme")
+        .tenant_isolation(true)
+        .build()
+        .await
+        .expect("build");
+    let response = r
+        .chat(ChatInput {
+            session_id: "u".into(),
+            message: "ping".into(),
+            agent_name: "alpha".into(),
+            model: None,
+            system_prompt: None,
+            tenant_id: Some("globex".into()),
+        })
+        .await
+        .expect("chat with per-call tenant ok");
+    assert!(response.text.contains("ping"));
+}
+
+#[tokio::test]
+async fn fix_part6_chat_default_tenant_satisfies_isolation_gate() {
+    let r = RelixEmbedded::builder()
+        .provider(Arc::new(MockProvider))
+        .default_tenant_id("acme")
+        .tenant_isolation(true)
+        .build()
+        .await
+        .expect("build");
+    // No per-call tenant → builder default takes over → gate passes.
+    let response = r
+        .chat(ChatInput {
+            session_id: "u".into(),
+            message: "ping".into(),
+            agent_name: "alpha".into(),
+            model: None,
+            system_prompt: None,
+            tenant_id: None,
+        })
+        .await
+        .expect("default tenant satisfies the gate");
+    assert!(response.text.contains("ping"));
+}
+
+#[tokio::test]
+async fn fix_part6_memory_ingest_and_search_isolate_per_tenant() {
+    let r = isolated_runtime().await;
+    // Tenant A ingests something Tenant B should NOT see.
+    r.memory_ingest_document(MemoryIngestInput {
+        subject_id: "user".into(),
+        content: "acme tenant payload".into(),
+        content_type: "txt".into(),
+        source: "doc-a".into(),
+        tenant_id: Some("acme".into()),
+    })
+    .await
+    .expect("ingest A");
+    r.memory_ingest_document(MemoryIngestInput {
+        subject_id: "user".into(),
+        content: "globex tenant payload".into(),
+        content_type: "txt".into(),
+        source: "doc-b".into(),
+        tenant_id: Some("globex".into()),
+    })
+    .await
+    .expect("ingest B");
+    // Search as A — sees only A's chunk.
+    let a_hits = r
+        .memory_search(MemorySearchInput {
+            query: "tenant payload".into(),
+            subject_id: "".into(),
+            limit: 10,
+            tenant_id: Some("acme".into()),
+        })
+        .await
+        .expect("search A");
+    assert_eq!(a_hits.len(), 1);
+    assert!(a_hits[0].text.contains("acme"));
+    // Search as B — sees only B's chunk.
+    let b_hits = r
+        .memory_search(MemorySearchInput {
+            query: "tenant payload".into(),
+            subject_id: "".into(),
+            limit: 10,
+            tenant_id: Some("globex".into()),
+        })
+        .await
+        .expect("search B");
+    assert_eq!(b_hits.len(), 1);
+    assert!(b_hits[0].text.contains("globex"));
+}
+
+#[tokio::test]
+async fn fix_part6_memory_search_fails_closed_on_missing_tenant() {
+    let r = isolated_runtime().await;
+    let err = r
+        .memory_search(MemorySearchInput {
+            query: "anything".into(),
+            subject_id: "".into(),
+            limit: 5,
+            tenant_id: None,
+        })
+        .await
+        .expect_err("missing tenant should reject");
+    assert!(err.to_string().contains("memory_search"));
+}
+
+#[tokio::test]
+async fn fix_part6_memory_ingest_fails_closed_on_missing_tenant() {
+    let r = isolated_runtime().await;
+    let err = r
+        .memory_ingest_document(MemoryIngestInput {
+            subject_id: "user".into(),
+            content: "anything".into(),
+            content_type: "txt".into(),
+            source: "doc".into(),
+            tenant_id: None,
+        })
+        .await
+        .expect_err("missing tenant should reject");
+    assert!(err.to_string().contains("memory_ingest_document"));
+}
+
+#[tokio::test]
+async fn fix_part6_legacy_callers_unaffected_when_isolation_off() {
+    // With tenant_isolation = false (default), every operation
+    // accepts a missing tenant id and behaves as pre-PART-6.
+    let r = mock_runtime().await;
+    r.chat(ChatInput {
+        session_id: "u".into(),
+        message: "hi".into(),
+        agent_name: "alpha".into(),
+        model: None,
+        system_prompt: None,
+        tenant_id: None,
+    })
+    .await
+    .expect("legacy chat ok");
+    r.memory_ingest_document(MemoryIngestInput {
+        subject_id: "user".into(),
+        content: "legacy payload".into(),
+        content_type: "txt".into(),
+        source: "doc".into(),
+        tenant_id: None,
+    })
+    .await
+    .expect("legacy ingest ok");
+    let hits = r
+        .memory_search(MemorySearchInput {
+            query: "legacy payload".into(),
+            subject_id: "".into(),
+            limit: 10,
+            tenant_id: None,
+        })
+        .await
+        .expect("legacy search ok");
+    assert!(!hits.is_empty());
 }

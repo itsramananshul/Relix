@@ -52,6 +52,14 @@ pub struct MemoryIngestInput {
     /// as a `source:<label>` tag for downstream filtering. May be
     /// empty.
     pub source: String,
+    /// PART 6 — tenant the chunks are written under. `None`
+    /// or empty falls back to the runtime's
+    /// [`RelixEmbedded::default_tenant_id`]. When the runtime
+    /// has `tenant_isolation = true` AND neither value
+    /// resolves, the call returns
+    /// [`EmbeddedError::MissingTenant`].
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// Return value of `memory_ingest_document`.
@@ -79,6 +87,18 @@ pub struct MemorySearchInput {
     pub subject_id: String,
     /// Max rows. Clamped to `[1, 1000]` by the store.
     pub limit: usize,
+    /// PART 6 — tenant the search runs against. `None` or
+    /// empty falls back to the runtime's
+    /// [`RelixEmbedded::default_tenant_id`]. When the runtime
+    /// has `tenant_isolation = true` AND neither value
+    /// resolves, the call returns
+    /// [`EmbeddedError::MissingTenant`]. When the runtime is
+    /// tenant-isolated AND a tenant resolves, only rows whose
+    /// `tenant_id` column matches are returned — the SQLite
+    /// `WHERE tenant_id = ?` filter ships with the store's
+    /// `text_search_for_tenant` method.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// One row returned by `memory_search`.
@@ -140,6 +160,15 @@ impl RelixEmbedded {
             )));
         }
 
+        // PART 6: resolve the effective tenant + stamp every
+        // chunk row's `tenant_id` so tenant-aware reads
+        // (`text_search_for_tenant`, `get_for_tenant`) filter
+        // correctly. `resolve_tenant` returns
+        // `Err(MissingTenant)` when tenant_isolation is on
+        // AND nothing resolves.
+        let tenant_for_chunks =
+            self.resolve_tenant(input.tenant_id.as_deref(), "memory_ingest_document")?;
+
         let store = self.memory_store().clone();
         let subject_id = input.subject_id.clone();
         let source_tag = input.source.clone();
@@ -150,6 +179,7 @@ impl RelixEmbedded {
                 let id = chunk_id(&subject_id, &source_tag, idx, &chunk);
                 let mut record = MemoryRecord::new_raw(id, chunk, &subject_id);
                 record.layer = MemoryLayer::Semantic;
+                record.tenant_id = tenant_for_chunks.clone();
                 if !source_tag.is_empty() {
                     record.tags.push(format!("source:{source_tag}"));
                 }
@@ -174,17 +204,38 @@ impl RelixEmbedded {
     /// Substring search over Layer 1 + 2 records. When
     /// `subject_id` is non-empty, only rows whose `source` column
     /// equals `subject_id` are returned.
+    ///
+    /// PART 6: when the runtime has `tenant_isolation = true`,
+    /// the search runs through
+    /// [`LayeredMemoryStore::text_search_for_tenant`] so
+    /// every returned row's `tenant_id` matches the
+    /// resolved tenant. A missing tenant id (per-call empty
+    /// AND `default_tenant_id` unset) returns
+    /// [`EmbeddedError::MissingTenant`]. When isolation is
+    /// off, the legacy tenant-blind path runs (every row
+    /// regardless of tenant column).
     pub async fn memory_search(
         &self,
         input: MemorySearchInput,
     ) -> Result<Vec<MemoryHit>, EmbeddedError> {
         let limit = if input.limit == 0 { 5 } else { input.limit };
+        // PART 6: resolve the effective tenant. Returns
+        // `Err(MissingTenant)` when isolation is on AND
+        // nothing resolves.
+        let tenant = self.resolve_tenant(input.tenant_id.as_deref(), "memory_search")?;
+        let isolation_on = self.tenant_isolation_enabled();
         let store = self.memory_store().clone();
         let query = input.query.clone();
         let subject_id = input.subject_id.clone();
-        let raw = tokio::task::spawn_blocking(move || store.text_search(&query, limit))
-            .await
-            .map_err(|e| EmbeddedError::Config(format!("search task: {e}")))??;
+        let raw = tokio::task::spawn_blocking(move || {
+            if isolation_on {
+                store.text_search_for_tenant(&query, limit, tenant.as_deref())
+            } else {
+                store.text_search(&query, limit)
+            }
+        })
+        .await
+        .map_err(|e| EmbeddedError::Config(format!("search task: {e}")))??;
         let filtered: Vec<MemoryHit> = raw
             .into_iter()
             .filter(|r| subject_id.is_empty() || r.source == subject_id)

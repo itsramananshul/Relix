@@ -70,6 +70,20 @@ pub struct ChatInput {
     pub model: Option<String>,
     /// Optional system-prompt override.
     pub system_prompt: Option<String>,
+    /// PART 6 — tenant the persisted raw-turn rows are
+    /// written under. `None` or empty falls back to the
+    /// runtime's [`crate::RelixEmbedded::default_tenant_id`].
+    /// When the runtime has `tenant_isolation = true` AND
+    /// neither value resolves, the call returns
+    /// [`crate::EmbeddedError::MissingTenant`]. The in-process
+    /// history ring is keyed by `session_id` alone — tenant
+    /// isolation is enforced at the persistence layer only.
+    /// (Callers that need cross-tenant session isolation
+    /// must namespace their `session_id` themselves; this
+    /// matches the bridge surface where `session_id` is the
+    /// caller-controlled string.)
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// Return value of [`RelixEmbedded::chat`](crate::RelixEmbedded::chat).
@@ -157,6 +171,11 @@ impl RelixEmbedded {
                 "chat input requires a non-empty message".into(),
             ));
         }
+        // PART 6: resolve the effective tenant up-front so a
+        // missing tenant in isolation mode fails BEFORE we
+        // call the provider (no wasted API hit, no orphan
+        // history-ring entries).
+        let tenant_for_turns = self.resolve_tenant(input.tenant_id.as_deref(), "chat")?;
 
         let history = self.history_store_ref().render(&input.session_id);
         let model = match input.model.as_deref() {
@@ -193,14 +212,24 @@ impl RelixEmbedded {
         // is best-effort because the in-process ring is the source
         // of truth for the next chat's history pull; if SQLite
         // write fails we log a warning but still return the reply.
-        if let Err(e) = persist_turn(self, &input.session_id, &user_line) {
+        if let Err(e) = persist_turn(
+            self,
+            &input.session_id,
+            &user_line,
+            tenant_for_turns.as_deref(),
+        ) {
             tracing::warn!(
                 session_id = %input.session_id,
                 error = %e,
                 "embedded chat: failed to persist user turn (continuing)"
             );
         }
-        if let Err(e) = persist_turn(self, &input.session_id, &assistant_line) {
+        if let Err(e) = persist_turn(
+            self,
+            &input.session_id,
+            &assistant_line,
+            tenant_for_turns.as_deref(),
+        ) {
             tracing::warn!(
                 session_id = %input.session_id,
                 error = %e,
@@ -231,10 +260,17 @@ fn persist_turn(
     runtime: &RelixEmbedded,
     session_id: &str,
     line: &str,
+    tenant_id: Option<&str>,
 ) -> Result<(), EmbeddedError> {
     let id = turn_id(session_id, line);
     let mut record = MemoryRecord::new_raw(id, line, session_id);
     record.layer = MemoryLayer::Raw;
+    // PART 6: stamp the resolved tenant so tenant-aware
+    // memory reads (`text_search_for_tenant`,
+    // `get_for_tenant`) only return rows belonging to the
+    // querying tenant. `None` keeps the legacy untagged
+    // behaviour for `tenant_isolation = false` callers.
+    record.tenant_id = tenant_id.map(|s| s.to_string());
     runtime.memory_store().insert(&record)?;
     Ok(())
 }

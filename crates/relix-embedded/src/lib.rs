@@ -59,6 +59,7 @@
 //!         agent_name: "assistant".into(),
 //!         model: None,
 //!         system_prompt: None,
+//!         tenant_id: None,
 //!     })
 //!     .await?;
 //! println!("{}", response.text);
@@ -70,6 +71,7 @@
 //!         content: "Pricing tier B is $99/mo".into(),
 //!         content_type: "markdown".into(),
 //!         source: "notes.md".into(),
+//!         tenant_id: None,
 //!     })
 //!     .await?;
 //!
@@ -79,6 +81,7 @@
 //!         query: "pricing".into(),
 //!         subject_id: "user-123".into(),
 //!         limit: 5,
+//!         tenant_id: None,
 //!     })
 //!     .await?;
 //! for hit in hits {
@@ -120,6 +123,18 @@ pub enum EmbeddedError {
     /// content type).
     #[error("ingest: {0}")]
     Ingest(String),
+    /// PART 6 — `tenant_isolation` is enabled on the embedded
+    /// runtime AND no tenant id was supplied (per-call input
+    /// nor [`RelixEmbedded::default_tenant_id`]). Returned by
+    /// `chat`, `memory_search`, `memory_ingest_document`.
+    /// Operators get a precise error message naming the
+    /// operation that hit the gate.
+    #[error("tenant: tenant_id required for {op} in multi-tenant mode")]
+    MissingTenant {
+        /// Name of the embedded operation that triggered the
+        /// gate (`"chat"`, `"memory_search"`, etc.).
+        op: &'static str,
+    },
 }
 
 /// The in-process Relix runtime. Cheap to clone — `LayeredMemoryStore`
@@ -138,6 +153,24 @@ pub struct RelixEmbedded {
     default_model: String,
     chunk_size_chars: usize,
     history: Arc<HistoryStore>,
+    /// PART 6 — operator-supplied default tenant id. When a
+    /// per-call `ChatInput::tenant_id` /
+    /// `MemorySearchInput::tenant_id` /
+    /// `MemoryIngestInput::tenant_id` is `None`, this value
+    /// is used as the effective tenant. `None` means "no
+    /// default" — when `tenant_isolation = true`, the
+    /// per-call input MUST supply one or the operation
+    /// returns [`EmbeddedError::MissingTenant`].
+    default_tenant_id: Option<String>,
+    /// PART 6 — fail-closed mode. When `true`, every
+    /// operation that lacks a resolvable tenant id returns
+    /// `MissingTenant` rather than silently filing into the
+    /// no-tenant bucket. When `false`, missing tenant ids
+    /// pass through with `None` (pre-PART-6 behaviour).
+    /// The underlying [`LayeredMemoryStore`] is also opened
+    /// with the same flag so the SQLite fallback path
+    /// applies `WHERE tenant_id = ?` filtering.
+    tenant_isolation: bool,
 }
 
 impl RelixEmbedded {
@@ -179,6 +212,43 @@ impl RelixEmbedded {
     pub(crate) fn history_store_ref(&self) -> &Arc<HistoryStore> {
         &self.history
     }
+
+    /// PART 6 — operator-configured default tenant id. `None`
+    /// when no default was set; in that case the per-call
+    /// input MUST supply a tenant id when
+    /// [`Self::tenant_isolation_enabled`] is `true`.
+    pub fn default_tenant_id(&self) -> Option<&str> {
+        self.default_tenant_id.as_deref()
+    }
+
+    /// PART 6 — `true` when fail-closed tenant isolation is
+    /// enabled. Operations that resolve to no tenant id
+    /// return [`EmbeddedError::MissingTenant`] instead of
+    /// proceeding.
+    pub fn tenant_isolation_enabled(&self) -> bool {
+        self.tenant_isolation
+    }
+
+    /// PART 6 — resolve the effective tenant id for a single
+    /// operation. Per-call `per_call` wins; otherwise the
+    /// builder's `default_tenant_id` is used. When isolation
+    /// is enabled AND nothing resolves, returns
+    /// `Err(MissingTenant)` so the caller surfaces the same
+    /// shape as the bridge's HTTP 401 path.
+    pub(crate) fn resolve_tenant(
+        &self,
+        per_call: Option<&str>,
+        op: &'static str,
+    ) -> Result<Option<String>, EmbeddedError> {
+        let effective = per_call
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| self.default_tenant_id.clone());
+        match (&effective, self.tenant_isolation) {
+            (None, true) => Err(EmbeddedError::MissingTenant { op }),
+            _ => Ok(effective),
+        }
+    }
 }
 
 /// Builder for [`RelixEmbedded`]. Defaults:
@@ -197,6 +267,10 @@ pub struct RelixEmbeddedBuilder {
     provider: Option<Arc<dyn ChatProvider>>,
     default_model: String,
     chunk_size_chars: Option<usize>,
+    /// PART 6: see [`RelixEmbedded::default_tenant_id`].
+    default_tenant_id: Option<String>,
+    /// PART 6: see [`RelixEmbedded::tenant_isolation_enabled`].
+    tenant_isolation: bool,
 }
 
 impl RelixEmbeddedBuilder {
@@ -238,6 +312,32 @@ impl RelixEmbeddedBuilder {
         self
     }
 
+    /// PART 6: set the default tenant id every operation falls
+    /// back to when its per-call `tenant_id` field is `None`
+    /// or empty. Leave unset for "no default" — when
+    /// [`Self::tenant_isolation`] is `true` AND there's no
+    /// default AND no per-call tenant, the operation returns
+    /// [`EmbeddedError::MissingTenant`].
+    pub fn default_tenant_id(mut self, id: impl Into<String>) -> Self {
+        let s = id.into();
+        self.default_tenant_id = if s.trim().is_empty() { None } else { Some(s) };
+        self
+    }
+
+    /// PART 6: enable fail-closed tenant isolation. When
+    /// `true`, every operation that resolves to no tenant id
+    /// (per-call empty AND `default_tenant_id` unset) returns
+    /// [`EmbeddedError::MissingTenant`] rather than
+    /// silently filing into the no-tenant bucket. Also
+    /// propagates to the underlying [`LayeredMemoryStore`]
+    /// via `open_with_tenant_isolation`, so SQLite reads
+    /// apply `WHERE tenant_id = ?` filtering and writes
+    /// stamp the per-record `tenant_id` column.
+    pub fn tenant_isolation(mut self, enabled: bool) -> Self {
+        self.tenant_isolation = enabled;
+        self
+    }
+
     /// Boot the runtime. Async because the memory store opens its
     /// SQLite file inside a `spawn_blocking` so the caller's
     /// runtime doesn't take the open hit.
@@ -248,9 +348,13 @@ impl RelixEmbeddedBuilder {
             ));
         };
         let memory_path = self.memory_path;
+        let tenant_isolation = self.tenant_isolation;
+        // PART 6: thread `tenant_isolation` through the store
+        // open call so the SQLite fallback path applies the
+        // `WHERE tenant_id = ?` filter on every read.
         let memory = tokio::task::spawn_blocking(move || match memory_path {
-            Some(path) => LayeredMemoryStore::open(&path),
-            None => LayeredMemoryStore::in_memory(),
+            Some(path) => LayeredMemoryStore::open_with_tenant_isolation(&path, tenant_isolation),
+            None => LayeredMemoryStore::in_memory_with_tenant_isolation(tenant_isolation),
         })
         .await
         .map_err(|e| EmbeddedError::Config(format!("memory bootstrap task: {e}")))??;
@@ -261,6 +365,8 @@ impl RelixEmbeddedBuilder {
             default_model: self.default_model,
             chunk_size_chars,
             history: Arc::new(HistoryStore::default()),
+            default_tenant_id: self.default_tenant_id,
+            tenant_isolation,
         })
     }
 }
