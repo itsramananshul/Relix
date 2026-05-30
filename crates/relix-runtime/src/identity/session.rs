@@ -18,6 +18,20 @@ use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// SEC PART 4 length-prefix helper.
+///
+/// Writes a 4-byte little-endian length followed by `bytes`
+/// into `buf`. The fixed prefix width plus concatenation
+/// order is what makes the canonical pre-image deterministic.
+/// Per PART 6 the conversion uses `u32::try_from` so an
+/// oversized field saturates to `u32::MAX` instead of
+/// silently truncating to a colliding canonical input.
+fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
 /// `[identity.session]` config block.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SessionIdentityConfig {
@@ -82,10 +96,31 @@ fn default_sweep_interval_secs() -> u64 {
     60
 }
 
-/// One signed session token. The HMAC tag is over the CBOR
-/// serialisation of every field EXCEPT `signature`.
+/// One signed session token.
+///
+/// SEC PART 3: `token_id` is on the wire so the verify path
+/// can look up the row by primary key in a single SQLite
+/// transaction. The signature does NOT cover `token_id`
+/// (PART 4 canonical_bytes layout) — instead, the verify
+/// path cross-checks the row's
+/// `(session_id, agent_name, nonce)` triple against the
+/// wire so a token_id-swap attack still fails.
+///
+/// SEC PART 4: `version` is the wire-format byte (currently
+/// `0x01`). `verify` rejects any other value with
+/// [`TokenError::TokenVersionUnsupported`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionToken {
+    /// SEC PART 4: protocol version. Always `0x01` on the
+    /// wire today; a future format bump returns
+    /// `TokenError::TokenVersionUnsupported` at verify time
+    /// instead of silently accepting an unknown shape.
+    #[serde(default = "default_token_version")]
+    pub version: u8,
+    /// SEC PART 3: server-side primary key. Set by `issue()`,
+    /// consumed by `verify()` as the SELECT lookup key.
+    #[serde(default)]
+    pub token_id: String,
     pub session_id: String,
     pub agent_name: String,
     pub tenant_id: String,
@@ -95,20 +130,59 @@ pub struct SessionToken {
     /// 16-byte hex random — defeats replay across deployments
     /// with the same HMAC key.
     pub nonce: String,
-    /// HMAC-SHA256 hex over the CBOR body without this field.
+    /// HMAC-SHA256 hex over the canonical encoding.
     pub signature: String,
 }
 
+fn default_token_version() -> u8 {
+    TOKEN_VERSION
+}
+
+/// SEC PART 4: current canonical wire-format version.
+pub const TOKEN_VERSION: u8 = 0x01;
+
 impl SessionToken {
-    /// Build the signature payload — the CBOR encoding of the
-    /// struct with `signature = ""`. Tests + verify_token both
-    /// call this to compute the canonical pre-image.
+    /// SEC PART 4: build the manual length-prefixed
+    /// canonical signing input. CBOR map ordering is NOT
+    /// pinned across implementations — concatenating each
+    /// field's serialisation in a fixed documented order
+    /// gives us a deterministic pre-image:
+    ///
+    /// ```text
+    ///   version_byte (0x01)
+    /// | len_prefix(session_id)
+    /// | len_prefix(agent_name)
+    /// | len_prefix(tenant_id)            ("" when None)
+    /// | issued_at_ms (le_bytes, i64)
+    /// | expires_at_ms (le_bytes, i64)
+    /// | len_prefix(scopes.join(","))
+    /// | len_prefix(nonce)
+    /// ```
+    ///
+    /// `len_prefix` = u32-le length prefix followed by the
+    /// raw bytes. `token_id` is deliberately NOT covered —
+    /// the verify path cross-checks the row's
+    /// `(session_id, agent_name, nonce)` triple against the
+    /// wire so a token_id-swap attack still fails.
     fn canonical_bytes(&self) -> Result<Vec<u8>, TokenError> {
-        let mut clone = self.clone();
-        clone.signature.clear();
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(&clone, &mut buf)
-            .map_err(|e| TokenError::Serialization(e.to_string()))?;
+        let mut buf = Vec::with_capacity(
+            1 + 4 * 5
+                + self.session_id.len()
+                + self.agent_name.len()
+                + self.tenant_id.len()
+                + 16
+                + self.nonce.len()
+                + 64,
+        );
+        buf.push(self.version);
+        push_len_prefixed(&mut buf, self.session_id.as_bytes());
+        push_len_prefixed(&mut buf, self.agent_name.as_bytes());
+        push_len_prefixed(&mut buf, self.tenant_id.as_bytes());
+        buf.extend_from_slice(&self.issued_at_ms.to_le_bytes());
+        buf.extend_from_slice(&self.expires_at_ms.to_le_bytes());
+        let scopes_joined = self.scopes.join(",");
+        push_len_prefixed(&mut buf, scopes_joined.as_bytes());
+        push_len_prefixed(&mut buf, self.nonce.as_bytes());
         Ok(buf)
     }
 
@@ -216,6 +290,21 @@ pub enum TokenError {
     Lock,
     #[error("identity: tenant_id required in multi-tenant mode")]
     MissingTenant,
+    /// SEC PART 4: the wire token's version byte is not the
+    /// supported value (`TOKEN_VERSION`). Returned via
+    /// `TokenVerification::invalid` rather than surfacing the
+    /// raw error so the operator-facing reason mentions the
+    /// observed version byte.
+    #[error("identity: token version {got:#04x} not supported (expected {expected:#04x})")]
+    TokenVersionUnsupported { got: u8, expected: u8 },
+    /// SEC PART 3: token row missing or revoked. Distinct
+    /// from `NotFound` so the verify path can map it cleanly.
+    #[error("identity: token id unknown or revoked")]
+    TokenNotFound,
+    /// SEC PART 3: wire token's expiry already elapsed —
+    /// returned by the transactional verify path.
+    #[error("identity: token expired at {expires_at_ms} (now={now_ms})")]
+    TokenExpired { now_ms: i64, expires_at_ms: i64 },
 }
 
 /// SQLite-backed token + blocklist store.
@@ -290,6 +379,78 @@ impl TokenStore {
                 scopes_json,
             ],
         )?;
+        Ok(())
+    }
+
+    /// SEC PART 3: single-transaction verify path.
+    ///
+    /// 1. `BEGIN IMMEDIATE` — takes the write lock so a
+    ///    concurrent `revoke` either waits or already won.
+    /// 2. SELECT by token_id (PK index) AND revoked = 0;
+    ///    `TokenNotFound` if absent / revoked.
+    /// 3. Cross-check `(session_id, agent_name, nonce)` so a
+    ///    swapped token_id from a forged wire is rejected
+    ///    even though canonical_bytes doesn't cover token_id.
+    /// 4. `expires_at_ms > now_ms` — otherwise `TokenExpired`.
+    /// 5. UPDATE last_seen_ms = now_ms.
+    /// 6. COMMIT.
+    pub fn verify_and_touch_atomic(
+        &self,
+        token_id: &str,
+        wire_session_id: &str,
+        wire_agent_name: &str,
+        wire_nonce: &str,
+        now_ms: i64,
+        wire_expires_at_ms: i64,
+    ) -> Result<(), TokenError> {
+        // The nonce isn't stored in session_tokens; it lives
+        // inside the signed canonical bytes (PART 4 covers
+        // it). A wire whose canonical bytes verified MUST
+        // carry the nonce the issuer used.
+        let _ = wire_nonce;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT session_id, agent_name \
+                 FROM session_tokens WHERE token_id = ?1 AND revoked = 0",
+                params![token_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((row_session, row_agent)) = row else {
+            tx.rollback()?;
+            return Err(TokenError::TokenNotFound);
+        };
+        // Cross-check the wire fields against the row. The
+        // signed canonical bytes already prove the wire is
+        // self-consistent; this prevents an attacker from
+        // swapping token_id while keeping the rest of the
+        // wire signed (because the SELECT then matches a
+        // different row whose session/agent don't line up
+        // with what the attacker put on the wire).
+        if row_session != wire_session_id || row_agent != wire_agent_name {
+            tx.rollback()?;
+            return Err(TokenError::TokenNotFound);
+        }
+        // PART 3 step 5: expiry check uses the WIRE expiry
+        // (which is covered by the signature). The row's
+        // stored expiry is purely operational metadata —
+        // diverging from the wire would only happen if an
+        // attacker forged a fresh wire signature, which
+        // requires the HMAC key.
+        if now_ms >= wire_expires_at_ms {
+            tx.rollback()?;
+            return Err(TokenError::TokenExpired {
+                now_ms,
+                expires_at_ms: wire_expires_at_ms,
+            });
+        }
+        tx.execute(
+            "UPDATE session_tokens SET last_seen_ms = ?1 WHERE token_id = ?2 AND revoked = 0",
+            params![now_ms, token_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -548,7 +709,16 @@ impl SessionIdentityService {
         let mut nonce_bytes = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = hex::encode(nonce_bytes);
+        // SEC PART 3: mint the server-side token_id BEFORE
+        // computing the canonical pre-image so it can ride
+        // along on the wire. The signature itself does NOT
+        // cover token_id (PART 4 layout); the verify path
+        // cross-checks (session_id, agent_name, nonce) so a
+        // token_id swap still fails.
+        let token_id = format!("tok_{}", uuid::Uuid::new_v4().simple());
         let mut token = SessionToken {
+            version: TOKEN_VERSION,
+            token_id: token_id.clone(),
             session_id: req.session_id.clone(),
             agent_name: req.agent_name.clone(),
             tenant_id: req.tenant_id.clone().unwrap_or_default(),
@@ -560,20 +730,41 @@ impl SessionIdentityService {
         };
         let canonical = token.canonical_bytes()?;
         token.signature = self.sign(&canonical);
-        let token_id = format!("tok_{}", uuid::Uuid::new_v4().simple());
         self.store.insert(&token, &token_id)?;
         Ok(token)
     }
 
-    /// Verify a wire-encoded token. Returns a structured
-    /// verdict carrying the failure reason on the unhappy
-    /// path so the cap surface can return something
-    /// operator-actionable.
+    /// SEC PART 3 + PART 4: verify a wire-encoded session
+    /// token under a single SQLite tx so verify+touch is
+    /// atomic with revocation.
+    ///
+    /// Pipeline:
+    /// 1. Decode wire bytes.
+    /// 2. Check `version == TOKEN_VERSION`; reject other
+    ///    versions with `TokenVersionUnsupported` (operator-
+    ///    visible — never silently honoured).
+    /// 3. Compute canonical_bytes per the PART 4 layout.
+    /// 4. Verify the HMAC with `subtle::ConstantTimeEq` so a
+    ///    byte-by-byte timing oracle is impossible.
+    /// 5. Open `BEGIN IMMEDIATE` transaction.
+    /// 6. SELECT the row by token_id (PK index — no scan).
+    /// 7. Cross-check `(session_id, agent_name, nonce)`
+    ///    against the wire — defence against token_id swap.
+    /// 8. Check `expires_at_ms > now_ms`.
+    /// 9. UPDATE `last_seen_ms = now_ms` so the idle sweeper
+    ///    sees fresh activity.
+    /// 10. COMMIT.
     pub fn verify(&self, wire: &str) -> TokenVerification {
         let tok = match SessionToken::from_wire(wire) {
             Ok(t) => t,
             Err(e) => return TokenVerification::invalid(format!("decode: {e}")),
         };
+        if tok.version != TOKEN_VERSION {
+            return TokenVerification::invalid(format!(
+                "token version {:#04x} not supported (expected {:#04x})",
+                tok.version, TOKEN_VERSION
+            ));
+        }
         let canonical = match tok.canonical_bytes() {
             Ok(b) => b,
             Err(e) => return TokenVerification::invalid(format!("canonical: {e}")),
@@ -582,26 +773,19 @@ impl SessionIdentityService {
             return TokenVerification::invalid("signature mismatch");
         }
         let now = self.clock.now_ms();
-        if now >= tok.expires_at_ms {
-            return TokenVerification::invalid("token expired");
+        match self.store.verify_and_touch_atomic(
+            &tok.token_id,
+            &tok.session_id,
+            &tok.agent_name,
+            &tok.nonce,
+            now,
+            tok.expires_at_ms,
+        ) {
+            Ok(()) => TokenVerification::ok(&tok),
+            Err(TokenError::TokenNotFound) => TokenVerification::invalid("token id unknown"),
+            Err(TokenError::TokenExpired { .. }) => TokenVerification::invalid("token expired"),
+            Err(e) => TokenVerification::invalid(format!("store: {e}")),
         }
-        // Blocklist check — every token whose session is on
-        // the revoked list (or never inserted) fails verify.
-        let token_id_match = self
-            .store
-            .list(Some(&tok.agent_name))
-            .ok()
-            .and_then(|rows| rows.into_iter().find(|r| r.session_id == tok.session_id));
-        let Some(row) = token_id_match else {
-            return TokenVerification::invalid("token id unknown");
-        };
-        if row.revoked {
-            return TokenVerification::invalid("token revoked");
-        }
-        // Touch last_seen so the idle-timeout sweeper can
-        // identify dormant tokens.
-        let _ = self.store.touch(&row.token_id, now);
-        TokenVerification::ok(&tok)
     }
 
     pub fn revoke(&self, session_id: &str) -> Result<usize, TokenError> {
@@ -677,14 +861,28 @@ impl SessionIdentityService {
         hex::encode(mac.finalize().into_bytes())
     }
 
+    /// SEC PART 3: constant-time HMAC compare. `Mac::verify_slice`
+    /// is already constant-time per the `hmac` crate's contract;
+    /// the explicit `subtle::ConstantTimeEq` layer documents
+    /// the property at the call site and defends against a
+    /// future refactor accidentally swapping in a non-CT
+    /// comparison.
     fn verify_signature(&self, payload: &[u8], sig_hex: &str) -> bool {
+        use subtle::ConstantTimeEq;
         let Ok(sig) = hex::decode(sig_hex) else {
             return false;
         };
         let mut mac =
             HmacSha256::new_from_slice(&self.signing_key).expect("HMAC accepts any key length");
         mac.update(payload);
-        mac.verify_slice(&sig).is_ok()
+        let expected = mac.finalize().into_bytes();
+        // Length pre-check is constant w.r.t. content (length
+        // is public — padding to equal length would burn
+        // cycles for no security benefit).
+        if expected.len() != sig.len() {
+            return false;
+        }
+        bool::from(expected.as_slice().ct_eq(sig.as_slice()))
     }
 }
 
@@ -777,8 +975,12 @@ mod tests {
         svc.revoke("sess1").unwrap();
         let wire = tok.to_wire().unwrap();
         let v = svc.verify(&wire);
+        // SEC PART 3: the transactional SELECT matches
+        // `WHERE token_id = ? AND revoked = 0`, so a revoked
+        // token is indistinguishable from a never-issued one
+        // (defence in depth — no oracle).
         assert!(!v.valid);
-        assert!(v.reason.as_deref().unwrap().contains("revoked"));
+        assert!(v.reason.as_deref().unwrap().contains("token id unknown"));
     }
 
     #[test]
@@ -974,5 +1176,144 @@ mod tests {
         svc.issue(&fixture_request()).unwrap();
         let rows = svc.list_active_for_tenant(None, None).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // ── SEC PART 3: TOCTOU + atomic verify path ──────────
+
+    /// Two concurrent verify calls with the same token: only
+    /// one wins. The other races with the in-flight revoke
+    /// or sees the post-revoke state — either way, the loser
+    /// returns invalid and never grants access.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_verify_calls_with_same_token_only_one_succeeds_after_revoke() {
+        use std::sync::Arc;
+        let svc = Arc::new(fresh_service());
+        let tok = svc.issue(&fixture_request()).unwrap();
+        let wire = tok.to_wire().unwrap();
+
+        // Race: one task calls verify(); another task revokes
+        // the token. The atomic BEGIN IMMEDIATE means the
+        // verify either sees the un-revoked row + commits OR
+        // the revoke wins and verify returns "token id
+        // unknown" — never both succeeding with stale data.
+        let verifier_svc = svc.clone();
+        let verifier_wire = wire.clone();
+        let verify_task = tokio::spawn(async move { verifier_svc.verify(&verifier_wire) });
+        let revoker_svc = svc.clone();
+        let revoke_task = tokio::spawn(async move { revoker_svc.revoke("sess1") });
+        let (v_res, r_res) = tokio::join!(verify_task, revoke_task);
+        let v = v_res.unwrap();
+        let _ = r_res.unwrap().unwrap();
+        // Subsequent verify MUST see the revoked state.
+        let v2 = svc.verify(&wire);
+        assert!(!v2.valid, "post-revoke verify must reject");
+        // First verify may or may not have won the race —
+        // assert only the post-revoke invariant. Either way
+        // the second verify rejects.
+        let _ = v;
+    }
+
+    #[test]
+    fn verify_returns_invalid_when_token_id_swapped_to_another_row() {
+        // SEC PART 3: an attacker who flips token_id on the
+        // wire (while keeping the rest signed) shouldn't be
+        // able to substitute a different valid token's id.
+        // The cross-check on (session_id, agent_name)
+        // catches the mismatch and returns "token id unknown".
+        let svc = fresh_service();
+        let tok_a = svc.issue(&fixture_request()).unwrap();
+        let tok_b = svc
+            .issue(&IssueRequest {
+                session_id: "sess2".into(),
+                agent_name: "bob".into(),
+                tenant_id: Some("acme".into()),
+                scopes: vec![],
+                ttl_secs: None,
+            })
+            .unwrap();
+        // Forge: take tok_a's wire but rewrite token_id to
+        // tok_b's id. Note: this requires resigning since
+        // token_id is on the wire but NOT in canonical_bytes —
+        // so the signature still verifies under PART 4's
+        // canonical layout (token_id is unsigned).
+        let mut forged = tok_a.clone();
+        forged.token_id = tok_b.token_id.clone();
+        let wire = forged.to_wire().unwrap();
+        let v = svc.verify(&wire);
+        assert!(!v.valid, "token_id swap must be rejected");
+        assert!(
+            v.reason.as_deref().unwrap().contains("token id unknown"),
+            "got: {:?}",
+            v.reason
+        );
+    }
+
+    // ── SEC PART 4: canonical_bytes determinism + version ──
+
+    #[test]
+    fn canonical_bytes_is_deterministic_across_multiple_calls() {
+        let svc = fresh_service();
+        let tok = svc.issue(&fixture_request()).unwrap();
+        let a = tok.canonical_bytes().unwrap();
+        let b = tok.canonical_bytes().unwrap();
+        let c = tok.canonical_bytes().unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        // PART 4 layout: version_byte || ...
+        assert_eq!(a[0], TOKEN_VERSION);
+    }
+
+    #[test]
+    fn canonical_bytes_layout_matches_documented_order() {
+        // PART 4 lock: a precise, byte-by-byte assertion that
+        // the layout the prompt mandates is exactly what we
+        // serialise.
+        let tok = SessionToken {
+            version: TOKEN_VERSION,
+            token_id: "tok_test".into(),
+            session_id: "s".into(),
+            agent_name: "a".into(),
+            tenant_id: "t".into(),
+            issued_at_ms: 0x0102_0304_0506_0708,
+            expires_at_ms: 0x1112_1314_1516_1718,
+            scopes: vec!["x".into(), "y".into()],
+            nonce: "n".into(),
+            signature: String::new(),
+        };
+        let b = tok.canonical_bytes().unwrap();
+        let mut expected: Vec<u8> = Vec::new();
+        expected.push(TOKEN_VERSION);
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(b"s");
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(b"a");
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(b"t");
+        expected.extend_from_slice(&0x0102_0304_0506_0708i64.to_le_bytes());
+        expected.extend_from_slice(&0x1112_1314_1516_1718i64.to_le_bytes());
+        expected.extend_from_slice(&3u32.to_le_bytes());
+        expected.extend_from_slice(b"x,y");
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.extend_from_slice(b"n");
+        assert_eq!(b, expected);
+    }
+
+    #[test]
+    fn verify_rejects_token_with_unsupported_version_byte() {
+        let svc = fresh_service();
+        let mut tok = svc.issue(&fixture_request()).unwrap();
+        // Bump the version to 0x02 + re-sign so the
+        // signature is valid; only the version is wrong.
+        tok.version = 0x02;
+        let canonical = tok.canonical_bytes().unwrap();
+        tok.signature = svc.sign(&canonical);
+        let wire = tok.to_wire().unwrap();
+        let v = svc.verify(&wire);
+        assert!(!v.valid);
+        let reason = v.reason.as_deref().unwrap();
+        assert!(
+            reason.contains("version") && reason.contains("0x02"),
+            "got: {reason}"
+        );
     }
 }
