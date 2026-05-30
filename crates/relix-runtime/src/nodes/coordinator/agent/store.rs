@@ -229,6 +229,34 @@ pub struct StandingApproval {
     pub created_at: i64,
 }
 
+/// NOT-DONE 2: one row in the `startup_tasks` ledger. Tracks
+/// once-per-DB migration passes that need to survive process
+/// interruption mid-run. `completed_at_ms = None` means the
+/// pass is still in flight (or was interrupted); the
+/// background runner uses `last_processed_id` as a resume
+/// cursor in that case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupTaskRow {
+    /// Stable key identifying the migration pass (e.g.
+    /// `"legacy_token_orphaned_task_fail"`).
+    pub task_name: String,
+    /// Unix ms when the pass last started.
+    pub started_at_ms: i64,
+    /// Unix ms when the pass completed, or `None` if it is
+    /// still in flight / was interrupted.
+    pub completed_at_ms: Option<i64>,
+    /// Count of rows processed so far. On a clean completion
+    /// this equals the total population size; on a resume it
+    /// represents the high-water mark before the cursor was
+    /// advanced past `last_processed_id`.
+    pub rows_processed: i64,
+    /// Highest-sorted id the pass touched. The background
+    /// runner resumes by listing rows STRICTLY after this
+    /// value (lexicographic order). `None` when the pass has
+    /// not yet touched any row.
+    pub last_processed_id: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentStoreError {
     #[error("agent store: {0}")]
@@ -833,6 +861,136 @@ impl AgentStore {
         Ok(rows)
     }
 
+    /// NOT-DONE 2: cursor-aware variant of
+    /// [`Self::list_legacy_token_expired_task_ids`] that
+    /// returns `(approval_id, task_id)` pairs ordered ASC by
+    /// `approval_id` and starting STRICTLY after `cursor`. An
+    /// empty cursor returns every row. Used by the resumable
+    /// background-task migration pass.
+    ///
+    /// Ascending-by-id ordering makes the cursor stable across
+    /// process restarts: SQLite's PRIMARY KEY scan walks
+    /// `approval_id` lexicographically, so a partial pass
+    /// always resumes from the next id past the last one it
+    /// recorded.
+    pub fn list_legacy_token_expired_after(
+        &self,
+        cursor: &str,
+    ) -> Result<Vec<(String, String)>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT approval_id, task_id FROM approval_requests
+             WHERE status = 'legacy_token_expired'
+               AND task_id IS NOT NULL
+               AND approval_id > ?1
+             ORDER BY approval_id ASC",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![cursor], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    // ── NOT-DONE 2: startup_tasks ledger ─────────────────
+
+    /// Read the persisted state for one startup task. Returns
+    /// `None` when the task name has never been recorded.
+    pub fn startup_task_get(
+        &self,
+        task_name: &str,
+    ) -> Result<Option<StartupTaskRow>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT task_name, started_at_ms, completed_at_ms,
+                        rows_processed, last_processed_id
+                 FROM startup_tasks WHERE task_name = ?1",
+                params![task_name],
+                |r| {
+                    Ok(StartupTaskRow {
+                        task_name: r.get(0)?,
+                        started_at_ms: r.get(1)?,
+                        completed_at_ms: r.get(2)?,
+                        rows_processed: r.get(3)?,
+                        last_processed_id: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Convenience: `true` iff a row with `completed_at_ms IS
+    /// NOT NULL` exists for `task_name`. The background pass
+    /// short-circuits on this so a successful prior run is not
+    /// re-executed.
+    pub fn startup_task_is_complete(&self, task_name: &str) -> Result<bool, AgentStoreError> {
+        Ok(self
+            .startup_task_get(task_name)?
+            .and_then(|r| r.completed_at_ms)
+            .is_some())
+    }
+
+    /// Insert OR update the startup-task row to mark the pass
+    /// as "running". Idempotent: a re-run after interruption
+    /// preserves the cursor + rows_processed columns by using
+    /// `INSERT … ON CONFLICT DO UPDATE` that only refreshes
+    /// `started_at_ms`.
+    pub fn startup_task_begin(
+        &self,
+        task_name: &str,
+        started_at_ms: i64,
+    ) -> Result<(), AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO startup_tasks (task_name, started_at_ms)
+             VALUES (?1, ?2)
+             ON CONFLICT(task_name) DO UPDATE
+                SET started_at_ms = excluded.started_at_ms",
+            params![task_name, started_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Persist progress mid-pass: update the cursor +
+    /// `rows_processed` so an interrupted process resumes from
+    /// the right place on next boot.
+    pub fn startup_task_record_progress(
+        &self,
+        task_name: &str,
+        last_processed_id: &str,
+        rows_processed: i64,
+    ) -> Result<(), AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "UPDATE startup_tasks
+             SET last_processed_id = ?1, rows_processed = ?2
+             WHERE task_name = ?3",
+            params![last_processed_id, rows_processed, task_name],
+        )?;
+        Ok(())
+    }
+
+    /// Mark the pass complete. Subsequent
+    /// [`Self::startup_task_is_complete`] calls return `true`.
+    pub fn startup_task_complete(
+        &self,
+        task_name: &str,
+        completed_at_ms: i64,
+        rows_processed: i64,
+    ) -> Result<(), AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "UPDATE startup_tasks
+             SET completed_at_ms = ?1, rows_processed = ?2
+             WHERE task_name = ?3",
+            params![completed_at_ms, rows_processed, task_name],
+        )?;
+        Ok(())
+    }
+
     /// Newest-first pending approvals, capped at `limit`.
     pub fn list_pending_approvals(
         &self,
@@ -1083,7 +1241,21 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              consumed_at  INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS approval_token_blocklist_approval
-             ON approval_token_blocklist(approval_id);",
+             ON approval_token_blocklist(approval_id);
+
+         -- NOT-DONE 2: startup-task ledger. Tracks once-per-DB
+         -- migration passes that need to survive process
+         -- interruption mid-run. Background tasks consult
+         -- `completed_at_ms` to skip; the `last_processed_id`
+         -- column is the cursor a partially-completed pass
+         -- resumes from on next boot.
+         CREATE TABLE IF NOT EXISTS startup_tasks (
+             task_name TEXT PRIMARY KEY,
+             started_at_ms INTEGER NOT NULL,
+             completed_at_ms INTEGER,
+             rows_processed INTEGER NOT NULL DEFAULT 0,
+             last_processed_id TEXT
+         );",
     )?;
     // DEFERRED 2: agent_profiles + approval_requests both gain
     // `authorized_approvers TEXT NOT NULL DEFAULT '[]'`. The

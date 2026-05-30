@@ -2243,6 +2243,212 @@ fn ensure_msg_bookkeeping_task(
 /// Idempotent: re-running matches the same approval set, but
 /// the per-task terminal check guarantees only the first run
 /// transitions any given task.
+/// Stable name for the legacy-token orphaned-task fail pass in
+/// the `startup_tasks` ledger. Pulled out so tests / docs / the
+/// integration harness reference the same string.
+pub(crate) const LEGACY_TOKEN_TASK_FAIL_PASS_NAME: &str = "legacy_token_orphaned_task_fail";
+
+/// NOT-DONE 2: progress checkpoint interval. Every N rows the
+/// background pass records the current cursor + processed
+/// count + logs at INFO so operators see the high-water mark.
+pub(crate) const LEGACY_TOKEN_PASS_PROGRESS_INTERVAL: usize = 100;
+
+/// NOT-DONE 2: results of one invocation of the
+/// legacy-token-orphaned-task fail pass. Returned by
+/// [`run_legacy_token_orphaned_task_fail_pass`] so tests can
+/// assert exact counters; the background runner spawns it +
+/// drops the result.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyTokenPassReport {
+    pub transitioned: usize,
+    pub already_terminal: usize,
+    pub not_found: usize,
+    pub errored: usize,
+    pub progress_checkpoints: usize,
+    pub considered: usize,
+    pub started_at_resume_cursor: String,
+    pub final_cursor: String,
+    pub completed: bool,
+}
+
+/// NOT-DONE 2: async, resumable, non-blocking version of the
+/// previous synchronous legacy-token-orphaned-task fail pass.
+/// Spawned via `tokio::spawn` after the bridge wiring
+/// completes so the controller never blocks on it. Skips when
+/// `startup_tasks` records a prior completion; resumes from
+/// `last_processed_id` after interruption; per-row errors are
+/// logged and skipped, never aborting the whole pass; progress
+/// checkpoints land in the SQLite ledger every
+/// [`LEGACY_TOKEN_PASS_PROGRESS_INTERVAL`] rows.
+pub(crate) async fn run_legacy_token_orphaned_task_fail_pass(
+    agent_store: std::sync::Arc<crate::nodes::coordinator::agent::AgentStore>,
+    task_store: std::sync::Arc<crate::nodes::coordinator::TaskStore>,
+    clock: std::sync::Arc<dyn relix_core::clock::Clock>,
+) -> LegacyTokenPassReport {
+    let mut report = LegacyTokenPassReport::default();
+    match agent_store.startup_task_is_complete(LEGACY_TOKEN_TASK_FAIL_PASS_NAME) {
+        Ok(true) => {
+            tracing::info!(
+                pass = LEGACY_TOKEN_TASK_FAIL_PASS_NAME,
+                "approval: legacy-token orphaned-task fail pass already complete; skipping"
+            );
+            report.completed = true;
+            return report;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "legacy-token pass: startup_task_is_complete failed");
+            return report;
+        }
+    }
+    let resume_cursor = match agent_store.startup_task_get(LEGACY_TOKEN_TASK_FAIL_PASS_NAME) {
+        Ok(Some(row)) => row.last_processed_id.unwrap_or_default(),
+        Ok(None) => String::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "legacy-token pass: startup_task_get failed");
+            return report;
+        }
+    };
+    report.started_at_resume_cursor = resume_cursor.clone();
+    if let Err(e) = agent_store.startup_task_begin(LEGACY_TOKEN_TASK_FAIL_PASS_NAME, clock.now_ms())
+    {
+        tracing::warn!(error = %e, "legacy-token pass: startup_task_begin failed");
+        return report;
+    }
+    let mut rows_processed: i64 =
+        match agent_store.startup_task_get(LEGACY_TOKEN_TASK_FAIL_PASS_NAME) {
+            Ok(Some(r)) => r.rows_processed,
+            _ => 0,
+        };
+    let pairs = match agent_store.list_legacy_token_expired_after(&resume_cursor) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "legacy-token pass: list_legacy_token_expired_after failed");
+            return report;
+        }
+    };
+    tracing::info!(
+        pass = LEGACY_TOKEN_TASK_FAIL_PASS_NAME,
+        candidates = pairs.len(),
+        resume_cursor = %resume_cursor,
+        "approval: legacy-token orphaned-task fail pass starting"
+    );
+    report.considered = pairs.len();
+    for (i, (approval_id, task_id)) in pairs.iter().enumerate() {
+        let view = match task_store.get(task_id) {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
+                report.not_found += 1;
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    approval_id = %approval_id,
+                    error = %e,
+                    "legacy-token pass: task lookup failed (skipping)"
+                );
+                report.errored += 1;
+                None
+            }
+        };
+        if let Some(view) = view {
+            let is_terminal = matches!(view.status.as_str(), "completed" | "failed" | "cancelled");
+            if is_terminal {
+                report.already_terminal += 1;
+            } else {
+                match task_store.update(
+                    task_id,
+                    Some("failed"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("legacy_approval_token_expired"),
+                    Some("legacy_approval_token_expired"),
+                ) {
+                    Ok(()) => {
+                        let _ = task_store.append_event(
+                            task_id,
+                            "task.failed",
+                            "legacy_approval_token_expired",
+                        );
+                        report.transitioned += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            approval_id = %approval_id,
+                            error = %e,
+                            "legacy-token pass: task transition failed (skipping)"
+                        );
+                        report.errored += 1;
+                    }
+                }
+            }
+        }
+        rows_processed += 1;
+        report.final_cursor = approval_id.clone();
+        tokio::task::yield_now().await;
+        if (i + 1) % LEGACY_TOKEN_PASS_PROGRESS_INTERVAL == 0 {
+            tracing::info!(
+                pass = LEGACY_TOKEN_TASK_FAIL_PASS_NAME,
+                rows_processed,
+                last_processed_id = %approval_id,
+                transitioned = report.transitioned,
+                already_terminal = report.already_terminal,
+                not_found = report.not_found,
+                errored = report.errored,
+                "approval: legacy-token pass progress"
+            );
+            report.progress_checkpoints += 1;
+            if let Err(e) = agent_store.startup_task_record_progress(
+                LEGACY_TOKEN_TASK_FAIL_PASS_NAME,
+                approval_id,
+                rows_processed,
+            ) {
+                tracing::warn!(error = %e, "legacy-token pass: record_progress failed");
+            }
+        }
+    }
+    if !report.final_cursor.is_empty()
+        && let Err(e) = agent_store.startup_task_record_progress(
+            LEGACY_TOKEN_TASK_FAIL_PASS_NAME,
+            &report.final_cursor,
+            rows_processed,
+        )
+    {
+        tracing::warn!(error = %e, "legacy-token pass: final record_progress failed");
+    }
+    match agent_store.startup_task_complete(
+        LEGACY_TOKEN_TASK_FAIL_PASS_NAME,
+        clock.now_ms(),
+        rows_processed,
+    ) {
+        Ok(()) => {
+            report.completed = true;
+            tracing::info!(
+                pass = LEGACY_TOKEN_TASK_FAIL_PASS_NAME,
+                transitioned = report.transitioned,
+                already_terminal = report.already_terminal,
+                not_found = report.not_found,
+                errored = report.errored,
+                rows_processed,
+                "approval: legacy-token orphaned-task fail pass complete"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "legacy-token pass: startup_task_complete failed");
+        }
+    }
+    report
+}
+
+/// Legacy synchronous wrapper kept ONLY for the existing
+/// test-mode call sites. Production wiring now spawns
+/// [`run_legacy_token_orphaned_task_fail_pass`] via
+/// `tokio::spawn` after controller boot.
+#[cfg(test)]
 fn fail_tasks_orphaned_by_legacy_token_migration(
     agent_store: &std::sync::Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: &std::sync::Arc<crate::nodes::coordinator::TaskStore>,
@@ -2438,6 +2644,231 @@ mod legacy_token_task_fail_tests {
             task_ids.is_empty(),
             "row with NULL task_id must not be listed"
         );
+    }
+
+    // ── NOT-DONE 2: background-task pass + resume cursor ──
+
+    fn fake_clock() -> Arc<relix_core::clock::FakeClock> {
+        Arc::new(relix_core::clock::FakeClock::new(1_700_000_000_000))
+    }
+
+    fn dyn_clock(c: &Arc<relix_core::clock::FakeClock>) -> Arc<dyn relix_core::clock::Clock> {
+        c.clone()
+    }
+
+    /// Seed N legacy approvals each linked to a fresh task, in
+    /// id-ascending order suitable for cursor walks. Returns
+    /// the task ids in the same order so the test can audit
+    /// individual transitions.
+    fn seed_n_legacy_with_tasks(
+        agent: &AgentStore,
+        tasks: &TaskStore,
+        n: usize,
+        approval_prefix: &str,
+    ) -> Vec<String> {
+        let mut task_ids = Vec::with_capacity(n);
+        for i in 0..n {
+            // Zero-pad so lexicographic ASC ordering matches
+            // numeric. 4 digits handles up to 9_999 rows.
+            let approval_id = format!("{approval_prefix}-{i:04}");
+            let task_id = create_task(tasks, &format!("task-{approval_id}"));
+            // `approval_token` column carries a UNIQUE
+            // constraint — synthesise a per-row token so the
+            // seed loop does not collide on the second
+            // insert.
+            let token = format!("legacy-{approval_prefix}-{i:08}");
+            agent
+                .seed_legacy_token_row_for_test(&approval_id, "pending", &token)
+                .unwrap();
+            agent
+                .force_set_task_id_for_test(&approval_id, &task_id)
+                .unwrap();
+            task_ids.push(task_id);
+        }
+        agent.run_legacy_token_migration_for_test().unwrap();
+        task_ids
+    }
+
+    #[tokio::test]
+    async fn background_pass_does_not_block_caller() {
+        // Seed enough rows that the pass would visibly stall if
+        // it ran synchronously, then spawn it and immediately
+        // do "controller work" alongside. The pass must run
+        // off the calling task's progress path.
+        let (agent, tasks) = stores();
+        let _ = seed_n_legacy_with_tasks(&agent, &tasks, 250, "bg");
+        let clock = fake_clock();
+        let agent_for_spawn = agent.clone();
+        let tasks_for_spawn = tasks.clone();
+        let clock_for_spawn = dyn_clock(&clock);
+        let handle = tokio::spawn(async move {
+            run_legacy_token_orphaned_task_fail_pass(
+                agent_for_spawn,
+                tasks_for_spawn,
+                clock_for_spawn,
+            )
+            .await
+        });
+        // "Controller work": read the agent store while the
+        // pass runs. This races the pass intentionally — both
+        // must complete cleanly.
+        for _ in 0..20 {
+            let _ = agent.list_legacy_token_expired_task_ids().unwrap();
+            tokio::task::yield_now().await;
+        }
+        let report = handle.await.expect("background task joins");
+        assert!(report.completed);
+        assert_eq!(report.transitioned, 250);
+        assert_eq!(report.considered, 250);
+        // 250 rows / 100-row checkpoint = 2 checkpoints
+        // (rows 100 and 200; row 250 only writes the final
+        // cursor outside the checkpoint loop).
+        assert_eq!(report.progress_checkpoints, 2);
+    }
+
+    #[tokio::test]
+    async fn interrupted_pass_resumes_from_last_processed_id_on_next_run() {
+        // Manually seed `startup_tasks` to mid-pass state —
+        // simulates a process killed after `cursor = N-2`.
+        let (agent, tasks) = stores();
+        let task_ids = seed_n_legacy_with_tasks(&agent, &tasks, 5, "resume");
+        agent
+            .startup_task_begin(LEGACY_TOKEN_TASK_FAIL_PASS_NAME, 1_700_000_000_000)
+            .unwrap();
+        // Simulate that rows 0 + 1 + 2 were processed before
+        // interruption: cursor = "resume-0002", rows_processed = 3.
+        // The first three tasks are NOT actually transitioned
+        // in this fixture — the resume contract is "skip
+        // anything ≤ cursor"; whether the cursor's predecessors
+        // got their state machine update is a property of the
+        // pre-interruption run, not what this test is verifying.
+        agent
+            .startup_task_record_progress(LEGACY_TOKEN_TASK_FAIL_PASS_NAME, "resume-0002", 3)
+            .unwrap();
+        let clock = fake_clock();
+        let report = run_legacy_token_orphaned_task_fail_pass(
+            agent.clone(),
+            tasks.clone(),
+            dyn_clock(&clock),
+        )
+        .await;
+        assert!(report.completed);
+        assert_eq!(report.started_at_resume_cursor, "resume-0002");
+        // Two rows left to process after the cursor.
+        assert_eq!(report.considered, 2);
+        assert_eq!(report.transitioned, 2);
+        assert_eq!(report.final_cursor, "resume-0004");
+        // Tasks at indices 0/1/2 were NOT transitioned (the
+        // resume contract says skip pre-cursor); 3/4 were.
+        assert_eq!(tasks.get(&task_ids[0]).unwrap().unwrap().status, "pending");
+        assert_eq!(tasks.get(&task_ids[3]).unwrap().unwrap().status, "failed");
+        assert_eq!(tasks.get(&task_ids[4]).unwrap().unwrap().status, "failed");
+    }
+
+    #[tokio::test]
+    async fn completed_pass_is_not_re_run_on_next_boot() {
+        let (agent, tasks) = stores();
+        let task_ids = seed_n_legacy_with_tasks(&agent, &tasks, 3, "comp");
+        let clock = fake_clock();
+        // First run — completes.
+        let first = run_legacy_token_orphaned_task_fail_pass(
+            agent.clone(),
+            tasks.clone(),
+            dyn_clock(&clock),
+        )
+        .await;
+        assert!(first.completed);
+        assert_eq!(first.transitioned, 3);
+        // Second run — short-circuits via startup_task_is_complete.
+        let second = run_legacy_token_orphaned_task_fail_pass(
+            agent.clone(),
+            tasks.clone(),
+            dyn_clock(&clock),
+        )
+        .await;
+        assert!(second.completed);
+        assert_eq!(
+            second.considered, 0,
+            "second run must not consider any rows: {second:?}"
+        );
+        assert_eq!(second.transitioned, 0);
+        for tid in &task_ids {
+            // First-run side effects are preserved.
+            assert_eq!(tasks.get(tid).unwrap().unwrap().status, "failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn per_row_error_does_not_abort_the_whole_pass() {
+        // Seed three rows; for the middle one, point the
+        // approval row at a task_id the TaskStore does NOT
+        // have (so `task_store.get` returns Ok(None) →
+        // `not_found += 1`). The remaining rows must still
+        // transition.
+        let (agent, tasks) = stores();
+        let t0 = create_task(&tasks, "row-0");
+        let t2 = create_task(&tasks, "row-2");
+        // Row 0: valid task.
+        agent
+            .seed_legacy_token_row_for_test("err-0000", "pending", "abc-0000")
+            .unwrap();
+        agent.force_set_task_id_for_test("err-0000", &t0).unwrap();
+        // Row 1: task_id that does not exist in the TaskStore.
+        agent
+            .seed_legacy_token_row_for_test("err-0001", "pending", "abc-0001")
+            .unwrap();
+        agent
+            .force_set_task_id_for_test("err-0001", "nonexistent_task_id_xyz")
+            .unwrap();
+        // Row 2: valid task.
+        agent
+            .seed_legacy_token_row_for_test("err-0002", "pending", "abc-0002")
+            .unwrap();
+        agent.force_set_task_id_for_test("err-0002", &t2).unwrap();
+        agent.run_legacy_token_migration_for_test().unwrap();
+        let clock = fake_clock();
+        let report = run_legacy_token_orphaned_task_fail_pass(
+            agent.clone(),
+            tasks.clone(),
+            dyn_clock(&clock),
+        )
+        .await;
+        assert!(report.completed, "pass must complete despite errors");
+        assert_eq!(report.considered, 3);
+        assert_eq!(report.transitioned, 2, "rows 0 + 2 transition");
+        assert_eq!(report.not_found, 1, "row 1 was missing in TaskStore");
+        assert_eq!(report.errored, 0, "not_found is not counted as errored");
+        assert_eq!(tasks.get(&t0).unwrap().unwrap().status, "failed");
+        assert_eq!(tasks.get(&t2).unwrap().unwrap().status, "failed");
+    }
+
+    #[tokio::test]
+    async fn progress_is_checkpointed_every_n_rows() {
+        // Seed enough rows for two full checkpoint intervals
+        // (200) plus a remainder (50). Verify the
+        // `progress_checkpoints` counter on the report AND the
+        // SQLite ledger advanced past `rows_processed = 200`.
+        let n = 2 * LEGACY_TOKEN_PASS_PROGRESS_INTERVAL + 50;
+        let (agent, tasks) = stores();
+        let _ = seed_n_legacy_with_tasks(&agent, &tasks, n, "prog");
+        let clock = fake_clock();
+        let report = run_legacy_token_orphaned_task_fail_pass(
+            agent.clone(),
+            tasks.clone(),
+            dyn_clock(&clock),
+        )
+        .await;
+        assert!(report.completed);
+        assert_eq!(report.considered, n);
+        // Two scheduled checkpoints (rows 100, 200). The final
+        // 50 rows trigger only the end-of-run cursor write.
+        assert_eq!(report.progress_checkpoints, 2);
+        let row = agent
+            .startup_task_get(LEGACY_TOKEN_TASK_FAIL_PASS_NAME)
+            .unwrap()
+            .expect("ledger row");
+        assert_eq!(row.rows_processed, n as i64);
+        assert!(row.completed_at_ms.is_some());
     }
 }
 
@@ -7741,15 +8172,36 @@ fn register_node_type_handlers(
             crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
                 .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
         );
-        // DEFERRED B: AgentStore::open's
-        // `migrate_legacy_opaque_tokens` runs without TaskStore
-        // access. Now that both stores are alive, fail any
-        // tasks that were parked in `awaiting_input` by a
-        // since-migrated approval. The pass is idempotent —
-        // re-running matches the same set of legacy_token_expired
-        // rows, but the per-task check skips tasks already in a
-        // terminal status so no double-transition happens.
-        fail_tasks_orphaned_by_legacy_token_migration(&agent_store, &store);
+        // NOT-DONE 2: spawn the legacy-token orphaned-task fail
+        // pass in the BACKGROUND so it does not block the
+        // controller from accepting requests. The pass:
+        //
+        //   * skips entirely when the `startup_tasks` ledger
+        //     records a prior successful completion;
+        //   * resumes from `last_processed_id` after process
+        //     interruption (the cursor is persisted every
+        //     `LEGACY_TOKEN_PASS_PROGRESS_INTERVAL` rows AND
+        //     at end-of-run);
+        //   * yields between rows so a thousand-row pass does
+        //     not starve other tokio tasks;
+        //   * logs INFO at start, every checkpoint, and at
+        //     completion;
+        //   * per-row failures (task lookup error / state
+        //     machine reject) log at WARN and skip — they
+        //     never abort the whole pass.
+        {
+            let agent_store_for_pass = agent_store.clone();
+            let task_store_for_pass = store.clone();
+            let clock_for_pass = bridge.clock();
+            tokio::spawn(async move {
+                let _ = run_legacy_token_orphaned_task_fail_pass(
+                    agent_store_for_pass,
+                    task_store_for_pass,
+                    clock_for_pass,
+                )
+                .await;
+            });
+        }
         // DEFERRED 1: resolve the operator-configured token TTL
         // ONCE at register time so the cap closure captures a
         // clamped value. The startup logs the effective TTL
