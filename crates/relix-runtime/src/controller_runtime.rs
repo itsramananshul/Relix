@@ -7142,17 +7142,18 @@ fn register_node_type_handlers(
             }
         }
         // RELIX-7.30 PART 2: credential vault. Opens iff
-        // `[credentials] enabled = true` AND the master-key env
-        // var is set. Spawns the rotation scheduler when both
-        // are wired.
+        // `[credentials] enabled = true` AND at least one
+        // configured key version's env var is set. Spawns the
+        // rotation scheduler when both are wired.
         if let Some(cred_cfg) = cfg.credentials.clone()
             && cred_cfg.enabled
         {
-            let master = std::env::var(&cred_cfg.master_key_env).unwrap_or_default();
-            if master.is_empty() {
+            let key_versions = cred_cfg.key_versions_resolved();
+            if key_versions.is_empty() {
                 tracing::warn!(
                     env_var = %cred_cfg.master_key_env,
-                    "credentials: master key env var unset; vault NOT registered"
+                    "credentials: no usable key versions (master_key_env unset and \
+                     [credentials.key_versions] empty); vault NOT registered"
                 );
             } else {
                 let path = cred_cfg.db_path.clone().unwrap_or_else(|| {
@@ -7160,7 +7161,12 @@ fn register_node_type_handlers(
                     p.set_file_name("credentials.db");
                     p
                 });
-                match crate::credentials::CredentialStore::open(&path, &master) {
+                match crate::credentials::CredentialStore::open_with_params(
+                    &path,
+                    key_versions,
+                    cred_cfg.kdf_params(),
+                    false,
+                ) {
                     Ok(store) => {
                         crate::credentials::caps::register(bridge, store.clone());
                         let notifier: std::sync::Arc<dyn crate::credentials::RotationNotifier> =

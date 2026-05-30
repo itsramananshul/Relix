@@ -95,12 +95,25 @@ sha2.workspace = true
 # the credential store. Encrypts each credential value at rest
 # with a 32-byte key derived from the configured master secret.
 aes-gcm.workspace = true
-# RELIX-7.30 PART 3: HMAC-SHA256 for the per-session identity
-# token signature.
+# SEC PART A: constant-time HMAC compare for the signed
+# ApprovalToken signature verification path AND used by the
+# credential vault Argon2id KDF + the session-identity HMAC.
 hmac.workspace = true
 # SEC PART A: constant-time HMAC compare for the signed
 # ApprovalToken signature verification path.
 subtle.workspace = true
+# SEC: Argon2id KDF for the credential vault master key —
+# replaces the pre-fix plain SHA-256 derivation (no salt, no
+# work factor). vault_metadata stores the random salt + the
+# configured (memory_cost, time_cost, parallelism) so two opens
+# of the same vault deterministically derive the same 32-byte
+# AES key.
+argon2.workspace = true
+# SEC: zero sensitive heap bytes on drop. Wraps the derived
+# AES key, decrypted credential plaintext, HMAC signing keys,
+# and any other private key / API key / secret material so the
+# memory is wiped immediately when its owner is dropped.
+zeroize.workspace = true
 # `async-trait` already in deps above. base64 already in deps above.
 # Globally-unique Message-ID generation.
 uuid = { version = "1", default-features = false, features = ["v4"] }

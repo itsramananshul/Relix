@@ -29,6 +29,10 @@ hex.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+# Zero the signing-key bytes from disk on drop so the raw
+# 32-byte secret material doesn't live in the inspector's heap
+# any longer than the verify call requires.
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

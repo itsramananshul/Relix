@@ -1,5 +1,6 @@
 //! `relix credentials ...` — RELIX-7.30 PART 2 operator surface.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Subcommand;
@@ -71,6 +72,54 @@ pub enum Cmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
+    /// SEC PART 1: rebuild a legacy v1-format vault.
+    MigrateKdf {
+        /// Vault DB path. Direct file access — no bridge call.
+        #[arg(long)]
+        db_path: PathBuf,
+        /// Env var holding the legacy SHA-256 master secret.
+        #[arg(long, default_value = "RELIX_CREDENTIAL_KEY")]
+        legacy_key_env: String,
+        /// Active key version name to stamp on rewritten rows.
+        #[arg(long, default_value = "v1")]
+        new_key_version: String,
+        /// Env var holding the new master secret used to derive
+        /// the new Argon2id-protected AES key.
+        #[arg(long, default_value = "RELIX_CREDENTIAL_KEY")]
+        new_key_version_env: String,
+        /// Argon2id memory cost in KiB.
+        #[arg(long, default_value_t = 65_536)]
+        argon2_memory_cost: u32,
+        /// Argon2id time cost (iterations).
+        #[arg(long, default_value_t = 3)]
+        argon2_time_cost: u32,
+        /// Argon2id parallelism.
+        #[arg(long, default_value_t = 4)]
+        argon2_parallelism: u32,
+    },
+    /// SEC PART 7: rotate the vault key.
+    RotateVaultKey {
+        /// Vault DB path.
+        #[arg(long)]
+        db_path: PathBuf,
+        /// `name=env_var` pair for each known key version.
+        /// Repeat the flag once per version, e.g.
+        /// `--key-version v1=RELIX_CREDENTIAL_KEY
+        ///  --key-version v2=RELIX_CREDENTIAL_KEY_V2`. The
+        /// highest-numbered version with a non-empty env var
+        /// becomes the active write key.
+        #[arg(long = "key-version", value_name = "NAME=ENV_VAR")]
+        key_versions: Vec<String>,
+        /// Argon2id memory cost in KiB (must match the value
+        /// the vault was created with — re-derivation under
+        /// different params won't decrypt existing rows).
+        #[arg(long, default_value_t = 65_536)]
+        argon2_memory_cost: u32,
+        #[arg(long, default_value_t = 3)]
+        argon2_time_cost: u32,
+        #[arg(long, default_value_t = 4)]
+        argon2_parallelism: u32,
+    },
 }
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
@@ -116,7 +165,125 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             bridge,
             raw,
         } => audit(&bridge, &name, limit, raw).await,
+        Cmd::MigrateKdf {
+            db_path,
+            legacy_key_env,
+            new_key_version,
+            new_key_version_env,
+            argon2_memory_cost,
+            argon2_time_cost,
+            argon2_parallelism,
+        } => migrate_kdf(
+            db_path,
+            &legacy_key_env,
+            &new_key_version,
+            &new_key_version_env,
+            argon2_memory_cost,
+            argon2_time_cost,
+            argon2_parallelism,
+        ),
+        Cmd::RotateVaultKey {
+            db_path,
+            key_versions,
+            argon2_memory_cost,
+            argon2_time_cost,
+            argon2_parallelism,
+        } => rotate_vault_key(
+            db_path,
+            &key_versions,
+            argon2_memory_cost,
+            argon2_time_cost,
+            argon2_parallelism,
+        ),
     }
+}
+
+fn migrate_kdf(
+    db_path: PathBuf,
+    legacy_key_env: &str,
+    new_key_version: &str,
+    new_key_version_env: &str,
+    argon2_memory_cost: u32,
+    argon2_time_cost: u32,
+    argon2_parallelism: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use relix_runtime::credentials::store::{self, KdfParams, KeyVersionMap};
+    let legacy_master = std::env::var(legacy_key_env).unwrap_or_default();
+    if legacy_master.is_empty() {
+        return Err(format!(
+            "credentials migrate-kdf: legacy key env var `{legacy_key_env}` is unset or empty"
+        )
+        .into());
+    }
+    let new_master = std::env::var(new_key_version_env).unwrap_or_default();
+    if new_master.is_empty() {
+        return Err(format!(
+            "credentials migrate-kdf: new-version key env var \
+             `{new_key_version_env}` is unset or empty"
+        )
+        .into());
+    }
+    let mut keys = KeyVersionMap::default();
+    keys.insert(new_key_version.to_string(), new_master);
+    let params = KdfParams {
+        memory_cost_kib: argon2_memory_cost,
+        time_cost: argon2_time_cost,
+        parallelism: argon2_parallelism,
+    };
+    let report = store::migrate_kdf(&db_path, &legacy_master, keys, params)?;
+    println!(
+        "vault migrated: {} row(s) re-encrypted under key version `{}`",
+        report.rows_rotated, report.active_version
+    );
+    Ok(())
+}
+
+fn rotate_vault_key(
+    db_path: PathBuf,
+    key_versions: &[String],
+    argon2_memory_cost: u32,
+    argon2_time_cost: u32,
+    argon2_parallelism: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use relix_runtime::credentials::store::{CredentialStore, KdfParams, KeyVersionMap};
+    if key_versions.is_empty() {
+        return Err("credentials rotate-vault-key: at least one --key-version is required".into());
+    }
+    let mut map = KeyVersionMap::default();
+    for raw in key_versions {
+        let (name, env_var) = match raw.split_once('=') {
+            Some(pair) => pair,
+            None => {
+                return Err(format!(
+                    "credentials rotate-vault-key: invalid --key-version `{raw}` (use NAME=ENV_VAR)"
+                )
+                .into());
+            }
+        };
+        let secret = std::env::var(env_var).unwrap_or_default();
+        if secret.is_empty() {
+            // Skip — never panic an operator's rotation because
+            // an env var was unset; just warn and continue.
+            eprintln!("warning: --key-version `{name}` env var `{env_var}` is empty; skipping");
+            continue;
+        }
+        map.insert(name.to_string(), secret);
+    }
+    if map.is_empty() {
+        return Err("credentials rotate-vault-key: every --key-version env var was empty".into());
+    }
+    let params = KdfParams {
+        memory_cost_kib: argon2_memory_cost,
+        time_cost: argon2_time_cost,
+        parallelism: argon2_parallelism,
+    };
+    let store = CredentialStore::open_with_params(&db_path, map, params, false)?;
+    let report = store.rotate_vault_key(Some("relix credentials rotate-vault-key"))?;
+    println!(
+        "vault key rotated: {} row(s) re-encrypted under active version `{}`",
+        report.rows_rotated, report.active_version
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
