@@ -316,6 +316,27 @@ impl AgentStore {
         migrate_legacy_opaque_tokens(&conn).map_err(AgentStoreError::Db)
     }
 
+    /// DEFERRED B test-only helper. Stamps a task_id on an
+    /// existing approval row without going through the normal
+    /// create-approval path. Used by the controller-side
+    /// `fail_tasks_orphaned_by_legacy_token_migration` tests to
+    /// link a seeded legacy row to a TaskStore-managed task
+    /// without re-implementing the entire `create_approval`
+    /// signature.
+    #[cfg(test)]
+    pub(crate) fn force_set_task_id_for_test(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<(), AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "UPDATE approval_requests SET task_id = ?1 WHERE approval_id = ?2",
+            params![task_id, approval_id],
+        )?;
+        Ok(())
+    }
+
     pub fn in_memory() -> Result<Self, AgentStoreError> {
         let conn = Connection::open_in_memory()?;
         crate::db::apply_pragmas(&conn)?;
@@ -766,6 +787,30 @@ impl AgentStore {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// DEFERRED B: list the `task_id`s of every approval in
+    /// `legacy_token_expired` status that carries a non-NULL
+    /// task_id. The controller startup calls this after the
+    /// boot-time legacy-token migration so any task that was
+    /// parked in `awaiting_input` by a since-migrated approval
+    /// can be transitioned to `failed`.
+    ///
+    /// Idempotent: re-running returns the SAME list (the rows
+    /// stay in `legacy_token_expired` permanently). The
+    /// controller-side wrapper is the layer that filters out
+    /// tasks that are already terminal.
+    pub fn list_legacy_token_expired_task_ids(&self) -> Result<Vec<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id FROM approval_requests
+             WHERE status = 'legacy_token_expired'
+               AND task_id IS NOT NULL",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// Newest-first pending approvals, capped at `limit`.

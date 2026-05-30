@@ -2223,6 +2223,224 @@ fn ensure_msg_bookkeeping_task(
     }
 }
 
+/// DEFERRED B: post-startup pass that fails any task linked to a
+/// `legacy_token_expired` approval row.
+///
+/// Runs once AFTER `AgentStore::open` (which flipped the
+/// approval rows themselves) and AFTER the TaskStore is alive.
+/// For each `legacy_token_expired` row with a `task_id`:
+///
+/// 1. Read the task's current status via `TaskStore::get`.
+/// 2. Skip when the task is already in a terminal state
+///    (`completed | failed | cancelled`) — operators that have
+///    already handled the parked task must not see their
+///    decision overwritten.
+/// 3. Otherwise transition to `failed` with
+///    `error_cause = "legacy_approval_token_expired"` via the
+///    canonical `TaskStore::update` path so the state machine
+///    runs every guard + the chronicle event lands.
+///
+/// Idempotent: re-running matches the same approval set, but
+/// the per-task terminal check guarantees only the first run
+/// transitions any given task.
+fn fail_tasks_orphaned_by_legacy_token_migration(
+    agent_store: &std::sync::Arc<crate::nodes::coordinator::agent::AgentStore>,
+    task_store: &std::sync::Arc<crate::nodes::coordinator::TaskStore>,
+) {
+    let task_ids = match agent_store.list_legacy_token_expired_task_ids() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "legacy-token migration: task-fail pass — list failed");
+            return;
+        }
+    };
+    if task_ids.is_empty() {
+        return;
+    }
+    let mut transitioned = 0usize;
+    let mut already_terminal = 0usize;
+    let mut not_found = 0usize;
+    for tid in &task_ids {
+        let view = match task_store.get(tid) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                not_found += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(task_id = %tid, error = %e, "legacy-token migration: task lookup failed");
+                continue;
+            }
+        };
+        // Mirror of `TaskStore`'s terminal-status check (kept
+        // in lock-step with the dispatcher; see
+        // `close_orphan_attempts_closes_attempts_whose_task_is_terminal`).
+        let is_terminal = matches!(view.status.as_str(), "completed" | "failed" | "cancelled");
+        if is_terminal {
+            already_terminal += 1;
+            continue;
+        }
+        match task_store.update(
+            tid,
+            Some("failed"),
+            None,
+            None,
+            None,
+            None,
+            Some("legacy_approval_token_expired"),
+            Some("legacy_approval_token_expired"),
+        ) {
+            Ok(()) => {
+                let _ =
+                    task_store.append_event(tid, "task.failed", "legacy_approval_token_expired");
+                transitioned += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %tid,
+                    error = %e,
+                    "legacy-token migration: task transition to failed failed"
+                );
+            }
+        }
+    }
+    tracing::warn!(
+        transitioned,
+        already_terminal,
+        not_found,
+        total = task_ids.len(),
+        "approval: transitioned {transitioned} tasks to failed state due to legacy approval token migration ({already_terminal} already terminal, {not_found} not found)"
+    );
+}
+
+#[cfg(test)]
+mod legacy_token_task_fail_tests {
+    use super::*;
+    use crate::nodes::coordinator::TaskStore;
+    use crate::nodes::coordinator::agent::AgentStore;
+
+    fn stores() -> (Arc<AgentStore>, Arc<TaskStore>) {
+        (
+            Arc::new(AgentStore::in_memory().unwrap()),
+            Arc::new(TaskStore::in_memory().unwrap()),
+        )
+    }
+
+    fn create_task(ts: &TaskStore, title: &str) -> String {
+        ts.create(
+            title,
+            "flow",
+            "{}",
+            "owner",
+            crate::nodes::coordinator::RetryPolicy::None,
+            0,
+            None,
+            None,
+        )
+        .expect("create task")
+    }
+
+    /// Seed a legacy `pending`-with-opaque-token approval row
+    /// stamped with `task_id`, then run the boot-time
+    /// migration so the row is now `legacy_token_expired`.
+    fn seed_legacy_with_task(
+        agent: &AgentStore,
+        approval_id: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
+        agent
+            .seed_legacy_token_row_for_test(approval_id, "pending", "deadbeef")
+            .map_err(|e| e.to_string())?;
+        agent
+            .force_set_task_id_for_test(approval_id, task_id)
+            .map_err(|e| e.to_string())?;
+        let _ = agent
+            .run_legacy_token_migration_for_test()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn fail_pass_transitions_linked_task_to_failed() {
+        let (agent, tasks) = stores();
+        let task_id = create_task(&tasks, "fail-1 title");
+        seed_legacy_with_task(&agent, "leg-1", &task_id).unwrap();
+        fail_tasks_orphaned_by_legacy_token_migration(&agent, &tasks);
+        let view = tasks.get(&task_id).unwrap().unwrap();
+        assert_eq!(view.status, "failed");
+        assert_eq!(
+            view.error_cause.as_deref(),
+            Some("legacy_approval_token_expired")
+        );
+    }
+
+    #[test]
+    fn fail_pass_skips_task_already_in_terminal_state() {
+        let (agent, tasks) = stores();
+        let task_id = create_task(&tasks, "done title");
+        // Mark task `completed` BEFORE the migration pass.
+        tasks
+            .update(
+                &task_id,
+                Some("completed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        seed_legacy_with_task(&agent, "leg-2", &task_id).unwrap();
+        fail_tasks_orphaned_by_legacy_token_migration(&agent, &tasks);
+        let view = tasks.get(&task_id).unwrap().unwrap();
+        // Untouched: terminal state stays terminal.
+        assert_eq!(view.status, "completed");
+        assert!(view.error_cause.is_none());
+    }
+
+    #[test]
+    fn fail_pass_is_idempotent_under_repeat_run() {
+        let (agent, tasks) = stores();
+        let task_id = create_task(&tasks, "idem title");
+        seed_legacy_with_task(&agent, "leg-3", &task_id).unwrap();
+        // First run: transition.
+        fail_tasks_orphaned_by_legacy_token_migration(&agent, &tasks);
+        let first = tasks.get(&task_id).unwrap().unwrap();
+        let first_updated_at = first.updated_at;
+        let first_error = first.error_cause.clone();
+        assert_eq!(first.status, "failed");
+        // Second run: task is now `failed` (terminal); the
+        // per-task guard short-circuits + nothing else changes.
+        fail_tasks_orphaned_by_legacy_token_migration(&agent, &tasks);
+        let second = tasks.get(&task_id).unwrap().unwrap();
+        assert_eq!(second.status, "failed");
+        assert_eq!(second.error_cause, first_error);
+        assert_eq!(
+            second.updated_at, first_updated_at,
+            "second run must NOT bump updated_at"
+        );
+    }
+
+    #[test]
+    fn fail_pass_skips_approvals_without_task_id() {
+        // An approval with NULL task_id never blocked a task,
+        // so the post-migration pass should not even consider
+        // it. We assert via the agent store's list helper
+        // returning nothing.
+        let (agent, _tasks) = stores();
+        agent
+            .seed_legacy_token_row_for_test("leg-no-task", "pending", "abc")
+            .unwrap();
+        agent.run_legacy_token_migration_for_test().unwrap();
+        let task_ids = agent.list_legacy_token_expired_task_ids().unwrap();
+        assert!(
+            task_ids.is_empty(),
+            "row with NULL task_id must not be listed"
+        );
+    }
+}
+
 async fn run_approval_expire_loop(
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
@@ -7498,6 +7716,15 @@ fn register_node_type_handlers(
             crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
                 .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
         );
+        // DEFERRED B: AgentStore::open's
+        // `migrate_legacy_opaque_tokens` runs without TaskStore
+        // access. Now that both stores are alive, fail any
+        // tasks that were parked in `awaiting_input` by a
+        // since-migrated approval. The pass is idempotent —
+        // re-running matches the same set of legacy_token_expired
+        // rows, but the per-task check skips tasks already in a
+        // terminal status so no double-transition happens.
+        fail_tasks_orphaned_by_legacy_token_migration(&agent_store, &store);
         // DEFERRED 1: resolve the operator-configured token TTL
         // ONCE at register time so the cap closure captures a
         // clamped value. The startup logs the effective TTL
