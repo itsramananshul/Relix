@@ -40,6 +40,13 @@ pub struct StoredSkill {
     pub example_inputs: Vec<String>,
     pub example_outputs: Vec<String>,
     pub status: SkillStatus,
+    /// Tenant-isolation work follow-up: per-tenant scoping. `None` on
+    /// rows written before tenant isolation shipped + on rows written
+    /// through the tenant-blind `insert` path. The
+    /// `*_for_tenant` read methods filter by this column when the
+    /// store was opened with `tenant_isolation = true`.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 /// One step in a skill's procedure. Free-form `step` text + an
@@ -222,6 +229,12 @@ pub enum SkillStoreError {
     NotFound(String),
     #[error("skill store: invalid status `{0}`")]
     InvalidStatus(String),
+    /// Tenant-isolation: returned by `*_for_tenant` methods
+    /// when the store was opened with
+    /// `tenant_isolation = true` but the caller did not
+    /// supply a tenant id.
+    #[error("skill store: tenant_id required in multi-tenant mode")]
+    MissingTenant,
 }
 
 impl From<serde_json::Error> for SkillStoreError {
@@ -234,13 +247,34 @@ impl From<serde_json::Error> for SkillStoreError {
 #[derive(Clone)]
 pub struct SkillStore {
     conn: Arc<Mutex<Connection>>,
+    /// Tenant-isolation: when `true`, the `*_for_tenant`
+    /// read methods fail closed on a missing tenant id AND
+    /// every read filters `WHERE tenant_id = ?`. The
+    /// pre-isolation tenant-blind methods (`get`, `list`,
+    /// `search`) still exist for callers that have not yet
+    /// migrated; they continue to ignore tenant. Mirrors the
+    /// `LayeredMemoryStore::tenant_isolation` flag added in
+    /// the PART 4 tenant-isolation work.
+    tenant_isolation: bool,
 }
 
 impl SkillStore {
     /// Open (or create) the store at `path`. Applies the standard
     /// pragmas, runs migrations, runs an integrity check, and
-    /// returns the wrapped connection.
+    /// returns the wrapped connection. Tenant isolation defaults
+    /// to OFF; callers opt in via
+    /// [`Self::open_with_tenant_isolation`].
     pub fn open(path: &Path) -> Result<Self, SkillStoreError> {
+        Self::open_with_tenant_isolation(path, false)
+    }
+
+    /// Tenant-isolation variant. When `tenant_isolation = true`,
+    /// the `*_for_tenant` read methods fail closed on a missing
+    /// tenant id AND apply `WHERE tenant_id = ?` to every read.
+    pub fn open_with_tenant_isolation(
+        path: &Path,
+        tenant_isolation: bool,
+    ) -> Result<Self, SkillStoreError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -252,18 +286,35 @@ impl SkillStore {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            tenant_isolation,
         })
     }
 
     /// In-memory store. Tests + callers that want a transient
     /// skill library use this.
     pub fn open_in_memory() -> Result<Self, SkillStoreError> {
+        Self::open_in_memory_with_tenant_isolation(false)
+    }
+
+    /// In-memory tenant-isolation variant. Same fail-closed +
+    /// `WHERE tenant_id = ?` semantics as
+    /// [`Self::open_with_tenant_isolation`].
+    pub fn open_in_memory_with_tenant_isolation(
+        tenant_isolation: bool,
+    ) -> Result<Self, SkillStoreError> {
         let conn = Connection::open_in_memory()?;
         crate::db::apply_pragmas(&conn)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            tenant_isolation,
         })
+    }
+
+    /// `true` when this store enforces per-tenant filtering on
+    /// the `*_for_tenant` read methods.
+    pub fn tenant_isolation_enabled(&self) -> bool {
+        self.tenant_isolation
     }
 
     fn migrate(conn: &Connection) -> Result<(), SkillStoreError> {
@@ -304,6 +355,22 @@ impl SkillStore {
             )?;
             crate::db::record_migration_applied(conn, 1)?;
         }
+        if current < 2 {
+            // Tenant-isolation follow-up: per-tenant scoping
+            // column + partial index for tenant-filtered reads.
+            // The column is nullable so pre-migration rows
+            // continue to read fine through the tenant-blind
+            // `get` / `list` / `search` methods. The
+            // `*_for_tenant` variants apply `WHERE tenant_id = ?`.
+            if !column_exists(conn, "skills", "tenant_id")? {
+                conn.execute("ALTER TABLE skills ADD COLUMN tenant_id TEXT", [])?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_skills_tenant \
+                     ON skills(tenant_id) WHERE tenant_id IS NOT NULL;",
+            )?;
+            crate::db::record_migration_applied(conn, 2)?;
+        }
         Ok(())
     }
 
@@ -320,8 +387,9 @@ impl SkillStore {
             "INSERT INTO skills \
              (id, name, description, source_agent, version, confidence, \
               usage_count, last_used_ms, created_at_ms, updated_at_ms, \
-              tags, steps_json, example_inputs_json, example_outputs_json, status) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              tags, steps_json, example_inputs_json, example_outputs_json, \
+              status, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 skill.id,
                 skill.name,
@@ -338,6 +406,7 @@ impl SkillStore {
                 inputs_json,
                 outputs_json,
                 skill.status.as_str(),
+                skill.tenant_id,
             ],
         )?;
         conn.execute(
@@ -484,6 +553,182 @@ impl SkillStore {
             stmt.query_map(params![needle, min_conf, limit_i], row_to_skill)?
                 .collect::<Vec<_>>()
         };
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// Tenant-isolation: tenant-aware variant of [`Self::get`].
+    /// Returns the row only when its `tenant_id` matches;
+    /// returns `Ok(None)` (not Err) when the row exists but
+    /// belongs to a different tenant — a leaked id must not
+    /// reveal cross-tenant existence. When the store was
+    /// opened with `tenant_isolation = false`, this falls
+    /// through to [`Self::get`] so callers can migrate
+    /// incrementally.
+    pub fn get_for_tenant(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<StoredSkill>, SkillStoreError> {
+        if !self.tenant_isolation {
+            return self.get(id);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return Err(SkillStoreError::MissingTenant),
+        };
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, name, description, source_agent, version, \
+                        confidence, usage_count, last_used_ms, created_at_ms, \
+                        updated_at_ms, tags, steps_json, example_inputs_json, \
+                        example_outputs_json, status, tenant_id \
+                 FROM skills WHERE id = ?1 AND tenant_id = ?2",
+                params![id, tenant],
+                row_to_skill_with_tenant,
+            )
+            .optional()?;
+        match row {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Tenant-isolation: tenant-aware variant of
+    /// [`Self::search`]. Adds `WHERE tenant_id = ?` to the
+    /// SQL so cross-tenant rows are NEVER returned. Same
+    /// fail-closed-on-missing-tenant semantics as
+    /// [`Self::get_for_tenant`].
+    pub fn search_for_tenant(
+        &self,
+        query: &str,
+        limit: usize,
+        min_confidence: Option<f32>,
+        agent: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<StoredSkill>, SkillStoreError> {
+        if !self.tenant_isolation {
+            return self.search(query, limit, min_confidence, agent);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return Err(SkillStoreError::MissingTenant),
+        };
+        let q = query.trim();
+        let needle = format!("%{}%", q.to_lowercase());
+        let limit_i: i64 = limit.clamp(1, 500) as i64;
+        let min_conf = min_confidence.unwrap_or(0.0) as f64;
+        let conn = self.lock();
+        let (sql, has_agent) = match agent {
+            Some(_) => (
+                "SELECT id, name, description, source_agent, version, \
+                        confidence, usage_count, last_used_ms, created_at_ms, \
+                        updated_at_ms, tags, steps_json, example_inputs_json, \
+                        example_outputs_json, status, tenant_id \
+                 FROM skills \
+                 WHERE tenant_id = ?1 \
+                   AND status != 'deprecated' \
+                   AND confidence >= ?2 \
+                   AND (LOWER(name) LIKE ?3 \
+                        OR LOWER(description) LIKE ?3 \
+                        OR LOWER(tags) LIKE ?3) \
+                   AND source_agent = ?5 \
+                 ORDER BY usage_count DESC, confidence DESC \
+                 LIMIT ?4",
+                true,
+            ),
+            None => (
+                "SELECT id, name, description, source_agent, version, \
+                        confidence, usage_count, last_used_ms, created_at_ms, \
+                        updated_at_ms, tags, steps_json, example_inputs_json, \
+                        example_outputs_json, status, tenant_id \
+                 FROM skills \
+                 WHERE tenant_id = ?1 \
+                   AND status != 'deprecated' \
+                   AND confidence >= ?2 \
+                   AND (LOWER(name) LIKE ?3 \
+                        OR LOWER(description) LIKE ?3 \
+                        OR LOWER(tags) LIKE ?3) \
+                 ORDER BY usage_count DESC, confidence DESC \
+                 LIMIT ?4",
+                false,
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = if has_agent {
+            stmt.query_map(
+                params![tenant, min_conf, needle, limit_i, agent.unwrap_or("")],
+                row_to_skill_with_tenant,
+            )?
+            .collect::<Vec<_>>()
+        } else {
+            stmt.query_map(
+                params![tenant, min_conf, needle, limit_i],
+                row_to_skill_with_tenant,
+            )?
+            .collect::<Vec<_>>()
+        };
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// Tenant-isolation: tenant-aware variant of
+    /// [`Self::list`]. Adds `WHERE tenant_id = ?` to the
+    /// generated SQL. Same fail-closed-on-missing-tenant
+    /// semantics as [`Self::get_for_tenant`].
+    pub fn list_for_tenant(
+        &self,
+        filter: &SkillFilter,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<StoredSkill>, SkillStoreError> {
+        if !self.tenant_isolation {
+            return self.list(filter);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t.to_string(),
+            _ => return Err(SkillStoreError::MissingTenant),
+        };
+        let mut sql = String::from(
+            "SELECT id, name, description, source_agent, version, \
+                    confidence, usage_count, last_used_ms, created_at_ms, \
+                    updated_at_ms, tags, steps_json, example_inputs_json, \
+                    example_outputs_json, status, tenant_id \
+             FROM skills WHERE tenant_id = ?",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        args.push(Box::new(tenant));
+        if let Some(a) = &filter.agent {
+            sql.push_str(" AND source_agent = ?");
+            args.push(Box::new(a.clone()));
+        }
+        if let Some(c) = filter.min_confidence {
+            sql.push_str(" AND confidence >= ?");
+            args.push(Box::new(c as f64));
+        }
+        if let Some(st) = filter.status {
+            sql.push_str(" AND status = ?");
+            args.push(Box::new(st.as_str().to_string()));
+        }
+        if let Some(t) = &filter.tag {
+            sql.push_str(" AND tags LIKE ?");
+            args.push(Box::new(format!("%\"{t}\"%")));
+        }
+        sql.push_str(" ORDER BY created_at_ms DESC, id ASC");
+        if let Some(l) = filter.limit {
+            sql.push_str(" LIMIT ?");
+            args.push(Box::new(l as i64));
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let arg_refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
+        let rows = stmt.query_map(arg_refs.as_slice(), row_to_skill_with_tenant)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r??);
@@ -834,6 +1079,21 @@ pub struct SkillStats {
     pub recently_created: Vec<StoredSkill>,
 }
 
+/// Returns `true` when `column` exists on `table` in the
+/// connection's current schema. Used by the tenant-isolation
+/// migration to make the ALTER TABLE idempotent.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, SkillStoreError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn row_to_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StoredSkill, SkillStoreError>> {
     let id: String = row.get(0)?;
     let name: String = row.get(1)?;
@@ -873,9 +1133,29 @@ fn row_to_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StoredSkill,
             example_inputs,
             example_outputs,
             status,
+            // Tenant-isolation legacy path: the tenant-blind
+            // SELECTs don't read the column, so we expose
+            // None. The `*_for_tenant` methods use a separate
+            // decoder that includes the tenant_id column.
+            tenant_id: None,
         })
     };
     Ok(parse())
+}
+
+/// Tenant-aware row decoder. Same shape as [`row_to_skill`]
+/// but expects column 15 to be the `tenant_id`. Used by the
+/// `*_for_tenant` SELECTs which explicitly include the
+/// column.
+fn row_to_skill_with_tenant(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<StoredSkill, SkillStoreError>> {
+    let inner = row_to_skill(row)?;
+    let tenant: Option<String> = row.get(15)?;
+    Ok(inner.map(|mut s| {
+        s.tenant_id = tenant;
+        s
+    }))
 }
 
 /// Mint a new skill id. UUIDv4 over a blake3 hash of the source
@@ -946,6 +1226,7 @@ mod tests {
             example_inputs: vec!["fetch the latest".into()],
             example_outputs: vec!["here are the latest".into()],
             status: SkillStatus::Active,
+            tenant_id: None,
         }
     }
 
@@ -1333,5 +1614,117 @@ mod tests {
             assert_eq!(SkillStatus::parse(s.as_str()), Some(s));
         }
         assert!(SkillStatus::parse("nope").is_none());
+    }
+
+    // ---- Tenant-isolation follow-up (post-Part 8): per-tenant
+    // scoping in SkillStore. Mirrors the LayeredMemoryStore
+    // precedent in nodes/memory/schema.rs (commit a0d00f1).
+
+    fn tenant_sample(id: &str, name: &str, tenant: Option<&str>) -> StoredSkill {
+        let mut s = sample(id, name);
+        s.tenant_id = tenant.map(|t| t.to_string());
+        s
+    }
+
+    #[test]
+    fn tenant_isolation_flag_defaults_to_false() {
+        let store = SkillStore::open_in_memory().unwrap();
+        assert!(!store.tenant_isolation_enabled());
+    }
+
+    #[test]
+    fn tenant_isolation_opt_in_enables_flag() {
+        let store = SkillStore::open_in_memory_with_tenant_isolation(true).unwrap();
+        assert!(store.tenant_isolation_enabled());
+    }
+
+    #[test]
+    fn list_for_tenant_hides_cross_tenant_rows() {
+        let store = SkillStore::open_in_memory_with_tenant_isolation(true).unwrap();
+        store
+            .insert(&tenant_sample("a", "alpha", Some("tenant-a")))
+            .unwrap();
+        store
+            .insert(&tenant_sample("b", "beta", Some("tenant-b")))
+            .unwrap();
+        let only_a = store
+            .list_for_tenant(&SkillFilter::default(), Some("tenant-a"))
+            .unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].id, "a");
+        assert_eq!(only_a[0].tenant_id.as_deref(), Some("tenant-a"));
+    }
+
+    #[test]
+    fn list_for_tenant_fails_closed_on_missing_tenant() {
+        let store = SkillStore::open_in_memory_with_tenant_isolation(true).unwrap();
+        store
+            .insert(&tenant_sample("a", "alpha", Some("tenant-a")))
+            .unwrap();
+        let err = store
+            .list_for_tenant(&SkillFilter::default(), None)
+            .unwrap_err();
+        assert!(matches!(err, SkillStoreError::MissingTenant));
+        let err = store
+            .list_for_tenant(&SkillFilter::default(), Some("   "))
+            .unwrap_err();
+        assert!(matches!(err, SkillStoreError::MissingTenant));
+    }
+
+    #[test]
+    fn list_for_tenant_falls_through_when_isolation_disabled() {
+        let store = SkillStore::open_in_memory().unwrap();
+        store.insert(&sample("a", "alpha")).unwrap();
+        let rows = store
+            .list_for_tenant(&SkillFilter::default(), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn search_for_tenant_hides_cross_tenant_rows() {
+        let store = SkillStore::open_in_memory_with_tenant_isolation(true).unwrap();
+        store
+            .insert(&tenant_sample("a", "deploy_to_prod", Some("tenant-a")))
+            .unwrap();
+        store
+            .insert(&tenant_sample("b", "deploy_to_prod", Some("tenant-b")))
+            .unwrap();
+        let only_a = store
+            .search_for_tenant("deploy", 10, None, None, Some("tenant-a"))
+            .unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].id, "a");
+    }
+
+    #[test]
+    fn search_for_tenant_fails_closed_on_missing_tenant() {
+        let store = SkillStore::open_in_memory_with_tenant_isolation(true).unwrap();
+        let err = store
+            .search_for_tenant("deploy", 10, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, SkillStoreError::MissingTenant));
+    }
+
+    #[test]
+    fn get_for_tenant_returns_none_on_cross_tenant_id() {
+        let store = SkillStore::open_in_memory_with_tenant_isolation(true).unwrap();
+        store
+            .insert(&tenant_sample("a", "alpha", Some("tenant-a")))
+            .unwrap();
+        // Same id exists, but under a different tenant — must not
+        // leak the row by returning Some.
+        let absent = store.get_for_tenant("a", Some("tenant-b")).unwrap();
+        assert!(absent.is_none());
+        let present = store.get_for_tenant("a", Some("tenant-a")).unwrap();
+        assert!(present.is_some());
+        assert_eq!(present.unwrap().tenant_id.as_deref(), Some("tenant-a"));
+    }
+
+    #[test]
+    fn get_for_tenant_fails_closed_on_missing_tenant() {
+        let store = SkillStore::open_in_memory_with_tenant_isolation(true).unwrap();
+        let err = store.get_for_tenant("anything", None).unwrap_err();
+        assert!(matches!(err, SkillStoreError::MissingTenant));
     }
 }

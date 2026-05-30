@@ -403,6 +403,7 @@ mod tests {
             example_inputs: vec!["in1".into()],
             example_outputs: vec!["out1".into()],
             status: SkillStatus::Active,
+            tenant_id: None,
         }
     }
 

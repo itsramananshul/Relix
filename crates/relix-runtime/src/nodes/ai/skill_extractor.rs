@@ -302,6 +302,7 @@ impl SkillExtractor {
             example_inputs: vec![task.prompt.clone()],
             example_outputs: vec![task.response.clone()],
             status: SkillStatus::Active,
+            tenant_id: None,
         };
         match self.store.insert(&skill) {
             Ok(_) => {
@@ -1037,6 +1038,7 @@ mod tests {
             example_inputs: vec![],
             example_outputs: vec![],
             status: SkillStatus::Active,
+            tenant_id: None,
         };
         // Make this row's confidence reusable in the assert
         // below.

@@ -210,17 +210,33 @@ pub fn handle_search(store: &SkillStore, ctx: &InvocationCtx) -> HandlerOutcome 
             tag: None,
             limit: Some(limit),
         };
-        match store.list(&filter) {
+        let r = if store.tenant_isolation_enabled() {
+            store.list_for_tenant(&filter, ctx.tenant_id.as_deref())
+        } else {
+            store.list(&filter)
+        };
+        match r {
             Ok(v) => v,
             Err(e) => return internal(format!("memory.skill_search: list: {e}")),
         }
     } else {
-        match store.search(
-            &args.query,
-            limit,
-            args.min_confidence,
-            args.agent.as_deref(),
-        ) {
+        let r = if store.tenant_isolation_enabled() {
+            store.search_for_tenant(
+                &args.query,
+                limit,
+                args.min_confidence,
+                args.agent.as_deref(),
+                ctx.tenant_id.as_deref(),
+            )
+        } else {
+            store.search(
+                &args.query,
+                limit,
+                args.min_confidence,
+                args.agent.as_deref(),
+            )
+        };
+        match r {
             Ok(v) => v,
             Err(e) => return internal(format!("memory.skill_search: search: {e}")),
         }
@@ -242,7 +258,12 @@ pub fn handle_get(store: &SkillStore, ctx: &InvocationCtx) -> HandlerOutcome {
     if args.id.trim().is_empty() {
         return invalid_args("memory.skill_get: id required".into());
     }
-    let skill = match store.get(&args.id) {
+    let lookup = if store.tenant_isolation_enabled() {
+        store.get_for_tenant(&args.id, ctx.tenant_id.as_deref())
+    } else {
+        store.get(&args.id)
+    };
+    let skill = match lookup {
         Ok(Some(s)) => s,
         Ok(None) => {
             return invalid_args(format!("memory.skill_get: no skill `{}`", args.id));
@@ -288,6 +309,7 @@ pub fn handle_store(store: &SkillStore, ctx: &InvocationCtx) -> HandlerOutcome {
         example_inputs: Vec::new(),
         example_outputs: Vec::new(),
         status: SkillStatus::Active,
+        tenant_id: ctx.tenant_id.clone(),
     };
     if let Err(e) = store.insert(&skill) {
         return internal(format!("memory.skill_store: insert: {e}"));
@@ -481,6 +503,7 @@ mod tests {
             example_inputs: vec![],
             example_outputs: vec![],
             status: SkillStatus::Active,
+            tenant_id: None,
         };
         store.insert(&s).unwrap();
         id
