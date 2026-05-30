@@ -65,8 +65,13 @@ pub struct QdrantConfig {
     #[serde(default = "default_dim", alias = "embedding_dim")]
     pub dim: usize,
     /// Optional API key. Empty string treated as `None`.
+    ///
+    /// SEC PART 2: stored as `SecretString` so the key bytes
+    /// are zeroized on drop. The newtype carries its own
+    /// `Serialize` / `Deserialize` impls so the TOML config
+    /// path keeps working without macro contortions.
     #[serde(default)]
-    pub api_key: Option<String>,
+    pub api_key: Option<crate::credentials::SecretString>,
     /// GAP 23: per-tenant collection isolation. When `false`
     /// (the default), every read / write goes to
     /// [`Self::collection`] regardless of the request's
@@ -440,7 +445,7 @@ impl QdrantClient {
     }
 
     fn auth(&self, b: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.cfg.api_key.as_deref() {
+        match self.cfg.api_key.as_ref().map(|s| s.as_str()) {
             Some(k) if !k.is_empty() => b.header("api-key", k),
             _ => b,
         }
@@ -537,7 +542,7 @@ mod tests {
         assert_eq!(cfg.url, "http://localhost:6333");
         assert_eq!(cfg.collection, "my_coll");
         assert_eq!(cfg.dim, 768);
-        assert_eq!(cfg.api_key.as_deref(), Some("secret"));
+        assert_eq!(cfg.api_key.as_ref().map(|s| s.as_str()), Some("secret"));
     }
 
     #[test]
@@ -760,7 +765,7 @@ mod tests {
     async fn api_key_is_passed_as_header_when_configured() {
         let mock = MockQdrant::spawn(serde_json::Value::Null).await;
         let mut cfg = cfg_for(&mock.url());
-        cfg.api_key = Some("topsecret".into());
+        cfg.api_key = Some(crate::credentials::SecretString::new("topsecret".into()));
         let client = QdrantClient::new(cfg);
         client.ensure_collection().await.unwrap();
         let cap = mock.captured.lock().unwrap();

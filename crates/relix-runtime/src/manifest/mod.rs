@@ -535,7 +535,11 @@ pub struct DiscoveryOptions {
     /// Caller's signed identity bundle — same one used for `/chat`.
     pub identity_bundle: Bundle,
     /// 32-byte libp2p secret. Bridge uses its own.
-    pub client_key: [u8; 32],
+    ///
+    /// SEC PART 2: wrapped in `Zeroizing` so the secret key
+    /// bytes are wiped from the heap when `DiscoveryOptions`
+    /// is dropped.
+    pub client_key: zeroize::Zeroizing<[u8; 32]>,
     /// Peer alias map the bridge was started with.
     pub peers: PeersFile,
     /// Per-call deadline. 10s is plenty for `node.manifest`.
@@ -550,7 +554,7 @@ impl Default for DiscoveryOptions {
     fn default() -> Self {
         Self {
             identity_bundle: panic_no_identity(),
-            client_key: [0u8; 32],
+            client_key: zeroize::Zeroizing::new([0u8; 32]),
             peers: PeersFile::default(),
             deadline_secs: 10,
             overall_timeout: Duration::from_secs(6),
@@ -592,7 +596,7 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
         let local_port = opts
             .local_port
             .unwrap_or_else(|| 30_000 + (rand::random::<u16>() % 5_000));
-        let (client, _events, event_loop) = rpc::new(opts.client_key, local_port).await.ok()?;
+        let (client, _events, event_loop) = rpc::new(*opts.client_key, local_port).await.ok()?;
         drop(tokio::spawn(event_loop.run()));
         return Some((
             cache,
@@ -610,7 +614,7 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
         .local_port
         .unwrap_or_else(|| 30_000 + (rand::random::<u16>() % 5_000));
 
-    let (client, mut events, event_loop) = match rpc::new(opts.client_key, local_port).await {
+    let (client, mut events, event_loop) = match rpc::new(*opts.client_key, local_port).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "discovery: rpc::new failed; cache stays empty");
@@ -759,7 +763,7 @@ pub fn default_discovery_options(
 ) -> DiscoveryOptions {
     DiscoveryOptions {
         identity_bundle,
-        client_key,
+        client_key: zeroize::Zeroizing::new(client_key),
         peers,
         deadline_secs: 10,
         overall_timeout: Duration::from_secs(6),

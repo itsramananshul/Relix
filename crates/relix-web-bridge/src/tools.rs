@@ -117,11 +117,11 @@ pub(crate) fn manifest_logic(
 }
 
 pub async fn manifest(State(state): State<AppState>) -> Json<ManifestResponse> {
-    let key = state.client_key;
+    let key = state.client_key.clone();
     let signer = format!("{}:{}", state.bridge_host, state.bridge_port);
     Json(manifest_logic(
         state.tool_registry.as_ref(),
-        Some(&key),
+        Some(&*key),
         &signer,
     ))
 }

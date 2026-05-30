@@ -674,7 +674,12 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 "approval: structured-token signing key loaded from {} (SEC PART A)",
                 crate::approval::SIGNING_KEY_ENV
             );
-            bridge.set_approval_token_signing_key(key);
+            // SEC PART 2: hand the bridge the inner bytes and
+            // let `set_approval_token_signing_key` re-wrap.
+            // The intermediate `Vec<u8>` is the value `Zeroizing`
+            // releases on `into_inner`-style consumption; both
+            // sides hold zeroizing copies so nothing lingers.
+            bridge.set_approval_token_signing_key((*key).clone());
         }
         Err(_) => {
             tracing::warn!(
@@ -2002,7 +2007,7 @@ async fn populate_ai_memory_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
@@ -3064,7 +3069,11 @@ pub fn register_agent_capabilities(
         // invocation. Empty bytes when the operator did not
         // set `RELIX_APPROVAL_TOKEN_KEY` — handler gracefully
         // omits the token in that case.
-        let signing_key: Vec<u8> = crate::approval::signing_key_from_env().unwrap_or_default();
+        // SEC PART 2: the closure captures a Zeroizing copy
+        // — Arc-style sharing across spawned handler tasks via
+        // `Zeroizing::clone` keeps every replica wiped on drop.
+        let signing_key: zeroize::Zeroizing<Vec<u8>> = crate::approval::signing_key_from_env()
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(Vec::new()));
         // NOT-DONE 1: capture the dispatch clock so the
         // cap handler stamps `issued_at_ms` on each minted
         // token via the same time source the admission gate
@@ -3274,7 +3283,7 @@ async fn populate_delegation_ai_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
@@ -3375,7 +3384,7 @@ async fn populate_cron_ai_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
@@ -3495,7 +3504,7 @@ async fn populate_telegram_outbound_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         // Use the AI deadline as the outer bound — it's the
         // longest of the three configured per-call deadlines
@@ -3624,7 +3633,7 @@ async fn populate_discord_outbound_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.ai_peer.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -3742,7 +3751,7 @@ async fn populate_slack_outbound_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.ai_peer.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -3866,7 +3875,7 @@ async fn populate_email_outbound_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.ai_peer.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -3974,7 +3983,7 @@ async fn populate_memory_curator_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
@@ -4092,7 +4101,7 @@ async fn populate_memory_curator_coord_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(6),
@@ -4187,7 +4196,7 @@ async fn populate_drift_embedder_cell(
     let peers_file = PeersFile { peers: peers_map };
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -4286,7 +4295,7 @@ async fn populate_workflow_dispatcher_cell(
     let peers_file = PeersFile { peers: peers_map };
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -4379,7 +4388,7 @@ async fn populate_knowledge_mesh_cell(
     let peers_file = PeersFile { peers: peers_map };
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -4481,7 +4490,7 @@ async fn populate_alert_mesh_cell(
     let peers_file = PeersFile { peers: peers_map };
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -4567,7 +4576,7 @@ async fn populate_memory_embedding_cell(
 
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key: client_key_bytes,
+        client_key: zeroize::Zeroizing::new(client_key_bytes),
         peers: peers_file,
         deadline_secs: cfg.deadline_secs,
         overall_timeout: std::time::Duration::from_secs(10),
@@ -7245,7 +7254,13 @@ fn register_node_type_handlers(
             && let Some(sess_cfg) = id_section.session.clone()
             && sess_cfg.enabled
         {
-            let key_material = std::env::var(&sess_cfg.signing_key_env).unwrap_or_default();
+            // SEC PART 2: wrap the env-sourced key material in
+            // Zeroizing so the String backing it is wiped as
+            // soon as this scope ends (the service stores its
+            // own zeroizing copy of the bytes).
+            let key_material: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+                std::env::var(&sess_cfg.signing_key_env).unwrap_or_default(),
+            );
             if key_material.len() < 32 {
                 tracing::warn!(
                     env_var = %sess_cfg.signing_key_env,

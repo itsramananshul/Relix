@@ -296,7 +296,12 @@ pub struct OpenAiModelEntry {
 pub struct AppState {
     pub cfg: Arc<BridgeConfig>,
     pub identity_bundle: Bundle,
-    pub client_key: [u8; 32],
+    /// SEC PART 2: the bridge's 32-byte libp2p secret key
+    /// lives inside `Zeroizing` so the bytes are wiped from
+    /// the heap when the last AppState clone is dropped
+    /// (bridge shutdown). Each per-request clone of AppState
+    /// gets its own zeroizing copy.
+    pub client_key: zeroize::Zeroizing<[u8; 32]>,
     pub peers: PeersFile,
     pub template: String,
     /// Pre-validated tool-flow template when `[flow] tool_template_path` is
@@ -701,10 +706,17 @@ fn open_layered_memory(
 /// the file does not exist. Mirrors `controller_runtime::load_or_generate_key`
 /// so operators do not have to remember a manual `relix-cli` step before
 /// first start. The file is gitignored (`dev-keys/*.key`).
-pub fn load_or_generate_client_key(path: &Path) -> Result<[u8; 32], BridgeError> {
+pub fn load_or_generate_client_key(
+    path: &Path,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, BridgeError> {
     if path.exists() {
-        let bytes = std::fs::read(path)
-            .map_err(|e| BridgeError::Config(format!("read client key {}: {e}", path.display())))?;
+        // SEC PART 2: the raw 32-byte disk read lives inside
+        // Zeroizing so the bytes are wiped immediately after
+        // the array copy.
+        let bytes: zeroize::Zeroizing<Vec<u8>> =
+            zeroize::Zeroizing::new(std::fs::read(path).map_err(|e| {
+                BridgeError::Config(format!("read client key {}: {e}", path.display()))
+            })?);
         if bytes.len() != 32 {
             return Err(BridgeError::Config(format!(
                 "{}: expected 32-byte secret key, got {}",
@@ -712,18 +724,18 @@ pub fn load_or_generate_client_key(path: &Path) -> Result<[u8; 32], BridgeError>
                 bytes.len()
             )));
         }
-        let mut out = [0u8; 32];
+        let mut out = zeroize::Zeroizing::new([0u8; 32]);
         out.copy_from_slice(&bytes);
         Ok(out)
     } else {
         use rand::RngCore;
-        let mut out = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut out);
+        let mut out = zeroize::Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut *out);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| BridgeError::Config(format!("mkdir {}: {e}", parent.display())))?;
         }
-        std::fs::write(path, out).map_err(|e| {
+        std::fs::write(path, *out).map_err(|e| {
             BridgeError::Config(format!("write client key {}: {e}", path.display()))
         })?;
         // POSIX chmod 0600 + Windows icacls strip-inheritance.

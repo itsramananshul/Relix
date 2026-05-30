@@ -796,7 +796,7 @@ async fn boot_harness(
     let peers_file = PeersFile { peers: peers_map };
     let opts = DiscoveryOptions {
         identity_bundle: base_state.identity_bundle.clone(),
-        client_key: base_state.client_key,
+        client_key: base_state.client_key.clone(),
         peers: peers_file,
         deadline_secs: 30,
         overall_timeout: Duration::from_secs(8),

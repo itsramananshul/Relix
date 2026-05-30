@@ -769,7 +769,7 @@ async fn real_dispatcher_remote_call_stream_honours_cancel_signal() {
     let opts = relix_runtime::flow_runner::FlowRunOptions {
         flow_path,
         identity_bundle: caller_bundle,
-        client_key: cli_key.to_bytes(),
+        client_key: zeroize::Zeroizing::new(cli_key.to_bytes()),
         peers: peers_file,
         data_dir: None,
         deadline_secs: 30,

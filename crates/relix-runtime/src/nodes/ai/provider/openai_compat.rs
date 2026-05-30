@@ -28,7 +28,10 @@ const DEFAULT_EMBED_MODEL: &str = "text-embedding-3-small";
 pub struct OpenAICompatibleProvider {
     name: &'static str,
     base_url: String,
-    api_key: Option<String>,
+    /// SEC PART 2: Zeroizing wrapper; API key bytes wiped on
+    /// drop. `None` means the provider was configured without
+    /// a key (rare — typically a local Ollama).
+    api_key: Option<zeroize::Zeroizing<String>>,
     default_model: String,
     http: reqwest::Client,
 }
@@ -45,7 +48,7 @@ impl OpenAICompatibleProvider {
             })?
             .trim_end_matches('/')
             .to_string();
-        let api_key = load_api_key(entry)?;
+        let api_key = load_api_key(entry)?.map(zeroize::Zeroizing::new);
         let default_model = entry
             .default_model
             .clone()
@@ -73,8 +76,8 @@ impl ChatProvider for OpenAICompatibleProvider {
     async fn list_available_models(&self) -> Result<Vec<AvailableModel>, ProviderError> {
         let url = format!("{}/models", self.base_url);
         let mut req = self.http.get(&url);
-        if let Some(key) = self.api_key.as_deref() {
-            req = req.bearer_auth(key);
+        if let Some(key) = self.api_key.as_ref() {
+            req = req.bearer_auth(key.as_str());
         }
         let resp = req
             .send()
@@ -137,7 +140,7 @@ impl ChatProvider for OpenAICompatibleProvider {
             .header("content-type", "application/json")
             .body(body.to_string());
         if let Some(key) = &self.api_key {
-            req = req.header("authorization", format!("Bearer {key}"));
+            req = req.header("authorization", format!("Bearer {}", key.as_str()));
         }
 
         let resp = req.send().await.map_err(|e| {
@@ -288,7 +291,7 @@ impl ChatProvider for OpenAICompatibleProvider {
             .header("accept", "text/event-stream")
             .body(body.to_string());
         if let Some(key) = &self.api_key {
-            req = req.header("authorization", format!("Bearer {key}"));
+            req = req.header("authorization", format!("Bearer {}", key.as_str()));
         }
         let resp = req.send().await.map_err(|e| {
             ProviderError::Transient(format!(
@@ -426,7 +429,7 @@ impl ChatProvider for OpenAICompatibleProvider {
             .header("content-type", "application/json")
             .body(body.to_string());
         if let Some(key) = &self.api_key {
-            req = req.header("authorization", format!("Bearer {key}"));
+            req = req.header("authorization", format!("Bearer {}", key.as_str()));
         }
         let resp = req.send().await.map_err(|e| {
             ProviderError::Transient(format!(

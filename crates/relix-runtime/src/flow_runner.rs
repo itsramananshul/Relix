@@ -98,7 +98,11 @@ pub struct FlowRunOptions {
     /// signer for the per-flow event log records. The libp2p PeerId is
     /// independent of the caller's identity subject_id (alpha SIMP — see
     /// docs/sol-runtime-analysis.md §6).
-    pub client_key: [u8; 32],
+    ///
+    /// SEC PART 2: wrapped in `Zeroizing` so the secret-key
+    /// bytes are wiped from the heap when the `FlowRunOptions`
+    /// (or any future clones) goes out of scope.
+    pub client_key: zeroize::Zeroizing<[u8; 32]>,
     /// Peer alias map.
     pub peers: PeersFile,
     /// Where the per-flow event log goes. Defaults to
@@ -229,7 +233,7 @@ impl FlowRunner {
         } else {
             // Fallback path (CLI standalone).
             let local_port = 21_000 + (rand::random::<u16>() % 8_000);
-            let (client, mut events, event_loop) = rpc::new(opts.client_key, local_port)
+            let (client, mut events, event_loop) = rpc::new(*opts.client_key, local_port)
                 .await
                 .map_err(|e| FlowRunnerError::Transport(format!("rpc::new: {e}")))?;
             tokio::spawn(event_loop.run());

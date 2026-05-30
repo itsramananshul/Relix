@@ -41,6 +41,7 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 use relix_core::eventlog::{self, EventRecord};
 use relix_runtime::audit_partition::AuditPartitionStore;
@@ -171,11 +172,17 @@ fn handle_flow(flow_path: &PathBuf, args: &Args) -> Result<(), Box<dyn std::erro
         let key_path = args.signer_key.as_ref().ok_or_else(|| {
             "--replay-verify requires --signer-key <owner-signing-key>".to_string()
         })?;
-        let bytes = std::fs::read(key_path)?;
+        // SEC PART 2: the 32-byte ed25519 secret-key bytes
+        // live inside `Zeroizing<Vec<u8>>` so they're wiped
+        // when this scope ends (the `SigningKey` itself
+        // zeroizes its inner buffer on drop too, but the
+        // intermediate disk read would otherwise leave the
+        // raw bytes on the heap past the verify call).
+        let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(std::fs::read(key_path)?);
         if bytes.len() != 32 {
             return Err("signer key must be 32 raw bytes".into());
         }
-        let mut arr = [0u8; 32];
+        let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&bytes);
         let key = SigningKey::from_bytes(&arr);
         let (next_seq, _last_hash) = eventlog::verify_chain(flow_path, &key.verifying_key())?;

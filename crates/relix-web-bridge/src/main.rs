@@ -260,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // startup; every /chat thereafter reuses it.
     let discovery_opts = relix_runtime::manifest::DiscoveryOptions {
         identity_bundle: state.identity_bundle.clone(),
-        client_key: state.client_key,
+        client_key: state.client_key.clone(),
         peers: state.peers.clone(),
         deadline_secs: state.cfg.transport.deadline_secs.min(10),
         overall_timeout: std::time::Duration::from_secs(6),

@@ -14,6 +14,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -439,7 +440,10 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenSummary> {
 pub struct SessionIdentityService {
     store: TokenStore,
     cfg: Arc<SessionIdentityConfig>,
-    signing_key: Arc<Vec<u8>>,
+    /// SEC PART 2: wrapped in `Zeroizing` so the HMAC key
+    /// bytes are wiped from the heap on the last Arc drop
+    /// (controller shutdown / test teardown).
+    signing_key: Arc<Zeroizing<Vec<u8>>>,
     /// NOT-DONE 1: clock the service consults for every TTL /
     /// last-seen comparison so the idle sweeper + verify path
     /// are deterministically testable via
@@ -495,10 +499,15 @@ impl SessionIdentityService {
         if signing_key.len() < 32 {
             return Err(TokenError::InvalidSigningKey(signing_key.len()));
         }
+        // SEC PART 2: wrap the caller-supplied bytes in
+        // Zeroizing IMMEDIATELY so the only public surface
+        // for the HMAC key is the zeroizing wrapper. The
+        // caller's `Vec<u8>` is consumed (moved) into
+        // Zeroizing — no zeroizing-leak surface remains.
         Ok(Self {
             store,
             cfg: Arc::new(cfg),
-            signing_key: Arc::new(signing_key),
+            signing_key: Arc::new(Zeroizing::new(signing_key)),
             clock,
             tenant_isolation,
         })

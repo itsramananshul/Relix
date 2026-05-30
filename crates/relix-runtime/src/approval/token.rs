@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -344,9 +345,15 @@ impl ApprovalToken {
 /// Read the signing key from [`SIGNING_KEY_ENV`]. Returns
 /// [`TokenError::MissingSigningKey`] when unset or empty so
 /// the boot path can fail loud.
-pub fn signing_key_from_env() -> Result<Vec<u8>, TokenError> {
+///
+/// SEC PART 2: the key material is wrapped in `Zeroizing<Vec<u8>>`
+/// so it's wiped from the heap when the returned value is
+/// dropped — the dispatch bridge stores its own zeroizing
+/// copy + the env-var-sourced string is the only public
+/// surface.
+pub fn signing_key_from_env() -> Result<Zeroizing<Vec<u8>>, TokenError> {
     match std::env::var(SIGNING_KEY_ENV) {
-        Ok(v) if !v.is_empty() => Ok(v.into_bytes()),
+        Ok(v) if !v.is_empty() => Ok(Zeroizing::new(v.into_bytes())),
         _ => Err(TokenError::MissingSigningKey),
     }
 }
@@ -381,12 +388,12 @@ fn mint_nonce() -> String {
 mod tests {
     use super::*;
 
-    fn key() -> Vec<u8> {
-        b"test-signing-key-32-bytes-long-x".to_vec()
+    fn key() -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(b"test-signing-key-32-bytes-long-x".to_vec())
     }
 
-    fn other_key() -> Vec<u8> {
-        b"a-different-key-32-bytes-of-yyyy".to_vec()
+    fn other_key() -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(b"a-different-key-32-bytes-of-yyyy".to_vec())
     }
 
     #[test]
@@ -642,6 +649,8 @@ mod tests {
 
     #[test]
     fn issue_rejects_empty_key_and_non_positive_ttl() {
+        // ApprovalToken::issue returns Result<String, _>, so
+        // the OK branch IS PartialEq — use direct compare here.
         assert_eq!(
             ApprovalToken::issue("a", "m", "s", "sess", 0, 60_000, &[]),
             Err(TokenError::MissingSigningKey)
@@ -728,7 +737,14 @@ mod tests {
         // test runs each test with the inherited env, and we
         // intentionally do NOT lock that down here.
         if std::env::var(SIGNING_KEY_ENV).is_err() {
-            assert_eq!(signing_key_from_env(), Err(TokenError::MissingSigningKey));
+            // SEC PART 2: signing_key_from_env now returns
+            // Zeroizing<Vec<u8>> on the Ok branch; assert
+            // structurally rather than via PartialEq (Zeroizing
+            // doesn't implement Eq).
+            assert!(matches!(
+                signing_key_from_env(),
+                Err(TokenError::MissingSigningKey)
+            ));
         }
     }
 }

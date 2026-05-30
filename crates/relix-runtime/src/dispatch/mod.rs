@@ -354,7 +354,12 @@ pub struct DispatchBridge {
     /// `GateInputs::signing_key`. Empty bytes (default) cause
     /// every token-bearing call to fail with
     /// `approval_token_missing_key`.
-    approval_token_signing_key: Vec<u8>,
+    ///
+    /// SEC PART 2: wrapped in `Zeroizing` so the bytes are
+    /// wiped from the heap when the DispatchBridge is dropped
+    /// (e.g. controller shutdown) and on every
+    /// `set_approval_token_signing_key` replacement.
+    approval_token_signing_key: zeroize::Zeroizing<Vec<u8>>,
     /// NOT-DONE 1: clock injection for TTL-sensitive admission
     /// paths (token expiry check at step 8). Defaults to
     /// [`relix_core::clock::SystemClock`]; tests install a
@@ -542,7 +547,7 @@ impl DispatchBridge {
             tenant_policy: None,
             audit_partition: None,
             always_require_methods: Arc::new(HashSet::new()),
-            approval_token_signing_key: Vec::new(),
+            approval_token_signing_key: zeroize::Zeroizing::new(Vec::new()),
             clock: Arc::new(relix_core::clock::SystemClock),
         })
     }
@@ -573,7 +578,7 @@ impl DispatchBridge {
     /// configuration, in which case every token-bearing call
     /// fails with `approval_token_missing_key`.
     pub fn set_approval_token_signing_key(&mut self, key: Vec<u8>) {
-        self.approval_token_signing_key = key;
+        self.approval_token_signing_key = zeroize::Zeroizing::new(key);
     }
 
     /// SEC PART A: borrow the configured signing key. Used by

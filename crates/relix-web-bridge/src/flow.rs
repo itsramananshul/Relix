@@ -139,7 +139,7 @@ pub async fn execute_chat_flow(
     let opts = FlowRunOptions {
         flow_path,
         identity_bundle: state.identity_bundle.clone(),
-        client_key: state.client_key,
+        client_key: state.client_key.clone(),
         peers: state.peers.clone(),
         data_dir: state.cfg.transport.data_dir.clone(),
         deadline_secs: state.cfg.transport.deadline_secs,
@@ -358,7 +358,7 @@ pub async fn execute_chat_with_tool_flow(
     let opts = FlowRunOptions {
         flow_path,
         identity_bundle: state.identity_bundle.clone(),
-        client_key: state.client_key,
+        client_key: state.client_key.clone(),
         peers: state.peers.clone(),
         data_dir: state.cfg.transport.data_dir.clone(),
         deadline_secs: state.cfg.transport.deadline_secs,
@@ -538,7 +538,7 @@ pub async fn execute_chat_flow_streaming(
     let opts = FlowRunOptions {
         flow_path,
         identity_bundle: state.identity_bundle.clone(),
-        client_key: state.client_key,
+        client_key: state.client_key.clone(),
         peers: state.peers.clone(),
         data_dir: state.cfg.transport.data_dir.clone(),
         deadline_secs: state.cfg.transport.deadline_secs,

@@ -37,7 +37,9 @@ const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 
 pub struct GeminiProvider {
     base_url: String,
-    api_key: String,
+    /// SEC PART 2: Zeroizing wrapper — API key bytes are
+    /// wiped from the heap when the provider is dropped.
+    api_key: zeroize::Zeroizing<String>,
     default_model: String,
     http: reqwest::Client,
 }
@@ -67,7 +69,7 @@ impl GeminiProvider {
             .map_err(|e| ProviderError::Permanent(format!("gemini: http client: {e}")))?;
         Ok(Self {
             base_url,
-            api_key,
+            api_key: zeroize::Zeroizing::new(api_key),
             default_model,
             http,
         })
@@ -89,7 +91,7 @@ impl ChatProvider for GeminiProvider {
             .http
             .post(&url)
             .header("content-type", "application/json")
-            .header("x-goog-api-key", &self.api_key)
+            .header("x-goog-api-key", self.api_key.as_str())
             .body(body.to_string())
             .send()
             .await
@@ -183,7 +185,7 @@ impl ChatProvider for GeminiProvider {
             .post(&url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
-            .header("x-goog-api-key", &self.api_key)
+            .header("x-goog-api-key", self.api_key.as_str())
             .body(body.to_string())
             .send()
             .await
@@ -863,7 +865,7 @@ mod tests {
     fn test_provider(base_url: String, model: &str) -> GeminiProvider {
         GeminiProvider {
             base_url,
-            api_key: "fake-test-key".into(),
+            api_key: zeroize::Zeroizing::new("fake-test-key".to_string()),
             default_model: model.into(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))

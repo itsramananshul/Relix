@@ -44,6 +44,9 @@ async-stream.workspace       = true
 bytes.workspace              = true
 time.workspace               = true
 reqwest.workspace            = true
+# SEC PART 2: zeroize the bridge's libp2p secret key + per-
+# request cloned copies of AppState.
+zeroize.workspace            = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true

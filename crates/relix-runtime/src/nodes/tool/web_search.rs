@@ -242,12 +242,15 @@ fn http_client() -> Result<reqwest::Client, SearchError> {
 /// with the API key in the JSON body. `search_depth = "advanced"`
 /// gives the LLM-research-friendly content the pipeline expects.
 pub struct TavilyProvider {
-    api_key: String,
+    /// SEC PART 2: Zeroizing wrapper; API key bytes wiped on drop.
+    api_key: zeroize::Zeroizing<String>,
 }
 
 impl TavilyProvider {
     pub fn new(api_key: String) -> Self {
-        Self { api_key }
+        Self {
+            api_key: zeroize::Zeroizing::new(api_key),
+        }
     }
 }
 
@@ -265,7 +268,7 @@ impl WebSearchProvider for TavilyProvider {
         let client = http_client()?;
         let n = clamp_max_results(max_results);
         let body = serde_json::json!({
-            "api_key": self.api_key,
+            "api_key": self.api_key.as_str(),
             "query": query,
             "max_results": n,
             "search_depth": "advanced",
@@ -331,12 +334,15 @@ pub(crate) fn parse_tavily_body(raw: &str) -> Result<Vec<SearchResult>, SearchEr
 /// Brave Search API client. `GET https://api.search.brave.com/res/v1/web/search`
 /// with the API key in the `X-Subscription-Token` header.
 pub struct BraveProvider {
-    api_key: String,
+    /// SEC PART 2: Zeroizing wrapper; API key bytes wiped on drop.
+    api_key: zeroize::Zeroizing<String>,
 }
 
 impl BraveProvider {
     pub fn new(api_key: String) -> Self {
-        Self { api_key }
+        Self {
+            api_key: zeroize::Zeroizing::new(api_key),
+        }
     }
 }
 
@@ -356,7 +362,7 @@ impl WebSearchProvider for BraveProvider {
         let resp = client
             .get("https://api.search.brave.com/res/v1/web/search")
             .query(&[("q", query.to_string()), ("count", n.to_string())])
-            .header("X-Subscription-Token", self.api_key.clone())
+            .header("X-Subscription-Token", self.api_key.as_str())
             .header("Accept", "application/json")
             .send()
             .await
@@ -415,12 +421,15 @@ pub(crate) fn parse_brave_body(raw: &str) -> Result<Vec<SearchResult>, SearchErr
 /// response; we ask for a strict JSON array of
 /// `{title, url, snippet}` entries.
 pub struct PerplexityProvider {
-    api_key: String,
+    /// SEC PART 2: Zeroizing wrapper; API key bytes wiped on drop.
+    api_key: zeroize::Zeroizing<String>,
 }
 
 impl PerplexityProvider {
     pub fn new(api_key: String) -> Self {
-        Self { api_key }
+        Self {
+            api_key: zeroize::Zeroizing::new(api_key),
+        }
     }
 }
 
@@ -450,7 +459,7 @@ impl WebSearchProvider for PerplexityProvider {
         });
         let resp = client
             .post("https://api.perplexity.ai/chat/completions")
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.api_key.as_str())
             .json(&body)
             .send()
             .await

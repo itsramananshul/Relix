@@ -33,11 +33,17 @@ pub async fn run(
     let identity: Bundle = codec::decode(&bundle_bytes)?;
 
     // Local libp2p PeerId key.
-    let key_bytes = std::fs::read(client_key_path)?;
+    //
+    // SEC PART 2: wrap both the disk read AND the parsed
+    // 32-byte array in `Zeroizing` so the secret-key bytes
+    // never linger past this scope. `FlowRunOptions.client_key`
+    // accepts the zeroizing wrapper.
+    let key_bytes: zeroize::Zeroizing<Vec<u8>> =
+        zeroize::Zeroizing::new(std::fs::read(client_key_path)?);
     if key_bytes.len() != 32 {
         return Err("client key must be 32 raw bytes".into());
     }
-    let mut key = [0u8; 32];
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&key_bytes);
 
     // Peer alias map.

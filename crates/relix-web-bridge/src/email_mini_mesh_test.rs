@@ -253,7 +253,7 @@ addr = "{}"
     );
     let peers_file = PeersFile { peers: peers_map };
     let bridge_identity = base_state.identity_bundle.clone();
-    let bridge_key = base_state.client_key;
+    let bridge_key = base_state.client_key.clone();
     let opts = DiscoveryOptions {
         identity_bundle: bridge_identity.clone(),
         client_key: bridge_key,

@@ -19,7 +19,9 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub struct AnthropicProvider {
     base_url: String,
-    api_key: String,
+    /// SEC PART 2: wrapped in `Zeroizing` so the API key is
+    /// wiped from the heap when the provider is dropped.
+    api_key: zeroize::Zeroizing<String>,
     default_model: String,
     http: reqwest::Client,
 }
@@ -49,7 +51,7 @@ impl AnthropicProvider {
             .map_err(|e| ProviderError::Permanent(format!("anthropic: http client: {e}")))?;
         Ok(Self {
             base_url,
-            api_key,
+            api_key: zeroize::Zeroizing::new(api_key),
             default_model,
             http,
         })
@@ -116,7 +118,7 @@ impl ChatProvider for AnthropicProvider {
         let resp = self
             .http
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.as_str())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -280,7 +282,7 @@ impl ChatProvider for AnthropicProvider {
         let resp = self
             .http
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.as_str())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")

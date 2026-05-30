@@ -348,15 +348,17 @@ async fn call_peer(
     let bundle_bytes = std::fs::read(identity_bundle_path)?;
     let bundle: Bundle = codec::decode(&bundle_bytes)?;
 
-    let key_bytes = std::fs::read(client_key_path)?;
+    // SEC PART 2: zeroize the raw key bytes on scope exit.
+    let key_bytes: zeroize::Zeroizing<Vec<u8>> =
+        zeroize::Zeroizing::new(std::fs::read(client_key_path)?);
     if key_bytes.len() != 32 {
         return Err("client key must be 32 raw bytes".into());
     }
-    let mut key = [0u8; 32];
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&key_bytes);
 
     let port = 20_000 + (rand::random::<u16>() % 10_000);
-    let (client, mut events, event_loop) = rpc::new(key, port).await?;
+    let (client, mut events, event_loop) = rpc::new(*key, port).await?;
     tokio::spawn(event_loop.run());
 
     let addr: Multiaddr = peer_addr

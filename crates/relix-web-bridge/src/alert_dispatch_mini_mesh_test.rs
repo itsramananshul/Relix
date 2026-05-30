@@ -219,7 +219,7 @@ async fn multi_channel_sink_fans_out_to_telegram_discord_slack_email() {
     let client_key = key_for(120);
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key,
+        client_key: zeroize::Zeroizing::new(client_key),
         peers: peers_file,
         deadline_secs: 30,
         overall_timeout: Duration::from_secs(8),
@@ -391,7 +391,7 @@ async fn one_failing_target_does_not_block_others() {
     let client_key = key_for(121);
     let opts = DiscoveryOptions {
         identity_bundle: bundle.clone(),
-        client_key,
+        client_key: zeroize::Zeroizing::new(client_key),
         peers: peers_file,
         deadline_secs: 30,
         overall_timeout: Duration::from_secs(8),
