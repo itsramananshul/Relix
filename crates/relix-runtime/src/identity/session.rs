@@ -213,6 +213,8 @@ pub enum TokenError {
     NotFound,
     #[error("identity: lock poisoned")]
     Lock,
+    #[error("identity: tenant_id required in multi-tenant mode")]
+    MissingTenant,
 }
 
 /// SQLite-backed token + blocklist store.
@@ -347,6 +349,40 @@ impl TokenStore {
         Ok(rows)
     }
 
+    /// Tenant-isolation: list tokens scoped to one tenant.
+    /// `WHERE tenant_id = ?` is applied unconditionally; the
+    /// schema's NOT NULL DEFAULT '' means pre-tenant rows have
+    /// `tenant_id = ''` and only show up when the caller passes
+    /// the empty string. Combined with `agent_name_filter` when
+    /// supplied.
+    pub fn list_for_tenant(
+        &self,
+        agent_name_filter: Option<&str>,
+        tenant_id: &str,
+    ) -> Result<Vec<TokenSummary>, TokenError> {
+        let conn = self.lock()?;
+        let rows: Vec<TokenSummary> = if let Some(a) = agent_name_filter {
+            let mut stmt = conn.prepare(
+                "SELECT token_id, session_id, agent_name, tenant_id, issued_at_ms, \
+                        expires_at_ms, scopes_json, revoked, revoked_at_ms, last_seen_ms \
+                 FROM session_tokens WHERE tenant_id = ?1 AND agent_name = ?2 \
+                 ORDER BY issued_at_ms DESC, token_id ASC",
+            )?;
+            stmt.query_map(params![tenant_id, a], row_to_summary)?
+                .collect::<Result<_, _>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT token_id, session_id, agent_name, tenant_id, issued_at_ms, \
+                        expires_at_ms, scopes_json, revoked, revoked_at_ms, last_seen_ms \
+                 FROM session_tokens WHERE tenant_id = ?1 \
+                 ORDER BY issued_at_ms DESC, token_id ASC",
+            )?;
+            stmt.query_map(params![tenant_id], row_to_summary)?
+                .collect::<Result<_, _>>()?
+        };
+        Ok(rows)
+    }
+
     /// Revoke every active token whose `last_seen_ms` is older
     /// than `idle_cutoff_ms`. Tokens that have never been
     /// `touch()`-ed are compared against their `issued_at_ms`
@@ -410,6 +446,11 @@ pub struct SessionIdentityService {
     /// [`relix_core::clock::FakeClock`]. Production callers
     /// wire [`relix_core::clock::SystemClock`].
     clock: Arc<dyn relix_core::clock::Clock>,
+    /// Tenant-isolation follow-up: when `true`, the
+    /// `*_for_tenant` reads on the service apply
+    /// `WHERE tenant_id = ?` and the issue path requires the
+    /// token to carry a non-empty tenant_id.
+    tenant_isolation: bool,
 }
 
 impl SessionIdentityService {
@@ -437,6 +478,20 @@ impl SessionIdentityService {
         signing_key: Vec<u8>,
         clock: Arc<dyn relix_core::clock::Clock>,
     ) -> Result<Self, TokenError> {
+        Self::new_with_clock_and_isolation(store, cfg, signing_key, clock, false)
+    }
+
+    /// Tenant-isolation variant. Set `tenant_isolation = true`
+    /// to make the issue path reject empty tenant_ids and the
+    /// `list_active_for_tenant` reader fail closed on missing
+    /// tenant_id.
+    pub fn new_with_clock_and_isolation(
+        store: TokenStore,
+        cfg: SessionIdentityConfig,
+        signing_key: Vec<u8>,
+        clock: Arc<dyn relix_core::clock::Clock>,
+        tenant_isolation: bool,
+    ) -> Result<Self, TokenError> {
         if signing_key.len() < 32 {
             return Err(TokenError::InvalidSigningKey(signing_key.len()));
         }
@@ -445,7 +500,12 @@ impl SessionIdentityService {
             cfg: Arc::new(cfg),
             signing_key: Arc::new(signing_key),
             clock,
+            tenant_isolation,
         })
+    }
+
+    pub fn tenant_isolation_enabled(&self) -> bool {
+        self.tenant_isolation
     }
 
     pub fn store(&self) -> &TokenStore {
@@ -459,7 +519,21 @@ impl SessionIdentityService {
     /// Issue a fresh signed token + persist a row to the
     /// vault. The wire form returned by `to_wire()` is what
     /// the caller hands to verify.
+    ///
+    /// Tenant-isolation: when [`Self::tenant_isolation_enabled`]
+    /// is true the request must carry a non-empty `tenant_id` —
+    /// `None` or empty string returns
+    /// [`TokenError::MissingTenant`].
     pub fn issue(&self, req: &IssueRequest) -> Result<SessionToken, TokenError> {
+        if self.tenant_isolation
+            && req
+                .tenant_id
+                .as_ref()
+                .map(|t| t.trim().is_empty())
+                .unwrap_or(true)
+        {
+            return Err(TokenError::MissingTenant);
+        }
         let now = self.clock.now_ms();
         let ttl = req.ttl_secs.unwrap_or(self.cfg.session_ttl_secs).max(1);
         let mut nonce_bytes = [0u8; 16];
@@ -530,6 +604,27 @@ impl SessionIdentityService {
         agent_name_filter: Option<&str>,
     ) -> Result<Vec<TokenSummary>, TokenError> {
         self.store.list(agent_name_filter)
+    }
+
+    /// Tenant-aware variant of [`Self::list_active`]. Falls
+    /// through to [`Self::list_active`] when isolation is off;
+    /// fails closed with [`TokenError::MissingTenant`] when on
+    /// and the tenant_id is missing or empty. The underlying
+    /// query applies `WHERE tenant_id = ?` so cross-tenant
+    /// tokens are NEVER returned.
+    pub fn list_active_for_tenant(
+        &self,
+        agent_name_filter: Option<&str>,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<TokenSummary>, TokenError> {
+        if !self.tenant_isolation {
+            return self.store.list(agent_name_filter);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return Err(TokenError::MissingTenant),
+        };
+        self.store.list_for_tenant(agent_name_filter, tenant)
     }
 
     /// Spawn the idle-timeout sweeper. Returns immediately;
@@ -789,5 +884,86 @@ mod tests {
             revoked.is_empty(),
             "token still within idle window must NOT be revoked"
         );
+    }
+
+    // ---- Tenant-isolation follow-up: per-tenant scoping for
+    // SessionIdentityService. Mirrors the SkillStore +
+    // CredentialStore additive pattern.
+
+    fn isolated_service() -> SessionIdentityService {
+        let store = TokenStore::open_in_memory().unwrap();
+        let cfg = SessionIdentityConfig {
+            enabled: true,
+            session_ttl_secs: 60,
+            session_idle_timeout_secs: 5,
+            sweep_interval_secs: 60,
+            verify_on_dispatch: false,
+            ..Default::default()
+        };
+        SessionIdentityService::new_with_clock_and_isolation(
+            store,
+            cfg,
+            vec![7u8; 32],
+            Arc::new(relix_core::clock::SystemClock),
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tenant_isolation_flag_defaults_to_false() {
+        let svc = fresh_service();
+        assert!(!svc.tenant_isolation_enabled());
+    }
+
+    #[test]
+    fn tenant_isolation_opt_in_enables_flag() {
+        let svc = isolated_service();
+        assert!(svc.tenant_isolation_enabled());
+    }
+
+    #[test]
+    fn issue_fails_closed_when_tenant_missing_in_isolation_mode() {
+        let svc = isolated_service();
+        let mut req = fixture_request();
+        req.tenant_id = None;
+        let err = svc.issue(&req).unwrap_err();
+        assert!(matches!(err, TokenError::MissingTenant));
+        req.tenant_id = Some("   ".into());
+        let err = svc.issue(&req).unwrap_err();
+        assert!(matches!(err, TokenError::MissingTenant));
+    }
+
+    #[test]
+    fn list_active_for_tenant_hides_cross_tenant_tokens() {
+        let svc = isolated_service();
+        let mut a = fixture_request();
+        a.session_id = "sess-a".into();
+        a.tenant_id = Some("tenant-a".into());
+        svc.issue(&a).unwrap();
+        let mut b = fixture_request();
+        b.session_id = "sess-b".into();
+        b.tenant_id = Some("tenant-b".into());
+        svc.issue(&b).unwrap();
+        let only_a = svc.list_active_for_tenant(None, Some("tenant-a")).unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].session_id, "sess-a");
+    }
+
+    #[test]
+    fn list_active_for_tenant_fails_closed_on_missing_tenant() {
+        let svc = isolated_service();
+        let err = svc.list_active_for_tenant(None, None).unwrap_err();
+        assert!(matches!(err, TokenError::MissingTenant));
+        let err = svc.list_active_for_tenant(None, Some("   ")).unwrap_err();
+        assert!(matches!(err, TokenError::MissingTenant));
+    }
+
+    #[test]
+    fn list_active_for_tenant_falls_through_when_isolation_disabled() {
+        let svc = fresh_service();
+        svc.issue(&fixture_request()).unwrap();
+        let rows = svc.list_active_for_tenant(None, None).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

@@ -73,10 +73,14 @@ fn handle_issue(svc: &SessionIdentityService, ctx: &InvocationCtx) -> HandlerOut
     if args.session_id.trim().is_empty() || args.agent_name.trim().is_empty() {
         return invalid("session_id and agent_name are required");
     }
+    // Tenant-isolation: when the request omits tenant_id,
+    // default to the per-request tenant_id propagated on the
+    // InvocationCtx so issued tokens are auto-scoped to the
+    // caller's tenant in multi-tenant deployments.
     let req = IssueRequest {
         session_id: args.session_id,
         agent_name: args.agent_name,
-        tenant_id: args.tenant_id,
+        tenant_id: args.tenant_id.or_else(|| ctx.tenant_id.clone()),
         scopes: args.scopes,
         ttl_secs: args.ttl_secs,
     };
@@ -150,7 +154,12 @@ fn handle_list(svc: &SessionIdentityService, ctx: &InvocationCtx) -> HandlerOutc
             Err(e) => return invalid(&format!("decode args: {e}")),
         }
     };
-    match svc.list_active(args.agent_name.as_deref()) {
+    let result = if svc.tenant_isolation_enabled() {
+        svc.list_active_for_tenant(args.agent_name.as_deref(), ctx.tenant_id.as_deref())
+    } else {
+        svc.list_active(args.agent_name.as_deref())
+    };
+    match result {
         Ok(rows) => ok_json(&rows),
         Err(e) => internal(&format!("{e}")),
     }
