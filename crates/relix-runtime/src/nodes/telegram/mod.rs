@@ -125,6 +125,24 @@ pub fn register(
     ring: Arc<MessageRing>,
     api: Arc<dyn BotApi>,
 ) {
+    register_with_webhook(bridge, state, ring, api, None, None);
+}
+
+/// FIX 1 variant of [`register`] that ALSO wires the
+/// `telegram.webhook_update` cap. When `out_cell` + `cfg` are
+/// `Some`, the cap parses inbound Telegram Update bytes and
+/// dispatches them through the same `handle_one_update`
+/// pipeline the long-poll loop uses. When either is `None`,
+/// the cap is omitted (existing behaviour — the long-poll
+/// loop is the only inbound path).
+pub fn register_with_webhook(
+    bridge: &mut DispatchBridge,
+    state: Arc<ChannelState>,
+    ring: Arc<MessageRing>,
+    api: Arc<dyn BotApi>,
+    out_cell: Option<crate::nodes::telegram::client::TelegramOutboundClientCell>,
+    cfg: Option<Arc<crate::nodes::telegram::config::TelegramNodeConfig>>,
+) {
     {
         let state = state.clone();
         bridge.register(
@@ -184,6 +202,167 @@ pub fn register(
             })),
         );
     }
+    // FIX 1: webhook-update dispatch cap. The bridge forwards
+    // inbound Telegram Updates here when the bot is in webhook
+    // mode. The cap parses the raw Update body, converts to
+    // `IncomingMessage`, and runs the SAME `handle_one_update`
+    // pipeline the long-poll loop uses.
+    if let (Some(out_cell), Some(cfg)) = (out_cell, cfg) {
+        let api = api.clone();
+        let state = state.clone();
+        let ring = ring.clone();
+        bridge.register(
+            "telegram.webhook_update",
+            Arc::new(FnHandler(move |ctx: InvocationCtx| {
+                let api = api.clone();
+                let state = state.clone();
+                let ring = ring.clone();
+                let cfg = cfg.clone();
+                let out_cell = out_cell.clone();
+                async move {
+                    handle_webhook_update(api, out_cell, state, ring, cfg, ctx.args).await
+                }
+            })),
+        );
+    }
+}
+
+/// FIX 1: parse one inbound Telegram Update + dispatch through
+/// the same handler the long-poll loop uses. Returns
+/// `HandlerOutcome::Ok(b"{\"ok\":true}")` on success, or an
+/// `INVALID_ARGS` envelope on a malformed body. Telegram has
+/// already been ACK'd by the bridge route (HTTP 200) — this
+/// cap is the in-process dispatch leg.
+async fn handle_webhook_update(
+    api: Arc<dyn BotApi>,
+    out_cell: crate::nodes::telegram::client::TelegramOutboundClientCell,
+    state: Arc<ChannelState>,
+    ring: Arc<MessageRing>,
+    cfg: Arc<crate::nodes::telegram::config::TelegramNodeConfig>,
+    body: Vec<u8>,
+) -> HandlerOutcome {
+    // Telegram Update wire shape — `message` for text/voice,
+    // `callback_query` for inline-button presses. Anything
+    // else (edits, polls, channel posts) is silently ignored.
+    let raw: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return HandlerOutcome::Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("telegram.webhook_update: body is not JSON: {e}"),
+                retry_hint: 0,
+                retry_after: None,
+            });
+        }
+    };
+    let Some(msg) = parse_webhook_update_to_incoming(&raw) else {
+        // Unknown update type — ack OK so the bridge does not
+        // log spurious failures. Telegram already got its 200.
+        return HandlerOutcome::Ok(b"{\"ok\":true,\"dispatched\":false}".to_vec());
+    };
+    let out = out_cell.get().cloned();
+    let out_ref: Option<&dyn crate::nodes::telegram::client::TelegramOutbound> = out
+        .as_ref()
+        .map(|a| a.as_ref() as &dyn crate::nodes::telegram::client::TelegramOutbound);
+    crate::nodes::telegram::controller::handle_one_update(
+        api.as_ref(),
+        out_ref,
+        state.as_ref(),
+        ring.as_ref(),
+        cfg.as_ref(),
+        &msg,
+    )
+    .await;
+    let _ = msg; // suppress unused-warning lint
+    HandlerOutcome::Ok(b"{\"ok\":true,\"dispatched\":true}".to_vec())
+}
+
+/// FIX 1: parse a Telegram Update JSON shape into an
+/// `IncomingMessage`. Mirrors the logic in
+/// `relix_telegram::live::update_to_incoming` for the webhook
+/// path (which the channel crate's private function does not
+/// expose). Returns None for update types we don't model
+/// (edits, polls, channel posts, …).
+fn parse_webhook_update_to_incoming(
+    raw: &serde_json::Value,
+) -> Option<relix_telegram::IncomingMessage> {
+    use relix_telegram::IncomingMessage;
+    let update_id = raw.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    // Callback query path.
+    if let Some(cb) = raw.get("callback_query") {
+        let data = cb.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        if data.is_empty() {
+            return None;
+        }
+        let id = cb
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let from = cb.get("from")?;
+        let user_id = from.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let username = from
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (chat_id, message_id) = if let Some(m) = cb.get("message") {
+            let chat_id = m
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let message_id = m.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            (chat_id, message_id)
+        } else {
+            (0, 0)
+        };
+        return Some(IncomingMessage {
+            update_id,
+            chat_id,
+            user_id,
+            message_id,
+            username,
+            text: data.to_string(),
+            voice_file_id: None,
+            callback_query_id: Some(id),
+        });
+    }
+    // Message path.
+    let m = raw.get("message")?;
+    let from = m.get("from")?;
+    let chat = m.get("chat")?;
+    let chat_id = chat.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let user_id = from.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let username = from
+        .get("username")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let message_id = m.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let text = m
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let voice_file_id = m
+        .get("voice")
+        .and_then(|v| v.get("file_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if text.is_empty() && voice_file_id.is_none() {
+        return None;
+    }
+    Some(IncomingMessage {
+        update_id,
+        chat_id,
+        user_id,
+        message_id,
+        username,
+        text,
+        voice_file_id,
+        callback_query_id: None,
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -472,5 +651,90 @@ mod tests {
             HandlerOutcome::Err(e) => assert_eq!(e.kind, error_kinds::RESPONDER_INTERNAL),
             HandlerOutcome::Ok(_) => panic!("expected Err"),
         }
+    }
+
+    // ── FIX 1: webhook-update parsing ──────────────────────
+
+    /// FIX 1: text-message Updates parse into `IncomingMessage`
+    /// with the same fields the long-poll path produces.
+    #[test]
+    fn fix1_parse_webhook_text_message() {
+        let raw = serde_json::json!({
+            "update_id": 7,
+            "message": {
+                "message_id": 11,
+                "from": { "id": 42, "username": "alice" },
+                "chat": { "id": 100 },
+                "text": "hello"
+            }
+        });
+        let m = parse_webhook_update_to_incoming(&raw).expect("text message parses");
+        assert_eq!(m.update_id, 7);
+        assert_eq!(m.chat_id, 100);
+        assert_eq!(m.user_id, 42);
+        assert_eq!(m.message_id, 11);
+        assert_eq!(m.username, "alice");
+        assert_eq!(m.text, "hello");
+        assert!(m.voice_file_id.is_none());
+        assert!(m.callback_query_id.is_none());
+    }
+
+    /// FIX 1: callback_query Updates surface `data` as the
+    /// text body and carry the `callback_query_id` so the
+    /// downstream `answerCallbackQuery` (FIX 3) can clear
+    /// the spinner.
+    #[test]
+    fn fix1_parse_webhook_callback_query() {
+        let raw = serde_json::json!({
+            "update_id": 3,
+            "callback_query": {
+                "id": "cb-1",
+                "from": { "id": 42, "username": "alice" },
+                "message": { "message_id": 99, "chat": { "id": 100 } },
+                "data": "/approve apr-1"
+            }
+        });
+        let m = parse_webhook_update_to_incoming(&raw).expect("callback_query parses");
+        assert_eq!(m.callback_query_id.as_deref(), Some("cb-1"));
+        assert_eq!(m.text, "/approve apr-1");
+        assert_eq!(m.chat_id, 100);
+        assert_eq!(m.message_id, 99);
+    }
+
+    /// FIX 1: voice-message Updates surface `voice.file_id` so
+    /// the controller can route to `tool.audio.transcribe`.
+    #[test]
+    fn fix1_parse_webhook_voice_message() {
+        let raw = serde_json::json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 21,
+                "from": { "id": 42 },
+                "chat": { "id": 100 },
+                "voice": { "file_id": "AwACAg-fake" }
+            }
+        });
+        let m = parse_webhook_update_to_incoming(&raw).expect("voice parses");
+        assert_eq!(m.voice_file_id.as_deref(), Some("AwACAg-fake"));
+        assert_eq!(m.text, "");
+    }
+
+    /// FIX 1: unknown Update types (e.g. `edited_message`) are
+    /// silently skipped — the bridge already 200'd Telegram.
+    #[test]
+    fn fix1_parse_webhook_unknown_type_returns_none() {
+        let raw = serde_json::json!({
+            "update_id": 4,
+            "edited_message": { "text": "edited" }
+        });
+        assert!(parse_webhook_update_to_incoming(&raw).is_none());
+    }
+
+    /// FIX 1: an empty body or one without `message`/`callback_query`
+    /// is not a fatal error — returns None and the caller acks OK.
+    #[test]
+    fn fix1_parse_webhook_empty_body_returns_none() {
+        let raw = serde_json::json!({ "update_id": 0 });
+        assert!(parse_webhook_update_to_incoming(&raw).is_none());
     }
 }

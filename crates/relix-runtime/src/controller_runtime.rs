@@ -8788,27 +8788,78 @@ fn register_node_type_handlers(
         // Build the live bot API once and share it between the
         // long-poll loop AND the `telegram.send` capability.
         let api: Arc<dyn relix_telegram::BotApi> = Arc::new(relix_telegram::LiveBotApi::new(token));
-        crate::nodes::telegram::register(bridge, state.clone(), ring.clone(), api.clone());
-        // Spawn the long-poll loop now. The loop checks the
-        // out_cell on every tick and gracefully degrades when
-        // the mesh client isn't wired yet (sends a fallback
-        // reply rather than crashing).
-        let api_for_loop = api.clone();
-        let state_for_loop = state.clone();
-        let ring_for_loop = ring.clone();
-        let cfg_for_loop = Arc::new(tg_cfg.clone());
-        let out_for_loop = out_cell.clone();
-        tokio::spawn(async move {
-            crate::nodes::telegram::run_telegram_controller(
-                api_for_loop,
-                out_for_loop,
-                state_for_loop,
-                ring_for_loop,
-                notifier,
-                cfg_for_loop,
-            )
-            .await;
-        });
+        let cfg_arc = Arc::new(tg_cfg.clone());
+        // FIX 1: register the inbound caps. When effective_mode
+        // is Webhook, the new `telegram.webhook_update` cap is
+        // wired alongside the existing read-only +
+        // approval-send caps so the bridge can forward inbound
+        // updates here.
+        crate::nodes::telegram::register_with_webhook(
+            bridge,
+            state.clone(),
+            ring.clone(),
+            api.clone(),
+            Some(out_cell.clone()),
+            Some(cfg_arc.clone()),
+        );
+        let effective = tg_cfg.effective_mode();
+        match effective {
+            relix_telegram::config::DeliveryMode::Webhook => {
+                // FIX 1: register the URL with Telegram once at
+                // startup. A failure here logs ERROR but does
+                // NOT crash the controller — the
+                // `telegram.webhook_update` cap is still wired,
+                // so an operator who manually calls setWebhook
+                // out-of-band still gets inbound dispatch.
+                let webhook_url = tg_cfg.webhook_url.clone().unwrap_or_default();
+                if !webhook_url.trim().is_empty() {
+                    let api_for_set = api.clone();
+                    let url_for_set = webhook_url.clone();
+                    tokio::spawn(async move {
+                        match api_for_set.set_webhook(&url_for_set).await {
+                            Ok(()) => tracing::info!(
+                                url = %url_for_set,
+                                "telegram: setWebhook registered (FIX 1)"
+                            ),
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                url = %url_for_set,
+                                "telegram: setWebhook failed; webhook receive path may not work \
+                                 until operator manually registers the URL"
+                            ),
+                        }
+                    });
+                }
+                tracing::info!("Telegram controller in WEBHOOK mode; long-poll loop suppressed");
+                // Drop the notifier (the approval-notifier loop
+                // is run independently if configured); the
+                // long-poll loop is NOT spawned in webhook
+                // mode.
+                let _ = notifier;
+            }
+            relix_telegram::config::DeliveryMode::LongPoll => {
+                // Spawn the long-poll loop. The loop checks the
+                // out_cell on every tick and gracefully degrades
+                // when the mesh client isn't wired yet (sends a
+                // fallback reply rather than crashing).
+                let api_for_loop = api.clone();
+                let state_for_loop = state.clone();
+                let ring_for_loop = ring.clone();
+                let cfg_for_loop = cfg_arc.clone();
+                let out_for_loop = out_cell.clone();
+                tokio::spawn(async move {
+                    crate::nodes::telegram::run_telegram_controller(
+                        api_for_loop,
+                        out_for_loop,
+                        state_for_loop,
+                        ring_for_loop,
+                        notifier,
+                        cfg_for_loop,
+                    )
+                    .await;
+                });
+            }
+        }
         // Hand back to run() so the post-rpc::Client setup
         // can dial memory + ai + coord and publish the
         // outbound client into the cell.

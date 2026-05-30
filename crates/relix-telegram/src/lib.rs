@@ -119,6 +119,24 @@ pub trait BotApi: Send + Sync + 'static {
     /// `file_id → file_path`, then `GET <root>/file/bot<token>/<path>`
     /// to fetch the bytes.
     async fn get_file_bytes(&self, file_id: &str) -> Result<Vec<u8>, BotApiError>;
+
+    /// FIX 1: register the webhook URL with Telegram. Called
+    /// once at controller startup when
+    /// `TelegramConfig::effective_mode()` resolves to
+    /// `Webhook`. The body is:
+    ///
+    /// ```json
+    /// {
+    ///   "url": "<webhook_url>",
+    ///   "allowed_updates": ["message", "callback_query"]
+    /// }
+    /// ```
+    ///
+    /// Default impl returns Ok(()) so the in-memory mock and
+    /// any test stub keep compiling without overriding.
+    async fn set_webhook(&self, _url: &str) -> Result<(), BotApiError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

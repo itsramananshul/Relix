@@ -558,6 +558,19 @@ impl BotApi for LiveBotApi {
             .map(|b| b.to_vec())
             .map_err(|e| BotApiError::Transient(format!("getFile read body: {e}")))
     }
+
+    async fn set_webhook(&self, url: &str) -> Result<(), BotApiError> {
+        // FIX 1: register the URL Telegram should POST updates
+        // to. `allowed_updates` mirrors the `getUpdates` long-
+        // poll allowlist so the operator gets exactly the same
+        // event set on both paths.
+        let body = serde_json::json!({
+            "url": url,
+            "allowed_updates": ["message", "callback_query"],
+        });
+        let _: TgIgnoredResult = self.post("setWebhook", &body).await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]

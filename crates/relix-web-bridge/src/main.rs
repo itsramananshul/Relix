@@ -673,6 +673,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // process async). Operators paste this URL into Event
         // Subscriptions in the Slack app config.
         .route("/v1/channels/slack/events", post(channels::slack_events))
+        // Telegram FIX 1: inbound Telegram webhook receiver.
+        // Verifies the source IP against Telegram's published
+        // ranges (149.154.160.0/20 + 91.108.4.0/22), parses
+        // the Update payload, forwards to the Telegram peer via
+        // mesh `telegram.webhook_update`, and responds HTTP 200
+        // within Telegram's 5s budget. The bridge passes
+        // ConnectInfo<SocketAddr> through via
+        // `into_make_service_with_connect_info` at the bottom
+        // of `main()`.
+        .route(
+            "/v1/channels/telegram/webhook",
+            post(channels::telegram_webhook),
+        )
         // PART 3: inbound Discord interactions endpoint.
         // Verifies the `X-Signature-Ed25519` +
         // `X-Signature-Timestamp` pair against the application
@@ -1095,6 +1108,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Dashboard:    http://{}/dashboard", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Telegram FIX 1: `into_make_service_with_connect_info::<SocketAddr>()`
+    // populates the `ConnectInfo<SocketAddr>` extractor on
+    // every request, used by the `/v1/channels/telegram/webhook`
+    // route to verify the source IP is in Telegram's published
+    // ranges. Every other route is unaffected — they don't
+    // declare a `ConnectInfo` extractor.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

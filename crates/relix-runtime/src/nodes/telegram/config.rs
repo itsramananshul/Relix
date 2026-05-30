@@ -114,6 +114,25 @@ pub struct TelegramNodeConfig {
     /// configured" reply instead of being silently dropped.
     #[serde(default)]
     pub audio_peer: Option<AudioPeerConfig>,
+
+    /// FIX 1: explicit delivery-mode selector. Defaults to
+    /// `long_poll` so pre-FIX-1 deployments behave unchanged.
+    /// See [`Self::effective_mode`] for the arbitration with
+    /// [`Self::webhook_url`].
+    #[serde(default = "default_delivery_mode")]
+    pub mode: relix_telegram::config::DeliveryMode,
+
+    /// FIX 1: public HTTPS URL Telegram should POST updates to
+    /// in webhook mode. Empty / unset disables webhook mode
+    /// entirely (long-poll is forced). When set and `mode !=
+    /// "long_poll"`, the controller calls `setWebhook` at
+    /// startup and does NOT start the long-poll loop.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+
+fn default_delivery_mode() -> relix_telegram::config::DeliveryMode {
+    relix_telegram::config::DeliveryMode::LongPoll
 }
 
 fn default_allowed_groups() -> Vec<String> {
@@ -285,6 +304,25 @@ impl TelegramNodeConfig {
     /// chat. Zero == disabled.
     pub fn approval_notifications_enabled(&self) -> bool {
         self.operator_chat_id != 0
+    }
+
+    /// FIX 1: mutually-exclusive resolution of `mode` +
+    /// `webhook_url`. See `relix_telegram::TelegramConfig::effective_mode`
+    /// for the rule table; this runtime-side mirror applies the
+    /// exact same arbitration so a single source-of-truth is
+    /// observed across both config surfaces.
+    pub fn effective_mode(&self) -> relix_telegram::config::DeliveryMode {
+        use relix_telegram::config::DeliveryMode;
+        let has_url = self
+            .webhook_url
+            .as_deref()
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false);
+        match (has_url, self.mode) {
+            (true, DeliveryMode::Webhook) => DeliveryMode::Webhook,
+            (_, DeliveryMode::LongPoll) => DeliveryMode::LongPoll,
+            (false, DeliveryMode::Webhook) => DeliveryMode::LongPoll,
+        }
     }
 }
 

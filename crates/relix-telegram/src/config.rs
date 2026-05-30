@@ -50,6 +50,50 @@ pub struct TelegramConfig {
     /// hour regardless of this value.
     #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u32,
+
+    /// FIX 1: public HTTPS URL Telegram should POST updates to
+    /// when the controller is in webhook mode. Empty / unset
+    /// disables webhook mode entirely. The URL MUST be the
+    /// publicly-reachable URL of the bridge's
+    /// `POST /v1/channels/telegram/webhook` route. Telegram
+    /// requires TLS so this is always `https://…`.
+    ///
+    /// Mode arbitration is `effective_mode()`: when
+    /// `webhook_url` is set AND `mode != "long_poll"`, the
+    /// controller calls `setWebhook` at startup and does NOT
+    /// start the long-poll loop. When `webhook_url` is absent,
+    /// long-poll is forced regardless of `mode`. This keeps
+    /// pre-FIX-1 deployments working unchanged.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+
+impl TelegramConfig {
+    /// FIX 1: mutually-exclusive resolution of `mode` +
+    /// `webhook_url`. Returns the actual mode the controller
+    /// should run in:
+    ///
+    /// - `webhook_url` set AND mode != long_poll ⇒ Webhook
+    /// - `webhook_url` absent ⇒ LongPoll (forced)
+    /// - mode == long_poll explicitly ⇒ LongPoll (operator
+    ///   override; webhook_url is ignored)
+    pub fn effective_mode(&self) -> DeliveryMode {
+        let has_url = self
+            .webhook_url
+            .as_deref()
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false);
+        match (has_url, self.mode) {
+            (true, DeliveryMode::Webhook) => DeliveryMode::Webhook,
+            // Operator explicitly chose long_poll → respect it
+            // even when webhook_url is also set.
+            (_, DeliveryMode::LongPoll) => DeliveryMode::LongPoll,
+            // webhook_url absent + mode = webhook is a misconfig
+            // (no URL means no Telegram pushes); fail safe by
+            // long-polling.
+            (false, DeliveryMode::Webhook) => DeliveryMode::LongPoll,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -175,6 +219,60 @@ mod tests {
             coordinator_alias = "c"
         "#);
         assert_eq!(cfg.mode, DeliveryMode::Webhook);
+    }
+
+    /// FIX 1: webhook_url + mode = "webhook" → effective Webhook.
+    #[test]
+    fn fix1_effective_mode_webhook_when_url_and_mode_match() {
+        let cfg: TelegramConfig = mk(r#"
+            bot_token_env = "X"
+            mode = "webhook"
+            webhook_url = "https://example.com/v1/channels/telegram/webhook"
+            flow_template = "f.sol"
+            coordinator_alias = "c"
+        "#);
+        assert_eq!(cfg.effective_mode(), DeliveryMode::Webhook);
+    }
+
+    /// FIX 1: webhook_url present but mode explicitly long_poll
+    /// → operator override wins, effective LongPoll.
+    #[test]
+    fn fix1_effective_mode_respects_explicit_long_poll_override() {
+        let cfg: TelegramConfig = mk(r#"
+            bot_token_env = "X"
+            mode = "long_poll"
+            webhook_url = "https://example.com/webhook"
+            flow_template = "f.sol"
+            coordinator_alias = "c"
+        "#);
+        assert_eq!(cfg.effective_mode(), DeliveryMode::LongPoll);
+    }
+
+    /// FIX 1: mode = "webhook" but webhook_url absent →
+    /// fail-safe LongPoll (no URL means no Telegram pushes;
+    /// long-poll is the only viable receive path).
+    #[test]
+    fn fix1_effective_mode_fail_safes_to_long_poll_when_url_absent() {
+        let cfg: TelegramConfig = mk(r#"
+            bot_token_env = "X"
+            mode = "webhook"
+            flow_template = "f.sol"
+            coordinator_alias = "c"
+        "#);
+        assert_eq!(cfg.effective_mode(), DeliveryMode::LongPoll);
+    }
+
+    /// FIX 1: empty webhook_url string is treated as absent.
+    #[test]
+    fn fix1_effective_mode_treats_empty_webhook_url_as_absent() {
+        let cfg: TelegramConfig = mk(r#"
+            bot_token_env = "X"
+            mode = "webhook"
+            webhook_url = "   "
+            flow_template = "f.sol"
+            coordinator_alias = "c"
+        "#);
+        assert_eq!(cfg.effective_mode(), DeliveryMode::LongPoll);
     }
 
     #[test]

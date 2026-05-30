@@ -41,12 +41,13 @@
 //! / Slack interaction-response shape; the failed-deliveries
 //! surface reconciles the decision.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
 };
 use serde::Serialize;
@@ -804,6 +805,136 @@ async fn forward_record_decision(
     }
 }
 
+// ────────────────────────────────────────────────────────────
+// Telegram FIX 1 — webhook receiver
+// ────────────────────────────────────────────────────────────
+
+/// Telegram's published source-IP ranges. Updates POST'd from
+/// any address NOT in these ranges are rejected with HTTP 401.
+/// Documented at <https://core.telegram.org/bots/webhooks>.
+/// The two CIDR blocks are 149.154.160.0/20 (legacy datacenter)
+/// and 91.108.4.0/22 (newer datacenter).
+const TELEGRAM_CIDR_BLOCKS: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(149, 154, 160, 0), 20),
+    (Ipv4Addr::new(91, 108, 4, 0), 22),
+];
+
+/// Returns `true` when `ip` falls inside one of Telegram's
+/// published IPv4 source ranges. IPv6 addresses are rejected
+/// (Telegram does not currently send webhooks over IPv6).
+pub(crate) fn is_telegram_source_ip(ip: IpAddr) -> bool {
+    let IpAddr::V4(v4) = ip else {
+        return false;
+    };
+    let octets = v4.octets();
+    let ip_u32 = u32::from_be_bytes(octets);
+    for &(base, prefix) in TELEGRAM_CIDR_BLOCKS {
+        let base_u32 = u32::from_be_bytes(base.octets());
+        let mask: u32 = if prefix == 0 {
+            0
+        } else {
+            (!0u32) << (32 - prefix)
+        };
+        if (ip_u32 & mask) == (base_u32 & mask) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `POST /v1/channels/telegram/webhook`
+///
+/// Telegram FIX 1. Receives Update payloads from Telegram when
+/// the bot is in webhook mode (i.e. the operator pasted the
+/// bridge's public URL into `setWebhook`). Contract:
+///
+/// 1. Verify the source IP falls in Telegram's published
+///    ranges via [`is_telegram_source_ip`]. Reject HTTP 401
+///    otherwise.
+/// 2. Parse the body as JSON (Telegram's Update shape). Reject
+///    HTTP 400 on malformed JSON.
+/// 3. Forward the raw body to the Telegram peer via mesh
+///    `telegram.webhook_update` so the same code path that
+///    handles `get_updates` runs against the inbound message.
+/// 4. Respond HTTP 200 IMMEDIATELY — Telegram retries after 5s
+///    on any non-2xx, so a slow downstream peer must never
+///    block the response.
+///
+/// The forwarding hop is `tokio::spawn`-ed; the response goes
+/// out before the mesh call lands. A failure on the mesh leg
+/// is logged at WARN (the bridge cannot re-deliver after the
+/// 200 is on the wire — operators reconcile via the failed-
+/// deliveries surface).
+pub async fn telegram_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let ip = addr.ip();
+    if !is_telegram_source_ip(ip) {
+        tracing::warn!(
+            source_ip = %ip,
+            "telegram webhook: source IP not in Telegram's published ranges; rejecting"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: format!(
+                    "telegram webhook: source IP {ip} is not in Telegram's \
+                     published ranges (149.154.160.0/20 + 91.108.4.0/22)"
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    // Validate the body parses as JSON before acknowledging.
+    // A malformed body indicates either misconfiguration or a
+    // spoofed request that slipped through the IP check, so
+    // surfacing a 400 is more useful than 200.
+    if let Err(e) = serde_json::from_slice::<serde_json::Value>(&body) {
+        tracing::warn!(error = %e, "telegram webhook: body is not JSON");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("telegram webhook: body is not JSON: {e}"),
+            }),
+        )
+            .into_response();
+    }
+
+    // Forward to the Telegram peer via mesh. Spawned so the
+    // 200 lands within Telegram's 5s budget regardless of
+    // peer latency.
+    let state_for_spawn = state.clone();
+    let body_for_spawn = body.clone();
+    tokio::spawn(async move {
+        let mesh = match state_for_spawn.mesh_client.as_ref() {
+            Some(m) => m.clone(),
+            None => {
+                tracing::warn!("telegram webhook: mesh client not initialised; dropped Update");
+                return;
+            }
+        };
+        let envelope = build_request(
+            "telegram.webhook_update",
+            body_for_spawn.to_vec(),
+            state_for_spawn.identity_bundle.clone(),
+            state_for_spawn.cfg.transport.deadline_secs.clamp(5, 30),
+        );
+        if let Err(e) = mesh.call("telegram", envelope).await {
+            tracing::warn!(
+                error = %e,
+                "telegram webhook: forward to telegram peer via mesh failed"
+            );
+        }
+    });
+
+    (StatusCode::OK, Json(EmptyResponse::default())).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,6 +1149,97 @@ mod tests {
             "valid signature must pass; got {:?}",
             result.err().map(|r| r.status())
         );
+    }
+
+    // ── Telegram FIX 1 — webhook IP allowlist ──────────────
+
+    /// FIX 1: every Telegram-published IP in 149.154.160.0/20
+    /// passes. Sample addresses chosen at each boundary of the
+    /// /20 block: low end, mid range, high end. The /20 prefix
+    /// covers 149.154.160.0 through 149.154.175.255 (4096
+    /// addresses total).
+    #[test]
+    fn fix1_telegram_ip_block_149_154_admits_addresses_in_range() {
+        for addr in &[
+            "149.154.160.0",
+            "149.154.160.1",
+            "149.154.167.42",
+            "149.154.175.254",
+            "149.154.175.255",
+        ] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(
+                is_telegram_source_ip(ip),
+                "address {addr} must be admitted (149.154.160.0/20)"
+            );
+        }
+    }
+
+    #[test]
+    fn fix1_telegram_ip_block_91_108_admits_addresses_in_range() {
+        // /22 covers 91.108.4.0 through 91.108.7.255 (1024
+        // addresses total).
+        for addr in &[
+            "91.108.4.0",
+            "91.108.4.1",
+            "91.108.6.42",
+            "91.108.7.254",
+            "91.108.7.255",
+        ] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(
+                is_telegram_source_ip(ip),
+                "address {addr} must be admitted (91.108.4.0/22)"
+            );
+        }
+    }
+
+    #[test]
+    fn fix1_telegram_ip_block_rejects_addresses_just_outside_range() {
+        // One address below + above each block. These are the
+        // critical "off-by-one" cases that a naive comparison
+        // (e.g. checking only the first three octets) would
+        // miss.
+        for addr in &[
+            "149.154.159.255", // just below 149.154.160.0/20
+            "149.154.176.0",   // just above 149.154.175.255
+            "91.108.3.255",    // just below 91.108.4.0/22
+            "91.108.8.0",      // just above 91.108.7.255
+            "8.8.8.8",         // far outside
+            "192.168.1.1",     // RFC 1918
+            "127.0.0.1",       // loopback
+            "169.254.1.1",     // link-local
+        ] {
+            let ip: IpAddr = addr.parse().unwrap();
+            assert!(
+                !is_telegram_source_ip(ip),
+                "address {addr} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn fix1_telegram_ip_rejects_ipv6_addresses() {
+        // Telegram does not currently send webhooks over IPv6
+        // — when they start, the allowlist needs both this
+        // function AND the documented ranges updated.
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert!(!is_telegram_source_ip(v6));
+        let v6_global: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!is_telegram_source_ip(v6_global));
+    }
+
+    #[test]
+    fn fix1_telegram_ip_documented_constants_match_spec() {
+        // Pin the two CIDR blocks documented in the FIX 1
+        // spec. A future Telegram range change must update
+        // both this test AND the operator docs.
+        assert_eq!(TELEGRAM_CIDR_BLOCKS.len(), 2);
+        assert_eq!(
+            TELEGRAM_CIDR_BLOCKS[0],
+            (Ipv4Addr::new(149, 154, 160, 0), 20)
+        );
+        assert_eq!(TELEGRAM_CIDR_BLOCKS[1], (Ipv4Addr::new(91, 108, 4, 0), 22));
     }
 
     #[test]
