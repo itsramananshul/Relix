@@ -23,6 +23,7 @@
 //! - `slack.status` — bot online state + identity + team.
 //! - `slack.messages_recent` — last N inbound messages.
 
+pub mod bot_start_store;
 pub mod client;
 pub mod commands;
 pub mod config;

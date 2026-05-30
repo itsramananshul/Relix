@@ -1,5 +1,7 @@
 //! `[slack]` runtime config consumed when `node_type = "slack"`.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 /// Per-node Slack controller configuration.
@@ -42,6 +44,14 @@ pub struct SlackNodeConfig {
     pub memory_peer: MemoryPeerConfig,
     pub ai_peer: AiPeerConfig,
     pub coord_peer: CoordPeerConfig,
+    /// FIX 4 — path to the SQLite file holding the
+    /// historical-message filter state. `None` ⇒ no
+    /// persistent filter (existing behaviour — the controller
+    /// processes the first batch Slack returns, which can
+    /// include pre-boot history on a freshly-joined channel).
+    /// Set this to enable the FIX 4 historical filter.
+    #[serde(default)]
+    pub state_db_path: Option<PathBuf>,
 }
 
 fn default_allowed_groups() -> Vec<String> {

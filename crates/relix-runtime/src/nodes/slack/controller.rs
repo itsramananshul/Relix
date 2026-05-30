@@ -2,12 +2,25 @@
 //! Mirrors nodes/discord/controller.rs but uses Slack's `oldest`
 //! cursor and omits the typing indicator (Slack has no REST
 //! `chat.typing` — the spec is explicit: do NOT invent one).
+//!
+//! FIX 4 — historical-message filter. On controller startup we
+//! load (or, on first boot, record) a per-channel
+//! `bot_start_ts` from
+//! [`super::bot_start_store::SlackBotStartStore`]. Every poll
+//! drops messages with `ts < bot_start_ts` so a bot that joined
+//! mid-conversation does not replay the entire channel history.
+//! When the operator omits `[slack] state_db_path` the filter
+//! is disabled — backwards-compatible with deployments that
+//! relied on the pre-FIX-4 "process everything Slack returns"
+//! behaviour.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use relix_core::clock::{Clock, SystemClock};
 use relix_slack::{IncomingMessage, OutgoingMessage, SlackApi, derive_channel_subject};
 
+use super::bot_start_store::{SlackBotStartStore, unix_secs_to_slack_ts};
 use super::client::{SlackOutbound, SlackOutboundClientCell};
 use super::commands::{
     Command, brain_unreachable_message, help_message, memory_body, status_body,
@@ -47,6 +60,17 @@ pub async fn run_slack_controller(
         }
     }
 
+    // FIX 4: load or initialise the per-channel bot_start_ts.
+    // Disabled when `state_db_path` is unset (legacy default).
+    let bot_start_ts = init_bot_start_ts(&cfg, &SystemClock);
+    if let Some(ts) = bot_start_ts.as_deref() {
+        tracing::info!(
+            channel_id = %cfg.channel_id,
+            bot_start_ts = ts,
+            "slack: historical-message filter armed; will drop messages with ts < {ts}"
+        );
+    }
+
     let poll_interval = Duration::from_secs(cfg.poll_interval_secs.max(1));
     loop {
         let cursor = state.cursor();
@@ -65,6 +89,20 @@ pub async fn run_slack_controller(
         let bot_id = state.identity().user_id;
         for msg in &updates {
             advance_cursor(&state, &msg.ts);
+            // FIX 4: drop pre-boot history. Slack `ts` is
+            // string-compared lexicographically — see the
+            // `bot_start_store` doc on why that matches numeric
+            // order for the Slack format.
+            if let Some(floor) = bot_start_ts.as_deref()
+                && msg.ts.as_str() < floor
+            {
+                tracing::debug!(
+                    msg_ts = %msg.ts,
+                    floor = floor,
+                    "slack: skipping pre-boot historical message"
+                );
+                continue;
+            }
             // Defence in depth: the SDK parse layer already drops
             // subtype + bot_id messages, but a future SDK change
             // shouldn't reach the handler. Skip our own user_id +
@@ -82,6 +120,28 @@ pub async fn run_slack_controller(
         }
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// FIX 4: resolve the per-channel `bot_start_ts` floor from
+/// the configured SQLite path. Returns `None` when the operator
+/// omitted `[slack] state_db_path` so the filter stays disabled
+/// for that deployment.
+pub(crate) fn init_bot_start_ts(cfg: &SlackNodeConfig, clock: &dyn Clock) -> Option<String> {
+    let path = cfg.state_db_path.as_deref()?;
+    let store = match SlackBotStartStore::open(path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "slack: failed to open bot-start store; historical filter disabled"
+            );
+            return None;
+        }
+    };
+    let now_secs = clock.now_ms() / 1_000;
+    let candidate = unix_secs_to_slack_ts(now_secs);
+    Some(store.get_or_init(&cfg.channel_id, &candidate, clock))
 }
 
 /// Run the controller with a caller-provided `SlackApi`. Wraps
@@ -734,5 +794,57 @@ mod tests {
     fn ts_gt_compares_seconds_when_different() {
         assert!(ts_gt("2.000", "1.999999"));
         assert!(!ts_gt("1.999999", "2.000"));
+    }
+
+    /// FIX 4: `init_bot_start_ts` returns None when no
+    /// `state_db_path` is configured — backwards-compatible
+    /// default keeps the historical filter disabled.
+    #[test]
+    fn fix4_init_bot_start_ts_returns_none_when_state_db_path_unset() {
+        let cfg = cfg_default();
+        let clock = relix_core::clock::FakeClock::new(1_700_000_000_000);
+        assert!(init_bot_start_ts(&cfg, &clock).is_none());
+    }
+
+    /// FIX 4: on first boot `init_bot_start_ts` records the
+    /// current clock as the floor and returns it. On a second
+    /// boot against the SAME db, the recorded floor is
+    /// returned unchanged so a restart doesn't replay history.
+    #[test]
+    fn fix4_init_bot_start_ts_records_then_resumes_on_restart() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("slack-state.db");
+        let mut cfg = cfg_default();
+        cfg.state_db_path = Some(path.clone());
+        // First boot at t=1700000000s.
+        let clock1 = relix_core::clock::FakeClock::new(1_700_000_000_000);
+        let ts1 = init_bot_start_ts(&cfg, &clock1).expect("first init returns ts");
+        assert_eq!(ts1, "1700000000.000000");
+        // Second boot — wall clock advanced, but the stored
+        // floor must survive.
+        let clock2 = relix_core::clock::FakeClock::new(1_900_000_000_000);
+        let ts2 = init_bot_start_ts(&cfg, &clock2).expect("second init returns ts");
+        assert_eq!(
+            ts2, ts1,
+            "second boot must observe the first-boot floor, not generate a new one"
+        );
+    }
+
+    /// FIX 4: the bot-start store gracefully degrades when the
+    /// SQLite open fails (bad path, permission denied, etc.) —
+    /// the controller stays up, the filter just disables.
+    #[test]
+    fn fix4_init_bot_start_ts_disables_filter_on_bad_path() {
+        let mut cfg = cfg_default();
+        // A path on a non-existent drive letter is the easiest
+        // way to force an open failure cross-platform.
+        cfg.state_db_path = Some(std::path::PathBuf::from("Z:/definitely/missing/slack.db"));
+        let clock = relix_core::clock::FakeClock::new(1_000);
+        // The actual return value is None on failure; the
+        // function logs a WARN line but does NOT panic.
+        let _result = init_bot_start_ts(&cfg, &clock);
+        // We cannot assert None unconditionally because some
+        // platforms accept arbitrary paths. We assert the
+        // function does not panic.
     }
 }

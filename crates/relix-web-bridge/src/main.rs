@@ -666,6 +666,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/channels/slack/interact",
             post(channels::slack_interact),
         )
+        // Slack FIX 2: inbound Slack Events API receiver.
+        // Same signature-verification gate as /interact (shared
+        // verifier in channels.rs). Handles `url_verification`
+        // (challenge echo) and `event_callback` (ack 200,
+        // process async). Operators paste this URL into Event
+        // Subscriptions in the Slack app config.
+        .route("/v1/channels/slack/events", post(channels::slack_events))
         // PART 3: inbound Discord interactions endpoint.
         // Verifies the `X-Signature-Ed25519` +
         // `X-Signature-Timestamp` pair against the application

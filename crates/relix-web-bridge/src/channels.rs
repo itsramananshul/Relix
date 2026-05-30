@@ -110,93 +110,8 @@ pub async fn slack_interact(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let signing_secret = match std::env::var(SLACK_SIGNING_SECRET_ENV) {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => {
-            tracing::warn!("slack interact: {SLACK_SIGNING_SECRET_ENV} unset; rejecting webhook");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError {
-                    error: format!(
-                        "slack interactivity disabled: set {SLACK_SIGNING_SECRET_ENV} \
-                         to the Slack app's signing secret to enable"
-                    ),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    let ts = match headers
-        .get("x-slack-request-timestamp")
-        .and_then(|h| h.to_str().ok())
-    {
-        Some(s) => s.to_string(),
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ApiError {
-                    error: "missing x-slack-request-timestamp header".into(),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let sig = match headers
-        .get("x-slack-signature")
-        .and_then(|h| h.to_str().ok())
-    {
-        Some(s) => s.to_string(),
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ApiError {
-                    error: "missing x-slack-signature header".into(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let check = verify_request_signature(&signing_secret, &ts, &sig, &body, now);
-    match check {
-        SignatureCheck::Valid => {}
-        SignatureCheck::Stale => {
-            tracing::warn!(
-                "slack interact: signature stale (timestamp outside the 5-minute window)"
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ApiError {
-                    error: "x-slack-signature: timestamp outside the 5-minute window".into(),
-                }),
-            )
-                .into_response();
-        }
-        SignatureCheck::Mismatch => {
-            tracing::warn!("slack interact: HMAC signature mismatch");
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(ApiError {
-                    error: "x-slack-signature: HMAC mismatch".into(),
-                }),
-            )
-                .into_response();
-        }
-        SignatureCheck::Malformed(reason) => {
-            tracing::warn!(reason = reason, "slack interact: signature malformed");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: format!("x-slack-signature malformed: {reason}"),
-                }),
-            )
-                .into_response();
-        }
+    if let Err(resp) = verify_slack_signature_or_response(&headers, &body, "interact") {
+        return *resp;
     }
 
     let action = match parse_interaction_payload(&body) {
@@ -250,6 +165,259 @@ pub(crate) fn format_decision_note(user_id: &str, username: &str) -> String {
     } else {
         format!("slack:@{username} ({user_id})")
     }
+}
+
+/// Slack FIX 1 / FIX 2 shared signature gate. Verifies the
+/// `x-slack-signature` HMAC against the raw body using the
+/// signing secret from `RELIX_BRIDGE_SLACK_SIGNING_SECRET`.
+/// Returns `Ok(())` when the signature is valid; otherwise
+/// returns the canned axum response the route should reply with
+/// (503 when the env var is unset, 401 on stale/mismatch, 400 on
+/// malformed). Centralised so `slack_interact` and `slack_events`
+/// MUST both apply the same gate — no inbound Slack route can
+/// process a payload without going through this verifier.
+///
+/// Reads the signing secret from the env var; on miss returns a
+/// 503 response.
+fn verify_slack_signature_or_response(
+    headers: &HeaderMap,
+    body: &Bytes,
+    route_tag: &'static str,
+) -> Result<(), Box<axum::response::Response>> {
+    use axum::response::IntoResponse;
+
+    let signing_secret = match std::env::var(SLACK_SIGNING_SECRET_ENV) {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => {
+            tracing::warn!(
+                route = route_tag,
+                "slack: {SLACK_SIGNING_SECRET_ENV} unset; rejecting webhook"
+            );
+            return Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError {
+                        error: format!(
+                            "slack {route_tag}: disabled because {SLACK_SIGNING_SECRET_ENV} \
+                             is not set in the bridge environment"
+                        ),
+                    }),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+
+    verify_slack_signature_with_secret(&signing_secret, headers, body, route_tag)
+}
+
+/// Pure-function inner that the env-reading wrapper delegates
+/// to. Tests construct the secret directly + drive every
+/// signature-rejection branch without mutating process env.
+fn verify_slack_signature_with_secret(
+    signing_secret: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+    route_tag: &'static str,
+) -> Result<(), Box<axum::response::Response>> {
+    use axum::response::IntoResponse;
+
+    let ts = match headers
+        .get("x-slack-request-timestamp")
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiError {
+                        error: "missing x-slack-request-timestamp header".into(),
+                    }),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+    let sig = match headers
+        .get("x-slack-signature")
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiError {
+                        error: "missing x-slack-signature header".into(),
+                    }),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match verify_request_signature(signing_secret, &ts, &sig, body, now) {
+        SignatureCheck::Valid => Ok(()),
+        SignatureCheck::Stale => {
+            tracing::warn!(
+                route = route_tag,
+                "slack: signature stale (timestamp outside the 5-minute window)"
+            );
+            Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiError {
+                        error: "x-slack-signature: timestamp outside the 5-minute window".into(),
+                    }),
+                )
+                    .into_response(),
+            ))
+        }
+        SignatureCheck::Mismatch => {
+            tracing::warn!(route = route_tag, "slack: HMAC signature mismatch");
+            Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiError {
+                        error: "x-slack-signature: HMAC mismatch".into(),
+                    }),
+                )
+                    .into_response(),
+            ))
+        }
+        SignatureCheck::Malformed(reason) => {
+            tracing::warn!(
+                reason = reason,
+                route = route_tag,
+                "slack: signature malformed"
+            );
+            Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: format!("x-slack-signature malformed: {reason}"),
+                    }),
+                )
+                    .into_response(),
+            ))
+        }
+    }
+}
+
+/// `POST /v1/channels/slack/events` — Slack Events API receiver.
+///
+/// Slack FIX 2. Two payload types matter:
+///
+/// - `url_verification`: Slack sends this once when the operator
+///   pastes the bridge URL into the app's Event Subscriptions
+///   settings. The bridge responds with `{ "challenge": "..." }`
+///   echoing the random nonce so Slack accepts the URL.
+/// - `event_callback`: every real event arrives here. We
+///   spawn the processing task off the request thread and
+///   respond HTTP 200 immediately — Slack retries (with
+///   exponential backoff up to 3 times) on any non-2xx, so a
+///   slow downstream peer must NEVER block the response.
+///
+/// Both paths go through the same signature verification as
+/// `slack_interact` so no inbound payload can land without an
+/// HMAC check.
+pub async fn slack_events(
+    State(_state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if let Err(resp) = verify_slack_signature_or_response(&headers, &body, "events") {
+        return *resp;
+    }
+
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("slack events: payload is not JSON: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match kind {
+        "url_verification" => {
+            let challenge = payload
+                .get("challenge")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if challenge.is_empty() {
+                tracing::warn!(
+                    "slack events: url_verification arrived without a `challenge` field"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: "slack url_verification: missing `challenge`".into(),
+                    }),
+                )
+                    .into_response();
+            }
+            tracing::info!(
+                challenge_len = challenge.len(),
+                "slack events: url_verification handshake completed"
+            );
+            (StatusCode::OK, Json(SlackChallengeResponse { challenge })).into_response()
+        }
+        "event_callback" => {
+            // Spawn the downstream processing off-thread so the
+            // 200 lands within Slack's 3s retry budget no matter
+            // how slow the coordinator hop is. We log the event
+            // subtype so operators see what they're receiving;
+            // wiring the event to the controller is deliberately
+            // out-of-scope for FIX 2 (the spec is the route +
+            // signature verification + url_verification +
+            // event_callback fast-200).
+            let event_kind = payload
+                .get("event")
+                .and_then(|e| e.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let team_id = payload
+                .get("team_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            tokio::spawn(async move {
+                tracing::info!(
+                    event_kind = %event_kind,
+                    team_id = %team_id,
+                    "slack events: event_callback dispatched"
+                );
+            });
+            (StatusCode::OK, Json(EmptyResponse::default())).into_response()
+        }
+        other => {
+            tracing::warn!(
+                kind = other,
+                "slack events: unhandled payload type; acking 200 to suppress retry"
+            );
+            (StatusCode::OK, Json(EmptyResponse::default())).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SlackChallengeResponse {
+    challenge: String,
 }
 
 // ────────────────────────────────────────────────────────────
@@ -737,5 +905,132 @@ mod tests {
         let from = "ops@example.com\r\n";
         let cleaned: String = from.replace([' ', '\n', '\r'], "");
         assert_eq!(cleaned, "ops@example.com");
+    }
+
+    // ── Slack FIX 2 — events endpoint ──────────────────────
+
+    /// FIX 2: missing `x-slack-request-timestamp` is rejected
+    /// with HTTP 401.
+    #[test]
+    fn fix2_signature_helper_rejects_missing_timestamp_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-slack-signature", "v0=deadbeef".parse().unwrap());
+        let body = Bytes::from_static(b"{}");
+        let result = verify_slack_signature_with_secret("test-secret", &headers, &body, "events");
+        let resp = result.expect_err("must reject when ts header missing");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// FIX 2: missing `x-slack-signature` is rejected with
+    /// HTTP 401.
+    #[test]
+    fn fix2_signature_helper_rejects_missing_signature_header() {
+        let mut headers = HeaderMap::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        headers.insert(
+            "x-slack-request-timestamp",
+            now.to_string().parse().unwrap(),
+        );
+        let body = Bytes::from_static(b"{}");
+        let result = verify_slack_signature_with_secret("test-secret", &headers, &body, "events");
+        let resp = result.expect_err("must reject when signature header missing");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// FIX 2: stale timestamp (> 5min old) gets HTTP 401.
+    #[test]
+    fn fix2_signature_helper_rejects_stale_timestamp() {
+        let mut headers = HeaderMap::new();
+        let old_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 6 * 60; // 6 minutes ago
+        headers.insert(
+            "x-slack-request-timestamp",
+            old_ts.to_string().parse().unwrap(),
+        );
+        // A valid-looking signature shape so the verifier
+        // proceeds past parse and lands on the stale branch.
+        headers.insert("x-slack-signature", "v0=00".parse().unwrap());
+        let body = Bytes::from_static(b"{}");
+        let result = verify_slack_signature_with_secret("test-secret", &headers, &body, "events");
+        let resp = result.expect_err("must reject stale timestamp");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// FIX 2: bad-shape signature (no `v0=` prefix) yields
+    /// HTTP 400 — distinct from "missing" (401) so operators
+    /// can tell apart a misconfigured app from a missing
+    /// header.
+    #[test]
+    fn fix2_signature_helper_rejects_malformed_signature() {
+        let mut headers = HeaderMap::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        headers.insert(
+            "x-slack-request-timestamp",
+            now.to_string().parse().unwrap(),
+        );
+        // Garbage signature — no `v0=` prefix.
+        headers.insert("x-slack-signature", "garbage".parse().unwrap());
+        let body = Bytes::from_static(b"{}");
+        let result = verify_slack_signature_with_secret("test-secret", &headers, &body, "events");
+        let resp = result.expect_err("must reject malformed signature");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// FIX 2: valid signature passes through with `Ok(())`.
+    /// We compute the HMAC the same way `verify_request_signature`
+    /// does so the round trip succeeds.
+    #[test]
+    fn fix2_signature_helper_accepts_valid_signature() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let secret = "test-secret";
+        let body_bytes = b"{\"type\":\"event_callback\"}";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let basestring = format!("v0:{now}:{}", String::from_utf8_lossy(body_bytes));
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(basestring.as_bytes());
+        let sig_hex = hex::encode(mac.finalize().into_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-slack-request-timestamp",
+            now.to_string().parse().unwrap(),
+        );
+        headers.insert(
+            "x-slack-signature",
+            format!("v0={sig_hex}").parse().unwrap(),
+        );
+        let body = Bytes::copy_from_slice(body_bytes);
+        let result = verify_slack_signature_with_secret(secret, &headers, &body, "events");
+        assert!(
+            result.is_ok(),
+            "valid signature must pass; got {:?}",
+            result.err().map(|r| r.status())
+        );
+    }
+
+    #[test]
+    fn fix2_slack_challenge_response_serialises_with_single_field() {
+        // FIX 2: the documented contract — the `slack_events`
+        // handler MUST respond to `url_verification` with a
+        // JSON body shaped exactly `{"challenge":"..."}`. Lock
+        // the wire shape here so a future refactor that adds
+        // extra fields would break this test.
+        let r = SlackChallengeResponse {
+            challenge: "nonce-1234".into(),
+        };
+        let j = serde_json::to_string(&r).expect("serialise");
+        assert_eq!(j, r#"{"challenge":"nonce-1234"}"#);
     }
 }
