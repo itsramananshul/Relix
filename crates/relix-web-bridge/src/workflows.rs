@@ -26,7 +26,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use relix_runtime::dispatch::{build_request, decode_response};
+use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use relix_runtime::transport::stream::{StreamFrame, StreamReader, write_request_envelope};
 
@@ -158,11 +158,15 @@ async fn run_stream(state: &AppState, req: &RunRequest) -> Response {
         Err(e) => return bad_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("encode: {e}")),
     };
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 600);
-    let envelope = build_request(
+    let envelope = build_request_with_tenant(
         "workflow.run.stream",
         arg_bytes,
         state.identity_bundle.clone(),
         deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
     );
 
     let mut raw_stream = match mesh.client().open_stream(peer_id).await {
@@ -287,11 +291,15 @@ async fn call_peer_json(
         )
     })?;
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 120);
-    let envelope = build_request(
+    let envelope = build_request_with_tenant(
         method,
         arg.to_vec(),
         state.identity_bundle.clone(),
         deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
     );
     let timeout = std::time::Duration::from_secs(deadline_secs as u64 + 5);
     let resp_bytes = tokio::time::timeout(timeout, mesh.call(alias, envelope))

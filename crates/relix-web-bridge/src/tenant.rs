@@ -46,6 +46,53 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+tokio::task_local! {
+    /// PART 3 — task-local tenant resolved by the middleware.
+    /// Every wrapper helper that builds a mesh request reads
+    /// this via [`current_tenant`] so no handler has to thread
+    /// the tenant id through its signature manually. The
+    /// middleware binds it via
+    /// `CURRENT_TENANT.scope(tenant, next.run(req))` so the
+    /// value is in scope for the entire downstream call chain
+    /// (axum drives `next.run` in the same task; the task-local
+    /// is visible to every `.await` inside the handler).
+    ///
+    /// Value semantics: `String` (always present after the
+    /// middleware ran). `"default"` for single-tenant mode;
+    /// the canonical tenant id for multi-tenant resolved
+    /// requests. `current_tenant()` returns `Option<String>`;
+    /// it returns `None` ONLY when called outside the
+    /// middleware's scope (test code that constructs the
+    /// envelope directly).
+    pub static CURRENT_TENANT: String;
+}
+
+/// PART 3 — read the per-request tenant id resolved by the
+/// middleware. Returns `Some(tid)` when called inside the
+/// middleware's scope, `None` otherwise. Wrappers should
+/// pass the result through to
+/// `relix_runtime::dispatch::build_request_with_tenant`.
+pub fn current_tenant() -> Option<String> {
+    CURRENT_TENANT.try_with(|t| t.clone()).ok()
+}
+
+/// PART 3 — same as [`current_tenant`] but filters out the
+/// single-tenant sentinel so callers can pass
+/// `Option<&str>` directly to
+/// `build_request_with_tenant`. When the middleware resolved
+/// the request to single-tenant mode, the bound value is
+/// `"default"`; downstream wrappers prefer to omit the field
+/// entirely so the wire envelope's `tenant_id` stays
+/// `None` for legacy responders.
+pub fn current_tenant_or_none() -> Option<String> {
+    let raw = current_tenant()?;
+    if raw == DEFAULT_TENANT {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
 /// Identifier extracted from the request — either derived
 /// from an auth binding (canonical) or accepted from a
 /// trusted source's header (advisory). Cloned into each
@@ -299,10 +346,19 @@ pub async fn tenant_middleware(
             };
         }
     };
-    req.extensions_mut().insert(TenantId(
-        tenant_value.unwrap_or_else(|| DEFAULT_TENANT.to_string()),
-    ));
-    let mut resp = next.run(req).await;
+    let scope_value = tenant_value
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+    req.extensions_mut().insert(TenantId(scope_value.clone()));
+    // PART 3 — bind the resolved tenant as a task-local so
+    // every downstream wrapper (`call_peer_*`, `proxy_json`,
+    // …) can read it without the handler having to thread
+    // the value through its signature manually. The scope
+    // covers the entire `next.run(req)` future; when the
+    // handler awaits a mesh call, the wrapper inside reads
+    // `current_tenant()` and stamps it onto the envelope via
+    // `build_request_with_tenant`.
+    let mut resp = CURRENT_TENANT.scope(scope_value, next.run(req)).await;
     if let Ok(v) = axum::http::HeaderValue::from_str(&header_echo) {
         resp.headers_mut().insert("x-relix-tenant", v);
     }
@@ -454,6 +510,47 @@ mod tests {
             "Bearer abcdef".parse().unwrap(),
         );
         assert_eq!(extract_bearer_from_headers(&h), Some("abcdef"));
+    }
+
+    #[tokio::test]
+    async fn fix_part3_current_tenant_returns_none_outside_scope() {
+        // Outside the middleware's scope (e.g. a direct test
+        // call), the task-local is unbound and the helper
+        // returns None so the wrapper falls through to the
+        // legacy tenant-blind path.
+        assert!(current_tenant().is_none());
+        assert!(current_tenant_or_none().is_none());
+    }
+
+    #[tokio::test]
+    async fn fix_part3_current_tenant_reads_value_from_scope() {
+        // Inside `CURRENT_TENANT.scope(...)`, the helper
+        // returns the bound value. The middleware uses the
+        // same pattern to bind the resolved tenant for the
+        // entire downstream handler chain.
+        let observed = CURRENT_TENANT
+            .scope("acme".to_string(), async { current_tenant() })
+            .await;
+        assert_eq!(observed, Some("acme".to_string()));
+    }
+
+    #[tokio::test]
+    async fn fix_part3_current_tenant_or_none_filters_default_sentinel() {
+        // In single-tenant mode the middleware binds
+        // `DEFAULT_TENANT`. The `_or_none` variant filters
+        // that sentinel so the outbound envelope's
+        // `tenant_id` stays `None` for legacy responders.
+        let observed = CURRENT_TENANT
+            .scope(DEFAULT_TENANT.to_string(), async {
+                current_tenant_or_none()
+            })
+            .await;
+        assert!(observed.is_none());
+        // A real tenant id passes through.
+        let observed = CURRENT_TENANT
+            .scope("acme".to_string(), async { current_tenant_or_none() })
+            .await;
+        assert_eq!(observed, Some("acme".to_string()));
     }
 
     #[test]

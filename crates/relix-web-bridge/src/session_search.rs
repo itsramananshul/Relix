@@ -18,7 +18,7 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use relix_runtime::dispatch::{build_request, decode_response};
+use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -106,11 +106,15 @@ async fn call_memory_peer(state: &AppState, alias: &str, arg: &[u8]) -> Result<S
         }),
     ))?;
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(10, 60);
-    let envelope = build_request(
+    let envelope = build_request_with_tenant(
         "memory.session_search",
         arg.to_vec(),
         state.identity_bundle.clone(),
         deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
         let msg = e.to_string();

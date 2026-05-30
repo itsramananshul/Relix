@@ -433,8 +433,20 @@ async fn fetch_one_channel_health(
     deadline: i64,
 ) -> Option<relix_core::channel_health::ChannelHealthSnapshot> {
     let method = format!("{alias}.health");
-    let envelope =
-        relix_runtime::dispatch::build_request(&method, Vec::new(), identity.clone(), deadline);
+    // PART 3: read the request-task's resolved tenant. The
+    // `tokio::join!` inside `fetch_channels_health` runs in
+    // the same task as the `/v1/health` handler so the
+    // task-local `CURRENT_TENANT` is still in scope here.
+    let envelope = relix_runtime::dispatch::build_request_with_tenant(
+        &method,
+        Vec::new(),
+        identity.clone(),
+        deadline,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
+    );
     let resp_bytes = match mesh.call(alias, envelope).await {
         Ok(b) => b,
         Err(e) => {

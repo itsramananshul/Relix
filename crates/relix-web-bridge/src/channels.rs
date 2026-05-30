@@ -57,7 +57,7 @@ use relix_runtime::approval::{
     EmailProvider, EmailReplyError, SubjectDecision, parse_inbound_webhook,
     parse_subject_for_decision, verify_mailgun_signature,
 };
-use relix_runtime::dispatch::{build_request, decode_response};
+use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 use relix_slack::{
     InteractionParseError, SignatureCheck, parse_interaction_payload, verify_request_signature,
@@ -757,11 +757,15 @@ async fn forward_record_decision(
         }
     };
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 30);
-    let envelope = build_request(
+    let envelope = build_request_with_tenant(
         "approval.record_decision",
         arg_bytes,
         state.identity_bundle.clone(),
         deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
     );
     match mesh.call(COORDINATOR_ALIAS, envelope).await {
         Ok(bytes) => match decode_response(&bytes) {
@@ -910,6 +914,14 @@ pub async fn telegram_webhook(
     // peer latency.
     let state_for_spawn = state.clone();
     let body_for_spawn = body.clone();
+    // PART 3: capture the request-task's resolved tenant id
+    // BEFORE the `tokio::spawn` so it crosses the task
+    // boundary as a regular value. The task-local
+    // `CURRENT_TENANT` does NOT propagate into spawned
+    // futures — without this capture the forwarded envelope
+    // would carry `tenant_id = None` and the downstream
+    // would silently route to the default tenant.
+    let tenant_for_spawn = crate::tenant::current_tenant_or_none();
     tokio::spawn(async move {
         let mesh = match state_for_spawn.mesh_client.as_ref() {
             Some(m) => m.clone(),
@@ -918,11 +930,15 @@ pub async fn telegram_webhook(
                 return;
             }
         };
-        let envelope = build_request(
+        let envelope = relix_runtime::dispatch::build_request_with_tenant(
             "telegram.webhook_update",
             body_for_spawn.to_vec(),
             state_for_spawn.identity_bundle.clone(),
             state_for_spawn.cfg.transport.deadline_secs.clamp(5, 30),
+            None,
+            None,
+            None,
+            tenant_for_spawn,
         );
         if let Err(e) = mesh.call("telegram", envelope).await {
             tracing::warn!(

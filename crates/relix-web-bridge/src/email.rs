@@ -26,7 +26,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use relix_runtime::dispatch::{build_request, decode_response};
+use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
 use crate::config::AppState;
@@ -437,11 +437,15 @@ async fn call_peer_json(
         }
     };
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 120);
-    let envelope = build_request(
+    let envelope = build_request_with_tenant(
         method,
         arg_bytes,
         state.identity_bundle.clone(),
         deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
         let msg = e.to_string();
@@ -524,11 +528,15 @@ async fn call_peer_string(
         }),
     ))?;
     let deadline_secs = state.cfg.transport.deadline_secs.clamp(5, 60);
-    let envelope = build_request(
+    let envelope = build_request_with_tenant(
         method,
         arg.to_vec(),
         state.identity_bundle.clone(),
         deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
         let msg = e.to_string();

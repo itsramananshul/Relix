@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use relix_core::bundle::Bundle;
-use relix_runtime::dispatch::{build_request, decode_response};
+use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::manifest::MeshClient;
 use relix_runtime::nodes::coordinator::FailureClass;
 use relix_runtime::transport::envelope::ResponseResult;
@@ -445,11 +445,15 @@ impl TaskRecorder {
     /// Low-level wrapper. Builds an envelope, sends via MeshClient,
     /// decodes the response, returns the body bytes or a string error.
     async fn call(&self, method: &str, arg: &[u8]) -> Result<Vec<u8>, String> {
-        let envelope = build_request(
+        let envelope = build_request_with_tenant(
             method,
             arg.to_vec(),
             self.identity.clone(),
             self.deadline_secs,
+            None,
+            None,
+            None,
+            crate::tenant::current_tenant_or_none(),
         );
         let resp_bytes = self
             .mesh

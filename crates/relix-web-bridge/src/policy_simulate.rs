@@ -28,7 +28,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use relix_runtime::dispatch::{build_request, decode_response};
+use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
 use crate::config::AppState;
@@ -141,11 +141,15 @@ async fn call_peer(
             error: "bridge mesh client not initialized (peer discovery failed at startup)".into(),
         }),
     ))?;
-    let envelope = build_request(
+    let envelope = build_request_with_tenant(
         method,
         arg.to_vec(),
         state.identity_bundle.clone(),
         state.cfg.transport.deadline_secs,
+        None,
+        None,
+        None,
+        crate::tenant::current_tenant_or_none(),
     );
     let resp_bytes = mesh.call(alias, envelope).await.map_err(|e| {
         let msg = e.to_string();
