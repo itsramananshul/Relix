@@ -62,7 +62,7 @@ hmac          = { version = "0.12", default-features = false, features = ["std"]
 # Constant-time comparison primitives for token signature
 # verification. Pinned to the 2.x line — the constant-time
 # guarantee is the only thing we rely on.
-subtle        = { version = "2.5", default-features = false }
+subtle        = { version = "2.6", default-features = false }
 
 # Archive handling for `relix update` self-replace
 tar    = { version = "0.4", default-features = false }
