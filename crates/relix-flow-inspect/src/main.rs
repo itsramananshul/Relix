@@ -3,6 +3,14 @@
 //! Operator entry point. Reads:
 //! - flow event logs (`--flow <path>`): per-flow append-only signed log.
 //! - audit logs (`--audit <path>`): per-responder append-only signed log.
+//! - PART 7: audit partition mirror
+//!   (`--audit-partition <path>`): SQLite per-tenant index the
+//!   bridge writes alongside the signed CBOR log. Required
+//!   input mode for the `--tenant` / `--all-tenants` filters
+//!   because the signed `AuditRecord` does NOT carry
+//!   `tenant_id` (the field lives only on the partition
+//!   mirror — changing the signed shape would break the
+//!   existing hash chain).
 //!
 //! Output modes:
 //! - default: one summary line per record.
@@ -15,12 +23,27 @@
 //! Filters (audit only):
 //! - `--trace <hex>`: keep only records whose `trace_id` matches.
 //! - `--rid   <hex>`: keep only records whose `request_id` matches.
+//!
+//! PART 7 — multi-tenant audit reads (partition mirror only):
+//! - `--tenant <id>`: filter rows to the named tenant via the
+//!   underlying `tenant_recent(tenant_id)` query (which itself
+//!   ships a `WHERE tenant_id = ?1` clause).
+//! - `--all-tenants`: print every tenant's rows grouped by
+//!   tenant id with a separator line. Requires interactive
+//!   confirmation on stdin: the operator must type `yes` to
+//!   proceed; anything else exits without reading.
+//! - `--multi-tenant-mode`: when set, the no-flag case is
+//!   rejected with the documented error message. Operators
+//!   running in multi-tenant deployments wire this so a
+//!   forgotten `--tenant` flag never reads across tenants.
 
 use clap::Parser;
 use ed25519_dalek::SigningKey;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use relix_core::eventlog::{self, EventRecord};
+use relix_runtime::audit_partition::AuditPartitionStore;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,14 +80,88 @@ struct Args {
     /// (audit only) Filter records by request_id (hex).
     #[arg(long)]
     rid: Option<String>,
+
+    /// PART 7 — path to the audit partition SQLite mirror.
+    /// Required for the `--tenant` / `--all-tenants` flags
+    /// because the signed CBOR audit log does NOT carry
+    /// `tenant_id`. Operators point this at the file written
+    /// by `AuditPartitionStore::open` (default
+    /// `<data_dir>/audit-partition.db`).
+    #[arg(long)]
+    audit_partition: Option<PathBuf>,
+
+    /// PART 7 — filter audit-partition rows to a single
+    /// tenant id via the underlying `WHERE tenant_id = ?1`
+    /// query. Mutually exclusive with `--all-tenants`;
+    /// requires `--audit-partition`.
+    #[arg(long)]
+    tenant: Option<String>,
+
+    /// PART 7 — print every tenant's rows grouped by tenant
+    /// id with a separator line between groups. Requires
+    /// interactive confirmation on stdin: the operator must
+    /// type `yes` to proceed; anything else exits without
+    /// reading. Mutually exclusive with `--tenant`; requires
+    /// `--audit-partition`.
+    #[arg(long, default_value_t = false)]
+    all_tenants: bool,
+
+    /// PART 7 — enforces that one of `--tenant <id>` /
+    /// `--all-tenants` is supplied when reading the audit
+    /// partition. Operators running multi-tenant deployments
+    /// wire this so a forgotten flag cannot silently print
+    /// every tenant's rows. Equivalent to the bridge's
+    /// `[auth] multi_tenant_mode` config flag.
+    #[arg(long, default_value_t = false)]
+    multi_tenant_mode: bool,
+
+    /// PART 7 — when set, skip the `--all-tenants`
+    /// confirmation prompt. Reserved for non-interactive
+    /// pipelines (CI / scripted operator tools) that have
+    /// already confirmed out-of-band. Has no effect on the
+    /// `--multi-tenant-mode` enforcement; the operator still
+    /// must pass one of `--tenant` / `--all-tenants`.
+    #[arg(long, default_value_t = false)]
+    yes: bool,
+
+    /// PART 7 — cap rows returned per tenant by the
+    /// partition reader. Defaults to 1000 (the
+    /// `tenant_recent` server-side clamp).
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    match (args.flow.as_ref(), args.audit.as_ref()) {
-        (Some(flow_path), _) => handle_flow(flow_path, &args),
-        (None, Some(audit_path)) => handle_audit(audit_path, &args),
-        (None, None) => Err("provide --flow <path> or --audit <path>".into()),
+    // PART 7: mutual-exclusion on the per-tenant flags. They
+    // require --audit-partition AND only one may apply per
+    // run.
+    if args.tenant.is_some() && args.all_tenants {
+        return Err("--tenant and --all-tenants are mutually exclusive".into());
+    }
+    if (args.tenant.is_some() || args.all_tenants) && args.audit_partition.is_none() {
+        return Err(
+            "--tenant / --all-tenants require --audit-partition <path>; the signed audit \
+             log does not carry tenant_id (the field lives on the partition mirror only)"
+                .into(),
+        );
+    }
+    match (
+        args.flow.as_ref(),
+        args.audit.as_ref(),
+        args.audit_partition.as_ref(),
+    ) {
+        (Some(flow_path), _, _) => handle_flow(flow_path, &args),
+        (None, Some(audit_path), _) => handle_audit(audit_path, &args),
+        (None, None, Some(partition_path)) => handle_audit_partition(
+            partition_path,
+            &args,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+        ),
+        (None, None, None) => Err("provide --flow <path>, --audit <path>, \
+             or --audit-partition <path>"
+            .into()),
     }
 }
 
@@ -194,4 +291,377 @@ fn extract_latency_ms(payload: &[u8]) -> Option<u64> {
         }
     }
     None
+}
+
+/// PART 7 — read the audit partition mirror with the
+/// per-tenant flags applied. `stdin` / `stdout` are injected
+/// so the confirmation prompt is testable without touching
+/// real terminal handles. Returns the documented errors
+/// verbatim so the operator's tooling can grep them.
+fn handle_audit_partition(
+    path: &PathBuf,
+    args: &Args,
+    stdin: &mut dyn BufRead,
+    stdout: &mut dyn Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = AuditPartitionStore::open(path)
+        .map_err(|e| format!("open audit partition {}: {e}", path.display()))?;
+
+    // Resolve the mode this invocation runs in.
+    match (args.tenant.as_deref(), args.all_tenants) {
+        (Some(_), true) => unreachable!("main() rejected this combination"),
+        (Some(tenant_id), false) => print_tenant_recent(&store, tenant_id, args, stdout),
+        (None, true) => {
+            // PART 7: --all-tenants requires confirmation
+            // unless the operator opted out via --yes.
+            if !args.yes && !confirm_all_tenants(stdin, stdout)? {
+                writeln!(stdout, "Aborted; no records read.")?;
+                return Ok(());
+            }
+            print_all_tenants(&store, args, stdout)
+        }
+        (None, false) => {
+            if args.multi_tenant_mode {
+                Err("In multi-tenant mode you must specify --tenant <id> or --all-tenants.".into())
+            } else {
+                // Single-tenant mode without a tenant filter:
+                // print every row regardless of tenant (the
+                // store has only the `default` bucket in
+                // single-tenant deployments).
+                print_all_tenants(&store, args, stdout)
+            }
+        }
+    }
+}
+
+/// PART 7 — prompt the operator on `stdin` and accept ONLY
+/// the literal string `yes` (case-insensitive, trimmed).
+/// Anything else returns `Ok(false)` so the caller exits
+/// cleanly.
+fn confirm_all_tenants(
+    stdin: &mut dyn BufRead,
+    stdout: &mut dyn Write,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    write!(
+        stdout,
+        "This will display audit records for ALL tenants. Type 'yes' to confirm: "
+    )?;
+    stdout.flush()?;
+    let mut line = String::new();
+    stdin.read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// PART 7 — print one tenant's rows. Calls
+/// `AuditPartitionStore::tenant_recent` which itself ships
+/// the `WHERE tenant_id = ?1` clause.
+fn print_tenant_recent(
+    store: &AuditPartitionStore,
+    tenant_id: &str,
+    args: &Args,
+    stdout: &mut dyn Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rows = store
+        .tenant_recent(tenant_id, args.limit)
+        .map_err(|e| format!("tenant_recent({tenant_id}): {e}"))?;
+    writeln!(
+        stdout,
+        "audit partition rows for tenant={tenant_id}: {}",
+        rows.len()
+    )?;
+    for r in &rows {
+        write_partition_row(stdout, r, args.human)?;
+    }
+    Ok(())
+}
+
+/// PART 7 — print every tenant's rows grouped by tenant id.
+/// A separator line precedes each tenant's group so the
+/// boundaries are visible in operator pipes.
+fn print_all_tenants(
+    store: &AuditPartitionStore,
+    args: &Args,
+    stdout: &mut dyn Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tenants = store
+        .list_tenants()
+        .map_err(|e| format!("list_tenants: {e}"))?;
+    if tenants.is_empty() {
+        writeln!(stdout, "audit partition is empty")?;
+        return Ok(());
+    }
+    let mut total = 0usize;
+    for (i, tenant) in tenants.iter().enumerate() {
+        if i > 0 {
+            // Separator between tenant groups.
+            writeln!(stdout, "{}", "-".repeat(72))?;
+        }
+        let rows = store
+            .tenant_recent(tenant, args.limit)
+            .map_err(|e| format!("tenant_recent({tenant}): {e}"))?;
+        writeln!(stdout, "tenant={tenant} rows={}", rows.len())?;
+        for r in &rows {
+            write_partition_row(stdout, r, args.human)?;
+        }
+        total += rows.len();
+    }
+    writeln!(
+        stdout,
+        "# total rows across {} tenant(s): {total}",
+        tenants.len()
+    )?;
+    Ok(())
+}
+
+/// PART 7 — single-row renderer shared by both paths.
+fn write_partition_row(
+    stdout: &mut dyn Write,
+    r: &relix_runtime::audit_partition::PartitionReadRow,
+    human: bool,
+) -> std::io::Result<()> {
+    if human {
+        writeln!(stdout, "  ts={} rid={}", r.ts_secs, r.request_id)?;
+        writeln!(
+            stdout,
+            "    caller={} method={} status={}",
+            r.caller_name, r.method, r.status
+        )?;
+        writeln!(stdout, "    policy={}", r.policy_decision)?;
+        if let Some(k) = r.error_kind {
+            writeln!(stdout, "    error_kind={k}")?;
+        }
+        writeln!(
+            stdout,
+            "    latency_ms={} tenant={}",
+            r.latency_ms, r.tenant_id
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "ts={} rid={} tenant={} caller={} method={} status={} policy={}",
+            r.ts_secs,
+            r.request_id,
+            r.tenant_id,
+            r.caller_name,
+            r.method,
+            r.status,
+            r.policy_decision
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relix_runtime::audit_partition::PartitionRow;
+    use tempfile::TempDir;
+
+    /// Helper: build an `Args` skeleton for the audit-
+    /// partition tests. Every field defaults to its CLI
+    /// default; tests override the bits they care about.
+    fn args_for_partition() -> Args {
+        Args {
+            flow: None,
+            audit: None,
+            replay_verify: false,
+            signer_key: None,
+            human: false,
+            trace: None,
+            rid: None,
+            audit_partition: None,
+            tenant: None,
+            all_tenants: false,
+            multi_tenant_mode: false,
+            yes: false,
+            limit: 1000,
+        }
+    }
+
+    fn row(tenant: Option<&str>, ts: i64, rid: &str, method: &str) -> PartitionRow {
+        PartitionRow {
+            ts_secs: ts,
+            request_id_hex: rid.to_string(),
+            tenant_id: tenant.map(str::to_string),
+            caller_name: "alice".into(),
+            method: method.into(),
+            policy_decision: "allow:r".into(),
+            status: "ok",
+            error_kind: None,
+            latency_ms: 5,
+        }
+    }
+
+    fn open_store_with_seed() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("audit.db");
+        let store = AuditPartitionStore::open(&path).expect("open");
+        store
+            .append(&row(Some("acme"), 100, "a1", "ai.chat"))
+            .expect("append a1");
+        store
+            .append(&row(Some("acme"), 200, "a2", "ai.chat"))
+            .expect("append a2");
+        store
+            .append(&row(Some("globex"), 300, "g1", "tool.web_fetch"))
+            .expect("append g1");
+        (tmp, path)
+    }
+
+    #[test]
+    fn fix_part7_tenant_filter_returns_only_matching_rows() {
+        let (_tmp, path) = open_store_with_seed();
+        let mut args = args_for_partition();
+        args.audit_partition = Some(path.clone());
+        args.tenant = Some("acme".into());
+        let mut stdin = std::io::Cursor::new(Vec::new());
+        let mut stdout: Vec<u8> = Vec::new();
+        handle_audit_partition(&path, &args, &mut stdin, &mut stdout).expect("ok");
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(
+            text.contains("audit partition rows for tenant=acme: 2"),
+            "tenant filter must apply: {text}"
+        );
+        // The globex row must NOT appear.
+        assert!(
+            !text.contains("tool.web_fetch"),
+            "globex row leaked: {text}"
+        );
+        assert!(text.contains("rid=a1"));
+        assert!(text.contains("rid=a2"));
+    }
+
+    #[test]
+    fn fix_part7_all_tenants_requires_yes_confirmation() {
+        let (_tmp, path) = open_store_with_seed();
+        let mut args = args_for_partition();
+        args.audit_partition = Some(path.clone());
+        args.all_tenants = true;
+        // Type something other than 'yes'.
+        let mut stdin = std::io::Cursor::new(b"no\n".to_vec());
+        let mut stdout: Vec<u8> = Vec::new();
+        handle_audit_partition(&path, &args, &mut stdin, &mut stdout).expect("ok");
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(
+            text.contains("This will display audit records for ALL tenants"),
+            "prompt missing: {text}"
+        );
+        assert!(text.contains("Aborted"), "abort line missing: {text}");
+        assert!(
+            !text.contains("tenant=acme"),
+            "rows leaked despite abort: {text}"
+        );
+    }
+
+    #[test]
+    fn fix_part7_all_tenants_with_yes_prints_grouped_rows() {
+        let (_tmp, path) = open_store_with_seed();
+        let mut args = args_for_partition();
+        args.audit_partition = Some(path.clone());
+        args.all_tenants = true;
+        let mut stdin = std::io::Cursor::new(b"yes\n".to_vec());
+        let mut stdout: Vec<u8> = Vec::new();
+        handle_audit_partition(&path, &args, &mut stdin, &mut stdout).expect("ok");
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(text.contains("tenant=acme rows=2"));
+        assert!(text.contains("tenant=globex rows=1"));
+        // Separator line between the two tenant groups.
+        assert!(text.contains("---"));
+        assert!(text.contains("total rows across 2 tenant(s): 3"));
+    }
+
+    #[test]
+    fn fix_part7_all_tenants_with_yes_flag_skips_prompt() {
+        // `--yes` lets non-interactive pipelines skip the
+        // confirmation prompt while still reading every
+        // tenant.
+        let (_tmp, path) = open_store_with_seed();
+        let mut args = args_for_partition();
+        args.audit_partition = Some(path.clone());
+        args.all_tenants = true;
+        args.yes = true;
+        // EMPTY stdin would normally fail the confirmation
+        // — `--yes` short-circuits the read.
+        let mut stdin = std::io::Cursor::new(Vec::new());
+        let mut stdout: Vec<u8> = Vec::new();
+        handle_audit_partition(&path, &args, &mut stdin, &mut stdout).expect("ok");
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(!text.contains("Type 'yes' to confirm"));
+        assert!(text.contains("tenant=acme rows=2"));
+    }
+
+    #[test]
+    fn fix_part7_multi_tenant_mode_requires_a_filter() {
+        let (_tmp, path) = open_store_with_seed();
+        let mut args = args_for_partition();
+        args.audit_partition = Some(path.clone());
+        args.multi_tenant_mode = true;
+        let mut stdin = std::io::Cursor::new(Vec::new());
+        let mut stdout: Vec<u8> = Vec::new();
+        let err = handle_audit_partition(&path, &args, &mut stdin, &mut stdout)
+            .expect_err("multi-tenant mode must reject no-flag");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("In multi-tenant mode you must specify --tenant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn fix_part7_single_tenant_mode_without_filter_prints_everything() {
+        let (_tmp, path) = open_store_with_seed();
+        let mut args = args_for_partition();
+        args.audit_partition = Some(path.clone());
+        // multi_tenant_mode = false → no filter is OK.
+        let mut stdin = std::io::Cursor::new(Vec::new());
+        let mut stdout: Vec<u8> = Vec::new();
+        handle_audit_partition(&path, &args, &mut stdin, &mut stdout).expect("ok");
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(text.contains("tenant=acme rows=2"));
+        assert!(text.contains("tenant=globex rows=1"));
+    }
+
+    #[test]
+    fn fix_part7_human_mode_renders_indented_multiline_per_row() {
+        let (_tmp, path) = open_store_with_seed();
+        let mut args = args_for_partition();
+        args.audit_partition = Some(path.clone());
+        args.tenant = Some("acme".into());
+        args.human = true;
+        let mut stdin = std::io::Cursor::new(Vec::new());
+        let mut stdout: Vec<u8> = Vec::new();
+        handle_audit_partition(&path, &args, &mut stdin, &mut stdout).expect("ok");
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(text.contains("  ts=100 rid=a1"));
+        assert!(text.contains("    caller=alice method=ai.chat"));
+        assert!(text.contains("    policy=allow:r"));
+        assert!(text.contains("    latency_ms=5 tenant=acme"));
+    }
+
+    #[test]
+    fn fix_part7_confirmation_accepts_yes_case_insensitively_and_trimmed() {
+        // YES + \n, with leading whitespace, both accepted.
+        for input in [b"yes\n".as_slice(), b"YES\n", b"  Yes  \n"] {
+            let mut stdin = std::io::Cursor::new(input.to_vec());
+            let mut stdout: Vec<u8> = Vec::new();
+            assert!(
+                confirm_all_tenants(&mut stdin, &mut stdout).unwrap(),
+                "must accept: {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn fix_part7_confirmation_rejects_anything_other_than_yes() {
+        for input in [b"y\n".as_slice(), b"\n", b"no\n", b"y e s\n"] {
+            let mut stdin = std::io::Cursor::new(input.to_vec());
+            let mut stdout: Vec<u8> = Vec::new();
+            assert!(
+                !confirm_all_tenants(&mut stdin, &mut stdout).unwrap(),
+                "must reject: {:?}",
+                input
+            );
+        }
+    }
 }

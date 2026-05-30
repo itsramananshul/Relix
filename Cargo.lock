@@ -3679,7 +3679,9 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "relix-core",
+ "relix-runtime",
  "serde",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

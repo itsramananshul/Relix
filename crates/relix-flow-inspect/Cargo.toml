@@ -18,9 +18,17 @@ path = "src/main.rs"
 
 [dependencies]
 relix-core.workspace = true
+# PART 7: read the per-tenant audit partition mirror through
+# the same `AuditPartitionStore` the runtime writes with.
+# Keeps the SQL + sanitiser logic in one place instead of
+# reimplementing it in the CLI.
+relix-runtime.workspace = true
 
 clap.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
