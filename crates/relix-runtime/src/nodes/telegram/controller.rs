@@ -114,7 +114,44 @@ pub async fn run_telegram_controller_with_api<B: BotApi + 'static>(
 
 /// Process one inbound update: authorise, route on the
 /// parsed command, dispatch.
+///
+/// FIX 3: when `msg` originated from an inline-button press
+/// (`msg.is_callback_query()`), we call `answerCallbackQuery`
+/// AFTER the rest of the handler returns so Telegram clears
+/// the operator's spinning button indicator. The ack call
+/// happens unconditionally — Telegram drops the spinner only
+/// when the ack reaches its servers, and a missing ack leaves
+/// the operator's UI stuck for 15s. Failure to ack is logged
+/// at WARN and otherwise ignored: a missed spinner is annoying
+/// but the decision itself has already been recorded.
 pub async fn handle_one_update(
+    api: &dyn BotApi,
+    out: Option<&dyn TelegramOutbound>,
+    state: &ChannelState,
+    ring: &MessageRing,
+    cfg: &TelegramNodeConfig,
+    msg: &IncomingMessage,
+) {
+    handle_one_update_inner(api, out, state, ring, cfg, msg).await;
+    if let Some(cb_id) = msg.callback_query_id.as_deref()
+        && let Err(e) = api
+            .answer_callback_query(cb_id, Some("Decision recorded"))
+            .await
+    {
+        tracing::warn!(
+            callback_query_id = cb_id,
+            error = %e,
+            "telegram: answerCallbackQuery failed; operator UI spinner may stick \
+             for ~15s but the decision has already been recorded"
+        );
+    }
+}
+
+/// Inner handler body. Split out from `handle_one_update` so
+/// the outer wrapper can run a post-processing
+/// `answerCallbackQuery` even when the inner body returns
+/// early via an authorisation deny or transcription failure.
+async fn handle_one_update_inner(
     api: &dyn BotApi,
     out: Option<&dyn TelegramOutbound>,
     state: &ChannelState,
@@ -1072,5 +1109,96 @@ mod tests {
         handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("hi")).await;
         // Ring still recorded the inbound.
         assert_eq!(ring.len(), 1);
+    }
+
+    fn callback_msg(cb_id: &str, text: &str) -> IncomingMessage {
+        IncomingMessage {
+            update_id: 1,
+            chat_id: 100,
+            user_id: 42,
+            message_id: 7,
+            username: "alice".into(),
+            text: text.into(),
+            voice_file_id: None,
+            callback_query_id: Some(cb_id.into()),
+        }
+    }
+
+    /// FIX 3: after processing a callback_query the controller
+    /// MUST call `answerCallbackQuery` so the operator's
+    /// in-Telegram button spinner clears. Without this call
+    /// Telegram leaves the UI loading for ~15s before timing
+    /// out — bad UX. We assert (a) the ack lands at all, and
+    /// (b) the documented "Decision recorded" copy is the
+    /// ack body.
+    #[tokio::test]
+    async fn callback_query_triggers_answer_callback_after_processing() {
+        let api = MockBotApi::new();
+        let out = StubOutbound::default();
+        *out.ai_chat_reply.lock().unwrap() = Some("ack body".into());
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        let cfg = cfg_with_allow_list(&[42]);
+        handle_one_update(
+            &api,
+            Some(&out),
+            &state,
+            &ring,
+            &cfg,
+            &callback_msg("cb-xyz", "hi"),
+        )
+        .await;
+        let acks = api.callback_acks();
+        assert_eq!(acks.len(), 1, "exactly one ack should fire per callback");
+        assert_eq!(acks[0].0, "cb-xyz");
+        assert_eq!(
+            acks[0].1.as_deref(),
+            Some("Decision recorded"),
+            "ack body must match the documented copy"
+        );
+    }
+
+    /// FIX 3: regular text messages MUST NOT trigger an
+    /// answerCallbackQuery — `callback_query_id` is None and
+    /// `answer_callback_query` requires a non-empty id.
+    #[tokio::test]
+    async fn text_message_does_not_call_answer_callback() {
+        let api = MockBotApi::new();
+        let out = StubOutbound::default();
+        *out.ai_chat_reply.lock().unwrap() = Some("ack body".into());
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        let cfg = cfg_with_allow_list(&[42]);
+        handle_one_update(&api, Some(&out), &state, &ring, &cfg, &msg("hi")).await;
+        assert!(
+            api.callback_acks().is_empty(),
+            "no callback ack should fire for a plain text message"
+        );
+    }
+
+    /// FIX 3: the ack fires even when the inner handler exits
+    /// early via the authorisation deny path. A blocked user
+    /// pressing an inline button still needs the spinner to
+    /// clear — Telegram doesn't care WHY we acked.
+    #[tokio::test]
+    async fn callback_ack_fires_even_when_user_is_denied() {
+        let api = MockBotApi::new();
+        let out = StubOutbound::default();
+        let state = state_online();
+        let ring = MessageRing::new(50);
+        // Allow-list excludes user 42 so handle_one_update's
+        // inner body returns at the `user_is_allowed` check.
+        let cfg = cfg_with_allow_list(&[999]);
+        handle_one_update(
+            &api,
+            Some(&out),
+            &state,
+            &ring,
+            &cfg,
+            &callback_msg("cb-denied", "hi"),
+        )
+        .await;
+        assert_eq!(api.callback_acks().len(), 1, "ack fires after deny too");
+        assert_eq!(api.callback_acks()[0].0, "cb-denied");
     }
 }

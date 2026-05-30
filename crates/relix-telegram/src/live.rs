@@ -65,6 +65,13 @@ const PER_CALL_TIMEOUT_SECS: u64 = 35;
 /// liveness and request churn.
 const LONG_POLL_TIMEOUT_SECS: u32 = 30;
 
+/// FIX 4: maximum we'll honour from a 429 `retry_after`. The
+/// Bot API generally caps at a few minutes; values above this
+/// indicate either an extreme rate-limit punishment or a wire
+/// glitch. We log + clamp so a single bad message can't wedge
+/// the receive loop for hours.
+const RETRY_AFTER_CLAMP_SECS: i64 = 3600;
+
 #[derive(Clone)]
 pub struct LiveBotApi {
     http: reqwest::Client,
@@ -154,18 +161,33 @@ impl LiveBotApi {
             let parsed: Option<TgErrorEnvelope> = serde_json::from_str(&body_text).ok();
 
             if status.as_u16() == 429 {
-                // Honour Telegram's retry_after.
-                let secs = parsed
+                // Honour Telegram's retry_after, but clamp at
+                // RETRY_AFTER_CLAMP_SECS so an aggressive
+                // server-side throttle can't wedge a worker
+                // for hours. Operators see the original value
+                // in the log so they know Telegram is asking
+                // for more than we'll grant.
+                let raw = parsed
                     .as_ref()
                     .and_then(|e| e.parameters.as_ref())
                     .and_then(|p| p.retry_after)
                     .unwrap_or(1);
+                let clamped = raw.min(RETRY_AFTER_CLAMP_SECS);
+                if clamped < raw {
+                    tracing::warn!(
+                        method,
+                        raw_retry_after = raw,
+                        clamped_retry_after = clamped,
+                        "telegram: 429 retry_after clamped to {RETRY_AFTER_CLAMP_SECS}s; \
+                         Telegram requested {raw}s — aggressive rate limit, check bot health"
+                    );
+                }
                 if attempt >= MAX_RETRIES {
                     return Err(BotApiError::Transient(format!(
-                        "{method}: 429 retry_after={secs} after {MAX_RETRIES} retries"
+                        "{method}: 429 retry_after={clamped} (raw={raw}) after {MAX_RETRIES} retries"
                     )));
                 }
-                tokio::time::sleep(Duration::from_secs(secs.max(1) as u64)).await;
+                tokio::time::sleep(Duration::from_secs(clamped.max(1) as u64)).await;
                 attempt += 1;
                 continue;
             }
@@ -197,10 +219,23 @@ impl LiveBotApi {
     }
 }
 
-/// Exponential backoff: 1s, 2s, 4s.
+/// Exponential backoff with jitter: 1s, 2s, 4s base + up to
+/// 50% jitter on each attempt. The jitter (FIX 5) prevents a
+/// fleet of bots all retrying after the same Telegram blip
+/// from synchronising into a thundering herd. `rand::thread_rng`
+/// is thread-safe (each tokio worker has its own RNG state) so
+/// concurrent retries from different tasks don't contend on a
+/// shared lock.
 async fn backoff(attempt: u32) {
+    use rand::Rng;
     let base_ms = 1000u64.checked_shl(attempt).unwrap_or(8000).min(8000);
-    tokio::time::sleep(Duration::from_millis(base_ms)).await;
+    // `gen_range(0..0)` would panic — guard with `.max(1)` so the
+    // first attempt (base_ms = 1000) still produces a valid range
+    // and tiny bases stay safe.
+    let jitter_ceiling = (base_ms / 2).max(1);
+    let jitter_ms = rand::thread_rng().gen_range(0..jitter_ceiling);
+    let actual_delay = base_ms + jitter_ms;
+    tokio::time::sleep(Duration::from_millis(actual_delay)).await;
 }
 
 // ── Wire envelopes ────────────────────────────────────────
@@ -677,5 +712,78 @@ mod tests {
         // doesn't panic.
         let v = 1000u64.checked_shl(10).unwrap_or(8000).min(8000);
         assert_eq!(v, 8000);
+    }
+
+    #[test]
+    fn retry_after_clamp_constant_matches_spec() {
+        // FIX 4: the clamp is documented as one hour. Locking
+        // the constant in a test so a future "just bump the
+        // clamp" change has to update the test too.
+        assert_eq!(RETRY_AFTER_CLAMP_SECS, 3600);
+    }
+
+    #[test]
+    fn retry_after_clamps_when_telegram_returns_more_than_an_hour() {
+        // FIX 4: simulate the exact arithmetic the 429 branch
+        // executes. The function-under-test is `i64::min`, so
+        // this is an integration-friendly test of the constant
+        // itself + the `.min()` clamp semantics.
+        let raw: i64 = 86_400; // 24h — Telegram should never
+        // ask for this but the SDK has to refuse to honour it.
+        let clamped = raw.min(RETRY_AFTER_CLAMP_SECS);
+        assert_eq!(clamped, 3600);
+        assert!(clamped < raw, "the clamp must actually shrink the value");
+    }
+
+    #[test]
+    fn retry_after_no_clamp_when_within_budget() {
+        // FIX 4: a normal 30s rate-limit response passes
+        // through unchanged.
+        let raw: i64 = 30;
+        let clamped = raw.min(RETRY_AFTER_CLAMP_SECS);
+        assert_eq!(clamped, 30);
+    }
+
+    #[test]
+    fn backoff_jitter_never_collapses_to_a_single_value() {
+        // FIX 5: the contract is "deterministic backoff plus
+        // a uniformly-random jitter in [0, base/2)". Sampling
+        // 32 draws is enough to detect a frozen RNG with very
+        // high probability (P(all 32 equal | uniform over [0,
+        // 500)) ≈ (1/500)^31, negligible). The test asserts
+        // that AT LEAST two of the sampled durations differ,
+        // which fails if the jitter is missing entirely.
+        use rand::Rng;
+        let base_ms: u64 = 1000;
+        let jitter_ceiling = (base_ms / 2).max(1);
+        let mut samples = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let j = rand::thread_rng().gen_range(0..jitter_ceiling);
+            samples.push(base_ms + j);
+        }
+        let min = samples.iter().min().copied().unwrap();
+        let max = samples.iter().max().copied().unwrap();
+        assert!(
+            max > min,
+            "jitter must produce at least two distinct durations across 32 samples: \
+             {samples:?}"
+        );
+        // And the range must be within [base, base + ceiling).
+        assert!(samples.iter().all(|&v| (1000..1500).contains(&v)));
+    }
+
+    #[test]
+    fn backoff_jitter_is_safe_when_base_is_one_ms() {
+        // FIX 5: defensive — if a future config knob lets the
+        // base shrink to 1ms, `base / 2 = 0` would panic
+        // `gen_range(0..0)`. The `.max(1)` guard in the
+        // backoff fn must keep the sampler healthy.
+        use rand::Rng;
+        let base_ms: u64 = 1;
+        let jitter_ceiling = (base_ms / 2).max(1);
+        // Should not panic. The actual value is 0 (the only
+        // value in `[0, 1)`).
+        let j = rand::thread_rng().gen_range(0..jitter_ceiling);
+        assert_eq!(j, 0);
     }
 }

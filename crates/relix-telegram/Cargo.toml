@@ -25,6 +25,9 @@ tracing.workspace    = true
 rusqlite.workspace   = true
 # Live Bot API client (HTTPS, rustls — no openssl).
 reqwest.workspace    = true
+# Jitter on retry backoff so a swarm of bots retrying after a
+# Telegram blip don't synchronise into a thundering herd.
+rand.workspace       = true
 
 [dev-dependencies]
 tempfile.workspace = true
