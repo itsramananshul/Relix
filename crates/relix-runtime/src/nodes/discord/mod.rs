@@ -24,6 +24,7 @@ pub mod config;
 pub mod controller;
 pub mod ring;
 pub mod state;
+pub mod watermark_store;
 
 use std::sync::Arc;
 

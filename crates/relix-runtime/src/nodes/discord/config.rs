@@ -1,6 +1,8 @@
 //! `[discord]` runtime config — what `node_type = "discord"`
 //! consumes when booting a discord controller.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 /// Per-node discord controller configuration.
@@ -72,6 +74,14 @@ pub struct DiscordNodeConfig {
     pub ai_peer: AiPeerConfig,
     /// Coordinator peer — required.
     pub coord_peer: CoordPeerConfig,
+
+    /// FIX 2 — path to the SQLite file holding the
+    /// per-channel polling watermark. Absent ⇒ in-memory
+    /// cursor only (existing behaviour: a bridge restart
+    /// re-bootstraps from the channel tail). Set this to
+    /// enable restart-safe watermark persistence.
+    #[serde(default)]
+    pub state_db_path: Option<PathBuf>,
 }
 
 fn default_allowed_groups() -> Vec<String> {

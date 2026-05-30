@@ -1,10 +1,20 @@
 //! Polling loop + per-message handler for the discord controller.
 //! Mirrors nodes/telegram/controller.rs but uses Discord's REST
 //! `after` cursor instead of Telegram's `offset`.
+//!
+//! FIX 2 — persistent watermark. The cursor on
+//! [`ChannelState`] is in-memory only and resets across
+//! restarts. When the operator configures
+//! `[discord] state_db_path`, the controller hydrates the
+//! per-channel watermark from a
+//! [`super::watermark_store::DiscordWatermarkStore`] at startup
+//! and persists every advance back to it so a bridge restart
+//! does NOT replay the channel history Discord serves.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use relix_core::clock::SystemClock;
 use relix_discord::{DiscordApi, IncomingMessage, OutgoingMessage, derive_channel_subject};
 
 use super::client::{DiscordOutbound, DiscordOutboundClientCell};
@@ -15,6 +25,7 @@ use super::commands::{
 use super::config::DiscordNodeConfig;
 use super::ring::{MessageRing, RecordedInbound};
 use super::state::ChannelState;
+use super::watermark_store::DiscordWatermarkStore;
 
 const HISTORY_TURNS: usize = 10;
 
@@ -47,7 +58,36 @@ pub async fn run_discord_controller(
         }
     }
 
+    // FIX 2: hydrate the persisted watermark, if configured.
+    // When unset the controller falls back to its existing
+    // in-memory cursor (empty ⇒ bootstrap from current tail).
+    let watermark_store =
+        cfg.state_db_path
+            .as_deref()
+            .and_then(|p| match DiscordWatermarkStore::open(p) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %p.display(),
+                        "discord: failed to open watermark store; persistence disabled"
+                    );
+                    None
+                }
+            });
+    if let Some(s) = watermark_store.as_ref()
+        && let Some(stored) = s.get(&cfg.channel_id)
+    {
+        tracing::info!(
+            channel_id = %cfg.channel_id,
+            last_message_id = %stored,
+            "discord: hydrated watermark from store; resuming past historical messages"
+        );
+        state.set_cursor(&stored);
+    }
+
     let poll_interval = Duration::from_secs(cfg.poll_interval_secs.max(1));
+    let clock = SystemClock;
     loop {
         // Bootstrapping: an empty cursor means "start from the most
         // recent message". The very first poll returns up to 50
@@ -72,6 +112,13 @@ pub async fn run_discord_controller(
             // handler short-circuits (e.g. bot's own message),
             // so the next poll doesn't replay the same content.
             advance_cursor(&state, &msg.message_id);
+            // FIX 2: persist the advanced watermark every time
+            // the in-memory cursor moves. The store's
+            // `INSERT … ON CONFLICT DO UPDATE` is idempotent
+            // so a no-op advance is cheap.
+            if let Some(s) = watermark_store.as_ref() {
+                s.record(&cfg.channel_id, &state.cursor(), &clock);
+            }
             if !bot_id.is_empty() && msg.user_id == bot_id {
                 continue;
             }
