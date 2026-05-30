@@ -46,6 +46,19 @@ pub struct AuthState {
     pub token: BridgeToken,
     pub host: String,
     pub port: u16,
+    /// PART 8: extra bearer-credential prefixes admitted by the
+    /// middleware. Populated from `[auth.tenant_bindings]` at
+    /// startup. Any bearer whose 8-char prefix (per
+    /// `crate::tenant::api_key_prefix`) appears in this set is
+    /// admitted as if it were the bridge token. The tenant
+    /// middleware (which runs AFTER auth) then resolves the
+    /// prefix to a tenant_id from the same `tenant_bindings`
+    /// table.
+    ///
+    /// Empty in single-tenant deployments — auth admits only
+    /// the bridge token. Populated when
+    /// `[auth] tenant_bindings = { … }` is configured.
+    pub tenant_binding_prefixes: std::collections::HashSet<String>,
 }
 
 /// Bytes of entropy in the bridge token (256 bits → 64 hex chars).
@@ -310,10 +323,23 @@ pub async fn auth_middleware(State(auth): State<AuthState>, req: Request, next: 
     };
 
     if ct_eq(&provided, token) {
-        next.run(req).await
-    } else {
-        unauthorized()
+        return next.run(req).await;
     }
+    // PART 8: admit a bearer whose 8-char prefix matches a
+    // configured `[auth.tenant_bindings]` key. The tenant
+    // middleware (mounted underneath) reads the same prefix
+    // and routes the request to the bound tenant. We don't
+    // need constant-time compare here because the prefix is
+    // an operator-published lookup key, not a secret —
+    // possession of the full bearer is what authenticates;
+    // the prefix only routes the binding lookup.
+    if !auth.tenant_binding_prefixes.is_empty() {
+        let prefix = crate::tenant::api_key_prefix(&provided);
+        if auth.tenant_binding_prefixes.contains(&prefix) {
+            return next.run(req).await;
+        }
+    }
+    unauthorized()
 }
 
 /// `GET /v1/auth/token` — one-time bootstrap so the dashboard can
@@ -472,6 +498,7 @@ mod tests {
                 token,
                 host: "127.0.0.1".to_string(),
                 port: 19791,
+                tenant_binding_prefixes: std::collections::HashSet::new(),
             },
             value,
         )

@@ -178,6 +178,8 @@ mod task_recorder;
 mod tasks;
 mod telegram;
 mod tenant;
+#[cfg(test)]
+mod tenant_isolation_full_stack_test;
 mod term_audit;
 mod tool_screen;
 mod tools;
@@ -1066,6 +1068,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 token: state.bridge_token.clone(),
                 host: state.bridge_host.clone(),
                 port: state.bridge_port,
+                // PART 8: bearer prefixes the auth layer
+                // admits alongside the canonical bridge_token.
+                // Populated from `[auth.tenant_bindings]`; the
+                // tenant middleware (mounted underneath) reads
+                // the same prefixes to resolve the per-request
+                // tenant id.
+                tenant_binding_prefixes: state
+                    .cfg
+                    .auth
+                    .tenant_bindings
+                    .keys()
+                    .map(|s| s.to_lowercase())
+                    .collect(),
             },
             auth::auth_middleware,
         ))
