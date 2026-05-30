@@ -37,7 +37,7 @@
 //!   `api-key` as a header; both work, and `Bearer` matches the
 //!   project's other auth wiring (OpenAI, Anthropic).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,37 +98,75 @@ fn default_collection_prefix() -> String {
     "relix".to_string()
 }
 
-/// GAP 23: derive the Qdrant collection name for a request.
+/// Maximum collection name length. Qdrant enforces a 63-char
+/// limit on collection names so the resolver truncates
+/// `<prefix>_<sanitized_tenant>` past this boundary. The
+/// truncation is deterministic — same `(prefix, tenant)` always
+/// produces the same collection — so a tenant cannot bypass
+/// isolation by submitting a long id that collides with another
+/// after truncation (the tenant_id is sanitised + truncated
+/// before the prefix is prepended, and the prefix is part of
+/// the static config, so collisions are operator-detectable).
+pub const QDRANT_COLLECTION_NAME_MAX: usize = 63;
+
+/// Replace every character that is not ASCII alphanumeric or
+/// `_` with `_`, then truncate to at most
+/// [`QDRANT_COLLECTION_NAME_MAX`] characters. Empty / pre-empty
+/// input becomes the literal `"default"`. Pure function —
+/// exported so tests + Part 5 callers can use the same
+/// canonical sanitiser.
+pub fn sanitize_tenant_id(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    let canonical = if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    if canonical.len() > QDRANT_COLLECTION_NAME_MAX {
+        canonical.chars().take(QDRANT_COLLECTION_NAME_MAX).collect()
+    } else {
+        canonical
+    }
+}
+
+/// GAP 23 / PART 4: derive the Qdrant collection name for a
+/// request. Fails closed when tenant isolation is enabled and
+/// no tenant id is supplied.
 ///
 /// - When `tenant_isolation = false`, returns `cfg.collection`
 ///   verbatim. Single-tenant deployments are byte-identical to
 ///   the pre-GAP-23 behaviour.
-/// - When `tenant_isolation = true`, returns
-///   `format!("{prefix}_{sanitized_tenant_id}")` where the
-///   tenant id has every non-`[A-Za-z0-9_]` character replaced
-///   by `_`. Empty / `None` tenant ids resolve to the literal
-///   `"default"` sanitisation key.
-///
-/// Pure function — exported for tests of the sanitiser.
-pub fn resolve_collection_name(cfg: &QdrantConfig, tenant_id: Option<&str>) -> String {
+/// - When `tenant_isolation = true` AND `tenant_id` is
+///   `Some(non_empty)`, returns
+///   `format!("{prefix}_{sanitized_tenant_id}")`.
+/// - When `tenant_isolation = true` AND `tenant_id` is `None` /
+///   empty, returns `Err(QdrantError::MissingTenant)`. The
+///   pre-PART-4 silent fallback to `"default"` was a tenant
+///   isolation bug — every tenant whose id wasn't propagated
+///   shared one collection.
+pub fn resolve_collection_name(
+    cfg: &QdrantConfig,
+    tenant_id: Option<&str>,
+) -> Result<String, QdrantError> {
     if !cfg.tenant_isolation {
-        return cfg.collection.clone();
+        return Ok(cfg.collection.clone());
     }
-    let raw = tenant_id.unwrap_or("default");
-    let sanitised: String = if raw.is_empty() {
-        "default".to_string()
-    } else {
-        raw.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
+    let raw = match tenant_id {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => return Err(QdrantError::MissingTenant),
     };
-    format!("{}_{}", cfg.collection_prefix, sanitised)
+    let sanitised = sanitize_tenant_id(raw);
+    Ok(format!("{}_{}", cfg.collection_prefix, sanitised))
 }
 
 /// Errors raised by the Qdrant client. The memory pipeline
@@ -142,6 +180,14 @@ pub enum QdrantError {
     Api { status: u16, message: String },
     #[error("qdrant serialization: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// PART 4: returned by [`resolve_collection_name`] when
+    /// tenant isolation is enabled but no tenant id was
+    /// supplied. The bridge surfaces this as HTTP 401 so
+    /// operators see the wire reason for a missing
+    /// X-Relix-Tenant binding instead of a silent fallback
+    /// to a shared collection.
+    #[error("qdrant: tenant_id required in multi-tenant mode")]
+    MissingTenant,
 }
 
 /// One point to upsert. `id` is a stable u64 derived from the
@@ -177,6 +223,22 @@ pub struct QdrantClient {
     /// call. The mutex is held only across the cache check;
     /// the ensure_collection RPC happens outside the lock.
     ensured: Arc<Mutex<HashSet<String>>>,
+    /// PART 4: per-collection-name async serialisation for
+    /// the FIRST `ensure_collection_in` call. Without this
+    /// lock, two concurrent requests for a brand-new tenant
+    /// would both observe `!was_ensured`, both fire the
+    /// `PUT /collections/<name>` request, and both insert
+    /// into `ensured`. Qdrant tolerates the duplicate PUT
+    /// (the second returns 200 "already exists with matching
+    /// params") but the duplicate request is wasted work +
+    /// each PUT goes through the slow "create collection +
+    /// allocate disk" path on Qdrant's side. The lock makes
+    /// the FIRST observer of a new collection hold a
+    /// per-name `tokio::sync::Mutex` while the PUT lands,
+    /// then update the `ensured` cache, then drop the lock;
+    /// subsequent observers see the cached-ensured marker
+    /// and skip the PUT entirely.
+    ensure_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl QdrantClient {
@@ -192,6 +254,7 @@ impl QdrantClient {
             http,
             cfg,
             ensured: Arc::new(Mutex::new(HashSet::new())),
+            ensure_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -202,10 +265,14 @@ impl QdrantClient {
         &self.cfg
     }
 
-    /// GAP 23: collection name for `tenant_id` after consulting
-    /// [`QdrantConfig::tenant_isolation`]. Thin wrapper around
-    /// [`resolve_collection_name`].
-    pub fn collection_for_tenant(&self, tenant_id: Option<&str>) -> String {
+    /// GAP 23 / PART 4: collection name for `tenant_id` after
+    /// consulting [`QdrantConfig::tenant_isolation`]. Thin
+    /// wrapper around [`resolve_collection_name`]. Returns
+    /// `Err(QdrantError::MissingTenant)` when tenant isolation
+    /// is enabled but no tenant id was supplied — callers must
+    /// surface this rather than fall through to a shared
+    /// collection.
+    pub fn collection_for_tenant(&self, tenant_id: Option<&str>) -> Result<String, QdrantError> {
         resolve_collection_name(&self.cfg, tenant_id)
     }
 
@@ -222,11 +289,31 @@ impl QdrantClient {
         self.ensure_collection_in(&self.cfg.collection).await
     }
 
-    /// GAP 23: ensure-collection against an explicit name. The
-    /// `ensured` cache short-circuits repeat creates for
-    /// collections this client has already created during the
-    /// current process.
+    /// GAP 23 / PART 4: ensure-collection against an explicit
+    /// name. The `ensured` cache short-circuits repeat creates
+    /// for collections this client has already created during
+    /// the current process.
+    ///
+    /// PART 4: serialised on a per-collection-name async lock
+    /// so two concurrent requests for a brand-new tenant
+    /// produce ONE `PUT /collections/<name>` call, not two.
+    /// Qdrant tolerates the duplicate PUT but the lock turns
+    /// it into a cheap cache-hit on the second caller.
     pub async fn ensure_collection_in(&self, name: &str) -> Result<(), QdrantError> {
+        if self.was_ensured(name) {
+            return Ok(());
+        }
+        // Acquire (or create) the per-name async lock.
+        let lock = {
+            let mut map = self.ensure_locks.lock().await;
+            map.entry(name.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        // Re-check under the lock — a concurrent caller may
+        // have just finished the PUT and the `ensured` cache
+        // is now warm.
         if self.was_ensured(name) {
             return Ok(());
         }
@@ -692,8 +779,11 @@ mod tests {
             tenant_isolation: false,
             collection_prefix: "relix".into(),
         };
-        assert_eq!(resolve_collection_name(&cfg, Some("acme")), "relix_memory");
-        assert_eq!(resolve_collection_name(&cfg, None), "relix_memory");
+        assert_eq!(
+            resolve_collection_name(&cfg, Some("acme")).unwrap(),
+            "relix_memory"
+        );
+        assert_eq!(resolve_collection_name(&cfg, None).unwrap(), "relix_memory");
     }
 
     #[test]
@@ -706,15 +796,18 @@ mod tests {
             tenant_isolation: true,
             collection_prefix: "relix".into(),
         };
-        assert_eq!(resolve_collection_name(&cfg, Some("acme")), "relix_acme");
         assert_eq!(
-            resolve_collection_name(&cfg, Some("globex")),
+            resolve_collection_name(&cfg, Some("acme")).unwrap(),
+            "relix_acme"
+        );
+        assert_eq!(
+            resolve_collection_name(&cfg, Some("globex")).unwrap(),
             "relix_globex"
         );
         // Different tenants → different collections.
         assert_ne!(
-            resolve_collection_name(&cfg, Some("acme")),
-            resolve_collection_name(&cfg, Some("globex"))
+            resolve_collection_name(&cfg, Some("acme")).unwrap(),
+            resolve_collection_name(&cfg, Some("globex")).unwrap()
         );
     }
 
@@ -731,13 +824,40 @@ mod tests {
         // Slashes / dots / hyphens collapse to underscore so
         // Qdrant's collection naming rules are satisfied.
         assert_eq!(
-            resolve_collection_name(&cfg, Some("acme/tenant-1.dev")),
+            resolve_collection_name(&cfg, Some("acme/tenant-1.dev")).unwrap(),
             "relix_acme_tenant_1_dev"
         );
-        // Empty tenant id falls back to "default".
-        assert_eq!(resolve_collection_name(&cfg, Some("")), "relix_default");
-        // None tenant resolves to "default" too.
-        assert_eq!(resolve_collection_name(&cfg, None), "relix_default");
+    }
+
+    /// PART 4: tenant-isolation mode MUST fail closed when no
+    /// tenant id is supplied. The pre-PART-4 silent fallback to
+    /// `"default"` was a critical isolation bug — any handler
+    /// that forgot to propagate the tenant header would route
+    /// to a shared collection.
+    #[test]
+    fn fix_part4_resolve_collection_name_fails_closed_on_missing_tenant() {
+        let cfg = QdrantConfig {
+            url: String::new(),
+            collection: "x".into(),
+            dim: 1536,
+            api_key: None,
+            tenant_isolation: true,
+            collection_prefix: "relix".into(),
+        };
+        // None tenant in isolation mode → MissingTenant.
+        assert!(matches!(
+            resolve_collection_name(&cfg, None),
+            Err(QdrantError::MissingTenant)
+        ));
+        // Empty / whitespace-only tenant id also fails closed.
+        assert!(matches!(
+            resolve_collection_name(&cfg, Some("")),
+            Err(QdrantError::MissingTenant)
+        ));
+        assert!(matches!(
+            resolve_collection_name(&cfg, Some("   ")),
+            Err(QdrantError::MissingTenant)
+        ));
     }
 
     #[test]
@@ -750,7 +870,50 @@ mod tests {
             tenant_isolation: true,
             collection_prefix: "saas".into(),
         };
-        assert_eq!(resolve_collection_name(&cfg, Some("acme")), "saas_acme");
+        assert_eq!(
+            resolve_collection_name(&cfg, Some("acme")).unwrap(),
+            "saas_acme"
+        );
+    }
+
+    /// PART 4: sanitize_tenant_id replaces every non-alphanumeric
+    /// + non-underscore character with `_`.
+    #[test]
+    fn fix_part4_sanitize_tenant_id_replaces_special_characters() {
+        assert_eq!(sanitize_tenant_id("acme"), "acme");
+        assert_eq!(sanitize_tenant_id("acme-corp"), "acme_corp");
+        assert_eq!(sanitize_tenant_id("acme/tenant.1"), "acme_tenant_1");
+        assert_eq!(sanitize_tenant_id("a:b@c#d$e%"), "a_b_c_d_e");
+        // Multiple specials collapse but do not get
+        // de-duplicated — Qdrant accepts repeated underscores.
+        assert_eq!(sanitize_tenant_id("a..b"), "a__b");
+    }
+
+    /// PART 4: sanitize_tenant_id truncates at 63 chars (Qdrant
+    /// collection name limit).
+    #[test]
+    fn fix_part4_sanitize_tenant_id_truncates_at_63_chars() {
+        let long = "a".repeat(100);
+        let out = sanitize_tenant_id(&long);
+        assert_eq!(out.len(), 63);
+        assert_eq!(out, "a".repeat(63));
+        // Exactly 63 passes through.
+        let exact = "b".repeat(63);
+        assert_eq!(sanitize_tenant_id(&exact), exact);
+        // 64 truncates.
+        let one_over = "c".repeat(64);
+        assert_eq!(sanitize_tenant_id(&one_over).len(), 63);
+    }
+
+    /// PART 4: sanitize_tenant_id falls back to `"default"` on
+    /// empty / all-special input. Used by the audit_partition
+    /// path that explicitly opts into the shared bucket.
+    #[test]
+    fn fix_part4_sanitize_tenant_id_defaults_on_empty_input() {
+        assert_eq!(sanitize_tenant_id(""), "default");
+        // All-special input → all underscores → trimmed →
+        // empty → default.
+        assert_eq!(sanitize_tenant_id("///"), "default");
     }
 
     #[tokio::test]
@@ -808,7 +971,7 @@ mod tests {
             vector: vec![0.1, 0.2, 0.3, 0.4],
             payload: serde_json::Value::Null,
         }];
-        let coll = client.collection_for_tenant(Some("tenant_x"));
+        let coll = client.collection_for_tenant(Some("tenant_x")).unwrap();
         client.upsert_in(&coll, pts).await.unwrap();
         let cap = mock.captured.lock().unwrap();
         assert!(
@@ -825,8 +988,8 @@ mod tests {
         cfg.tenant_isolation = true;
         cfg.collection_prefix = "relix".into();
         let client = QdrantClient::new(cfg);
-        let coll_a = client.collection_for_tenant(Some("alpha"));
-        let coll_b = client.collection_for_tenant(Some("beta"));
+        let coll_a = client.collection_for_tenant(Some("alpha")).unwrap();
+        let coll_b = client.collection_for_tenant(Some("beta")).unwrap();
         assert_eq!(coll_a, "relix_alpha");
         assert_eq!(coll_b, "relix_beta");
         let pts = vec![QdrantPoint {
@@ -839,6 +1002,42 @@ mod tests {
         let cap = mock.captured.lock().unwrap();
         assert!(cap.iter().any(|r| r.path == "/collections/relix_alpha"));
         assert!(cap.iter().any(|r| r.path == "/collections/relix_beta"));
+    }
+
+    /// PART 4: two concurrent ensure_collection_in calls on a
+    /// brand-new tenant must produce EXACTLY ONE
+    /// PUT /collections/<name> — the per-collection async lock
+    /// serialises the first observer's work and subsequent
+    /// observers see the cached-ensured marker.
+    #[tokio::test]
+    async fn fix_part4_concurrent_ensure_creates_collection_exactly_once() {
+        let mock = MockQdrant::spawn(serde_json::Value::Null).await;
+        let client = QdrantClient::new(cfg_for(&mock.url()));
+        // 8 concurrent ensure calls on a brand-new collection.
+        // Without the per-name lock, the race would produce up
+        // to 8 PUT calls.
+        let coll = "relix_concurrent_tenant";
+        let mut handles = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let c = client.clone();
+            let n = coll.to_string();
+            handles.push(tokio::spawn(
+                async move { c.ensure_collection_in(&n).await },
+            ));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        let cap = mock.captured.lock().unwrap();
+        let puts: Vec<_> = cap
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path == format!("/collections/{coll}"))
+            .collect();
+        assert_eq!(
+            puts.len(),
+            1,
+            "concurrent ensure_collection_in must produce exactly one PUT"
+        );
     }
 
     #[test]

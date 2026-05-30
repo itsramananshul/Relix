@@ -1417,11 +1417,25 @@ async fn handle_records_search(
                     let Some(vec) = vectors.pop() else {
                         return fallback_text_search(&layered.store, query, n);
                     };
-                    // GAP 23: scope the Qdrant search to the
-                    // caller's tenant collection. When
+                    // GAP 23 / PART 4: scope the Qdrant search
+                    // to the caller's tenant collection. When
                     // `tenant_isolation = false` this resolves
                     // to the single shared collection.
-                    let coll = q.collection_for_tenant(ctx.tenant_id.as_deref());
+                    // `collection_for_tenant` now returns Result;
+                    // a missing tenant in multi-tenant mode
+                    // falls back to text search rather than
+                    // silently routing to a shared collection.
+                    let coll = match q.collection_for_tenant(ctx.tenant_id.as_deref()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "memory.search: collection_for_tenant failed; \
+                                 falling back to SQLite text search"
+                            );
+                            return fallback_text_search(&layered.store, query, n);
+                        }
+                    };
                     match q
                         .search_in(&coll, vec, n, layered.score_threshold, None)
                         .await

@@ -82,13 +82,35 @@ pub struct PartitionReadRow {
 pub struct AuditPartitionStore {
     path: PathBuf,
     conn: Mutex<Connection>,
+    /// PART 4: when `true`, every `append` MUST supply a
+    /// non-empty `tenant_id`. A missing tenant returns
+    /// `Err("audit_partition: tenant_id required …")` rather
+    /// than the pre-PART-4 silent fall-through to the
+    /// `"default"` bucket. Operators enable this in
+    /// multi-tenant deployments so audit rows for tenant A
+    /// can never be silently mixed into tenant B's bucket on
+    /// a missing-header bug.
+    partition_by_tenant: bool,
 }
 
 impl AuditPartitionStore {
     /// Open or create the partition store at `path`. Creates
     /// parent directories. Idempotent — the schema migration
-    /// runs every open.
+    /// runs every open. `partition_by_tenant = false` so
+    /// existing single-tenant callers stay byte-identical;
+    /// callers opt into fail-closed via
+    /// [`Self::open_with_partition`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open_with_partition(path, false)
+    }
+
+    /// PART 4 variant. When `partition_by_tenant = true`,
+    /// `append` rejects rows with no tenant id rather than
+    /// silently filing them under `"default"`.
+    pub fn open_with_partition(
+        path: impl AsRef<Path>,
+        partition_by_tenant: bool,
+    ) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -118,12 +140,32 @@ impl AuditPartitionStore {
         Ok(Self {
             path,
             conn: Mutex::new(conn),
+            partition_by_tenant,
         })
+    }
+
+    /// `true` when this store was opened in fail-closed
+    /// (per-tenant) mode.
+    pub fn partition_by_tenant(&self) -> bool {
+        self.partition_by_tenant
     }
 
     /// Append one row. The bridge calls this just before
     /// finalising the canonical CBOR record.
     pub fn append(&self, row: &PartitionRow) -> Result<(), String> {
+        // PART 4: fail-closed on missing tenant when
+        // partition-by-tenant mode is on.
+        if self.partition_by_tenant
+            && row
+                .tenant_id
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        {
+            return Err(
+                "audit_partition: tenant_id required when partition_by_tenant = true".to_string(),
+            );
+        }
         let tenant = sanitise_tenant_id(row.tenant_id.as_deref());
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
@@ -339,5 +381,48 @@ mod tests {
         assert_eq!(tenants, vec!["acme_eu"]);
         let rows = store.tenant_recent("acme_eu", 10).expect("recent");
         assert_eq!(rows.len(), 2);
+    }
+
+    /// PART 4: fail-closed mode rejects rows without a tenant
+    /// id rather than silently dropping them into the
+    /// `"default"` bucket.
+    #[test]
+    fn fix_part4_partition_by_tenant_mode_rejects_missing_tenant() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = AuditPartitionStore::open_with_partition(tmp.path().join("audit.db"), true)
+            .expect("open");
+        // None tenant → error.
+        let err = store.append(&row(None, 1, "x", "ai.chat")).unwrap_err();
+        assert!(
+            err.contains("tenant_id required"),
+            "expected fail-closed message, got: {err}"
+        );
+        // Empty string tenant → error too.
+        let err2 = store.append(&row(Some(""), 1, "y", "ai.chat")).unwrap_err();
+        assert!(err2.contains("tenant_id required"), "got: {err2}");
+        // Whitespace-only also rejected.
+        let err3 = store
+            .append(&row(Some("   "), 1, "z", "ai.chat"))
+            .unwrap_err();
+        assert!(err3.contains("tenant_id required"), "got: {err3}");
+        // A valid tenant id succeeds.
+        store
+            .append(&row(Some("acme"), 1, "ok", "ai.chat"))
+            .expect("valid tenant accepted");
+    }
+
+    /// PART 4: legacy (non-partitioning) mode keeps the
+    /// `"default"` fall-through so single-tenant deployments
+    /// stay byte-identical.
+    #[test]
+    fn fix_part4_legacy_mode_accepts_missing_tenant_into_default() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let store = AuditPartitionStore::open(tmp.path().join("audit.db")).expect("open");
+        assert!(!store.partition_by_tenant());
+        store
+            .append(&row(None, 1, "x", "ai.chat"))
+            .expect("none tenant accepted in legacy mode");
+        let rows = store.tenant_recent("default", 10).expect("recent");
+        assert_eq!(rows.len(), 1);
     }
 }

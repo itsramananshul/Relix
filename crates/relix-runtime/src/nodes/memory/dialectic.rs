@@ -233,9 +233,27 @@ async fn load_observations(
                             {"key": "source", "match": {"value": args.subject_id}},
                         ]
                     });
-                    // GAP 23: dialectic Qdrant search runs
-                    // against the caller's tenant collection.
-                    let coll = q.collection_for_tenant(tenant_id);
+                    // GAP 23 / PART 4: dialectic Qdrant search
+                    // runs against the caller's tenant
+                    // collection. `collection_for_tenant` now
+                    // returns Result; a missing tenant in
+                    // multi-tenant mode short-circuits the
+                    // search rather than silently routing to a
+                    // shared collection.
+                    let coll = match q.collection_for_tenant(tenant_id) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "dialectic: collection_for_tenant failed; \
+                                 falling back to text search"
+                            );
+                            return (
+                                text_fallback(&layered.store, args),
+                                RetrievalPath::TextFallback(format!("missing tenant: {e}")),
+                            );
+                        }
+                    };
                     match q
                         .search_in(
                             &coll,

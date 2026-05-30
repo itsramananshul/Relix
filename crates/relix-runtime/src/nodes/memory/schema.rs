@@ -303,6 +303,11 @@ pub enum LayeredMemoryError {
     Lock,
     #[error("layered memory serialization: {0}")]
     Serialization(String),
+    /// PART 4: returned by tenant-aware methods when the
+    /// store was opened with `tenant_isolation = true` but
+    /// the caller did not supply a tenant id.
+    #[error("layered memory: tenant_id required in multi-tenant mode")]
+    MissingTenant,
 }
 
 /// SQLite-backed store for the four-layer schema. The
@@ -312,13 +317,34 @@ pub enum LayeredMemoryError {
 #[derive(Clone)]
 pub struct LayeredMemoryStore {
     conn: Arc<Mutex<Connection>>,
+    /// PART 4: when `true`, the tenant-aware variants
+    /// (`text_search_for_tenant`, `list_for_tenant`,
+    /// `get_for_tenant`) fail closed on a missing tenant id
+    /// AND every read query is filtered with
+    /// `WHERE tenant_id = ?`. The pre-PART-4 tenant-blind
+    /// methods (`text_search`, `list`, `get`) still exist for
+    /// callers that have not yet been migrated and for
+    /// internal maintenance paths (promoter, consolidator,
+    /// migration); they continue to ignore tenant.
+    tenant_isolation: bool,
 }
 
 impl LayeredMemoryStore {
     /// Open the store at `path`. Creates the parent directory
     /// and the table if absent; applies the project-wide
     /// SQLite pragmas (WAL, foreign_keys, busy timeout).
+    /// Tenant isolation defaults to OFF; callers opt in via
+    /// [`Self::open_with_tenant_isolation`].
     pub fn open(path: &Path) -> Result<Self, LayeredMemoryError> {
+        Self::open_with_tenant_isolation(path, false)
+    }
+
+    /// PART 4: open variant that toggles per-tenant
+    /// fail-closed filtering on the tenant-aware read methods.
+    pub fn open_with_tenant_isolation(
+        path: &Path,
+        tenant_isolation: bool,
+    ) -> Result<Self, LayeredMemoryError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| LayeredMemoryError::Io(e.to_string()))?;
         }
@@ -329,6 +355,7 @@ impl LayeredMemoryStore {
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            tenant_isolation,
         })
     }
 
@@ -336,13 +363,28 @@ impl LayeredMemoryStore {
     /// on `:memory:` anyway) but keeps foreign_keys + busy
     /// timeout consistent with the file-backed open path.
     pub fn in_memory() -> Result<Self, LayeredMemoryError> {
+        Self::in_memory_with_tenant_isolation(false)
+    }
+
+    /// PART 4: in-memory variant with explicit isolation
+    /// toggle, used by tenant-isolation tests.
+    pub fn in_memory_with_tenant_isolation(
+        tenant_isolation: bool,
+    ) -> Result<Self, LayeredMemoryError> {
         let conn = Connection::open_in_memory()?;
         crate::db::apply_pragmas(&conn)?;
         crate::db::ensure_migration_table(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            tenant_isolation,
         })
+    }
+
+    /// `true` when this store enforces per-tenant filtering on
+    /// the `*_for_tenant` read methods.
+    pub fn tenant_isolation_enabled(&self) -> bool {
+        self.tenant_isolation
     }
 
     /// Insert a new record. Idempotent on `id` collision via
@@ -631,6 +673,81 @@ impl LayeredMemoryStore {
             out.push(r??);
         }
         Ok(out)
+    }
+
+    /// PART 4: tenant-aware variant of [`text_search`]. Adds a
+    /// `WHERE tenant_id = ?1` clause so the SQLite fallback
+    /// path cannot leak rows across tenants. When
+    /// `tenant_isolation = true` AND `tenant_id` is `None` /
+    /// empty, returns
+    /// [`LayeredMemoryError::MissingTenant`].
+    ///
+    /// When `tenant_isolation = false`, this method falls
+    /// through to [`Self::text_search`] (no filter applied)
+    /// so single-tenant deployments stay byte-identical.
+    pub fn text_search_for_tenant(
+        &self,
+        query: &str,
+        limit: usize,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<MemoryRecord>, LayeredMemoryError> {
+        if !self.tenant_isolation {
+            return self.text_search(query, limit);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return Err(LayeredMemoryError::MissingTenant),
+        };
+        let limit = limit.clamp(1, 1000) as i64;
+        let pattern = format!("%{}%", query.replace('%', "\\%"));
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+             FROM memory_records \
+             WHERE tenant_id = ?1 AND text LIKE ?2 ESCAPE '\\' \
+             ORDER BY created_at DESC, id ASC \
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![tenant, pattern, limit], row_to_record)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r??);
+        }
+        Ok(out)
+    }
+
+    /// PART 4: tenant-aware variant of [`Self::get`]. Returns
+    /// the row only when its `tenant_id` matches; returns
+    /// `Ok(None)` (not an error) when the row exists but
+    /// belongs to a different tenant — a leaked id must not
+    /// reveal cross-tenant existence.
+    pub fn get_for_tenant(
+        &self,
+        id: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<Option<MemoryRecord>, LayeredMemoryError> {
+        if !self.tenant_isolation {
+            return self.get(id);
+        }
+        let tenant = match tenant_id {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return Err(LayeredMemoryError::MissingTenant),
+        };
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+             FROM memory_records \
+             WHERE id = ?1 AND tenant_id = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![id, tenant], row_to_record)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r??)),
+            None => Ok(None),
+        }
     }
 
     /// Mark a record as no longer valid by stamping
@@ -1422,7 +1539,9 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "CREATE INDEX IF NOT EXISTS memory_records_share_policy \
              ON memory_records(share_policy) WHERE share_policy != 'none';\
          CREATE INDEX IF NOT EXISTS memory_records_shared_by \
-             ON memory_records(shared_by) WHERE shared_by IS NOT NULL;",
+             ON memory_records(shared_by) WHERE shared_by IS NOT NULL;\
+         CREATE INDEX IF NOT EXISTS idx_memory_records_tenant \
+             ON memory_records(tenant_id) WHERE tenant_id IS NOT NULL;",
     )?;
     // RELIX-MEM (GAP 6): quarantine table for high-anomaly
     // observations + external-trust records awaiting operator
@@ -2115,5 +2234,132 @@ mod tests {
             .unwrap();
         let got = store.get("post-migrate").unwrap().unwrap();
         assert_eq!(got.share_policy, SharePolicy::None);
+    }
+
+    /// PART 4: helper that inserts a row pinned to a specific
+    /// tenant_id so the tenant-aware read tests have data to
+    /// look at.
+    fn record_for_tenant(
+        id: &str,
+        layer: MemoryLayer,
+        text: &str,
+        source: &str,
+        tenant: &str,
+    ) -> MemoryRecord {
+        let mut r = record(id, layer, text, source);
+        r.tenant_id = Some(tenant.to_string());
+        r
+    }
+
+    /// PART 4: tenant-aware text search filters by tenant_id
+    /// and never returns rows from other tenants.
+    #[test]
+    fn fix_part4_text_search_for_tenant_isolates_buckets() {
+        let store = LayeredMemoryStore::in_memory_with_tenant_isolation(true).unwrap();
+        store
+            .insert(&record_for_tenant(
+                "a1",
+                MemoryLayer::Raw,
+                "shared secret",
+                "alice",
+                "acme",
+            ))
+            .unwrap();
+        store
+            .insert(&record_for_tenant(
+                "b1",
+                MemoryLayer::Raw,
+                "shared secret",
+                "bob",
+                "globex",
+            ))
+            .unwrap();
+        // acme sees only its own row.
+        let acme_hits = store
+            .text_search_for_tenant("shared", 10, Some("acme"))
+            .unwrap();
+        assert_eq!(acme_hits.len(), 1);
+        assert_eq!(acme_hits[0].id, "a1");
+        // globex sees only its own.
+        let globex_hits = store
+            .text_search_for_tenant("shared", 10, Some("globex"))
+            .unwrap();
+        assert_eq!(globex_hits.len(), 1);
+        assert_eq!(globex_hits[0].id, "b1");
+        // Unknown tenant sees nothing.
+        let none_hits = store
+            .text_search_for_tenant("shared", 10, Some("unknown"))
+            .unwrap();
+        assert!(none_hits.is_empty());
+    }
+
+    /// PART 4: tenant-aware read fails closed in
+    /// tenant-isolation mode when the caller forgets to
+    /// supply a tenant id.
+    #[test]
+    fn fix_part4_text_search_for_tenant_fails_closed_on_missing_tenant() {
+        let store = LayeredMemoryStore::in_memory_with_tenant_isolation(true).unwrap();
+        assert!(matches!(
+            store.text_search_for_tenant("anything", 10, None),
+            Err(LayeredMemoryError::MissingTenant)
+        ));
+        assert!(matches!(
+            store.text_search_for_tenant("anything", 10, Some("")),
+            Err(LayeredMemoryError::MissingTenant)
+        ));
+        assert!(matches!(
+            store.text_search_for_tenant("anything", 10, Some("   ")),
+            Err(LayeredMemoryError::MissingTenant)
+        ));
+    }
+
+    /// PART 4: in legacy (isolation-off) mode the tenant-aware
+    /// methods passthrough to the tenant-blind variants for
+    /// backwards compatibility.
+    #[test]
+    fn fix_part4_text_search_for_tenant_passes_through_when_isolation_off() {
+        let store = LayeredMemoryStore::in_memory().unwrap();
+        assert!(!store.tenant_isolation_enabled());
+        store
+            .insert(&record_for_tenant(
+                "x",
+                MemoryLayer::Raw,
+                "hi there",
+                "alice",
+                "acme",
+            ))
+            .unwrap();
+        // In legacy mode passing None still returns the row.
+        let hits = store.text_search_for_tenant("hi", 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// PART 4: tenant-aware `get` hides cross-tenant rows
+    /// (Ok(None), not Err) so a leaked id can't reveal
+    /// existence.
+    #[test]
+    fn fix_part4_get_for_tenant_hides_cross_tenant_rows() {
+        let store = LayeredMemoryStore::in_memory_with_tenant_isolation(true).unwrap();
+        store
+            .insert(&record_for_tenant(
+                "secret-id",
+                MemoryLayer::Raw,
+                "private",
+                "alice",
+                "acme",
+            ))
+            .unwrap();
+        // Owner sees the row.
+        let owner = store.get_for_tenant("secret-id", Some("acme")).unwrap();
+        assert!(owner.is_some());
+        // Other tenant gets Ok(None) — same shape as a real
+        // not-found, so cross-tenant existence is invisible.
+        let other = store.get_for_tenant("secret-id", Some("globex")).unwrap();
+        assert!(other.is_none());
+        // Missing tenant id is an error, not a silent miss.
+        assert!(matches!(
+            store.get_for_tenant("secret-id", None),
+            Err(LayeredMemoryError::MissingTenant)
+        ));
     }
 }

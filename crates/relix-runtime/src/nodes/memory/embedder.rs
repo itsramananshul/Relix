@@ -265,8 +265,24 @@ async fn run_tick(p: &EmbeddingPipeline) -> usize {
                 continue;
             }
         }
+        // PART 4: collection_for_tenant now returns Result so
+        // a missing tenant in multi-tenant mode is caught
+        // here. The embedder pipeline skips the record + logs
+        // — same posture as other Qdrant errors above; we
+        // never silently route a record into a different
+        // tenant's collection.
         let coll = match p.qdrant.as_ref() {
-            Some(q) => q.collection_for_tenant(record.tenant_id.as_deref()),
+            Some(q) => match q.collection_for_tenant(record.tenant_id.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        record_id = %record.id,
+                        "memory embedder: collection_for_tenant failed; skipping record"
+                    );
+                    continue;
+                }
+            },
             None => String::new(),
         };
         buckets

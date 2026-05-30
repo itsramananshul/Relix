@@ -194,6 +194,15 @@ pub struct TenantPolicyResolver {
     global: PolicyEngine,
     dir: Option<PathBuf>,
     ttl: Duration,
+    /// PART 4: when `true`, every `evaluate` call MUST supply
+    /// a non-empty `tenant_id`. A missing tenant returns
+    /// `Decision::Deny(SECURITY_DENIED)` with cause
+    /// "tenant_id required in multi-tenant mode" rather than
+    /// the pre-PART-4 silent fallback to the global engine.
+    /// Operators enable this in multi-tenant deployments so
+    /// tenant A's policy cannot accidentally apply to tenant
+    /// B's traffic.
+    tenant_isolation_enabled: bool,
     /// `tenant_id -> (loaded_at, engine_or_negative_cache)`.
     /// `Some(engine)` = a file was found and parsed. `None` =
     /// negative cache: no file at that path. Both expire after
@@ -206,13 +215,32 @@ impl TenantPolicyResolver {
     /// Construct. `dir = None` disables per-tenant resolution
     /// (every call falls straight through to `global`). A
     /// `ttl_secs` of 0 disables caching — useful in tests.
+    /// `tenant_isolation_enabled` defaults to `false`; callers
+    /// opt into fail-closed behaviour via
+    /// [`Self::with_tenant_isolation`].
     pub fn new(global: PolicyEngine, dir: Option<PathBuf>, ttl_secs: u64) -> Self {
         Self {
             global,
             dir,
             ttl: Duration::from_secs(ttl_secs),
+            tenant_isolation_enabled: false,
             cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// PART 4: enable fail-closed semantics. When set, calls
+    /// to [`Self::evaluate`] with `tenant_id = None` return a
+    /// deny decision instead of falling back to the global
+    /// engine.
+    pub fn with_tenant_isolation(mut self, enabled: bool) -> Self {
+        self.tenant_isolation_enabled = enabled;
+        self
+    }
+
+    /// `true` when tenant isolation is enabled and missing
+    /// tenant ids are rejected.
+    pub fn tenant_isolation_enabled(&self) -> bool {
+        self.tenant_isolation_enabled
     }
 
     /// Borrow the global / fallback engine.
@@ -252,12 +280,25 @@ impl TenantPolicyResolver {
     /// errors are logged via tracing and fall back to the
     /// global engine so a typo in a per-tenant TOML never bricks
     /// the cap.
+    ///
+    /// PART 4: when [`Self::tenant_isolation_enabled`] is
+    /// `true` and `tenant_id` is `None` / empty, the call is
+    /// denied with `reason = "tenant_id required in
+    /// multi-tenant mode"`. The dispatch bridge maps this
+    /// deny reason onto `error_kinds::SECURITY_DENIED` so the
+    /// admission failure is visible in audit logs.
     pub fn evaluate(
         &self,
         caller: &VerifiedIdentity,
         method: &str,
         tenant_id: Option<&str>,
     ) -> Decision {
+        if self.tenant_isolation_enabled && tenant_id.map(|s| s.trim().is_empty()).unwrap_or(true) {
+            return Decision::Deny {
+                reason: "tenant_id required in multi-tenant mode".to_string(),
+                matched_rule: None,
+            };
+        }
         if let Some(engine) = self.engine_for_tenant(tenant_id) {
             engine.evaluate(caller, method)
         } else {
@@ -621,5 +662,60 @@ mod tests {
             d => panic!("expected default-deny, got {:?}", d),
         }
         assert!(engine.is_permissive());
+    }
+
+    /// PART 4: tenant-isolation-enabled resolver MUST deny
+    /// calls that arrive without a tenant id, even when the
+    /// global engine would have admitted them. The pre-PART-4
+    /// silent fallback to the global engine was a critical
+    /// isolation bug — a handler that forgot to propagate the
+    /// tenant header would have its policy evaluated against
+    /// the global file regardless of which tenant the caller
+    /// actually belonged to.
+    #[test]
+    fn fix_part4_resolver_fails_closed_when_tenant_id_missing_in_isolation_mode() {
+        // Global engine permits ai.chat for the "chat" group.
+        let global = PolicyEngine::from_toml(
+            r#"
+            [[rules]]
+            name = "chat_for_chat_group"
+            method = "ai.chat"
+            allow_groups = ["chat"]
+            "#,
+        )
+        .expect("policy parses");
+        let alice = mk_id("alice", &["chat"]);
+        // Without tenant_isolation, missing tenant_id falls
+        // through to the global engine and the rule admits.
+        let permissive_resolver = TenantPolicyResolver::new(global.clone(), None, 0);
+        assert!(matches!(
+            permissive_resolver.evaluate(&alice, "ai.chat", None),
+            Decision::Allow { .. }
+        ));
+        // With tenant_isolation = true, missing tenant_id is
+        // a hard deny.
+        let strict = TenantPolicyResolver::new(global, None, 0).with_tenant_isolation(true);
+        match strict.evaluate(&alice, "ai.chat", None) {
+            Decision::Deny { reason, .. } => {
+                assert!(reason.contains("tenant_id required"));
+            }
+            d => panic!("expected Deny, got {:?}", d),
+        }
+        // Empty / whitespace tenant id also denied.
+        match strict.evaluate(&alice, "ai.chat", Some("")) {
+            Decision::Deny { .. } => {}
+            d => panic!("expected Deny on empty, got {:?}", d),
+        }
+        match strict.evaluate(&alice, "ai.chat", Some("   ")) {
+            Decision::Deny { .. } => {}
+            d => panic!("expected Deny on whitespace, got {:?}", d),
+        }
+        // A real tenant id falls through to the global engine
+        // (no per-tenant file configured) and the global
+        // rule admits.
+        assert!(matches!(
+            strict.evaluate(&alice, "ai.chat", Some("acme")),
+            Decision::Allow { .. }
+        ));
     }
 }
