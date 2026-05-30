@@ -1054,6 +1054,75 @@ mod tests {
         }
     }
 
+    // DEFERRED A: end-to-end gate-level TTL boundary tests via
+    // clock injection on `GateInputs::now_ms`. Each test issues
+    // a token with `expires_at_ms = issued + 60_000` and then
+    // drives the gate at three precise clock values:
+    // expires - 1 (admit), expires (reject), expires + 1
+    // (reject). No `tokio::time::sleep` — purely synthetic
+    // time, runs in microseconds.
+
+    /// Helper: issue a token at `issued_at_ms` with `ttl_ms`,
+    /// evaluate the gate at `now_ms`, and return the verdict.
+    /// Pulled out so the three boundary tests share one
+    /// 12-line setup.
+    fn evaluate_at_clock(
+        s: &AgentStoreHandle,
+        issued_at_ms: i64,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> GateDecision {
+        let (wire, _) = approve_and_mint_token(s, "tool.x", b"subj-1", ttl_ms, issued_at_ms);
+        let id = ident(b"subj-1");
+        let mut e = env("tool.x", None);
+        e.approval_token = Some(wire);
+        let key = test_key();
+        evaluate(
+            Some(s),
+            GateInputs {
+                identity: &id,
+                envelope: &e,
+                capability: None,
+                now: now_ms / 1_000,
+                now_ms,
+                signing_key: &key,
+            },
+        )
+    }
+
+    #[test]
+    fn gate_admits_token_one_ms_before_ttl_expires() {
+        // expires_at_ms = 1_700_000_000_000 + 60_000 = 1_700_000_060_000
+        // now_ms = expires - 1 = 1_700_000_059_999 → admit.
+        let s = store();
+        let d = evaluate_at_clock(&s, 1_700_000_000_000, 60_000, 1_700_000_059_999);
+        assert!(matches!(d, GateDecision::Allow(_)), "got {d:?}");
+    }
+
+    #[test]
+    fn gate_rejects_token_exactly_at_ttl_expiry() {
+        // The exclusive-boundary check: now == expires_at_ms is
+        // already expired. Locks the contract documented on
+        // `TokenError::Expired`.
+        let s = store();
+        let d = evaluate_at_clock(&s, 1_700_000_000_000, 60_000, 1_700_000_060_000);
+        match d {
+            GateDecision::Deny(d) => assert_eq!(d.matched_rule, "approval_token_expired"),
+            other => panic!("expected expired-at-boundary deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_rejects_token_one_ms_after_ttl_expires() {
+        // now_ms = expires + 1 = 1_700_000_060_001 → deny.
+        let s = store();
+        let d = evaluate_at_clock(&s, 1_700_000_000_000, 60_000, 1_700_000_060_001);
+        match d {
+            GateDecision::Deny(d) => assert_eq!(d.matched_rule, "approval_token_expired"),
+            other => panic!("expected expired deny, got {other:?}"),
+        }
+    }
+
     #[test]
     fn structured_token_bad_signature_is_denied() {
         let s = store();

@@ -496,6 +496,78 @@ mod tests {
         }
     }
 
+    // ── DEFERRED A: TTL boundary tests via clock injection ──
+    //
+    // `check_not_expired` takes `now_ms` as a parameter — pure
+    // function, no wall-clock dep. These tests verify the
+    // boundary condition explicitly: `now >= expires_at_ms`
+    // rejects, `now < expires_at_ms` admits. Locks the
+    // exclusive-boundary contract documented in the
+    // `TokenError::Expired` variant.
+
+    /// Helper: mint a token with `expires_at_ms = issued + ttl`
+    /// and immediately parse the wire form back. Returns the
+    /// parsed token so the test can drive `check_not_expired`
+    /// against synthetic `now_ms` values without re-hitting
+    /// `unix_ms()`.
+    fn token_with_window(issued_at_ms: i64, ttl_ms: i64) -> ApprovalToken {
+        let wire =
+            ApprovalToken::issue("a", "m", "s", "sess", issued_at_ms, ttl_ms, &key()).unwrap();
+        ApprovalToken::parse(&wire).unwrap()
+    }
+
+    #[test]
+    fn ttl_boundary_admits_one_ms_before_expiry() {
+        // Verified at `now = issued + 59_999`: token must admit.
+        let tok = token_with_window(1_000, 60_000);
+        assert_eq!(tok.expires_at_ms, 61_000);
+        tok.check_not_expired(60_999)
+            .expect("now = expires - 1 must admit");
+    }
+
+    #[test]
+    fn ttl_boundary_rejects_exactly_at_expiry() {
+        // Verified at `now = expires_at_ms`: must reject. The
+        // SQL/runtime contract is `now >= expires` ⇒ expired
+        // (exclusive upper bound — a token issued for 0ms is
+        // already expired the moment it is parsed).
+        let tok = token_with_window(1_000, 60_000);
+        match tok.check_not_expired(61_000) {
+            Err(TokenError::Expired {
+                now_ms,
+                expires_at_ms,
+            }) => {
+                assert_eq!(now_ms, 61_000);
+                assert_eq!(expires_at_ms, 61_000);
+            }
+            other => panic!("expected Expired at the exact expires_at_ms boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttl_boundary_rejects_one_ms_after_expiry() {
+        // Verified at `now = issued + 60_001`: must reject.
+        let tok = token_with_window(1_000, 60_000);
+        match tok.check_not_expired(61_001) {
+            Err(TokenError::Expired { .. }) => {}
+            other => panic!("expected Expired at expires + 1ms, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttl_boundary_admits_at_issued_at_ms_with_one_ms_ttl() {
+        // Smallest legal token: `ttl_ms = 1` ⇒ expires_at = issued + 1.
+        // - now = issued       → admits (1 < expires)
+        // - now = issued + 1   → rejects (now == expires)
+        let tok = token_with_window(0, 1);
+        assert_eq!(tok.expires_at_ms, 1);
+        tok.check_not_expired(0).expect("now=0 < expires=1 admits");
+        match tok.check_not_expired(1) {
+            Err(TokenError::Expired { .. }) => {}
+            other => panic!("expected Expired at now=expires=1, got {other:?}"),
+        }
+    }
+
     #[test]
     fn malformed_base64_returns_malformed_encoding() {
         match ApprovalToken::parse("!!not-base64!!") {
