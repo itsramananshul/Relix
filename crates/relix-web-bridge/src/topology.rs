@@ -134,6 +134,23 @@ pub struct HealthResponse {
     /// plus total opened since bridge start. Counters reset
     /// on restart.
     pub streams: StreamCounters,
+    /// FIX 49: per-channel health snapshots pulled in
+    /// parallel from the telegram, slack, and discord peers'
+    /// `<channel>.health` capabilities. Missing entries
+    /// (peer unreachable, cap not registered) are surfaced
+    /// as `null` rather than omitted so dashboards can
+    /// distinguish "channel down" from "channel not deployed".
+    pub channels: ChannelsHealth,
+}
+
+/// FIX 49: aggregator for the three channel-side health
+/// snapshots. Each field is `None` when the bridge could not
+/// reach that channel's `<channel>.health` capability.
+#[derive(Debug, Serialize, Default)]
+pub struct ChannelsHealth {
+    pub telegram: Option<relix_core::channel_health::ChannelHealthSnapshot>,
+    pub slack: Option<relix_core::channel_health::ChannelHealthSnapshot>,
+    pub discord: Option<relix_core::channel_health::ChannelHealthSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -363,6 +380,10 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         active: state.stream_metrics.active(),
         opened_total: state.stream_metrics.opened_total(),
     };
+    // FIX 49: fan out three concurrent `<channel>.health`
+    // calls. Each failure → `None` so the bridge stays up
+    // even when a channel peer is offline.
+    let channels = fetch_channels_health(&state).await;
     Json(HealthResponse {
         status: "ok",
         started_at: state.started_at,
@@ -375,7 +396,63 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         peers_expired: expired,
         reconnect,
         streams,
+        channels,
     })
+}
+
+/// FIX 49: parallel fetch of the three channel peers'
+/// `<channel>.health` capabilities. Always returns a
+/// `ChannelsHealth` (default-empty when the mesh client
+/// is missing).
+async fn fetch_channels_health(state: &AppState) -> ChannelsHealth {
+    let Some(mesh) = state.mesh_client.as_ref() else {
+        return ChannelsHealth::default();
+    };
+    let deadline = state.cfg.transport.deadline_secs.clamp(2, 10);
+    let identity = state.identity_bundle.clone();
+    let mesh = mesh.clone();
+    // `tokio::join!` runs the three calls concurrently. Each
+    // returns `Option<Snapshot>` so a missing peer doesn't
+    // sink the whole response.
+    let (tg, sl, dc) = tokio::join!(
+        fetch_one_channel_health(&mesh, "telegram", &identity, deadline),
+        fetch_one_channel_health(&mesh, "slack", &identity, deadline),
+        fetch_one_channel_health(&mesh, "discord", &identity, deadline),
+    );
+    ChannelsHealth {
+        telegram: tg,
+        slack: sl,
+        discord: dc,
+    }
+}
+
+async fn fetch_one_channel_health(
+    mesh: &std::sync::Arc<relix_runtime::manifest::MeshClient>,
+    alias: &str,
+    identity: &relix_core::bundle::Bundle,
+    deadline: i64,
+) -> Option<relix_core::channel_health::ChannelHealthSnapshot> {
+    let method = format!("{alias}.health");
+    let envelope =
+        relix_runtime::dispatch::build_request(&method, Vec::new(), identity.clone(), deadline);
+    let resp_bytes = match mesh.call(alias, envelope).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                alias = alias,
+                "v1/health: channel health call failed; surfacing as null"
+            );
+            return None;
+        }
+    };
+    let resp = relix_runtime::dispatch::decode_response(&resp_bytes).ok()?;
+    match resp.res {
+        relix_runtime::transport::envelope::ResponseResult::Ok(body) => {
+            serde_json::from_slice::<relix_core::channel_health::ChannelHealthSnapshot>(&body).ok()
+        }
+        _ => None,
+    }
 }
 
 /// `GET /v1/topology` — list every peer in the bridge's

@@ -162,6 +162,28 @@ pub fn register(
             })),
         );
     }
+    // FIX 49: per-channel health cap — `slack.health`.
+    {
+        let state = state.clone();
+        bridge.register(
+            "slack.health",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let state = state.clone();
+                async move {
+                    let snapshot = state.health().snapshot();
+                    match serde_json::to_vec(&snapshot) {
+                        Ok(b) => HandlerOutcome::Ok(b),
+                        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::RESPONDER_INTERNAL,
+                            cause: format!("slack.health: serialise snapshot: {e}"),
+                            retry_hint: 0,
+                            retry_after: None,
+                        }),
+                    }
+                }
+            })),
+        );
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]

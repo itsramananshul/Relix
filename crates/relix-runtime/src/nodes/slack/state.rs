@@ -3,11 +3,13 @@
 //! specific identity (team_id) and using a `ts` string for the
 //! polling cursor.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use relix_core::channel_health::ChannelHealth;
+use relix_core::channel_rate_limit::ChannelRateLimiter;
+use relix_core::clock::{Clock, SystemClock};
 use relix_slack::BotIdentity;
 
-#[derive(Default)]
 pub struct ChannelState {
     online: Mutex<bool>,
     identity: Mutex<BotIdentity>,
@@ -17,9 +19,28 @@ pub struct ChannelState {
     /// as the `oldest` parameter for the next
     /// `conversations.history` poll.
     cursor: Mutex<String>,
+    /// FIX 49: per-channel health tracker.
+    health: ChannelHealth,
+}
+
+impl Default for ChannelState {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemClock), None)
+    }
 }
 
 impl ChannelState {
+    pub fn with_clock(clock: Arc<dyn Clock>, rate_limiter: Option<ChannelRateLimiter>) -> Self {
+        Self {
+            online: Mutex::new(false),
+            identity: Mutex::new(BotIdentity::default()),
+            messages_seen: Mutex::new(0),
+            last_message_at: Mutex::new(None),
+            cursor: Mutex::new(String::new()),
+            health: ChannelHealth::new("polling", clock, rate_limiter),
+        }
+    }
+
     pub fn online(&self) -> bool {
         *self.online.lock().expect("poisoned")
     }
@@ -44,14 +65,21 @@ impl ChannelState {
         *self.cursor.lock().expect("poisoned") = ts.to_string();
     }
 
+    /// FIX 49: per-channel health accessor.
+    pub fn health(&self) -> &ChannelHealth {
+        &self.health
+    }
+
     pub fn mark_online(&self, id: BotIdentity) {
         *self.identity.lock().expect("poisoned") = id;
         *self.online.lock().expect("poisoned") = true;
+        self.health.mark_enabled();
     }
 
     pub fn record_inbound(&self, ts: i64) {
         *self.messages_seen.lock().expect("poisoned") += 1;
         *self.last_message_at.lock().expect("poisoned") = Some(ts);
+        self.health.record_event_received();
     }
 }
 

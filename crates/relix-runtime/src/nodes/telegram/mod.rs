@@ -202,6 +202,30 @@ pub fn register_with_webhook(
             })),
         );
     }
+    // FIX 49: per-channel health cap. Returns the
+    // `ChannelHealthSnapshot` JSON the bridge aggregates
+    // into `/v1/health` under `channels.telegram`.
+    {
+        let state = state.clone();
+        bridge.register(
+            "telegram.health",
+            Arc::new(FnHandler(move |_ctx: InvocationCtx| {
+                let state = state.clone();
+                async move {
+                    let snapshot = state.health().snapshot();
+                    match serde_json::to_vec(&snapshot) {
+                        Ok(b) => HandlerOutcome::Ok(b),
+                        Err(e) => HandlerOutcome::Err(ErrorEnvelope {
+                            kind: error_kinds::RESPONDER_INTERNAL,
+                            cause: format!("telegram.health: serialise snapshot: {e}"),
+                            retry_hint: 0,
+                            retry_after: None,
+                        }),
+                    }
+                }
+            })),
+        );
+    }
     // FIX 1: webhook-update dispatch cap. The bridge forwards
     // inbound Telegram Updates here when the bot is in webhook
     // mode. The cap parses the raw Update body, converts to

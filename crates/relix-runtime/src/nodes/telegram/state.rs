@@ -6,15 +6,22 @@
 //! every poll tick.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use relix_core::channel_health::ChannelHealth;
+use relix_core::channel_rate_limit::ChannelRateLimiter;
+use relix_core::clock::{Clock, SystemClock};
 use relix_telegram::BotIdentity;
 
 /// Shared mutable state for the telegram controller. All
 /// fields are locked individually to keep the read paths
 /// (status capability + recent-messages renderer) free of
 /// contention with the long-poll loop.
-#[derive(Default)]
+///
+/// FIX 49: an embedded [`ChannelHealth`] surfaces the
+/// per-channel snapshot via the `telegram.health` capability
+/// (operators read it through the bridge's `/v1/health`
+/// aggregation under `channels.telegram`).
 pub struct ChannelState {
     /// `true` once `get_me` has succeeded. Used by the
     /// status capability + the dashboard.
@@ -27,9 +34,33 @@ pub struct ChannelState {
     messages_seen: Mutex<u64>,
     /// Unix seconds of the most recent inbound message.
     last_message_at: Mutex<Option<i64>>,
+    /// FIX 49: per-channel health tracker. Carries
+    /// last_poll_success_ms, last_event_received_ms,
+    /// last_send_success_ms, consecutive_failures,
+    /// session_count, rate_limit_state.
+    health: ChannelHealth,
+}
+
+impl Default for ChannelState {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemClock), None)
+    }
 }
 
 impl ChannelState {
+    /// FIX 49 / 50: construct with an explicit clock + optional
+    /// rate-limiter so tests can drive the health snapshot
+    /// deterministically.
+    pub fn with_clock(clock: Arc<dyn Clock>, rate_limiter: Option<ChannelRateLimiter>) -> Self {
+        Self {
+            online: Mutex::new(false),
+            identity: Mutex::new(BotIdentity::default()),
+            messages_seen: Mutex::new(0),
+            last_message_at: Mutex::new(None),
+            health: ChannelHealth::new("long_poll", clock, rate_limiter),
+        }
+    }
+
     pub fn online(&self) -> bool {
         *self.online.lock().expect("poisoned")
     }
@@ -46,12 +77,20 @@ impl ChannelState {
         *self.last_message_at.lock().expect("poisoned")
     }
 
+    /// FIX 49: read access to the health tracker — used by
+    /// the `telegram.health` capability.
+    pub fn health(&self) -> &ChannelHealth {
+        &self.health
+    }
+
     /// Stamp the identity returned by `get_me` and flip
     /// the `online` flag. Idempotent — restart loops can
     /// call this without resetting state.
     pub fn mark_online(&self, id: BotIdentity) {
         *self.identity.lock().expect("poisoned") = id;
         *self.online.lock().expect("poisoned") = true;
+        // FIX 49: a successful `get_me` enables the channel.
+        self.health.mark_enabled();
     }
 
     /// Record a new inbound message: bumps the counter and
@@ -59,6 +98,12 @@ impl ChannelState {
     pub fn record_inbound(&self, ts: i64) {
         *self.messages_seen.lock().expect("poisoned") += 1;
         *self.last_message_at.lock().expect("poisoned") = Some(ts);
+        // FIX 49: stamp the event-received timestamp on
+        // every inbound. Both poll-success and
+        // event-received fire on inbound traffic — the
+        // controller's poll loop also stamps poll_success
+        // independently when get_updates returns OK.
+        self.health.record_event_received();
     }
 }
 

@@ -59,6 +59,11 @@ pub struct LiveSlackApi {
     http: reqwest::Client,
     base_url: String,
     token: String,
+    /// FIX 50: optional proactive rate-limit tracker.
+    /// `chat_post_message` / `chat_update` calls
+    /// `acquire(channel).await` before issuing the HTTP
+    /// request.
+    rate_limiter: Option<relix_core::channel_rate_limit::ChannelRateLimiter>,
 }
 
 impl LiveSlackApi {
@@ -76,6 +81,31 @@ impl LiveSlackApi {
             http,
             base_url: base,
             token,
+            rate_limiter: None,
+        }
+    }
+
+    /// FIX 50: install a proactive rate-limit tracker. Pass
+    /// `ChannelRateLimiter::new(SLACK_PER_CHANNEL, None, clock)`
+    /// to honour the Tier 3 1-msg/s/channel cap.
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: relix_core::channel_rate_limit::ChannelRateLimiter,
+    ) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// FIX 50: per-channel rate-limit gate.
+    async fn rate_limit_acquire(&self, channel: &str) {
+        if let Some(lim) = self.rate_limiter.as_ref() {
+            let state = lim.acquire(channel).await;
+            if matches!(
+                state,
+                relix_core::channel_rate_limit::RateLimitState::Throttled
+            ) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 
@@ -331,6 +361,8 @@ impl SlackApi for LiveSlackApi {
     }
 
     async fn chat_post_message(&self, out: &OutgoingMessage) -> Result<(), SlackApiError> {
+        // FIX 50: per-channel rate-limit gate.
+        self.rate_limit_acquire(&out.channel_id).await;
         let body = serde_json::to_value(SlackPostMessage {
             channel: &out.channel_id,
             text: &out.text,
@@ -343,6 +375,8 @@ impl SlackApi for LiveSlackApi {
     }
 
     async fn chat_update(&self, channel: &str, ts: &str, text: &str) -> Result<(), SlackApiError> {
+        // FIX 50: per-channel rate-limit gate.
+        self.rate_limit_acquire(channel).await;
         let body = serde_json::to_value(SlackUpdateMessage { channel, ts, text })
             .map_err(|e| SlackApiError::Transient(format!("chat.update body: {e}")))?;
         let _: SlackPostResp = self.request("chat.update", &body).await?;

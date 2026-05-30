@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use relix_core::channel_rate_limit::{ChannelRateLimiter, RateLimitState};
 use serde::{Deserialize, Serialize};
 
 use crate::{BotApi, BotApiError, IncomingMessage, OutgoingMessage, ParseMode};
@@ -78,6 +79,12 @@ pub struct LiveBotApi {
     /// Pre-computed URL prefix: `<base>/bot<token>`. Tokens
     /// are never logged or returned; the prefix is internal.
     url_prefix: String,
+    /// FIX 50: optional proactive rate-limit tracker. When
+    /// set, outbound `sendMessage` / `editMessageText` /
+    /// `sendChatAction` / `answerCallbackQuery` calls
+    /// `acquire(chat_key).await` before issuing the HTTP
+    /// request. When `None`, behaviour is unchanged.
+    rate_limiter: Option<ChannelRateLimiter>,
 }
 
 impl LiveBotApi {
@@ -102,6 +109,37 @@ impl LiveBotApi {
         Self {
             http,
             url_prefix: prefix,
+            rate_limiter: None,
+        }
+    }
+
+    /// FIX 50: install a proactive rate-limit tracker. Pass
+    /// the result of
+    /// `ChannelRateLimiter::new(TELEGRAM_PER_CHAT, Some(TELEGRAM_GLOBAL), clock)`
+    /// to honour the documented per-chat + global caps.
+    /// Returns `self` so callers can chain with `LiveBotApi::new(...).with_rate_limiter(...)`.
+    pub fn with_rate_limiter(mut self, limiter: ChannelRateLimiter) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// FIX 50: gate one outbound call on the rate limiter.
+    /// `key` is the per-chat identifier (chat_id rendered as
+    /// a string). When the bucket is at >= 80% utilisation
+    /// we add a small artificial backoff before approving
+    /// the send so the next request approaches the cap
+    /// gracefully rather than slamming it. When the bucket
+    /// is empty `acquire()` awaits the refill.
+    async fn rate_limit_acquire(&self, key: &str) {
+        if let Some(lim) = self.rate_limiter.as_ref() {
+            let state = lim.acquire(key).await;
+            if matches!(state, RateLimitState::Throttled) {
+                // 50ms artificial backoff at the soft
+                // threshold. Tiny enough to be invisible at
+                // normal load; large enough to break the
+                // synchronised-thundering-herd pattern.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 
@@ -443,6 +481,9 @@ impl BotApi for LiveBotApi {
     }
 
     async fn send_message(&self, out: &OutgoingMessage) -> Result<(), BotApiError> {
+        // FIX 50: gate on the per-chat rate limit before
+        // issuing the HTTP POST.
+        self.rate_limit_acquire(&out.chat_id.to_string()).await;
         let mut body = serde_json::json!({
             "chat_id": out.chat_id,
             "text": out.text,
@@ -494,6 +535,8 @@ impl BotApi for LiveBotApi {
         text: &str,
         parse_mode: Option<ParseMode>,
     ) -> Result<(), BotApiError> {
+        // FIX 50: per-chat rate-limit gate.
+        self.rate_limit_acquire(&chat_id.to_string()).await;
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id,
@@ -507,6 +550,8 @@ impl BotApi for LiveBotApi {
     }
 
     async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), BotApiError> {
+        // FIX 50: per-chat rate-limit gate.
+        self.rate_limit_acquire(&chat_id.to_string()).await;
         let body = serde_json::json!({
             "chat_id": chat_id,
             "action": action,

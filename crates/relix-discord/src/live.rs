@@ -54,6 +54,8 @@ pub struct LiveDiscordApi {
     http: reqwest::Client,
     base_url: String,
     token: String,
+    /// FIX 50: optional proactive rate-limit tracker.
+    rate_limiter: Option<relix_core::channel_rate_limit::ChannelRateLimiter>,
 }
 
 impl LiveDiscordApi {
@@ -75,6 +77,33 @@ impl LiveDiscordApi {
             http,
             base_url: base,
             token,
+            rate_limiter: None,
+        }
+    }
+
+    /// FIX 50: install a proactive rate-limit tracker. Pass
+    /// `ChannelRateLimiter::new(DISCORD_PER_CHANNEL, Some(DISCORD_GLOBAL), clock)`
+    /// to honour the documented 5/s per-channel + 50/s global
+    /// caps.
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: relix_core::channel_rate_limit::ChannelRateLimiter,
+    ) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// FIX 50: per-channel rate-limit gate. Called before
+    /// every outbound REST POST.
+    async fn rate_limit_acquire(&self, channel: &str) {
+        if let Some(lim) = self.rate_limiter.as_ref() {
+            let state = lim.acquire(channel).await;
+            if matches!(
+                state,
+                relix_core::channel_rate_limit::RateLimitState::Throttled
+            ) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 
@@ -332,6 +361,8 @@ impl DiscordApi for LiveDiscordApi {
     }
 
     async fn send_message(&self, out: &OutgoingMessage) -> Result<(), DiscordApiError> {
+        // FIX 50: per-channel rate-limit gate.
+        self.rate_limit_acquire(&out.channel_id).await;
         let path = format!("/channels/{}/messages", out.channel_id);
         let body = serde_json::to_value(DcSendMessage {
             content: &out.content,
@@ -352,6 +383,8 @@ impl DiscordApi for LiveDiscordApi {
     }
 
     async fn send_typing(&self, channel_id: &str) -> Result<(), DiscordApiError> {
+        // FIX 50: per-channel rate-limit gate.
+        self.rate_limit_acquire(channel_id).await;
         let path = format!("/channels/{channel_id}/typing");
         let _: EmptyResponse = self
             .request(reqwest::Method::POST, &path, None, false)

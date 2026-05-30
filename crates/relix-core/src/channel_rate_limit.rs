@@ -40,10 +40,11 @@ use crate::clock::Clock;
 /// Per-key rate-limit tracker state. Lives behind the
 /// `RateLimitState::current()` accessor so the health
 /// endpoint can surface "ok|throttled" verbatim.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RateLimitState {
     /// Bucket below the 80% threshold; sends proceed.
+    #[default]
     Ok,
     /// Bucket above the 80% threshold; sends incur a backoff.
     Throttled,
