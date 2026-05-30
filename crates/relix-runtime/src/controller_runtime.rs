@@ -2246,7 +2246,8 @@ fn ensure_msg_bookkeeping_task(
 /// Stable name for the legacy-token orphaned-task fail pass in
 /// the `startup_tasks` ledger. Pulled out so tests / docs / the
 /// integration harness reference the same string.
-pub(crate) const LEGACY_TOKEN_TASK_FAIL_PASS_NAME: &str = "legacy_token_orphaned_task_fail";
+#[doc(hidden)]
+pub const LEGACY_TOKEN_TASK_FAIL_PASS_NAME: &str = "legacy_token_orphaned_task_fail";
 
 /// NOT-DONE 2: progress checkpoint interval. Every N rows the
 /// background pass records the current cursor + processed
@@ -2258,8 +2259,9 @@ pub(crate) const LEGACY_TOKEN_PASS_PROGRESS_INTERVAL: usize = 100;
 /// [`run_legacy_token_orphaned_task_fail_pass`] so tests can
 /// assert exact counters; the background runner spawns it +
 /// drops the result.
+#[doc(hidden)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct LegacyTokenPassReport {
+pub struct LegacyTokenPassReport {
     pub transitioned: usize,
     pub already_terminal: usize,
     pub not_found: usize,
@@ -2280,7 +2282,8 @@ pub(crate) struct LegacyTokenPassReport {
 /// logged and skipped, never aborting the whole pass; progress
 /// checkpoints land in the SQLite ledger every
 /// [`LEGACY_TOKEN_PASS_PROGRESS_INTERVAL`] rows.
-pub(crate) async fn run_legacy_token_orphaned_task_fail_pass(
+#[doc(hidden)]
+pub async fn run_legacy_token_orphaned_task_fail_pass(
     agent_store: std::sync::Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: std::sync::Arc<crate::nodes::coordinator::TaskStore>,
     clock: std::sync::Arc<dyn relix_core::clock::Clock>,
@@ -2926,7 +2929,8 @@ async fn run_approval_expire_loop(
 /// approval-decide handler captures closures that flip the
 /// waiting task back to running / failed and append the
 /// corresponding chronicle event.
-fn register_agent_capabilities(
+#[doc(hidden)]
+pub fn register_agent_capabilities(
     bridge: &mut crate::dispatch::DispatchBridge,
     agent_store: Arc<crate::nodes::coordinator::agent::AgentStore>,
     task_store: Arc<crate::nodes::coordinator::TaskStore>,

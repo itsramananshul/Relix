@@ -346,6 +346,44 @@ impl AgentStore {
         Ok(())
     }
 
+    /// NOT-DONE 3 test scaffold. Inserts a pre-SEC-PART-A
+    /// approval row (status `pending`, non-NULL `approval_token`,
+    /// linked to `task_id`) that the boot-time
+    /// `migrate_legacy_opaque_tokens` pass will target. The
+    /// post-SEC `create_approval` path no longer writes the
+    /// legacy `approval_token` column, so this helper is the
+    /// ONLY public way to construct the exact shape the
+    /// migration is designed to flip.
+    ///
+    /// `#[doc(hidden)] pub` so the relix-web-bridge integration
+    /// test (which sits in a sibling crate and CANNOT depend on
+    /// `rusqlite` — bridge invariant) can seed without raw SQL.
+    /// Never call this from production code: it bypasses every
+    /// caller-side validation (capability category, requested_at,
+    /// expires_at sanity, etc.) and writes a row in a shape that
+    /// only exists in legacy databases.
+    #[doc(hidden)]
+    pub fn force_insert_legacy_pending_approval_for_test(
+        &self,
+        approval_id: &str,
+        task_id: &str,
+        opaque_token: &str,
+    ) -> Result<(), AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO approval_requests (
+                 approval_id, agent_id, subject_id, method, capability_category,
+                 args_redacted_hash, reason, approver_groups,
+                 requested_at, expires_at, status, task_id, approval_token,
+                 authorized_approvers
+             ) VALUES (?1, 'agt-legacy', 'subj-op', 'tool.web_read',
+                       'external_api:read', '', 'legacy pending', '[]',
+                       1700000000, 9999999999, 'pending', ?2, ?3, '[]')",
+            params![approval_id, task_id, opaque_token],
+        )?;
+        Ok(())
+    }
+
     /// DEFERRED 3 test-only helper. Re-runs the legacy-token
     /// migration on the underlying connection. Used by the cap
     /// handler tests to seed a row + migrate + observe the

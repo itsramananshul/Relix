@@ -130,6 +130,8 @@ mod judge;
 mod knowledge;
 #[cfg(test)]
 mod knowledge_mini_mesh_test;
+#[cfg(test)]
+mod legacy_token_full_stack_integration_test;
 mod lifecycle;
 mod mcp;
 mod mcp_audit;
