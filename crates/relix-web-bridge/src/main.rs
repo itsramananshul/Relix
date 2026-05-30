@@ -149,6 +149,7 @@ mod observability;
 mod observability_mini_mesh_test;
 mod openai;
 mod os_secure;
+mod peer_call;
 mod pii;
 mod planning;
 #[cfg(test)]
@@ -1068,12 +1069,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             auth::auth_middleware,
         ))
-        // Per-request tenant identifier middleware. Extracts
-        // `X-Relix-Tenant` and stashes it in request Extensions
-        // for downstream handlers. Defaults to `"default"` when
-        // absent. See `crate::tenant` + the SDK's
-        // `RelixClient::with_tenant`.
-        .layer(axum::middleware::from_fn(tenant::tenant_middleware))
+        // PART 5: per-request tenant identifier middleware.
+        // Resolves the canonical tenant via the decision tree
+        // in `crate::tenant::resolve_tenant`:
+        //   1. authenticated bearer + binding in
+        //      [auth.tenant_bindings] → use the binding.
+        //   2. authenticated request with no binding +
+        //      multi_tenant_mode → HTTP 401.
+        //   3. trusted internal origin sending
+        //      X-Relix-Tenant → accept the header.
+        //   4. anything else → single-tenant default.
+        // Stashes the resolved `TenantId` in request
+        // Extensions so handlers + `peer_call::build_mesh_request`
+        // can pull it out.
+        .layer(axum::middleware::from_fn_with_state(
+            tenant::TenantConfig::from_auth_section(&state.cfg.auth),
+            tenant::tenant_middleware,
+        ))
         // Universal security headers (CSP, X-Frame-Options,
         // X-Content-Type-Options). Layered outermost so the
         // headers ride 401/403/429 responses from the inner

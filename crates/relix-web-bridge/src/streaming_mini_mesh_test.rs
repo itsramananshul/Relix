@@ -273,6 +273,7 @@ function start() -> str {
         coordinator: None,
         mesh: MeshSection::default(),
         observability: None,
+        auth: crate::config::AuthSection::default(),
     };
     let state = AppState::try_new(cfg).expect("AppState::try_new");
 

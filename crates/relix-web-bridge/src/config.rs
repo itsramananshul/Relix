@@ -48,6 +48,59 @@ pub struct BridgeConfig {
     /// `[observability.otel]`.
     #[serde(default)]
     pub observability: Option<BridgeObservabilitySection>,
+    /// PART 5: multi-tenant auth configuration. Absent /
+    /// default keeps the pre-PART-5 single-tenant behaviour
+    /// (`multi_tenant_mode = false`, `tenant_bindings` empty,
+    /// `trusted_internal_origins = ["127.0.0.1", "::1"]`).
+    /// See [`AuthSection`].
+    #[serde(default)]
+    pub auth: AuthSection,
+}
+
+/// `[auth]` — multi-tenant binding + trusted-origin
+/// configuration. PART 5 of the tenant-isolation rollout.
+///
+/// ```toml
+/// [auth]
+/// multi_tenant_mode = false
+/// trusted_internal_origins = ["127.0.0.1", "::1"]
+///
+/// [auth.tenant_bindings]
+/// # First 8 chars of API key → tenant_id.
+/// "deadbeef" = "acme"
+/// "cafef00d" = "globex"
+/// ```
+///
+/// `multi_tenant_mode = true` makes a missing tenant binding
+/// fail-closed with HTTP 401; `false` keeps the single-tenant
+/// pre-PART-5 behaviour.
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct AuthSection {
+    /// When `true`, every authenticated request MUST resolve
+    /// to a tenant via [`AuthSection::tenant_bindings`] or
+    /// the HTTP layer returns 401. When `false`, missing
+    /// bindings fall through to the single-tenant default
+    /// (legacy behaviour). Defaults to `false`.
+    #[serde(default)]
+    pub multi_tenant_mode: bool,
+    /// IP addresses whose `X-Relix-Tenant` header is honoured
+    /// (e.g. trusted reverse-proxy / control-plane). Requests
+    /// from any other source IP have the header IGNORED. The
+    /// default whitelist accepts loopback only so external
+    /// callers cannot inject a tenant id by hand.
+    #[serde(default = "default_trusted_origins")]
+    pub trusted_internal_origins: Vec<String>,
+    /// Map of the first 8 characters of an API key to the
+    /// tenant id the credential belongs to. Operators set
+    /// this in their `[auth.tenant_bindings]` block; the
+    /// bridge token's prefix matches an entry here to derive
+    /// the canonical tenant for every request.
+    #[serde(default)]
+    pub tenant_bindings: std::collections::HashMap<String, String>,
+}
+
+fn default_trusted_origins() -> Vec<String> {
+    vec!["127.0.0.1".to_string(), "::1".to_string()]
 }
 
 /// `[observability]` for the bridge. Carries the OTel block; future

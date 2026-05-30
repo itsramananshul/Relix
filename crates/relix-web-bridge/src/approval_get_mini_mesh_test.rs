@@ -255,6 +255,7 @@ addr = "{}"
         coordinator: None,
         mesh: MeshSection::default(),
         observability: None,
+        auth: crate::config::AuthSection::default(),
     };
     let base_state = AppState::try_new(cfg).expect("AppState::try_new");
 
