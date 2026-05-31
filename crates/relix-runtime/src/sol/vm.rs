@@ -119,6 +119,18 @@ pub struct VM {
     /// VM see the same value without per-call updates from
     /// the host.
     last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
+    /// Set mid-instruction when malformed/hostile bytecode hits
+    /// a VM-integrity fault — stack underflow, an out-of-range
+    /// heap ref or local slot, an out-of-bounds element index,
+    /// a bad constant payload, or an oversized allocation. The
+    /// VM's `pop()` and the opcode handlers record the cause
+    /// here instead of panicking; `step()` checks it after each
+    /// instruction and converts it to a clean halt
+    /// (`VM_ERROR_SENTINEL` + structured `last_error`). Bytecode
+    /// compiled from operator/agent-authored SOL or YAML is
+    /// untrusted, so these faults must never abort the
+    /// `spawn_blocking` worker.
+    fault: Option<String>,
 }
 
 impl VM {
@@ -144,6 +156,7 @@ impl VM {
             steps_taken: 0,
             flow_name: None,
             fuel_exhausted_steps: None,
+            fault: None,
         }
     }
 
@@ -271,9 +284,76 @@ impl VM {
         self.stack.push(val);
     }
 
+    /// Pop the operand stack. On underflow (malformed bytecode)
+    /// this records a fault and returns `0` instead of
+    /// panicking; `step()` converts the recorded fault into a
+    /// clean halt after the instruction finishes. The bogus `0`
+    /// is harmless because the VM bails before the result is
+    /// observable.
     #[inline]
     fn pop(&mut self) -> u64 {
-        self.stack.pop().expect("Runtime Error: Stack underflow")
+        match self.stack.pop() {
+            Some(v) => v,
+            None => {
+                self.fault("stack underflow");
+                0
+            }
+        }
+    }
+
+    /// Record a VM-integrity fault from malformed bytecode. Only
+    /// the first fault per instruction is kept (later faults in
+    /// the same instruction are downstream effects of the
+    /// first).
+    #[inline]
+    fn fault(&mut self, cause: impl Into<String>) {
+        if self.fault.is_none() {
+            self.fault = Some(cause.into());
+        }
+    }
+
+    /// Bound an operator-controlled allocation request. The size
+    /// is checked against the remaining fuel (each element costs
+    /// at least as much as a VM step) and an absolute ceiling so
+    /// a malformed `size` (e.g. `usize::MAX` popped for
+    /// `NewArray`) cannot OOM the `spawn_blocking` worker before
+    /// the fuel counter intervenes. Records a fault and returns
+    /// `false` when the request is rejected.
+    fn check_alloc(&mut self, requested: usize, what: &str) -> bool {
+        // Absolute element ceiling, independent of fuel, so a
+        // very large fuel budget can't authorize a multi-GB
+        // allocation.
+        const ALLOC_CEILING: usize = 1 << 24; // 16,777,216 elements
+        let budget = (self.fuel as usize).min(ALLOC_CEILING);
+        if requested > budget {
+            self.fault(format!(
+                "{what}: requested {requested} elements exceeds allocation budget {budget}"
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Convert a recorded `fault` into a clean, hard halt: set
+    /// the structured `last_error` (so `flow_runner` surfaces a
+    /// cause exactly as it does for `RemoteCall` failures and
+    /// fuel exhaustion) and return the error sentinel. Malformed
+    /// bytecode is a VM-integrity fault, so — unlike SOL-level
+    /// `RemoteCall` errors — it is NOT routed through
+    /// `try`/`catch`; the flow fails cleanly.
+    fn raise_malformed(&mut self, cause: String) -> Option<u64> {
+        self.done = true;
+        let flow = self
+            .flow_name
+            .clone()
+            .unwrap_or_else(|| "<sol_vm>".to_string());
+        self.last_error = Some(RemoteCallError::local(
+            "<sol_vm>",
+            flow,
+            format!("malformed bytecode: {cause}"),
+        ));
+        Some(VM_ERROR_SENTINEL)
     }
 
     pub fn run(&mut self) -> u64 {
@@ -346,37 +426,50 @@ impl VM {
                         self.heap.push(HeapObject::String(s.clone()));
                         (self.heap.len() - 1) as u64
                     }
-                    _ => panic!("Runtime Error: Invalid constant AST node passed to VM"),
+                    _ => {
+                        self.fault("invalid constant AST node passed to PushConst");
+                        0
+                    }
                 };
                 self.push(bits);
             }
 
             Inst::LoadLocal(offset) => {
                 let idx = (self.fp as isize + offset) as usize;
-                let val = self.stack[idx];
-                self.push(val);
+                match self.stack.get(idx) {
+                    Some(&val) => self.push(val),
+                    None => self.fault(format!(
+                        "LoadLocal: slot {idx} out of range (stack len {})",
+                        self.stack.len()
+                    )),
+                }
             }
 
             Inst::StoreLocal(offset) => {
                 let val = self.pop();
                 let idx = (self.fp as isize + offset) as usize;
-                while self.stack.len() <= idx {
-                    self.stack.push(0);
+                // A malformed offset (or a corrupted fp) can make
+                // `idx` enormous; growing the stack to fill it
+                // would OOM the worker. Bound the growth against
+                // the allocation budget before zero-filling.
+                let needed = idx.saturating_add(1);
+                let grow_by = needed.saturating_sub(self.stack.len());
+                if self.check_alloc(grow_by, "StoreLocal stack growth") {
+                    while self.stack.len() < needed {
+                        self.stack.push(0);
+                    }
+                    self.stack[idx] = val;
                 }
-                self.stack[idx] = val;
             }
 
             Inst::Pop => {
                 self.pop();
             }
 
-            Inst::Dup => {
-                let val = *self
-                    .stack
-                    .last()
-                    .expect("Runtime Error: Cannot DUP empty stack");
-                self.push(val);
-            }
+            Inst::Dup => match self.stack.last().copied() {
+                Some(val) => self.push(val),
+                None => self.fault("Dup on empty stack"),
+            },
 
             // --- 2. Integer Math & Comparisons ---
             Inst::IntAdd => {
@@ -397,7 +490,14 @@ impl VM {
             Inst::IntDiv => {
                 let b = self.pop() as i64;
                 let a = self.pop() as i64;
-                self.push((a / b) as u64);
+                // `a / b` panics (aborting the worker) on divide
+                // by zero and on `i64::MIN / -1` overflow. Both
+                // are reachable from a flow, so convert them to a
+                // structured fault.
+                match a.checked_div(b) {
+                    Some(q) => self.push(q as u64),
+                    None => self.fault(format!("IntDiv: division error ({a} / {b})")),
+                }
             }
 
             Inst::IntEq => {
@@ -564,48 +664,77 @@ impl VM {
 
             // --- 6. Compound Structures (Heap Interaction) ---
             Inst::NewStruct(fields) => {
-                let mut elements = vec![0; fields];
-                for i in (0..fields).rev() {
-                    elements[i] = self.pop();
+                if self.check_alloc(fields, "NewStruct") {
+                    let mut elements = vec![0; fields];
+                    for i in (0..fields).rev() {
+                        elements[i] = self.pop();
+                    }
+                    self.heap.push(HeapObject::Struct(elements));
+                    self.push((self.heap.len() - 1) as u64);
                 }
-                self.heap.push(HeapObject::Struct(elements));
-                self.push((self.heap.len() - 1) as u64);
             }
 
             Inst::GetField(idx) => {
                 let struct_ref = self.pop() as usize;
-                if let HeapObject::Struct(fields) = &self.heap[struct_ref] {
-                    self.push(fields[idx]);
+                match self.heap.get(struct_ref) {
+                    Some(HeapObject::Struct(fields)) => match fields.get(idx) {
+                        Some(&v) => self.push(v),
+                        None => self.fault(format!("GetField: field index {idx} out of range")),
+                    },
+                    _ => self.fault(format!("GetField: heap ref {struct_ref} is not a struct")),
                 }
             }
 
             Inst::SetField(idx) => {
                 let struct_ref = self.pop() as usize;
                 let value = self.pop();
-                if let HeapObject::Struct(fields) = &mut self.heap[struct_ref] {
-                    fields[idx] = value;
+                match self.heap.get_mut(struct_ref) {
+                    Some(HeapObject::Struct(fields)) => match fields.get_mut(idx) {
+                        Some(slot) => {
+                            *slot = value;
+                            self.push(value);
+                        }
+                        None => self.fault(format!("SetField: field index {idx} out of range")),
+                    },
+                    _ => self.fault(format!("SetField: heap ref {struct_ref} is not a struct")),
                 }
-                self.push(value);
             }
 
             Inst::NewArray => {
                 let size = self.pop() as usize;
-                self.heap.push(HeapObject::Array(vec![0; size]));
-                self.push((self.heap.len() - 1) as u64);
+                // The size is operator-controlled (popped from the
+                // stack); bound it against the allocation budget
+                // so `size = usize::MAX` cannot OOM the worker.
+                if self.check_alloc(size, "NewArray") {
+                    self.heap.push(HeapObject::Array(vec![0; size]));
+                    self.push((self.heap.len() - 1) as u64);
+                }
             }
 
             Inst::ArrayLen => {
                 let arr_ref = self.pop() as usize;
-                if let HeapObject::Array(items) = &self.heap[arr_ref] {
-                    self.push(items.len() as u64);
+                match self.heap.get(arr_ref) {
+                    Some(HeapObject::Array(items)) => {
+                        let len = items.len() as u64;
+                        self.push(len);
+                    }
+                    _ => self.fault(format!("ArrayLen: heap ref {arr_ref} is not an array")),
                 }
             }
 
             Inst::GetElem => {
                 let idx = self.pop() as usize;
                 let arr_ref = self.pop() as usize;
-                if let HeapObject::Array(items) = &self.heap[arr_ref] {
-                    self.push(items[idx]);
+                match self.heap.get(arr_ref) {
+                    Some(HeapObject::Array(items)) => {
+                        let len = items.len();
+                        match items.get(idx).copied() {
+                            Some(v) => self.push(v),
+                            None => self
+                                .fault(format!("GetElem: index {idx} out of bounds (len {len})")),
+                        }
+                    }
+                    _ => self.fault(format!("GetElem: heap ref {arr_ref} is not an array")),
                 }
             }
 
@@ -613,31 +742,49 @@ impl VM {
                 let value = self.pop();
                 let idx = self.pop() as usize;
                 let arr_ref = self.pop() as usize;
-                if let HeapObject::Array(items) = &mut self.heap[arr_ref] {
-                    items[idx] = value;
+                let fault = match self.heap.get_mut(arr_ref) {
+                    Some(HeapObject::Array(items)) => {
+                        let len = items.len();
+                        match items.get_mut(idx) {
+                            Some(slot) => {
+                                *slot = value;
+                                None
+                            }
+                            None => Some(format!("SetElem: index {idx} out of bounds (len {len})")),
+                        }
+                    }
+                    _ => Some(format!("SetElem: heap ref {arr_ref} is not an array")),
+                };
+                match fault {
+                    None => self.push(value),
+                    Some(cause) => self.fault(cause),
                 }
-                self.push(value);
             }
 
             Inst::ConcatStr => {
                 let idx2 = self.pop() as usize;
                 let idx1 = self.pop() as usize;
-                if let (HeapObject::String(s1), HeapObject::String(s2)) =
-                    (&self.heap[idx1], &self.heap[idx2])
-                {
-                    let merged = format!("{}{}", s1, s2);
-                    self.heap.push(HeapObject::String(merged));
-                    self.push((self.heap.len() - 1) as u64);
+                match (self.heap.get(idx1), self.heap.get(idx2)) {
+                    (Some(HeapObject::String(s1)), Some(HeapObject::String(s2))) => {
+                        let merged = format!("{}{}", s1, s2);
+                        self.heap.push(HeapObject::String(merged));
+                        self.push((self.heap.len() - 1) as u64);
+                    }
+                    _ => self.fault(format!(
+                        "ConcatStr: heap refs {idx1}/{idx2} are not both strings"
+                    )),
                 }
             }
 
             Inst::EqStr => {
                 let idx2 = self.pop() as usize;
                 let idx1 = self.pop() as usize;
-                if let (HeapObject::String(s1), HeapObject::String(s2)) =
-                    (&self.heap[idx1], &self.heap[idx2])
-                {
-                    self.push(if s1 == s2 { 1 } else { 0 });
+                match (self.heap.get(idx1), self.heap.get(idx2)) {
+                    (Some(HeapObject::String(s1)), Some(HeapObject::String(s2))) => {
+                        let eq = if s1 == s2 { 1 } else { 0 };
+                        self.push(eq);
+                    }
+                    _ => self.fault(format!("EqStr: heap refs {idx1}/{idx2} are not both strings")),
                 }
             }
 
@@ -653,12 +800,24 @@ impl VM {
             }
 
             Inst::Call(target, arg_count) => {
-                self.call_stack.push(Frame {
-                    return_ptr: self.inst_ptr,
-                    old_fp: self.fp,
-                });
-                self.fp = self.stack.len() - arg_count;
-                self.inst_ptr = target;
+                // `stack.len() - arg_count` underflows (usize wrap
+                // → bogus fp → later panic) when malformed
+                // bytecode claims more arguments than are on the
+                // stack. Check it.
+                match self.stack.len().checked_sub(arg_count) {
+                    Some(new_fp) => {
+                        self.call_stack.push(Frame {
+                            return_ptr: self.inst_ptr,
+                            old_fp: self.fp,
+                        });
+                        self.fp = new_fp;
+                        self.inst_ptr = target;
+                    }
+                    None => self.fault(format!(
+                        "Call: arg_count {arg_count} exceeds stack depth {}",
+                        self.stack.len()
+                    )),
+                }
             }
 
             Inst::Ret => {
@@ -669,7 +828,11 @@ impl VM {
                     self.push(0);
                 } else {
                     self.done = true;
-                    return Some(self.pop());
+                    let v = self.pop();
+                    if let Some(cause) = self.fault.take() {
+                        return self.raise_malformed(cause);
+                    }
+                    return Some(v);
                 }
             }
 
@@ -682,6 +845,9 @@ impl VM {
                     self.push(return_value);
                 } else {
                     self.done = true;
+                    if let Some(cause) = self.fault.take() {
+                        return self.raise_malformed(cause);
+                    }
                     return Some(return_value);
                 }
             }
@@ -709,8 +875,9 @@ impl VM {
 
             Inst::PrintString => {
                 let idx = self.pop() as usize;
-                if let HeapObject::String(s) = &self.heap[idx] {
-                    println!("{}", s);
+                match self.heap.get(idx) {
+                    Some(HeapObject::String(s)) => println!("{}", s),
+                    _ => self.fault(format!("PrintString: heap ref {idx} is not a string")),
                 }
                 let _ = io::stdout().flush();
                 self.push(0);
@@ -948,18 +1115,23 @@ impl VM {
 
             // ---- F5 / F7: list & map opcodes ----
             Inst::PushList(n) => {
-                let mut elements: Vec<u64> = vec![0; n];
-                for slot in elements.iter_mut().rev() {
-                    *slot = self.pop();
+                if self.check_alloc(n, "PushList") {
+                    let mut elements: Vec<u64> = vec![0; n];
+                    for slot in elements.iter_mut().rev() {
+                        *slot = self.pop();
+                    }
+                    self.heap.push(HeapObject::List(elements));
+                    self.push((self.heap.len() - 1) as u64);
                 }
-                self.heap.push(HeapObject::List(elements));
-                self.push((self.heap.len() - 1) as u64);
             }
             Inst::PushMap(n) => {
                 // Stack layout: ..., key1, val1, key2, val2, ..., keyN, valN
                 // (alternating, with valN on top.) Pop into a
                 // temporary vec then reverse so insertion order
                 // matches source order.
+                if !self.check_alloc(n, "PushMap") {
+                    // Oversized operand — bail before reserving.
+                } else {
                 let mut pairs: Vec<(String, u64)> = Vec::with_capacity(n);
                 for _ in 0..n {
                     let value = self.pop();
@@ -973,6 +1145,7 @@ impl VM {
                 pairs.reverse();
                 self.heap.push(HeapObject::Map(pairs));
                 self.push((self.heap.len() - 1) as u64);
+                }
             }
             Inst::ListLen => {
                 let lst_ref = self.pop() as usize;
@@ -1289,6 +1462,14 @@ impl VM {
             }
         }
 
+        // Malformed-bytecode faults recorded by `pop()` or an
+        // opcode handler during this instruction halt the VM
+        // cleanly with a structured `last_error` rather than
+        // aborting the worker.
+        if let Some(cause) = self.fault.take() {
+            return self.raise_malformed(cause);
+        }
+
         None
     }
 
@@ -1466,5 +1647,128 @@ mod fuel_tests {
         // VM is done — further step() calls return None
         // without re-firing the fuel check.
         assert!(vm.step().is_none());
+    }
+}
+
+#[cfg(test)]
+mod malformed_bytecode_tests {
+    //! Malformed / hostile bytecode must fail the flow cleanly
+    //! (structured `last_error` + `VM_ERROR_SENTINEL`) rather
+    //! than panicking the `spawn_blocking` worker. Bytecode
+    //! reaching the VM is untrusted (it is compiled from
+    //! operator/agent-authored SOL or YAML), so the VM treats
+    //! every stack/heap/index/alloc invariant as attacker-
+    //! controlled.
+
+    use super::*;
+    use crate::sol::bytecode::Inst;
+    use crate::sol::parser::Ast;
+
+    /// CRITERION 1 — a hand-crafted malformed program (stack
+    /// underflow + a bad PushConst payload + an out-of-range
+    /// local load) returns a structured error, not a panic.
+    #[test]
+    fn malformed_bytecode_returns_structured_error_not_panic() {
+        // (a) Stack underflow: `Pop` with an empty stack.
+        let mut vm = VM::from(&[Inst::Pop]);
+        let exit = vm.run();
+        assert_eq!(
+            exit, VM_ERROR_SENTINEL,
+            "stack underflow must halt with the error sentinel"
+        );
+        let err = vm
+            .last_error()
+            .expect("stack underflow must set a structured last_error");
+        assert!(
+            err.cause.contains("malformed bytecode") && err.cause.contains("stack underflow"),
+            "unexpected cause: {}",
+            err.cause
+        );
+
+        // (b) Bad PushConst: a non-constant AST node is an
+        // invalid constant payload (only the compiler should
+        // ever emit constant nodes here).
+        let mut vm = VM::from(&[Inst::PushConst(Ast::ExprVar("x".to_string()))]);
+        let exit = vm.run();
+        assert_eq!(exit, VM_ERROR_SENTINEL);
+        assert!(
+            vm.last_error()
+                .map(|e| e.cause.contains("invalid constant AST node"))
+                .unwrap_or(false),
+            "bad PushConst payload must surface a structured cause"
+        );
+
+        // (c) Out-of-range local slot (a "bad index"): load a
+        // local far past the top of the stack.
+        let mut vm = VM::from(&[Inst::LoadLocal(9999)]);
+        let exit = vm.run();
+        assert_eq!(exit, VM_ERROR_SENTINEL);
+        assert!(
+            vm.last_error()
+                .map(|e| e.cause.contains("LoadLocal"))
+                .unwrap_or(false),
+            "out-of-range LoadLocal must surface a structured cause"
+        );
+    }
+
+    /// CRITERION 2 — `NewArray` with `size = usize::MAX` returns
+    /// a structured error instead of attempting a >16-exabyte
+    /// allocation that would OOM the worker.
+    #[test]
+    fn newarray_with_max_size_returns_error_not_oom() {
+        // PushConst(-1) → bits = (-1i128 as u64) = u64::MAX,
+        // which NewArray reads as `usize::MAX` on 64-bit.
+        let program = [
+            Inst::PushConst(Ast::ExprInteger(-1)),
+            Inst::NewArray,
+        ];
+        let mut vm = VM::from(&program);
+        let exit = vm.run();
+        assert_eq!(
+            exit, VM_ERROR_SENTINEL,
+            "an oversized NewArray must halt with the error sentinel"
+        );
+        let err = vm
+            .last_error()
+            .expect("oversized NewArray must set a structured last_error");
+        assert!(
+            err.cause.contains("NewArray") && err.cause.contains("allocation budget"),
+            "unexpected cause: {}",
+            err.cause
+        );
+    }
+
+    /// Divide-by-zero — reachable from a flow — must fault
+    /// cleanly rather than panicking the worker.
+    #[test]
+    fn int_div_by_zero_returns_error_not_panic() {
+        let program = [
+            Inst::PushConst(Ast::ExprInteger(7)),
+            Inst::PushConst(Ast::ExprInteger(0)),
+            Inst::IntDiv,
+        ];
+        let mut vm = VM::from(&program);
+        let exit = vm.run();
+        assert_eq!(exit, VM_ERROR_SENTINEL);
+        assert!(
+            vm.last_error()
+                .map(|e| e.cause.contains("IntDiv"))
+                .unwrap_or(false),
+            "division by zero must surface a structured cause"
+        );
+    }
+
+    /// A malformed `NewArray` mid-program must not corrupt the
+    /// VM into a panic on a later instruction either — the VM
+    /// halts immediately on the fault.
+    #[test]
+    fn fault_halts_immediately_and_is_not_catchable_as_success() {
+        // GetElem with an empty stack: underflow on both pops,
+        // then a heap lookup of ref 0 on an empty heap. Must
+        // fault, not panic.
+        let mut vm = VM::from(&[Inst::GetElem]);
+        let exit = vm.run();
+        assert_eq!(exit, VM_ERROR_SENTINEL);
+        assert!(vm.last_error().is_some());
     }
 }
