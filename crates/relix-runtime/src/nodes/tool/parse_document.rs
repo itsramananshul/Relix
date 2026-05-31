@@ -226,6 +226,18 @@ pub struct ParseRequest {
 /// Wire-shaped response. `tier_used` carries the name of whichever
 /// tier produced `text`; `source` echoes the request label so the
 /// caller doesn't have to track it.
+///
+/// SEC PART 1: `text` carries content pulled from an external
+/// document, URL, or OCR tier — i.e. attacker-controllable
+/// bytes. In-process consumers that feed this value into an
+/// LLM prompt MUST wrap it via
+/// `relix_core::types::UntrustedText::new(resp.text).wrap_for_prompt()`
+/// (or route it through `ai.perception_extract` for the full
+/// two-stage isolation) so the planning model treats it as
+/// inert data, not as instructions. The field is kept as
+/// `String` so wire consumers (the dashboard, the chronicle,
+/// storage) can read it unchanged; the boundary is enforced
+/// at prompt-construction time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParseResponse {
     pub text: String,

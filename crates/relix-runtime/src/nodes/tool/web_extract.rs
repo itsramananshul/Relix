@@ -191,6 +191,14 @@ impl Mode {
 
 /// Parsed HTML view. Public so other modules / tests can use the
 /// extractor directly.
+///
+/// SEC PART 1: every field carries text pulled from an
+/// attacker-controllable web page. In-process consumers that
+/// feed these values into an LLM prompt MUST wrap them via
+/// `relix_core::types::UntrustedText::new(value).wrap_for_prompt()`
+/// (or route through `ai.perception_extract` for two-stage
+/// isolation). The boundary is enforced at prompt-
+/// construction time.
 #[derive(Debug, Clone, Default)]
 pub struct Extracted {
     pub title: Option<String>,

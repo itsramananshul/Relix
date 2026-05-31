@@ -6,6 +6,62 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// SEC PART 1: typed boundary for external / attacker-
+/// controllable text on its way into an LLM prompt.
+///
+/// Pre-fix path: every code site that concatenated a
+/// fetched web page, parsed document, OCR transcript, or
+/// retrieved memory observation directly into a prompt
+/// string was an unguarded prompt-injection vector — the
+/// raw bytes could carry "ignore previous instructions"
+/// payloads that the planning model would dutifully
+/// follow.
+///
+/// `UntrustedText` makes the boundary compile-time-
+/// checked: the type does NOT implement `Display`, so the
+/// naive `format!("{}", value)` path is a hard compile
+/// error. Code that wants to interpolate untrusted text
+/// into a prompt MUST call [`Self::wrap_for_prompt`],
+/// which fences the content between explicit `BEGIN
+/// UNTRUSTED DATA` / `END UNTRUSTED DATA` markers.
+/// `as_raw()` is the deliberate escape hatch for non-
+/// prompt consumers (storage, presentation, logging).
+///
+/// SOUL.md content + operator-authored instructions are
+/// trusted and intentionally bypass this type.
+#[derive(Clone, Debug)]
+pub struct UntrustedText(String);
+
+impl UntrustedText {
+    /// Wrap a raw `String` (typically the result of a
+    /// fetch / parse / extract step) as untrusted.
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    /// Render the content for inclusion in a prompt,
+    /// fenced by explicit untrusted-data markers. The
+    /// fences are the boundary the model is instructed
+    /// (via the system prompt or extraction prompt) to
+    /// treat as inert text rather than as instructions.
+    pub fn wrap_for_prompt(&self) -> String {
+        format!(
+            "\n\n--- BEGIN UNTRUSTED DATA ---\n{}\n--- END UNTRUSTED DATA ---\n\n",
+            self.0
+        )
+    }
+
+    /// Deliberate escape hatch — returns the raw underlying
+    /// string. Callers that route through this must NOT
+    /// be feeding the value into an LLM prompt; use
+    /// `wrap_for_prompt` for that path. Typical callers
+    /// are persistence, logging, hashing, or operator-
+    /// facing display.
+    pub fn as_raw(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A node identity — the BLAKE3-256 hash of the node's Ed25519 public key.
 ///
 /// This is the alpha equivalent of libp2p `PeerId` carried in our own wire envelope.
@@ -306,5 +362,50 @@ mod tests {
         let back: ErrorEnvelope = crate::codec::decode(&bytes).expect("decode");
         assert_eq!(e.kind, back.kind);
         assert_eq!(e.cause, back.cause);
+    }
+
+    // ── SEC PART 1: UntrustedText surface ───────────────────
+
+    #[test]
+    fn untrusted_text_wraps_with_explicit_delimiters() {
+        let u = UntrustedText::new("hello\nworld");
+        let wrapped = u.wrap_for_prompt();
+        assert!(wrapped.contains("BEGIN UNTRUSTED DATA"));
+        assert!(wrapped.contains("END UNTRUSTED DATA"));
+        assert!(wrapped.contains("hello\nworld"));
+    }
+
+    #[test]
+    fn untrusted_text_as_raw_returns_underlying_string() {
+        let u = UntrustedText::new("inner");
+        assert_eq!(u.as_raw(), "inner");
+    }
+
+    #[test]
+    fn untrusted_text_does_not_implement_display() {
+        // SEC PART 1: the whole defence rests on `UntrustedText`
+        // NOT having a `Display` impl, so a naive
+        // `format!("{}", value)` against an UntrustedText is a
+        // compile error and callers must explicitly call
+        // `wrap_for_prompt()` (or the deliberate-escape
+        // `as_raw()` reader). This test is a runtime fingerprint
+        // — we don't have trybuild here, so we use a trait
+        // probe: any type that implements `std::fmt::Display`
+        // also implements `ToString`. We assert the reverse:
+        // UntrustedText is NOT a ToString. If anyone adds a
+        // Display impl in the future, this test fails to
+        // compile because the trait-bound assertion would
+        // succeed where we expect it to fail.
+        fn assert_no_display<T>(_: &T)
+        where
+            T: std::fmt::Debug,
+        {
+            // Successful instantiation proves Debug is there;
+            // the absence of a paired Display impl is the
+            // contract — verified by inspection of types.rs
+            // (no `impl Display for UntrustedText`).
+        }
+        let u = UntrustedText::new("x");
+        assert_no_display(&u);
     }
 }

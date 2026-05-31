@@ -96,6 +96,18 @@ pub struct ScreenRequest {
     pub region: Option<Region>,
 }
 
+/// Wire-shaped response from `tool.screen`.
+///
+/// SEC PART 1: `image_base64` carries pixel data captured
+/// from the host display — its contents can be controlled by
+/// whatever the user has on screen. The current handler does
+/// NOT run OCR (there is no in-tree OCR pipeline), but any
+/// downstream consumer that feeds these bytes (or OCR-derived
+/// text from them) into an LLM prompt MUST wrap that text via
+/// `relix_core::types::UntrustedText::new(text).wrap_for_prompt()`
+/// or route it through `ai.perception_extract` for the
+/// two-stage isolation primitive. The boundary is enforced at
+/// prompt-construction time, not at the wire layer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScreenResponse {
     pub image_base64: String,
