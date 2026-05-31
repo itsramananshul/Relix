@@ -212,9 +212,85 @@ impl TrainingStore {
         Ok(n > 0)
     }
 
+    /// CORR PART 5: record the intended export-file path for
+    /// a (`export_set`, `ids_hash`) pair BEFORE the file is
+    /// written. Idempotent — re-inserting the same key is a
+    /// no-op (ON CONFLICT DO NOTHING).
+    pub fn stage_export_path(
+        &self,
+        export_set: &str,
+        ids_hash: &str,
+        path: &str,
+    ) -> Result<(), TrainingStoreError> {
+        let conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS training_export_passes (\
+                 export_set TEXT NOT NULL, \
+                 ids_hash   TEXT NOT NULL, \
+                 file_path  TEXT NOT NULL, \
+                 staged_at  INTEGER NOT NULL, \
+                 PRIMARY KEY (export_set, ids_hash) \
+             )",
+            [],
+        )?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO training_export_passes \
+             (export_set, ids_hash, file_path, staged_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(export_set, ids_hash) DO NOTHING",
+            params![export_set, ids_hash, path, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// CORR PART 5: look up the staged export-file path for a
+    /// prior pass with the same (`export_set`, `ids_hash`).
+    /// Returns `None` when no prior staging row exists.
+    pub fn lookup_staged_export(
+        &self,
+        export_set: &str,
+        ids_hash: &str,
+    ) -> Result<Option<String>, TrainingStoreError> {
+        let conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
+        // Defensive: ensure the table exists. A fresh DB
+        // calls this before stage_export_path has ever run.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS training_export_passes (\
+                 export_set TEXT NOT NULL, \
+                 ids_hash   TEXT NOT NULL, \
+                 file_path  TEXT NOT NULL, \
+                 staged_at  INTEGER NOT NULL, \
+                 PRIMARY KEY (export_set, ids_hash) \
+             )",
+            [],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path FROM training_export_passes \
+             WHERE export_set = ?1 AND ids_hash = ?2",
+        )?;
+        let mut rows = stmt.query(params![export_set, ids_hash])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get::<_, String>(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Mark a batch of interactions as exported and stamp them
-    /// with the export set name. Idempotent — re-exporting an
-    /// already-exported row updates the set name.
+    /// with the export set name.
+    ///
+    /// CORR PART 5: the UPDATE now carries `WHERE exported = 0`
+    /// so an already-exported row stays mapped to its prior
+    /// export set rather than being silently re-claimed by a
+    /// later export pass. The returned `usize` counts ONLY
+    /// rows that transitioned from un-exported → exported
+    /// (rows that were already exported contribute zero), so
+    /// the exporter can distinguish "this row was claimed by
+    /// us" from "this row was already claimed before".
     pub fn mark_exported(
         &self,
         ids: &[InteractionId],
@@ -229,7 +305,7 @@ impl TrainingStore {
         {
             let mut stmt = tx.prepare(
                 "UPDATE training_interactions SET exported = 1, export_set = ?1 \
-                 WHERE interaction_id = ?2",
+                 WHERE interaction_id = ?2 AND exported = 0",
             )?;
             for id in ids {
                 n += stmt.execute(params![export_set, id.as_str()])?;
@@ -813,6 +889,43 @@ mod tests {
         let got = store.get("a").unwrap().unwrap();
         assert!(got.exported);
         assert_eq!(got.export_set.as_deref(), Some("set1"));
+    }
+
+    // ── CORR PART 5: mark_exported guard + staging ─────────
+
+    #[test]
+    fn corr_p5_mark_exported_does_not_overwrite_already_exported_row() {
+        let store = TrainingStore::in_memory().unwrap();
+        store.insert(&sample("a", "alice", 100, true)).unwrap();
+        let n1 = store
+            .mark_exported(&[InteractionId("a".into())], "set1")
+            .unwrap();
+        assert_eq!(n1, 1);
+        // Second pass with a different set name MUST NOT
+        // reclaim the row.
+        let n2 = store
+            .mark_exported(&[InteractionId("a".into())], "set2")
+            .unwrap();
+        assert_eq!(n2, 0, "second pass must not reclaim");
+        let got = store.get("a").unwrap().unwrap();
+        assert_eq!(
+            got.export_set.as_deref(),
+            Some("set1"),
+            "original set name preserved"
+        );
+    }
+
+    #[test]
+    fn corr_p5_stage_export_path_is_idempotent() {
+        let store = TrainingStore::in_memory().unwrap();
+        store
+            .stage_export_path("setA", "abc123", "/tmp/out.jsonl")
+            .unwrap();
+        store
+            .stage_export_path("setA", "abc123", "/tmp/another.jsonl")
+            .unwrap();
+        let path = store.lookup_staged_export("setA", "abc123").unwrap();
+        assert_eq!(path.as_deref(), Some("/tmp/out.jsonl"));
     }
 
     #[test]

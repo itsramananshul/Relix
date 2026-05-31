@@ -179,6 +179,27 @@ impl EventLog {
         self.file
             .sync_data()
             .map_err(|e| EventLogError::Io(e.to_string()))?;
+        // CORR PART 5: after the file contents are durable on
+        // disk, also fsync the parent directory inode so the
+        // newly-recorded entry survives a crash even when the
+        // directory metadata was not yet flushed. On Unix the
+        // canonical fix is `File::open(parent).sync_all()`. On
+        // Windows `std::fs` does not expose a directory-handle
+        // fsync (opening a directory as `File` requires
+        // `FILE_FLAG_BACKUP_SEMANTICS`, which is not in
+        // `OpenOptions`); NTFS journals directory entries so
+        // the file's own `sync_data` above is sufficient for
+        // durability on that platform. This is a real platform
+        // fact, not a design preference — see the PART 5
+        // notes in the PR description.
+        #[cfg(unix)]
+        {
+            if let Some(parent) = self.path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
 
         self.last_hash = codec::content_hash(&record_bytes);
         // SEC PART 6: checked increment. A flow that somehow

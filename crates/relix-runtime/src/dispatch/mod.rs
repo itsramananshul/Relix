@@ -2527,7 +2527,16 @@ impl DispatchBridge {
             started_at: started,
             tenant_id: req.tenant_id.clone(),
         };
-        let aid = req.rid.0.to_vec(); // alpha: use rid as audit id (cross-correlation key)
+        // CORR PART 5: server-generated audit id. Pre-fix path
+        // used `req.rid.0.to_vec()` — the caller-supplied
+        // RequestId — which let a hostile caller pin a
+        // collision against an existing entry or replay one
+        // they had observed. The audit id is now a fresh
+        // UUIDv4 minted server-side and is independent of
+        // `req.rid`. `req.rid` itself is still recorded on
+        // the AuditDraft as `request_id` for cross-correlation
+        // with the caller's trace; it is NOT the row's PK.
+        let aid = uuid::Uuid::new_v4().as_bytes().to_vec();
         // GAP 23C: when a partition mirror is wired, write a
         // queryable row BEFORE finalising the canonical signed
         // log. Mirror failures are logged but never block the

@@ -246,17 +246,63 @@ impl ExportEngine {
         let total_tokens: u64 = rows.iter().map(|r| r.token_count.unwrap_or(0) as u64).sum();
 
         let sanitized = sanitize_set(export_set);
-        let filename = format!(
-            "training_export_{sanitized}_{now_unix_ms}.{ext}",
-            ext = format.extension(),
-        );
+        let ids: Vec<InteractionId> = rows.iter().map(|r| r.interaction_id.clone()).collect();
+        // CORR PART 5: idempotent export — derive a hash over
+        // the exact id set so a re-run with the same ids
+        // resolves to the same staging key.
+        let mut hasher = blake3::Hasher::new();
+        for id in &ids {
+            hasher.update(id.as_str().as_bytes());
+            hasher.update(b"\n");
+        }
+        let ids_hash = hasher.finalize().to_hex();
         std::fs::create_dir_all(&self.output_dir).map_err(|e| ExportError::Io(e.to_string()))?;
-        let path = self.output_dir.join(&filename);
 
+        // CORR PART 5: order is recorded path FIRST, write
+        // file SECOND, mark exported THIRD. Pre-fix path
+        // (write → mark_exported) meant an interrupted run
+        // that crashed between write and mark would let the
+        // next run produce a second file. Now we look up the
+        // staged path; if a row exists AND the file is on
+        // disk, we skip the render entirely and just finish
+        // the mark step.
+        let path = if let Some(prior) = self.store.lookup_staged_export(export_set, &ids_hash)? {
+            let prior_path = std::path::PathBuf::from(prior);
+            if prior_path.exists() {
+                let exported_count = self.store.mark_exported(&ids, export_set)? as u64;
+                return Ok(ExportResult {
+                    matched_count,
+                    exported_count,
+                    output_path: Some(prior_path.to_string_lossy().into_owned()),
+                    total_tokens,
+                    format,
+                    export_set: export_set.to_string(),
+                    anonymized_at_export,
+                });
+            }
+            // Staging row exists but the file is gone — the
+            // operator probably deleted it. Re-mint a fresh
+            // filename and overwrite the staging row below.
+            self.output_dir.join(format!(
+                "training_export_{sanitized}_{now_unix_ms}_{}.{ext}",
+                &ids_hash.as_str()[..16],
+                ext = format.extension(),
+            ))
+        } else {
+            self.output_dir.join(format!(
+                "training_export_{sanitized}_{now_unix_ms}_{}.{ext}",
+                &ids_hash.as_str()[..16],
+                ext = format.extension(),
+            ))
+        };
+
+        // Step 1: record intended path.
+        self.store
+            .stage_export_path(export_set, &ids_hash, &path.to_string_lossy())?;
+        // Step 2: write file.
         let body = render(format, &rows, filters.include_tool_calls)?;
         std::fs::write(&path, &body).map_err(|e| ExportError::Io(e.to_string()))?;
-
-        let ids: Vec<InteractionId> = rows.iter().map(|r| r.interaction_id.clone()).collect();
+        // Step 3: mark exported.
         let exported_count = self.store.mark_exported(&ids, export_set)? as u64;
 
         Ok(ExportResult {
