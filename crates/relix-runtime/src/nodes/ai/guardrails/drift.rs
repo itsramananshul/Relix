@@ -282,7 +282,13 @@ impl DriftDetector {
         for (i, e) in events[start..].iter().enumerate() {
             let payload = e.payload.trim();
             let trimmed_payload = if payload.len() > 200 {
-                format!("{}…", &payload[..200])
+                // Snap 200 down to a char boundary so multi-byte
+                // payload text isn't sliced mid-codepoint (panics).
+                let mut cut = 200;
+                while cut > 0 && !payload.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}…", &payload[..cut])
             } else {
                 payload.to_string()
             };

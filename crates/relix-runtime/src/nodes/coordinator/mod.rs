@@ -7454,7 +7454,13 @@ fn run_auto_skill_for_task(
             // Truncate noisy payloads so the SKILL.md stays
             // human-readable.
             let trimmed = if e.payload.len() > 200 {
-                format!("{}…", &e.payload[..200])
+                // Snap 200 down to a char boundary so multi-byte
+                // payload text isn't sliced mid-codepoint (panics).
+                let mut cut = 200;
+                while cut > 0 && !e.payload.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}…", &e.payload[..cut])
             } else {
                 e.payload.clone()
             };

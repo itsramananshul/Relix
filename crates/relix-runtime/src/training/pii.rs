@@ -561,8 +561,16 @@ fn push_dob_hits(out: &mut Vec<PiiSpan>, text: &str, re: &Regex) {
     for m in re.find_iter(text) {
         let start = m.start();
         let end = m.end();
-        let win_lo = start.saturating_sub(32);
-        let win_hi = (end + 32).min(text.len());
+        let mut win_lo = start.saturating_sub(32);
+        let mut win_hi = (end + 32).min(text.len());
+        // The ±32 byte offsets can land inside a multi-byte codepoint;
+        // snap lo down and hi up to the nearest char boundaries.
+        while win_lo > 0 && !lowered.is_char_boundary(win_lo) {
+            win_lo -= 1;
+        }
+        while win_hi < lowered.len() && !lowered.is_char_boundary(win_hi) {
+            win_hi += 1;
+        }
         let window = &lowered[win_lo..win_hi];
         let has_context = window.contains("born")
             || window.contains("dob")

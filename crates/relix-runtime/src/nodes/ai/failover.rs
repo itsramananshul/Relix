@@ -215,7 +215,12 @@ pub fn classify_transport_failure(_err_str: &str) -> FailoverReason {
 /// for error-shape detection without quadratic-cost scans on huge
 /// bodies.
 fn body_lower_excerpt(body: &str) -> String {
-    let cap = 4096.min(body.len());
+    let mut cap = 4096.min(body.len());
+    // Snap the cap down to a char boundary: response bodies are
+    // network input and 4096 can land inside a multi-byte codepoint.
+    while cap > 0 && !body.is_char_boundary(cap) {
+        cap -= 1;
+    }
     body[..cap].to_ascii_lowercase()
 }
 

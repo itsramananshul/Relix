@@ -984,7 +984,17 @@ fn handle_search(jail: &FsJail, ctx: &InvocationCtx) -> HandlerOutcome {
                     }
                     if line.contains(pattern) {
                         let rel = jail.display_rel(&p);
-                        let trimmed_line = if line.len() > 240 { &line[..240] } else { line };
+                        let trimmed_line = if line.len() > 240 {
+                            // Snap 240 down to a char boundary so a
+                            // multi-byte codepoint isn't split (panics).
+                            let mut cut = 240;
+                            while cut > 0 && !line.is_char_boundary(cut) {
+                                cut -= 1;
+                            }
+                            &line[..cut]
+                        } else {
+                            line
+                        };
                         hits.push(format!("{}:{}:{}", rel, i + 1, trimmed_line));
                     }
                 }

@@ -282,7 +282,13 @@ pub(crate) fn chunk_text(body: &str, chunk_size_chars: usize) -> Vec<String> {
             current.push_str(p);
         } else {
             chunks.extend(split_oversize(&current, target));
-            let overlap_from = current.len().saturating_sub(PARAGRAPH_OVERLAP_CHARS);
+            // Snap the byte offset down to a char boundary: a raw
+            // `len - overlap` offset can land inside a multi-byte UTF-8
+            // codepoint and panic when sliced on multilingual input.
+            let mut overlap_from = current.len().saturating_sub(PARAGRAPH_OVERLAP_CHARS);
+            while overlap_from < current.len() && !current.is_char_boundary(overlap_from) {
+                overlap_from += 1;
+            }
             current = format!("{}\n\n{}", &current[overlap_from..], p);
         }
     }
@@ -322,4 +328,44 @@ fn chunk_id(subject_id: &str, source: &str, idx: usize, body: &str) -> String {
     h.update(body.as_bytes());
     let hex = h.finalize().to_hex();
     format!("sem-{}", &hex.as_str()[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a >5 KB document of multi-byte text (Chinese +
+    /// emoji, paragraphs separated by `\n\n`) must chunk without
+    /// panicking. Before the boundary-safe fix, the
+    /// `&current[overlap_from..]` slice in `chunk_text` panicked
+    /// when `len - PARAGRAPH_OVERLAP_CHARS` landed inside a
+    /// multi-byte UTF-8 codepoint.
+    #[test]
+    fn chunk_text_handles_multibyte_document_without_panic() {
+        let paragraph = "这是一段包含中文和表情符号的测试文本😀🚀🌟，\
+                         用来验证分块器在多字节输入上的字节边界处理是否正确。\
+                         每个段落都足够长，以反复触发重叠拼接路径，\
+                         从而暴露原先在 UTF-8 码点中间切片导致的崩溃缺陷。✨🔥💡🌈🎯";
+        let mut doc = String::new();
+        for _ in 0..40 {
+            doc.push_str(paragraph);
+            doc.push_str("\n\n");
+        }
+        assert!(
+            doc.len() > 5 * 1024,
+            "document must exceed 5KB, got {} bytes",
+            doc.len()
+        );
+
+        // The actual assertion is "does not panic". A small chunk
+        // size forces the overlap-stitch path repeatedly.
+        let chunks = chunk_text(&doc, 256);
+
+        assert!(!chunks.is_empty());
+        // Every emitted chunk is valid UTF-8 (a `String` always is)
+        // and non-empty.
+        for c in &chunks {
+            assert!(!c.is_empty());
+        }
+    }
 }
