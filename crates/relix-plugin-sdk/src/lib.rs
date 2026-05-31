@@ -354,7 +354,17 @@ async fn handle_invoke(
                 ok: true,
                 body: &body,
             })
-            .unwrap(),
+            .unwrap_or_else(|e| {
+                // The static struct shape always serialises; if
+                // this ever fires (e.g. a future field carries
+                // non-UTF-8 bytes), fall back to a hand-built
+                // error so we never panic out of an HTTP handler.
+                serde_json::json!({
+                    "ok": false,
+                    "error_kind": error_kind::RESPONDER_INTERNAL,
+                    "error_cause": format!("response serialise failed: {e}"),
+                })
+            }),
         ),
         Err(e) => Json(
             serde_json::to_value(InvokeErrBody {
@@ -362,7 +372,13 @@ async fn handle_invoke(
                 error_kind: e.kind(),
                 error_cause: &format!("{method}: {e}"),
             })
-            .unwrap(),
+            .unwrap_or_else(|se| {
+                serde_json::json!({
+                    "ok": false,
+                    "error_kind": error_kind::RESPONDER_INTERNAL,
+                    "error_cause": format!("{method}: {e} (serialise failed: {se})"),
+                })
+            }),
         ),
     }
 }

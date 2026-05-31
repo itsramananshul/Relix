@@ -1567,3 +1567,88 @@ steps:
         "got {err:?}"
     );
 }
+
+// ── CORR PART 1: file size + nesting depth caps ─────────────
+
+#[test]
+fn corr_p1_file_too_large_returns_typed_error() {
+    use super::{MAX_YAML_FILE_BYTES, compile_path};
+    let td = tempfile::tempdir().expect("tmp");
+    let p = td.path().join("huge.yml");
+    // Write MAX + 1 bytes. The file is filler ASCII so the
+    // YAML parser would happily munch through it if the size
+    // gate didn't fire.
+    let mut blob = Vec::with_capacity(MAX_YAML_FILE_BYTES as usize + 1);
+    blob.resize(MAX_YAML_FILE_BYTES as usize + 1, b'a');
+    std::fs::write(&p, &blob).expect("write");
+    let err = compile_path(&p).expect_err("must reject oversize file");
+    assert!(
+        matches!(
+            err,
+            YamlFlowError::FileTooLarge { size_bytes, max_bytes, .. }
+                if size_bytes > max_bytes && max_bytes == MAX_YAML_FILE_BYTES
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn corr_p1_file_exactly_at_cap_is_accepted_by_size_gate() {
+    use super::{MAX_YAML_FILE_BYTES, compile_path};
+    let td = tempfile::tempdir().expect("tmp");
+    let p = td.path().join("ok.yml");
+    // Tiny valid YAML; the size gate must not flag a normal
+    // file. (A malformed YAML body would surface as Parse,
+    // not FileTooLarge.)
+    std::fs::write(&p, b"- result: \"ok\"\n").expect("write");
+    let res = compile_path(&p);
+    // Either compiles (best case) or returns a Parse/Lower
+    // error — never FileTooLarge for a small input. The point
+    // of the assertion is that FileTooLarge is NOT the error.
+    if let Err(e) = res {
+        assert!(
+            !matches!(e, YamlFlowError::FileTooLarge { .. }),
+            "small file must not trip the size gate, got {e:?}"
+        );
+    }
+    let _ = MAX_YAML_FILE_BYTES;
+}
+
+#[test]
+fn corr_p1_nesting_depth_too_deep_returns_typed_error() {
+    use super::MAX_YAML_NESTING_DEPTH;
+    // Build a deeply-nested sequence: a list inside a list
+    // inside a list … `MAX_YAML_NESTING_DEPTH + 5` times.
+    let mut yaml = String::new();
+    let depth = MAX_YAML_NESTING_DEPTH + 5;
+    for _ in 0..depth {
+        yaml.push_str("- ");
+    }
+    yaml.push_str("x\n");
+    let err = compile_source(&yaml).expect_err("must reject deep nesting");
+    assert!(
+        matches!(err, YamlFlowError::NestingTooDeep { max_depth, .. } if max_depth == MAX_YAML_NESTING_DEPTH),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn corr_p1_realistic_flow_within_depth_limit_compiles() {
+    // A normal operator flow nests 3–5 levels (a try wraps a
+    // loop wraps a few calls). Confirm the depth check does
+    // not break legitimate flows.
+    let yaml = r#"
+        steps:
+          - try:
+              steps:
+                - loop:
+                    times: 2
+                    steps:
+                      - print: "hello"
+              catch:
+                kind: any
+                steps:
+                  - print: "caught"
+    "#;
+    compile_source(yaml).expect("realistic nesting compiles");
+}

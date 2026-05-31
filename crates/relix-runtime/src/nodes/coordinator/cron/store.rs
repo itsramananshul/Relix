@@ -313,7 +313,10 @@ impl CronStore {
     /// the past to make a job due immediately).
     #[cfg(test)]
     pub(crate) fn conn_for_tests(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("poisoned")
+        self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
 
     /// Stamp the last_status column after a fire completes.

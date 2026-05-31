@@ -368,12 +368,24 @@ pub async fn bootstrap_token(State(state): State<AppState>, req: Request) -> Res
         token: state.bridge_token.value(),
     })
     .unwrap_or_else(|_| "{}".to_string());
-    Response::builder()
+    match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
         .body(Body::from(body))
-        .expect("bootstrap response builds")
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "auth: bootstrap response builder failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrBody {
+                    error: "bootstrap_response_failed",
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

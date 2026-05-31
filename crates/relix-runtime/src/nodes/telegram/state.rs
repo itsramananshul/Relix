@@ -62,19 +62,34 @@ impl ChannelState {
     }
 
     pub fn online(&self) -> bool {
-        *self.online.lock().expect("poisoned")
+        *self.online.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
 
     pub fn identity(&self) -> BotIdentity {
-        self.identity.lock().expect("poisoned").clone()
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn messages_seen(&self) -> u64 {
-        *self.messages_seen.lock().expect("poisoned")
+        *self.messages_seen.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
 
     pub fn last_message_at(&self) -> Option<i64> {
-        *self.last_message_at.lock().expect("poisoned")
+        *self.last_message_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
 
     /// FIX 49: read access to the health tracker — used by
@@ -87,8 +102,14 @@ impl ChannelState {
     /// the `online` flag. Idempotent — restart loops can
     /// call this without resetting state.
     pub fn mark_online(&self, id: BotIdentity) {
-        *self.identity.lock().expect("poisoned") = id;
-        *self.online.lock().expect("poisoned") = true;
+        *self.identity.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = id;
+        *self.online.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = true;
         // FIX 49: a successful `get_me` enables the channel.
         self.health.mark_enabled();
     }
@@ -96,8 +117,14 @@ impl ChannelState {
     /// Record a new inbound message: bumps the counter and
     /// stamps the timestamp.
     pub fn record_inbound(&self, ts: i64) {
-        *self.messages_seen.lock().expect("poisoned") += 1;
-        *self.last_message_at.lock().expect("poisoned") = Some(ts);
+        *self.messages_seen.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) += 1;
+        *self.last_message_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = Some(ts);
         // FIX 49: stamp the event-received timestamp on
         // every inbound. Both poll-success and
         // event-received fire on inbound traffic — the
@@ -119,12 +146,21 @@ pub struct NotifierState {
 
 impl NotifierState {
     pub fn mark_notified(&self, task_id: &str) -> bool {
-        let mut g = self.seen.lock().expect("poisoned");
+        let mut g = self.seen.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.insert(task_id.to_string())
     }
 
     pub fn count(&self) -> usize {
-        self.seen.lock().expect("poisoned").len()
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .len()
     }
 }
 

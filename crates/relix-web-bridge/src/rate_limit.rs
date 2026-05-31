@@ -194,7 +194,10 @@ impl RateLimits {
             // Refuse outright so a misconfiguration is loud.
             return Err(Duration::from_secs(60));
         }
-        let mut guard = map.lock().expect("rate-limit map lock");
+        let mut guard = map.lock().unwrap_or_else(|e| {
+            tracing::warn!("rate-limit map lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         let entry = guard
             .entry(principal.to_string())
             .or_insert_with(|| TokenBucket::new(cap));
@@ -208,7 +211,10 @@ impl RateLimits {
     /// holds the guard for the lifetime of the upgrade.
     pub fn ws_acquire(&self, principal: &str) -> Result<WsGuard, u32> {
         let limit = self.inner.cfg.ws_max_concurrent;
-        let mut guard = self.inner.ws_inflight.lock().expect("ws map lock");
+        let mut guard = self.inner.ws_inflight.lock().unwrap_or_else(|e| {
+            tracing::warn!("ws map lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         let count = guard.entry(principal.to_string()).or_insert(0);
         if *count >= limit {
             return Err(limit);
@@ -231,12 +237,10 @@ pub struct WsGuard {
 
 impl Drop for WsGuard {
     fn drop(&mut self) {
-        let mut guard = self
-            .state
-            .inner
-            .ws_inflight
-            .lock()
-            .expect("ws map lock on drop");
+        let mut guard = self.state.inner.ws_inflight.lock().unwrap_or_else(|e| {
+            tracing::warn!("ws map lock poisoned during WsGuard drop; recovering inner state");
+            e.into_inner()
+        });
         if let Some(count) = guard.get_mut(&self.principal) {
             if *count > 0 {
                 *count -= 1;
@@ -626,6 +630,27 @@ mod tests {
         drop(g1);
         let _g3 = state.ws_acquire("principal-x").expect("third after drop");
         drop(g2);
+    }
+
+    // ── CORR PART 1: lock poison recovery ─────────────────
+
+    #[test]
+    fn corr_p1_poisoned_lock_recovered_and_takes_token() {
+        // Poison the inner Mutex by panicking inside a
+        // lock guard, then assert the next `try_acquire_http`
+        // call recovers via `unwrap_or_else(e.into_inner())`
+        // instead of panicking.
+        let state = RateLimits::new(cfg_strict());
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = state_clone.inner.ai_buckets.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        // Pre-fix path panicked here ("rate-limit map lock");
+        // post-fix path recovers + serves the token.
+        let res = state.try_acquire_http(RouteClass::Ai, "anyone");
+        assert!(res.is_ok(), "poisoned-lock recovery must serve a token");
     }
 
     #[test]

@@ -135,7 +135,10 @@ impl PolicyDenialRing {
     }
 
     pub fn push(&self, e: PolicyDenialEntry) {
-        let mut g = self.entries.lock().expect("policy denial ring poisoned");
+        let mut g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("policy denial ring poisoned; recovering inner state");
+            e.into_inner()
+        });
         if g.len() == self.capacity {
             g.pop_front();
         }
@@ -144,14 +147,20 @@ impl PolicyDenialRing {
 
     /// Snapshot the most recent `max` entries, newest first.
     pub fn snapshot_newest_first(&self, max: usize) -> Vec<PolicyDenialEntry> {
-        let g = self.entries.lock().expect("policy denial ring poisoned");
+        let g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("policy denial ring poisoned; recovering inner state");
+            e.into_inner()
+        });
         g.iter().rev().take(max).cloned().collect()
     }
 
     pub fn len(&self) -> usize {
         self.entries
             .lock()
-            .expect("policy denial ring poisoned")
+            .unwrap_or_else(|e| {
+                tracing::warn!("policy denial ring poisoned; recovering inner state");
+                e.into_inner()
+            })
             .len()
     }
 
@@ -383,9 +392,7 @@ pub type CapabilityDescribeFn =
 /// invocation regardless of how many capabilities the node has
 /// registered, replacing the pre-fix path where each lookup had
 /// to scan the manifest's capability vector under a lock.
-pub fn describe_fn_from_cache(
-    cache: crate::manifest::DescriptorCache,
-) -> CapabilityDescribeFn {
+pub fn describe_fn_from_cache(cache: crate::manifest::DescriptorCache) -> CapabilityDescribeFn {
     Arc::new(move |method: &str| cache.get(method).map(|entry| entry.value().clone()))
 }
 

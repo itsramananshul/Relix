@@ -140,7 +140,10 @@ impl FsAuditRing {
     }
 
     pub fn push(&self, entry: FsAuditEntry) {
-        let mut g = self.entries.lock().expect("fs audit ring poisoned");
+        let mut g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("'fs audit ring poisoned'; recovering inner state");
+            e.into_inner()
+        });
         if g.len() == self.capacity {
             g.pop_front();
         }
@@ -148,7 +151,10 @@ impl FsAuditRing {
     }
 
     pub fn snapshot_newest_first(&self, max: usize) -> Vec<FsAuditEntry> {
-        let g = self.entries.lock().expect("fs audit ring poisoned");
+        let g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("'fs audit ring poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.iter().rev().take(max).cloned().collect()
     }
 }

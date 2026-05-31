@@ -31,7 +31,10 @@ impl MessageRing {
     }
 
     pub fn record(&self, entry: RecordedInbound) {
-        let mut g = self.inner.lock().expect("poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        });
         if g.len() >= self.capacity {
             g.remove(0);
         }
@@ -39,11 +42,23 @@ impl MessageRing {
     }
 
     pub fn snapshot(&self) -> Vec<RecordedInbound> {
-        self.inner.lock().expect("poisoned").clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("poisoned").len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {

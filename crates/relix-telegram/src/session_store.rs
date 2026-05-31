@@ -114,22 +114,37 @@ impl InMemorySessionStore {
 
 impl SessionStorage for InMemorySessionStore {
     fn record(&self, chat_id: i64, message_id: i64, task_id: String) {
-        let mut g = self.inner.write().expect("poisoned");
+        let mut g = self.inner.write().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         g.insert((chat_id, message_id), task_id);
     }
 
     fn lookup(&self, chat_id: i64, message_id: i64) -> Option<String> {
-        let g = self.inner.read().expect("poisoned");
+        let g = self.inner.read().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         g.get(&(chat_id, message_id)).cloned()
     }
 
     fn forget(&self, chat_id: i64, message_id: i64) -> Option<String> {
-        let mut g = self.inner.write().expect("poisoned");
+        let mut g = self.inner.write().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         g.remove(&(chat_id, message_id))
     }
 
     fn len(&self) -> usize {
-        self.inner.read().expect("poisoned").len()
+        self.inner
+            .read()
+            .unwrap_or_else(|e| {
+                tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+                e.into_inner()
+            })
+            .len()
     }
 }
 
@@ -253,7 +268,10 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, r
 impl SessionStorage for SqliteSessionStore {
     fn record(&self, chat_id: i64, message_id: i64, task_id: String) {
         let now_ms = self.clock.now_ms();
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         // ON CONFLICT REPLACE so reprocessed Telegram updates
         // (rare but possible during restart races) merge.
         // FIX 6: bump `last_seen_ms` on every write so an active
@@ -271,7 +289,10 @@ impl SessionStorage for SqliteSessionStore {
 
     fn lookup(&self, chat_id: i64, message_id: i64) -> Option<String> {
         let now_ms = self.clock.now_ms();
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         let task_id: Option<String> = conn
             .query_row(
                 "SELECT task_id FROM telegram_sessions
@@ -296,7 +317,10 @@ impl SessionStorage for SqliteSessionStore {
     }
 
     fn forget(&self, chat_id: i64, message_id: i64) -> Option<String> {
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         // Read-then-delete in one transaction so concurrent
         // lookups don't see a half-deleted row.
         let tx = conn.unchecked_transaction().ok()?;
@@ -320,7 +344,10 @@ impl SessionStorage for SqliteSessionStore {
     }
 
     fn len(&self) -> usize {
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         conn.query_row("SELECT COUNT(*) FROM telegram_sessions", [], |r| {
             r.get::<_, i64>(0)
         })
@@ -329,7 +356,10 @@ impl SessionStorage for SqliteSessionStore {
     }
 
     fn sweep_older_than(&self, cutoff_ms: i64) -> usize {
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("telegram session_store lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         conn.execute(
             "DELETE FROM telegram_sessions WHERE last_seen_ms < ?1",
             params![cutoff_ms],

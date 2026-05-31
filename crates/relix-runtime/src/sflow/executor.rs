@@ -112,13 +112,17 @@ pub struct VecChronicle {
     inner: std::sync::Mutex<Vec<(String, String)>>,
 }
 impl VecChronicle {
+    fn lock_poison_safe(&self) -> std::sync::MutexGuard<'_, Vec<(String, String)>> {
+        self.inner.lock().unwrap_or_else(|e| {
+            tracing::warn!("VecChronicle mutex poisoned; recovering inner state");
+            e.into_inner()
+        })
+    }
     pub fn entries(&self) -> Vec<(String, String)> {
-        self.inner.lock().unwrap().clone()
+        self.lock_poison_safe().clone()
     }
     pub fn kinds(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_poison_safe()
             .iter()
             .map(|(k, _)| k.clone())
             .collect()
@@ -126,9 +130,7 @@ impl VecChronicle {
 }
 impl ChronicleSink for VecChronicle {
     fn write(&self, kind: &str, payload: &str) {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_poison_safe()
             .push((kind.to_string(), payload.to_string()));
     }
 }

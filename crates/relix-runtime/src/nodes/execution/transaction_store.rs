@@ -153,7 +153,10 @@ impl TransactionStore {
         tool: &str,
         idempotency_key: &str,
     ) -> Result<Option<GatewayActionRow>, TransactionStoreError> {
-        let conn = self.conn.lock().expect("transaction store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'transaction store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let row = conn
             .query_row(
                 "SELECT action_id, transaction_id, tool, args, result, tier_tag, tier_json, \
@@ -179,7 +182,10 @@ impl TransactionStore {
     /// the caller via [`Self::find_by_idempotency_key`].
     pub fn record(&self, row: &GatewayActionRow) -> Result<(), TransactionStoreError> {
         let tier_json = serde_json::to_string(&row.tier)?;
-        let conn = self.conn.lock().expect("transaction store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'transaction store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         conn.execute(
             "INSERT INTO gateway_actions \
              (action_id, transaction_id, tool, args, result, tier_tag, tier_json, \
@@ -212,7 +218,10 @@ impl TransactionStore {
         &self,
         transaction_id: &str,
     ) -> Result<Vec<GatewayActionRow>, TransactionStoreError> {
-        let conn = self.conn.lock().expect("transaction store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'transaction store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let mut stmt = conn.prepare(
             "SELECT action_id, transaction_id, tool, args, result, tier_tag, tier_json, \
                     idempotency_key, dry_run, success, error, actor, rolled_back, \
@@ -232,7 +241,10 @@ impl TransactionStore {
     /// rollback handler after a Tier A compensating call
     /// succeeds.
     pub fn mark_rolled_back(&self, action_id: &str) -> Result<(), TransactionStoreError> {
-        let conn = self.conn.lock().expect("transaction store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'transaction store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let n = conn.execute(
             "UPDATE gateway_actions SET rolled_back = 1 WHERE action_id = ?1",
             params![action_id],
@@ -246,7 +258,10 @@ impl TransactionStore {
     /// Direct lookup by action_id. Used by the evidence store
     /// to attach evidence rows back to the action.
     pub fn get(&self, action_id: &str) -> Result<Option<GatewayActionRow>, TransactionStoreError> {
-        let conn = self.conn.lock().expect("transaction store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'transaction store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let row = conn
             .query_row(
                 "SELECT action_id, transaction_id, tool, args, result, tier_tag, tier_json, \

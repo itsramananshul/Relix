@@ -761,7 +761,10 @@ impl SecretsHandle {
     where
         F: FnOnce(&BridgeSecrets) -> T,
     {
-        let g = self.inner.read().expect("secrets read lock");
+        let g = self.inner.read().unwrap_or_else(|e| {
+            tracing::warn!("secrets read lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         f(&g)
     }
 
@@ -773,7 +776,10 @@ impl SecretsHandle {
     where
         F: FnOnce(&mut BridgeSecrets) -> T,
     {
-        let mut g = self.inner.write().expect("secrets write lock");
+        let mut g = self.inner.write().unwrap_or_else(|e| {
+            tracing::warn!("secrets write lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         let out = f(&mut g);
         g.save(&self.path)?;
         Ok(out)

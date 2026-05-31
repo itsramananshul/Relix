@@ -230,10 +230,10 @@ fn spawn_pty(
     let caller_subject_id = ctx.caller.subject_id.to_string();
 
     {
-        let mut g = backend
-            .sessions
-            .lock()
-            .expect("tool.terminal sessions poisoned");
+        let mut g = backend.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal sessions poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.insert(
             session_id.clone(),
             TerminalSessionRecord {
@@ -261,10 +261,10 @@ fn spawn_pty(
             retry_after: None,
         })?;
         let arc: SharedPtyWriter = Arc::new(Mutex::new(Some(w)));
-        let mut g = backend
-            .pty_shell_writers
-            .lock()
-            .expect("tool.terminal pty_shell_writers poisoned");
+        let mut g = backend.pty_shell_writers.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal pty_shell_writers poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.insert(session_id.clone(), arc.clone());
         Some(arc)
     } else {
@@ -439,7 +439,10 @@ async fn drive_to_completion(
     // First make sure shell-mode writers (which were take_writer'd
     // off the master) are released too.
     if let Some(w) = s.writer_handle.take() {
-        let mut g = w.lock().expect("pty writer poisoned");
+        let mut g = w.lock().unwrap_or_else(|e| {
+            tracing::warn!("'pty writer poisoned'; recovering inner state");
+            e.into_inner()
+        });
         *g = None;
     }
     // Force-drop master half. Re-bind to a unit so the explicit
@@ -449,22 +452,28 @@ async fn drive_to_completion(
     let _ = s.read_join.await;
 
     {
-        let mut g = backend
-            .sessions
-            .lock()
-            .expect("tool.terminal sessions poisoned");
+        let mut g = backend.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal sessions poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.remove(&s.session_id);
     }
     {
-        let mut g = backend
-            .pty_shell_writers
-            .lock()
-            .expect("tool.terminal pty_shell_writers poisoned");
+        let mut g = backend.pty_shell_writers.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal pty_shell_writers poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.remove(&s.session_id);
     }
 
-    let stdout_bytes = std::mem::take(&mut *s.stdout_buf.lock().expect("stdout buf poisoned"));
-    let stderr_bytes = std::mem::take(&mut *s.stderr_buf.lock().expect("stderr buf poisoned"));
+    let stdout_bytes = std::mem::take(&mut *s.stdout_buf.lock().unwrap_or_else(|e| {
+        tracing::warn!("'stdout buf poisoned'; recovering inner state");
+        e.into_inner()
+    }));
+    let stderr_bytes = std::mem::take(&mut *s.stderr_buf.lock().unwrap_or_else(|e| {
+        tracing::warn!("'stderr buf poisoned'; recovering inner state");
+        e.into_inner()
+    }));
     let (stdout, truncated_stdout) = truncate_output(stdout_bytes);
     let (stderr, truncated_stderr) = truncate_output(stderr_bytes);
 

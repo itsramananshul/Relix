@@ -58,70 +58,157 @@ pub struct EmailChannelState {
 
 impl EmailChannelState {
     pub fn identity(&self) -> EmailIdentity {
-        self.identity.lock().expect("poisoned").clone()
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .clone()
     }
     pub fn set_identity(&self, id: EmailIdentity) {
-        *self.identity.lock().expect("poisoned") = id;
+        *self.identity.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = id;
     }
     pub fn smtp_status(&self) -> LinkStatus {
-        *self.smtp_status.lock().expect("poisoned")
+        *self.smtp_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
     pub fn imap_status(&self) -> LinkStatus {
-        *self.imap_status.lock().expect("poisoned")
+        *self.imap_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
     pub fn smtp_last_error(&self) -> Option<String> {
-        self.smtp_last_error.lock().expect("poisoned").clone()
+        self.smtp_last_error
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .clone()
     }
     pub fn imap_last_error(&self) -> Option<String> {
-        self.imap_last_error.lock().expect("poisoned").clone()
+        self.imap_last_error
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .clone()
     }
     pub fn last_send_at(&self) -> Option<i64> {
-        *self.last_send_at.lock().expect("poisoned")
+        *self.last_send_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
     pub fn last_poll_at(&self) -> Option<i64> {
-        *self.last_poll_at.lock().expect("poisoned")
+        *self.last_poll_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
     pub fn messages_seen(&self) -> u64 {
-        *self.messages_seen.lock().expect("poisoned")
+        *self.messages_seen.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
     pub fn messages_sent(&self) -> u64 {
-        *self.messages_sent.lock().expect("poisoned")
+        *self.messages_sent.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
     pub fn last_message_at(&self) -> Option<i64> {
-        *self.last_message_at.lock().expect("poisoned")
+        *self.last_message_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
     pub fn mark_smtp_connected(&self) {
-        *self.smtp_status.lock().expect("poisoned") = LinkStatus::Connected;
-        *self.smtp_last_error.lock().expect("poisoned") = None;
+        *self.smtp_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = LinkStatus::Connected;
+        *self.smtp_last_error.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = None;
     }
     pub fn mark_smtp_error(&self, error: &str) {
-        *self.smtp_status.lock().expect("poisoned") = LinkStatus::Error;
-        *self.smtp_last_error.lock().expect("poisoned") = Some(error.to_string());
+        *self.smtp_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = LinkStatus::Error;
+        *self.smtp_last_error.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = Some(error.to_string());
     }
     pub fn mark_smtp_disconnected(&self) {
-        *self.smtp_status.lock().expect("poisoned") = LinkStatus::Disconnected;
+        *self.smtp_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = LinkStatus::Disconnected;
     }
     pub fn mark_imap_connected(&self) {
-        *self.imap_status.lock().expect("poisoned") = LinkStatus::Connected;
-        *self.imap_last_error.lock().expect("poisoned") = None;
+        *self.imap_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = LinkStatus::Connected;
+        *self.imap_last_error.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = None;
     }
     pub fn mark_imap_error(&self, error: &str) {
-        *self.imap_status.lock().expect("poisoned") = LinkStatus::Error;
-        *self.imap_last_error.lock().expect("poisoned") = Some(error.to_string());
+        *self.imap_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = LinkStatus::Error;
+        *self.imap_last_error.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = Some(error.to_string());
     }
     pub fn mark_imap_disconnected(&self) {
-        *self.imap_status.lock().expect("poisoned") = LinkStatus::Disconnected;
+        *self.imap_status.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = LinkStatus::Disconnected;
     }
     pub fn record_send(&self, ts: i64) {
-        *self.last_send_at.lock().expect("poisoned") = Some(ts);
-        *self.messages_sent.lock().expect("poisoned") += 1;
+        *self.last_send_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = Some(ts);
+        *self.messages_sent.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) += 1;
     }
     pub fn record_poll(&self, ts: i64) {
-        *self.last_poll_at.lock().expect("poisoned") = Some(ts);
+        *self.last_poll_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = Some(ts);
     }
     pub fn record_inbound(&self, ts: i64) {
-        *self.messages_seen.lock().expect("poisoned") += 1;
-        *self.last_message_at.lock().expect("poisoned") = Some(ts);
+        *self.messages_seen.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) += 1;
+        *self.last_message_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = Some(ts);
     }
 }
 

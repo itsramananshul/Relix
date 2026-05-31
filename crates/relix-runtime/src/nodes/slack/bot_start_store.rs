@@ -77,7 +77,10 @@ impl SlackBotStartStore {
     /// Read the recorded bot-start timestamp for `channel_id`.
     /// Returns `None` when the channel has never been recorded.
     pub fn get(&self, channel_id: &str) -> Option<String> {
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        });
         conn.query_row(
             "SELECT bot_start_ts FROM slack_bot_start WHERE channel_id = ?1",
             params![channel_id],
@@ -96,7 +99,10 @@ impl SlackBotStartStore {
             return existing;
         }
         let now_ms = clock.now_ms();
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        });
         // INSERT OR IGNORE so a race between two `get_or_init`
         // calls on different connections still produces a single
         // canonical first-write value. The follow-up SELECT

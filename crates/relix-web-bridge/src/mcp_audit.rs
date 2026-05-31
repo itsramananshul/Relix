@@ -86,7 +86,10 @@ impl McpAuditRing {
     }
 
     pub fn push(&self, e: McpAuditEntry) {
-        let mut g = self.entries.lock().expect("mcp audit ring poisoned");
+        let mut g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("'mcp audit ring poisoned'; recovering inner state");
+            e.into_inner()
+        });
         if g.len() == self.capacity {
             g.pop_front();
         }
@@ -95,14 +98,23 @@ impl McpAuditRing {
 
     /// Snapshot the most recent `max` entries, newest first.
     pub fn snapshot_newest_first(&self, max: usize) -> Vec<McpAuditEntry> {
-        let g = self.entries.lock().expect("mcp audit ring poisoned");
+        let g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("'mcp audit ring poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.iter().rev().take(max).cloned().collect()
     }
 
     /// Count of entries currently in the ring (saturates at
     /// `capacity`).
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("mcp audit ring poisoned").len()
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'mcp audit ring poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .len()
     }
 
     /// Convenience for tests + future operator surfaces — pairs

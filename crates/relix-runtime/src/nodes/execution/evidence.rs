@@ -192,7 +192,10 @@ impl EvidenceStore {
 
     /// Persist one record.
     pub fn record(&self, r: &EvidenceRecord) -> Result<(), EvidenceStoreError> {
-        let conn = self.conn.lock().expect("evidence store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'evidence store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         conn.execute(
             "INSERT INTO evidence_records \
              (evidence_id, action_id, actor_id, tenant_id, tool, arguments_redacted, \
@@ -232,7 +235,10 @@ impl EvidenceStore {
         limit: usize,
     ) -> Result<Vec<EvidenceRecord>, EvidenceStoreError> {
         let limit_i: i64 = limit.clamp(1, 1000) as i64;
-        let conn = self.conn.lock().expect("evidence store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'evidence store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) = match (action_id, actor_id) {
             (None, None) => (
                 "SELECT evidence_id, action_id, actor_id, tenant_id, tool, arguments_redacted, \
@@ -285,7 +291,10 @@ impl EvidenceStore {
     }
 
     pub fn get(&self, evidence_id: &str) -> Result<Option<EvidenceRecord>, EvidenceStoreError> {
-        let conn = self.conn.lock().expect("evidence store lock poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'evidence store lock poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let row = conn
             .query_row(
                 "SELECT evidence_id, action_id, actor_id, tenant_id, tool, arguments_redacted, \

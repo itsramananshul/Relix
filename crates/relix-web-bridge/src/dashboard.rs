@@ -127,16 +127,26 @@ fn split_assets() -> &'static (String, String) {
 }
 
 /// `GET /dashboard` — operator dashboard HTML.
-pub async fn page() -> impl IntoResponse {
+pub async fn page() -> Response {
     let (html, _js) = split_assets();
-    Response::builder()
+    match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         // Modest cache to avoid re-fetching on tab switches.
         // 300s is plenty: the page is static; data is live.
         .header(header::CACHE_CONTROL, "public, max-age=300")
         .body(html.clone())
-        .expect("dashboard response builds")
+    {
+        Ok(r) => r.into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "dashboard: response builder failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "dashboard response builder failed",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// `GET /assets/dashboard.js` — the dashboard's JavaScript,
@@ -144,9 +154,9 @@ pub async fn page() -> impl IntoResponse {
 /// `Content-Security-Policy: script-src 'self'` (no
 /// `'unsafe-inline'`). One-hour cache because the file changes
 /// only at bridge restart.
-pub async fn script_asset() -> impl IntoResponse {
+pub async fn script_asset() -> Response {
     let (_html, js) = split_assets();
-    Response::builder()
+    match Response::builder()
         .status(StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
@@ -154,7 +164,17 @@ pub async fn script_asset() -> impl IntoResponse {
         )
         .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(js.clone())
-        .expect("dashboard js asset response builds")
+    {
+        Ok(r) => r.into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "dashboard: script asset response builder failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "dashboard js builder failed",
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

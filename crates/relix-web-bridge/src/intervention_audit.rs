@@ -170,7 +170,10 @@ impl InterventionAudit {
         let detail = clamp_detail(relix_core::redact::redact_secrets(&detail.into()));
         let actor = clamp_detail(actor.into());
         let entry = {
-            let mut g = self.inner.write().expect("intervention write lock");
+            let mut g = self.inner.write().unwrap_or_else(|e| {
+                tracing::warn!("intervention write lock poisoned; recovering inner state");
+                e.into_inner()
+            });
             g.seq += 1;
             let entry = InterventionEntry {
                 seq: g.seq,
@@ -212,7 +215,10 @@ impl InterventionAudit {
     /// limited to those after a sequence cursor. `since=0`
     /// returns up to `limit` of the newest entries.
     pub fn since(&self, since: i64, limit: usize) -> (Vec<InterventionEntry>, i64) {
-        let g = self.inner.read().expect("intervention read lock");
+        let g = self.inner.read().unwrap_or_else(|e| {
+            tracing::warn!("intervention read lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         let mut out: Vec<InterventionEntry> = g
             .events
             .iter()
@@ -232,7 +238,10 @@ impl InterventionAudit {
     /// Hard ring snapshot (for tests + diagnostics).
     #[cfg(test)]
     pub fn snapshot(&self) -> Vec<InterventionEntry> {
-        let g = self.inner.read().expect("intervention read lock");
+        let g = self.inner.read().unwrap_or_else(|e| {
+            tracing::warn!("intervention read lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         g.events.iter().cloned().collect()
     }
 

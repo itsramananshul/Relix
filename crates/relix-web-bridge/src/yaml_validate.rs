@@ -69,7 +69,9 @@ pub async fn validate(Json(req): Json<YamlValidateRequest>) -> impl IntoResponse
                 YamlFlowError::Lower { .. }
                 | YamlFlowError::Io { .. }
                 | YamlFlowError::InvalidCondition { .. }
-                | YamlFlowError::InvalidScalar { .. } => (0, 0),
+                | YamlFlowError::InvalidScalar { .. }
+                | YamlFlowError::FileTooLarge { .. }
+                | YamlFlowError::NestingTooDeep { .. } => (0, 0),
             };
             (
                 StatusCode::BAD_REQUEST,

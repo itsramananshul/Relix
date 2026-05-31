@@ -430,10 +430,10 @@ impl TerminalAuditRing {
     }
 
     pub fn push(&self, e: TerminalAuditEntry) {
-        let mut g = self
-            .entries
-            .lock()
-            .expect("tool.terminal audit ring poisoned");
+        let mut g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal audit ring poisoned'; recovering inner state");
+            e.into_inner()
+        });
         if g.len() == self.capacity {
             g.pop_front();
         }
@@ -441,10 +441,10 @@ impl TerminalAuditRing {
     }
 
     pub fn snapshot_newest_first(&self, max: usize) -> Vec<TerminalAuditEntry> {
-        let g = self
-            .entries
-            .lock()
-            .expect("tool.terminal audit ring poisoned");
+        let g = self.entries.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal audit ring poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.iter().rev().take(max).cloned().collect()
     }
 }
@@ -557,10 +557,10 @@ impl TerminalBackend {
     /// cloned so the caller is free to format them outside the
     /// lock.
     pub fn snapshot_sessions(&self) -> Vec<TerminalSessionRecord> {
-        let g = self
-            .sessions
-            .lock()
-            .expect("tool.terminal sessions poisoned");
+        let g = self.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal sessions poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.values().cloned().collect()
     }
 
@@ -1297,10 +1297,10 @@ async fn validate_and_spawn(
     let stderr_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let caller_subject_id = ctx.caller.subject_id.to_string();
     {
-        let mut g = backend
-            .sessions
-            .lock()
-            .expect("tool.terminal sessions poisoned");
+        let mut g = backend.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal sessions poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.insert(
             session_id.clone(),
             TerminalSessionRecord {
@@ -1323,10 +1323,10 @@ async fn validate_and_spawn(
     // session-cleanup branch of drive_to_completion also
     // removes it so a forgotten close doesn't leak the pipe.
     if let Some(stdin) = stdin_pipe {
-        let mut g = backend
-            .shell_stdins
-            .lock()
-            .expect("tool.terminal shell_stdins poisoned");
+        let mut g = backend.shell_stdins.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal shell_stdins poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.insert(
             session_id.clone(),
             Arc::new(tokio::sync::Mutex::new(Some(stdin))),
@@ -1396,10 +1396,10 @@ async fn drive_to_completion(
     let _ = s.stdout_drain.await;
     let _ = s.stderr_drain.await;
     {
-        let mut g = backend
-            .sessions
-            .lock()
-            .expect("tool.terminal sessions poisoned");
+        let mut g = backend.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal sessions poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.remove(&s.session_id);
     }
     // PH-TERM-SHELL: also clear the stdin entry. No-op for
@@ -1408,14 +1408,20 @@ async fn drive_to_completion(
     // `tool.terminal.shell.close`, this prevents the writer
     // Arc from leaking past the lifetime of the child.
     {
-        let mut g = backend
-            .shell_stdins
-            .lock()
-            .expect("tool.terminal shell_stdins poisoned");
+        let mut g = backend.shell_stdins.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal shell_stdins poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.remove(&s.session_id);
     }
-    let stdout_bytes = std::mem::take(&mut *s.stdout_buf.lock().expect("stdout buf poisoned"));
-    let stderr_bytes = std::mem::take(&mut *s.stderr_buf.lock().expect("stderr buf poisoned"));
+    let stdout_bytes = std::mem::take(&mut *s.stdout_buf.lock().unwrap_or_else(|e| {
+        tracing::warn!("'stdout buf poisoned'; recovering inner state");
+        e.into_inner()
+    }));
+    let stderr_bytes = std::mem::take(&mut *s.stderr_buf.lock().unwrap_or_else(|e| {
+        tracing::warn!("'stderr buf poisoned'; recovering inner state");
+        e.into_inner()
+    }));
     let (stdout, truncated_stdout) = truncate_output(stdout_bytes);
     let (stderr, truncated_stderr) = truncate_output(stderr_bytes);
 
@@ -1667,10 +1673,12 @@ async fn write_to_session_stdin(
     #[cfg(feature = "terminal-pty")]
     {
         let pty_writer = {
-            let g = backend
-                .pty_shell_writers
-                .lock()
-                .expect("tool.terminal pty_shell_writers poisoned");
+            let g = backend.pty_shell_writers.lock().unwrap_or_else(|e| {
+                tracing::warn!(
+                    "'tool.terminal pty_shell_writers poisoned'; recovering inner state"
+                );
+                e.into_inner()
+            });
             g.get(session_id).cloned()
         };
         if let Some(w) = pty_writer {
@@ -1678,10 +1686,10 @@ async fn write_to_session_stdin(
         }
     }
     let stdin_arc = {
-        let g = backend
-            .shell_stdins
-            .lock()
-            .expect("tool.terminal shell_stdins poisoned");
+        let g = backend.shell_stdins.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal shell_stdins poisoned'; recovering inner state");
+            e.into_inner()
+        });
         match g.get(session_id) {
             Some(arc) => arc.clone(),
             None => {
@@ -1938,10 +1946,10 @@ fn handle_shell_close(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> Han
         });
     }
     let removed_pipe = {
-        let mut g = backend
-            .shell_stdins
-            .lock()
-            .expect("tool.terminal shell_stdins poisoned");
+        let mut g = backend.shell_stdins.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal shell_stdins poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.remove(s).is_some()
     };
     // PH-TERM-PTY: also drop the PTY writer entry if any.
@@ -1950,10 +1958,10 @@ fn handle_shell_close(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> Han
     // behaviour as the pipe-mode case.
     #[cfg(feature = "terminal-pty")]
     let removed_pty = {
-        let mut g = backend
-            .pty_shell_writers
-            .lock()
-            .expect("tool.terminal pty_shell_writers poisoned");
+        let mut g = backend.pty_shell_writers.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal pty_shell_writers poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.remove(s).is_some()
     };
     #[cfg(not(feature = "terminal-pty"))]
@@ -2086,7 +2094,10 @@ where
         match pipe.read(&mut tmp).await {
             Ok(0) | Err(_) => return,
             Ok(n) => {
-                let mut g = buf.lock().expect("drain buf poisoned");
+                let mut g = buf.lock().unwrap_or_else(|e| {
+                    tracing::warn!("'drain buf poisoned'; recovering inner state");
+                    e.into_inner()
+                });
                 if g.len() >= cap {
                     return;
                 }
@@ -2144,10 +2155,10 @@ fn handle_tail(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerOut
         });
     }
     let buf_arc = {
-        let g = backend
-            .sessions
-            .lock()
-            .expect("tool.terminal sessions poisoned");
+        let g = backend.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal sessions poisoned'; recovering inner state");
+            e.into_inner()
+        });
         match g.get(&req.session_id) {
             Some(rec) => match req.stream.as_str() {
                 "stdout" => rec.stdout_buf.clone(),
@@ -2177,7 +2188,10 @@ fn handle_tail(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerOut
         }
     };
     let (chunk_bytes, next_offset, truncated, chunk_str) = {
-        let g = buf_arc.lock().expect("tool.terminal tail buf poisoned");
+        let g = buf_arc.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal tail buf poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let len = g.len();
         let start = (req.offset as usize).min(len);
         let mut end = len;
@@ -2226,10 +2240,10 @@ fn handle_cancel(backend: Arc<TerminalBackend>, ctx: &InvocationCtx) -> HandlerO
         });
     }
     let notify = {
-        let g = backend
-            .sessions
-            .lock()
-            .expect("tool.terminal sessions poisoned");
+        let g = backend.sessions.lock().unwrap_or_else(|e| {
+            tracing::warn!("'tool.terminal sessions poisoned'; recovering inner state");
+            e.into_inner()
+        });
         g.get(s).map(|r| r.cancel_notify.clone())
     };
     match notify {

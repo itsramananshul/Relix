@@ -42,27 +42,51 @@ impl ChannelState {
     }
 
     pub fn online(&self) -> bool {
-        *self.online.lock().expect("poisoned")
+        *self.online.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
 
     pub fn identity(&self) -> BotIdentity {
-        self.identity.lock().expect("poisoned").clone()
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn messages_seen(&self) -> u64 {
-        *self.messages_seen.lock().expect("poisoned")
+        *self.messages_seen.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
 
     pub fn last_message_at(&self) -> Option<i64> {
-        *self.last_message_at.lock().expect("poisoned")
+        *self.last_message_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        })
     }
 
     pub fn cursor(&self) -> String {
-        self.cursor.lock().expect("poisoned").clone()
+        self.cursor
+            .lock()
+            .unwrap_or_else(|e| {
+                tracing::warn!("'poisoned'; recovering inner state");
+                e.into_inner()
+            })
+            .clone()
     }
 
     pub fn set_cursor(&self, ts: &str) {
-        *self.cursor.lock().expect("poisoned") = ts.to_string();
+        *self.cursor.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = ts.to_string();
     }
 
     /// FIX 49: per-channel health accessor.
@@ -71,14 +95,26 @@ impl ChannelState {
     }
 
     pub fn mark_online(&self, id: BotIdentity) {
-        *self.identity.lock().expect("poisoned") = id;
-        *self.online.lock().expect("poisoned") = true;
+        *self.identity.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = id;
+        *self.online.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = true;
         self.health.mark_enabled();
     }
 
     pub fn record_inbound(&self, ts: i64) {
-        *self.messages_seen.lock().expect("poisoned") += 1;
-        *self.last_message_at.lock().expect("poisoned") = Some(ts);
+        *self.messages_seen.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) += 1;
+        *self.last_message_at.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        }) = Some(ts);
         self.health.record_event_received();
     }
 }

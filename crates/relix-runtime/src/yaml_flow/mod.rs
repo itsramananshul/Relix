@@ -173,7 +173,48 @@ pub enum YamlFlowError {
         what: &'static str,
         value: String,
     },
+
+    /// CORR PART 1: an operator-supplied YAML file is bigger
+    /// than [`MAX_YAML_FILE_BYTES`]. Pre-fix path called
+    /// `std::fs::read_to_string` with no size cap, so a
+    /// malicious / accidental gigabyte-sized .yml could
+    /// allocate unbounded memory. This error is raised at the
+    /// boundary BEFORE the YAML parser is asked to do any work.
+    #[error("yaml flow: `{path}` is {size_bytes} bytes; max is {max_bytes}")]
+    FileTooLarge {
+        path: String,
+        size_bytes: u64,
+        max_bytes: u64,
+    },
+
+    /// CORR PART 1: the YAML document nests deeper than
+    /// [`MAX_YAML_NESTING_DEPTH`]. Pre-fix path let the parser
+    /// recurse for as long as the heap held out, which a
+    /// malicious flow could weaponise into stack exhaustion or
+    /// O(n) memory blowup. The depth bound is honest about
+    /// what real operator flows look like (well under 20).
+    #[error("yaml flow: nesting depth {depth} exceeds max {max_depth} at {path}")]
+    NestingTooDeep {
+        path: String,
+        depth: usize,
+        max_depth: usize,
+    },
 }
+
+/// CORR PART 1: hard ceiling on the size of a YAML flow file
+/// the bridge / runtime will read into memory. 10 MiB —
+/// orders of magnitude bigger than any realistic operator
+/// flow and small enough that an attacker can't pin the
+/// process by pointing it at `/dev/zero` (or, on Windows, a
+/// huge log file).
+pub const MAX_YAML_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// CORR PART 1: hard ceiling on YAML nesting depth.
+/// Operator flows realistically nest 3–5 levels (a try wraps
+/// a loop wraps a few calls). 20 is well past that; far short
+/// of the depth a hostile document would need to weaponise
+/// recursive lowering into stack exhaustion.
+pub const MAX_YAML_NESTING_DEPTH: usize = 20;
 
 // ──────────────────────────── YAML AST ──────────────────────────
 
@@ -285,6 +326,14 @@ pub fn compile_source(yaml_source: &str) -> Result<Vec<Inst>, YamlFlowError> {
         Some(n) => n.clone(),
         None => Node::from(YamlDataOwned::BadValue),
     };
+    // CORR PART 1: reject pathologically nested documents
+    // BEFORE the lowering pass walks them. The check is a
+    // bounded recursion of its own that bails out the moment
+    // depth exceeds the limit (so a hostile document doesn't
+    // pay full O(N) traversal cost), and feeds the path of
+    // the offending node into the error so operators can fix
+    // it.
+    check_depth_node(&root, 1, MAX_YAML_NESTING_DEPTH, "$")?;
     let flow = parse_flow(&root)?;
     let mut last_step_context = "<before any step>".to_string();
     let lowered = lower_to_sol_inner(&flow, &mut last_step_context)?;
@@ -295,13 +344,83 @@ pub fn compile_source(yaml_source: &str) -> Result<Vec<Inst>, YamlFlowError> {
     })
 }
 
+/// CORR PART 1: depth-bounded walk of a saphyr node. Returns
+/// `Err(NestingTooDeep)` the instant `depth` would exceed
+/// `max_depth`; this avoids running through the full tree of
+/// an adversarial document.
+fn check_depth_node(
+    n: &Node,
+    depth: usize,
+    max_depth: usize,
+    path: &str,
+) -> Result<(), YamlFlowError> {
+    if depth > max_depth {
+        return Err(YamlFlowError::NestingTooDeep {
+            path: path.to_string(),
+            depth,
+            max_depth,
+        });
+    }
+    match &n.data {
+        YamlDataOwned::Mapping(m) => {
+            for (k, v) in m {
+                let key_str = match &k.data {
+                    YamlDataOwned::Value(ScalarOwned::String(s)) => s.clone(),
+                    _ => "<non-string-key>".to_string(),
+                };
+                let child_path = if path == "$" {
+                    format!("$.{key_str}")
+                } else {
+                    format!("{path}.{key_str}")
+                };
+                check_depth_node(v, depth + 1, max_depth, &child_path)?;
+            }
+        }
+        YamlDataOwned::Sequence(seq) => {
+            for (i, v) in seq.iter().enumerate() {
+                let child_path = format!("{path}[{i}]");
+                check_depth_node(v, depth + 1, max_depth, &child_path)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Compile a YAML flow file at the given path. Convenience
 /// wrapper around [`compile_source`].
 pub fn compile_path(path: &Path) -> Result<Vec<Inst>, YamlFlowError> {
+    // CORR PART 1: size-cap BEFORE reading into memory. We
+    // stat the file first; a metadata failure falls through to
+    // a normal Io error (same surface as before). A file that
+    // exceeds the cap is rejected loudly with the exact size
+    // so the operator knows what they pointed us at.
+    let meta = std::fs::metadata(path).map_err(|e| YamlFlowError::Io {
+        path: path.display().to_string(),
+        cause: e.to_string(),
+    })?;
+    let size = meta.len();
+    if size > MAX_YAML_FILE_BYTES {
+        return Err(YamlFlowError::FileTooLarge {
+            path: path.display().to_string(),
+            size_bytes: size,
+            max_bytes: MAX_YAML_FILE_BYTES,
+        });
+    }
     let source = std::fs::read_to_string(path).map_err(|e| YamlFlowError::Io {
         path: path.display().to_string(),
         cause: e.to_string(),
     })?;
+    // Defence-in-depth: even if the on-disk size was within
+    // the cap, the materialised UTF-8 string may have grown
+    // (BOM stripping etc.). Re-check.
+    if source.len() as u64 > MAX_YAML_FILE_BYTES {
+        return Err(YamlFlowError::FileTooLarge {
+            path: path.display().to_string(),
+            size_bytes: source.len() as u64,
+            max_bytes: MAX_YAML_FILE_BYTES,
+        });
+    }
     compile_source(&source)
 }
 

@@ -387,7 +387,10 @@ impl ManifestProvider {
 
     /// Append a capability the dispatch bridge has just registered.
     pub fn add_capability(&self, desc: CapabilityDescriptor) {
-        let mut guard = self.inner.write().expect("manifest provider lock poisoned");
+        let mut guard = self.inner.write().unwrap_or_else(|e| {
+            tracing::warn!("manifest provider lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         // De-dupe by method_name so register-on-restart doesn't duplicate.
         if guard
             .capabilities
@@ -411,7 +414,10 @@ impl ManifestProvider {
     pub fn snapshot(&self) -> NodeManifest {
         self.inner
             .read()
-            .expect("manifest provider lock poisoned")
+            .unwrap_or_else(|e| {
+                tracing::warn!("manifest provider lock poisoned; recovering inner state");
+                e.into_inner()
+            })
             .clone()
     }
 
@@ -487,7 +493,10 @@ impl ManifestCache {
     /// prior timestamp intact (the caller skips the insert).
     pub fn insert(&self, alias: Option<String>, manifest: NodeManifest) {
         let key = manifest.node_id.to_string();
-        let mut guard = self.inner.write().expect("manifest cache lock poisoned");
+        let mut guard = self.inner.write().unwrap_or_else(|e| {
+            tracing::warn!("manifest cache lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         guard.insert(
             key,
             CachedManifest {
@@ -502,7 +511,10 @@ impl ManifestCache {
     pub fn entries(&self) -> Vec<CachedManifest> {
         self.inner
             .read()
-            .expect("manifest cache lock poisoned")
+            .unwrap_or_else(|e| {
+                tracing::warn!("manifest cache lock poisoned; recovering inner state");
+                e.into_inner()
+            })
             .values()
             .cloned()
             .collect()
@@ -514,7 +526,10 @@ impl ManifestCache {
     /// method *or* the matching peer was added to the cache without an
     /// alias — the bridge today only adds aliased peers.
     pub fn find_alias_for_method(&self, method: &str) -> Option<String> {
-        let guard = self.inner.read().expect("manifest cache lock poisoned");
+        let guard = self.inner.read().unwrap_or_else(|e| {
+            tracing::warn!("manifest cache lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         for cached in guard.values() {
             if cached.manifest.advertises(method)
                 && let Some(a) = cached.alias.as_ref()
@@ -527,7 +542,10 @@ impl ManifestCache {
 
     /// Aggregate every advertised method from every cached peer.
     pub fn all_methods(&self) -> Vec<String> {
-        let guard = self.inner.read().expect("manifest cache lock poisoned");
+        let guard = self.inner.read().unwrap_or_else(|e| {
+            tracing::warn!("manifest cache lock poisoned; recovering inner state");
+            e.into_inner()
+        });
         let mut out: BTreeMap<String, ()> = BTreeMap::new();
         for cached in guard.values() {
             for cap in &cached.manifest.capabilities {
@@ -541,7 +559,10 @@ impl ManifestCache {
     pub fn has_method(&self, method: &str) -> bool {
         self.inner
             .read()
-            .expect("manifest cache lock poisoned")
+            .unwrap_or_else(|e| {
+                tracing::warn!("manifest cache lock poisoned; recovering inner state");
+                e.into_inner()
+            })
             .values()
             .any(|c| c.manifest.advertises(method))
     }
@@ -1588,10 +1609,7 @@ mod tests {
         let cached = cache.get("memory.search").expect("cache miss");
         assert_eq!(cached.method_name, "memory.search");
         assert_eq!(cached.categories, vec!["query".to_string()]);
-        assert_eq!(
-            cached.risk_level,
-            relix_core::capability::RiskLevel::Safe
-        );
+        assert_eq!(cached.risk_level, relix_core::capability::RiskLevel::Safe);
     }
 
     #[test]
@@ -1644,8 +1662,7 @@ mod tests {
             vec![],
         );
         provider.add_capability(
-            CapabilityDescriptor::unary("ai.chat")
-                .with_categories(["chat".into()]),
+            CapabilityDescriptor::unary("ai.chat").with_categories(["chat".into()]),
         );
         let describe = describe_fn_from_cache(provider.descriptor_cache());
 

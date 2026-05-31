@@ -75,7 +75,10 @@ impl DiscordWatermarkStore {
     /// controller then falls through to its existing
     /// "empty cursor = bootstrap from current tail" branch.
     pub fn get(&self, channel_id: &str) -> Option<String> {
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        });
         conn.query_row(
             "SELECT last_message_id FROM discord_watermarks WHERE channel_id = ?1",
             params![channel_id],
@@ -92,7 +95,10 @@ impl DiscordWatermarkStore {
     /// from the injected clock so test runs are deterministic.
     pub fn record(&self, channel_id: &str, last_message_id: &str, clock: &dyn Clock) {
         let now_ms = clock.now_ms();
-        let conn = self.conn.lock().expect("poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| {
+            tracing::warn!("'poisoned'; recovering inner state");
+            e.into_inner()
+        });
         let _ = conn.execute(
             "INSERT INTO discord_watermarks
                  (channel_id, last_message_id, updated_at_ms)

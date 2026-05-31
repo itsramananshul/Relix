@@ -280,9 +280,7 @@ impl Default for DnsCache {
 impl DnsCache {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
-            inner: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+            inner: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             ttl_secs,
         }
     }
@@ -419,10 +417,7 @@ pub fn check_ssrf_cloud_tier(
         return Ok(());
     }
     if let Some(reason) = forbidden_hostname_reason(&host) {
-        return Err(SsrfError::HostnameDenied {
-            host,
-            reason,
-        });
+        return Err(SsrfError::HostnameDenied { host, reason });
     }
     let ips = dns_cache.resolve_blocking(&host)?;
     if ips.is_empty() {
@@ -1255,8 +1250,8 @@ mod tests {
     fn check_ssrf_tool_capability_blocks_loopback() {
         let cache = DnsCache::new(60);
         let allowlist = UrlAllowlist::default();
-        let e = check_ssrf_tool_capability("https://127.0.0.1/", true, &cache, &allowlist)
-            .unwrap_err();
+        let e =
+            check_ssrf_tool_capability("https://127.0.0.1/", true, &cache, &allowlist).unwrap_err();
         assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
     }
 
