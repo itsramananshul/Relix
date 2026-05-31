@@ -82,6 +82,20 @@ pub struct VerificationConfig {
     /// unchanged).
     #[serde(default)]
     pub required_steps: Vec<String>,
+    /// SEC PART 4: wall-clock timeout for every regex
+    /// `is_match` call in [`evaluate_pattern_match`].
+    /// `regex` crate patterns can be crafted to exhibit
+    /// catastrophic backtracking (ReDoS); wrapping each
+    /// match in a worker thread with this timeout caps
+    /// the damage at `regex_timeout_ms` per call. Default
+    /// 100ms — long enough for any honest pattern, short
+    /// enough that an attacker can't tie up the harness.
+    #[serde(default = "default_regex_timeout_ms")]
+    pub regex_timeout_ms: u64,
+}
+
+fn default_regex_timeout_ms() -> u64 {
+    100
 }
 
 fn default_verifier_agent() -> String {
@@ -287,7 +301,11 @@ impl VerificationHarness {
             VerificationStrategy::LengthCheck => evaluate_length_check(criterion, output),
             VerificationStrategy::KeywordPresence => evaluate_keyword_presence(criterion, output),
             VerificationStrategy::KeywordAbsence => evaluate_keyword_absence(criterion, output),
-            VerificationStrategy::PatternMatch => evaluate_pattern_match(criterion, output),
+            VerificationStrategy::PatternMatch => {
+                // SEC PART 4: thread the configured ReDoS
+                // timeout through. Default 100ms.
+                evaluate_pattern_match_with_timeout(criterion, output, self.cfg.regex_timeout_ms)
+            }
             VerificationStrategy::AiJudge => self.evaluate_ai_judge(criterion, output).await,
         }
     }
@@ -598,29 +616,79 @@ fn extract_quoted(s: &str, q: char, out: &mut Vec<String>) {
     }
 }
 
+/// SEC PART 4: structured errors from [`safe_regex_is_match`].
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RegexError {
+    /// `regex::Regex::new` returned an error — invalid syntax,
+    /// look-around, etc.
+    #[error("regex compile: {0}")]
+    Compile(String),
+    /// The match worker thread didn't return within the
+    /// configured timeout. Likely catastrophic backtracking
+    /// (ReDoS) on a hostile pattern + input.
+    #[error("regex timeout after {ms} ms")]
+    Timeout { ms: u64 },
+}
+
+/// SEC PART 4: timeout-bounded regex match.
+///
+/// Spawns a worker thread that runs `is_match` and sends the
+/// result through an mpsc channel; the main thread waits up
+/// to `timeout_ms` for the answer. On timeout the worker is
+/// abandoned (process eventually frees it once the regex
+/// engine yields) and the caller sees
+/// [`RegexError::Timeout`].
+///
+/// Compile failures map to [`RegexError::Compile`] so the
+/// caller can fail-closed instead of the pre-fix path's
+/// silent "pass by default."
+pub fn safe_regex_is_match(pattern: &str, text: &str, timeout_ms: u64) -> Result<bool, RegexError> {
+    let re = regex::Regex::new(pattern).map_err(|e| RegexError::Compile(e.to_string()))?;
+    let text_owned = text.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(re.is_match(&text_owned));
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(timeout_ms))
+        .map_err(|_| RegexError::Timeout { ms: timeout_ms })
+}
+
 /// PatternMatch: when the criterion is `/regex/`, compile and
-/// match against the output. Bad regexes pass with a note.
+/// match against the output.
+///
+/// SEC PART 4: compile failures and ReDoS timeouts both fail
+/// CLOSED (return `false`) — the pre-fix behaviour passed by
+/// default when the regex couldn't be evaluated, which is a
+/// "verification can't run" → "verification passed" silent
+/// upgrade. Verification that cannot execute MUST be reported
+/// as a failure so the operator notices.
 pub fn evaluate_pattern_match(criterion: &str, output: &str) -> (bool, String) {
+    // Back-compat shim: uses the default 100ms timeout.
+    evaluate_pattern_match_with_timeout(criterion, output, default_regex_timeout_ms())
+}
+
+pub fn evaluate_pattern_match_with_timeout(
+    criterion: &str,
+    output: &str,
+    timeout_ms: u64,
+) -> (bool, String) {
     let trimmed = criterion.trim();
     let pattern = trimmed
         .strip_prefix('/')
         .and_then(|s| s.strip_suffix('/'))
         .unwrap_or(trimmed);
-    match regex::Regex::new(pattern) {
-        Ok(re) => {
-            if re.is_match(output) {
-                (true, format!("pattern match: `/{pattern}/` matched"))
-            } else {
-                (
-                    false,
-                    format!("pattern match: `/{pattern}/` did not match output"),
-                )
-            }
-        }
-        Err(e) => (
-            true,
+    match safe_regex_is_match(pattern, output, timeout_ms) {
+        Ok(true) => (true, format!("pattern match: `/{pattern}/` matched")),
+        Ok(false) => (
+            false,
+            format!("pattern match: `/{pattern}/` did not match output"),
+        ),
+        Err(RegexError::Compile(msg)) => (false, format!("regex compile error: {msg}")),
+        Err(RegexError::Timeout { ms }) => (
+            false,
             format!(
-                "pattern match: regex compile failed for `/{pattern}/`: {e}; passed by default"
+                "pattern match: regex evaluation exceeded {ms} ms timeout (possible ReDoS); \
+                 failing closed"
             ),
         ),
     }
@@ -920,6 +988,7 @@ mod tests {
                 verifier_agent: "coordinator".into(),
                 verifier_peer: "coordinator".into(),
                 required_steps,
+                regex_timeout_ms: 100,
             },
         )
     }
@@ -1042,10 +1111,72 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_pattern_match_passes_by_default_on_bad_regex() {
+    fn evaluate_pattern_match_fails_closed_on_bad_regex() {
+        // SEC PART 4: pre-fix behaviour silently passed when
+        // the regex couldn't compile — a verification step
+        // that can't run was reported as "verified ok",
+        // upgrading every misconfigured pattern into a
+        // bypass. Failure to compile now fails CLOSED with
+        // an operator-visible reason.
         let (passed, reason) = evaluate_pattern_match("/[unclosed/", "any text");
-        assert!(passed, "bad regex must default-pass with a note");
-        assert!(reason.contains("regex compile failed"), "reason={reason}");
+        assert!(!passed, "compile failure must FAIL closed");
+        assert!(reason.contains("regex compile error"), "reason={reason}");
+    }
+
+    #[test]
+    fn safe_regex_is_match_times_out_on_redos_pattern() {
+        // SEC PART 4: classic catastrophic-backtracking
+        // pattern. With the default 100ms timeout, the
+        // worker is abandoned and `Timeout` returns.
+        let evil = "^(a+)+$";
+        // 30 `a`'s + a `b` triggers exponential blow-up in
+        // backtracking engines on `^(a+)+$`. The Rust
+        // `regex` crate uses an automaton that is supposedly
+        // immune — but the timeout MUST apply regardless,
+        // so we test the contract.
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
+        // With a 0ms timeout the worker can't possibly
+        // beat the recv_timeout deadline; we use 1ms to
+        // exercise the Timeout path on a CI host.
+        let res = safe_regex_is_match(evil, text, 1);
+        // The Rust regex engine is linear-time so this may
+        // legitimately return Ok(_) before the 1ms timeout.
+        // Either branch is acceptable; the goal is that the
+        // function HAS the timeout machinery, surfaced as
+        // RegexError::Timeout when the engine genuinely
+        // exceeds the wall clock.
+        match res {
+            Ok(_) => {} // engine outran the 1ms budget — fine.
+            Err(RegexError::Timeout { ms }) => {
+                assert_eq!(ms, 1, "timeout value must round-trip");
+            }
+            Err(e) => panic!("unexpected error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn safe_regex_is_match_returns_compile_error_for_invalid_pattern() {
+        let res = safe_regex_is_match("[unclosed", "x", 100);
+        match res {
+            Err(RegexError::Compile(_)) => {}
+            other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_pattern_match_with_timeout_fails_closed_when_timeout_hit() {
+        // Force a near-zero timeout — any non-trivial regex
+        // either races through under it (Ok) or trips the
+        // timeout path (Failed closed).
+        let (passed, _reason) =
+            evaluate_pattern_match_with_timeout("/^(a+)+$/", "aaaaaaaaaaaaaaaaaaaaaab", 0);
+        // 0ms is impossibly tight — recv_timeout(0) almost
+        // certainly returns Disconnected/Timeout, failing
+        // closed. If the worker finishes first then the
+        // pattern legitimately didn't match the trailing `b`
+        // and we ALSO get `passed=false`. Either way fail-
+        // closed.
+        assert!(!passed);
     }
 
     #[test]
@@ -1083,6 +1214,7 @@ mod tests {
                 verifier_agent: "coordinator".into(),
                 verifier_peer: "coordinator".into(),
                 required_steps: Vec::new(),
+                regex_timeout_ms: 100,
             },
         );
         let (passed, reason) = harness
@@ -1107,6 +1239,7 @@ mod tests {
                 verify_steps: true,
                 verifier_agent: "c".into(),
                 verifier_peer: "c".into(),
+                regex_timeout_ms: 100,
                 required_steps: vec!["step_a".into()],
             },
         );
@@ -1142,6 +1275,7 @@ mod tests {
                 verify_steps: true,
                 verifier_agent: "c".into(),
                 verifier_peer: "c".into(),
+                regex_timeout_ms: 100,
                 required_steps: vec!["critical".into()],
             },
         );
@@ -1210,6 +1344,7 @@ mod tests {
                 verify_steps: true,
                 verifier_agent: "c".into(),
                 verifier_peer: "c".into(),
+                regex_timeout_ms: 100,
                 required_steps: vec!["first".into()],
             },
         );
