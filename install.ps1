@@ -271,12 +271,17 @@ try {
         New-Item -ItemType Directory -Path $p -Force | Out-Null
     }
 
-    $archiveShaPath = Join-Path $TmpAux 'archive.sha256'
-    $archiveSigPath = Join-Path $TmpAux 'archive.sig'
-    $archivePemPath = Join-Path $TmpAux 'archive.pem'
-    $sumsPath       = Join-Path $TmpAux 'SHA256SUMS.txt'
-    $sumsSigPath    = Join-Path $TmpAux 'SHA256SUMS.txt.sig'
-    $sumsPemPath    = Join-Path $TmpAux 'SHA256SUMS.txt.pem'
+    $archiveShaPath    = Join-Path $TmpAux 'archive.sha256'
+    $archiveShaSigPath = Join-Path $TmpAux 'archive.sha256.sig'
+    $archiveShaPemPath = Join-Path $TmpAux 'archive.sha256.pem'
+    $archiveSigPath    = Join-Path $TmpAux 'archive.sig'
+    $archivePemPath    = Join-Path $TmpAux 'archive.pem'
+    $sumsPath          = Join-Path $TmpAux 'SHA256SUMS.txt'
+    $sumsSigPath       = Join-Path $TmpAux 'SHA256SUMS.txt.sig'
+    $sumsPemPath       = Join-Path $TmpAux 'SHA256SUMS.txt.pem'
+
+    $sha256SigUrl = "$sha256Url.sig"
+    $sha256PemUrl = "$sha256Url.pem"
 
     Write-Host "Downloading SHA256 + cosign material for archive..."
     try {
@@ -284,8 +289,21 @@ try {
     } catch {
         throw "could not fetch $sha256Url (no per-archive checksum published for $tag?) : $($_.Exception.Message)"
     }
-    try { Invoke-Download -Url $archiveSigUrl -OutFile $archiveSigPath } catch { Write-Warning "no cosign signature for $archiveName at $tag" }
-    try { Invoke-Download -Url $archivePemUrl -OutFile $archivePemPath } catch { Write-Warning "no cosign cert for $archiveName at $tag" }
+    try { Invoke-Download -Url $sha256SigUrl  -OutFile $archiveShaSigPath } catch { Write-Warning "no cosign signature for $archiveName.sha256 at $tag" }
+    try { Invoke-Download -Url $sha256PemUrl  -OutFile $archiveShaPemPath } catch { Write-Warning "no cosign cert for $archiveName.sha256 at $tag" }
+    try { Invoke-Download -Url $archiveSigUrl -OutFile $archiveSigPath    } catch { Write-Warning "no cosign signature for $archiveName at $tag" }
+    try { Invoke-Download -Url $archivePemUrl -OutFile $archivePemPath    } catch { Write-Warning "no cosign cert for $archiveName at $tag" }
+
+    # Verify the cosign signature on the .sha256 file BEFORE we trust
+    # the hash it contains. See install.sh for the threat-model
+    # rationale.
+    if ((Test-Path -LiteralPath $archiveShaSigPath) -and (Test-Path -LiteralPath $archiveShaPemPath) `
+        -and ((Get-Item -LiteralPath $archiveShaSigPath).Length -gt 0) `
+        -and ((Get-Item -LiteralPath $archiveShaPemPath).Length -gt 0)) {
+        Invoke-VerifySignature -Binary $archiveShaPath -Signature $archiveShaSigPath -Certificate $archiveShaPemPath
+    } else {
+        Write-Warning "skipping cosign verification on $archiveName.sha256: no .sig/.pem published"
+    }
 
     $expectedArchiveSha = ((Get-Content -LiteralPath $archiveShaPath -TotalCount 1) -split '\s+')[0]
     if (-not $expectedArchiveSha) {

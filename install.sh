@@ -347,20 +347,43 @@ mkdir -p "${EXTRACT_DIR}"
 # lets us reach keyless-verified provenance even on systems where
 # cosign isn't installed (we still have the SHA256 gate).
 info "Downloading SHA256 + cosign material for archive..."
+ARCHIVE_SHA_SIG_PATH="${ARCHIVE_SHA_PATH}.sig"
+ARCHIVE_SHA_PEM_PATH="${ARCHIVE_SHA_PATH}.pem"
 if have curl; then
-    curl -fsSL -o "${ARCHIVE_SHA_PATH}" "${SHA256_URL}" \
+    curl -fsSL -o "${ARCHIVE_SHA_PATH}"     "${SHA256_URL}" \
         || err "could not fetch ${SHA256_URL} (no per-archive checksum published for ${TAG}?)"
-    curl -fsSL -o "${ARCHIVE_SIG_PATH}" "${ARCHIVE_SIG_URL}" \
+    curl -fsSL -o "${ARCHIVE_SHA_SIG_PATH}" "${SHA256_SIG_URL}" \
+        || warn "no cosign signature for ${ARCHIVE_NAME}.sha256 at ${TAG}"
+    curl -fsSL -o "${ARCHIVE_SHA_PEM_PATH}" "${SHA256_PEM_URL}" \
+        || warn "no cosign cert for ${ARCHIVE_NAME}.sha256 at ${TAG}"
+    curl -fsSL -o "${ARCHIVE_SIG_PATH}"     "${ARCHIVE_SIG_URL}" \
         || warn "no cosign signature for ${ARCHIVE_NAME} at ${TAG}"
-    curl -fsSL -o "${ARCHIVE_PEM_PATH}" "${ARCHIVE_PEM_URL}" \
+    curl -fsSL -o "${ARCHIVE_PEM_PATH}"     "${ARCHIVE_PEM_URL}" \
         || warn "no cosign cert for ${ARCHIVE_NAME} at ${TAG}"
 elif have wget; then
-    wget -q -O "${ARCHIVE_SHA_PATH}" "${SHA256_URL}" \
+    wget -q -O "${ARCHIVE_SHA_PATH}"     "${SHA256_URL}" \
         || err "could not fetch ${SHA256_URL}"
-    wget -q -O "${ARCHIVE_SIG_PATH}" "${ARCHIVE_SIG_URL}" \
+    wget -q -O "${ARCHIVE_SHA_SIG_PATH}" "${SHA256_SIG_URL}" \
+        || warn "no cosign signature for ${ARCHIVE_NAME}.sha256 at ${TAG}"
+    wget -q -O "${ARCHIVE_SHA_PEM_PATH}" "${SHA256_PEM_URL}" \
+        || warn "no cosign cert for ${ARCHIVE_NAME}.sha256 at ${TAG}"
+    wget -q -O "${ARCHIVE_SIG_PATH}"     "${ARCHIVE_SIG_URL}" \
         || warn "no cosign signature for ${ARCHIVE_NAME} at ${TAG}"
-    wget -q -O "${ARCHIVE_PEM_PATH}" "${ARCHIVE_PEM_URL}" \
+    wget -q -O "${ARCHIVE_PEM_PATH}"     "${ARCHIVE_PEM_URL}" \
         || warn "no cosign cert for ${ARCHIVE_NAME} at ${TAG}"
+fi
+
+# Verify the cosign signature on the .sha256 file BEFORE we trust the
+# hash it contains. Without this step an attacker who can swap both
+# the archive and its matching .sha256 in transit could pass the
+# fetch_and_verify hash check below — the hash would match the
+# attacker's archive because the attacker also chose the hash. The
+# cosign signature on the .sha256 file is what binds it to a
+# legitimate release.yml run.
+if [ -s "${ARCHIVE_SHA_SIG_PATH}" ] && [ -s "${ARCHIVE_SHA_PEM_PATH}" ]; then
+    verify_signature "${ARCHIVE_SHA_PATH}" "${ARCHIVE_SHA_SIG_PATH}" "${ARCHIVE_SHA_PEM_PATH}"
+else
+    warn "skipping cosign verification on ${ARCHIVE_NAME}.sha256: no .sig/.pem published"
 fi
 
 EXPECTED_ARCHIVE_SHA="$(awk 'NR==1 {print $1}' "${ARCHIVE_SHA_PATH}")"
@@ -527,6 +550,13 @@ done
 # ---------------------------------------------------------------------------
 # 7. PATH wiring
 # ---------------------------------------------------------------------------
+# The `$PATH` is intentionally kept literal in the line we append to
+# the shell rc file — it must expand at shell-init time, not now. The
+# install dir is concatenated outside the single quotes so it does
+# expand here. shellcheck SC2016 fires on the literal `$PATH` it
+# sees inside single quotes; the suppression is the documented
+# escape hatch for "I really mean a literal dollar".
+# shellcheck disable=SC2016
 PATH_LINE='export PATH="'"${INSTALL_DIR}"':$PATH"'
 
 already_on_path() {

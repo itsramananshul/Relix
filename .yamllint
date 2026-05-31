@@ -1,0 +1,29 @@
+# yamllint configuration for the Relix repo.
+#
+# Defaults are written for hand-authored YAML; GitHub Actions
+# workflow files have their own conventions (no leading `---`,
+# bare `on:` key, long shell-snippet and URL lines). The
+# overrides below match those conventions so the workflow
+# lint runs clean.
+
+extends: default
+
+rules:
+  # GitHub Actions parses `on:` as the trigger key, not the YAML
+  # boolean `on`. Allow the bare `on` so we don't have to quote
+  # it as `"on":` in every workflow.
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false
+
+  # GitHub workflow files conventionally omit the `---` document
+  # start marker. Don't fail the lint because of it.
+  document-start: disable
+
+  # Workflow files routinely carry long shell snippets, long
+  # URLs in `gh issue create --body`, and long matrix entry
+  # tables. 200 columns gives those room to breathe without
+  # hand-wrapping every line into something less readable.
+  line-length:
+    max: 200
+    level: error
