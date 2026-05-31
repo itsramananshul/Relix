@@ -1,60 +1,62 @@
-//! Minimal operator dashboard served at `/dashboard`.
+//! Operator dashboard served at `/dashboard`.
 //!
-//! Single static HTML page. Vanilla JS only — no build step,
-//! no bundler, no framework. The page consumes the existing
-//! `/v1/tasks*` JSON endpoints described in
-//! [`docs/task-api.md`](../../../docs/task-api.md); the bridge
-//! does not introduce any new server-side state or
-//! orchestration to support it (see
-//! [`docs/bridge-invariants.md`](../../../docs/bridge-invariants.md)).
+//! Single self-contained HTML file with every CSS rule and every
+//! line of JavaScript inline (no external fetches, no CDN, no
+//! bundler). The file lives at `src/dashboard.html` and is
+//! `include_str!`-baked into the binary so the bridge ships as one
+//! self-contained artifact — operators do not have to manage a
+//! frontend asset directory.
 //!
-//! The page intentionally stays small enough to read in one
-//! sitting. If it grows beyond that the right move is to
-//! split into static files served by an external web server —
-//! the bridge is not a frontend host.
+//! ## Per-route CSP
 //!
-//! ## CSP-driven split
+//! The bridge's default CSP (see `crate::security_headers`) is the
+//! strict `script-src 'self'` policy that forbids inline `<script>`
+//! blocks. The dashboard ships its JavaScript inline (one file
+//! covers all 18 sections), so the `/dashboard` route stamps its
+//! own CSP that adds `'unsafe-inline'` to `script-src` and
+//! `style-src`. The security-headers middleware in
+//! `crate::security_headers` preserves a per-handler CSP rather
+//! than overwriting it, so the strict default still applies to
+//! every other route.
 //!
-//! Inline `<script>` blocks are blocked by the strict
-//! `script-src 'self'` directive of
-//! [`crate::security_headers`]. The source `dashboard.html`
-//! still carries the JavaScript inline so the file is one
-//! editable unit, but at runtime we split it into:
+//! ## Operator override
 //!
-//! - the page HTML, with `<script>...</script>` replaced by
-//!   `<script src="/assets/dashboard.js"></script>`,
-//! - the standalone JS body, served at
-//!   [`GET /assets/dashboard.js`](script_asset).
-//!
-//! The split happens once at process startup via
-//! `OnceLock`; subsequent requests just clone an `Arc<str>`
-//! pointer.
+//! `RELIX_DASHBOARD_PATH=/some/file.html` lets operators hot-swap
+//! the dashboard at process start without rebuilding the binary.
+//! A missing or unreadable file logs a warning and falls back to
+//! the embedded copy. Resolved once per process via [`OnceLock`].
 
 use std::sync::OnceLock;
 
 use axum::{
-    http::{StatusCode, header},
+    http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
-/// The static HTML page baked into the binary. Inline CSS +
-/// JS deliberately — keeps the bridge a single binary with no
-/// resource directory to ship. At request time we split this
-/// into HTML + JS to satisfy `script-src 'self'`.
+/// `X-Content-Type-Options` is not in `axum::http::header` re-export.
+/// Defined as a constant here so the value is reused without a
+/// per-request allocation.
+fn xcto_header_name() -> HeaderName {
+    HeaderName::from_static("x-content-type-options")
+}
+
+/// Embedded HTML. The build-time `include_str!` pulls the file in
+/// from this crate's `src/` so the shipped binary needs no extra
+/// resource directory.
 const DASHBOARD_HTML_EMBEDDED: &str = include_str!("dashboard.html");
 
-/// Resolve the dashboard HTML source for this process.
-///
-/// Order of precedence:
-/// 1. `RELIX_DASHBOARD_PATH=/some/file.html` reads the file
-///    at boot (operators can hot-swap the UI without rebuilding).
-///    A missing or unreadable file logs a warning and falls
-///    back to the embedded copy.
-/// 2. Otherwise the [`include_str!`]-baked copy.
-///
-/// Resolution happens once per process via [`OnceLock`] so
-/// the env-var change requires a bridge restart — matches the
-/// rest of the bridge's configuration posture.
+/// Per-route Content-Security-Policy stamped on `/dashboard`. Adds
+/// `'unsafe-inline'` to `script-src` and `style-src` because the
+/// dashboard ships its JS + CSS inline. The bridge's default strict
+/// CSP (see `crate::security_headers`) still applies to every other
+/// route; the security-headers middleware only stamps the default
+/// when a handler has not already set one.
+const DASHBOARD_CSP: &str = "default-src 'self'; \
+                             script-src 'self' 'unsafe-inline'; \
+                             style-src 'self' 'unsafe-inline'; \
+                             img-src 'self' data:; \
+                             connect-src 'self'";
+
 fn dashboard_html_source() -> &'static str {
     static SOURCE: OnceLock<String> = OnceLock::new();
     SOURCE
@@ -65,10 +67,9 @@ fn dashboard_html_source() -> &'static str {
         .as_str()
 }
 
-/// Pure resolver — takes the env-var value as an `Option<&str>`
-/// so tests can exercise both the file-found and file-missing
-/// branches without mutating process env (`std::env::set_var`
-/// is unsafe in Rust 2024 and the test harness forbids unsafe).
+/// Pure resolver — takes the env-var value as an `Option<&str>` so
+/// tests can exercise both the file-found and file-missing
+/// branches without mutating process env.
 fn resolve_dashboard_source(env_value: Option<&str>) -> String {
     match env_value {
         Some(path) if !path.trim().is_empty() => match std::fs::read_to_string(path) {
@@ -95,47 +96,28 @@ fn resolve_dashboard_source(env_value: Option<&str>) -> String {
     }
 }
 
-/// Result of the one-time split. `.0` is the modified HTML
-/// (script tag rewritten), `.1` is the bare JS body without
-/// surrounding `<script>` markers.
-fn split_assets() -> &'static (String, String) {
-    static SPLIT: OnceLock<(String, String)> = OnceLock::new();
-    SPLIT.get_or_init(|| {
-        let source = dashboard_html_source();
-        // The dashboard's single inline script block sits
-        // between `<script>\n` and `\n</script>` on a line of
-        // its own. If a future edit alters that exact shape
-        // the fallback below preserves correctness (no
-        // extraction, no /assets/dashboard.js).
-        let start_tag = "<script>\n";
-        let end_tag = "</script>";
-        let Some(s) = source.find(start_tag) else {
-            return (source.to_string(), String::new());
-        };
-        let after = s + start_tag.len();
-        let Some(e_rel) = source[after..].find(end_tag) else {
-            return (source.to_string(), String::new());
-        };
-        let e = after + e_rel;
-        let js = source[after..e].to_string();
-        let mut html = String::with_capacity(source.len());
-        html.push_str(&source[..s]);
-        html.push_str("<script src=\"/assets/dashboard.js\" defer></script>");
-        html.push_str(&source[e + end_tag.len()..]);
-        (html, js)
-    })
-}
-
-/// `GET /dashboard` — operator dashboard HTML.
+/// `GET /dashboard` — operator dashboard HTML. Sets the per-route
+/// CSP, the spec'd `X-Frame-Options: DENY`,
+/// `X-Content-Type-Options: nosniff`, and `Referrer-Policy:
+/// no-referrer` so the dashboard's data flow cannot leak to
+/// cross-origin contexts.
 pub async fn page() -> Response {
-    let (html, _js) = split_assets();
+    let html = dashboard_html_source();
     match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        // Modest cache to avoid re-fetching on tab switches.
-        // 300s is plenty: the page is static; data is live.
         .header(header::CACHE_CONTROL, "public, max-age=300")
-        .body(html.clone())
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(DASHBOARD_CSP),
+        )
+        .header(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"))
+        .header(xcto_header_name(), HeaderValue::from_static("nosniff"))
+        .header(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        )
+        .body(html.to_string())
     {
         Ok(r) => r.into_response(),
         Err(e) => {
@@ -143,34 +125,6 @@ pub async fn page() -> Response {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "dashboard response builder failed",
-            )
-                .into_response()
-        }
-    }
-}
-
-/// `GET /assets/dashboard.js` — the dashboard's JavaScript,
-/// extracted from `dashboard.html` so the page can ship under
-/// `Content-Security-Policy: script-src 'self'` (no
-/// `'unsafe-inline'`). One-hour cache because the file changes
-/// only at bridge restart.
-pub async fn script_asset() -> Response {
-    let (_html, js) = split_assets();
-    match Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
-        .body(js.clone())
-    {
-        Ok(r) => r.into_response(),
-        Err(e) => {
-            tracing::warn!(error = %e, "dashboard: script asset response builder failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "dashboard js builder failed",
             )
                 .into_response()
         }
@@ -195,82 +149,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_body_drops_inline_script_and_loads_via_src() {
+    async fn page_stamps_per_route_csp_with_unsafe_inline_for_scripts() {
         let resp = page().await.into_response();
-        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
-        // The original inline script body is no longer in the
-        // page (its first identifying line was the `use strict`
-        // directive immediately after `<script>`).
-        assert!(
-            !body.contains("\n'use strict';"),
-            "inline JS body should have been extracted"
-        );
-        // …and a same-origin <script src=> tag took its place.
-        assert!(
-            body.contains(r#"<script src="/assets/dashboard.js" defer></script>"#),
-            "expected same-origin script tag in HTML"
-        );
-    }
-
-    #[tokio::test]
-    async fn script_asset_serves_javascript() {
-        let resp = script_asset().await.into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ctype = resp
+        let csp = resp
             .headers()
-            .get(header::CONTENT_TYPE)
+            .get(header::CONTENT_SECURITY_POLICY)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
-            ctype.starts_with("application/javascript"),
-            "content-type was {ctype:?}"
+            csp.contains("default-src 'self'"),
+            "csp missing default-src: {csp:?}"
         );
-        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
-        // First non-comment line of the JS body is
-        // `'use strict';` — sanity that we extracted the right
-        // window.
         assert!(
-            body.starts_with("'use strict';") || body.lines().any(|l| l.trim() == "'use strict';"),
-            "expected JS body to start with 'use strict';, got prefix: {:?}",
-            &body[..80.min(body.len())]
+            csp.contains("script-src 'self' 'unsafe-inline'"),
+            "csp missing inline script allowance: {csp:?}"
         );
-        // The JS must NOT contain `<script>` / `</script>`
-        // tags — that would be a sign the split slipped.
         assert!(
-            !body.contains("</script>"),
-            "JS body must not contain </script>"
+            csp.contains("style-src 'self' 'unsafe-inline'"),
+            "csp missing inline style allowance: {csp:?}"
+        );
+        assert!(
+            csp.contains("img-src 'self' data:"),
+            "csp missing data: img: {csp:?}"
+        );
+        assert!(
+            csp.contains("connect-src 'self'"),
+            "csp missing connect-src: {csp:?}"
         );
     }
 
     #[tokio::test]
-    async fn page_body_contains_landmark_strings() {
+    async fn page_stamps_xframe_xcto_and_referrer_policy_headers() {
+        let resp = page().await.into_response();
+        let xfo = resp
+            .headers()
+            .get(header::X_FRAME_OPTIONS)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(xfo, "DENY");
+        let xcto = resp
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(xcto, "nosniff");
+        let rp = resp
+            .headers()
+            .get(header::REFERRER_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(rp, "no-referrer");
+    }
+
+    /// Every spec'd dashboard section must register a top-level
+    /// `<section id="section-<name>">` so navigation can show it
+    /// and operator scripts can deep-link. A future edit that
+    /// drops one of these IDs fails this gate fast.
+    #[tokio::test]
+    async fn page_body_contains_all_eighteen_section_ids() {
         let resp = page().await.into_response();
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        // Sanity that we actually shipped the dashboard, not
-        // some default error page.
-        assert!(body.contains("<title>Relix"));
-        // The HTML still wires the JS endpoints by URL even
-        // though the JS body lives in /assets now.
-        assert!(
-            body.contains("/v1/tasks") || body.contains("v1/tasks"),
-            "HTML must still reference the task API surface"
-        );
-        // No external script/style src — page is self-contained,
-        // and the CSP we set would block one anyway. We check the
-        // load-attribute forms specifically so that legitimate
-        // `https://` literals in user-facing copy (e.g. webhook
-        // URL placeholders, help text explaining a required
-        // scheme) don't trip the guard.
+        for sec in [
+            "overview",
+            "chat",
+            "memory",
+            "approvals",
+            "skills",
+            "sessions",
+            "reasoning",
+            "credentials",
+            "identity",
+            "cost",
+            "observability",
+            "tenant",
+            "planning",
+            "workflows",
+            "email",
+            "plugins",
+            "config",
+            "logs",
+        ] {
+            assert!(
+                body.contains(&format!("id=\"section-{sec}\"")),
+                "missing section id for {sec}"
+            );
+        }
+    }
+
+    /// The dashboard ships everything inline — there must be no
+    /// `<script src=>` or `<link href=>` pointing at an external
+    /// resource (the strict CSP would block any such load anyway,
+    /// but this catches the regression at the HTML level too).
+    #[tokio::test]
+    async fn page_has_no_external_script_or_style_loads() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
         for needle in [
-            r#"src="https://"#,
-            r#"src='https://"#,
-            r#"href="https://"#,
-            r#"href='https://"#,
-            r#"@import"#,
-            "url(https://",
+            "src=\"https://",
+            "src='https://",
+            "src=\"http://",
+            "src='http://",
+            "src=\"//",
+            "src='//",
+            "src=\"/assets/dashboard.js",
+            "@import",
         ] {
             assert!(
                 !body.contains(needle),
@@ -279,154 +263,103 @@ mod tests {
         }
     }
 
+    /// The dashboard's JavaScript must never use `innerHTML` with
+    /// dynamic data. The safe DOM builder (`el(...)`) and direct
+    /// `textContent` writes are the only allowed paths.
+    /// `outerHTML` is allowed in property names referenced by
+    /// devtools, but no `node.innerHTML =` or `.innerHTML +=`
+    /// assignment should appear in the source.
     #[tokio::test]
-    async fn page_body_contains_redesign_landmarks() {
-        // M3 redesign landmarks: sidebar shell, all six routes,
-        // topbar status indicator. If a future change drops one
-        // of these sections, this test fails fast.
+    async fn page_javascript_has_no_innerhtml_assignment() {
         let resp = page().await.into_response();
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            ".innerHTML =",
+            ".innerHTML=",
+            ".innerHTML +=",
+            ".innerHTML+=",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "dashboard JS contains forbidden innerHTML assignment: {needle:?}"
+            );
+        }
+    }
 
+    /// The SVG cost chart helper must be present and reachable
+    /// from the cost panel. Sanity-check the source string.
+    #[tokio::test]
+    async fn page_carries_svg_chart_helper() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(
-            body.contains(r#"<aside class="sidebar">"#),
-            "missing sidebar"
+            body.contains("function horizontalBars"),
+            "missing horizontalBars helper"
         );
         assert!(
-            body.contains(r#"<header class="topbar">"#),
-            "missing topbar"
+            body.contains("function lineChart"),
+            "missing lineChart helper"
         );
+        assert!(
+            body.contains("svgEl('rect'"),
+            "horizontalBars must build rect elements"
+        );
+    }
+
+    /// Sidebar + 18-section nav landmarks must be present in the
+    /// shipped page (operator-facing brand strings and nav data
+    /// attributes the JS uses for routing).
+    #[tokio::test]
+    async fn page_landmarks_brand_and_nav() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("<title>Relix"), "missing title");
         assert!(body.contains("Operator Console"), "missing brand subtitle");
-
-        // All twelve routes register a nav item AND a
-        // corresponding page section.
-        for route in [
-            "overview",
-            "tasks",
-            "topology",
-            "capabilities",
-            "mcp",
-            "fsaudit",
-            "termaudit",
-            "browser",
-            "metrics",
-            "providers",
-            "telegram",
-            "config",
-        ] {
-            assert!(
-                body.contains(&format!(r#"data-route="{route}""#)),
-                "missing nav item for {route}"
-            );
-            assert!(
-                body.contains(&format!(r#"data-page="{route}""#)),
-                "missing page section for {route}"
-            );
-        }
-
+        assert!(body.contains("id=\"sidebar\""), "missing sidebar shell");
         assert!(
-            body.contains(r#"id="status-dot""#),
-            "missing topbar status dot"
+            body.contains("id=\"theme-toggle\""),
+            "missing dark-mode toggle"
         );
-        for ep in ["/v1/health", "/v1/topology", "/v1/tasks/cursor"] {
-            // The JS that consumes these moved to /assets, but
-            // the endpoint strings still appear in HTML data
-            // attributes / comments — keep the canary loose.
-            let _ = ep;
-        }
+        assert!(
+            body.contains("data-section=\"overview\""),
+            "missing nav routing data"
+        );
     }
 
+    /// Dark-mode toggle wires through to the `<html>` root via
+    /// `setAttribute('data-theme', ...)` — operator tests assert
+    /// that lookup string is present.
     #[tokio::test]
-    async fn page_providers_landmarks_present() {
-        // The providers page (M6) wires the dashboard to
-        // /v1/config/providers. Assert the page mentions every
-        // provider card stub by name.
+    async fn page_dark_mode_toggle_targets_data_theme_attribute() {
         let resp = page().await.into_response();
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(body.contains("data-page=\"providers\""));
+        assert!(
+            body.contains("setAttribute('data-theme'"),
+            "dashboard JS does not toggle data-theme"
+        );
+        assert!(
+            body.contains("getElementById('theme-toggle')"),
+            "dashboard JS does not bind the theme-toggle button"
+        );
     }
 
-    // ── RELIX-7.11 GAP 3 — agent observability landmarks + env override ──
-
+    /// Logs section uses EventSource on /v1/logs/stream and the
+    /// bridge installs that route. The endpoint is asserted by
+    /// `logs.rs` tests; here we just confirm the dashboard wires
+    /// to the documented path.
     #[tokio::test]
-    async fn page_includes_agent_observability_panels() {
-        // The four GAP-3 panels (Agent summary, Active alerts,
-        // Cost breakdown, Per-agent trend) must each register a
-        // host element + manual refresh button + last-refresh
-        // slot in the dashboard HTML. A future edit that drops
-        // one of these IDs breaks the per-panel refresh /
-        // teardown wiring. JS-side landmarks
-        // (AGENT_OBS_INTERVALS_MS, _SPARK_GLYPHS,
-        // relixBridgeBase, endpoint URLs) live in the
-        // /assets/dashboard.js body and are asserted by
-        // `script_asset_carries_agent_observability_logic`.
+    async fn page_logs_section_subscribes_to_v1_logs_stream() {
         let resp = page().await.into_response();
         let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        for id in ["agents-host", "alerts-host", "cost-host", "trend-host"] {
-            assert!(
-                body.contains(&format!(r#"id="{id}""#)),
-                "missing GAP-3 panel host id={id:?}"
-            );
-        }
-        for prefix in ["agents", "alerts", "cost", "trend"] {
-            assert!(
-                body.contains(&format!(r#"id="{prefix}-refresh-btn""#)),
-                "missing per-panel refresh button for {prefix}"
-            );
-            assert!(
-                body.contains(&format!(r#"id="{prefix}-last-refresh""#)),
-                "missing per-panel last-refresh slot for {prefix}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn script_asset_carries_agent_observability_logic() {
-        // The JS that drives the four GAP-3 panels lives in
-        // /assets/dashboard.js (extracted out for CSP). Every
-        // load-bearing JS landmark is asserted here so a future
-        // refactor of the script body fails fast.
-        let resp = script_asset().await.into_response();
-        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(
-            body.contains("AGENT_OBS_INTERVALS_MS"),
-            "missing per-panel polling cadence map"
+            body.contains("new EventSource('/v1/logs/stream'"),
+            "logs section is not subscribed to /v1/logs/stream"
         );
-        assert!(
-            body.contains("relixBridgeBase"),
-            "missing localStorage.relixBridgeBase override"
-        );
-        assert!(
-            body.contains("_SPARK_GLYPHS"),
-            "missing sparkline glyph table"
-        );
-        for ep in [
-            "/v1/metrics/agents",
-            "/v1/metrics/alerts",
-            "/v1/metrics/cost",
-            "/timeseries",
-        ] {
-            assert!(
-                body.contains(ep),
-                "script asset does not reference {ep:?} — panel will not load"
-            );
-        }
-        // Per-panel loaders + teardown helper.
-        for fname in [
-            "loadAgentsPanel",
-            "loadAlertsPanel",
-            "loadCostPanel",
-            "loadTrendPanel",
-            "teardownAgentObservability",
-        ] {
-            assert!(
-                body.contains(fname),
-                "missing JS function {fname} in script asset"
-            );
-        }
     }
 
     #[test]
@@ -445,10 +378,6 @@ mod tests {
 
     #[test]
     fn resolve_dashboard_source_serves_alternate_file_when_env_set() {
-        // Write a recognisable HTML file to a tempfile and
-        // verify the resolver reads it instead of returning the
-        // embedded copy. Marker chosen so it cannot collide with
-        // any real dashboard string.
         let tmp =
             std::env::temp_dir().join(format!("relix_dashboard_test_{}.html", std::process::id()));
         let marker = "<!-- RELIX_TEST_MARKER_ZZZ -->";
@@ -460,10 +389,8 @@ mod tests {
 
     #[test]
     fn resolve_dashboard_source_falls_back_when_file_missing() {
-        // Pointing at a path that does not exist must not panic
-        // — it logs a warning and returns the embedded copy.
         let bogus = std::env::temp_dir().join("relix_dashboard_does_not_exist_zzz.html");
-        let _ = std::fs::remove_file(&bogus); // ensure absent
+        let _ = std::fs::remove_file(&bogus);
         let out = resolve_dashboard_source(Some(bogus.to_str().unwrap()));
         assert_eq!(out, DASHBOARD_HTML_EMBEDDED);
     }

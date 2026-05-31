@@ -397,6 +397,10 @@ pub struct AppState {
     /// gate. Shared with both the HTTP middleware and the
     /// WebSocket handler. See `crate::rate_limit`.
     pub rate_limits: crate::rate_limit::RateLimits,
+    /// Real-time log ring + broadcast surface. Installed as a
+    /// tracing-subscriber layer at process startup; consumed by
+    /// the dashboard's Section 18 (`GET /v1/logs/stream`).
+    pub log_ring: crate::logs::LogRing,
     /// Multi-agent handoff audit ring. Bounded in-memory
     /// (`HANDOFF_RING_CAP = 100`); resets on bridge restart.
     /// Populated via `POST /v1/guardrails/handoffs`; read via
@@ -640,6 +644,7 @@ impl AppState {
             bridge_host,
             bridge_port,
             rate_limits: crate::rate_limit::RateLimits::new(rate_limit_cfg),
+            log_ring: crate::logs::LogRing::new(),
             handoff_audit: crate::guardrails::HandoffAuditRing::new(),
             jit_secrets: std::sync::Arc::new(
                 relix_runtime::nodes::execution::secrets::SecretStore::from_env(),

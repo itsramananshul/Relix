@@ -133,6 +133,7 @@ mod knowledge_mini_mesh_test;
 #[cfg(test)]
 mod legacy_token_full_stack_integration_test;
 mod lifecycle;
+mod logs;
 mod mcp;
 mod mcp_audit;
 mod memory_curator;
@@ -224,12 +225,24 @@ fn unix_secs() -> i64 {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Dashboard Section 18: the LogRing must be installed as a
+    // tracing layer BEFORE any event fires so the ring captures
+    // the bridge's own startup output. We construct it here,
+    // hand it to the tracing registry, and then thread the same
+    // handle into AppState.log_ring so the SSE endpoint and the
+    // layer share one buffer.
+    let log_ring = crate::logs::LogRing::new();
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(crate::logs::LogRingLayer::new(log_ring.clone()))
+            .init();
+    }
 
     let args = Args::parse();
     let cfg: BridgeConfig = {
@@ -238,6 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         toml::from_str(&text).map_err(|e| format!("parse config: {e}"))?
     };
     let mut state = AppState::try_new(cfg.clone())?;
+    // Replace the default LogRing baked into AppState by the
+    // try_new ctor with the one we installed on the tracing
+    // registry above — both halves must point at the same
+    // buffer.
+    state.log_ring = log_ring;
 
     // W7: spawn the OTel flush loop on startup if the bridge's
     // `[observability.otel]` block enabled the exporter. The
@@ -1010,17 +1028,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // save/test. JSONL on disk under data_dir +
         // in-memory ring (resets on restart).
         .route("/v1/intervention/recent", get(intervention_audit::recent))
+        // Dashboard Section 18: real-time log tail. SSE stream
+        // that ships the last 500 lines from the in-memory ring
+        // first, then live-tails the broadcast channel
+        // populated by the LogRingLayer installed on tracing
+        // init in `main()`. Keep-alive comments every 15s so
+        // idle connections survive reverse-proxy timeouts.
+        .route("/v1/logs/stream", get(logs::stream))
         // Operator dashboard. Single-page static HTML; consumes
         // the existing /v1/tasks* endpoints. No server-side
         // state introduced. See docs/bridge-invariants.md.
         .route("/dashboard", get(dashboard::page))
-        // Dashboard's JavaScript body, extracted out of the
-        // inline `<script>` so the strict CSP at
-        // `crate::security_headers` (script-src 'self', no
-        // 'unsafe-inline') can take effect. Both routes serve
-        // a single string each — the split is cached in a
-        // OnceLock the first time either is hit.
-        .route("/assets/dashboard.js", get(dashboard::script_asset))
+        // The dashboard ships as a single self-contained HTML
+        // file (CSS + JS inline) under a per-route CSP that
+        // allows inline scripts. The historical
+        // `/assets/dashboard.js` split was deleted in the
+        // dashboard rebuild — operators load the whole UI in
+        // one round trip now.
         // One-time bootstrap so the dashboard can pick up its
         // bearer token without the operator pasting it manually.
         // Guarded inside the handler: refuses when the caller

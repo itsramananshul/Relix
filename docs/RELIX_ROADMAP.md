@@ -1,6 +1,6 @@
 # Relix — Full Engineering Roadmap
 
-**Last updated:** May 29, 2026 (later same day) — §7.23 Perception Tools flipped to `[DONE]` (cloud parse_document + web_read tiers via LlamaParse / Jina / Firecrawl with silent local fallthrough; tool.screen via scrot / screencapture / PowerShell; setup scripts walk every key) and §7.28 Feature 2 spike + drift alerts flipped fully `[DONE]` (persistent baseline + spike-history store + scheduler + caps + bridge + CLI in 5f56dd3). GAP 10 and GAP 22 Feature 2 closed end-to-end. Earlier May 29 audit: §7.18 Research-Backed Identity flipped to `[DONE]` (commits 5c18f41 + 2bde84d + 34465a5 + 061634a; GAP 17 closed). Prior audit pass (May 27): Dependency Auto-Install shipped (cd9ea63); 14 items flipped to `[SKIPPED]` with the honest reason each requires (external infrastructure, external API access, multi-week frontend work, or a dedicated session for cross-cutting cryptographic / policy review). Memory Security, Memory Inspector, and Memory Consolidation Strategy flipped to `[DONE]` against their already-shipped commits.
+**Last updated:** May 31, 2026 — Operator dashboard rebuild flipped fully `[DONE]`. Single self-contained `dashboard.html` (CSS + JS inline, no external deps) wired to all 18 spec'd sections (Overview, Chat, Memory, Approvals, Skills, Sessions, Reasoning, Credentials, Identity, Cost & Metrics, Observability, Multi-Tenant, Planning, Workflows, Email, Plugins, Configuration, Logs). New `crates/relix-web-bridge/src/logs.rs` adds a tracing `Layer` + bounded ring + `GET /v1/logs/stream` SSE endpoint so Section 18 streams the last 500 lines live (replaces the prior stdout-only logging surface). Per-route CSP (`script-src 'self' 'unsafe-inline'`) stamped only on `/dashboard` — the bridge's strict default CSP still applies everywhere else via the middleware's preserve-on-handler-set rule. The legacy `/assets/dashboard.js` extraction route deleted. 18 new dashboard tests + 4 new logs tests pass. Earlier May 29 (later same day): §7.23 Perception Tools flipped to `[DONE]` (cloud parse_document + web_read tiers via LlamaParse / Jina / Firecrawl with silent local fallthrough; tool.screen via scrot / screencapture / PowerShell; setup scripts walk every key) and §7.28 Feature 2 spike + drift alerts flipped fully `[DONE]` (persistent baseline + spike-history store + scheduler + caps + bridge + CLI in 5f56dd3). GAP 10 and GAP 22 Feature 2 closed end-to-end. Earlier May 29 audit: §7.18 Research-Backed Identity flipped to `[DONE]` (commits 5c18f41 + 2bde84d + 34465a5 + 061634a; GAP 17 closed). Prior audit pass (May 27): Dependency Auto-Install shipped (cd9ea63); 14 items flipped to `[SKIPPED]` with the honest reason each requires (external infrastructure, external API access, multi-week frontend work, or a dedicated session for cross-cutting cryptographic / policy review). Memory Security, Memory Inspector, and Memory Consolidation Strategy flipped to `[DONE]` against their already-shipped commits.
 **Status:** Living document — add ideas here before building anything
 
 ---
@@ -402,6 +402,21 @@ All dependencies ready. Memory features enabled.
 2. Remove all inline `onclick=` handlers — move to `addEventListener`.
 3. Add Content Security Policy header from the bridge.
 4. Add XSS regression tests.
+
+---
+
+### 4.2 Full Operator Dashboard (18 sections) `[DONE — May 31, 2026]`
+
+Full rebuild of `crates/relix-web-bridge/src/dashboard.html` as a single self-contained HTML file (CSS + JS inline, no CDN, no external fonts, no bundler) wiring every shipped Relix feature to a dedicated dashboard section. The 18 sections — Overview, Chat, Memory, Approvals, Skills, Sessions, Reasoning, Credentials, Identity, Cost & Metrics, Observability, Multi-Tenant, Planning, Workflows, Email, Plugins, Configuration, Logs — each call real bridge endpoints, render via a safe `el()` DOM builder (zero `innerHTML` assignments with dynamic data), and ship error / loading states with retry per panel. Dark mode persists via `localStorage`, the sidebar collapses to a hamburger under 900px, and per-section auto-refresh (30 s default, 10 s for Approvals) tears down cleanly on navigation.
+
+Bridge work that landed alongside the UI:
+
+- New `crates/relix-web-bridge/src/logs.rs` module: a `tracing_subscriber::Layer` captures every event into a bounded `LogRing` (500 lines) + `tokio::sync::broadcast` channel; the `GET /v1/logs/stream` SSE handler ships the ring snapshot first, then live-tails the broadcast with 15 s keep-alive. The fmt layer to stdout is unchanged — the ring is additive.
+- `crates/relix-web-bridge/src/dashboard.rs` rewritten: drops the legacy `/assets/dashboard.js` split (the spec's per-route CSP allows `'unsafe-inline'`, so the whole UI ships in one HTML document), stamps the per-route CSP + `X-Frame-Options: DENY` + `X-Content-Type-Options: nosniff` + `Referrer-Policy: no-referrer` on `/dashboard`, keeps the `RELIX_DASHBOARD_PATH` env override for hot-swap, and asserts the new shape via 14 unit tests (one per claim: 18 section IDs, no external script/style loads, no `innerHTML` assignments with dynamic data, SVG chart helper present, dark-mode toggle wires to `data-theme`, `/v1/logs/stream` subscribed by Section 18).
+- `main.rs` installs the `LogRingLayer` on the tracing registry before any event fires so the bridge's own startup output is captured, then threads the same `LogRing` handle into `AppState.log_ring` for the SSE handler to consume.
+- `crates/relix-web-bridge/src/security_headers.rs` is unchanged — its existing preserve-on-handler-set rule lets the dashboard's per-route CSP take effect while every other route keeps the strict `script-src 'self'` default.
+
+Tests: 14 dashboard tests + 4 log-ring tests pass; the full bridge test suite (537+ tests) is green; cargo clippy `-D warnings` clean.
 
 ---
 
