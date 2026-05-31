@@ -79,6 +79,15 @@ pub struct ResearchConfig {
     /// Default 2s.
     #[serde(default = "default_approval_poll_interval_secs")]
     pub approval_poll_interval_secs: u64,
+    /// PART 7: per-call search timeout, seconds. Each
+    /// `provider.search` invocation is wrapped in
+    /// [`tokio::time::timeout`] using this value; a timeout
+    /// logs a warning and the partial-result set is still
+    /// returned. When every search times out the pipeline
+    /// surfaces [`ResearchError::AllSearchesTimedOut`].
+    /// Default 30s.
+    #[serde(default = "default_search_timeout_secs")]
+    pub search_timeout_secs: u64,
 }
 
 impl Default for ResearchConfig {
@@ -91,6 +100,7 @@ impl Default for ResearchConfig {
             max_results_per_query: default_max_results_per_query(),
             approval_wait_timeout_secs: default_approval_wait_timeout_secs(),
             approval_poll_interval_secs: default_approval_poll_interval_secs(),
+            search_timeout_secs: default_search_timeout_secs(),
         }
     }
 }
@@ -113,6 +123,10 @@ fn default_approval_wait_timeout_secs() -> u64 {
 
 fn default_approval_poll_interval_secs() -> u64 {
     2
+}
+
+fn default_search_timeout_secs() -> u64 {
+    30
 }
 
 const HARD_QUERY_CAP: usize = 10;
@@ -195,6 +209,15 @@ pub enum ResearchError {
     MemoryWrite(String),
     #[error("identity.research: subject name is required")]
     SubjectMissing,
+    /// PART 7: every per-call search wrapped in
+    /// [`tokio::time::timeout`] elapsed without returning,
+    /// leaving the synthesis stage with no candidate URLs.
+    /// The pipeline surfaces this distinct from a provider
+    /// error so the operator can lengthen
+    /// `[identity.research] search_timeout_secs` rather than
+    /// chasing a search backend.
+    #[error("identity.research: every search query timed out — adjust search_timeout_secs")]
+    AllSearchesTimedOut,
 }
 
 /// The five-stage pipeline. Cheap to clone (couple of
@@ -375,25 +398,50 @@ impl ResearchPipeline {
 
     async fn run_searches(&self, queries: &[String]) -> Result<Vec<SearchResult>, ResearchError> {
         let per_query = self.cfg.max_results_per_query.clamp(1, 20);
+        // PART 7: wrap every per-call provider.search in
+        // tokio::time::timeout so a single hung query can't
+        // stall the whole pipeline. Timeouts log a warning;
+        // surviving queries' results are merged into the
+        // combined set. If every query times out we surface
+        // AllSearchesTimedOut so the operator sees the
+        // structural cause instead of an empty result set.
+        let timeout = Duration::from_secs(self.cfg.search_timeout_secs.max(1));
         let mut handles = Vec::with_capacity(queries.len());
         for q in queries {
             let provider = self.search.clone();
             let q = q.clone();
-            handles.push(tokio::spawn(
-                async move { provider.search(&q, per_query).await },
-            ));
+            handles.push(tokio::spawn(async move {
+                tokio::time::timeout(timeout, provider.search(&q, per_query)).await
+            }));
         }
         let mut combined: Vec<SearchResult> = Vec::new();
+        let total_queries = handles.len();
+        let mut timed_out = 0usize;
+        let mut completed = 0usize;
         for h in handles {
             match h.await {
-                Ok(Ok(mut rows)) => combined.append(&mut rows),
-                Ok(Err(e)) => {
+                Ok(Ok(Ok(mut rows))) => {
+                    completed += 1;
+                    combined.append(&mut rows);
+                }
+                Ok(Ok(Err(e))) => {
+                    completed += 1;
                     tracing::warn!(error = %e, "identity.research: search query failed");
+                }
+                Ok(Err(_)) => {
+                    timed_out += 1;
+                    tracing::warn!(
+                        timeout_secs = self.cfg.search_timeout_secs,
+                        "identity.research: search query timed out; continuing with partial results"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "identity.research: search task panicked");
                 }
             }
+        }
+        if total_queries > 0 && timed_out == total_queries && completed == 0 {
+            return Err(ResearchError::AllSearchesTimedOut);
         }
         Ok(dedup_by_url(combined))
     }
@@ -998,6 +1046,7 @@ mod tests {
             max_results_per_query: 3,
             approval_wait_timeout_secs: 1,
             approval_poll_interval_secs: 1,
+            search_timeout_secs: 5,
         };
         let ai: Arc<dyn ChatProvider> = Arc::new(ScriptedAi::new(vec![
             r#"["Alice Smith github", "Alice Smith engineer"]"#,
