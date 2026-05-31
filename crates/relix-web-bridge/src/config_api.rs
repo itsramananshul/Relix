@@ -425,6 +425,24 @@ fn scrub_telegram_url(s: &str) -> String {
     out
 }
 
+/// PHASE 1B — validate a Telegram bot token against the exact
+/// grammar `^\d+:[A-Za-z0-9_-]+$` (numeric bot id, colon,
+/// base64url-style secret). Implemented without the `regex`
+/// crate. Crucially this rejects CRLF and every other
+/// out-of-charset byte, so a token cannot splice extra lines
+/// into the outbound `api.telegram.org` request URL.
+pub fn is_valid_telegram_bot_token(token: &str) -> bool {
+    let Some((id, secret)) = token.split_once(':') else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && !secret.is_empty()
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// `PUT /v1/config/telegram` — set the bot token + delivery
 /// mode. Idempotent. Persists webhook mode + URL when
 /// supplied, but the live HTTPS client wiring is pending —
@@ -437,6 +455,17 @@ pub async fn put_telegram(
     let corr = new_correlation_id();
     if req.bot_token.trim().is_empty() {
         return Err(bad_request("bot_token required (non-empty)"));
+    }
+    // PHASE 1B: the bot token is interpolated into the outbound
+    // `https://api.telegram.org/bot<TOKEN>/…` URL. A CRLF (or any
+    // out-of-charset byte) in it would splice extra request lines
+    // into that call (HTTP request-splitting). Enforce the exact
+    // Telegram token grammar at PUT time and reject anything else.
+    if !is_valid_telegram_bot_token(req.bot_token.trim()) {
+        return Err(unprocessable(
+            "bot_token must match ^\\d+:[A-Za-z0-9_-]+$ — rejects CRLF and other \
+             out-of-charset bytes that could splice into the outbound Telegram API URL",
+        ));
     }
     if !ALLOWED_TELEGRAM_MODES.contains(&req.mode.as_str()) {
         return Err(unprocessable(format!(
@@ -456,6 +485,15 @@ pub async fn put_telegram(
         if !url.starts_with("https://") {
             return Err(unprocessable(
                 "webhook_url must be https:// (Telegram Bot API requires HTTPS)",
+            ));
+        }
+        // PHASE 1B: the webhook URL is sent to Telegram and later
+        // interpolated into outbound calls; reject any control
+        // byte (CRLF etc.) or whitespace that could splice or
+        // corrupt that URL.
+        if url.chars().any(|c| c.is_whitespace() || (c as u32) < 0x20) {
+            return Err(unprocessable(
+                "webhook_url must not contain whitespace or control characters",
             ));
         }
     }
@@ -828,5 +866,26 @@ mod tests {
         let v2 = h2.read(|s| s.provider_status("openai"));
         assert!(v2.configured);
         assert_eq!(v2.key_preview.as_deref(), Some("…1234"));
+    }
+
+    #[test]
+    fn phase1b_bot_token_validation_rejects_crlf_and_out_of_charset() {
+        // Well-formed token accepted.
+        assert!(super::is_valid_telegram_bot_token(
+            "123456789:AAH-abcDEF_ghijklmnopqrstuvwxyz01"
+        ));
+        // CRLF injection → rejected (request-splitting vector).
+        assert!(!super::is_valid_telegram_bot_token(
+            "123456789:AAH\r\nHost: evil"
+        ));
+        assert!(!super::is_valid_telegram_bot_token("123:abc\rdef"));
+        assert!(!super::is_valid_telegram_bot_token("123:abc\ndef"));
+        // Out-of-charset / malformed shapes → rejected.
+        assert!(!super::is_valid_telegram_bot_token("123:abc def"));
+        assert!(!super::is_valid_telegram_bot_token("123:abc/def"));
+        assert!(!super::is_valid_telegram_bot_token("notdigits:abc"));
+        assert!(!super::is_valid_telegram_bot_token("123abc"));
+        assert!(!super::is_valid_telegram_bot_token(":abc"));
+        assert!(!super::is_valid_telegram_bot_token("123:"));
     }
 }

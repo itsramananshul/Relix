@@ -91,6 +91,25 @@ pub async fn send(
         )
             .into_response();
     }
+    // PHASE 1B: validate every file-backed attachment path
+    // BEFORE forwarding it to the email peer. A verbatim path
+    // (e.g. `/etc/shadow` or one containing `..`) would ship an
+    // arbitrary host file. Paths are confined to the fixed
+    // attachment root.
+    let root = attachment_root();
+    for att in &req.attachments {
+        if let Some(p) = att.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Err(e) = validate_attachment_path(p, &root) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: format!("attachment path rejected: {e}"),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let args = serde_json::json!({
         "to": req.to,
@@ -313,6 +332,55 @@ pub struct SendAttachment {
 
 fn default_attachment_ct() -> String {
     "application/octet-stream".to_string()
+}
+
+/// PHASE 1B — the fixed directory file-backed email attachments
+/// must live under. Operator-overridable via
+/// `RELIX_EMAIL_ATTACHMENT_ROOT`; defaults to `./attachments`.
+fn attachment_root() -> std::path::PathBuf {
+    std::env::var_os("RELIX_EMAIL_ATTACHMENT_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("attachments"))
+}
+
+/// PHASE 1B — confine a client-supplied attachment path to
+/// `root`. Rejects absolute paths, drive prefixes, root-anchored
+/// paths, and any `..` component, then resolves against `root`
+/// and confirms the CANONICAL result is still inside the
+/// canonical root (defeating symlink / traversal escapes). On
+/// success returns the canonical in-root path.
+pub fn validate_attachment_path(
+    path: &str,
+    root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return Err(format!("`{path}` is absolute; only paths relative to the attachment root are allowed"));
+    }
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => return Err(format!("`{path}` contains `..`")),
+            // `/etc/shadow` (RootDir) and `C:\…` (Prefix) are
+            // root-anchored even when `is_absolute()` is false on
+            // some platforms — reject both.
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("`{path}` is root-anchored"));
+            }
+            _ => {}
+        }
+    }
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("attachment root `{}` unavailable: {e}", root.display()))?;
+    let canon = root
+        .join(p)
+        .canonicalize()
+        .map_err(|e| format!("`{path}` does not resolve to a file under the attachment root: {e}"))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(format!("`{path}` escapes the attachment root"));
+    }
+    Ok(canon)
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -641,6 +709,22 @@ mod tests {
         assert!(req.to.is_empty());
         assert!(req.subject.is_empty());
         assert!(req.body.is_empty());
+    }
+
+    #[test]
+    fn phase1b_attachment_path_rejects_escape_and_accepts_in_root() {
+        let root = tempfile::tempdir().unwrap();
+        // A legitimate in-root file is accepted.
+        std::fs::write(root.path().join("report.pdf"), b"hi").unwrap();
+        assert!(
+            validate_attachment_path("report.pdf", root.path()).is_ok(),
+            "a legitimate in-root attachment must be accepted"
+        );
+        // Absolute host path exfil → rejected.
+        assert!(validate_attachment_path("/etc/shadow", root.path()).is_err());
+        // Traversal out of the root → rejected.
+        assert!(validate_attachment_path("../../etc/passwd", root.path()).is_err());
+        assert!(validate_attachment_path("sub/../../escape", root.path()).is_err());
     }
 
     #[test]
