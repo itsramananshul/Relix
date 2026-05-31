@@ -647,6 +647,86 @@ impl LayeredMemoryStore {
         Ok(out)
     }
 
+    /// CORR PART 6: cursor-based variant of [`Self::list`].
+    /// Returns up to `limit` rows whose SQLite rowid is
+    /// strictly greater than `cursor_rowid`, paired with the
+    /// rowid so the caller can mint the next cursor. Ordered
+    /// `rowid ASC` so a stable forward scan is possible — the
+    /// pre-fix `ORDER BY created_at DESC` ordering doesn't
+    /// support cursoring (two rows can share a created_at,
+    /// and DESC doesn't compose with `> cursor` semantics).
+    pub fn list_after_rowid(
+        &self,
+        layer: Option<MemoryLayer>,
+        source: Option<&str>,
+        cursor_rowid: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, MemoryRecord)>, LayeredMemoryError> {
+        let limit = limit.clamp(1, 4096);
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) = match (layer, source) {
+            (None, None) => (
+                "SELECT rowid, id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+                 FROM memory_records \
+                 WHERE rowid > ?2 \
+                 ORDER BY rowid ASC \
+                 LIMIT ?1",
+                vec![limit.into(), cursor_rowid.into()],
+            ),
+            (Some(l), None) => (
+                "SELECT rowid, id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+                 FROM memory_records WHERE layer = ?3 AND rowid > ?2 \
+                 ORDER BY rowid ASC \
+                 LIMIT ?1",
+                vec![
+                    limit.into(),
+                    cursor_rowid.into(),
+                    l.as_str().to_string().into(),
+                ],
+            ),
+            (None, Some(s)) => (
+                "SELECT rowid, id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+                 FROM memory_records WHERE source = ?3 AND rowid > ?2 \
+                 ORDER BY rowid ASC \
+                 LIMIT ?1",
+                vec![limit.into(), cursor_rowid.into(), s.to_string().into()],
+            ),
+            (Some(l), Some(s)) => (
+                "SELECT rowid, id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+                 FROM memory_records WHERE layer = ?3 AND source = ?4 AND rowid > ?2 \
+                 ORDER BY rowid ASC \
+                 LIMIT ?1",
+                vec![
+                    limit.into(),
+                    cursor_rowid.into(),
+                    l.as_str().to_string().into(),
+                    s.to_string().into(),
+                ],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |r| {
+            let rowid: i64 = r.get(0)?;
+            // Skip the rowid column for `row_to_record`; the
+            // *_offset variant reads from index 1 onward.
+            Ok((rowid, row_to_record_offset(r)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (rowid, rec_res) = r?;
+            out.push((rowid, rec_res?));
+        }
+        Ok(out)
+    }
+
     /// Naive substring search against the `text` column. Used
     /// by `memory.search` when no Qdrant is configured. Case-
     /// insensitive (SQLite's `LIKE` is case-insensitive for
@@ -1588,6 +1668,76 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
 /// folded through rusqlite's `Result` so we can use it inside
 /// `query_map`. The outer `Result<_>` is rusqlite's; the inner
 /// `Result<_>` is ours (returns the parse error on bad rows).
+/// CORR PART 6: variant of [`row_to_record`] that reads from
+/// index 1 onward, leaving index 0 for the caller's rowid
+/// projection. Used by [`LayeredMemoryStore::list_after_rowid`].
+fn row_to_record_offset(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<MemoryRecord, LayeredMemoryError>> {
+    let id: String = r.get(1)?;
+    let layer_s: String = r.get(2)?;
+    let text: String = r.get(3)?;
+    let source: String = r.get(4)?;
+    let tags_json: String = r.get(5)?;
+    let created_at: i64 = r.get(6)?;
+    let valid_from: i64 = r.get(7)?;
+    let valid_to: Option<i64> = r.get(8)?;
+    let observed_at: i64 = r.get(9)?;
+    let embedding_blob: Option<Vec<u8>> = r.get(10)?;
+    let shareable: i32 = r.get(11).unwrap_or(0);
+    let shared_with_json: Option<String> = r.get(12).unwrap_or(None);
+    let shared_by: Option<String> = r.get(13).unwrap_or(None);
+    let share_policy_s: Option<String> = r.get(14).unwrap_or(None);
+    let source_trust_s: Option<String> = r.get(15).unwrap_or(None);
+    let frozen: i32 = r.get(16).unwrap_or(0);
+    let last_edited_ms: Option<i64> = r.get(17).unwrap_or(None);
+    let consolidated: i32 = r.get(18).unwrap_or(0);
+    let tenant_id: Option<String> = r.get(19).unwrap_or(None);
+    let superseded_by: Option<String> = r.get(20).unwrap_or(None);
+    Ok((|| {
+        let layer = MemoryLayer::parse(&layer_s).ok_or_else(|| {
+            LayeredMemoryError::Serialization(format!("unknown layer: {layer_s}"))
+        })?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json)
+            .map_err(|e| LayeredMemoryError::Serialization(e.to_string()))?;
+        let embedding = embedding_blob.map(|b| decode_f32_le(&b));
+        let shared_with: Vec<String> = match shared_with_json.as_deref() {
+            None | Some("") => Vec::new(),
+            Some(s) => serde_json::from_str(s).unwrap_or_default(),
+        };
+        let share_policy = share_policy_s
+            .as_deref()
+            .and_then(SharePolicy::parse)
+            .unwrap_or(SharePolicy::None);
+        let source_trust = source_trust_s
+            .as_deref()
+            .and_then(SourceTrust::parse)
+            .unwrap_or(SourceTrust::Internal);
+        Ok(MemoryRecord {
+            id,
+            layer,
+            text,
+            source,
+            tags,
+            created_at,
+            valid_from,
+            valid_to,
+            observed_at,
+            embedding,
+            shareable: shareable != 0,
+            shared_with,
+            shared_by,
+            share_policy,
+            source_trust,
+            frozen: frozen != 0,
+            last_edited_ms,
+            consolidated: consolidated != 0,
+            tenant_id,
+            superseded_by,
+        })
+    })())
+}
+
 fn row_to_record(
     r: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<Result<MemoryRecord, LayeredMemoryError>> {

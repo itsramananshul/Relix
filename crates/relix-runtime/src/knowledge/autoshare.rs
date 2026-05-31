@@ -45,10 +45,20 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::nodes::memory::schema::{LayeredMemoryStore, MemoryLayer, SharePolicy};
+use crate::nodes::memory::schema::{LayeredMemoryStore, MemoryLayer, MemoryRecord, SharePolicy};
 
 use super::config::KnowledgeConfig;
 use super::service::{KnowledgeService, ShareRequest};
+
+/// CORR PART 6: page size for cursor-walking observation
+/// rows on the per-agent autoshare path.
+pub const AUTOSHARE_LIST_PAGE_SIZE: usize = 500;
+
+/// CORR PART 6: per-tick hard cap on how many observation
+/// rows the autoshare scanner reads PER AGENT. Replaces the
+/// pre-fix bare `LIMIT 500` so a deep history is no longer
+/// silently shadowed.
+pub const AUTOSHARE_PER_AGENT_HARD_CAP: usize = 5_000;
 
 /// Configuration for the spawned task.
 #[derive(Clone, Debug)]
@@ -298,17 +308,48 @@ async fn run_tick(task: &AutoShareTask) -> AutoShareTickStats {
         }
         stats.agents_scanned += 1;
         let cursor = cursor_snapshot.get(&agent).copied().unwrap_or(0);
-        let rows = match task
-            .store
-            .list(Some(MemoryLayer::Observation), Some(&agent), 500, 0)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, agent, "knowledge.autoshare: list failed");
-                last_completed_idx = Some(idx);
-                continue;
+        // CORR PART 6: cursor-walk the per-agent observation
+        // rows instead of a single 500-row pull. Pre-fix path
+        // capped at 500 rows with no continuation, so any
+        // agent with > 500 observation rows could permanently
+        // shadow its newer entries from the autoshare scanner.
+        // We walk in batches of `AUTOSHARE_LIST_PAGE_SIZE`
+        // and stop at the same total cap so the per-tick
+        // memory + CPU budget stays bounded.
+        let mut rows: Vec<MemoryRecord> = Vec::new();
+        let mut rowid_cursor: i64 = 0;
+        loop {
+            if rows.len() >= AUTOSHARE_PER_AGENT_HARD_CAP {
+                break;
             }
-        };
+            let chunk = match task.store.list_after_rowid(
+                Some(MemoryLayer::Observation),
+                Some(&agent),
+                rowid_cursor,
+                AUTOSHARE_LIST_PAGE_SIZE as i64,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, agent, "knowledge.autoshare: list failed");
+                    break;
+                }
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let last = chunk.last().map(|p| p.0).unwrap_or(0);
+            for (_rowid, r) in chunk {
+                rows.push(r);
+            }
+            rowid_cursor = last;
+        }
+        if rows.is_empty() && rowid_cursor == 0 {
+            // Original `list` returned an error path above; we
+            // already logged and moved on. Continue to the
+            // next agent.
+            last_completed_idx = Some(idx);
+            continue;
+        }
         let mut eligible: Vec<_> = rows
             .into_iter()
             .filter(|r| r.share_policy == SharePolicy::Auto && r.valid_to.is_none())

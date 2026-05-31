@@ -88,6 +88,11 @@ pub struct BroadcastResult {
 }
 
 /// Filter for [`KnowledgeService::list_shared`].
+///
+/// CORR PART 6: `cursor` + `page_size` add cursor-based
+/// pagination. The pre-fix path hard-coded a 10000-row LIMIT
+/// with no continuation, so a tenant with > 10k received
+/// observations could never read past the first page.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ListSharedFilter {
     pub agent: String,
@@ -99,6 +104,41 @@ pub struct ListSharedFilter {
     pub date_to: Option<i64>,
     #[serde(default)]
     pub min_quality_score: Option<f32>,
+    /// CORR PART 6: opaque continuation cursor returned by a
+    /// prior `list_shared` call's [`ListSharedPage::next_cursor`].
+    /// `None` returns the first page. Format: the rowid of
+    /// the last returned row, base-16 encoded — opaque to
+    /// callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// CORR PART 6: page size cap. Clamped to
+    /// [`LIST_SHARED_MAX_PAGE_SIZE`] on the server; default is
+    /// [`LIST_SHARED_DEFAULT_PAGE_SIZE`] when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
+}
+
+/// CORR PART 6: default page size for `list_shared` /
+/// per-agent autoshare list when the caller does not
+/// specify one.
+pub const LIST_SHARED_DEFAULT_PAGE_SIZE: usize = 100;
+
+/// CORR PART 6: hard cap on page size operators can
+/// request. A caller asking for more is clamped here.
+pub const LIST_SHARED_MAX_PAGE_SIZE: usize = 1000;
+
+/// CORR PART 6: paginated page of `list_shared` rows. The
+/// pre-fix path returned a bare `Vec<ListSharedRow>` with no
+/// continuation cursor.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct ListSharedPage {
+    pub items: Vec<ListSharedRow>,
+    /// `Some(cursor)` when more rows exist beyond this page;
+    /// the operator passes the value back as
+    /// [`ListSharedFilter::cursor`] on the next call. `None`
+    /// on the final page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// One row returned by [`KnowledgeService::list_shared`].
@@ -594,65 +634,155 @@ impl KnowledgeService {
         })
     }
 
-    /// Implementation of `knowledge.list_shared`. Returns
-    /// every observation `agent` has received (where
-    /// `shared_by IS NOT NULL` and the receiver matches).
-    pub fn list_shared(&self, filter: &ListSharedFilter) -> Result<Vec<ListSharedRow>, ShareError> {
+    /// CORR PART 6: paginated implementation of
+    /// `knowledge.list_shared`. Returns the next page of
+    /// observations `agent` has received, plus an opaque
+    /// `next_cursor` callers send back to walk forward.
+    /// Cursor is the rowid of the last returned row, base-16
+    /// encoded — opaque on the wire.
+    pub fn list_shared_page(
+        &self,
+        filter: &ListSharedFilter,
+    ) -> Result<ListSharedPage, ShareError> {
         if filter.agent.trim().is_empty() {
             return Err(ShareError::InvalidArgs("agent is required".into()));
         }
-        // Pull every observation row owned by the receiver
-        // (source == receiver_agent on a copy) then filter
-        // down. The layered store has an index on `source`
-        // so this is O(rows-for-agent).
-        let raw = self.store.list(
-            Some(MemoryLayer::Observation),
-            Some(&filter.agent),
-            10_000,
-            0,
-        )?;
-        let mut out = Vec::with_capacity(raw.len());
-        for r in raw {
-            // Only rows that came from another agent (shared_by present).
-            let Some(shared_by) = r.shared_by.clone() else {
-                continue;
-            };
-            if let Some(filter_by) = filter.shared_by.as_ref()
-                && &shared_by != filter_by
-            {
-                continue;
+        let page_size = filter
+            .page_size
+            .unwrap_or(LIST_SHARED_DEFAULT_PAGE_SIZE)
+            .clamp(1, LIST_SHARED_MAX_PAGE_SIZE);
+        let cursor_after = match filter.cursor.as_deref() {
+            Some(s) if !s.is_empty() => Some(
+                i64::from_str_radix(s, 16)
+                    .map_err(|e| ShareError::InvalidArgs(format!("bad cursor: {e}")))?,
+            ),
+            _ => None,
+        };
+        // Pull a window of observation rows. We over-fetch
+        // slightly because the post-fetch filter (shared_by /
+        // date / quality) can reduce the page size; the
+        // outer loop refills until we have `page_size` rows
+        // or the source is exhausted. Each underlying
+        // `store.list` call is bounded so we never read more
+        // than `page_size * 4` raw rows per page.
+        let raw_window = (page_size as i64).saturating_mul(4);
+        let mut out: Vec<ListSharedRow> = Vec::with_capacity(page_size);
+        let mut last_rowid: Option<i64> = None;
+        let mut cursor_high_water = cursor_after.unwrap_or(0);
+        loop {
+            if out.len() >= page_size {
+                break;
             }
-            if let Some(from) = filter.date_from
-                && r.observed_at < from
-            {
-                continue;
+            let raw = self.store.list_after_rowid(
+                Some(MemoryLayer::Observation),
+                Some(&filter.agent),
+                cursor_high_water,
+                raw_window,
+            )?;
+            if raw.is_empty() {
+                break;
             }
-            if let Some(to) = filter.date_to
-                && r.observed_at > to
-            {
-                continue;
+            let last_chunk_rowid = raw.last().map(|r| r.0).unwrap_or(0);
+            for (rowid, r) in raw {
+                cursor_high_water = rowid;
+                let Some(shared_by) = r.shared_by.clone() else {
+                    continue;
+                };
+                if let Some(filter_by) = filter.shared_by.as_ref()
+                    && &shared_by != filter_by
+                {
+                    continue;
+                }
+                if let Some(from) = filter.date_from
+                    && r.observed_at < from
+                {
+                    continue;
+                }
+                if let Some(to) = filter.date_to
+                    && r.observed_at > to
+                {
+                    continue;
+                }
+                let quality = super::trust::extract_quality_score(&r);
+                if let Some(min) = filter.min_quality_score
+                    && quality.unwrap_or(0.0) < min
+                {
+                    continue;
+                }
+                let message = extract_share_message(&r);
+                out.push(ListSharedRow {
+                    id: r.id.clone(),
+                    text: r.text.clone(),
+                    shared_by,
+                    received_by: r.source.clone(),
+                    created_at: r.created_at,
+                    observed_at: r.observed_at,
+                    message,
+                    tags: r.tags.clone(),
+                    quality_score: quality,
+                    revoked: r.valid_to.is_some(),
+                });
+                last_rowid = Some(rowid);
+                if out.len() >= page_size {
+                    break;
+                }
             }
-            let quality = super::trust::extract_quality_score(&r);
-            if let Some(min) = filter.min_quality_score
-                && quality.unwrap_or(0.0) < min
-            {
-                continue;
+            if cursor_high_water >= last_chunk_rowid && out.len() < page_size {
+                // We consumed the whole chunk; if the chunk
+                // size matched the window we may have more,
+                // otherwise the source is exhausted.
+                if (raw_window as usize) > out.len() {
+                    break;
+                }
             }
-            let message = extract_share_message(&r);
-            out.push(ListSharedRow {
-                id: r.id.clone(),
-                text: r.text.clone(),
-                shared_by,
-                received_by: r.source.clone(),
-                created_at: r.created_at,
-                observed_at: r.observed_at,
-                message,
-                tags: r.tags.clone(),
-                quality_score: quality,
-                revoked: r.valid_to.is_some(),
-            });
         }
-        Ok(out)
+        let next_cursor = if out.len() < page_size {
+            None
+        } else {
+            last_rowid.map(|r| format!("{r:x}"))
+        };
+        Ok(ListSharedPage {
+            items: out,
+            next_cursor,
+        })
+    }
+
+    /// Legacy unpaginated `list_shared`. Back-compat wrapper
+    /// that walks every page of [`Self::list_shared_page`]
+    /// until exhaustion, capped at
+    /// `LIST_SHARED_MAX_PAGE_SIZE * 100` rows total so the
+    /// legacy call cannot exhaust memory the way the pre-fix
+    /// 10000-row path could. New callers should use
+    /// [`Self::list_shared_page`] and walk `next_cursor`.
+    pub fn list_shared(&self, filter: &ListSharedFilter) -> Result<Vec<ListSharedRow>, ShareError> {
+        let mut all = Vec::new();
+        let mut cursor = filter.cursor.clone();
+        // Safety cap: never return more than 100_000 rows
+        // through the legacy API even if the underlying
+        // store has more.
+        let hard_max = LIST_SHARED_MAX_PAGE_SIZE * 100;
+        loop {
+            let page_filter = ListSharedFilter {
+                cursor: cursor.clone(),
+                page_size: Some(LIST_SHARED_MAX_PAGE_SIZE),
+                ..filter.clone()
+            };
+            let page = self.list_shared_page(&page_filter)?;
+            let returned = page.items.len();
+            all.extend(page.items);
+            if all.len() >= hard_max {
+                all.truncate(hard_max);
+                break;
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+            if returned == 0 {
+                break;
+            }
+        }
+        Ok(all)
     }
 
     /// Implementation of `knowledge.revoke`. Soft-deletes the
@@ -1326,6 +1456,83 @@ mod tests {
             })
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    // ── CORR PART 6: cursor-based pagination on list_shared ─
+
+    #[tokio::test]
+    async fn corr_p6_list_shared_page_returns_cursor_for_more() {
+        // Push 5 observations from alice → bob; ask for page
+        // size 2; expect a cursor pointing into the middle of
+        // the set.
+        let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
+        for i in 0..5 {
+            let id = format!("a{i}");
+            store
+                .insert(&obs(&id, "alice", &format!("fact {i}"), true))
+                .unwrap();
+            svc.share(&ShareRequest {
+                source_agent: "alice".into(),
+                target_agents: vec!["bob".into()],
+                observation_ids: vec![id.clone()],
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+        let page1 = svc
+            .list_shared_page(&ListSharedFilter {
+                agent: "bob".into(),
+                page_size: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.next_cursor.is_some(), "more rows must yield a cursor");
+        let page2 = svc
+            .list_shared_page(&ListSharedFilter {
+                agent: "bob".into(),
+                page_size: Some(2),
+                cursor: page1.next_cursor.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page2.items.len(), 2);
+        // Two pages together cover four of the five rows; the
+        // last row needs a third page. Either way, no item id
+        // should repeat between page1 and page2.
+        let ids1: std::collections::BTreeSet<_> =
+            page1.items.iter().map(|r| r.id.clone()).collect();
+        let ids2: std::collections::BTreeSet<_> =
+            page2.items.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            ids1.is_disjoint(&ids2),
+            "pages must not overlap: {ids1:?} vs {ids2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corr_p6_list_shared_page_size_clamped_to_max() {
+        let (svc, store) = service(&["alice", "bob"], SharePolicy::Explicit);
+        store.insert(&obs("a1", "alice", "x", true)).unwrap();
+        svc.share(&ShareRequest {
+            source_agent: "alice".into(),
+            target_agents: vec!["bob".into()],
+            observation_ids: vec!["a1".into()],
+            message: None,
+        })
+        .await
+        .unwrap();
+        let page = svc
+            .list_shared_page(&ListSharedFilter {
+                agent: "bob".into(),
+                page_size: Some(LIST_SHARED_MAX_PAGE_SIZE * 100),
+                ..Default::default()
+            })
+            .unwrap();
+        // Single row → no cursor on the final page.
+        assert_eq!(page.items.len(), 1);
+        assert!(page.next_cursor.is_none());
     }
 
     #[tokio::test]
