@@ -57,6 +57,13 @@ bytes.workspace = true
 # the sflow executor pulls it in, keeping the workspace dep list focused.
 regex = "1"
 
+# SEC PART 7: O(1) capability descriptor lookup. The dispatch
+# bridge's per-request `describe(method)` closure reads a shared
+# `Arc<DashMap<String, CapabilityDescriptor>>` populated at
+# capability-registration time, replacing the pre-fix linear scan
+# over the manifest's capability vector.
+dashmap = "6"
+
 # RELIX-7.7 — production email channel.
 #
 # `lettre` is the production SMTP client (STARTTLS / TLS / plain on

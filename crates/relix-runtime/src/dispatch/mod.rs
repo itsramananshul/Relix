@@ -376,6 +376,19 @@ pub struct DispatchBridge {
 pub type CapabilityDescribeFn =
     Arc<dyn Fn(&str) -> Option<relix_core::capability::CapabilityDescriptor> + Send + Sync>;
 
+/// SEC PART 7: build a [`CapabilityDescribeFn`] backed by the
+/// shared descriptor cache the [`crate::manifest::ManifestProvider`]
+/// populates at capability-registration time. The returned
+/// closure does a single lock-free `DashMap::get` per
+/// invocation regardless of how many capabilities the node has
+/// registered, replacing the pre-fix path where each lookup had
+/// to scan the manifest's capability vector under a lock.
+pub fn describe_fn_from_cache(
+    cache: crate::manifest::DescriptorCache,
+) -> CapabilityDescribeFn {
+    Arc::new(move |method: &str| cache.get(method).map(|entry| entry.value().clone()))
+}
+
 /// Coordinator-side closure that records an approval request
 /// when the gate returns `RequireApproval`. Implementation
 /// mints the approval row + chronicle event + telegram

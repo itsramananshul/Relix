@@ -3019,6 +3019,7 @@ pub fn register_agent_capabilities(
     task_store: Arc<crate::nodes::coordinator::TaskStore>,
     token_ttl_secs: u64,
     clock: Arc<dyn relix_core::clock::Clock>,
+    descriptor_cache: crate::manifest::DescriptorCache,
 ) {
     use crate::dispatch::{FnHandler, InvocationCtx};
     use crate::nodes::coordinator::agent::handlers;
@@ -3219,9 +3220,15 @@ pub fn register_agent_capabilities(
     let bindings_store = agent_store.clone();
     let bindings_create = agent_store.clone();
     let bindings_task_store = task_store.clone();
+    // SEC PART 7: back the agent gate's per-request descriptor
+    // lookup with the shared `DescriptorCache` the manifest
+    // populates at registration time. The closure is a single
+    // lock-free `DashMap::get` per call — replaces the pre-fix
+    // stub that always returned `None` and forced the gate to
+    // fall through to a category-free / risk-free admit.
     bridge.set_agent_gate(crate::dispatch::AgentGateBindings {
         store: bindings_store,
-        describe: Arc::new(|_method: &str| None),
+        describe: crate::dispatch::describe_fn_from_cache(descriptor_cache),
         on_require_approval: Arc::new(move |req, _task_id_hint| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -8341,6 +8348,7 @@ fn register_node_type_handlers(
             store.clone(),
             effective_ttl_secs,
             agent_caps_clock,
+            manifest.descriptor_cache(),
         );
         let agent_caps: &[(&str, &str, &[&str])] = &[
             (

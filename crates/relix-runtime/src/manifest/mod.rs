@@ -326,7 +326,20 @@ pub struct ManifestProvider {
     /// [`Self::snapshot`] (which is now a back-compat alias
     /// kept for the in-process tests in this module).
     signer: Option<Arc<SigningKey>>,
+    /// SEC PART 7: O(1) capability descriptor cache. Populated
+    /// in lock-step with [`Self::add_capability`]; consumed by
+    /// the dispatch bridge's `describe` closure so the
+    /// per-request agent-gate lookup is a single `DashMap`
+    /// probe rather than a linear scan of the manifest's
+    /// capability vector. Cheap to clone — the underlying
+    /// `DashMap` is reference-counted.
+    descriptor_cache: DescriptorCache,
 }
+
+/// SEC PART 7: shared, lock-free descriptor lookup table.
+/// Type alias so the cache surface is named consistently
+/// across the bridge / controller / tests.
+pub type DescriptorCache = Arc<dashmap::DashMap<String, CapabilityDescriptor>>;
 
 impl ManifestProvider {
     /// Build with the node's identity. Capabilities are appended later as
@@ -349,7 +362,17 @@ impl ManifestProvider {
                 capabilities: Vec::new(),
             })),
             signer: None,
+            descriptor_cache: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// SEC PART 7: hand out the shared descriptor cache. The
+    /// dispatch bridge captures a clone of this `Arc` and
+    /// builds its `describe(method)` closure against it so the
+    /// per-request lookup stays O(1) regardless of how many
+    /// capabilities the node has registered.
+    pub fn descriptor_cache(&self) -> DescriptorCache {
+        Arc::clone(&self.descriptor_cache)
     }
 
     /// SEC PART 2: install the node's libp2p Ed25519 signing
@@ -373,6 +396,12 @@ impl ManifestProvider {
         {
             return;
         }
+        // SEC PART 7: keep the descriptor cache in lock-step
+        // with the manifest vector so the dispatch bridge's
+        // O(1) describe closure sees every registered capability
+        // the moment add_capability returns.
+        self.descriptor_cache
+            .insert(desc.method_name.clone(), desc.clone());
         guard.capabilities.push(desc);
     }
 
@@ -1534,5 +1563,120 @@ mod tests {
         // make sure the obviously-irrelevant strings still bounce.
         assert!(!looks_like_transport_break("unknown method"));
         assert!(!looks_like_transport_break("policy_denied: no rule"));
+    }
+
+    // ── SEC PART 7: descriptor cache populated in lock-step ──
+
+    #[test]
+    fn add_capability_populates_descriptor_cache() {
+        let provider = ManifestProvider::new(
+            NodeId([7u8; 32]),
+            "coord-a",
+            "coordinator",
+            NodeId([0u8; 32]),
+            vec![],
+        );
+        let cache = provider.descriptor_cache();
+        assert!(cache.is_empty());
+
+        let d = CapabilityDescriptor::unary("memory.search")
+            .with_categories(["query".into()])
+            .with_risk(relix_core::capability::RiskLevel::Safe);
+        provider.add_capability(d.clone());
+
+        // Cache reflects the just-registered descriptor.
+        let cached = cache.get("memory.search").expect("cache miss");
+        assert_eq!(cached.method_name, "memory.search");
+        assert_eq!(cached.categories, vec!["query".to_string()]);
+        assert_eq!(
+            cached.risk_level,
+            relix_core::capability::RiskLevel::Safe
+        );
+    }
+
+    #[test]
+    fn add_capability_dedupe_does_not_double_insert_into_cache() {
+        let provider = ManifestProvider::new(
+            NodeId([7u8; 32]),
+            "coord-a",
+            "coordinator",
+            NodeId([0u8; 32]),
+            vec![],
+        );
+        let cache = provider.descriptor_cache();
+        let d = CapabilityDescriptor::unary("memory.search");
+        provider.add_capability(d.clone());
+        provider.add_capability(d.clone());
+        assert_eq!(cache.len(), 1, "cache must respect de-dupe path");
+        assert_eq!(provider.snapshot().capabilities.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_cache_handle_is_shared_with_provider() {
+        // The caller-held cache + the provider's internal cache
+        // are the same `Arc<DashMap>`, so descriptors registered
+        // after the handle was taken are visible without
+        // re-fetching.
+        let provider = ManifestProvider::new(
+            NodeId([7u8; 32]),
+            "coord-a",
+            "coordinator",
+            NodeId([0u8; 32]),
+            vec![],
+        );
+        let cache_before = provider.descriptor_cache();
+        provider.add_capability(CapabilityDescriptor::unary("a.b"));
+        assert!(cache_before.contains_key("a.b"));
+        // The provider exposes a second handle that sees the
+        // same data — proving the Arc isn't being cloned.
+        let cache_after = provider.descriptor_cache();
+        assert_eq!(cache_before.len(), cache_after.len());
+    }
+
+    #[test]
+    fn describe_fn_from_cache_returns_o1_lookup() {
+        use crate::dispatch::describe_fn_from_cache;
+        let provider = ManifestProvider::new(
+            NodeId([7u8; 32]),
+            "coord-a",
+            "coordinator",
+            NodeId([0u8; 32]),
+            vec![],
+        );
+        provider.add_capability(
+            CapabilityDescriptor::unary("ai.chat")
+                .with_categories(["chat".into()]),
+        );
+        let describe = describe_fn_from_cache(provider.descriptor_cache());
+
+        // Hit.
+        let d = describe("ai.chat").expect("hit");
+        assert_eq!(d.method_name, "ai.chat");
+        assert_eq!(d.categories, vec!["chat".to_string()]);
+
+        // Miss — the bridge falls back to the existing
+        // category-free admit path, which is the expected
+        // behaviour for unregistered methods.
+        assert!(describe("ai.unknown").is_none());
+    }
+
+    #[test]
+    fn describe_fn_sees_later_registrations_through_shared_cache() {
+        use crate::dispatch::describe_fn_from_cache;
+        let provider = ManifestProvider::new(
+            NodeId([7u8; 32]),
+            "coord-a",
+            "coordinator",
+            NodeId([0u8; 32]),
+            vec![],
+        );
+        // Describe closure captured before any capability was
+        // registered — must still see the descriptor when it
+        // arrives because both ends share the same Arc<DashMap>.
+        let describe = describe_fn_from_cache(provider.descriptor_cache());
+        assert!(describe("late.add").is_none());
+
+        provider.add_capability(CapabilityDescriptor::unary("late.add"));
+        assert!(describe("late.add").is_some());
     }
 }

@@ -288,12 +288,28 @@ async fn legacy_token_full_stack_real_controller_real_bridge_real_http() {
     )
     .expect("bridge constructs");
     let clock = bridge.clock();
+    // SEC PART 7: the agent gate's `describe` closure reads
+    // from a `DescriptorCache` populated at capability-
+    // registration time. The test doesn't exercise the
+    // category-driven gate path, so an empty cache (built via
+    // the manifest provider it is normally shared with) is
+    // sufficient and keeps the integration honest about the
+    // wire-up shape.
+    let descriptor_cache = relix_runtime::manifest::ManifestProvider::new(
+        relix_core::types::NodeId([0u8; 32]),
+        "test-bridge",
+        "coordinator",
+        relix_core::types::NodeId([0u8; 32]),
+        vec![],
+    )
+    .descriptor_cache();
     register_agent_capabilities(
         &mut bridge,
         agent_store.clone(),
         task_store.clone(),
         300,
         clock.clone(),
+        descriptor_cache,
     );
     let bridge = Arc::new(bridge);
 
