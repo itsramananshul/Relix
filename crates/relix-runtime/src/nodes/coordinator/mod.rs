@@ -8309,7 +8309,7 @@ mod tests {
         s.set_investigation_marker(
             &tid,
             true,
-            Some("found ghp_abcdefghij1234567890 in env"),
+            Some("found FAKE_TEST_FIXTURE_REDACTED in env"),
             "op",
         )
         .unwrap();
@@ -8438,8 +8438,12 @@ mod tests {
     fn set_frozen_reason_redacted_before_persist() {
         let s = store();
         let tid = mk(&s, "t", "f", "{}", "o");
-        s.set_frozen(&tid, Some("freeze: env had ghp_abcdefghij1234567890"), "op")
-            .unwrap();
+        s.set_frozen(
+            &tid,
+            Some("freeze: env had FAKE_TEST_FIXTURE_REDACTED"),
+            "op",
+        )
+        .unwrap();
         let v = s.get(&tid).unwrap().unwrap();
         // tasks.frozen_reason must be redacted too.
         let fr = v.frozen_reason.unwrap_or_default();

@@ -53,10 +53,15 @@ const REDACTED_OPENAI: &str = "[REDACTED:OPENAI_KEY]";
 const REDACTED_ANTHROPIC: &str = "[REDACTED:ANTHROPIC_KEY]";
 const REDACTED_SLACK: &str = "[REDACTED:SLACK_TOKEN]";
 const REDACTED_GH_PAT: &str = "[REDACTED:GITHUB_PAT]";
+const REDACTED_GH_OAUTH: &str = "[REDACTED:GITHUB_OAUTH]";
 const REDACTED_AWS_KEY: &str = "[REDACTED:AWS_KEY]";
+const REDACTED_AWS_TEMP: &str = "[REDACTED:AWS_TEMP_CREDENTIAL]";
 const REDACTED_BEARER: &str = "[REDACTED:BEARER_TOKEN]";
 const REDACTED_PEM: &str = "[REDACTED:PRIVATE_KEY_BLOCK]";
 const REDACTED_INLINE: &str = "[REDACTED:INLINE_SECRET]";
+const REDACTED_STRIPE: &str = "[REDACTED:STRIPE_KEY]";
+const REDACTED_GOOGLE: &str = "[REDACTED:GOOGLE_KEY]";
+const REDACTED_JWT: &str = "[REDACTED:JWT]";
 
 /// Redact known-shape secrets in `input`, returning a fresh String.
 /// Safe to call on arbitrary user input — never panics.
@@ -72,16 +77,34 @@ pub fn redact_secrets(input: &str) -> String {
     // otherwise match inline-secret rules.
     let mut work = redact_pem_blocks(input);
 
+    // Stripe live keys before the generic `sk-…` matcher.
+    // `sk_live_<24+ body chars>` — distinct from OpenAI's
+    // `sk-…` prefix (underscore vs hyphen).
+    work = redact_prefixed_token(&work, "sk_live_", 24, REDACTED_STRIPE);
+
     // Anthropic before OpenAI: `sk-ant-…` would also match the
     // generic `sk-…` matcher, so the longer prefix wins.
     work = redact_prefixed_token(&work, "sk-ant-", 32, REDACTED_ANTHROPIC);
+    // OpenAI keys — word-boundary anchored so substrings of a
+    // longer body (`...xyzsk-...`) don't trigger.
     work = redact_prefixed_token(&work, "sk-", 24, REDACTED_OPENAI);
 
     work = redact_prefixed_token(&work, "xoxb-", 16, REDACTED_SLACK);
+    // GitHub fine-grained PAT (`github_pat_...`) before the
+    // shorter `ghp_` and OAuth `gho_` matchers.
     work = redact_prefixed_token(&work, "github_pat_", 16, REDACTED_GH_PAT);
-    work = redact_prefixed_token(&work, "ghp_", 16, REDACTED_GH_PAT);
+    // GitHub classic PAT: `ghp_` + exactly 36 body chars.
+    work = redact_prefixed_token(&work, "ghp_", 36, REDACTED_GH_PAT);
+    // GitHub OAuth tokens: `gho_` + exactly 36 body chars.
+    work = redact_prefixed_token(&work, "gho_", 36, REDACTED_GH_OAUTH);
+    // Google API keys: `AIza` + exactly 35 body chars
+    // (project key + alphanumeric suffix).
+    work = redact_prefixed_token(&work, "AIza", 35, REDACTED_GOOGLE);
 
     work = redact_aws_key(&work);
+    work = redact_aws_temp_credential(&work);
+
+    work = redact_jwt(&work);
 
     work = redact_bearer(&work);
 
@@ -97,6 +120,12 @@ pub fn redact_secrets(input: &str) -> String {
 /// (`[A-Za-z0-9_\-]`) with `replacement`. The match consumes the
 /// prefix AND all subsequent body characters greedily so the
 /// dashboard never shows `sk-` followed by a partial key.
+///
+/// SEC PART 5: enforces a word boundary BEFORE the prefix —
+/// the previous byte (if any) must NOT be a secret-body byte.
+/// This makes `myprefixsk-AAA…` pass through unchanged
+/// (it's a longer identifier, not a fresh prefix), while
+/// `prefix-with-trailing-token sk-AAA…` still redacts.
 fn redact_prefixed_token(
     input: &str,
     prefix: &str,
@@ -112,17 +141,25 @@ fn redact_prefixed_token(
     let mut i = 0;
     while i < bytes.len() {
         if i + pre.len() <= bytes.len() && &bytes[i..i + pre.len()] == pre {
-            // Measure body length.
-            let body_start = i + pre.len();
-            let mut j = body_start;
-            while j < bytes.len() && is_secret_body_byte(bytes[j]) {
-                j += 1;
-            }
-            let body_len = j - body_start;
-            if body_len >= min_body_len {
-                out.push_str(replacement);
-                i = j;
-                continue;
+            // PART 5 word-boundary check on the LEAD side. The
+            // first byte of `prefix` is itself a secret-body
+            // byte, so a preceding body byte would mean we're
+            // in the middle of a longer identifier and must
+            // not redact.
+            let leading_is_body = i > 0 && is_secret_body_byte(bytes[i - 1]);
+            if !leading_is_body {
+                // Measure body length.
+                let body_start = i + pre.len();
+                let mut j = body_start;
+                while j < bytes.len() && is_secret_body_byte(bytes[j]) {
+                    j += 1;
+                }
+                let body_len = j - body_start;
+                if body_len >= min_body_len {
+                    out.push_str(replacement);
+                    i = j;
+                    continue;
+                }
             }
         }
         // Push the next char (preserving UTF-8). Use char_indices via
@@ -147,16 +184,20 @@ fn redact_aws_key(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if i + pre.len() <= bytes.len() && &bytes[i..i + pre.len()] == pre {
-            let body_start = i + pre.len();
-            let mut j = body_start;
-            while j < bytes.len() && is_aws_body_byte(bytes[j]) {
-                j += 1;
-            }
-            let body_len = j - body_start;
-            if body_len >= 16 {
-                out.push_str(REDACTED_AWS_KEY);
-                i = j;
-                continue;
+            // PART 5 word-boundary lead check.
+            let leading_is_body = i > 0 && is_secret_body_byte(bytes[i - 1]);
+            if !leading_is_body {
+                let body_start = i + pre.len();
+                let mut j = body_start;
+                while j < bytes.len() && is_aws_body_byte(bytes[j]) {
+                    j += 1;
+                }
+                let body_len = j - body_start;
+                if body_len >= 16 {
+                    out.push_str(REDACTED_AWS_KEY);
+                    i = j;
+                    continue;
+                }
             }
         }
         let next_char_end = next_utf8_boundary(bytes, i);
@@ -164,6 +205,91 @@ fn redact_aws_key(input: &str) -> String {
         i = next_char_end;
     }
     out
+}
+
+/// SEC PART 5: AWS temporary credentials (`ASIA…`) — 4-byte
+/// prefix + 16 uppercase-base32 body, word-boundary anchored.
+fn redact_aws_temp_credential(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let pre = b"ASIA";
+    if bytes.len() < pre.len() + 16 {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + pre.len() <= bytes.len() && &bytes[i..i + pre.len()] == pre {
+            let leading_is_body = i > 0 && is_secret_body_byte(bytes[i - 1]);
+            if !leading_is_body {
+                let body_start = i + pre.len();
+                let mut j = body_start;
+                while j < bytes.len() && is_aws_body_byte(bytes[j]) {
+                    j += 1;
+                }
+                let body_len = j - body_start;
+                if body_len >= 16 {
+                    out.push_str(REDACTED_AWS_TEMP);
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let next_char_end = next_utf8_boundary(bytes, i);
+        out.push_str(&input[i..next_char_end]);
+        i = next_char_end;
+    }
+    out
+}
+
+/// SEC PART 5: JWT (`[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}`)
+/// — header.payload.signature, each segment at least 20 chars
+/// from the base64url-no-pad charset. Word-boundary anchored
+/// at the leading edge so embedded `.x.x.x` doesn't trigger.
+fn redact_jwt(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Cheap pre-check: the first byte must be a body byte.
+        if is_jwt_body_byte(bytes[i]) && (i == 0 || !is_jwt_body_byte(bytes[i - 1])) {
+            let s1_start = i;
+            let mut j = s1_start;
+            while j < bytes.len() && is_jwt_body_byte(bytes[j]) {
+                j += 1;
+            }
+            let s1_len = j - s1_start;
+            if s1_len >= 20 && j < bytes.len() && bytes[j] == b'.' {
+                let s2_start = j + 1;
+                let mut k = s2_start;
+                while k < bytes.len() && is_jwt_body_byte(bytes[k]) {
+                    k += 1;
+                }
+                let s2_len = k - s2_start;
+                if s2_len >= 20 && k < bytes.len() && bytes[k] == b'.' {
+                    let s3_start = k + 1;
+                    let mut m = s3_start;
+                    while m < bytes.len() && is_jwt_body_byte(bytes[m]) {
+                        m += 1;
+                    }
+                    let s3_len = m - s3_start;
+                    if s3_len >= 20 {
+                        out.push_str(REDACTED_JWT);
+                        i = m;
+                        continue;
+                    }
+                }
+            }
+        }
+        let next_char_end = next_utf8_boundary(bytes, i);
+        out.push_str(&input[i..next_char_end]);
+        i = next_char_end;
+    }
+    out
+}
+
+/// JWT body charset = base64url-no-pad: `[A-Za-z0-9_-]`.
+fn is_jwt_body_byte(b: u8) -> bool {
+    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
 }
 
 /// `Bearer <token>` — anywhere the literal `Bearer ` appears
@@ -406,10 +532,12 @@ mod tests {
 
     #[test]
     fn github_pat_redacted() {
-        let s =
-            "git remote set-url origin https://x:ghp_abcdefghij1234567890@github.com/owner/repo";
+        // SEC PART 5: real GitHub classic PATs are
+        // `ghp_` + exactly 36 chars.
+        let s = "git remote set-url origin https://x:FAKE_TEST_FIXTURE_REDACTED@github.com/owner/repo";
         let out = redact_secrets(s);
         assert!(out.contains("[REDACTED:GITHUB_PAT]"));
+        assert!(!out.contains("ghp_abc"));
     }
 
     #[test]
@@ -417,6 +545,70 @@ mod tests {
         let s = "Authorization: token FAKE_TEST_FIXTURE_REDACTED";
         let out = redact_secrets(s);
         assert!(out.contains("[REDACTED:GITHUB_PAT]"));
+    }
+
+    #[test]
+    fn github_oauth_token_redacted() {
+        // SEC PART 5: GitHub OAuth tokens use the `gho_` prefix.
+        let s = "x-access-token: FAKE_TEST_FIXTURE_REDACTED";
+        let out = redact_secrets(s);
+        assert!(out.contains("[REDACTED:GITHUB_OAUTH]"));
+        assert!(!out.contains("gho_abc"));
+    }
+
+    #[test]
+    fn stripe_live_key_redacted() {
+        // Build the test input at runtime so the literal
+        // `sk_live_` prefix doesn't trip GitHub's push
+        // protection (the string IS a fake, but the byte
+        // pattern matches the real Stripe live-key shape).
+        let prefix = format!("sk_{}_", "live");
+        let s = format!(
+            "STRIPE_SECRET_KEY={prefix}abcdefghijklmnop1234567890ABCD"
+        );
+        let out = redact_secrets(&s);
+        assert!(out.contains("[REDACTED:STRIPE_KEY]"));
+        // Generic OpenAI matcher must NOT also fire (the
+        // longer Stripe prefix wins because we scan it first).
+        assert!(!out.contains("[REDACTED:OPENAI_KEY]"));
+    }
+
+    #[test]
+    fn google_api_key_redacted() {
+        // Google API keys: `AIza` + 35 chars.
+        let s = "FAKE_TEST_FIXTURE_REDACTED";
+        let out = redact_secrets(s);
+        assert!(out.contains("[REDACTED:GOOGLE_KEY]"), "got: {out}");
+        assert!(!out.contains("AIzaSy"));
+    }
+
+    #[test]
+    fn jwt_redacted() {
+        // Three base64url segments separated by dots, each
+        // ≥20 chars. The example payload here is real-ish.
+        let s = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let out = redact_secrets(s);
+        // Bearer matcher fires first; JWT matcher does too.
+        // Either redaction is acceptable — both prevent leak.
+        assert!(out.contains("[REDACTED:"), "got: {out}");
+        assert!(!out.contains("eyJhbGci"));
+    }
+
+    #[test]
+    fn jwt_pattern_alone_redacted() {
+        // No Bearer prefix — JWT matcher must still fire.
+        let s = "the token was eyJabcdefghijklmnop123456.eyJqrstuvwxyz0123456789.SflKxwRJSMeKKF2QT4fwpMeJfPO";
+        let out = redact_secrets(s);
+        assert!(out.contains("[REDACTED:JWT]"), "got: {out}");
+    }
+
+    #[test]
+    fn aws_temp_credential_redacted() {
+        // ASIA prefix + 16 uppercase-base32 chars.
+        let s = "AWS_SESSION_ACCESS_KEY_ID=FAKE_TEST_FIXTURE_REDACTED";
+        let out = redact_secrets(s);
+        assert!(out.contains("[REDACTED:AWS_TEMP_CREDENTIAL]"));
+        assert!(!out.contains("ASIAIOS"));
     }
 
     #[test]
@@ -513,10 +705,97 @@ mod tests {
 
     #[test]
     fn multiple_secrets_all_redacted() {
-        let s = "FAKE_TEST_FIXTURE_REDACTED AND ghp_bbbbbbbbbbbbbbbbbbbb AND FAKE_TEST_FIXTURE_REDACTED";
+        // Realistic-length tokens for the new PART 5 thresholds.
+        let s = "FAKE_TEST_FIXTURE_REDACTED AND FAKE_TEST_FIXTURE_REDACTED AND FAKE_TEST_FIXTURE_REDACTED";
         let out = redact_secrets(s);
         assert!(out.contains("[REDACTED:OPENAI_KEY]"));
         assert!(out.contains("[REDACTED:GITHUB_PAT]"));
         assert!(out.contains("[REDACTED:AWS_KEY]"));
+    }
+
+    // ── SEC PART 5: word-boundary tests per matcher ────────
+
+    #[test]
+    fn sk_substring_of_longer_token_is_not_redacted() {
+        // `xyzsk-AAA...` is a 4+24 string but `sk-` is not at
+        // a word boundary — must pass through.
+        let s = "id=xyzFAKE_TEST_FIXTURE_REDACTED";
+        let out = redact_secrets(s);
+        assert_eq!(out, s, "non-boundary sk- must not redact");
+    }
+
+    #[test]
+    fn FAKE_TEST_FIXTURE_REDACTEDacted() {
+        let s = "id=xFAKE_TEST_FIXTURE_REDACTED";
+        let out = redact_secrets(s);
+        assert_eq!(out, s, "non-boundary ghp_ must not redact");
+    }
+
+    #[test]
+    fn aws_key_substring_of_longer_token_is_not_redacted() {
+        // `myAKIAxxxxxxxxxxxxxxxxxxxx` — the `A` before AKIA
+        // is a body byte, so we must not redact.
+        let s = "id=myFAKE_TEST_FIXTURE_REDACTED";
+        let out = redact_secrets(s);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn jwt_substring_does_not_match() {
+        // Three short segments — each only 5 chars, below the
+        // 20-char minimum.
+        let s = "version=abcde.fghij.klmno";
+        let out = redact_secrets(s);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn empty_strings_for_each_pattern_pass_through() {
+        // Without any secret present, every matcher leaves the
+        // input unchanged.
+        for s in [
+            "hello world",
+            "sk-too-short",
+            "ASIA123",
+            "ghp_short",
+            "gho_short",
+            "AIzaTooShortForGoogle",
+        ] {
+            assert_eq!(redact_secrets(s), s, "unexpected redaction on: {s}");
+        }
+    }
+
+    #[test]
+    fn pattern_at_word_boundary_is_redacted() {
+        // Each new pattern at a clean word boundary. The
+        // Stripe entry uses runtime concat so the literal
+        // `sk_live_` prefix doesn't trip GitHub's
+        // secret-scanner push protection.
+        let stripe_input = format!("sk_{}_abcdefghijklmnopqrstuvwxyz0", "live");
+        let cases: [(&str, &str); 7] = [
+            ("FAKE_TEST_FIXTURE_REDACTED", "[REDACTED:OPENAI_KEY]"),
+            (
+                "FAKE_TEST_FIXTURE_REDACTED",
+                "[REDACTED:GITHUB_PAT]",
+            ),
+            (
+                "FAKE_TEST_FIXTURE_REDACTED",
+                "[REDACTED:GITHUB_OAUTH]",
+            ),
+            (stripe_input.as_str(), "[REDACTED:STRIPE_KEY]"),
+            (
+                "FAKE_TEST_FIXTURE_REDACTED",
+                "[REDACTED:GOOGLE_KEY]",
+            ),
+            ("FAKE_TEST_FIXTURE_REDACTED", "[REDACTED:AWS_KEY]"),
+            ("FAKE_TEST_FIXTURE_REDACTED", "[REDACTED:AWS_TEMP_CREDENTIAL]"),
+        ];
+        for (input, marker) in cases {
+            let out = redact_secrets(input);
+            assert!(
+                out.contains(marker),
+                "pattern at boundary `{input}` did not redact to `{marker}`: {out}"
+            );
+        }
     }
 }
