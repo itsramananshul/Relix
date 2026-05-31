@@ -70,14 +70,22 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+
+/// SEC PART 2: the env var the host loader sets when it
+/// spawns a plugin. The SDK reads this once at `serve()`
+/// time; when set, every `/invoke` is gated on a matching
+/// `Authorization: Bearer <token>` header.
+pub const PLUGIN_BEARER_ENV: &str = "RELIX_PLUGIN_BEARER";
 
 /// Stable error kinds plugins return through the protocol. Mirror
 /// of the subset of `relix_core::types::error_kinds` that makes
@@ -195,6 +203,10 @@ pub struct PluginServer {
     /// Wrapped in an Arc<Mutex<>> so /ready can flip from false
     /// to true atomically.
     ready: Arc<Mutex<bool>>,
+    /// SEC PART 2: test-only override for the expected bearer.
+    /// Production callers leave this `None` and let `serve()`
+    /// read [`PLUGIN_BEARER_ENV`] from the process environment.
+    expected_bearer_override: Option<String>,
 }
 
 enum PortSink {
@@ -209,7 +221,18 @@ impl PluginServer {
             bind: "127.0.0.1:0".to_string(),
             port_sink: PortSink::Stdout,
             ready: Arc::new(Mutex::new(true)),
+            expected_bearer_override: None,
         }
+    }
+
+    /// SEC PART 2: explicitly require `Authorization: Bearer
+    /// <token>` for `/invoke`, overriding (or supplying) the
+    /// value the SDK would otherwise read from
+    /// [`PLUGIN_BEARER_ENV`]. Test seam — production callers
+    /// rely on the env var the host loader sets.
+    pub fn with_bearer_for_test(mut self, token: impl Into<String>) -> Self {
+        self.expected_bearer_override = Some(token.into());
+        self
     }
 
     /// Override the listen address. Used by tests to pin a known
@@ -265,6 +288,13 @@ impl PluginServer {
     }
 
     /// Bind, announce the port, and serve forever.
+    ///
+    /// SEC PART 2: when `RELIX_PLUGIN_BEARER` is set in the
+    /// process environment, `/invoke` is gated on a matching
+    /// `Authorization: Bearer <token>` header. Requests without
+    /// (or with a wrong) bearer get HTTP 401. `/health` and
+    /// `/ready` stay open so the host loader's readiness probe
+    /// works.
     pub async fn serve(self) -> Result<(), ServeError> {
         let listener = TcpListener::bind(&self.bind)
             .await
@@ -273,19 +303,85 @@ impl PluginServer {
             .local_addr()
             .map_err(|e| ServeError::Bind(format!("local_addr: {e}")))?;
         announce_port(&self.port_sink, local.port()).await?;
+        let expected_bearer = self
+            .expected_bearer_override
+            .clone()
+            .or_else(|| std::env::var(PLUGIN_BEARER_ENV).ok())
+            .filter(|s| !s.is_empty());
         let state = AppState {
             handlers: Arc::new(self.handlers),
             ready: self.ready,
+            expected_bearer: expected_bearer.map(Arc::new),
         };
         let app = Router::new()
             .route("/health", get(handle_health))
             .route("/ready", get(handle_ready))
             .route("/invoke", post(handle_invoke))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_for_invoke,
+            ))
             .with_state(state);
         axum::serve(listener, app)
             .await
             .map_err(|e| ServeError::Serve(format!("{e}")))
     }
+}
+
+/// SEC PART 2: middleware that requires
+/// `Authorization: Bearer <token>` for `/invoke` when the
+/// expected bearer was set at `serve()` time. Other routes
+/// (`/health`, `/ready`) pass through so the host loader can
+/// probe the plugin before the bearer is required.
+async fn require_bearer_for_invoke(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if path != "/invoke" {
+        return next.run(req).await;
+    }
+    let Some(expected) = state.expected_bearer.as_ref() else {
+        // Operator opted out (no env var). Behaves like the
+        // pre-fix path for backwards compatibility with
+        // tests that run the plugin in-process.
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .unwrap_or("");
+    if presented.is_empty() || !ct_eq(presented, expected.as_str()) {
+        let body = serde_json::json!({
+            "ok": false,
+            "error_kind": error_kind::INVALID_ARGS,
+            "error_cause": "/invoke requires Authorization: Bearer <token> matching RELIX_PLUGIN_BEARER",
+        });
+        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    }
+    next.run(req).await
+}
+
+/// Constant-time string compare so the SDK doesn't leak a
+/// token prefix via per-byte short-circuit timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 impl Default for PluginServer {
@@ -318,6 +414,12 @@ async fn announce_port(sink: &PortSink, port: u16) -> Result<(), ServeError> {
 struct AppState {
     handlers: Arc<HashMap<String, HandlerFn>>,
     ready: Arc<Mutex<bool>>,
+    /// SEC PART 2: when `Some`, every `/invoke` requires
+    /// `Authorization: Bearer <token>` matching this value.
+    /// `None` means the operator did not set
+    /// `RELIX_PLUGIN_BEARER` and the server admits requests
+    /// without a bearer (legacy path for in-process tests).
+    expected_bearer: Option<Arc<String>>,
 }
 
 async fn handle_health() -> Json<serde_json::Value> {
@@ -586,5 +688,91 @@ mod tests {
             error_kind::RESPONDER_INTERNAL as u64
         );
         assert!(body["error_cause"].as_str().unwrap().contains("boom"));
+    }
+
+    // ── SEC PART 2: per-plugin bearer enforcement ────────
+
+    #[tokio::test]
+    async fn sec_p2_invoke_without_bearer_returns_401_when_required() {
+        let mut server = PluginServer::new().with_bearer_for_test("expected-token");
+        server.register("ok.method", |_| async move { Ok(String::new()) });
+        let (port, _) = start(server).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://127.0.0.1:{port}/invoke"))
+            .json(&serde_json::json!({
+                "method": "ok.method",
+                "args": "",
+                "trace_id": "",
+                "request_id": "",
+                "caller_subject_id": "",
+                "deadline_unix": 0,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn sec_p2_invoke_with_wrong_bearer_returns_401() {
+        let mut server = PluginServer::new().with_bearer_for_test("expected-token");
+        server.register("ok.method", |_| async move { Ok(String::new()) });
+        let (port, _) = start(server).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://127.0.0.1:{port}/invoke"))
+            .bearer_auth("not-the-right-one")
+            .json(&serde_json::json!({
+                "method": "ok.method",
+                "args": "",
+                "trace_id": "",
+                "request_id": "",
+                "caller_subject_id": "",
+                "deadline_unix": 0,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+    }
+
+    #[tokio::test]
+    async fn sec_p2_invoke_with_correct_bearer_admitted() {
+        let mut server = PluginServer::new().with_bearer_for_test("expected-token");
+        server.register("ok.method", |_| async move { Ok("ok-body".to_string()) });
+        let (port, _) = start(server).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://127.0.0.1:{port}/invoke"))
+            .bearer_auth("expected-token")
+            .json(&serde_json::json!({
+                "method": "ok.method",
+                "args": "",
+                "trace_id": "",
+                "request_id": "",
+                "caller_subject_id": "",
+                "deadline_unix": 0,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["ok"], serde_json::json!(true));
+        assert_eq!(body["body"], serde_json::json!("ok-body"));
+    }
+
+    #[tokio::test]
+    async fn sec_p2_health_path_open_even_when_bearer_required() {
+        // Host loader probes /health BEFORE it has called
+        // /invoke; the bearer middleware must let /health
+        // through.
+        let server = PluginServer::new().with_bearer_for_test("expected-token");
+        let (port, _) = start(server).await;
+        let r = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
     }
 }

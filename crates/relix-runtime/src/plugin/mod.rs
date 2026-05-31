@@ -37,7 +37,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 pub use dispatcher::{InvokeRequest, PluginDispatcher, PluginInvokeError};
-pub use loader::{LoadError, LoadedPlugin, PluginLoader};
+pub use loader::{LoadError, LoadedPlugin, PluginLoader, SandboxLimits};
 pub use manifest::{ManifestError, PluginCapability, PluginManifest, PluginRuntime};
 pub use registry::{PluginRegistry, PluginStatus, RegistryError, StoredPlugin};
 
@@ -59,10 +59,27 @@ pub struct PluginHostConfig {
     /// host's `RELIX_DATA_DIR`.
     #[serde(default)]
     pub registry_db_path: Option<PathBuf>,
+    /// SEC PART 2: per-plugin virtual-memory cap, applied on
+    /// Unix via `RLIMIT_AS`. 0 means "do not apply" — used by
+    /// tests. Default 512 MiB.
+    #[serde(default = "default_max_memory_mb")]
+    pub max_memory_mb: u64,
+    /// SEC PART 2: per-plugin CPU-time cap (RLIMIT_CPU), in
+    /// seconds. 0 means "do not apply". Default 30.
+    #[serde(default = "default_max_cpu_secs")]
+    pub max_cpu_secs: u64,
 }
 
 fn default_max_plugins() -> usize {
     20
+}
+
+fn default_max_memory_mb() -> u64 {
+    512
+}
+
+fn default_max_cpu_secs() -> u64 {
+    30
 }
 
 /// Errors emerging from plugin operations that need a stable

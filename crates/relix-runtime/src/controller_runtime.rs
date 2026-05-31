@@ -4871,7 +4871,18 @@ fn register_plugin_management_capabilities(
                             });
                         }
                     };
-                    match crate::plugin::PluginLoader::spawn(manifest, path, 10, 30).await {
+                    // SEC PART 2: plugin reload uses the same
+                    // sandbox limits as initial spawn. Defaults
+                    // until per-tenant override is wired.
+                    match crate::plugin::PluginLoader::spawn(
+                        manifest,
+                        path,
+                        10,
+                        30,
+                        crate::plugin::SandboxLimits::default(),
+                    )
+                    .await
+                    {
                         Ok(loaded) => {
                             let _ = state.registry.set_status(
                                 &loaded.plugin_id,
@@ -9387,12 +9398,22 @@ fn register_node_type_handlers(
             // worker can drive the spawn future without
             // panicking on a nested block_on. 10s + 30s
             // timeouts.
+            // SEC PART 2: thread the per-plugin sandbox caps
+            // from [plugin_host] into the loader so the child
+            // process is started under RLIMIT_AS / RLIMIT_CPU
+            // (Unix) and the per-plugin bearer token wire.
+            let sandbox_limits = crate::plugin::SandboxLimits {
+                max_memory_mb: ph_cfg.max_memory_mb,
+                max_cpu_secs: ph_cfg.max_cpu_secs,
+                max_open_fds: 100,
+            };
             let loaded = match tokio::task::block_in_place(|| {
                 host_handle.block_on(crate::plugin::PluginLoader::spawn(
                     manifest_for_spawn,
                     manifest_path_for_spawn,
                     10,
                     30,
+                    sandbox_limits,
                 ))
             }) {
                 Ok(p) => p,

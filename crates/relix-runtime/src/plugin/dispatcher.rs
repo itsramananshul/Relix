@@ -53,10 +53,19 @@ pub struct PluginDispatcher {
     http: reqwest::Client,
     base: String,
     invoke_timeout: Duration,
+    /// SEC PART 2: per-plugin bearer token. Generated at
+    /// load time (32 random bytes hex-encoded) and verified
+    /// by the plugin SDK on every `/invoke`. Pre-fix path
+    /// let any local process talk to the plugin's HTTP
+    /// endpoint.
+    bearer_token: String,
 }
 
 impl PluginDispatcher {
-    pub fn new(port: u16, invoke_timeout_secs: u64) -> Self {
+    /// Build a dispatcher with a per-plugin bearer token. The
+    /// SDK verifies the token on every `/invoke`; calls
+    /// without it are rejected with 401.
+    pub fn new(port: u16, invoke_timeout_secs: u64, bearer_token: String) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(invoke_timeout_secs.max(1)))
             .build()
@@ -65,11 +74,19 @@ impl PluginDispatcher {
             http,
             base: format!("http://127.0.0.1:{port}"),
             invoke_timeout: Duration::from_secs(invoke_timeout_secs.max(1)),
+            bearer_token,
         }
     }
 
     pub fn base_url(&self) -> &str {
         &self.base
+    }
+
+    /// Borrow the per-plugin bearer token. Exposed so tests
+    /// and the host loader can mirror it into the plugin's
+    /// environment.
+    pub fn bearer_token(&self) -> &str {
+        &self.bearer_token
     }
 
     /// Hit `/health`. Returns `Ok(true)` if the server replied
@@ -92,10 +109,14 @@ impl PluginDispatcher {
     /// to [`PluginInvokeError::Plugin`].
     pub async fn invoke(&self, req: InvokeRequest) -> Result<String, PluginInvokeError> {
         let url = format!("{}/invoke", self.base);
+        // SEC PART 2: include the per-plugin bearer token on
+        // every /invoke. The plugin SDK rejects requests
+        // without (or with a wrong) bearer with HTTP 401.
         let resp = self
             .http
             .post(&url)
             .timeout(self.invoke_timeout)
+            .bearer_auth(&self.bearer_token)
             .json(&req)
             .send()
             .await

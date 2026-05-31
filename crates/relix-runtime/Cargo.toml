@@ -162,6 +162,22 @@ fantoccini = { version = "0.21", default-features = false, features = ["rustls-t
 # and channels. See `terminal/pty.rs` for the architecture.
 portable-pty = { version = "0.8", optional = true }
 
+# SEC PART 2: plugin-sandbox unix resource limits. `rlimit`
+# is Unix-only (Linux + macOS); on Windows the loader logs a
+# startup warning and skips resource caps. The dependency is
+# Unix-target-conditional so a Windows build does not even
+# attempt to compile it.
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
+
+# SEC PART 2 (Linux only): `libc` for `prctl(PR_SET_NO_NEW_PRIVS, 1)`
+# and `seccompiler` for the syscall allowlist filter applied
+# after the plugin process spawns. Both are gated to Linux so
+# macOS Unix builds carry only the rlimit dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.4"
+
 [features]
 # PH-BROWSER-FEATURES — per-backend opt-in flags. Default
 # build ships the NoneBackend honest scaffold only.
