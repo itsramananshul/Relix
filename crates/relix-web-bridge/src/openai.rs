@@ -75,6 +75,37 @@ pub struct ChatCompletionRequest {
 pub struct OpenAiMessage {
     pub role: String,
     pub content: String,
+    /// SEC PART 5: serde-deserialised marker that signals
+    /// the incoming message carried a `tool_calls` payload
+    /// (assistant-emitted function-call envelope per the
+    /// OpenAI spec). We do not implement OpenAI-format
+    /// tool calling, so `translate_request` rejects with a
+    /// clear error rather than silently dropping. Always
+    /// serialises as `false` (no `#[serde(skip)]`) so
+    /// round-tripping our own response is stable.
+    #[serde(
+        default,
+        rename = "tool_calls",
+        deserialize_with = "deserialize_has_tool_calls",
+        skip_serializing
+    )]
+    pub has_tool_calls: bool,
+}
+
+/// SEC PART 5: serde helper for `OpenAiMessage::has_tool_calls`.
+/// Reads the OpenAI `tool_calls` array (if present) and returns
+/// `true` when it is a non-empty array — the shape OpenAI
+/// clients use to attach function-call envelopes.
+fn deserialize_has_tool_calls<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<Value> = Option::deserialize(deserializer)?;
+    Ok(match v {
+        Some(Value::Array(arr)) => !arr.is_empty(),
+        Some(Value::Null) | None => false,
+        _ => false,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -366,6 +397,7 @@ pub async fn chat_completions(
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
                     content: outcome.reply.clone(),
+                    has_tool_calls: false,
                 },
                 finish_reason: "stop",
             }],
@@ -760,9 +792,66 @@ pub struct TranslatedChatRequest {
 
 /// Convert an OpenAI chat completion request into the (session_id, prompt)
 /// pair the SOL chat flow consumes.
+///
+/// SEC PART 5: pre-fix behaviour silently DROPPED OpenAI
+/// `system` messages and any `tools` / `tool_calls` payload —
+/// callers had no way to tell their context was discarded. The
+/// new contract:
+///
+/// 1. `tools` (function-calling tool definitions) and per-
+///    message `tool_calls` payloads are REJECTED with a clear
+///    "not supported" error. The Relix native API is the
+///    documented path for tool-calling; silently dropping the
+///    definitions risks producing answers that look like they
+///    honoured the operator's tool surface when they did not.
+/// 2. EVERY `system` message in the request is preserved as
+///    additional context — the prompt sent to the Relix chat
+///    flow is `[system 1]\n[system 2]\n…\n[last user message]`.
+///    The last user message remains the primary instruction;
+///    system messages are framed so the model can distinguish
+///    them.
+/// 3. The session-id derivation is unchanged (blake3 of first
+///    system + first user) so existing conversations keep
+///    bucketing correctly.
 pub fn translate_request(req: &ChatCompletionRequest) -> Result<TranslatedChatRequest, String> {
     if req.messages.is_empty() {
         return Err("messages: empty".into());
+    }
+
+    // SEC PART 5: reject OpenAI tool definitions outright.
+    // `_extra` is the serde-flatten catch-all for unknown
+    // top-level keys; OpenAI clients put the `tools` array
+    // there. Refusing is preferable to silently dropping
+    // because a dropped tool definition produces answers
+    // that look like they honoured the operator's tool
+    // surface when they did not.
+    if req._extra.contains_key("tools") {
+        return Err(
+            "Tool definitions in OpenAI format are not supported by the Relix OpenAI shim. \
+             Use the native Relix API for tool calls."
+                .to_string(),
+        );
+    }
+    // SEC PART 5: same posture for per-message `tool_calls`
+    // (the assistant-emitted function-call envelope) and
+    // `role = "tool"` messages (the function-call result the
+    // OpenAI client would normally feed back in). Both
+    // surfaces are part of the tool-calling protocol we do
+    // not implement; admitting them silently is the bug.
+    for (idx, m) in req.messages.iter().enumerate() {
+        if m.role.eq_ignore_ascii_case("tool") {
+            return Err(format!(
+                "messages[{idx}] role = \"tool\" is not supported by the Relix OpenAI shim. \
+                 Use the native Relix API for tool calls."
+            ));
+        }
+        if m.has_tool_calls {
+            return Err(format!(
+                "messages[{idx}] carries `tool_calls`. Tool definitions in OpenAI format \
+                 are not supported by the Relix OpenAI shim. Use the native Relix API \
+                 for tool calls."
+            ));
+        }
     }
 
     // The prompt is the last `user` message; ignore trailing `assistant` /
@@ -774,11 +863,44 @@ pub fn translate_request(req: &ChatCompletionRequest) -> Result<TranslatedChatRe
         .find(|m| m.role.eq_ignore_ascii_case("user"))
         .ok_or_else(|| "messages: no user message found".to_string())?;
 
-    let prompt = sanitize_openai_message(&last_user.content)
+    let last_user_text = sanitize_openai_message(&last_user.content)
         .map_err(|e| format!("messages[last user].content: {e}"))?;
-    if prompt.is_empty() {
+    if last_user_text.is_empty() {
         return Err("messages[last user].content: empty after sanitisation".into());
     }
+
+    // SEC PART 5: collect EVERY system message in order and
+    // sanitise each. The bridge then prepends them to the
+    // prompt as additional context so the AI node sees what
+    // the OpenAI client intended. Pre-fix path dropped them
+    // entirely. We frame each block with `[SYSTEM N]` /
+    // `[USER]` headers so the receiving model can
+    // distinguish them.
+    let mut system_blocks: Vec<String> = Vec::new();
+    for (idx, m) in req
+        .messages
+        .iter()
+        .filter(|m| m.role.eq_ignore_ascii_case("system"))
+        .enumerate()
+    {
+        let cleaned = sanitize_openai_message(&m.content)
+            .map_err(|e| format!("messages[system #{}].content: {e}", idx + 1))?;
+        if !cleaned.is_empty() {
+            system_blocks.push(cleaned);
+        }
+    }
+
+    let prompt = if system_blocks.is_empty() {
+        last_user_text
+    } else {
+        let mut combined = String::with_capacity(last_user_text.len() + 128);
+        for (i, sys) in system_blocks.iter().enumerate() {
+            combined.push_str(&format!("[SYSTEM {}]\n{}\n\n", i + 1, sys));
+        }
+        combined.push_str("[USER]\n");
+        combined.push_str(&last_user_text);
+        combined
+    };
 
     // Session id = blake3 of (first system content + first user content).
     // Stable as conversation grows; bucketing in Relix memory just works.
@@ -1148,8 +1270,94 @@ mod tests {
             }"#,
         );
         let t = translate_request(&req).expect("translate");
-        assert_eq!(t.prompt, "how are you?");
+        // SEC PART 5: the system message is now prepended
+        // as additional context (pre-fix path silently
+        // dropped it). The last user turn ends the prompt.
+        assert!(
+            t.prompt.contains("[SYSTEM 1]\nbe helpful"),
+            "expected system block, got: {}",
+            t.prompt
+        );
+        assert!(
+            t.prompt.ends_with("[USER]\nhow are you?"),
+            "expected user tail, got: {}",
+            t.prompt
+        );
         assert!(t.session_id.starts_with("oa-"));
+    }
+
+    // ── SEC PART 5: system + tool surface ───────────────
+
+    #[test]
+    fn sec_p5_translate_includes_every_system_message_in_order() {
+        let req = req_json(
+            r#"{
+                "model":"relix-mock",
+                "messages":[
+                    {"role":"system","content":"sys A"},
+                    {"role":"user","content":"q1"},
+                    {"role":"system","content":"sys B"},
+                    {"role":"user","content":"q2"}
+                ]
+            }"#,
+        );
+        let t = translate_request(&req).expect("translate");
+        // Both system messages appear, in order; the last
+        // user message terminates the prompt.
+        let pos_a = t.prompt.find("[SYSTEM 1]\nsys A").expect("sys A present");
+        let pos_b = t.prompt.find("[SYSTEM 2]\nsys B").expect("sys B present");
+        assert!(pos_a < pos_b, "system messages must appear in order");
+        assert!(t.prompt.ends_with("[USER]\nq2"));
+    }
+
+    #[test]
+    fn sec_p5_translate_rejects_tools_field() {
+        let req = req_json(
+            r#"{
+                "model":"x",
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"do_thing"}}]
+            }"#,
+        );
+        let err = translate_request(&req).expect_err("must reject");
+        assert!(
+            err.contains("Tool definitions in OpenAI format are not supported"),
+            "got: {err}"
+        );
+        assert!(err.contains("native Relix API"));
+    }
+
+    #[test]
+    fn sec_p5_translate_rejects_tool_role_message() {
+        let req = req_json(
+            r#"{
+                "model":"x",
+                "messages":[
+                    {"role":"user","content":"hi"},
+                    {"role":"tool","content":"{\"result\":42}"}
+                ]
+            }"#,
+        );
+        let err = translate_request(&req).expect_err("must reject");
+        assert!(
+            err.contains("role = \"tool\" is not supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn sec_p5_translate_rejects_assistant_tool_calls_payload() {
+        let req = req_json(
+            r#"{
+                "model":"x",
+                "messages":[
+                    {"role":"user","content":"hi"},
+                    {"role":"assistant","content":"","tool_calls":[{"id":"c1"}]}
+                ]
+            }"#,
+        );
+        let err = translate_request(&req).expect_err("must reject");
+        assert!(err.contains("tool_calls"), "got: {err}");
     }
 
     #[test]
@@ -1176,9 +1384,14 @@ mod tests {
         );
         let t1 = translate_request(&r1).expect("t1");
         let t2 = translate_request(&r2).expect("t2");
+        // SEC PART 5: the session id is still derived from
+        // the FIRST system + FIRST user turn so it remains
+        // stable as the conversation grows. The PROMPT now
+        // carries the system context as well; assert the
+        // user-tail rather than the legacy bare prompt.
         assert_eq!(t1.session_id, t2.session_id);
-        assert_eq!(t1.prompt, "first turn");
-        assert_eq!(t2.prompt, "third turn");
+        assert!(t1.prompt.ends_with("[USER]\nfirst turn"));
+        assert!(t2.prompt.ends_with("[USER]\nthird turn"));
     }
 
     #[test]
