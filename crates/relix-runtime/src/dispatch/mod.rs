@@ -1583,7 +1583,14 @@ impl DispatchBridge {
         // RELIX-7.19: confidence scoring + fallback. No-op when
         // no scorer is wired (pre-7.19 byte-for-byte path).
         let (outcome, total_elapsed_ms, confidence_score) = self
-            .apply_confidence(&req.method, &handler, &ctx, outcome, elapsed_ms)
+            .apply_confidence(
+                &req.method,
+                &handler,
+                &ctx,
+                outcome,
+                elapsed_ms,
+                req.deadline.0,
+            )
             .await;
 
         // === Admission step 11: audit ===
@@ -1665,6 +1672,7 @@ impl DispatchBridge {
         ctx: &InvocationCtx,
         outcome: HandlerOutcome,
         first_elapsed_ms: u64,
+        deadline_unix_secs: i64,
     ) -> (HandlerOutcome, u64, Option<f32>) {
         let scorer = match &self.confidence_scorer {
             Some(s) => s.clone(),
@@ -1722,6 +1730,30 @@ impl DispatchBridge {
                 }
                 let retries = max_retries.min(MAX_RETRY_CAP);
                 for _ in 0..retries {
+                    // PART 6: respect the original admission
+                    // deadline. The admission step gates the
+                    // first invocation against `req.deadline.0`;
+                    // each retry can add seconds of wall time
+                    // and must NOT push the response past the
+                    // caller's deadline (plus the 30-second
+                    // grace already used elsewhere in admission).
+                    // When the budget is gone we stop retrying
+                    // and return DEADLINE_EXCEEDED.
+                    let now = unix_now();
+                    if now > deadline_unix_secs + 30 {
+                        return (
+                            HandlerOutcome::Err(ErrorEnvelope {
+                                kind: error_kinds::TIMEOUT,
+                                cause:
+                                    "retry:deadline_exceeded — request deadline elapsed mid-retry"
+                                        .to_string(),
+                                retry_hint: 0,
+                                retry_after: None,
+                            }),
+                            total_elapsed,
+                            Some(best_score),
+                        );
+                    }
                     if retry_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                     }

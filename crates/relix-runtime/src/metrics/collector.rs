@@ -971,7 +971,7 @@ mod tests {
         );
         // And the most recent entries are still resident — the
         // pre-fix clear-all would have dropped them too.
-        let mut g = col.hints.lock().unwrap();
+        let g = col.hints.lock().unwrap();
         assert!(
             g.contains(&unique_rid(HINT_CACHE_CAP + extra - 1)),
             "newest entry must still be in the cache"
