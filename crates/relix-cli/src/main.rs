@@ -114,9 +114,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: topology::Cmd,
     },
-    /// PH-WAVE2L: operator ops snapshots. Currently just
-    /// `providers-health` against the bridge's consolidated
-    /// `/v1/providers/health` endpoint.
+    /// PH-WAVE2L: operator ops snapshots. `capabilities`,
+    /// `stuck`, `dispatch-stats`, `smoke`, `policy-simulate`,
+    /// `policy-denials`, `events`, and `cron` subcommands
+    /// against the bridge's `/v1/*` surface. See `ops::Cmd` for
+    /// the full list.
     Ops {
         #[command(subcommand)]
         cmd: ops::Cmd,

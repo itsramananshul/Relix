@@ -1,13 +1,21 @@
 //! `relix-cli ops` — operator-facing CLI snapshots.
 //!
 //! Subcommands:
-//! - `providers-health` (PH-WAVE2L) — hits the bridge's
-//!   `/v1/providers/health` and pretty-prints aggregate +
-//!   per-provider state.
 //! - `capabilities` (PH-DASH3-CLI) — hits `/v1/topology` and
 //!   pretty-prints every capability the bridge has discovered,
 //!   mirroring the dashboard's PH-DASH3 explorer for terminal
 //!   operators.
+//! - `stuck`, `dispatch-stats`, `smoke`, `policy-simulate`,
+//!   `policy-denials`, `events`, `cron`, ... — see each variant
+//!   for its source endpoint.
+//!
+//! PART 6 (this commit) removed the `providers-health` and
+//! `route-test` subcommands. Both dispatched against bridge
+//! endpoints (`/v1/providers/health` and
+//! `/v1/providers/route_test`) that were deleted in the prior
+//! security session — provider key handling no longer lives on
+//! the bridge. Aggregate provider counters flow through
+//! `/v1/observability/*` and `/v1/metrics/*` now.
 //!
 //! All subcommands are one-shot HTTP-against-bridge — useful
 //! for status-line scripts, on-call triage, and tmux dashboards.
@@ -18,18 +26,6 @@ use serde_json::json;
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Print the consolidated provider-health snapshot from the
-    /// bridge. Shows aggregate counters across the AI stack
-    /// (cooldowns active, rate-limit hits in 5min / 1h, lifetime
-    /// success / fail counts) plus a per-provider one-liner.
-    ProvidersHealth {
-        /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
-        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
-        bridge: String,
-        /// Raw JSON instead of the pretty one-screen summary.
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
     /// List every capability the bridge has discovered across
     /// every peer in the cached topology. Mirrors the dashboard's
     /// PH-DASH3 capability explorer for terminal operators.
@@ -58,23 +54,6 @@ pub enum Cmd {
         #[arg(long, default_value_t = 300i64)]
         threshold_secs: i64,
         /// Raw JSON instead of the table view.
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
-    /// Preview the HealthAwareRouter's pick for a candidate
-    /// list (PH-ROUTER-PREVIEW). Hits POST
-    /// /v1/providers/route_test against current cached health.
-    /// Does NOT send any chat call.
-    RouteTest {
-        /// Bridge HTTP base URL.
-        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
-        bridge: String,
-        /// Comma-separated candidate list (e.g.
-        /// `openai,anthropic`). Order matters — the router uses
-        /// it for stable tie-breaking.
-        #[arg(long)]
-        candidates: String,
-        /// Raw JSON instead of the pretty summary.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -903,7 +882,6 @@ pub enum CronCmd {
 
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        Cmd::ProvidersHealth { bridge, json } => providers_health(&bridge, json).await,
         Cmd::Capabilities {
             bridge,
             filter,
@@ -921,11 +899,6 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             json,
             csv,
         } => events(&bridge, limit, &filter, json, csv).await,
-        Cmd::RouteTest {
-            bridge,
-            candidates,
-            json,
-        } => route_test(&bridge, &candidates, json).await,
         Cmd::DispatchStats { bridge, peer, json } => dispatch_stats(&bridge, &peer, json).await,
         Cmd::PolicySimulate {
             bridge,
@@ -2125,90 +2098,6 @@ async fn smoke(bridge: &str, provider: &str) -> Result<(), Box<dyn std::error::E
     }
 }
 
-async fn providers_health(bridge: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{}/v1/providers/health", bridge.trim_end_matches('/'));
-    let body = http_get(&url).await?;
-    if json {
-        print!("{body}");
-        if !body.ends_with('\n') {
-            println!();
-        }
-        return Ok(());
-    }
-    let h: HealthResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("bridge returned non-JSON body: {e}\nraw:\n{body}"))?;
-    print_pretty(&h);
-    Ok(())
-}
-
-fn print_pretty(h: &HealthResponse) {
-    // Aggregate header.
-    let a = &h.aggregate;
-    let total_ok = a.success_request_count;
-    let total_fail = a.failed_request_count;
-    let reliability = (total_ok * 100)
-        .checked_div(total_ok + total_fail)
-        .unwrap_or(0);
-    println!(
-        "providers={count}  cooldowns_active={cd}  quarantined={q}",
-        count = h.providers.len(),
-        cd = a.cooldowns_active,
-        q = a.quarantined,
-    );
-    println!(
-        "rate_limit_hits  5min={rl5}  1h={rl1h}",
-        rl5 = a.rate_limit_hits_5min,
-        rl1h = a.rate_limit_hits_1h,
-    );
-    println!(
-        "lifetime  ok={ok}  fail={fail}  reliability={r}%",
-        ok = total_ok,
-        fail = total_fail,
-        r = reliability,
-    );
-    println!();
-    // Per-provider table.
-    let name_h = "provider";
-    let cfg_h = "cfg";
-    let cd_h = "cooldown";
-    let last_h = "last_fail";
-    let rl_h = "rl 5m/1h";
-    println!("{name_h:<14}  {cfg_h:<5}  {cd_h:<12}  {last_h:<24}  {rl_h}");
-    for p in &h.providers {
-        let name = &p.name;
-        let cfg = if p.configured { "yes" } else { "no" };
-        let cd = match p.cooldown_until {
-            Some(c) => {
-                let rem = c - now_secs();
-                if rem > 0 {
-                    let auto = if p.quarantined_at.is_none() {
-                        "auto"
-                    } else {
-                        "op"
-                    };
-                    format!("{rem}s ({auto})")
-                } else {
-                    "-".to_string()
-                }
-            }
-            None => "-".to_string(),
-        };
-        let last = match (p.last_failure_reason.as_deref(), p.last_failure_at) {
-            (Some(r), Some(t)) => format!("{r} @ {t}"),
-            _ => "-".to_string(),
-        };
-        let rl = format!("{}/{}", p.rate_limit_hits_5min, p.rate_limit_hits_1h);
-        println!("{name:<14}  {cfg:<5}  {cd:<12}  {last:<24}  {rl}",);
-    }
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 async fn capabilities(
     bridge: &str,
     filter: &str,
@@ -2403,51 +2292,6 @@ async fn events(
     Ok(())
 }
 
-async fn route_test(
-    bridge: &str,
-    candidates_csv: &str,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let candidates: Vec<String> = candidates_csv
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if candidates.is_empty() {
-        return Err("--candidates required (comma-separated, non-empty)".into());
-    }
-    let url = format!("{}/v1/providers/route_test", bridge.trim_end_matches('/'));
-    let body_in = serde_json::json!({ "candidates": candidates }).to_string();
-    let body = http_post_json(&url, &body_in).await?;
-    if json {
-        print!("{body}");
-        if !body.ends_with('\n') {
-            println!();
-        }
-        return Ok(());
-    }
-    let resp: RouteTestResp = serde_json::from_str(&body)
-        .map_err(|e| format!("bridge returned non-JSON body: {e}\nraw:\n{body}"))?;
-    println!("router={r}  chosen={c}", r = resp.router, c = resp.chosen,);
-    println!("reasoning: {}", resp.reasoning);
-    println!();
-    let name_h = "candidate";
-    let score_h = "score";
-    let elig_h = "eligibility";
-    let why_h = "why";
-    println!("{name_h:<14}  {score_h:>5}  {elig_h:<12}  {why_h}");
-    for c in &resp.candidates {
-        println!(
-            "{n:<14}  {s:>5.2}  {e:<12}  {w}",
-            n = c.name,
-            s = c.score,
-            e = c.eligibility,
-            w = c.why,
-        );
-    }
-    Ok(())
-}
-
 async fn http_post_json(url: &str, body: &str) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -2464,30 +2308,6 @@ async fn http_post_json(url: &str, body: &str) -> Result<String, Box<dyn std::er
         return Err(format!("bridge returned HTTP {status}: {body}").into());
     }
     Ok(body)
-}
-
-#[derive(Debug, Deserialize)]
-struct RouteTestResp {
-    #[serde(default)]
-    router: String,
-    #[serde(default)]
-    chosen: String,
-    #[serde(default)]
-    reasoning: String,
-    #[serde(default)]
-    candidates: Vec<RouteTestCandidate>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouteTestCandidate {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    score: f32,
-    #[serde(default)]
-    eligibility: String,
-    #[serde(default)]
-    why: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3011,51 +2831,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let head: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{head}…")
-}
-
-// Loose deserializers — we accept whatever the bridge sends and
-// don't fail on additional fields. Same posture as topology.rs's
-// HealthResponse.
-
-#[derive(Debug, Deserialize)]
-struct HealthResponse {
-    providers: Vec<ProviderStatus>,
-    aggregate: Aggregate,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct Aggregate {
-    #[serde(default)]
-    cooldowns_active: u64,
-    #[serde(default)]
-    quarantined: u64,
-    #[serde(default)]
-    rate_limit_hits_5min: u64,
-    #[serde(default)]
-    rate_limit_hits_1h: u64,
-    #[serde(default)]
-    failed_request_count: u64,
-    #[serde(default)]
-    success_request_count: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProviderStatus {
-    name: String,
-    #[serde(default)]
-    configured: bool,
-    #[serde(default)]
-    cooldown_until: Option<i64>,
-    #[serde(default)]
-    quarantined_at: Option<i64>,
-    #[serde(default)]
-    last_failure_reason: Option<String>,
-    #[serde(default)]
-    last_failure_at: Option<i64>,
-    #[serde(default)]
-    rate_limit_hits_5min: u64,
-    #[serde(default)]
-    rate_limit_hits_1h: u64,
 }
 
 // ── PH-CRON-CLI: cron scheduler subcommands ────────────────
@@ -4193,43 +3968,11 @@ mod tests {
         assert_eq!(urlencoding("simple"), "simple");
     }
 
-    #[test]
-    fn parse_typical_health_body() {
-        let body = r#"{
-            "providers": [
-                {
-                    "name": "openai",
-                    "configured": true,
-                    "rate_limit_hits_5min": 2,
-                    "rate_limit_hits_1h": 5,
-                    "last_failure_reason": "rate-limit",
-                    "last_failure_at": 1700000000
-                },
-                {"name": "anthropic", "configured": false}
-            ],
-            "aggregate": {
-                "cooldowns_active": 1,
-                "quarantined": 0,
-                "rate_limit_hits_5min": 2,
-                "rate_limit_hits_1h": 5,
-                "failed_request_count": 9,
-                "success_request_count": 41
-            }
-        }"#;
-        let h: HealthResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(h.providers.len(), 2);
-        assert_eq!(h.providers[0].rate_limit_hits_5min, 2);
-        assert_eq!(h.aggregate.cooldowns_active, 1);
-        assert_eq!(h.aggregate.failed_request_count, 9);
-    }
-
-    #[test]
-    fn parse_empty_providers() {
-        let body = r#"{"providers":[], "aggregate":{}}"#;
-        let h: HealthResponse = serde_json::from_str(body).unwrap();
-        assert!(h.providers.is_empty());
-        assert_eq!(h.aggregate.cooldowns_active, 0);
-    }
+    // PART 6: the `parse_typical_health_body` and
+    // `parse_empty_providers` tests were removed alongside
+    // `providers_health` — the bridge endpoint
+    // (`/v1/providers/health`) was deleted in the prior security
+    // session and the CLI no longer dispatches against it.
 
     #[test]
     fn parse_events_response() {
@@ -4249,25 +3992,11 @@ mod tests {
         assert_eq!(r.items[0].summary, "[retry] requested (#2/5)");
     }
 
-    #[test]
-    fn parse_route_test_response() {
-        let body = r#"{
-            "router": "health-aware",
-            "chosen": "openai",
-            "reasoning": "health-aware: chose openai (success_ratio=0.95) from 2 eligible of 2 total",
-            "chosen_at": 1700000000,
-            "candidates": [
-                {"name": "openai", "score": 0.95, "eligibility": "eligible", "why": "chosen (healthy success_ratio=0.95)"},
-                {"name": "anthropic", "score": 0.42, "eligibility": "eligible", "why": "considered (healthy success_ratio=0.84)"}
-            ]
-        }"#;
-        let r: RouteTestResp = serde_json::from_str(body).unwrap();
-        assert_eq!(r.router, "health-aware");
-        assert_eq!(r.chosen, "openai");
-        assert_eq!(r.candidates.len(), 2);
-        assert!((r.candidates[0].score - 0.95).abs() < 1e-3);
-        assert_eq!(r.candidates[1].eligibility, "eligible");
-    }
+    // PART 6: `parse_route_test_response` was removed alongside
+    // `route_test` (same reason as the providers-health tests
+    // above — the bridge endpoint
+    // `/v1/providers/route_test` was deleted in the prior
+    // security session).
 
     #[test]
     fn parse_stuck_response() {

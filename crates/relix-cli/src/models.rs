@@ -1,24 +1,20 @@
 //! GAP 16 partial — `relix models` CLI surface.
 //!
-//! Two subcommands, both calling the bridge's existing
-//! `/v1/config/providers` + `/v1/providers/health` endpoints:
+//! Two subcommands, both calling existing bridge endpoints:
 //!
 //! - `relix models list` — table of configured providers with
 //!   their default model, enabled flag, configured-status, and
-//!   last-test outcome (when present).
-//! - `relix models health` — same list plus the aggregate
-//!   cooldown / quarantined / rate-limit counters the bridge
-//!   exposes.
+//!   last-test outcome (when present). Hits
+//!   `GET /v1/config/providers`.
+//! - `relix models fetch` — live model catalogue for the active
+//!   provider via `GET /v1/models`.
 //!
-//! Honest scope: this does NOT probe each provider's `/models`
-//! endpoint over the wire. The bridge already exposes
-//! `GET /v1/models` which surfaces the OpenAI-compat model list
-//! when the active provider speaks that protocol; calling it
-//! per-provider is a follow-up because providers like Anthropic
-//! and Gemini do not expose a uniform `/models` endpoint. The
-//! current scope answers "what models is Relix configured to
-//! talk to right now" — which is what the §7.30 spec's
-//! `relix models` line asked for.
+//! `relix models health` was removed in PART 6 because the bridge
+//! endpoint it dispatched against (`/v1/providers/health`) was
+//! deleted in the prior security session (PART 4 of the bridge
+//! security pass — provider key handling was removed from the
+//! bridge entirely). The aggregate counters that used to live on
+//! that endpoint now flow through `/v1/observability/*` instead.
 
 use clap::{Args, Subcommand};
 
@@ -30,9 +26,6 @@ pub enum Cmd {
     /// default model + enabled flag. Hits
     /// `GET /v1/config/providers`.
     List(ListArgs),
-    /// Same list as `list` plus the aggregate health counters
-    /// the bridge exposes. Hits `GET /v1/providers/health`.
-    Health(HealthArgs),
     /// GAP 16 §7.29 Model Name Resolution — fetch the bridge's
     /// active AI provider's live model catalogue. Hits
     /// `GET /v1/models`. Operators use this to discover real
@@ -42,14 +35,6 @@ pub enum Cmd {
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
-    #[arg(long, default_value = DEFAULT_BRIDGE)]
-    pub bridge: String,
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct HealthArgs {
     #[arg(long, default_value = DEFAULT_BRIDGE)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
@@ -67,7 +52,6 @@ pub struct FetchArgs {
 pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Cmd::List(a) => list(a).await,
-        Cmd::Health(a) => health(a).await,
         Cmd::Fetch(a) => fetch(a).await,
     }
 }
@@ -127,51 +111,6 @@ async fn list(args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|x| x.as_array())
         .unwrap_or(&empty);
     print_provider_table(providers);
-    Ok(())
-}
-
-async fn health(args: HealthArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let base = args.bridge.trim_end_matches('/');
-    let url = format!("{base}/v1/providers/health");
-    let r = reqwest::Client::new().get(&url).send().await?;
-    let status = r.status();
-    let body = r.text().await?;
-    if !status.is_success() {
-        eprintln!("error: HTTP {status}: {body}");
-        std::process::exit(1);
-    }
-    if args.json {
-        println!("{body}");
-        return Ok(());
-    }
-    let v: serde_json::Value = serde_json::from_str(&body)?;
-    let empty: Vec<serde_json::Value> = Vec::new();
-    let providers = v
-        .get("providers")
-        .and_then(|x| x.as_array())
-        .unwrap_or(&empty);
-    print_provider_table(providers);
-    if let Some(agg) = v.get("aggregate") {
-        println!();
-        println!("Aggregate:");
-        let cooldowns = agg
-            .get("cooldowns_active")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        let quarantined = agg.get("quarantined").and_then(|x| x.as_u64()).unwrap_or(0);
-        let rl_5min = agg
-            .get("rate_limit_hits_5min")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        let rl_1h = agg
-            .get("rate_limit_hits_1h")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        println!("  cooldowns_active     : {cooldowns}");
-        println!("  quarantined          : {quarantined}");
-        println!("  rate_limit_hits_5min : {rl_5min}");
-        println!("  rate_limit_hits_1h   : {rl_1h}");
-    }
     Ok(())
 }
 
