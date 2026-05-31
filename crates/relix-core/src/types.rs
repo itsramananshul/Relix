@@ -201,25 +201,41 @@ impl Timestamp {
     /// deterministic `Time.now()` capability (RELIX-7 §7.11). This is fine for
     /// audit and bundle issuance timestamps.
     ///
-    /// SEC PART 6: panics if the system clock is before the Unix epoch.
-    /// Silently returning `1970-01-01` (the prior behaviour) caused
-    /// impossible-to-debug downstream comparisons; failing loud surfaces the
-    /// real fault — a misconfigured clock — at boot.
+    /// A misconfigured system clock must NEVER abort the responder process —
+    /// that would take down every live flow on it. Instead of panicking (the
+    /// prior behaviour), a bad clock is clamped and logged:
+    /// - a pre-epoch clock → clamp to epoch 0 (`1970-01-01`) + `WARN`
+    /// - a clock past `i64::MAX` seconds (≈year 292277026596) → clamp to
+    ///   `i64::MAX` + `WARN` (rather than silently saturating)
     pub fn now() -> Self {
-        // SEC PART 6: panic explicitly when the system clock is
-        // pre-epoch — never silently return `1970-01-01`. The
-        // `expect`/`unwrap` paths are forbidden by the
-        // relix-core clippy posture, so we pattern-match and
-        // panic with the documented message.
-        let dur = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d,
-            Err(_) => panic!("system clock is before the Unix epoch — check your system clock"),
-        };
-        // `as_secs()` returns u64; convert via try_from so a clock past
-        // i64::MAX (≈year 292277026596) saturates instead of silently
-        // wrapping to a negative timestamp.
-        let secs = i64::try_from(dur.as_secs()).unwrap_or(i64::MAX);
-        Self(secs)
+        Self::from_unix_time(std::time::SystemTime::now())
+    }
+
+    /// Convert a `SystemTime` into a `Timestamp` (seconds since the Unix
+    /// epoch). Factored out of [`Self::now`] so the clock-error handling is
+    /// unit-testable with an injected `SystemTime`. Never panics:
+    /// a pre-epoch instant clamps to `0` and a clock beyond the `i64::MAX`
+    /// second horizon clamps to `i64::MAX`; both clamps log a `WARN` so the
+    /// underlying clock fault is surfaced rather than silently swallowed.
+    fn from_unix_time(now: std::time::SystemTime) -> Self {
+        match now.duration_since(std::time::UNIX_EPOCH) {
+            Ok(dur) => match i64::try_from(dur.as_secs()) {
+                Ok(secs) => Self(secs),
+                Err(_) => {
+                    tracing::warn!(
+                        secs = dur.as_secs(),
+                        "system clock is past the i64::MAX-second horizon (≈year 292277026596) — clamping Timestamp to i64::MAX"
+                    );
+                    Self(i64::MAX)
+                }
+            },
+            Err(_) => {
+                tracing::warn!(
+                    "system clock is before the Unix epoch — clamping Timestamp to epoch 0 (1970-01-01); check the system clock"
+                );
+                Self(0)
+            }
+        }
     }
 
     /// SEC PART 6: checked add. Returns `ArithmeticOverflow`
@@ -337,6 +353,28 @@ mod tests {
     fn timestamp_addition() {
         let t = Timestamp(1000);
         assert_eq!(t.add_secs(5).unwrap().0, 1005);
+    }
+
+    #[test]
+    fn timestamp_now_handles_pre_epoch_clock_without_panicking() {
+        use std::time::{Duration, UNIX_EPOCH};
+        // Simulate a system clock set before the Unix epoch.
+        // Previously this panicked, aborting the responder
+        // process and every live flow on it. It must now clamp
+        // to epoch 0 and return a value, not panic.
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(10);
+        let ts = Timestamp::from_unix_time(pre_epoch);
+        assert_eq!(ts, Timestamp(0));
+    }
+
+    #[test]
+    fn timestamp_now_converts_a_normal_clock_and_never_panics() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let ts = Timestamp::from_unix_time(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        assert_eq!(ts, Timestamp(1_700_000_000));
+        // The real `now()` (wired to the host clock) must also
+        // never panic and must be post-epoch on any sane host.
+        assert!(Timestamp::now().0 > 0);
     }
 
     #[test]

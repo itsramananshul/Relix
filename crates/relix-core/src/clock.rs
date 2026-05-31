@@ -42,10 +42,40 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
-            .unwrap_or(0)
+        system_now_ms(std::time::SystemTime::now())
+    }
+}
+
+/// Convert a `SystemTime` to unix milliseconds for [`SystemClock`].
+/// Consistent with [`crate::types::Timestamp::now`]: a clock error is
+/// LOGGED and handled, never silently swallowed and never a panic.
+/// - a pre-epoch clock → `WARN` + clamp to epoch 0 (the old code returned
+///   `1970` silently via `.unwrap_or(0)`, hiding the fault)
+/// - a clock past the `i64::MAX`-millisecond horizon → `WARN` + clamp to
+///   `i64::MAX`
+///
+/// Factored out so the clock-error path is unit-testable with an injected
+/// `SystemTime`.
+fn system_now_ms(now: std::time::SystemTime) -> i64 {
+    match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(dur) => {
+            let ms = dur.as_millis();
+            if ms > i64::MAX as u128 {
+                tracing::warn!(
+                    ms,
+                    "system clock is past the i64::MAX-millisecond horizon — clamping now_ms to i64::MAX"
+                );
+                i64::MAX
+            } else {
+                ms as i64
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                "system clock is before the Unix epoch — clamping now_ms to epoch 0 (1970-01-01); check the system clock"
+            );
+            0
+        }
     }
 }
 
@@ -103,6 +133,23 @@ mod tests {
         let t2 = c.now_ms();
         assert!(t1 > 0);
         assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn system_now_ms_clamps_pre_epoch_clock_to_zero_without_panic() {
+        use std::time::{Duration, UNIX_EPOCH};
+        // A clock error must be handled (clamp to epoch 0), not a
+        // panic and not a silent wrong value — consistent with
+        // `Timestamp::now`.
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(5);
+        assert_eq!(super::system_now_ms(pre_epoch), 0);
+    }
+
+    #[test]
+    fn system_now_ms_converts_a_normal_instant_to_millis() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        assert_eq!(super::system_now_ms(t), 1_700_000_000_123);
     }
 
     #[test]
