@@ -1794,7 +1794,53 @@ async fn handle_chat(
             //   * attaches an [`AiSelfConsistencyHint`] so the
             //     dispatch bridge's `ConfidenceScorer` substitutes
             //     the score for `provider_signal`.
+            //
+            // PART 3: cost guards. Three new gates run BEFORE the
+            // SC fire decision and propagate to the judge + belief
+            // stages further down:
+            //   * `is_disabled` — a prior guard trip has SC paused.
+            //   * `per_request_budget_usd` — estimated SC + judge +
+            //     belief cost > config cap; cascade-skip all three.
+            //   * after SC runs, record the decision in the rolling
+            //     ring and the cost in the rolling-hour window so
+            //     subsequent requests see updated guard state.
+            let now_unix_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let baseline_prompt_tokens =
+                output.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
+            let baseline_completion_tokens = output
+                .usage
+                .as_ref()
+                .map(|u| u.completion_tokens)
+                .unwrap_or(0);
+            let model_for_cost = if output.model.is_empty() {
+                default_model.as_str()
+            } else {
+                output.model.as_str()
+            };
+            let estimated_optional_cost_usd = sc_stats.estimate_optional_cost_usd(
+                baseline_prompt_tokens,
+                baseline_completion_tokens,
+                model_for_cost,
+                sc_cfg.sample_count.max(1),
+            );
+            let cost_budget_exceeded = estimated_optional_cost_usd
+                .map(|c| c > sc_cfg.per_request_budget_usd)
+                .unwrap_or(false);
+            let sc_disabled_by_guard = sc_stats.is_disabled(now_unix_secs);
+            if cost_budget_exceeded {
+                tracing::warn!(
+                    session_id,
+                    estimated_optional_cost_usd,
+                    per_request_budget_usd = sc_cfg.per_request_budget_usd,
+                    "ai.chat: per-request cost budget exceeded; skipping SC + judge + belief"
+                );
+            }
             if sc_cfg.matches_capability("ai.chat")
+                && !cost_budget_exceeded
+                && !sc_disabled_by_guard
                 && sc_cfg.should_trigger(baseline_confidence(&output.text))
             {
                 let baseline_text = output.text.clone();
@@ -1816,6 +1862,22 @@ async fn handle_chat(
                         });
                     }
                     sc_stats.record(outcome.score, outcome.samples.len());
+                    sc_stats.record_decision(true, now_unix_secs, &sc_cfg);
+                    // SC cost ≈ (sample_count - 1) extra calls
+                    // priced like the baseline call.
+                    if let Some(base_unit) = sc_stats.estimate_optional_cost_usd(
+                        baseline_prompt_tokens,
+                        baseline_completion_tokens,
+                        model_for_cost,
+                        2, // ⇒ one extra unit
+                    ) {
+                        // `estimate_optional_cost_usd(_, _, _, 2)`
+                        // returns `1 + 2 = 3` baseline units; we
+                        // want `(sample_count - 1)` of those units.
+                        let per_unit = base_unit / 3.0;
+                        let sc_cost = per_unit * outcome.samples.len().saturating_sub(1) as f64;
+                        sc_stats.record_sc_cost_usd(sc_cost, now_unix_secs, &sc_cfg);
+                    }
                     tracing::info!(
                         session_id,
                         sc_score = outcome.score,
@@ -1824,6 +1886,13 @@ async fn handle_chat(
                         "ai.chat: self-consistency outcome recorded"
                     );
                 }
+            } else if sc_cfg.matches_capability("ai.chat") {
+                // PART 3: even when we DON'T fire SC (high
+                // baseline confidence, cost-budget exceeded, or
+                // gate disabled), record the decision so the
+                // rolling trigger-rate window reflects ground
+                // truth.
+                sc_stats.record_decision(false, now_unix_secs, &sc_cfg);
             }
             // RELIX-7.29 PART 3: non-blocking belief update. The
             // belief tracker reads existing beliefs for
@@ -1847,12 +1916,17 @@ async fn handle_chat(
             // `proceed` verdict so the handler never stalls.
             let prior_turns = judge_turns.bump(session_id);
             let chat_confidence = baseline_confidence(&output.text);
-            if judge::should_invoke(
-                &judge_runtime_cfg,
-                chat_confidence,
-                &output.text,
-                prior_turns,
-            ) {
+            // PART 3: per-request cost guard. When the cost
+            // estimate exceeded `per_request_budget_usd` above
+            // we cascade-skip judge after SC.
+            if !cost_budget_exceeded
+                && judge::should_invoke(
+                    &judge_runtime_cfg,
+                    chat_confidence,
+                    &output.text,
+                    prior_turns,
+                )
+            {
                 let judge_input = judge::build_judge_input(
                     &judge_runtime_cfg,
                     session_id,
@@ -1938,7 +2012,10 @@ async fn handle_chat(
                     output.text = combined;
                 }
             }
-            if belief_tracker.enabled() {
+            // PART 3: per-request cost guard. Skip belief update
+            // when the budget has been exceeded; otherwise honour
+            // the existing `belief_tracker.enabled()` gate.
+            if !cost_budget_exceeded && belief_tracker.enabled() {
                 let provider_for_belief = provider.clone();
                 let tracker_for_belief = belief_tracker.clone();
                 let subject_for_belief = belief_subject.clone();
@@ -5197,6 +5274,7 @@ mod tests {
             sample_count,
             min_score_to_enable: 1.0,
             capability_patterns: vec!["ai.chat.stream".into()],
+            ..Default::default()
         }
     }
 

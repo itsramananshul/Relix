@@ -216,6 +216,16 @@ pub enum AlertKind {
     /// exceeds the agent's rolling (24h) baseline rate by a
     /// configurable factor. Dedup is keyed per-agent.
     AskHumanRateDrift,
+    /// PART 3 + PART 4: generic absolute spend / cost guard
+    /// trip. Emitted by the self-consistency cost guard when
+    /// the rolling trigger-rate or hourly SC spend crosses its
+    /// config limit, and by the absolute spend caps under
+    /// `[metrics.cost_alerts]` when a request, hour, or day
+    /// exceeds its hard ceiling — independent of any
+    /// statistical baseline. The `message` field carries the
+    /// cause string (e.g. `self_consistency_trigger_rate_exceeded`,
+    /// `absolute_hourly_cap_exceeded`).
+    CostAlert,
 }
 
 impl AlertKind {
@@ -229,6 +239,7 @@ impl AlertKind {
             AlertKind::BudgetExceeded => "budget_exceeded",
             AlertKind::ProviderCostSpike => "provider_cost_spike",
             AlertKind::AskHumanRateDrift => "ask_human_rate_drift",
+            AlertKind::CostAlert => "cost_alert",
         }
     }
 }

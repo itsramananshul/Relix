@@ -31,10 +31,15 @@
 //! handler is responsible for sequencing the actual provider
 //! calls.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+
+use crate::metrics::alert::{ActiveAlert, AlertDeliver, AlertEvent, AlertKind, AlertSeverity};
+use crate::metrics::pricing::PriceTable;
 
 /// `[confidence.self_consistency]` configuration block.
 ///
@@ -73,6 +78,28 @@ pub struct SelfConsistencyConfig {
     /// capability".
     #[serde(default)]
     pub capability_patterns: Vec<String>,
+    /// PART 3: SC trigger-rate guard. When the rolling 1000-
+    /// sample trigger rate exceeds this percentage, the
+    /// guard disables SC for `disable_duration_secs` and
+    /// emits a [`super::AlertKind::CostAlert`] via the wired
+    /// `MultiChannelAlertSink`. Default 50%.
+    #[serde(default = "default_max_trigger_rate_pct")]
+    pub max_trigger_rate_pct: u8,
+    /// PART 3: how long SC stays disabled after a guard trip
+    /// (trigger-rate or hourly-budget). Default 300s.
+    #[serde(default = "default_disable_duration_secs")]
+    pub disable_duration_secs: u64,
+    /// PART 3: hourly absolute spend cap (USD) for SC samples.
+    /// Crossing it fires a CostAlert and disables SC for
+    /// `disable_duration_secs`. Default $10/hour.
+    #[serde(default = "default_sc_hourly_budget_usd")]
+    pub sc_hourly_budget_usd: f64,
+    /// PART 3: per-request budget (USD). When the estimated
+    /// cost of the optional stages (SC + judge + belief) for
+    /// a single request exceeds this, the AI handler skips
+    /// SC → judge → belief in that order. Default $1.
+    #[serde(default = "default_per_request_budget_usd")]
+    pub per_request_budget_usd: f64,
 }
 
 impl Default for SelfConsistencyConfig {
@@ -82,6 +109,10 @@ impl Default for SelfConsistencyConfig {
             sample_count: default_sample_count(),
             min_score_to_enable: default_min_score_to_enable(),
             capability_patterns: Vec::new(),
+            max_trigger_rate_pct: default_max_trigger_rate_pct(),
+            disable_duration_secs: default_disable_duration_secs(),
+            sc_hourly_budget_usd: default_sc_hourly_budget_usd(),
+            per_request_budget_usd: default_per_request_budget_usd(),
         }
     }
 }
@@ -92,6 +123,22 @@ fn default_sample_count() -> usize {
 
 fn default_min_score_to_enable() -> f32 {
     0.70
+}
+
+fn default_max_trigger_rate_pct() -> u8 {
+    50
+}
+
+fn default_disable_duration_secs() -> u64 {
+    300
+}
+
+fn default_sc_hourly_budget_usd() -> f64 {
+    10.0
+}
+
+fn default_per_request_budget_usd() -> f64 {
+    1.0
 }
 
 impl SelfConsistencyConfig {
@@ -158,6 +205,23 @@ impl Default for SelfConsistencyOutcome {
     }
 }
 
+/// PART 3 cost-guard size for the rolling trigger ring.
+pub(crate) const TRIGGER_RING_CAPACITY: usize = 1000;
+
+/// PART 3 internal cost-guard state. Behind one Mutex so the
+/// rolling structures stay consistent under the AI handler's
+/// concurrent calls.
+#[derive(Default)]
+struct CostGuardState {
+    /// Rolling decision ring — `true` ⇒ SC fired on that
+    /// request, `false` ⇒ SC was considered but skipped (e.g.
+    /// baseline confidence was high enough). Cap = 1000.
+    trigger_ring: VecDeque<bool>,
+    /// Rolling hourly SC spend events: `(unix_secs, usd)`.
+    /// Prune-on-write keeps the deque bounded by elapsed time.
+    hourly_spend_events: VecDeque<(i64, f64)>,
+}
+
 /// Process-wide rolling counters surfaced by the
 /// `confidence.self_consistency_stats` cap.
 #[derive(Clone, Default)]
@@ -167,11 +231,50 @@ pub struct SelfConsistencyStats {
     score_sum_bits: Arc<AtomicU64>,
     score_count: Arc<AtomicU32>,
     last_score_bits: Arc<AtomicU32>,
+    /// PART 3: unix-seconds the SC gate is disabled until.
+    /// `i64::MIN` ⇒ never disabled.
+    disabled_until_unix_secs: Arc<AtomicI64>,
+    /// PART 3: cost-guard rolling state.
+    guard: Arc<Mutex<CostGuardState>>,
+    /// PART 3: alert sink for CostAlert emissions. Installed
+    /// once at controller startup via
+    /// [`Self::install_alert_sink`]. When absent, the guard
+    /// still disables SC but skips the alert emission.
+    alert_sink: Arc<OnceLock<Arc<dyn AlertDeliver>>>,
+    /// PART 3: price table used by the per-request cost
+    /// estimator. Installed once via
+    /// [`Self::install_price_table`]. Without a price table
+    /// the per-request budget gate is inert (returns `None`).
+    price_table: Arc<OnceLock<Arc<PriceTable>>>,
 }
 
 impl SelfConsistencyStats {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            trigger_count: Arc::new(AtomicU64::new(0)),
+            total_samples: Arc::new(AtomicU64::new(0)),
+            score_sum_bits: Arc::new(AtomicU64::new(0)),
+            score_count: Arc::new(AtomicU32::new(0)),
+            last_score_bits: Arc::new(AtomicU32::new(0)),
+            disabled_until_unix_secs: Arc::new(AtomicI64::new(i64::MIN)),
+            guard: Arc::new(Mutex::new(CostGuardState::default())),
+            alert_sink: Arc::new(OnceLock::new()),
+            price_table: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// PART 3: install the alert sink the cost guards emit
+    /// CostAlerts through. Idempotent — second + later calls
+    /// are silently ignored. Without a sink, the guards still
+    /// disable SC; they just don't notify operators.
+    pub fn install_alert_sink(&self, sink: Arc<dyn AlertDeliver>) {
+        let _ = self.alert_sink.set(sink);
+    }
+
+    /// PART 3: install the price table used by
+    /// [`Self::estimate_optional_cost_usd`]. Idempotent.
+    pub fn install_price_table(&self, table: Arc<PriceTable>) {
+        let _ = self.price_table.set(table);
     }
 
     /// Record one SC outcome — the AI handler calls this every
@@ -205,6 +308,147 @@ impl SelfConsistencyStats {
             average_score: avg,
             last_score: f32::from_bits(self.last_score_bits.load(Ordering::Relaxed)),
         }
+    }
+
+    /// PART 3: `true` when the SC gate is currently disabled
+    /// by a prior cost-guard trip.
+    pub fn is_disabled(&self, now_unix_secs: i64) -> bool {
+        let until = self.disabled_until_unix_secs.load(Ordering::Relaxed);
+        until > now_unix_secs
+    }
+
+    /// PART 3: record one SC consideration outcome. The AI
+    /// handler calls this every time it evaluates whether to
+    /// fire SC — `triggered = true` when SC actually ran,
+    /// `false` when SC was matched-but-skipped (baseline
+    /// confidence above threshold, cost-budget exceeded, etc.).
+    /// Rolls the ring forward; when the ring is full and the
+    /// trigger rate exceeds `cfg.max_trigger_rate_pct`,
+    /// disables SC for `cfg.disable_duration_secs` and emits
+    /// a CostAlert.
+    pub fn record_decision(
+        &self,
+        triggered: bool,
+        now_unix_secs: i64,
+        cfg: &SelfConsistencyConfig,
+    ) {
+        let trip = {
+            let mut g = match self.guard.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if g.trigger_ring.len() >= TRIGGER_RING_CAPACITY {
+                g.trigger_ring.pop_front();
+            }
+            g.trigger_ring.push_back(triggered);
+            if g.trigger_ring.len() >= TRIGGER_RING_CAPACITY {
+                let fired = g.trigger_ring.iter().filter(|b| **b).count();
+                let rate_pct = (fired * 100) / g.trigger_ring.len();
+                rate_pct > cfg.max_trigger_rate_pct as usize
+            } else {
+                false
+            }
+        };
+        if trip {
+            self.trip_disable(
+                now_unix_secs,
+                cfg.disable_duration_secs,
+                "self_consistency_trigger_rate_exceeded",
+            );
+        }
+    }
+
+    /// PART 3: record the USD cost of one SC fan-out. Appends
+    /// to the rolling hourly window and trips the hourly-budget
+    /// guard when the window sum exceeds
+    /// `cfg.sc_hourly_budget_usd`.
+    pub fn record_sc_cost_usd(
+        &self,
+        cost_usd: f64,
+        now_unix_secs: i64,
+        cfg: &SelfConsistencyConfig,
+    ) {
+        let trip = {
+            let mut g = match self.guard.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            g.hourly_spend_events.push_back((now_unix_secs, cost_usd));
+            let cutoff = now_unix_secs - 3_600;
+            while let Some(&(t, _)) = g.hourly_spend_events.front() {
+                if t < cutoff {
+                    g.hourly_spend_events.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let sum: f64 = g.hourly_spend_events.iter().map(|(_, c)| *c).sum();
+            sum > cfg.sc_hourly_budget_usd
+        };
+        if trip {
+            self.trip_disable(
+                now_unix_secs,
+                cfg.disable_duration_secs,
+                "self_consistency_hourly_budget_exceeded",
+            );
+        }
+    }
+
+    /// PART 3: estimate the total optional-stage cost (SC
+    /// samples + judge call + belief call) for one request,
+    /// based on the baseline call's token usage. Returns
+    /// `None` when no price table is installed or the model
+    /// has no entry. Each optional stage is assumed to consume
+    /// the same prompt + completion budget as the baseline
+    /// call — a deliberate over-estimate so the budget gate
+    /// fires before the actual spend lands.
+    pub fn estimate_optional_cost_usd(
+        &self,
+        baseline_prompt_tokens: u32,
+        baseline_completion_tokens: u32,
+        model: &str,
+        sample_count: usize,
+    ) -> Option<f64> {
+        let table = self.price_table.get()?;
+        let base = table.estimate_cost_micros(
+            model,
+            baseline_prompt_tokens as u64,
+            baseline_completion_tokens as u64,
+        )?;
+        // SC fan-out cost: `sample_count - 1` additional calls
+        // (the baseline already happened and is NOT counted in
+        // the "optional" bucket). Judge + belief add one each.
+        let extra_sc_calls = sample_count.saturating_sub(1) as u64;
+        let total_micros = base
+            .saturating_mul(extra_sc_calls)
+            .saturating_add(base.saturating_mul(2));
+        Some(total_micros as f64 / 1_000_000.0)
+    }
+
+    fn trip_disable(&self, now_unix_secs: i64, duration_secs: u64, cause: &'static str) {
+        let until = now_unix_secs.saturating_add(duration_secs as i64);
+        // CAS so concurrent trips converge on the latest cutoff.
+        let _ = self
+            .disabled_until_unix_secs
+            .fetch_max(until, Ordering::Relaxed);
+        if let Some(sink) = self.alert_sink.get() {
+            let event = AlertEvent::Fired(ActiveAlert {
+                agent: "self_consistency".to_string(),
+                kind: AlertKind::CostAlert,
+                severity: AlertSeverity::Critical,
+                triggered_at_ms: now_unix_secs.saturating_mul(1_000),
+                threshold: 0.0,
+                actual: 0.0,
+                message: cause.to_string(),
+                method: None,
+            });
+            sink.deliver(&event);
+        }
+        tracing::warn!(
+            cause,
+            disabled_until_unix_secs = until,
+            "self_consistency: cost guard tripped — SC disabled"
+        );
     }
 }
 
@@ -401,6 +645,7 @@ mod tests {
             sample_count: 3,
             min_score_to_enable: 0.7,
             capability_patterns: Vec::new(),
+            ..Default::default()
         };
         assert!(cfg.matches_capability("ai.chat"));
         assert!(cfg.matches_capability("anything.else"));
@@ -413,6 +658,7 @@ mod tests {
             sample_count: 3,
             min_score_to_enable: 0.7,
             capability_patterns: vec!["ai.chat*".into(), "tool.search".into()],
+            ..Default::default()
         };
         assert!(cfg.matches_capability("ai.chat"));
         assert!(cfg.matches_capability("ai.chat.stream"));
@@ -442,6 +688,7 @@ mod tests {
             sample_count: 3,
             min_score_to_enable: 0.7,
             capability_patterns: Vec::new(),
+            ..Default::default()
         };
         assert!(cfg.should_trigger(0.5));
         assert!(!cfg.should_trigger(0.7));

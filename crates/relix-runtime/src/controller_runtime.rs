@@ -790,7 +790,14 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             let sink: std::sync::Arc<dyn crate::metrics::AlertDeliver> =
                 std::sync::Arc::new(composite);
             let engine = std::sync::Arc::new(m.alert_engine.clone());
-            bridge.set_alert_pipeline(engine, sink);
+            bridge.set_alert_pipeline(engine, sink.clone());
+            // PART 3: install the same alert sink + price table
+            // on the SC stats so the cost guards can emit
+            // CostAlerts when the trigger-rate / hourly-budget
+            // limits trip, and so per-request cost estimation
+            // is grounded in real model prices.
+            b.sc_stats.install_alert_sink(sink);
+            b.sc_stats.install_price_table(m.collector.prices());
         }
         // Register confidence.* coordinator caps so operators
         // can call confidence.policy_list / score_history /
