@@ -585,13 +585,20 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Manifest provider — populated as each node-type registers its
     // capabilities and served by the built-in `node.manifest` capability.
+    //
+    // SEC PART 2: thread the node's libp2p Ed25519 signing key
+    // into the provider so `signed_snapshot` can mint the
+    // wire-shaped [`SignedManifest`] receivers TOFU-pin +
+    // verify. Pre-fix path returned an unsigned `NodeManifest`
+    // — any peer on the transport could claim any capabilities.
     let manifest = ManifestProvider::new(
         node_id,
         cfg.controller.name.clone(),
         cfg.controller.node_type.clone(),
         NodeId::from_pubkey(trust_root.as_bytes()),
         vec![format!("/ip4/127.0.0.1/tcp/{}", cfg.controller.listen_port)],
-    );
+    )
+    .with_signer(node_signer.clone());
 
     // Dispatch bridge.
     let mut bridge = DispatchBridge::new(policy, trust_root, &audit_path, node_signer.clone())?;
@@ -1336,15 +1343,36 @@ fn register_builtins(
             async move { handle_policy_tenant_get(r.as_deref(), &ctx) }
         })),
     );
-    // Built-in: every node serves its own NodeManifest.
+    // Built-in: every node serves its own SignedManifest.
+    //
+    // SEC PART 2: the wire response is a signed envelope —
+    // signer is the node's libp2p Ed25519 key (installed at
+    // ManifestProvider construction above). Receivers TOFU-pin
+    // the fingerprint and verify the signature; the
+    // freshness check (`signed_at_ms` vs configured ttl_secs)
+    // fires `MANIFEST_STALE` on the receiver side.
     let manifest_for_handler = manifest.clone();
     bridge.register(
         "node.manifest",
         Arc::new(FnHandler(move |_ctx: InvocationCtx| {
             let provider = manifest_for_handler.clone();
             async move {
-                let snap = provider.snapshot();
-                match codec::encode(&snap) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                let signed = match provider.signed_snapshot(now_ms) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
+                            kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,
+                            cause: format!("node.manifest sign: {e}"),
+                            retry_hint: 1,
+                            retry_after: None,
+                        });
+                    }
+                };
+                match codec::encode(&signed) {
                     Ok(bytes) => HandlerOutcome::Ok(bytes),
                     Err(e) => HandlerOutcome::Err(relix_core::types::ErrorEnvelope {
                         kind: relix_core::types::error_kinds::RESPONDER_INTERNAL,

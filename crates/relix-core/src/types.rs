@@ -244,6 +244,18 @@ pub mod error_kinds {
     /// The error envelope's `cause` carries the limit + actual +
     /// reset time so the caller can surface a useful message.
     pub const RESOURCE_EXHAUSTED: u32 = 22;
+    /// SEC PART 2 (manifest signing): the signed manifest
+    /// envelope failed verification — bad signature,
+    /// malformed encoding, fingerprint mismatch with the
+    /// signer's public key, or the signer's fingerprint
+    /// disagrees with a previously TOFU-pinned value.
+    pub const MANIFEST_INVALID: u32 = 23;
+    /// SEC PART 2: a signed manifest was received from a
+    /// node whose fingerprint isn't in the known-nodes
+    /// registry. Distinct from `MANIFEST_INVALID` so
+    /// operators can grep for first-contact attempts that
+    /// failed because the registry was wiped.
+    pub const MANIFEST_UNKNOWN_SIGNER: u32 = 24;
 }
 
 #[cfg(test)]
