@@ -982,38 +982,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // gitignored TOML file at mode 0600. See
         // docs/dashboard-redesign.md for the contract.
         .route("/v1/config", get(config_api::get_effective_config))
+        // SEC PART 4: every provider-key-handling route is
+        // removed. The bridge no longer holds, reads, or
+        // dials AI provider API keys — operators configure
+        // them in the AI node's own TOML and the AI node
+        // performs every LLM call. The dashboard's "providers"
+        // view is now a read-only enumeration of allowed
+        // names + the operator-marked default. There is no
+        // `PUT key` / `POST test` / `PUT quarantine` /
+        // `PUT enabled` surface; the corresponding handlers,
+        // dial helpers, and unbounded `resp.text()` paths
+        // are deleted from config_api.rs.
         .route("/v1/config/providers", get(config_api::list_providers))
-        // PH-WAVE2K: consolidated ops endpoint — all provider
-        // statuses + aggregate counters in one fetch.
-        .route("/v1/providers/health", get(config_api::providers_health))
-        // PH-ROUTER-PREVIEW: preview the HealthAwareRouter's
-        // decision for a candidate list against the bridge's
-        // current cached health snapshot. Pure observability —
-        // does NOT send any chat call.
-        .route("/v1/providers/route_test", post(config_api::route_test))
-        .route(
-            "/v1/config/providers/:name",
-            get(config_api::get_provider)
-                .put(config_api::put_provider)
-                .delete(config_api::delete_provider),
-        )
-        .route(
-            "/v1/config/providers/:name/test",
-            post(config_api::test_provider),
-        )
-        .route(
-            "/v1/config/providers/:name/enabled",
-            axum::routing::put(config_api::set_provider_enabled),
-        )
-        // M69: operator quarantine + cooldown for a provider.
-        // The bridge enforces the cooldown at the
-        // test-provider endpoint immediately; the AI
-        // controller does NOT live-read this yet (response
-        // `note` field surfaces the gap honestly).
-        .route(
-            "/v1/config/providers/:name/quarantine",
-            axum::routing::put(config_api::set_provider_quarantine),
-        )
+        .route("/v1/config/providers/:name", get(config_api::get_provider))
         .route(
             "/v1/config/providers/default",
             axum::routing::put(config_api::put_default_provider),

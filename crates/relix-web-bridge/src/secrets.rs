@@ -185,18 +185,21 @@ pub struct ProviderEntry {
 /// PH-WAVE2G: hard cap on per-provider rate-limit ring size.
 /// Operators can tell "we got rate-limited 32+ times in our
 /// recorded window" from the ring being full at this size.
+#[allow(dead_code)]
 pub const RATE_LIMIT_RING_CAP: usize = 32;
 
 /// PH-WAVE2I: rate-limit hits within a 5-minute window that
 /// trigger the bridge to auto-set a cooldown. Higher than 1 so
 /// a single transient flap doesn't slam the cooldown door;
 /// low enough that a real rate-limit storm is caught quickly.
+#[allow(dead_code)]
 pub const ANTI_RATELIMIT_THRESHOLD_5MIN: u64 = 5;
 
 /// PH-WAVE2I: length of the auto-set cooldown, in seconds.
 /// Operators can extend / clear via the existing M69
 /// quarantine surface; the bridge just refuses test calls
 /// until cooldown_until passes.
+#[allow(dead_code)]
 pub const ANTI_RATELIMIT_COOLDOWN_SECS: i64 = 60;
 
 /// PH-WAVE2G: count rate-limit observations whose timestamp is
@@ -496,6 +499,7 @@ impl BridgeSecrets {
     /// - both
     ///
     /// `reason` is captured at set time; ignored on clear.
+    #[cfg(test)]
     pub fn set_provider_quarantine(
         &mut self,
         name: &str,
@@ -529,6 +533,7 @@ impl BridgeSecrets {
     /// set OR the cooldown has elapsed. Pure read — the
     /// bridge's test-provider handler uses this as a soft
     /// gate.
+    #[cfg(test)]
     pub fn cooldown_remaining_secs(&self, name: &str, now: i64) -> Option<i64> {
         self.providers
             .get(name)
@@ -542,6 +547,7 @@ impl BridgeSecrets {
     /// Set the operator-marked enabled flag on a provider
     /// entry. Returns `false` when the provider has no entry
     /// (operator must set a key first); `true` on success.
+    #[cfg(test)]
     pub fn set_provider_enabled(&mut self, name: &str, enabled: bool) -> bool {
         match self.providers.get_mut(name) {
             Some(e) => {
@@ -599,6 +605,14 @@ impl BridgeSecrets {
     /// shouldn't silently re-enable a disabled provider.
     /// Caller is responsible for validating `name` against
     /// [`ALLOWED_PROVIDERS`] + rejecting empty `api_key`.
+    ///
+    /// SEC PART 4: production bridge code no longer calls
+    /// this — the provider-key handling surface is removed.
+    /// Kept under `#[cfg(test)]` to keep the in-tree
+    /// regression tests that exercise the on-disk file
+    /// round-trip alive without re-introducing the key
+    /// surface to production callers.
+    #[cfg(test)]
     pub fn set_provider(&mut self, name: &str, api_key: String, default_model: Option<String>) {
         // Preserve operator-set flags across key overwrites.
         // The key may have changed underneath; the flags
@@ -649,6 +663,7 @@ impl BridgeSecrets {
     }
 
     /// Remove a provider entry, if present. Idempotent.
+    #[cfg(test)]
     pub fn delete_provider(&mut self, name: &str) {
         self.providers.remove(name);
     }
@@ -663,6 +678,7 @@ impl BridgeSecrets {
     /// `ok = false`; ignored on success. Pass `None` when the
     /// caller hasn't classified the failure (e.g. legacy paths
     /// that pre-date the H1 classifier).
+    #[cfg(test)]
     pub fn record_provider_test(
         &mut self,
         name: &str,

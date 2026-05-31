@@ -76,156 +76,15 @@ pub async fn list_providers(State(state): State<AppState>) -> Json<ProvidersResp
     Json(ProvidersResponse { providers })
 }
 
-/// PH-WAVE2K: consolidated providers-health response shape.
-/// Carries the same `providers` list as
-/// `GET /v1/config/providers` PLUS aggregate counters across
-/// all providers so an operator (or future cross-provider
-/// router) can answer "is the AI stack OK right now?" in one
-/// fetch.
-#[derive(Debug, Serialize)]
-pub struct ProvidersHealthResponse {
-    pub providers: Vec<ProviderStatus>,
-    pub aggregate: ProvidersAggregate,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ProvidersAggregate {
-    /// Number of providers currently in cooldown (auto or operator-set).
-    pub cooldowns_active: u64,
-    /// Number of providers operator-quarantined.
-    pub quarantined: u64,
-    /// Sum of rate_limit_hits_5min across all providers.
-    pub rate_limit_hits_5min: u64,
-    /// Sum of rate_limit_hits_1h across all providers.
-    pub rate_limit_hits_1h: u64,
-    /// Sum of failed_request_count (lifetime).
-    pub failed_request_count: u64,
-    /// Sum of success_request_count (lifetime).
-    pub success_request_count: u64,
-}
-
-/// `GET /v1/providers/health` — one-shot ops endpoint.
-pub async fn providers_health(State(state): State<AppState>) -> Json<ProvidersHealthResponse> {
-    let providers = state.secrets.read(|s| s.all_provider_statuses());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let mut agg = ProvidersAggregate {
-        cooldowns_active: 0,
-        quarantined: 0,
-        rate_limit_hits_5min: 0,
-        rate_limit_hits_1h: 0,
-        failed_request_count: 0,
-        success_request_count: 0,
-    };
-    for p in &providers {
-        if let Some(cd) = p.cooldown_until
-            && cd > now
-        {
-            agg.cooldowns_active += 1;
-        }
-        if p.quarantined_at.is_some() {
-            agg.quarantined += 1;
-        }
-        agg.rate_limit_hits_5min += p.rate_limit_hits_5min;
-        agg.rate_limit_hits_1h += p.rate_limit_hits_1h;
-        agg.failed_request_count += p.failed_request_count;
-        agg.success_request_count += p.success_request_count;
-    }
-    Json(ProvidersHealthResponse {
-        providers,
-        aggregate: agg,
-    })
-}
-
-/// PH-ROUTER-PREVIEW: request body for the route_test endpoint.
-#[derive(Debug, Deserialize)]
-pub struct RouteTestReq {
-    /// Caller-supplied candidate provider list, in priority
-    /// order. Names match `secrets::ALLOWED_PROVIDERS`. Empty
-    /// → 400.
-    pub candidates: Vec<String>,
-}
-
-/// PH-ROUTER-PREVIEW: response body — direct serialization of
-/// the runtime's `RouteDecision` envelope so operators get the
-/// same shape the future AI-node consumer would see.
-#[derive(Debug, Serialize)]
-pub struct RouteTestResp {
-    pub router: String,
-    pub chosen: String,
-    pub reasoning: String,
-    pub chosen_at: i64,
-    pub candidates: Vec<RouteTestCandidate>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RouteTestCandidate {
-    pub name: String,
-    pub score: f32,
-    pub eligibility: String,
-    pub why: String,
-}
-
-/// `POST /v1/providers/route_test` — preview which provider the
-/// HealthAwareRouter would pick given the bridge's current
-/// cached provider-health snapshot. Pure observability — does
-/// NOT send any actual chat call.
-pub async fn route_test(
-    State(state): State<AppState>,
-    Json(req): Json<RouteTestReq>,
-) -> Result<Json<RouteTestResp>, (StatusCode, Json<ApiError>)> {
-    use relix_runtime::nodes::ai::{ChatInput, HealthAwareRouter, ProviderHealth, ProviderRouter};
-    if req.candidates.is_empty() {
-        return Err(bad_request("candidates required (non-empty list)"));
-    }
-    for c in &req.candidates {
-        if !ALLOWED_PROVIDERS.contains(&c.as_str()) {
-            return Err(bad_request(format!(
-                "unknown provider '{c}'. allowed: {}",
-                ALLOWED_PROVIDERS.join(", ")
-            )));
-        }
-    }
-    let providers = state.secrets.read(|s| s.all_provider_statuses());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let snapshot: Vec<ProviderHealth> = providers
-        .iter()
-        .map(|p| {
-            let in_cooldown = p.cooldown_until.is_some_and(|cd| cd > now);
-            ProviderHealth {
-                name: p.name.clone(),
-                in_cooldown,
-                operator_quarantined: p.quarantined_at.is_some(),
-                rate_limit_hits_5min: p.rate_limit_hits_5min,
-                success_count: p.success_request_count,
-                failure_count: p.failed_request_count,
-            }
-        })
-        .collect();
-    let router = HealthAwareRouter::new(snapshot);
-    let decision = router.pick(&ChatInput::default(), &req.candidates);
-    Ok(Json(RouteTestResp {
-        router: router.name().to_string(),
-        chosen: decision.chosen,
-        reasoning: decision.reasoning,
-        chosen_at: decision.chosen_at,
-        candidates: decision
-            .candidates
-            .into_iter()
-            .map(|c| RouteTestCandidate {
-                name: c.name,
-                score: c.score,
-                eligibility: c.eligibility,
-                why: c.why,
-            })
-            .collect(),
-    }))
-}
+// SEC PART 4: `providers_health` + `route_test` deleted along
+// with their request / response types
+// (`ProvidersHealthResponse`, `ProvidersAggregate`,
+// `RouteTestReq`, `RouteTestResp`, `RouteTestCandidate`).
+// Both consumed bridge-side provider key state — cooldowns,
+// quarantine flags, rate-limit ring, success / failure
+// counts — which no longer exists because the bridge has no
+// provider-key surface to test. Operators consume the
+// AI-node's own observability for provider health.
 
 /// `GET /v1/config/providers/:name` — redacted status for one
 /// provider. 404 when the name is not in the allowlist.
@@ -247,725 +106,50 @@ pub async fn get_provider(
     Ok(Json(state.secrets.read(|s| s.provider_status(&name))))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct PutProviderReq {
-    /// Raw API key. Stored at mode 0600 on disk; never echoed
-    /// back via any HTTP response or log line.
-    pub api_key: String,
-    #[serde(default)]
-    pub default_model: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PutProviderResp {
-    pub status: ProviderStatus,
-    /// `true` when the change requires a controller restart to
-    /// take effect. Provider keys are read at controller
-    /// startup, so any PUT today returns `true`.
-    pub restart_required: bool,
-}
-
-/// `PUT /v1/config/providers/:name` — set the provider key +
-/// optional default model. Idempotent: re-submitting overwrites
-/// in place + bumps `set_at`.
-pub async fn put_provider(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(req): Json<PutProviderReq>,
-) -> Result<Json<PutProviderResp>, (StatusCode, Json<ApiError>)> {
-    let corr = new_correlation_id();
-    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
-        return Err(unprocessable(format!(
-            "unknown provider '{name}'. allowed: {}",
-            ALLOWED_PROVIDERS.join(", ")
-        )));
-    }
-    if req.api_key.trim().is_empty() {
-        return Err(bad_request("api_key required (non-empty)"));
-    }
-    let result = state.secrets.mutate(|s| {
-        s.set_provider(&name, req.api_key.clone(), req.default_model.clone());
-        s.provider_status(&name)
-    });
-    match result {
-        Ok(status) => {
-            tracing::info!(
-                provider = %name,
-                key_preview = %status.key_preview.as_deref().unwrap_or(""),
-                default_model = %status.default_model.as_deref().unwrap_or(""),
-                "config: providers.{name} updated"
-            );
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_save",
-                &name,
-                "ok",
-                format!(
-                    "key …{} · default_model={}",
-                    status.key_preview.as_deref().unwrap_or("none"),
-                    status.default_model.as_deref().unwrap_or("(none)")
-                ),
-                corr,
-            );
-            Ok(Json(PutProviderResp {
-                status,
-                restart_required: true,
-            }))
-        }
-        Err(e) => {
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_save",
-                &name,
-                "error",
-                format!("persist failed: {e}"),
-                corr,
-            );
-            Err(internal(format!("persist failed: {e}")))
-        }
-    }
-}
-
-/// Result of a `POST /v1/config/providers/:name/test`. Includes
-/// the upstream HTTP status code + elapsed_ms so operators can
-/// distinguish "key works but provider is slow" from "key is
-/// rejected" from "network unreachable."
-#[derive(Debug, Serialize)]
-pub struct ProviderTestResult {
-    pub name: String,
-    pub ok: bool,
-    /// Upstream HTTP status code, when the request reached the
-    /// provider's server. `None` for transport-layer failures
-    /// (DNS, TCP, TLS) — those land in `detail`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<u16>,
-    pub elapsed_ms: u64,
-    /// Human-readable summary. Bridge-supplied — NEVER includes
-    /// the raw key, NEVER echoes back arbitrary upstream body.
-    pub detail: String,
-}
-
-/// `POST /v1/config/providers/:name/test` — validate the saved
-/// key against the upstream provider by listing models. Returns
-/// success/failure + elapsed time + a redaction-safe detail
-/// string.
-pub async fn test_provider(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<ProviderTestResult>, (StatusCode, Json<ApiError>)> {
-    let corr = new_correlation_id();
-    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!(
-                    "unknown provider '{name}'. allowed: {}",
-                    ALLOWED_PROVIDERS.join(", ")
-                ),
-            }),
-        ));
-    }
-    // M69: real cooldown enforcement. When an operator-set
-    // cooldown is active for this provider, the bridge
-    // refuses to run live test calls. Mirrors the bridge's
-    // "we enforce what we control" stance — the AI controller
-    // won't see this until restart, but the test-provider
-    // path is bridge-side and we honour it immediately.
-    let cooldown_remaining = state.secrets.read(|s| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        s.cooldown_remaining_secs(&name, now)
-    });
-    if let Some(rem) = cooldown_remaining {
-        state.intervention_audit.record_with_id(
-            "anon",
-            "provider_test",
-            &name,
-            "refused",
-            format!("cooldown active · {rem}s remaining"),
-            corr,
-        );
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ApiError {
-                error: format!(
-                    "provider '{name}' is in operator-set cooldown for {rem} more second(s). \
-                     Clear the cooldown via PUT /v1/config/providers/{name}/quarantine."
-                ),
-            }),
-        ));
-    }
-    // Read the key from secrets under the lock; clone it
-    // immediately so the lock is released before the network
-    // round-trip.
-    let api_key = state.secrets.read(|s| {
-        s.providers
-            .get(&name)
-            .map(|e| e.api_key.clone())
-            .unwrap_or_default()
-    });
-    if api_key.is_empty() && name != "mock" {
-        return Err(unprocessable(format!(
-            "provider '{name}' is not configured. Set an API key via PUT /v1/config/providers/{name} first."
-        )));
-    }
-    let started = std::time::Instant::now();
-    let outcome = check_provider_key(&name, &api_key).await;
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    let result = match outcome {
-        Ok(detail) => ProviderTestResult {
-            name: name.clone(),
-            ok: true,
-            status_code: Some(200),
-            elapsed_ms,
-            detail,
-        },
-        Err((status_code, detail)) => ProviderTestResult {
-            name: name.clone(),
-            ok: false,
-            status_code,
-            elapsed_ms,
-            detail,
-        },
-    };
-    // INFO line carries only the redaction-safe summary, never
-    // the raw key.
-    tracing::info!(
-        provider = %name,
-        ok = result.ok,
-        status_code = ?result.status_code,
-        elapsed_ms = result.elapsed_ms,
-        "config: providers.{name} test"
-    );
-    // M58: persist the test outcome so operators see a
-    // last-tested badge on the provider card without re-running.
-    // Best-effort — a persist failure logs at warn but the
-    // live response still ships, so the operator isn't blocked.
-    //
-    // H1: when the test failed AND we have an upstream HTTP
-    // status, classify the failure into a typed
-    // FailoverReason so the dashboard surfaces "rate-limit"
-    // vs "context-overflow" vs "auth-rejected" etc. without
-    // parsing the free-form detail string.
-    let failure_reason_label = if result.ok {
-        None
-    } else if let Some(code) = result.status_code {
-        Some(
-            relix_runtime::nodes::ai::classify_http_failure(code, &result.detail)
-                .label()
-                .to_string(),
-        )
-    } else {
-        // Transport-class failure: no HTTP status came back.
-        Some(
-            relix_runtime::nodes::ai::classify_transport_failure(&result.detail)
-                .label()
-                .to_string(),
-        )
-    };
-    let cache_persist = state.secrets.mutate(|s| {
-        s.record_provider_test(
-            &name,
-            result.ok,
-            result.status_code,
-            result.elapsed_ms,
-            result.detail.clone(),
-            failure_reason_label.as_deref(),
-        )
-    });
-    if let Err(e) = cache_persist {
-        tracing::warn!(
-            provider = %name,
-            error = %e,
-            "config: providers.{name} test cache persist failed"
-        );
-    }
-    state.intervention_audit.record_with_id(
-        "anon",
-        "provider_test",
-        &name,
-        if result.ok { "ok" } else { "error" },
-        format!(
-            "{}ms{}{}",
-            result.elapsed_ms,
-            result
-                .status_code
-                .map(|c| format!(" · HTTP {c}"))
-                .unwrap_or_default(),
-            if result.ok {
-                String::new()
-            } else {
-                format!(" · {}", result.detail)
-            }
-        ),
-        corr,
-    );
-    Ok(Json(result))
-}
-
-/// Per-provider connectivity probe. Returns `Ok(detail)` on
-/// success, `Err((status_code, detail))` on failure. Never
-/// surfaces the raw key in the returned strings.
-async fn check_provider_key(name: &str, api_key: &str) -> Result<String, (Option<u16>, String)> {
-    // Short timeout — operators won't wait long on a "test
-    // connection" button. 10s is generous for a list-models call.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| (None, format!("http client init failed: {e}")))?;
-    match name {
-        "mock" => Ok("mock provider: no upstream to test".to_string()),
-        "openai" => probe_bearer(&client, "https://api.openai.com/v1/models", api_key).await,
-        "openrouter" => probe_bearer(&client, "https://openrouter.ai/api/v1/models", api_key).await,
-        "xai" => probe_bearer(&client, "https://api.x.ai/v1/models", api_key).await,
-        "anthropic" => {
-            // Anthropic uses x-api-key + anthropic-version, not
-            // Authorization: Bearer.
-            let resp = client
-                .get("https://api.anthropic.com/v1/models")
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .send()
-                .await
-                .map_err(|e| {
-                    (
-                        None,
-                        format!("network error: {}", redact_err(&e.to_string())),
-                    )
-                })?;
-            interpret_response(resp).await
-        }
-        "google" => {
-            // Gemini uses ?key=<KEY> in the query string. The
-            // URL is built deliberately — the key is never logged.
-            let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-                urlencode(api_key)
-            );
-            let resp = client.get(&url).send().await.map_err(|e| {
-                (
-                    None,
-                    format!("network error: {}", redact_err(&e.to_string())),
-                )
-            })?;
-            interpret_response(resp).await
-        }
-        _ => Err((
-            None,
-            format!("provider '{name}' has no shipped test handler"),
-        )),
-    }
-}
-
-async fn probe_bearer(
-    client: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-) -> Result<String, (Option<u16>, String)> {
-    let resp = client
-        .get(url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                None,
-                format!("network error: {}", redact_err(&e.to_string())),
-            )
-        })?;
-    interpret_response(resp).await
-}
-
-/// Translate a `reqwest::Response` into the success/failure
-/// detail string. Never includes the raw body — only the
-/// status + (optional) model count parsed from a JSON list
-/// shape.
-async fn interpret_response(resp: reqwest::Response) -> Result<String, (Option<u16>, String)> {
-    let status = resp.status();
-    if status.is_success() {
-        // Try to parse a model count; non-fatal if we can't.
-        match resp.text().await {
-            Ok(body) => {
-                let count = count_models_loosely(&body);
-                let suffix = if count > 0 {
-                    format!(" · {count} models advertised")
-                } else {
-                    String::new()
-                };
-                Ok(format!("ok ({}){suffix}", status.as_u16()))
-            }
-            Err(_) => Ok(format!("ok ({})", status.as_u16())),
-        }
-    } else {
-        // Read the body but strip anything that looks like the
-        // key (defensive). Most providers' error bodies don't
-        // include the key, but they sometimes do echo back
-        // headers in debug output. We hard-truncate to keep the
-        // response surface minimal.
-        let body = resp.text().await.unwrap_or_default();
-        let detail = truncate_for_op(&body, 200);
-        Err((
-            Some(status.as_u16()),
-            format!("upstream returned {}: {detail}", status.as_u16()),
-        ))
-    }
-}
-
-/// Very loose model-count parser — looks for a top-level
-/// `"data": [...]` array (OpenAI shape) or counts top-level
-/// objects under `"models"` (Google shape). Misses some
-/// providers; that's fine — the count is a nice-to-have.
-fn count_models_loosely(body: &str) -> usize {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-            return arr.len();
-        }
-        if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
-            return arr.len();
-        }
-    }
-    0
-}
-
-/// Defensive: scrub anything that obviously looks like an API
-/// key prefix from upstream error strings. Not cryptographic —
-/// just an extra belt-and-braces guard so an oddly-formatted
-/// upstream error can't accidentally surface the key.
-fn redact_err(s: &str) -> String {
-    // Common provider key prefixes. Treat any token that
-    // starts with these as redacted.
-    let redacted: String = s
-        .split_whitespace()
-        .map(|tok| {
-            let lower = tok.to_ascii_lowercase();
-            if lower.starts_with("sk-")
-                || lower.starts_with("xai-")
-                || lower.starts_with("aiza")
-                || lower.starts_with("bearer ")
-            {
-                "<redacted>"
-            } else {
-                tok
-            }
-        })
-        .collect::<Vec<&str>>()
-        .join(" ");
-    truncate_for_op(&redacted, 200)
-}
-
-fn truncate_for_op(s: &str, n: usize) -> String {
-    let trimmed = s.trim();
-    let s: String = trimmed.chars().take(n).collect();
-    if trimmed.chars().count() > n {
-        format!("{s}…")
-    } else {
-        s
-    }
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 16);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PutEnabledReq {
-    pub enabled: bool,
-}
-
-/// `PUT /v1/config/providers/:name/enabled` — flip the
-/// operator-marked enabled flag. Hint only — the AI
-/// controller reads its provider config from its own TOML
-/// at startup, so flipping this here does NOT switch the
-/// live runtime. Returns the new ProviderStatus.
-pub async fn set_provider_enabled(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(req): Json<PutEnabledReq>,
-) -> Result<Json<PutProviderResp>, (StatusCode, Json<ApiError>)> {
-    let corr = new_correlation_id();
-    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
-        return Err(unprocessable(format!(
-            "unknown provider '{name}'. allowed: {}",
-            ALLOWED_PROVIDERS.join(", ")
-        )));
-    }
-    let result = state.secrets.mutate(|s| {
-        let applied = s.set_provider_enabled(&name, req.enabled);
-        (applied, s.provider_status(&name))
-    });
-    match result {
-        Ok((applied, status)) => {
-            if !applied {
-                state.intervention_audit.record_with_id(
-                    "anon",
-                    "provider_enabled_set",
-                    &name,
-                    "refused",
-                    "no entry yet — set api_key first",
-                    corr,
-                );
-                return Err(unprocessable(format!(
-                    "provider '{name}' has no entry; set an api_key first via PUT /v1/config/providers/{name}"
-                )));
-            }
-            tracing::info!(
-                provider = %name,
-                enabled = req.enabled,
-                "config: providers.{name} enabled flag updated"
-            );
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_enabled_set",
-                &name,
-                "ok",
-                if req.enabled { "enabled" } else { "disabled" },
-                corr,
-            );
-            Ok(Json(PutProviderResp {
-                status,
-                restart_required: true,
-            }))
-        }
-        Err(e) => {
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_enabled_set",
-                &name,
-                "error",
-                format!("persist failed: {e}"),
-                corr,
-            );
-            Err(internal(format!("persist failed: {e}")))
-        }
-    }
-}
-
-// ── M69: provider quarantine ────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct PutQuarantineReq {
-    /// `true` to mark this provider as operator-quarantined,
-    /// `false` to clear the flag. Required.
-    pub quarantine: bool,
-    /// Optional short reason captured at quarantine time.
-    /// Ignored on clear. Capped bridge-side at 2000 bytes;
-    /// rejected with 422 on overflow.
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// Optional cooldown window in seconds. When `Some(N>0)`
-    /// the bridge sets `cooldown_until = now + N` and the
-    /// test-provider endpoint refuses live calls against
-    /// this entry until that time. `Some(0)` / `None` clears
-    /// any active cooldown. Independent of `quarantine` —
-    /// operators can:
-    /// - quarantine without cooldown (manual review path),
-    /// - cooldown without quarantine (auto-recovery window),
-    /// - both.
-    #[serde(default)]
-    pub cooldown_secs: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PutQuarantineResp {
-    pub status: ProviderStatus,
-    /// Always `true` — like every other provider mutation
-    /// today, this is operator-visible state. The AI
-    /// controller live-reads provider config at startup, so
-    /// flipping this without restarting the AI controller
-    /// changes only what the bridge enforces (today: the
-    /// test-provider endpoint cooldown gate). Honestly
-    /// surfaced as `note` so operators don't expect live
-    /// routing change.
-    pub restart_required: bool,
-    pub note: String,
-}
-
-/// `PUT /v1/config/providers/:name/quarantine` — set or
-/// clear the operator-quarantine flag on a provider entry
-/// (M69). Persistent state in `bridge-secrets.toml`. The
-/// bridge enforces it at the boundaries it controls (today:
-/// the test-provider endpoint refuses live calls during a
-/// cooldown). The AI controller does NOT live-read this
-/// state yet — that requires a runtime reload primitive
-/// (separate milestone). The `note` field on the response
-/// surfaces this honestly.
-pub async fn set_provider_quarantine(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(req): Json<PutQuarantineReq>,
-) -> Result<Json<PutQuarantineResp>, (StatusCode, Json<ApiError>)> {
-    let corr = new_correlation_id();
-    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
-        return Err(unprocessable(format!(
-            "unknown provider '{name}'. allowed: {}",
-            ALLOWED_PROVIDERS.join(", ")
-        )));
-    }
-    let trimmed_reason = req
-        .reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let Some(r) = trimmed_reason
-        && r.len() > 2_000
-    {
-        return Err(unprocessable(format!(
-            "reason: too long (max 2000 bytes, got {})",
-            r.len()
-        )));
-    }
-    let cooldown_secs = req.cooldown_secs.filter(|s| *s > 0);
-    let applied = state.secrets.mutate(|s| {
-        let applied = s.set_provider_quarantine(
-            &name,
-            req.quarantine,
-            trimmed_reason.map(str::to_string),
-            cooldown_secs,
-        );
-        (applied, s.provider_status(&name))
-    });
-    match applied {
-        Ok((true, status)) => {
-            tracing::info!(
-                provider = %name,
-                quarantined = req.quarantine,
-                cooldown_secs = ?cooldown_secs,
-                "config: providers.{name} quarantine updated"
-            );
-            let detail = if req.quarantine {
-                let cooldown_part = cooldown_secs
-                    .map(|s| format!(" · cooldown {s}s"))
-                    .unwrap_or_default();
-                match trimmed_reason {
-                    Some(r) => format!("quarantined · {r}{cooldown_part}"),
-                    None => format!("quarantined{cooldown_part}"),
-                }
-            } else if cooldown_secs.is_some() {
-                format!("cleared · cooldown {}s", cooldown_secs.unwrap_or(0))
-            } else {
-                "cleared".to_string()
-            };
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_quarantine",
-                &name,
-                "ok",
-                detail,
-                corr,
-            );
-            Ok(Json(PutQuarantineResp {
-                status,
-                restart_required: true,
-                note: "Operator-visible flag stored locally. The AI controller \
-                       does not live-read this state yet; it picks up provider \
-                       config at startup. The bridge enforces the cooldown at \
-                       the test-provider endpoint immediately."
-                    .to_string(),
-            }))
-        }
-        Ok((false, _)) => {
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_quarantine",
-                &name,
-                "refused",
-                "no entry yet — set api_key first",
-                corr,
-            );
-            Err(unprocessable(format!(
-                "provider '{name}' has no entry; set an api_key first via PUT /v1/config/providers/{name}"
-            )))
-        }
-        Err(e) => {
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_quarantine",
-                &name,
-                "error",
-                format!("persist failed: {e}"),
-                corr,
-            );
-            Err(internal(format!("persist failed: {e}")))
-        }
-    }
-}
-
-/// `DELETE /v1/config/providers/:name` — remove the provider
-/// entry. Idempotent: deleting an absent entry is a no-op.
-pub async fn delete_provider(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<ProviderStatus>, (StatusCode, Json<ApiError>)> {
-    let corr = new_correlation_id();
-    if !ALLOWED_PROVIDERS.contains(&name.as_str()) {
-        return Err(unprocessable(format!(
-            "unknown provider '{name}'. allowed: {}",
-            ALLOWED_PROVIDERS.join(", ")
-        )));
-    }
-    let status = state.secrets.mutate(|s| {
-        s.delete_provider(&name);
-        s.provider_status(&name)
-    });
-    match status {
-        Ok(s) => {
-            tracing::info!(provider = %name, "config: providers.{name} deleted");
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_delete",
-                &name,
-                "ok",
-                "",
-                corr,
-            );
-            Ok(Json(s))
-        }
-        Err(e) => {
-            state.intervention_audit.record_with_id(
-                "anon",
-                "provider_delete",
-                &name,
-                "error",
-                format!("persist failed: {e}"),
-                corr,
-            );
-            Err(internal(format!("persist failed: {e}")))
-        }
-    }
-}
-
-// ── Default provider marker ─────────────────────────────────
-
+/// Body for `PUT /v1/config/providers/default`.
 #[derive(Debug, Deserialize)]
 pub struct PutDefaultProviderReq {
-    /// One of [`crate::secrets::ALLOWED_PROVIDERS`], or `null`
-    /// to clear the marker.
+    /// `None` clears the operator-marked default.
+    #[serde(default)]
     pub name: Option<String>,
 }
 
+/// Response for `PUT /v1/config/providers/default`.
 #[derive(Debug, Serialize)]
 pub struct DefaultProviderResp {
-    /// `Some(name)` when a default is set, `None` otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
-    /// Always `true` — the AI controller reads its provider
-    /// config from a separate TOML at startup, so changing the
-    /// dashboard default is a hint, not a runtime switch.
-    /// Operators must update their AI controller config + restart
-    /// for the change to take effect.
+    /// `true` when the change requires a controller restart
+    /// to take effect.
     pub restart_required: bool,
 }
+
+/// SEC PART 4: `truncate_for_op` survived the provider-key
+/// deletion because the telegram test path still uses it.
+/// Kept here unchanged — operator-readable text only, no
+/// secret material.
+fn truncate_for_op(s: &str, n: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= n {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(n).collect();
+    format!("{cut}…")
+}
+
+// SEC PART 4: `PutProviderReq`, `PutProviderResp`,
+// `put_provider`, `ProviderTestResult`, `test_provider`,
+// `check_provider_key`, `probe_bearer`,
+// `interpret_response`, `count_models_loosely`,
+// `redact_err`, `truncate_for_op`, `urlencode`,
+// `set_provider_enabled`, `set_provider_quarantine`,
+// `delete_provider`, `providers_health`, and `route_test`
+// were all defined here and have been deleted. The bridge
+// no longer holds, reads, or dials AI provider API keys;
+// operators set provider keys directly in the AI-node's
+// own configuration. Routes are removed in main.rs so
+// callers receive 404. The unbounded `resp.text()` reads
+// on the dial path are moot at the source — no body to
+// read because no request is made.
 
 /// `PUT /v1/config/providers/default` — set or clear the
 /// operator-marked default provider. Hint-only metadata; the
@@ -1415,6 +599,85 @@ mod tests {
     use super::*;
     use crate::secrets::{BridgeSecrets, SecretsHandle};
 
+    // ── SEC PART 4: provider-key surface absence ─────────
+
+    #[test]
+    fn sec_p4_bridge_does_not_read_provider_keys_from_env_or_config() {
+        // SEC PART 4: the bridge's `BridgeConfig` type has
+        // NO `[providers]` block, NO `api_key` field on any
+        // surface, and the only env variables the bridge
+        // reads (`RELIX_SETUP_TOKEN`, `RELIX_DASHBOARD_PATH`,
+        // …) carry no provider keys. Symbolic check by
+        // searching the public surface for forbidden
+        // identifiers — keeps a future contributor from
+        // re-introducing a key field by accident.
+        let bridge_source = include_str!("../src/config.rs");
+        let openai_source = include_str!("../src/openai.rs");
+        let auth_source = include_str!("../src/auth.rs");
+        let config_api_source = include_str!("../src/config_api.rs");
+        // Look for the literal `std::env::var("…_API_KEY")`
+        // call pattern, not just the symbol string. The
+        // symbol appears in this very test body (and in
+        // documentation), so we restrict to the actual
+        // env-var read shape.
+        for (label, body) in [
+            ("config.rs", bridge_source),
+            ("openai.rs", openai_source),
+            ("auth.rs", auth_source),
+            ("config_api.rs", config_api_source),
+        ] {
+            for line in body.lines() {
+                let lower = line.to_ascii_lowercase();
+                let env_call = lower.contains("std::env::var")
+                    || lower.contains("env::var")
+                    || lower.contains("var_os");
+                if env_call {
+                    assert!(
+                        !line.contains("OPENAI_API_KEY"),
+                        "{label}: bridge reads OPENAI_API_KEY: {line}"
+                    );
+                    assert!(
+                        !line.contains("ANTHROPIC_API_KEY"),
+                        "{label}: bridge reads ANTHROPIC_API_KEY: {line}"
+                    );
+                    assert!(
+                        !line.contains("GEMINI_API_KEY"),
+                        "{label}: bridge reads GEMINI_API_KEY: {line}"
+                    );
+                    assert!(
+                        !line.contains("XAI_API_KEY"),
+                        "{label}: bridge reads XAI_API_KEY: {line}"
+                    );
+                    assert!(
+                        !line.contains("OPENROUTER_API_KEY"),
+                        "{label}: bridge reads OPENROUTER_API_KEY: {line}"
+                    );
+                }
+            }
+        }
+        // The dial-time handlers are gone. We assert there
+        // is no LINE STARTING with the deleted handler
+        // signatures — the deletion comments above mention
+        // the names by reference but never as fn signatures.
+        for src in [config_api_source] {
+            for line in src.lines() {
+                let trimmed = line.trim_start();
+                assert!(
+                    !trimmed.starts_with("pub async fn put_provider("),
+                    "put_provider handler must be deleted"
+                );
+                assert!(
+                    !trimmed.starts_with("async fn check_provider_key("),
+                    "check_provider_key dial helper must be deleted"
+                );
+                assert!(
+                    !trimmed.starts_with("pub async fn test_provider("),
+                    "test_provider handler must be deleted"
+                );
+            }
+        }
+    }
+
     fn handle_with(secrets: BridgeSecrets) -> SecretsHandle {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("bridge-secrets.toml");
@@ -1425,21 +688,10 @@ mod tests {
         SecretsHandle::new(secrets, path)
     }
 
-    #[test]
-    fn put_provider_request_accepts_minimal_body() {
-        // Required field present, default_model absent → ok.
-        let body = r#"{"api_key":"sk-test-1234"}"#;
-        let req: PutProviderReq = serde_json::from_str(body).unwrap();
-        assert_eq!(req.api_key, "sk-test-1234");
-        assert!(req.default_model.is_none());
-    }
-
-    #[test]
-    fn put_provider_request_round_trips_default_model() {
-        let body = r#"{"api_key":"sk-x","default_model":"gpt-4o"}"#;
-        let req: PutProviderReq = serde_json::from_str(body).unwrap();
-        assert_eq!(req.default_model.as_deref(), Some("gpt-4o"));
-    }
+    // SEC PART 4 (DELETED): `put_provider_request_*` tests
+    // exercised `PutProviderReq` which no longer exists.
+    // Removing them so the test suite stays honest about
+    // what the bridge accepts.
 
     #[test]
     fn put_telegram_request_defaults_mode_to_polling() {
@@ -1511,54 +763,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_models_loosely_handles_openai_shape() {
-        let body = r#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"},{"id":"o1"}]}"#;
-        assert_eq!(count_models_loosely(body), 3);
-    }
-
-    #[test]
-    fn count_models_loosely_handles_google_shape() {
-        let body = r#"{"models":[{"name":"models/gemini-1"},{"name":"models/gemini-2"}]}"#;
-        assert_eq!(count_models_loosely(body), 2);
-    }
-
-    #[test]
-    fn count_models_loosely_returns_zero_on_unknown_shape() {
-        assert_eq!(count_models_loosely(""), 0);
-        assert_eq!(count_models_loosely("{}"), 0);
-        assert_eq!(count_models_loosely("not json"), 0);
-    }
-
-    #[test]
-    fn redact_err_strips_known_key_prefixes() {
-        // Defensive: even if an upstream error string somehow
-        // contained the key, the bridge's response must not
-        // forward it verbatim.
-        let s = redact_err("401 Unauthorized for key sk-test-1234567890");
-        assert!(!s.contains("sk-test"));
-        assert!(s.contains("<redacted>"));
-    }
-
-    #[test]
-    fn redact_err_passes_normal_text_through() {
-        let s = redact_err("network timeout after 5s");
-        assert_eq!(s, "network timeout after 5s");
-    }
-
+    // SEC PART 4 (DELETED): `count_models_loosely_*`,
+    // `redact_err_*`, and `urlencode_*` tests — the helpers
+    // existed solely for the provider-dial path which is
+    // gone. `truncate_for_op` survives (telegram_test uses
+    // it); its test is kept below.
     #[test]
     fn truncate_for_op_caps_long_strings_with_ellipsis() {
         let s = truncate_for_op("aaaaaaaaaa", 4);
         assert_eq!(s, "aaaa…");
-    }
-
-    #[test]
-    fn urlencode_preserves_unreserved_chars() {
-        // Letters / digits / -_.~ stay as-is; everything else
-        // is %HH.
-        assert_eq!(urlencode("AIza_abc-DEF.123~"), "AIza_abc-DEF.123~");
-        assert_eq!(urlencode("a b"), "a%20b");
-        assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
     }
 
     #[test]
@@ -1594,35 +807,9 @@ mod tests {
         assert_eq!(s2, "see /botanical for help");
     }
 
-    #[test]
-    fn route_test_req_round_trips() {
-        let body = r#"{"candidates":["openai","anthropic"]}"#;
-        let r: RouteTestReq = serde_json::from_str(body).unwrap();
-        assert_eq!(r.candidates, vec!["openai", "anthropic"]);
-    }
-
-    #[test]
-    fn route_test_resp_is_stable_shape() {
-        // The dashboard / CLI consumes this shape; pin it.
-        let r = RouteTestResp {
-            router: "health-aware".into(),
-            chosen: "openai".into(),
-            reasoning: "test".into(),
-            chosen_at: 1700000000,
-            candidates: vec![RouteTestCandidate {
-                name: "openai".into(),
-                score: 1.0,
-                eligibility: "eligible".into(),
-                why: "chosen".into(),
-            }],
-        };
-        let json = serde_json::to_string(&r).unwrap();
-        assert!(json.contains("\"router\":\"health-aware\""));
-        assert!(json.contains("\"chosen\":\"openai\""));
-        assert!(json.contains("\"chosen_at\":1700000000"));
-        assert!(json.contains("\"candidates\":["));
-        assert!(json.contains("\"eligibility\":\"eligible\""));
-    }
+    // SEC PART 4 (DELETED): `route_test_*` tests exercised
+    // `RouteTestReq` / `RouteTestResp` / `RouteTestCandidate`
+    // which are removed alongside the route_test handler.
 
     #[test]
     fn handle_can_persist_and_reload_via_mutate() {
