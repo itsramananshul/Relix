@@ -53,6 +53,15 @@ pub struct AgentProfile {
     /// for channel-originated approvals.
     pub authorized_approvers: Vec<String>,
     pub approval_timeout_secs: i64,
+    /// SEC PART 1 (agent-gate default-deny): explicit profile
+    /// label. The only operator-meaningful value today is
+    /// `"allow-all"` — when set, the admission gate bypasses
+    /// every categorical / surface / risk / approval check and
+    /// admits with `matched_rule = "allow_all_profile"`. The
+    /// bypass is audited as such. `None` (the default) leaves
+    /// the gate's standard checks in force.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -92,6 +101,9 @@ pub struct AgentGateView {
     /// approval row without a second profile lookup.
     pub authorized_approvers: Vec<String>,
     pub approval_timeout_secs: i64,
+    /// SEC PART 1: agent-gate explicit-bypass profile. See
+    /// [`AgentProfile::profile`].
+    pub profile: Option<String>,
 }
 
 impl From<&AgentProfile> for AgentGateView {
@@ -109,6 +121,7 @@ impl From<&AgentProfile> for AgentGateView {
             approval_required_categories: p.approval_required_categories.clone(),
             authorized_approvers: p.authorized_approvers.clone(),
             approval_timeout_secs: p.approval_timeout_secs,
+            profile: p.profile.clone(),
         }
     }
 }
@@ -528,7 +541,7 @@ impl AgentStore {
                         allow_sensitivity_tags, deny_sensitivity_tags,
                         approval_required_categories, authorized_approvers,
                         approval_timeout_secs,
-                        created_at, updated_at
+                        created_at, updated_at, profile
                  FROM agent_profiles WHERE subject_id = ?1",
                 params![subject_id],
                 row_to_agent,
@@ -645,6 +658,28 @@ impl AgentStore {
                     "UPDATE agent_profiles SET {field}=?1, updated_at=?2 WHERE agent_id=?3"
                 );
                 conn.execute(&sql, params![json, now, agent_id])?
+            }
+            "profile" => {
+                // SEC PART 1: only `allow-all` and `""`/NULL
+                // are valid. Reject any other label so an
+                // operator can't introduce a new permissive
+                // profile name that the gate doesn't know
+                // about (which would fall through to the
+                // default-deny path silently).
+                let trimmed = value.trim();
+                let stored: Option<&str> = if trimmed.is_empty() {
+                    None
+                } else if trimmed == "allow-all" {
+                    Some("allow-all")
+                } else {
+                    return Err(AgentStoreError::BadInput(format!(
+                        "profile '{trimmed}' not recognised (only 'allow-all' or empty are valid)"
+                    )));
+                };
+                conn.execute(
+                    "UPDATE agent_profiles SET profile=?1, updated_at=?2 WHERE agent_id=?3",
+                    params![stored, now, agent_id],
+                )?
             }
             other => {
                 return Err(AgentStoreError::BadInput(format!(
@@ -1192,7 +1227,7 @@ const SELECT_AGENT: &str = "SELECT agent_id, name, role, title, department, team
         allow_sensitivity_tags, deny_sensitivity_tags,
         approval_required_categories, authorized_approvers,
         approval_timeout_secs,
-        created_at, updated_at
+        created_at, updated_at, profile
  FROM agent_profiles WHERE agent_id = ?1";
 
 const SELECT_APPROVAL: &str =
@@ -1315,6 +1350,11 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         "authorized_approvers",
         "TEXT NOT NULL DEFAULT '[]'",
     )?;
+    // SEC PART 1: agent-gate default-deny — `profile` column
+    // for explicit "allow-all" bypass. Nullable so existing
+    // rows continue to flow through the categorical checks
+    // (which now default-deny when no profile exists).
+    ensure_column(conn, "agent_profiles", "profile", "TEXT")?;
     Ok(())
 }
 
@@ -1420,6 +1460,10 @@ fn row_to_agent(r: &rusqlite::Row) -> rusqlite::Result<AgentProfile> {
         approval_timeout_secs: r.get(17)?,
         created_at: r.get(18)?,
         updated_at: r.get(19)?,
+        // SEC PART 1: nullable. The ALTER TABLE adds it as
+        // a no-default column, so existing rows read NULL
+        // → None and stay subject to the standard checks.
+        profile: r.get::<_, Option<String>>(20)?,
     })
 }
 

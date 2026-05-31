@@ -1020,9 +1020,31 @@ impl DispatchBridge {
         self.streaming_handlers.contains_key(method)
     }
 
+    /// Back-compat wrapper around [`Self::handle_inbound_with_surface`]
+    /// — passes `caller_surface = None` so callers that don't yet
+    /// thread a transport-derived surface stay compiling. New
+    /// production callers should use the explicit variant so the
+    /// agent gate's surface allowlist is enforced against the
+    /// transport-layer-trusted alias of the caller.
+    pub async fn handle_inbound(&self, encoded_envelope: Vec<u8>) -> Vec<u8> {
+        self.handle_inbound_with_surface(encoded_envelope, None)
+            .await
+    }
+
     /// Run the admission pipeline on an inbound encoded envelope and dispatch.
     /// Returns the encoded response envelope to send back on the wire.
-    pub async fn handle_inbound(&self, encoded_envelope: Vec<u8>) -> Vec<u8> {
+    ///
+    /// SEC PART 1: `caller_surface` is the trusted surface label
+    /// derived from the libp2p transport layer (peer alias of
+    /// the calling node, computed from its `PeerId`). The agent
+    /// gate consults this for `surface_allowlist` matching —
+    /// the operator-asserted `envelope.surface` field is
+    /// ignored for admission decisions.
+    pub async fn handle_inbound_with_surface(
+        &self,
+        encoded_envelope: Vec<u8>,
+        caller_surface: Option<String>,
+    ) -> Vec<u8> {
         let started_at = Instant::now();
 
         // === Admission step 1: decode envelope ===
@@ -1103,6 +1125,7 @@ impl DispatchBridge {
                     now,
                     now_ms,
                     signing_key: &self.approval_token_signing_key,
+                    caller_surface: caller_surface.as_deref(),
                 },
             );
             match gate_decision {
@@ -1819,10 +1842,26 @@ impl DispatchBridge {
     /// streaming surface has stabilised. Future TODO:
     /// `run_admission(envelope) -> AdmissionOutcome` shared by
     /// both paths.
+    /// SEC PART 1: back-compat — see [`Self::handle_inbound_stream_with_surface`].
     pub async fn handle_inbound_stream(
         &self,
         encoded_envelope: Vec<u8>,
         writer: crate::transport::stream::StreamWriter,
+    ) {
+        self.handle_inbound_stream_with_surface(encoded_envelope, writer, None)
+            .await
+    }
+
+    /// SEC PART 1: streaming counterpart to
+    /// [`Self::handle_inbound_with_surface`]. `caller_surface`
+    /// is the transport-derived surface label the agent gate
+    /// consults instead of the operator-asserted
+    /// `envelope.surface`.
+    pub async fn handle_inbound_stream_with_surface(
+        &self,
+        encoded_envelope: Vec<u8>,
+        writer: crate::transport::stream::StreamWriter,
+        caller_surface: Option<String>,
     ) {
         use crate::transport::stream::StreamFrame;
         use serde_bytes::ByteBuf;
@@ -1917,6 +1956,7 @@ impl DispatchBridge {
                     now,
                     now_ms,
                     signing_key: &self.approval_token_signing_key,
+                    caller_surface: caller_surface.as_deref(),
                 },
             );
             match gate_decision {

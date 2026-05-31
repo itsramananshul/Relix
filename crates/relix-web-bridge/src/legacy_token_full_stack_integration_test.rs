@@ -370,6 +370,32 @@ async fn legacy_token_full_stack_real_controller_real_bridge_real_http() {
     );
     let bundle_path = bridge_tmp.path().join("bridge.bundle");
     std::fs::write(&bundle_path, &bundle_bytes).expect("write bundle");
+    // SEC PART 1 (agent-gate default-deny): the bridge's
+    // identity-bundle subject_id needs an explicit agent
+    // profile so the coordinator's gate doesn't fail-closed
+    // on every call. The bridge is a trusted internal peer —
+    // give it the `allow-all` profile and audit it as such.
+    {
+        let bundle_decoded: Bundle = codec::decode(&bundle_bytes).expect("decode bridge bundle");
+        let id_payload: IdentityBundle =
+            codec::decode(bundle_decoded.payload.as_ref()).expect("decode bridge id payload");
+        let bridge_subject = id_payload.subject_id.to_string();
+        let bridge_agent_id = agent_store
+            .create_agent(
+                "legacy-token-test-bridge",
+                "bridge",
+                "Bridge",
+                "internal",
+                "ops",
+                "integration-test",
+                &bridge_subject,
+                "critical",
+            )
+            .expect("register bridge agent");
+        agent_store
+            .update_agent_field(&bridge_agent_id, "profile", "allow-all")
+            .expect("set bridge profile = allow-all");
+    }
     let client_key_path = bridge_tmp.path().join("client.key");
     let chat_template_path = bridge_tmp.path().join("chat.sol");
     std::fs::write(

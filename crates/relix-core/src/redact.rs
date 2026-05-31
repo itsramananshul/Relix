@@ -563,9 +563,7 @@ mod tests {
         // protection (the string IS a fake, but the byte
         // pattern matches the real Stripe live-key shape).
         let prefix = format!("sk_{}_", "live");
-        let s = format!(
-            "STRIPE_SECRET_KEY={prefix}abcdefghijklmnop1234567890ABCD"
-        );
+        let s = format!("STRIPE_SECRET_KEY={prefix}abcdefghijklmnop1234567890ABCD");
         let out = redact_secrets(&s);
         assert!(out.contains("[REDACTED:STRIPE_KEY]"));
         // Generic OpenAI matcher must NOT also fire (the

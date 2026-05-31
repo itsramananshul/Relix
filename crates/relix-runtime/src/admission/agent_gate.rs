@@ -113,7 +113,28 @@ pub mod deny_reasons {
     /// when a non-token-specific failure happens. Specific
     /// token failure rules come from [`TokenError::matched_rule`].
     pub const APPROVAL_TOKEN_INVALID: &str = "approval_token_invalid";
+    /// SEC PART 1 (default-deny): admission attempted while no
+    /// agent store is wired. Previously admitted with
+    /// `no_agent_store`; now fail-closed.
+    pub const AGENT_STORE_NOT_CONFIGURED: &str = "agent_store_not_configured";
+    /// SEC PART 1: caller's subject_id has no row in
+    /// `agent_profiles`. Previously admitted with
+    /// `no_agent_profile`; now fail-closed. Operators set up
+    /// the agent via `relix agent create` (or seed
+    /// `[[agents]]` in the controller TOML) before any
+    /// admission attempt.
+    pub const AGENT_NO_PROFILE: &str = "agent_no_profile";
 }
+
+/// SEC PART 1 (allow-all profile): matched_rule emitted when
+/// `AgentProfile.profile == "allow-all"` bypasses every
+/// categorical check. Audited as a distinct allow-rule so
+/// operators can grep for bypasses in the chronicle.
+pub const ALLOW_RULE_ALLOW_ALL_PROFILE: &str = "allow_all_profile";
+
+/// SEC PART 1 (allow-all profile): the only operator-meaningful
+/// `profile` label. Matches `AgentProfile.profile`.
+pub const PROFILE_ALLOW_ALL: &str = "allow-all";
 
 /// Inputs the gate consumes for one call.
 pub struct GateInputs<'a> {
@@ -135,6 +156,19 @@ pub struct GateInputs<'a> {
     /// Empty / absent = the gate refuses every token-bearing
     /// call with `approval_token_missing_key`.
     pub signing_key: &'a [u8],
+    /// SEC PART 1: surface label derived from the transport
+    /// layer connection metadata (peer alias from the libp2p
+    /// `PeerId` of the calling peer). The gate consults THIS
+    /// for `surface_allowlist` matching — `envelope.surface`
+    /// is operator-asserted and therefore untrusted; it is
+    /// ignored for admission decisions.
+    ///
+    /// `None` means the transport layer did not provide a
+    /// surface (e.g. an internal test that didn't go through
+    /// the controller event loop). The gate treats `None`
+    /// exactly as it treated `envelope.surface = None` before
+    /// PART 1 — denied when `surface_allowlist` is non-empty.
+    pub caller_surface: Option<&'a str>,
 }
 
 /// Live store dependency. Wrapped in `Arc` so the dispatch
@@ -145,11 +179,20 @@ pub type AgentStoreHandle = Arc<AgentStore>;
 /// handle; no chronicle / task side effects happen here — the
 /// dispatch bridge runs those based on the returned decision.
 pub fn evaluate(store: Option<&AgentStoreHandle>, inputs: GateInputs<'_>) -> GateDecision {
+    // SEC PART 1: fail-closed when the store is not wired.
+    // The pre-fix behaviour (silent allow) was a default-
+    // permissive bypass — any deployment that booted without
+    // an agent store admitted EVERY call. Operators wiring a
+    // test stub get an explicit deny instead of latent
+    // production-shaped bypass.
     let Some(store) = store else {
-        // No agent store configured (e.g. tests that exercise
-        // the bridge without a coordinator-side store). Fall
-        // through.
-        return allow("no_agent_store");
+        return GateDecision::Deny(GateDeny {
+            reason: "agent_gate: store not configured — all requests denied \
+                     until agent store is wired"
+                .into(),
+            matched_rule: deny_reasons::AGENT_STORE_NOT_CONFIGURED.into(),
+            agent_id: None,
+        });
     };
 
     // 1. Token-bearing call: structured signed token is the
@@ -174,8 +217,19 @@ pub fn evaluate(store: Option<&AgentStoreHandle>, inputs: GateInputs<'_>) -> Gat
     let profile = match store.get_by_subject(&subject_id) {
         Ok(Some(p)) => p,
         Ok(None) => {
-            // No profile = backward-compat allow.
-            return allow("no_agent_profile");
+            // SEC PART 1: fail-closed when the agent has no
+            // profile. Pre-fix: silent allow as "backward
+            // compat." Operators register the agent (via
+            // `relix agent create` or `[[agents]]` TOML)
+            // BEFORE the agent is allowed to make any call.
+            return GateDecision::Deny(GateDeny {
+                reason: format!(
+                    "agent_gate: no profile found for agent {subject_id} — \
+                     register the agent before making requests"
+                ),
+                matched_rule: deny_reasons::AGENT_NO_PROFILE.into(),
+                agent_id: None,
+            });
         }
         Err(e) => {
             return GateDecision::Deny(GateDeny {
@@ -289,6 +343,18 @@ fn evaluate_against_view(
     inputs: GateInputs<'_>,
     store: &AgentStoreHandle,
 ) -> GateDecision {
+    // SEC PART 1: `profile = "allow-all"` is the explicit
+    // bypass. Runs BEFORE the status check so an operator can
+    // hand a trusted internal agent unrestricted access
+    // without ALSO toggling every categorical field. The
+    // matched_rule is distinct so the chronicle / audit ring
+    // makes the bypass visible.
+    if view.profile.as_deref() == Some(PROFILE_ALLOW_ALL) {
+        return GateDecision::Allow(GateAllow {
+            matched_rule: ALLOW_RULE_ALLOW_ALL_PROFILE.to_string(),
+            consumed_approval_id: None,
+        });
+    }
     // a) Status.
     match view.status.as_str() {
         "suspended" => {
@@ -316,14 +382,22 @@ fn evaluate_against_view(
     }
 
     // b) Surface check.
+    //
+    // SEC PART 1: source the surface from `inputs.caller_surface`
+    // — the transport-layer-derived alias of the calling peer.
+    // The previous read of `inputs.envelope.surface` trusted
+    // an operator-asserted wire field; an off-policy caller
+    // could claim any surface to bypass an allowlist designed
+    // around scheduler-only / internal-only access. The
+    // envelope's surface field is now ignored at admission.
     if !view.surface_allowlist.is_empty() {
-        match inputs.envelope.surface.as_deref() {
+        match inputs.caller_surface {
             Some(s) if view.surface_allowlist.iter().any(|allowed| allowed == s) => {}
             other => {
                 return deny(
                     deny_reasons::AGENT_SURFACE_DENIED,
                     format!(
-                        "surface {} not in {:?}",
+                        "transport surface {} not in {:?}",
                         other.unwrap_or("<none>"),
                         view.surface_allowlist
                     ),
@@ -466,6 +540,7 @@ fn evaluate_against_view(
     })
 }
 
+#[allow(dead_code)]
 fn allow(matched_rule: &str) -> GateDecision {
     GateDecision::Allow(GateAllow {
         matched_rule: matched_rule.to_string(),
@@ -583,6 +658,21 @@ mod tests {
         envelope: &RequestEnvelope,
         cap: Option<&CapabilityDescriptor>,
     ) -> GateDecision {
+        // Production paths derive caller_surface from the
+        // libp2p PeerId. Tests that drive `evaluate` directly
+        // need to mirror what the bridge would pass — the
+        // envelope's own `surface` field is the test's
+        // representation of the trusted transport-layer alias.
+        run_with_surface(store, identity, envelope, cap, envelope.surface.as_deref())
+    }
+
+    fn run_with_surface(
+        store: &AgentStoreHandle,
+        identity: &VerifiedIdentity,
+        envelope: &RequestEnvelope,
+        cap: Option<&CapabilityDescriptor>,
+        caller_surface: Option<&str>,
+    ) -> GateDecision {
         let key = test_key();
         evaluate(
             Some(store),
@@ -593,27 +683,39 @@ mod tests {
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_000,
                 signing_key: &key,
+                caller_surface,
             },
         )
     }
 
-    // ── backward compat ──────────────────────────────────
+    // ── SEC PART 1: default-deny posture ─────────────────
 
     #[test]
-    fn no_profile_admits_unchanged() {
+    fn no_profile_returns_security_denied() {
+        // SEC PART 1: pre-fix behaviour was silent allow with
+        // matched_rule "no_agent_profile". Fail-closed now.
         let s = store();
         let id = ident(b"unknown-subject");
         let e = env("tool.web_fetch", Some("api"));
         let cap = cap(&["fetch"], &["external:network"], RiskLevel::Low);
         let d = run(&s, &id, &e, Some(&cap));
         match d {
-            GateDecision::Allow(a) => assert_eq!(a.matched_rule, "no_agent_profile"),
-            other => panic!("expected Allow, got {other:?}"),
+            GateDecision::Deny(deny) => {
+                assert_eq!(deny.matched_rule, deny_reasons::AGENT_NO_PROFILE);
+                assert!(
+                    deny.reason.contains("no profile found"),
+                    "reason: {}",
+                    deny.reason
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
         }
     }
 
     #[test]
-    fn store_handle_none_admits() {
+    fn store_handle_none_returns_security_denied() {
+        // SEC PART 1: pre-fix behaviour was silent allow with
+        // matched_rule "no_agent_store". Fail-closed now.
         let id = ident(b"x");
         let e = env("m", None);
         let key = test_key();
@@ -626,9 +728,55 @@ mod tests {
                 now: 0,
                 now_ms: 0,
                 signing_key: &key,
+                caller_surface: None,
             },
         );
-        assert!(matches!(d, GateDecision::Allow(_)));
+        match d {
+            GateDecision::Deny(deny) => {
+                assert_eq!(deny.matched_rule, deny_reasons::AGENT_STORE_NOT_CONFIGURED);
+                assert!(
+                    deny.reason.contains("store not configured"),
+                    "reason: {}",
+                    deny.reason
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_all_profile_bypasses_every_categorical_check() {
+        // SEC PART 1: explicit profile = "allow-all" admits
+        // through with matched_rule "allow_all_profile" even
+        // when other fields would otherwise deny (e.g. risk
+        // ceiling = safe + cap is critical).
+        let (s, id) = setup_with_profile("safe", "active", &[], &[], &[]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.update_agent_field(&agent_id, "profile", "allow-all")
+            .unwrap();
+        let e = env("tool.payments.charge", None);
+        // High-risk capability + categorical deny intent — the
+        // bypass still admits because profile == allow-all.
+        let c = cap(&["payments"], &[], RiskLevel::Critical);
+        match run(&s, &id, &e, Some(&c)) {
+            GateDecision::Allow(a) => {
+                assert_eq!(a.matched_rule, ALLOW_RULE_ALLOW_ALL_PROFILE);
+            }
+            other => panic!("expected Allow(allow_all_profile), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_profile_label_is_rejected_by_update() {
+        // The profile column is a strict allowlist — an
+        // operator can't sneak in a new "allow-all-but-not"
+        // label that the gate doesn't recognise.
+        let (s, _id) = setup_with_profile("medium", "active", &[], &[], &[]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        let err = s
+            .update_agent_field(&agent_id, "profile", "permissive")
+            .expect_err("unknown profile must error");
+        assert!(format!("{err:?}").contains("not recognised"), "got {err:?}");
     }
 
     // ── status checks ────────────────────────────────────
@@ -730,6 +878,36 @@ mod tests {
         let e = env("tool.x", Some("api"));
         let c = cap(&["fetch"], &[], RiskLevel::Low);
         assert!(matches!(run(&s, &id, &e, Some(&c)), GateDecision::Allow(_)));
+    }
+
+    #[test]
+    fn envelope_surface_is_ignored_for_admission_decisions() {
+        // SEC PART 1: the operator-asserted envelope.surface
+        // must NOT influence the surface check. We set
+        // surface_allowlist = ["scheduler"] but pass an
+        // envelope claiming `scheduler` while the trusted
+        // transport-layer surface is `api`. The gate must
+        // consult the trusted surface only and deny.
+        let (s, id) = setup_with_profile("high", "active", &[], &[], &[]);
+        let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
+        s.update_agent_field(&agent_id, "surface_allowlist", "scheduler")
+            .unwrap();
+        let e = env("tool.x", Some("scheduler")); // forged
+        let c = cap(&["fetch"], &[], RiskLevel::Low);
+        // Trusted surface from the transport: "api". Forged
+        // envelope claims "scheduler". Gate must DENY.
+        let d = run_with_surface(&s, &id, &e, Some(&c), Some("api"));
+        match d {
+            GateDecision::Deny(deny) => {
+                assert_eq!(deny.matched_rule, deny_reasons::AGENT_SURFACE_DENIED);
+                assert!(
+                    deny.reason.contains("transport surface api"),
+                    "reason: {}",
+                    deny.reason
+                );
+            }
+            other => panic!("expected Deny via trusted surface, got {other:?}"),
+        }
     }
 
     // ── risk ceiling ─────────────────────────────────────
@@ -954,6 +1132,7 @@ mod tests {
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
                 signing_key: &key,
+                caller_surface: None,
             },
         );
         match d {
@@ -989,6 +1168,7 @@ mod tests {
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
                 signing_key: &key,
+                caller_surface: None,
             },
         );
         match d {
@@ -1017,6 +1197,7 @@ mod tests {
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
                 signing_key: &key,
+                caller_surface: None,
             },
         );
         match d {
@@ -1046,6 +1227,7 @@ mod tests {
                 now: 1_700_000_500,
                 now_ms: 1_700_000_500_000,
                 signing_key: &key,
+                caller_surface: None,
             },
         );
         match d {
@@ -1088,6 +1270,7 @@ mod tests {
                 now: now_ms / 1_000,
                 now_ms,
                 signing_key: &key,
+                caller_surface: None,
             },
         )
     }
@@ -1142,6 +1325,7 @@ mod tests {
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
                 signing_key: &other_key,
+                caller_surface: None,
             },
         );
         match d {
@@ -1171,6 +1355,7 @@ mod tests {
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
                 signing_key: &key,
+                caller_surface: None,
             },
         );
         assert!(matches!(first, GateDecision::Allow(_)));
@@ -1183,6 +1368,7 @@ mod tests {
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_600,
                 signing_key: &key,
+                caller_surface: None,
             },
         );
         match replay {
@@ -1227,6 +1413,7 @@ mod tests {
                     now: 1_700_000_000,
                     now_ms: 1_700_000_000_500,
                     signing_key: &key,
+                    caller_surface: None,
                 },
             );
             match d {

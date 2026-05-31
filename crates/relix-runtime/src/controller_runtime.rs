@@ -1146,6 +1146,22 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("controller online; awaiting inbound RPCs");
 
+    // SEC PART 1: build a peer_id → alias map so the agent
+    // gate's surface_allowlist check can match against a
+    // transport-derived surface rather than the operator-
+    // asserted envelope.surface. The map is populated as
+    // PeerConnected events arrive — we match the reported
+    // multiaddr's `/ip4/.../tcp/<port>` substring against the
+    // peers config, then stash (peer_id → alias).
+    let peer_alias_map: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<libp2p::PeerId, String>>,
+    > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let alias_by_port: std::collections::HashMap<u16, String> = cfg
+        .peers
+        .iter()
+        .map(|(alias, peer_cfg)| (peer_cfg.port, alias.clone()))
+        .collect();
+
     // Inbound event loop.
     let bridge_for_loop = bridge.clone();
     while let Some(event) = events.recv().await {
@@ -1156,14 +1172,48 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 respond,
             } => {
                 let bridge = bridge_for_loop.clone();
+                let alias_map = peer_alias_map.clone();
                 tokio::spawn(async move {
-                    let resp = bridge.handle_inbound(envelope).await;
+                    // SEC PART 1: derive the trusted caller
+                    // surface from the libp2p PeerId. `None`
+                    // when the peer hasn't yet been mapped —
+                    // the gate then treats this as "unknown
+                    // surface" (denied if surface_allowlist is
+                    // non-empty).
+                    let caller_surface = alias_map.read().ok().and_then(|g| g.get(&from).cloned());
+                    let resp = bridge
+                        .handle_inbound_with_surface(envelope, caller_surface)
+                        .await;
                     respond.respond(resp).await;
-                    let _ = from; // peer id available for future audit metadata
                 });
             }
             TransportEvent::PeerConnected { peer_id, address } => {
-                tracing::info!(peer = %peer_id, addr = %address, "peer connected");
+                // SEC PART 1: stash peer_id → alias for the
+                // surface derivation above. We match the
+                // reported address's `/tcp/<port>` segment
+                // against `alias_by_port`. Aliases unknown to
+                // the local peers config simply stay absent —
+                // their requests get caller_surface = None.
+                let reported = address.to_string();
+                let alias = alias_by_port.iter().find_map(|(port, alias)| {
+                    let needle = format!("/tcp/{port}");
+                    if reported.contains(&needle) {
+                        Some(alias.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(alias) = alias.clone()
+                    && let Ok(mut g) = peer_alias_map.write()
+                {
+                    g.insert(peer_id, alias);
+                }
+                tracing::info!(
+                    peer = %peer_id,
+                    addr = %address,
+                    alias = ?alias,
+                    "peer connected"
+                );
             }
         }
     }
