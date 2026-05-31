@@ -23,6 +23,73 @@ use relix_core::types::TraceId;
 use relix_runtime::flow_runner::{FlowRunOptions, FlowRunner, FlowRunnerError};
 use relix_runtime::nodes::coordinator::FailureClass;
 
+/// SEC PART 3: a two-pass `{{KEY}}` template renderer that
+/// cannot chain-trigger a second substitution. The pre-fix
+/// path called `.replace("{{SESSION}}", session_id)` followed
+/// by `.replace("{{MESSAGE}}", message)` — if `session_id`
+/// itself contained the literal `{{MESSAGE}}` (or any other
+/// placeholder), the second `.replace` would substitute that
+/// in too, letting an attacker control template expansion
+/// past the bridge's intent.
+///
+/// Algorithm:
+///   1. Walk every value once, escaping any `{{` substring to
+///      a sentinel that the template engine can never re-emit.
+///   2. Scan the template ONCE left-to-right; at each `{{KEY}}`
+///      look up the escaped value and splice it in. Unknown
+///      `{{KEY}}` runs pass through verbatim (preserves the
+///      existing behaviour of `String::replace` on missing
+///      keys — a no-op).
+///   3. After the scan, replace each sentinel with the literal
+///      `{{` so the rendered template still contains the
+///      user-supplied bytes faithfully but the engine can't
+///      re-trigger on them.
+///
+/// `ESCAPED_OPEN` is two ASCII bytes that don't appear in
+/// SOL source (NUL is forbidden inside source by every
+/// tokenizer), so a final substitution back to `{{` is
+/// unambiguous.
+pub(crate) fn render_template_safe(template: &str, pairs: &[(&str, &str)]) -> String {
+    const ESCAPED_OPEN: &str = "\0{\0{\0";
+    let escaped_pairs: Vec<(&str, String)> = pairs
+        .iter()
+        .map(|(k, v)| (*k, v.replace("{{", ESCAPED_OPEN)))
+        .collect();
+    // Single left-to-right scan: find `{{KEY}}` runs and splice.
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"{{" {
+            // Find matching `}}` ahead.
+            let rest = &template[i + 2..];
+            if let Some(close_rel) = rest.find("}}") {
+                let key = &rest[..close_rel];
+                if let Some((_, v)) = escaped_pairs.iter().find(|(k, _)| *k == key) {
+                    out.push_str(v);
+                    i += 2 + close_rel + 2;
+                    continue;
+                }
+            }
+        }
+        // Push the next char (preserving UTF-8 boundaries).
+        let next = next_utf8_boundary(bytes, i);
+        out.push_str(&template[i..next]);
+        i = next;
+    }
+    // Restore the escaped `{{` so the rendered output is byte-
+    // identical to what the user supplied (minus the splice).
+    out.replace(ESCAPED_OPEN, "{{")
+}
+
+fn next_utf8_boundary(bytes: &[u8], from: usize) -> usize {
+    let mut j = from + 1;
+    while j < bytes.len() && (bytes[j] & 0xC0) == 0x80 {
+        j += 1;
+    }
+    j.min(bytes.len())
+}
+
 /// Pick the tempfile suffix that matches the configured
 /// template's on-disk extension. The bridge writes the rendered
 /// template to a tempfile; the FlowRunner dispatches on the
@@ -122,10 +189,13 @@ pub async fn execute_chat_flow(
     )
     .await;
 
-    let rendered = state
-        .template
-        .replace("{{SESSION}}", session_id)
-        .replace("{{MESSAGE}}", message);
+    // SEC PART 3: two-pass safe substitution — a session_id
+    // containing the literal `{{MESSAGE}}` no longer triggers
+    // a second substitution.
+    let rendered = render_template_safe(
+        &state.template,
+        &[("SESSION", session_id), ("MESSAGE", message)],
+    );
 
     let tmp = tempfile::Builder::new()
         .prefix("relix-bridge-chat-")
@@ -334,10 +404,16 @@ pub async fn execute_chat_with_tool_flow(
     )
     .await;
 
-    let rendered = tool_template
-        .replace("{{SESSION}}", session_id)
-        .replace("{{MESSAGE}}", message)
-        .replace("{{TOOL_URL}}", url);
+    // SEC PART 3: safe two-pass substitution (see
+    // `render_template_safe`).
+    let rendered = render_template_safe(
+        tool_template,
+        &[
+            ("SESSION", session_id),
+            ("MESSAGE", message),
+            ("TOOL_URL", url),
+        ],
+    );
 
     let tool_template_suffix = state
         .cfg
@@ -516,9 +592,11 @@ pub async fn execute_chat_flow_streaming(
     )
     .await;
 
-    let rendered = streaming_template
-        .replace("{{SESSION}}", session_id)
-        .replace("{{MESSAGE}}", message);
+    // SEC PART 3: safe two-pass substitution.
+    let rendered = render_template_safe(
+        streaming_template,
+        &[("SESSION", session_id), ("MESSAGE", message)],
+    );
     let stream_template_suffix = state
         .cfg
         .flow
@@ -614,5 +692,48 @@ mod tests {
         assert_eq!(turn.content, "hello | world");
         assert_eq!(turn.timestamp_unix, 1_700_000_001);
         assert_eq!(turn.session_id, "sess-A");
+    }
+
+    // ── SEC PART 3: safe template substitution ───────────
+
+    #[test]
+    fn render_template_safe_handles_simple_substitution() {
+        let template = "session={{SESSION}} message={{MESSAGE}}";
+        let out = render_template_safe(template, &[("SESSION", "s1"), ("MESSAGE", "hi")]);
+        assert_eq!(out, "session=s1 message=hi");
+    }
+
+    #[test]
+    fn render_template_safe_no_double_substitution_when_value_contains_placeholder() {
+        // Pre-fix path used `.replace("{{SESSION}}", session_id)` then
+        // `.replace("{{MESSAGE}}", message)`; a session_id of
+        // `xxx{{MESSAGE}}yyy` would trigger the second
+        // substitution. The two-pass engine must NOT.
+        let template = "S={{SESSION}} M={{MESSAGE}}";
+        let out = render_template_safe(
+            template,
+            &[("SESSION", "alpha{{MESSAGE}}beta"), ("MESSAGE", "PWNED")],
+        );
+        // The {{MESSAGE}} inside SESSION must survive verbatim,
+        // not be expanded.
+        assert_eq!(out, "S=alpha{{MESSAGE}}beta M=PWNED");
+        assert!(!out.contains("PWNEDbeta"), "double-sub detected: {out}");
+    }
+
+    #[test]
+    fn render_template_safe_unknown_placeholder_passes_through_unchanged() {
+        let template = "{{KNOWN}} {{UNKNOWN}}";
+        let out = render_template_safe(template, &[("KNOWN", "yes")]);
+        assert_eq!(out, "yes {{UNKNOWN}}");
+    }
+
+    #[test]
+    fn render_template_safe_preserves_value_containing_three_open_braces() {
+        // Defence in depth: a value with `{{{` survives the
+        // sentinel-escape round trip without becoming a
+        // double-substituted run.
+        let template = "{{V}}";
+        let out = render_template_safe(template, &[("V", "{{{notakey}}}")]);
+        assert_eq!(out, "{{{notakey}}}");
     }
 }

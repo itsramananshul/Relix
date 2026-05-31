@@ -145,6 +145,34 @@ pub enum YamlFlowError {
     /// failed to open.
     #[error("yaml flow: failed to read `{path}`: {cause}")]
     Io { path: String, cause: String },
+
+    /// SEC PART 3: a user-supplied `if.condition` string
+    /// (or any other field interpolated raw into SOL source)
+    /// contained characters outside the allowlist for SOL
+    /// boolean predicates. Pre-fix path emitted the raw
+    /// string verbatim into the lowered SOL source, allowing
+    /// arbitrary statements to be smuggled in. The allowlist
+    /// is `^[A-Za-z0-9_\.\s\(\)\!\=\<\>\&\|]+$` — the exact
+    /// character set of legitimate SOL boolean predicates
+    /// (identifiers, member access, parentheses, comparison
+    /// + logical operators, whitespace).
+    #[error(
+        "at {path}: invalid condition `{value}` — only [A-Za-z0-9_\\.\\s\\(\\)\\!\\=\\<\\>\\&\\|] characters are allowed (SOL boolean predicate grammar)"
+    )]
+    InvalidCondition { path: String, value: String },
+
+    /// SEC PART 3: a user-supplied scalar value that would be
+    /// interpolated raw into SOL source (`int`/`bool`/`float`
+    /// `let.value` strings, or string-typed `list`/`map`
+    /// fallback literals) failed its grammar-specific
+    /// allowlist. Same posture as `InvalidCondition` but for
+    /// scalars whose grammar is narrower than predicate.
+    #[error("at {path}: invalid {what} value `{value}` — fails the SOL {what} grammar allowlist")]
+    InvalidScalar {
+        path: String,
+        what: &'static str,
+        value: String,
+    },
 }
 
 // ──────────────────────────── YAML AST ──────────────────────────
@@ -978,6 +1006,13 @@ impl Lowerer {
     }
 
     fn lower_if(&mut self, s: &IfStep, path: &StepPath) -> Result<(), YamlFlowError> {
+        // SEC PART 3: validate the user-supplied condition
+        // against the strict SOL-predicate allowlist BEFORE
+        // splicing it into the lowered SOL source. Without
+        // this check, an attacker who controlled the YAML
+        // could smuggle arbitrary statements through
+        // `if: { condition: "...; remote_call(...)" }`.
+        validate_condition(&s.condition, path)?;
         self.indented(&format!("if {} {{\n", s.condition.trim()));
         self.indent += 1;
         for (i, step) in s.then.iter().enumerate() {
@@ -1334,7 +1369,14 @@ fn lower_let_value(ty: &LetType, value: &Node, path: &StepPath) -> Result<String
         LetType::Int | LetType::Bool | LetType::Float => require_scalar_unquoted(value, ty, path),
         LetType::List => match &value.data {
             YamlDataOwned::Sequence(_) => yaml_to_sol_expr(value, path),
-            YamlDataOwned::Value(ScalarOwned::String(s)) => Ok(s.clone()),
+            YamlDataOwned::Value(ScalarOwned::String(s)) => {
+                // SEC PART 3: when the user provides a
+                // string-typed SOL list literal, validate it
+                // against the strict collection-allowlist
+                // before splicing into the lowered source.
+                validate_collection_literal(s, "list", path)?;
+                Ok(s.clone())
+            }
             YamlDataOwned::Value(ScalarOwned::Null) => Ok("[]".to_string()),
             YamlDataOwned::Mapping(_) => Err(semantic_at_node(
                 path,
@@ -1357,7 +1399,11 @@ fn lower_let_value(ty: &LetType, value: &Node, path: &StepPath) -> Result<String
         },
         LetType::Map => match &value.data {
             YamlDataOwned::Mapping(_) => yaml_to_sol_expr(value, path),
-            YamlDataOwned::Value(ScalarOwned::String(s)) => Ok(s.clone()),
+            YamlDataOwned::Value(ScalarOwned::String(s)) => {
+                // SEC PART 3: see LetType::List branch above.
+                validate_collection_literal(s, "map", path)?;
+                Ok(s.clone())
+            }
             YamlDataOwned::Value(ScalarOwned::Null) => Ok("{}".to_string()),
             YamlDataOwned::Sequence(_) => Err(semantic_at_node(
                 path,
@@ -1387,11 +1433,33 @@ fn require_scalar_unquoted(
     path: &StepPath,
 ) -> Result<String, YamlFlowError> {
     match &value.data {
-        YamlDataOwned::Value(ScalarOwned::String(s)) => Ok(s.clone()),
+        YamlDataOwned::Value(ScalarOwned::String(s)) => {
+            // SEC PART 3: validate the user-supplied string
+            // matches the SOL grammar for `ty` before
+            // splicing it into the lowered source.
+            match ty {
+                LetType::Int => validate_int_literal(s, path)?,
+                LetType::Float => validate_float_literal(s, path)?,
+                LetType::Bool => validate_bool_literal(s, path)?,
+                _ => {}
+            }
+            Ok(s.clone())
+        }
         YamlDataOwned::Value(ScalarOwned::Integer(i)) => Ok(i.to_string()),
         YamlDataOwned::Value(ScalarOwned::FloatingPoint(f)) => Ok(f.0.to_string()),
         YamlDataOwned::Value(ScalarOwned::Boolean(b)) => Ok(b.to_string()),
-        YamlDataOwned::Representation(s, _, _) => Ok(s.clone()),
+        YamlDataOwned::Representation(s, _, _) => {
+            // Representation carries the source's literal
+            // text — apply the same grammar check the
+            // String branch does.
+            match ty {
+                LetType::Int => validate_int_literal(s, path)?,
+                LetType::Float => validate_float_literal(s, path)?,
+                LetType::Bool => validate_bool_literal(s, path)?,
+                _ => {}
+            }
+            Ok(s.clone())
+        }
         YamlDataOwned::Sequence(_) => Err(semantic_at_node(
             path,
             value,
@@ -1466,6 +1534,108 @@ fn yaml_to_sol_expr(value: &Node, path: &StepPath) -> Result<String, YamlFlowErr
             "encountered a node the YAML frontend cannot lower",
         )),
     }
+}
+
+/// SEC PART 3: strict allowlist regexes for every
+/// user-supplied SOL fragment that the lowerer would
+/// otherwise interpolate verbatim. Compiled once via
+/// `OnceLock` so the hot path stays allocation-free.
+fn condition_allowlist() -> &'static regex::Regex {
+    static RX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RX.get_or_init(|| {
+        // Rust `regex` crate forbids unnecessary `\` escapes
+        // inside char classes; the prompt's `^[A-Za-z0-9_\.\s\(\)\!\=\<\>\&\|]+$`
+        // is equivalent to this strictly-formed pattern.
+        regex::Regex::new(r"^[A-Za-z0-9_.\s()!=<>&|]+$")
+            .expect("condition allowlist regex is constant + tested at boot")
+    })
+}
+
+fn int_allowlist() -> &'static regex::Regex {
+    static RX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RX.get_or_init(|| regex::Regex::new(r"^-?[0-9]+$").expect("int allowlist regex"))
+}
+
+fn float_allowlist() -> &'static regex::Regex {
+    static RX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RX.get_or_init(|| regex::Regex::new(r"^-?[0-9]+(\.[0-9]+)?$").expect("float allowlist regex"))
+}
+
+/// `^[\[\]\{\}\:\,\s\"A-Za-z0-9_\.\-]+$` — the chars that show
+/// up in legitimate SOL list/map literals (brackets, braces,
+/// colon, comma, quoted strings, scalars). Excludes `;`,
+/// newlines, function-call parens, and operators that would
+/// let a string-typed `let.value` smuggle statements into the
+/// surrounding SOL source.
+fn collection_allowlist() -> &'static regex::Regex {
+    static RX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RX.get_or_init(|| {
+        regex::Regex::new(r#"^[\[\]{}:,\s"A-Za-z0-9_.\-]+$"#).expect("collection allowlist regex")
+    })
+}
+
+/// SEC PART 3: validate a user-supplied SOL boolean predicate
+/// before interpolating it into the lowered source. Reject
+/// anything outside the allowlist with
+/// [`YamlFlowError::InvalidCondition`] so the SOL injection
+/// path is closed even when the operator hand-edits the YAML.
+fn validate_condition(value: &str, path: &StepPath) -> Result<(), YamlFlowError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !condition_allowlist().is_match(trimmed) {
+        return Err(YamlFlowError::InvalidCondition {
+            path: path.render(),
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_int_literal(value: &str, path: &StepPath) -> Result<(), YamlFlowError> {
+    if !int_allowlist().is_match(value.trim()) {
+        return Err(YamlFlowError::InvalidScalar {
+            path: path.render(),
+            what: "int",
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_bool_literal(value: &str, path: &StepPath) -> Result<(), YamlFlowError> {
+    match value.trim() {
+        "true" | "false" => Ok(()),
+        _ => Err(YamlFlowError::InvalidScalar {
+            path: path.render(),
+            what: "bool",
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn validate_float_literal(value: &str, path: &StepPath) -> Result<(), YamlFlowError> {
+    if !float_allowlist().is_match(value.trim()) {
+        return Err(YamlFlowError::InvalidScalar {
+            path: path.render(),
+            what: "float",
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_collection_literal(
+    value: &str,
+    what: &'static str,
+    path: &StepPath,
+) -> Result<(), YamlFlowError> {
+    if !collection_allowlist().is_match(value) {
+        return Err(YamlFlowError::InvalidScalar {
+            path: path.render(),
+            what,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// SOL strings have no escape sequences (SIMP-016). A literal

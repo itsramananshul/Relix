@@ -369,14 +369,20 @@ fn multi_interpolation_resolves_each_marker() {
 
 #[test]
 fn if_else_takes_then_branch_when_condition_is_true() {
+    // SEC PART 3: the condition allowlist
+    // (`^[A-Za-z0-9_\.\s\(\)\!\=\<\>\&\|]+$`) intentionally
+    // excludes string literals. Pre-fix tests compared
+    // `status == "completed"`; quotes can't appear in a
+    // post-fix predicate, so the predicate now compares
+    // boolean / numeric values.
     let yaml = r#"
         steps:
           - let:
-              name: status
-              type: str
-              value: "completed"
+              name: ready
+              type: bool
+              value: true
           - if:
-              condition: status == "completed"
+              condition: ready == true
               then:
                 - result: "ok"
               else:
@@ -391,11 +397,11 @@ fn if_else_takes_else_branch_when_condition_is_false() {
     let yaml = r#"
         steps:
           - let:
-              name: status
-              type: str
-              value: "pending"
+              name: ready
+              type: bool
+              value: false
           - if:
-              condition: status == "completed"
+              condition: ready == true
               then:
                 - result: "ok"
               else:
@@ -410,11 +416,11 @@ fn if_without_else_compiles_and_runs() {
     let yaml = r#"
         steps:
           - let:
-              name: name
-              type: str
-              value: "alice"
+              name: code
+              type: int
+              value: 42
           - if:
-              condition: name == "alice"
+              condition: code == 42
               then:
                 - result: "hi alice"
           - result: "fallthrough"
@@ -1470,4 +1476,94 @@ fn chat_template_streaming_yml_lowers_to_remote_call_stream() {
     assert_eq!(yaml_final, "streamed");
 
     assert_eq!(disp_yaml.calls(), disp_sol.calls());
+}
+
+// ── SEC PART 3: SOL-injection rejection at YAML compile time ──
+
+#[test]
+fn injection_via_condition_string_is_rejected_at_parse_time() {
+    // The pre-fix lowerer spliced any user string into the
+    // emitted SOL source — `}; remote_call(...)` would
+    // close the `if` and smuggle a statement.
+    let yaml = r#"
+steps:
+  - if:
+      condition: "true } remote_call(\"x\", \"y\", \"\")"
+      then:
+        - result: "ok"
+"#;
+    let err = compile_source(yaml).expect_err("must reject");
+    match err {
+        YamlFlowError::InvalidCondition { path, value } => {
+            assert!(value.contains("remote_call"), "got value: {value}");
+            assert!(path.contains("step"), "got path: {path}");
+        }
+        other => panic!("expected InvalidCondition, got {other:?}"),
+    }
+}
+
+#[test]
+fn condition_with_legitimate_predicate_chars_compiles() {
+    // The allowlist passes a normal boolean predicate.
+    let yaml = r#"
+steps:
+  - let:
+      name: x
+      type: int
+      value: 1
+  - if:
+      condition: "x == 1 && (x != 2)"
+      then:
+        - result: "ok"
+  - result: "fallthrough"
+"#;
+    let _ = compile_source(yaml).expect("must compile");
+}
+
+#[test]
+fn injection_via_int_let_value_string_is_rejected() {
+    let yaml = r#"
+steps:
+  - let:
+      name: x
+      type: int
+      value: "1; remote_call(\"x\", \"y\", \"\")"
+"#;
+    let err = compile_source(yaml).expect_err("must reject");
+    assert!(
+        matches!(err, YamlFlowError::InvalidScalar { what: "int", .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn injection_via_list_string_literal_is_rejected() {
+    let yaml = r#"
+steps:
+  - let:
+      name: items
+      type: list
+      value: "[]; remote_call(\"x\", \"y\", \"\")"
+"#;
+    let err = compile_source(yaml).expect_err("must reject");
+    assert!(
+        matches!(err, YamlFlowError::InvalidScalar { what: "list", .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn injection_via_bool_let_value_string_is_rejected() {
+    let yaml = r#"
+steps:
+  - let:
+      name: flag
+      type: bool
+      value: "true; print(\"pwned\")"
+"#;
+    let err = compile_source(yaml).expect_err("must reject");
+    assert!(
+        matches!(err, YamlFlowError::InvalidScalar { what: "bool", .. }),
+        "got {err:?}"
+    );
 }

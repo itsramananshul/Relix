@@ -61,7 +61,15 @@ pub async fn validate(Json(req): Json<YamlValidateRequest>) -> impl IntoResponse
             let (line, column) = match &e {
                 YamlFlowError::Parse { line, column, .. } => (*line, *column),
                 YamlFlowError::Semantic { line, column, .. } => (*line, *column),
-                YamlFlowError::Lower { .. } | YamlFlowError::Io { .. } => (0, 0),
+                // SEC PART 3: the new InvalidCondition +
+                // InvalidScalar variants are path-only (no
+                // source span) — report (0, 0) so the
+                // dashboard surfaces the path + message
+                // verbatim.
+                YamlFlowError::Lower { .. }
+                | YamlFlowError::Io { .. }
+                | YamlFlowError::InvalidCondition { .. }
+                | YamlFlowError::InvalidScalar { .. } => (0, 0),
             };
             (
                 StatusCode::BAD_REQUEST,
