@@ -248,32 +248,89 @@ impl RelixClient {
                     Err(_) => continue,
                 };
                 buf.push_str(&s);
-                while let Some(end) = buf.find("\n\n") {
+                // SSE frames are separated by a blank line. CRLF is
+                // tolerated for callers routed through a non-Relix
+                // proxy that rewrites line endings.
+                loop {
+                    let crlf = buf.find("\r\n\r\n");
+                    let lf = buf.find("\n\n");
+                    let (end, sep_len) = match (crlf, lf) {
+                        (Some(c), Some(l)) if c < l => (c, 4),
+                        (_, Some(l)) => (l, 2),
+                        (Some(c), None) => (c, 4),
+                        (None, None) => break,
+                    };
                     let frame = buf[..end].to_string();
-                    buf.drain(..end + 2);
-                    for line in frame.lines() {
-                        if let Some(payload) = line.strip_prefix("data:") {
-                            let payload = payload.trim();
-                            if payload.is_empty() || payload == "[DONE]" {
-                                continue;
+                    buf.drain(..end + sep_len);
+                    let mut event_kind: Option<String> = None;
+                    let mut data_parts: Vec<String> = Vec::new();
+                    for raw_line in frame.lines() {
+                        if raw_line.is_empty() || raw_line.starts_with(':') {
+                            continue;
+                        }
+                        if let Some(rest) = raw_line.strip_prefix("event:") {
+                            event_kind = Some(rest.trim().to_string());
+                        } else if let Some(rest) = raw_line.strip_prefix("data:") {
+                            // Per the SSE spec the leading single
+                            // space after `data:` is significant — it
+                            // is stripped, but additional leading
+                            // whitespace is preserved.
+                            data_parts.push(
+                                rest.strip_prefix(' ').unwrap_or(rest).to_string(),
+                            );
+                        }
+                    }
+                    if data_parts.is_empty() {
+                        continue;
+                    }
+                    let payload = data_parts.join("\n");
+                    // The bridge sends `event: chunk` frames whose
+                    // `data:` field is PLAIN TEXT (a slice of the
+                    // reply), and `event: done` frames whose `data:`
+                    // field is a JSON metadata blob. The pre-fix
+                    // parser tried to JSON-parse every payload and
+                    // silently dropped chunks when parse failed,
+                    // which is why chat_stream yielded zero items.
+                    match event_kind.as_deref() {
+                        Some("done") => {
+                            // Terminal frame. We don't surface the
+                            // metadata as a stream item — callers
+                            // see end-of-stream and read the trace
+                            // via /v1/tasks endpoints if they care.
+                            // `[DONE]` is the OpenAI-compat sentinel.
+                            return;
+                        }
+                        Some("error") => {
+                            yield Err(RelixError::Http {
+                                status: 0,
+                                body: payload,
+                            });
+                            return;
+                        }
+                        _ => {
+                            // `event: chunk` (or no event field at
+                            // all — defaults to "message"). Treat as
+                            // raw text; the OpenAI shim sends JSON
+                            // here, so we fall back to extracting a
+                            // `chunk` / `text` field if the payload
+                            // happens to be valid JSON. Otherwise we
+                            // yield the literal text.
+                            if payload == "[DONE]" {
+                                return;
                             }
-                            // The bridge emits SSE frames with a JSON object
-                            // carrying `chunk` (or `text`) keys; be lenient
-                            // about which field name the payload uses.
-                            match serde_json::from_str::<serde_json::Value>(payload) {
-                                Ok(v) => {
-                                    let txt = v
-                                        .get("chunk")
+                            let text =
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload)
+                                {
+                                    v.get("chunk")
                                         .or_else(|| v.get("text"))
                                         .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string());
-                                    if let Some(t) = txt
-                                        && !t.is_empty()
-                                    {
-                                        yield Ok(t);
-                                    }
-                                }
-                                Err(_) => continue,
+                                        .map(|s| s.to_string())
+                                        .unwrap_or(payload)
+                                } else {
+                                    payload
+                                };
+                            if !text.is_empty() {
+                                yield Ok(text);
                             }
                         }
                     }
@@ -467,6 +524,128 @@ mod tests {
         assert_eq!(back.id, "m1");
         assert_eq!(back.tags, vec!["alpha".to_string()]);
         assert_eq!(back.score, Some(0.9));
+    }
+
+    /// Reusable in-process HTTP server: accepts one TCP
+    /// connection, reads the request, writes the supplied
+    /// response bytes verbatim, and returns the raw request
+    /// text so the caller can assert on headers + body.
+    async fn one_shot_server(response_bytes: Vec<u8>) -> (u16, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            sock.write_all(&response_bytes).await.unwrap();
+            sock.shutdown().await.ok();
+            req
+        });
+        (port, handle)
+    }
+
+    /// PART 1 — real-server test that chat() round-trips the
+    /// bridge's documented `{ "reply": "...", ... }` body shape.
+    /// Uses a one-shot tokio TCP listener (no httpmock / wiremock
+    /// dependency) so the test exercises the real reqwest +
+    /// serde_json path end-to-end.
+    #[tokio::test]
+    async fn chat_returns_chat_response_with_non_empty_text_from_real_server() {
+        let body = r#"{"reply":"hello from the bridge","flow_id":"f1","trace_id":"t1","flow_log":"/tmp/log","task_id":"task-1"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        )
+        .into_bytes();
+        let (port, handle) = one_shot_server(response).await;
+        let c = RelixClient::new(&format!("http://127.0.0.1:{port}"), "tok");
+        let reply = c.chat("hi there").await.expect("chat");
+        assert_eq!(reply, "hello from the bridge");
+        let req = handle.await.unwrap();
+        // The SDK posts to /chat and sends the JSON envelope the
+        // bridge expects.
+        assert!(req.starts_with("POST /chat "), "request line wrong: {req}");
+        assert!(req.contains(r#""message":"hi there""#));
+        assert!(req.contains(r#""session_id""#));
+    }
+
+    /// PART 1 — real-server test that chat_stream() yields at
+    /// least one chunk with non-empty text against the actual
+    /// SSE wire shape the bridge emits:
+    ///
+    ///   event: chunk\n
+    ///   data: <raw text>\n\n
+    ///   ...
+    ///   event: done\n
+    ///   data: {json metadata}\n\n
+    ///
+    /// The pre-fix parser tried to JSON-parse every `data:` payload
+    /// and silently dropped chunks when the parse failed — so the
+    /// stream yielded zero items against the real bridge. This
+    /// test would have caught that bug.
+    #[tokio::test]
+    async fn chat_stream_yields_at_least_one_chunk_with_non_empty_text_from_real_server() {
+        use futures::StreamExt;
+        // The exact wire shape `crate::sse::build_chunked_sse`
+        // produces. We hand-craft the bytes here to be sure the
+        // SDK sees the bridge's literal output, not a JSON-wrapped
+        // fixture that masks the bug.
+        let sse_body = "event: chunk\r\n\
+                        data: Hello \r\n\
+                        \r\n\
+                        event: chunk\r\n\
+                        data: world\r\n\
+                        \r\n\
+                        event: chunk\r\n\
+                        data: !\r\n\
+                        \r\n\
+                        event: done\r\n\
+                        data: {\"flow_id\":\"f1\",\"trace_id\":\"t1\",\"flow_log\":\"/tmp/x\",\"task_id\":null}\r\n\
+                        \r\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            sse_body.len(),
+            sse_body,
+        )
+        .into_bytes();
+        let (port, handle) = one_shot_server(response).await;
+        let c = RelixClient::new(&format!("http://127.0.0.1:{port}"), "tok");
+        let stream = c.chat_stream("hi").await.expect("chat_stream");
+        let mut stream = std::pin::pin!(stream);
+        let mut chunks: Vec<String> = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("stream item"));
+        }
+        assert!(
+            !chunks.is_empty(),
+            "chat_stream yielded zero chunks; SSE parser is broken"
+        );
+        let first_non_empty = chunks
+            .iter()
+            .find(|c| !c.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !first_non_empty.is_empty(),
+            "every yielded chunk was empty; SSE parser regressed",
+        );
+        assert_eq!(
+            chunks.concat(),
+            "Hello world!",
+            "chunks concatenate to the full reply"
+        );
+        let req = handle.await.unwrap();
+        assert!(
+            req.starts_with("POST /chat/stream "),
+            "request line wrong: {req}"
+        );
+        assert!(
+            req.to_lowercase().contains("accept: text/event-stream"),
+            "missing accept header: {req}"
+        );
     }
 
     /// End-to-end test against an in-process one-shot server
