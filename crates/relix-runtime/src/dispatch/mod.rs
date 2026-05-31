@@ -990,12 +990,18 @@ impl DispatchBridge {
         input_bytes: usize,
         output_bytes: usize,
         confidence_score: Option<f32>,
+        // GROUP 6: the request's VERIFIED tenant (envelope
+        // `tenant_id`, resolved by the bridge from the auth
+        // principal — never a wire body). Stored on the row so
+        // metrics reads can be tenant-scoped.
+        tenant_id: &str,
     ) {
         let Some(sink) = self.metrics_sink.as_ref() else {
             return;
         };
         let metric = crate::metrics::InvocationMetric {
             agent_name: agent_name.to_string(),
+            tenant_id: tenant_id.to_string(),
             peer_alias: self.peer_alias.clone(),
             method: method.to_string(),
             timestamp_ms: unix_now_ms(),
@@ -1035,12 +1041,15 @@ impl DispatchBridge {
         request_id: relix_core::types::RequestId,
         started: Instant,
         error_kind_str: &'static str,
+        // GROUP 6: request's VERIFIED tenant (envelope tenant_id).
+        tenant_id: &str,
     ) {
         let Some(sink) = self.metrics_sink.as_ref() else {
             return;
         };
         let metric = crate::metrics::InvocationMetric {
             agent_name: agent_name.to_string(),
+            tenant_id: tenant_id.to_string(),
             peer_alias: self.peer_alias.clone(),
             method: method.to_string(),
             timestamp_ms: unix_now_ms(),
@@ -1532,6 +1541,7 @@ impl DispatchBridge {
                         req.rid,
                         started_at,
                         "APPROVAL_REQUIRED",
+                        req.tenant_id.as_deref().unwrap_or("default"),
                     );
                     return self
                         .audit_and_err_with_id(
@@ -1581,6 +1591,7 @@ impl DispatchBridge {
                     req.rid,
                     started_at,
                     "APPROVAL_REQUIRED",
+                    req.tenant_id.as_deref().unwrap_or("default"),
                 );
                 return self
                     .audit_and_err_with_id(
@@ -1601,6 +1612,7 @@ impl DispatchBridge {
                     req.rid,
                     started_at,
                     "SECURITY_DENIED",
+                    req.tenant_id.as_deref().unwrap_or("default"),
                 );
                 return self
                     .audit_and_err_with_id(
@@ -1880,6 +1892,7 @@ impl DispatchBridge {
             req.args.len(),
             output_bytes,
             confidence_score,
+            req.tenant_id.as_deref().unwrap_or("default"),
         );
         let aid = self
             .write_audit(
@@ -2513,6 +2526,7 @@ impl DispatchBridge {
                         req.rid,
                         started_at,
                         "APPROVAL_REQUIRED",
+                        req.tenant_id.as_deref().unwrap_or("default"),
                     );
                     let _ = writer
                         .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
@@ -2550,6 +2564,7 @@ impl DispatchBridge {
                     req.rid,
                     started_at,
                     "APPROVAL_REQUIRED",
+                    req.tenant_id.as_deref().unwrap_or("default"),
                 );
                 let _ = writer
                     .write_err(error_kinds::APPROVAL_REQUIRED, cause.clone())
@@ -2574,6 +2589,7 @@ impl DispatchBridge {
                     req.rid,
                     started_at,
                     "SECURITY_DENIED",
+                    req.tenant_id.as_deref().unwrap_or("default"),
                 );
                 let cause = "approval_token_unverifiable: no agent gate wired \
                              to verify + consume the token atomically"
@@ -3419,7 +3435,7 @@ mod tests {
                 None,
                 9_999_999_999,
                 &[],
-            )
+            "default")
             .unwrap();
         let meta = store
             .decide_approval(

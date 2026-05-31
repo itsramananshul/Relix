@@ -159,6 +159,22 @@ fn add_column_if_missing(
     Ok(())
 }
 
+/// GROUP 6: idempotently add a `tenant_id TEXT NOT NULL DEFAULT
+/// 'default'` column to `table` (plus a tenant index) when it is
+/// absent. Pre-multi-tenant rows are attributed to the reserved
+/// `'default'` tenant — safe because single-tenant deployments
+/// read as `"default"` and so keep seeing their own historical
+/// rows. Idempotent via the `PRAGMA table_info` probe, so a
+/// re-open never errors or double-applies.
+pub fn ensure_tenant_id_column(conn: &Connection, table: &str) -> Result<(), SqliteError> {
+    add_column_if_missing(conn, table, "tenant_id", "TEXT NOT NULL DEFAULT 'default'")?;
+    conn.execute(
+        &format!("CREATE INDEX IF NOT EXISTS {table}_tenant_idx ON {table}(tenant_id)"),
+        [],
+    )?;
+    Ok(())
+}
+
 /// CORR PART 2: identifier-based check. Returns `true` when
 /// a row with `migration_id = id` exists in `_relix_migrations`.
 /// Callers use this BEFORE running a migration body so an

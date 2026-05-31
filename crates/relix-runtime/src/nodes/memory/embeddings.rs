@@ -83,6 +83,10 @@ impl EmbeddingStore {
     /// Insert one embedding row. Returns the new `embedding_id`,
     /// or — on duplicate `(subject_id, target, entry_hash)` —
     /// the existing row's id so the caller can be idempotent.
+    /// GROUP 6: tenant-blind insert — writes the reserved
+    /// `'default'` tenant. Retained so existing single-tenant
+    /// call sites compile unchanged; new code should prefer
+    /// [`Self::insert_for_tenant`].
     pub fn insert(
         &self,
         subject_id: &str,
@@ -91,6 +95,25 @@ impl EmbeddingStore {
         embedding: &[f32],
         model: &str,
     ) -> Result<InsertOutcome, MemoryError> {
+        self.insert_for_tenant(subject_id, target, chunk_text, embedding, model, "default")
+    }
+
+    /// GROUP 6: insert attributed to the caller's VERIFIED tenant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_for_tenant(
+        &self,
+        subject_id: &str,
+        target: &str,
+        chunk_text: &str,
+        embedding: &[f32],
+        model: &str,
+        tenant_id: &str,
+    ) -> Result<InsertOutcome, MemoryError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         if subject_id.is_empty() {
             return Err(MemoryError::InvalidArg("subject_id required".into()));
         }
@@ -135,8 +158,8 @@ impl EmbeddingStore {
         let ts = unix_secs();
         conn.execute(
             "INSERT INTO memory_embeddings \
-             (embedding_id, subject_id, target, chunk_text, embedding, model, created_at, entry_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (embedding_id, subject_id, target, chunk_text, embedding, model, created_at, entry_hash, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 &embedding_id,
                 subject_id,
@@ -145,11 +168,33 @@ impl EmbeddingStore {
                 blob,
                 model,
                 ts,
-                &entry_hash
+                &entry_hash,
+                tenant,
             ],
         )
         .map_err(MemoryError::Db)?;
         Ok(InsertOutcome::Inserted { embedding_id })
+    }
+
+    /// GROUP 6: tenant-scoped count for `(subject_id, target)` —
+    /// proves cross-tenant denial: a read carrying tenant A never
+    /// observes tenant B's embeddings even for a shared subject.
+    pub fn count_for_tenant(
+        &self,
+        tenant: &str,
+        subject_id: &str,
+        target: &str,
+    ) -> Result<u64, MemoryError> {
+        let conn = self.conn.lock().map_err(|_| MemoryError::Lock)?;
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings \
+                 WHERE tenant_id = ?1 AND subject_id = ?2 AND target = ?3",
+                params![tenant, subject_id, target],
+                |r| r.get(0),
+            )
+            .map_err(MemoryError::Db)?;
+        Ok(n as u64)
     }
 
     /// Top-K cosine-similarity search within one (subject_id,
@@ -288,6 +333,9 @@ pub fn apply_schema(conn: &Connection) -> Result<(), MemoryError> {
         "#,
     )
     .map_err(MemoryError::Db)?;
+    // GROUP 6: tenant isolation column (idempotent). Sibling of
+    // the already tenant-scoped `memory_records`.
+    crate::db::ensure_tenant_id_column(conn, "memory_embeddings").map_err(MemoryError::Db)?;
     Ok(())
 }
 
@@ -356,6 +404,20 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         apply_schema(&conn).unwrap();
         EmbeddingStore::new(Arc::new(Mutex::new(conn)))
+    }
+
+    #[test]
+    fn group6_embeddings_reads_are_isolated_by_verified_tenant() {
+        // Two tenants embed (distinct) chunks for the SAME
+        // subject. A tenant-scoped count must see ONLY its own.
+        let s = store_in_memory();
+        s.insert_for_tenant("subj", "user", "tenant a chunk", &[0.1, 0.2], "m", "tenant-a")
+            .unwrap();
+        s.insert_for_tenant("subj", "user", "tenant b chunk", &[0.3, 0.4], "m", "tenant-b")
+            .unwrap();
+        assert_eq!(s.count_for_tenant("tenant-a", "subj", "user").unwrap(), 1);
+        assert_eq!(s.count_for_tenant("tenant-b", "subj", "user").unwrap(), 1);
+        assert_eq!(s.count_for_tenant("tenant-c", "subj", "user").unwrap(), 0);
     }
 
     #[test]

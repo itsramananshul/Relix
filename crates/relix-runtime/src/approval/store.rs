@@ -166,6 +166,8 @@ impl ApprovalRequestStore {
         // record a decision on the row. NOT NULL with default
         // `'[]'` so legacy rows back-fill cleanly.
         Self::ensure_column(conn, "authorized_approvers", "TEXT NOT NULL DEFAULT '[]'")?;
+        // GROUP 6: tenant isolation column (idempotent).
+        crate::db::ensure_tenant_id_column(conn, "approval_delivery")?;
         Ok(())
     }
 
@@ -194,7 +196,24 @@ impl ApprovalRequestStore {
     /// "pending"` and `delivered_at_ms = None`; the timestamp
     /// is stamped via [`Self::mark_delivered`] AFTER the
     /// per-channel send actually succeeds.
+    /// GROUP 6: tenant-blind upsert — writes the reserved
+    /// `'default'` tenant. Retained for existing call sites; new
+    /// code should prefer [`Self::upsert_for_tenant`].
     pub fn upsert(&self, row: &ApprovalDeliveryRow) -> Result<(), ApprovalStoreError> {
+        self.upsert_for_tenant(row, "default")
+    }
+
+    /// GROUP 6: upsert attributed to the caller's VERIFIED tenant.
+    pub fn upsert_for_tenant(
+        &self,
+        row: &ApprovalDeliveryRow,
+        tenant_id: &str,
+    ) -> Result<(), ApprovalStoreError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         let conn = self.lock()?;
         let approvers_json = serde_json::to_string(&row.authorized_approvers)
             .map_err(|e| ApprovalStoreError::Json(e.to_string()))?;
@@ -202,8 +221,8 @@ impl ApprovalRequestStore {
             "INSERT OR REPLACE INTO approval_delivery \
              (approval_id, agent_name, capability, request_summary, session_id, status, \
               delivery_channel, escalated, escalation_channel, delivered_at_ms, escalated_at_ms, \
-              decided_at_ms, decision, decision_note, delivery_error, authorized_approvers) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              decided_at_ms, decision, decision_note, delivery_error, authorized_approvers, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 row.approval_id,
                 row.agent_name,
@@ -221,9 +240,32 @@ impl ApprovalRequestStore {
                 row.decision_note,
                 row.delivery_error,
                 approvers_json,
+                tenant,
             ],
         )?;
         Ok(())
+    }
+
+    /// GROUP 6: tenant-scoped lookup — returns the row ONLY when
+    /// it belongs to `tenant`, so a caller scoped to tenant A
+    /// cannot read tenant B's approval-delivery row by id.
+    pub fn get_for_tenant(
+        &self,
+        approval_id: &str,
+        tenant: &str,
+    ) -> Result<Option<ApprovalDeliveryRow>, ApprovalStoreError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT approval_id, agent_name, capability, request_summary, session_id, status, \
+                    delivery_channel, escalated, escalation_channel, delivered_at_ms, \
+                    escalated_at_ms, decided_at_ms, decision, decision_note, delivery_error, \
+                    authorized_approvers \
+             FROM approval_delivery WHERE approval_id = ?1 AND tenant_id = ?2",
+            params![approval_id, tenant],
+            row_to_record,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// PART 6: stamp `delivered_at_ms` AFTER the per-channel
@@ -432,6 +474,22 @@ mod tests {
             delivery_error: None,
             authorized_approvers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn group6_approval_delivery_reads_are_isolated_by_verified_tenant() {
+        // Two tenants record approval-delivery rows. A
+        // tenant-scoped get must return ONLY the caller's
+        // tenant's row — never the other tenant's, by id.
+        let s = ApprovalRequestStore::open_in_memory().unwrap();
+        s.upsert_for_tenant(&fixture_row("ap-a"), "tenant-a").unwrap();
+        s.upsert_for_tenant(&fixture_row("ap-b"), "tenant-b").unwrap();
+        assert!(s.get_for_tenant("ap-a", "tenant-a").unwrap().is_some());
+        assert!(
+            s.get_for_tenant("ap-b", "tenant-a").unwrap().is_none(),
+            "tenant A must not read tenant B's approval-delivery row"
+        );
+        assert!(s.get_for_tenant("ap-b", "tenant-b").unwrap().is_some());
     }
 
     /// PART 6 fixture: row in the "pending, not yet

@@ -75,7 +75,28 @@ impl SessionDebugger {
     /// Returns `Ok(None)` when no event exists for the
     /// session — the caller renders a "no such session" UI.
     pub fn session_timeline(&self, session_id: &str) -> Result<Option<SessionTimeline>, SinkError> {
-        let mut events = self.metadata.query(Some(session_id), None, 1000)?;
+        let events = self.metadata.query(Some(session_id), None, 1000)?;
+        self.timeline_from_events(session_id, events)
+    }
+
+    /// GROUP 6: tenant-scoped timeline. Reads ONLY the verified
+    /// tenant's events for `session_id`, so a caller scoped to
+    /// tenant A can never assemble tenant B's session timeline
+    /// even when supplying B's `session_id`.
+    pub fn session_timeline_for_tenant(
+        &self,
+        tenant: &str,
+        session_id: &str,
+    ) -> Result<Option<SessionTimeline>, SinkError> {
+        let events = self.metadata.query_for_tenant(tenant, Some(session_id), 1000)?;
+        self.timeline_from_events(session_id, events)
+    }
+
+    fn timeline_from_events(
+        &self,
+        session_id: &str,
+        mut events: Vec<crate::observability::sinks::MetadataEvent>,
+    ) -> Result<Option<SessionTimeline>, SinkError> {
         if events.is_empty() {
             return Ok(None);
         }
@@ -264,6 +285,40 @@ mod tests {
             model_name: Some("gpt-4o-mini".into()),
             success: true,
         }
+    }
+
+    #[test]
+    fn group6_session_timeline_is_isolated_by_verified_tenant() {
+        // Two tenants emit events under the SAME session_id. The
+        // tenant-scoped timeline read must assemble ONLY the
+        // calling tenant's events — never the other tenant's.
+        let (meta, content) = ctx();
+        meta.record_for_tenant(&evt("a", "shared", "model_call", 100, Some(1), Some(1)), "tenant-a")
+            .unwrap();
+        meta.record_for_tenant(&evt("b", "shared", "model_call", 200, Some(1), Some(1)), "tenant-b")
+            .unwrap();
+        let debugger = SessionDebugger::new(meta, content);
+        let a = debugger
+            .session_timeline_for_tenant("tenant-a", "shared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.events.len(),
+            1,
+            "tenant A sees only its own event in the shared session, never B's"
+        );
+        let b = debugger
+            .session_timeline_for_tenant("tenant-b", "shared")
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.events.len(), 1);
+        // A tenant with no events gets an empty timeline.
+        assert!(
+            debugger
+                .session_timeline_for_tenant("tenant-c", "shared")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

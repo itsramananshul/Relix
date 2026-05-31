@@ -152,7 +152,13 @@ async fn handle_run(
     let started_at = unix_now();
     let result = execute(workflow, dispatcher, &args.input).await;
     let ended_at = unix_now();
-    if let Err(e) = chronicle.record(&result, &args.input, started_at, ended_at) {
+    if let Err(e) = chronicle.record(
+        &result,
+        &args.input,
+        started_at,
+        ended_at,
+        ctx.tenant_id_or_default(),
+    ) {
         tracing::warn!(
             execution_id = %result.trace.execution_id,
             error = %e,
@@ -220,11 +226,14 @@ async fn handle_run_stream(
     // closes and the stream consumer sees EOF after the
     // terminal `Finished` event.
     let input = args.input.clone();
+    // GROUP 6: capture the verified tenant before moving into the
+    // spawned task so the chronicle row is attributed correctly.
+    let tenant = ctx.tenant_id_or_default().to_string();
     let started_at = unix_now();
     tokio::spawn(async move {
         let result = execute_with_events(workflow, dispatcher, &input, event_tx).await;
         let ended_at = unix_now();
-        if let Err(e) = chronicle.record(&result, &input, started_at, ended_at) {
+        if let Err(e) = chronicle.record(&result, &input, started_at, ended_at, &tenant) {
             tracing::warn!(
                 execution_id = %result.trace.execution_id,
                 error = %e,

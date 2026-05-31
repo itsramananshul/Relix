@@ -572,7 +572,7 @@ mod tests {
     async fn run_one_tick_fires_a_due_job_and_creates_a_task() {
         let (tasks, cron) = stores();
         let id = cron
-            .create("daily", "1d", "f.sol", "summarise", "subj-1")
+            .create("daily", "1d", "f.sol", "summarise", "subj-1", "default")
             .unwrap();
         force_due(&cron, &id);
         let (cell, ai) = ai_cell_with(Some("ai reply"));
@@ -596,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn run_one_tick_skips_non_due_jobs() {
         let (tasks, cron) = stores();
-        let id = cron.create("future", "1d", "f.sol", "p", "subj-1").unwrap();
+        let id = cron.create("future", "1d", "f.sol", "p", "subj-1", "default").unwrap();
         let (cell, ai) = ai_cell_with(Some("x"));
         let sem = Arc::new(Semaphore::new(3));
         run_one_tick(tasks.clone(), cron.clone(), cell, sem, 30).await;
@@ -610,7 +610,7 @@ mod tests {
         let (tasks, cron) = stores();
         // ISO instant in the past so it's immediately due.
         let id = cron
-            .create("once", "2020-01-01T00:00:00Z", "f.sol", "p", "subj")
+            .create("once", "2020-01-01T00:00:00Z", "f.sol", "p", "subj", "default")
             .unwrap();
         let (cell, _ai) = ai_cell_with(Some("x"));
         let sem = Arc::new(Semaphore::new(3));
@@ -624,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn already_running_previous_task_is_skipped() {
         let (tasks, cron) = stores();
-        let id = cron.create("daily", "1d", "f.sol", "p", "subj").unwrap();
+        let id = cron.create("daily", "1d", "f.sol", "p", "subj", "default").unwrap();
         // Pretend a previous task is still running.
         let prev_task = tasks
             .create(
@@ -665,8 +665,8 @@ mod tests {
         // max_concurrent = 1; two due jobs. Only one fires
         // immediately; the other is deferred (run_count stays 0).
         let (tasks, cron) = stores();
-        let a = cron.create("a", "1d", "f.sol", "p", "subj").unwrap();
-        let b = cron.create("b", "1d", "f.sol", "p", "subj").unwrap();
+        let a = cron.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let b = cron.create("b", "1d", "f.sol", "p", "subj", "default").unwrap();
         force_due(&cron, &a);
         force_due(&cron, &b);
         let (cell, _ai) = ai_cell_with(Some("x"));
@@ -682,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn ai_timeout_results_in_failed_task() {
         let (tasks, cron) = stores();
-        let id = cron.create("a", "1d", "f.sol", "p", "subj").unwrap();
+        let id = cron.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
         force_due(&cron, &id);
 
         // Dispatcher that never responds.
@@ -711,7 +711,7 @@ mod tests {
     #[tokio::test]
     async fn fire_job_writes_cron_job_fired_chronicle_event() {
         let (tasks, cron) = stores();
-        let id = cron.create("daily", "1d", "f.sol", "p", "subj").unwrap();
+        let id = cron.create("daily", "1d", "f.sol", "p", "subj", "default").unwrap();
         let job = cron.get(&id).unwrap().unwrap();
         let (cell, _ai) = ai_cell_with(Some("x"));
         let outcome = fire_job(&job, tasks.clone(), cron.clone(), cell, 30).await;

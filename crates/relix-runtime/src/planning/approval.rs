@@ -270,17 +270,46 @@ impl ApprovalStore {
             )?;
             crate::db::record_migration_applied(conn, 2)?;
         }
+        // GROUP 6: tenant isolation. This module tracks its schema
+        // with the LEGACY integer-version scheme (versions 1, 2
+        // above), so — per the spec's "do not mix" rule — the
+        // tenant_id migration is added as version 3 in the SAME
+        // scheme rather than the modern identifier framework.
+        // Idempotent: gated on `current < 3`; existing rows get the
+        // reserved 'default' tenant.
+        if current < 3 {
+            crate::db::ensure_tenant_id_column(conn, "plan_approvals")?;
+            crate::db::ensure_tenant_id_column(conn, "plan_verifications")?;
+            crate::db::record_migration_applied(conn, 3)?;
+        }
         Ok(())
     }
 
     /// Persist a single [`VerificationEntry`]. Used by the
     /// verification harness as each step completes.
+    /// GROUP 6: tenant-blind insert — writes the reserved
+    /// `'default'` tenant. New code should prefer
+    /// [`Self::insert_verification_for_tenant`].
     pub fn insert_verification(&self, entry: &VerificationEntry) -> Result<(), ApprovalError> {
+        self.insert_verification_for_tenant(entry, "default")
+    }
+
+    /// GROUP 6: insert attributed to the caller's VERIFIED tenant.
+    pub fn insert_verification_for_tenant(
+        &self,
+        entry: &VerificationEntry,
+        tenant_id: &str,
+    ) -> Result<(), ApprovalError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         let conn = self.lock();
         conn.execute(
             "INSERT INTO plan_verifications \
-             (plan_id, step_id, criterion, strategy_used, passed, reason, verified_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (plan_id, step_id, criterion, strategy_used, passed, reason, verified_at_ms, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 entry.plan_id,
                 entry.step_id,
@@ -289,9 +318,26 @@ impl ApprovalStore {
                 if entry.passed { 1 } else { 0 },
                 entry.reason,
                 entry.verified_at_ms,
+                tenant,
             ],
         )?;
         Ok(())
+    }
+
+    /// GROUP 6: tenant-scoped count of verification rows for a
+    /// plan — proves cross-tenant denial in SQL.
+    pub fn count_verifications_for_tenant(
+        &self,
+        tenant: &str,
+        plan_id: &str,
+    ) -> Result<u64, ApprovalError> {
+        let conn = self.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM plan_verifications WHERE tenant_id = ?1 AND plan_id = ?2",
+            params![tenant, plan_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     /// List every verification entry for `plan_id`, ordered
@@ -345,6 +391,20 @@ impl ApprovalStore {
     /// Insert a new pending approval. Errors if a record with
     /// the same `plan_id` already exists.
     pub fn insert_pending(&self, record: &ApprovalRecord) -> Result<(), ApprovalError> {
+        self.insert_pending_for_tenant(record, "default")
+    }
+
+    /// GROUP 6: insert attributed to the caller's VERIFIED tenant.
+    pub fn insert_pending_for_tenant(
+        &self,
+        record: &ApprovalRecord,
+        tenant_id: &str,
+    ) -> Result<(), ApprovalError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         let conn = self.lock();
         let spec_json = serde_json::to_string(&record.spec)?;
         let orch_json = match &record.orchestrator_meta {
@@ -357,8 +417,8 @@ impl ApprovalStore {
         };
         conn.execute(
             "INSERT INTO plan_approvals \
-             (id, spec_json, workflow_yaml, status, created_at_ms, decided_at_ms, decision_note, orchestrator_meta, critic_meta) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, spec_json, workflow_yaml, status, created_at_ms, decided_at_ms, decision_note, orchestrator_meta, critic_meta, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 record.plan_id,
                 spec_json,
@@ -369,9 +429,31 @@ impl ApprovalStore {
                 record.decision_note,
                 orch_json,
                 critic_json,
+                tenant,
             ],
         )?;
         Ok(())
+    }
+
+    /// GROUP 6: tenant-scoped lookup — returns the record ONLY
+    /// when it belongs to `tenant`, so a caller scoped to tenant
+    /// A cannot read tenant B's plan approval by id.
+    pub fn get_for_tenant(
+        &self,
+        plan_id: &str,
+        tenant: &str,
+    ) -> Result<Option<ApprovalRecord>, ApprovalError> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, spec_json, workflow_yaml, status, created_at_ms, decided_at_ms, \
+                    decision_note, orchestrator_meta, critic_meta \
+             FROM plan_approvals WHERE id = ?1 AND tenant_id = ?2",
+            params![plan_id, tenant],
+            row_to_record,
+        )
+        .optional()
+        .map_err(Into::into)
+        .and_then(|opt| opt.transpose())
     }
 
     /// Look up one record by plan id. `None` when no row
@@ -702,6 +784,63 @@ mod tests {
             orchestrator_meta: serde_json::json!({"activated": true, "specialist_count": 2}),
             critic_meta: serde_json::json!({"enabled": true, "rounds": 1, "approved": true}),
         }
+    }
+
+    #[test]
+    fn group6_planning_reads_are_isolated_by_verified_tenant() {
+        // plan_approvals + plan_verifications: two tenants write
+        // records; a tenant-scoped read sees ONLY its own.
+        let s = ApprovalStore::open_in_memory().unwrap();
+        s.insert_pending_for_tenant(
+            &fixture_record("plan-a", ApprovalStatus::Pending, 1),
+            "tenant-a",
+        )
+        .unwrap();
+        s.insert_pending_for_tenant(
+            &fixture_record("plan-b", ApprovalStatus::Pending, 2),
+            "tenant-b",
+        )
+        .unwrap();
+        assert!(s.get_for_tenant("plan-a", "tenant-a").unwrap().is_some());
+        assert!(
+            s.get_for_tenant("plan-b", "tenant-a").unwrap().is_none(),
+            "tenant A must not read tenant B's plan approval"
+        );
+        // plan_verifications isolation.
+        s.insert_verification_for_tenant(
+            &VerificationEntry {
+                plan_id: "shared-plan".into(),
+                step_id: "s".into(),
+                criterion: "c".into(),
+                strategy_used: "length_check".into(),
+                passed: true,
+                reason: "r".into(),
+                verified_at_ms: 1,
+            },
+            "tenant-a",
+        )
+        .unwrap();
+        s.insert_verification_for_tenant(
+            &VerificationEntry {
+                plan_id: "shared-plan".into(),
+                step_id: "s".into(),
+                criterion: "c".into(),
+                strategy_used: "length_check".into(),
+                passed: true,
+                reason: "r".into(),
+                verified_at_ms: 2,
+            },
+            "tenant-b",
+        )
+        .unwrap();
+        assert_eq!(
+            s.count_verifications_for_tenant("tenant-a", "shared-plan").unwrap(),
+            1
+        );
+        assert_eq!(
+            s.count_verifications_for_tenant("tenant-b", "shared-plan").unwrap(),
+            1
+        );
     }
 
     #[test]

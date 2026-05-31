@@ -33,7 +33,14 @@ pub fn handle_create(store: &CronStore, ctx: &InvocationCtx) -> HandlerOutcome {
     }
     let (name, schedule, flow_template, prompt, subject_id) =
         (parts[0], parts[1], parts[2], parts[3], parts[4]);
-    match store.create(name, schedule, flow_template, prompt, subject_id) {
+    match store.create(
+        name,
+        schedule,
+        flow_template,
+        prompt,
+        subject_id,
+        ctx.tenant_id_or_default(),
+    ) {
         Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
         Err(CronStoreError::BadInput(m)) => invalid(m),
         Err(CronStoreError::Schedule(e)) => invalid(format!("cron.create: {e}")),
@@ -48,7 +55,7 @@ pub fn handle_list(store: &CronStore, ctx: &InvocationCtx) -> HandlerOutcome {
         Err(e) => return invalid(format!("cron.list utf8: {e}")),
     };
     let subject = if s.is_empty() { None } else { Some(s) };
-    match store.list(subject) {
+    match store.list(ctx.tenant_id_or_default(), subject) {
         Ok(rows) => {
             let mut out = String::new();
             for r in &rows {
@@ -75,7 +82,7 @@ pub fn handle_get(store: &CronStore, ctx: &InvocationCtx) -> HandlerOutcome {
     if job_id.is_empty() {
         return invalid("cron.get: job_id required".into());
     }
-    match store.get(job_id) {
+    match store.get_for_tenant(job_id, ctx.tenant_id_or_default()) {
         Ok(Some(j)) => HandlerOutcome::Ok(render_job_body(&j).into_bytes()),
         Ok(None) => invalid(format!("cron.get: not found: {job_id}")),
         Err(e) => internal(format!("cron.get: {e}")),
@@ -199,8 +206,8 @@ mod tests {
 
     fn store_with_jobs() -> (Arc<CronStore>, String, String) {
         let s = Arc::new(CronStore::in_memory().unwrap());
-        let a = s.create("daily", "1d", "f.sol", "p", "subj-1").unwrap();
-        let b = s.create("weekly", "7d", "f.sol", "p2", "subj-2").unwrap();
+        let a = s.create("daily", "1d", "f.sol", "p", "subj-1", "default").unwrap();
+        let b = s.create("weekly", "7d", "f.sol", "p2", "subj-2", "default").unwrap();
         (s, a, b)
     }
 

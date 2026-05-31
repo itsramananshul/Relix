@@ -651,7 +651,7 @@ flow:
 
     let chronicle = WorkflowChronicle::in_memory().expect("in-memory chronicle");
     chronicle
-        .record(&result, "in", 1_700_000_000, 1_700_000_001)
+        .record(&result, "in", 1_700_000_000, 1_700_000_001, "default")
         .expect("record");
 
     let fetched = chronicle

@@ -828,6 +828,7 @@ mod tests {
     fn metric(agent: &str, ts_ms: i64, cost: u64) -> InvocationMetric {
         InvocationMetric {
             agent_name: agent.into(),
+            tenant_id: "default".into(),
             peer_alias: "p".into(),
             method: "ai.chat".into(),
             timestamp_ms: ts_ms,

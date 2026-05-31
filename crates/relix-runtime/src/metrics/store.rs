@@ -128,6 +128,27 @@ impl MetricsStore {
         Ok(n as u64)
     }
 
+    /// GROUP 6: tenant-scoped read. Counts rows for `tenant`
+    /// matching `agent_name` — a SELECT that filters by the
+    /// caller's VERIFIED tenant. A caller scoped to tenant A can
+    /// never observe tenant B's rows even for a shared
+    /// agent/session key, because the `tenant_id = ?` predicate
+    /// is applied in SQL, not in the (correct-but-bypassable)
+    /// handler layer.
+    pub fn count_for_tenant_and_agent(
+        &self,
+        tenant: &str,
+        agent: &str,
+    ) -> Result<u64, MetricsStoreError> {
+        let conn = self.conn.lock().map_err(|_| MetricsStoreError::Lock)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM metrics_invocations WHERE tenant_id = ?1 AND agent_name = ?2",
+            params![tenant, agent],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     /// Borrow the underlying connection for read queries. Used
     /// by [`super::query::MetricsQuery`].
     pub fn with_conn<F, R>(&self, f: F) -> Result<R, MetricsStoreError>
@@ -140,12 +161,19 @@ impl MetricsStore {
 }
 
 fn insert_one(conn: &Connection, m: &InvocationMetric) -> Result<(), MetricsStoreError> {
+    // GROUP 6: persist the verified tenant; default to the
+    // reserved single-tenant sentinel if a caller left it empty.
+    let tenant = if m.tenant_id.trim().is_empty() {
+        "default"
+    } else {
+        m.tenant_id.as_str()
+    };
     conn.execute(
         "INSERT INTO metrics_invocations \
          (agent_name, peer_alias, method, timestamp_ms, latency_ms, success, \
           error_kind, token_count, cost_micros, input_bytes, output_bytes, model, \
-          confidence_score, routing_tier) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+          confidence_score, routing_tier, tenant_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             m.agent_name,
             m.peer_alias,
@@ -161,6 +189,7 @@ fn insert_one(conn: &Connection, m: &InvocationMetric) -> Result<(), MetricsStor
             m.model,
             m.confidence_score.map(|v| v as f64),
             m.routing_tier,
+            tenant,
         ],
     )?;
     Ok(())
@@ -225,6 +254,24 @@ fn init_schema(conn: &Connection) -> Result<(), MetricsStoreError> {
             [],
         )?;
     }
+    // GROUP 6: tenant isolation. Add `tenant_id` so each row is
+    // attributed to the caller's VERIFIED tenant and reads can be
+    // tenant-scoped. The column probe makes this idempotent
+    // (re-open is a no-op); existing pre-migration rows get the
+    // reserved `'default'` tenant via the column default, so a
+    // single-tenant deployment (which reads as `"default"`) still
+    // sees its own historical rows. NOT NULL DEFAULT 'default'
+    // also means legacy `INSERT`s that omit the column stay valid.
+    if !column_exists(conn, "metrics_invocations", "tenant_id")? {
+        conn.execute(
+            "ALTER TABLE metrics_invocations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS metrics_invocations_tenant_ts \
+             ON metrics_invocations(tenant_id, timestamp_ms DESC);",
+    )?;
     Ok(())
 }
 
@@ -253,9 +300,111 @@ pub fn default_metrics_path(data_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn sample_for_tenant(
+        tenant: &str,
+        agent: &str,
+        method: &str,
+        ts: i64,
+        latency: u64,
+        success: bool,
+    ) -> InvocationMetric {
+        let mut m = sample(agent, method, ts, latency, success);
+        m.tenant_id = tenant.to_string();
+        m
+    }
+
+    #[test]
+    fn group6_metrics_reads_are_isolated_by_verified_tenant() {
+        // Two tenants write rows that share the SAME agent_name
+        // (the cross-tenant shared key an attacker would query
+        // by). A read scoped to tenant A must return ONLY A's
+        // row — never B's — proving real cross-tenant denial at
+        // the data layer.
+        let store = MetricsStore::in_memory().unwrap();
+        store
+            .insert(&sample_for_tenant("tenant-a", "shared-agent", "ai.chat", 100, 5, true))
+            .unwrap();
+        store
+            .insert(&sample_for_tenant("tenant-b", "shared-agent", "ai.chat", 200, 5, true))
+            .unwrap();
+        // Both rows exist globally...
+        assert_eq!(store.row_count().unwrap(), 2);
+        // ...but each tenant sees exactly one — its own.
+        assert_eq!(
+            store
+                .count_for_tenant_and_agent("tenant-a", "shared-agent")
+                .unwrap(),
+            1,
+            "tenant A must see only its own row"
+        );
+        assert_eq!(
+            store
+                .count_for_tenant_and_agent("tenant-b", "shared-agent")
+                .unwrap(),
+            1
+        );
+        // A tenant with no rows sees nothing for the shared key.
+        assert_eq!(
+            store
+                .count_for_tenant_and_agent("tenant-c", "shared-agent")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn group6_metrics_migration_is_idempotent_and_defaults_legacy_rows() {
+        // Simulate a pre-migration DB: create the OLD schema
+        // (no tenant_id) + insert a legacy row, then run the
+        // migration (init_schema) TWICE.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::apply_pragmas(&conn).unwrap();
+        crate::db::ensure_migration_table(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metrics_invocations (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                 agent_name TEXT NOT NULL,\
+                 peer_alias TEXT NOT NULL DEFAULT '',\
+                 method TEXT NOT NULL,\
+                 timestamp_ms INTEGER NOT NULL,\
+                 latency_ms INTEGER NOT NULL,\
+                 success INTEGER NOT NULL,\
+                 error_kind TEXT,\
+                 token_count INTEGER,\
+                 cost_micros INTEGER,\
+                 input_bytes INTEGER NOT NULL,\
+                 output_bytes INTEGER NOT NULL,\
+                 model TEXT\
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metrics_invocations \
+             (agent_name, method, timestamp_ms, latency_ms, success, input_bytes, output_bytes) \
+             VALUES ('legacy', 'm', 1, 1, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Run the migration twice — must not error or double-apply.
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        // The legacy row survives (no data loss) and is
+        // attributed to the reserved 'default' tenant, not NULL.
+        let (cnt, tenant): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(tenant_id) FROM metrics_invocations WHERE agent_name='legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1, "legacy row must survive the migration");
+        assert_eq!(tenant, "default", "pre-migration rows attributed to 'default'");
+    }
+
     fn sample(agent: &str, method: &str, ts: i64, latency: u64, success: bool) -> InvocationMetric {
         InvocationMetric {
             agent_name: agent.into(),
+            tenant_id: "default".into(),
             peer_alias: "p".into(),
             method: method.into(),
             timestamp_ms: ts,

@@ -775,6 +775,7 @@ mod tests {
     fn metric(req: RequestId, agent: &str, method: &str, ts: i64) -> InvocationMetric {
         InvocationMetric {
             agent_name: agent.into(),
+            tenant_id: "default".into(),
             peer_alias: "coord".into(),
             method: method.into(),
             timestamp_ms: ts,

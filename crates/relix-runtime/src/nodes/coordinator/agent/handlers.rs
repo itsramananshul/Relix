@@ -29,7 +29,15 @@ pub fn handle_create(store: &AgentStore, ctx: &InvocationCtx) -> HandlerOutcome 
         );
     }
     match store.create_agent(
-        parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7],
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3],
+        parts[4],
+        parts[5],
+        parts[6],
+        parts[7],
+        ctx.tenant_id_or_default(),
     ) {
         Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
         Err(AgentStoreError::BadInput(m)) => invalid(m),
@@ -587,7 +595,15 @@ pub fn handle_standing_create(store: &AgentStore, ctx: &InvocationCtx) -> Handle
         let t = p.trim();
         if t.is_empty() { None } else { Some(t) }
     });
-    match store.create_standing(agent_id, category, path_glob, expires_at, granted_by, note) {
+    match store.create_standing(
+        agent_id,
+        category,
+        path_glob,
+        expires_at,
+        granted_by,
+        note,
+        ctx.tenant_id_or_default(),
+    ) {
         Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
         Err(AgentStoreError::BadInput(m)) => invalid(m),
         Err(e) => internal(format!("agent.standing_approval.create: {e}")),
@@ -754,6 +770,7 @@ mod tests {
         let id = s
             .create_agent(
                 "Research", "research", "Junior", "rd", "ops", "alice", "subj-1", "medium",
+                "default",
             )
             .unwrap();
         let body = ok_body(handle_get(&s, &fake_ctx(id.as_bytes())));
@@ -773,9 +790,9 @@ mod tests {
     #[test]
     fn list_handler_filters_by_subject() {
         let s = store();
-        s.create_agent("a", "r", "t", "d", "t", "c", "subj-1", "low")
+        s.create_agent("a", "r", "t", "d", "t", "c", "subj-1", "low", "default")
             .unwrap();
-        s.create_agent("b", "r", "t", "d", "t", "c", "subj-2", "low")
+        s.create_agent("b", "r", "t", "d", "t", "c", "subj-2", "low", "default")
             .unwrap();
         let body = ok_body(handle_list(&s, &fake_ctx(b"subj-1")));
         let lines: Vec<&str> = body.lines().collect();
@@ -787,7 +804,7 @@ mod tests {
     fn update_handler_toggles_status() {
         let s = store();
         let id = s
-            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         let arg = format!("{id}|status|suspended");
         let out = handle_update(&s, &fake_ctx(arg.as_bytes()));
@@ -799,7 +816,7 @@ mod tests {
     fn delete_handler_disables_the_row() {
         let s = store();
         let id = s
-            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         let out = handle_delete(&s, &fake_ctx(id.as_bytes()));
         assert_eq!(ok_body(out), "ok\n");
@@ -810,7 +827,7 @@ mod tests {
     fn effective_capabilities_intersects_with_allow_categories() {
         let s = store();
         let id = s
-            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         s.update_agent_field(&id, "allow_categories", "browser, fetch")
             .unwrap();
@@ -848,7 +865,7 @@ mod tests {
     fn effective_capabilities_returns_zero_for_disabled_agent() {
         let s = store();
         let id = s
-            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("a", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         s.soft_delete_agent(&id).unwrap();
         let arg = format!("{id}|ai");
@@ -870,9 +887,9 @@ mod tests {
     #[test]
     fn approval_pending_returns_correct_row_count() {
         let s = store();
-        s.create_approval("a", "s", "m", "c", "", "r1", &[], None, 9999999999, &[])
+        s.create_approval("a", "s", "m", "c", "", "r1", &[], None, 9999999999, &[], "default")
             .unwrap();
-        s.create_approval("a", "s", "m", "c", "", "r2", &[], None, 9999999999, &[])
+        s.create_approval("a", "s", "m", "c", "", "r2", &[], None, 9999999999, &[], "default")
             .unwrap();
         let body = ok_body(handle_approval_pending(&s, &fake_ctx(b"")));
         assert!(body.contains("count=2"));
@@ -890,7 +907,7 @@ mod tests {
     fn approval_decide_approves_and_mints_structured_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -923,7 +940,7 @@ mod tests {
         // boot log warning.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -944,7 +961,7 @@ mod tests {
     fn approval_decide_rejects_returns_ok_without_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -979,7 +996,7 @@ mod tests {
                 Some("task-42"),
                 9999999999,
                 &[],
-            )
+            "default")
             .unwrap();
         let resumed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
@@ -1022,7 +1039,7 @@ mod tests {
                 Some("task-99"),
                 9999999999,
                 &[],
-            )
+            "default")
             .unwrap();
         let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1052,7 +1069,7 @@ mod tests {
         // resume / fail closures are never called.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
             .unwrap();
         let count: Arc<std::sync::atomic::AtomicUsize> =
             Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1132,7 +1149,7 @@ mod tests {
     fn approval_decide_with_60s_ttl_mints_token_with_60s_expiry() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1163,7 +1180,7 @@ mod tests {
     fn approval_decide_with_3600s_ttl_mints_long_lived_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1207,7 +1224,7 @@ mod tests {
                 None,
                 9_999_999_999,
                 &["subj-op".into()],
-            )
+            "default")
             .unwrap();
         let body = ok_body(handle_approval_get(&s, &fake_ctx(id.as_bytes())));
         let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
@@ -1282,7 +1299,7 @@ mod tests {
                 None,
                 9_999_999_999,
                 std::slice::from_ref(&approver_subject),
-            )
+            "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1331,7 +1348,7 @@ mod tests {
                 None,
                 9_999_999_999,
                 &[approver_subject],
-            )
+            "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1370,7 +1387,7 @@ mod tests {
                 9_999_999_999,
                 // Empty allow-list explicitly.
                 &[],
-            )
+            "default")
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));

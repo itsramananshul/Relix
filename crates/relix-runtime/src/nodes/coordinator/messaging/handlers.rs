@@ -58,7 +58,15 @@ pub fn handle_send(store: &MessageStore, ctx: &InvocationCtx) -> HandlerOutcome 
         Some(reply_to)
     };
     match store.send(
-        from, to, subject, body, thread_opt, reply_opt, ttl_secs, origin,
+        from,
+        to,
+        subject,
+        body,
+        thread_opt,
+        reply_opt,
+        ttl_secs,
+        origin,
+        ctx.tenant_id_or_default(),
     ) {
         Ok(id) => HandlerOutcome::Ok(format!("{id}\n").into_bytes()),
         Err(MessageStoreError::BadInput(m)) => invalid(m),

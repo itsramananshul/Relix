@@ -90,12 +90,26 @@ impl MetadataSink {
     /// collision so callers can re-record without worrying
     /// about constraint errors.
     pub fn record(&self, event: &MetadataEvent) -> Result<(), SinkError> {
+        self.record_for_tenant(event, "default")
+    }
+
+    /// GROUP 6: record attributed to the caller's VERIFIED tenant.
+    pub fn record_for_tenant(
+        &self,
+        event: &MetadataEvent,
+        tenant_id: &str,
+    ) -> Result<(), SinkError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         let conn = self.conn.lock().map_err(|_| SinkError::Lock)?;
         conn.execute(
             "INSERT OR REPLACE INTO metadata_events \
              (event_id, session_id, agent_id, event_type, timestamp_unix, latency_ms, \
-              token_count, cost_cents, error_type, tool_name, model_name, success) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              token_count, cost_cents, error_type, tool_name, model_name, success, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 event.event_id,
                 event.session_id,
@@ -109,9 +123,67 @@ impl MetadataSink {
                 event.tool_name,
                 event.model_name,
                 event.success as i32,
+                tenant,
             ],
         )?;
         Ok(())
+    }
+
+    /// GROUP 6: tenant-scoped read. Counts metadata events for
+    /// `tenant` in `session_id` — a caller scoped to tenant A can
+    /// never observe tenant B's session timeline even with B's
+    /// shared `session_id`, because `tenant_id = ?` is enforced
+    /// in SQL.
+    pub fn count_for_tenant_and_session(
+        &self,
+        tenant: &str,
+        session_id: &str,
+    ) -> Result<u64, SinkError> {
+        let conn = self.conn.lock().map_err(|_| SinkError::Lock)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM metadata_events WHERE tenant_id = ?1 AND session_id = ?2",
+            params![tenant, session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// GROUP 6: tenant-scoped paginated query — the isolation-
+    /// safe form of [`Self::query`]. EVERY row is filtered by the
+    /// caller's VERIFIED tenant, so the derived `session_timeline`
+    /// (which calls this) can never assemble another tenant's
+    /// events even for a shared `session_id`.
+    pub fn query_for_tenant(
+        &self,
+        tenant: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MetadataEvent>, SinkError> {
+        let limit = limit.clamp(1, 1000) as i64;
+        let conn = self.conn.lock().map_err(|_| SinkError::Lock)?;
+        let (sql, params_vec): (&str, Vec<rusqlite::types::Value>) = match session_id {
+            None => (
+                "SELECT event_id, session_id, agent_id, event_type, timestamp_unix, latency_ms, \
+                        token_count, cost_cents, error_type, tool_name, model_name, success \
+                 FROM metadata_events WHERE tenant_id = ?2 \
+                 ORDER BY timestamp_unix DESC, event_id ASC LIMIT ?1",
+                vec![limit.into(), tenant.to_string().into()],
+            ),
+            Some(s) => (
+                "SELECT event_id, session_id, agent_id, event_type, timestamp_unix, latency_ms, \
+                        token_count, cost_cents, error_type, tool_name, model_name, success \
+                 FROM metadata_events WHERE tenant_id = ?2 AND session_id = ?3 \
+                 ORDER BY timestamp_unix DESC, event_id ASC LIMIT ?1",
+                vec![limit.into(), tenant.to_string().into(), s.to_string().into()],
+            ),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), row_to_metadata)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Paginated query. Ordered newest-first so dashboards
@@ -391,7 +463,8 @@ fn init_metadata_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              error_type      TEXT,\
              tool_name       TEXT,\
              model_name      TEXT,\
-             success         INTEGER NOT NULL\
+             success         INTEGER NOT NULL,\
+             tenant_id       TEXT NOT NULL DEFAULT 'default'\
          );\
          CREATE INDEX IF NOT EXISTS metadata_events_session_ts \
              ON metadata_events(session_id, timestamp_unix DESC);\
@@ -399,6 +472,29 @@ fn init_metadata_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              ON metadata_events(event_type);\
          CREATE INDEX IF NOT EXISTS metadata_events_ts \
              ON metadata_events(timestamp_unix DESC);",
+    )?;
+    // GROUP 6: tenant isolation. The CREATE above carries
+    // `tenant_id` for fresh DBs; existing pre-migration DBs need
+    // the additive ALTER. Idempotent via the column probe;
+    // pre-migration rows default to the reserved 'default' tenant.
+    let mut has_tenant = false;
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(metadata_events)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        for r in rows {
+            if r? == "tenant_id" {
+                has_tenant = true;
+            }
+        }
+    }
+    if !has_tenant {
+        conn.execute_batch(
+            "ALTER TABLE metadata_events ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS metadata_events_tenant \
+             ON metadata_events(tenant_id, session_id);",
     )?;
     Ok(())
 }
@@ -453,6 +549,56 @@ fn unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod group6_tenant_tests {
+    use super::*;
+
+    fn ev(id: &str, session: &str) -> MetadataEvent {
+        MetadataEvent {
+            event_id: id.to_string(),
+            session_id: session.to_string(),
+            agent_id: "a".to_string(),
+            event_type: "step".to_string(),
+            timestamp_unix: 1,
+            latency_ms: None,
+            token_count: None,
+            cost_cents: None,
+            error_type: None,
+            tool_name: None,
+            model_name: None,
+            success: true,
+        }
+    }
+
+    #[test]
+    fn group6_observability_reads_are_isolated_by_verified_tenant() {
+        // Two tenants emit events under the SAME session_id (the
+        // cross-tenant shared key). A read scoped to tenant A must
+        // see ONLY A's event in that session timeline.
+        let sink = MetadataSink::in_memory().unwrap();
+        sink.record_for_tenant(&ev("e-a", "shared-session"), "tenant-a")
+            .unwrap();
+        sink.record_for_tenant(&ev("e-b", "shared-session"), "tenant-b")
+            .unwrap();
+        assert_eq!(
+            sink.count_for_tenant_and_session("tenant-a", "shared-session")
+                .unwrap(),
+            1,
+            "tenant A must see only its own event in the shared session timeline"
+        );
+        assert_eq!(
+            sink.count_for_tenant_and_session("tenant-b", "shared-session")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sink.count_for_tenant_and_session("tenant-c", "shared-session")
+                .unwrap(),
+            0
+        );
+    }
 }
 
 #[cfg(test)]

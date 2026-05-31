@@ -110,7 +110,14 @@ impl MessageStore {
         reply_to_message_id: Option<&str>,
         ttl_secs: i64,
         origin_surface: &str,
+        // GROUP 6: caller's VERIFIED tenant (from InvocationCtx).
+        tenant_id: &str,
     ) -> Result<String, MessageStoreError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         if from_subject_id.trim().is_empty() {
             return Err(MessageStoreError::BadInput(
                 "from_subject_id required".into(),
@@ -145,8 +152,8 @@ impl MessageStore {
             "INSERT INTO agent_messages (
                  message_id, from_subject_id, to_subject_id, thread_id,
                  reply_to_message_id, subject, body, sent_at,
-                 ttl_secs, status, origin_surface
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'delivered', ?10)",
+                 ttl_secs, status, origin_surface, tenant_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'delivered', ?10, ?11)",
             params![
                 message_id,
                 from_subject_id,
@@ -158,9 +165,27 @@ impl MessageStore {
                 now,
                 ttl_final,
                 origin,
+                tenant,
             ],
         )?;
         Ok(message_id)
+    }
+
+    /// GROUP 6: tenant-scoped count of a recipient's inbox —
+    /// proves cross-tenant denial: a read carrying tenant A never
+    /// sees tenant B's messages even for a shared `to_subject_id`.
+    pub fn count_inbox_for_tenant(
+        &self,
+        tenant: &str,
+        to_subject_id: &str,
+    ) -> Result<u64, MessageStoreError> {
+        let conn = self.conn.lock().map_err(|_| MessageStoreError::Lock)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE tenant_id = ?1 AND to_subject_id = ?2",
+            params![tenant, to_subject_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     pub fn get(&self, message_id: &str) -> Result<Option<MessageRecord>, MessageStoreError> {
@@ -414,7 +439,10 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              ON agent_messages(thread_id, sent_at);
          CREATE INDEX IF NOT EXISTS agent_messages_expire
              ON agent_messages(status, sent_at, ttl_secs);",
-    )
+    )?;
+    // GROUP 6: tenant isolation column (idempotent).
+    crate::db::ensure_tenant_id_column(conn, "agent_messages")?;
+    Ok(())
 }
 
 fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<MessageRecord> {
@@ -461,6 +489,31 @@ mod tests {
     }
 
     #[test]
+    fn group6_messaging_reads_are_isolated_by_verified_tenant() {
+        // Two tenants send to the SAME recipient subject. A
+        // tenant-scoped inbox read must see ONLY its own tenant's
+        // message — never the other tenant's.
+        let s = store();
+        s.send("a-sender", "shared-recipient", "", "from a", None, None, 0, "api", "tenant-a")
+            .unwrap();
+        s.send("b-sender", "shared-recipient", "", "from b", None, None, 0, "api", "tenant-b")
+            .unwrap();
+        assert_eq!(
+            s.count_inbox_for_tenant("tenant-a", "shared-recipient").unwrap(),
+            1,
+            "tenant A must see only its own message in the shared recipient's inbox"
+        );
+        assert_eq!(
+            s.count_inbox_for_tenant("tenant-b", "shared-recipient").unwrap(),
+            1
+        );
+        assert_eq!(
+            s.count_inbox_for_tenant("tenant-c", "shared-recipient").unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn send_round_trips_every_field() {
         let s = store();
         let id = s
@@ -473,6 +526,7 @@ mod tests {
                 None,
                 0,
                 "api",
+                "default",
             )
             .unwrap();
         let m = s.get(&id).unwrap().unwrap();
@@ -487,22 +541,22 @@ mod tests {
         assert_eq!(m.ttl_secs, 86400);
         assert_eq!(m.status, "delivered");
         assert!(m.read_at.is_none());
-        assert_eq!(m.origin_surface, "api");
+        assert_eq!(m.origin_surface, "api", "default");
     }
 
     #[test]
     fn send_rejects_empty_from_to_or_body() {
         let s = store();
         assert!(matches!(
-            s.send("", "bob", "", "body", None, None, 0, "api"),
+            s.send("", "bob", "", "body", None, None, 0, "api", "default"),
             Err(MessageStoreError::BadInput(_))
         ));
         assert!(matches!(
-            s.send("alice", "", "", "body", None, None, 0, "api"),
+            s.send("alice", "", "", "body", None, None, 0, "api", "default"),
             Err(MessageStoreError::BadInput(_))
         ));
         assert!(matches!(
-            s.send("alice", "bob", "", "", None, None, 0, "api"),
+            s.send("alice", "bob", "", "", None, None, 0, "api", "default"),
             Err(MessageStoreError::BadInput(_))
         ));
     }
@@ -511,10 +565,10 @@ mod tests {
     fn reply_attaches_to_existing_thread() {
         let s = store();
         let m1 = s
-            .send("alice", "bob", "", "hi", None, None, 0, "api")
+            .send("alice", "bob", "", "hi", None, None, 0, "api", "default")
             .unwrap();
         let m2 = s
-            .send("bob", "alice", "", "hey", Some(&m1), Some(&m1), 0, "api")
+            .send("bob", "alice", "", "hey", Some(&m1), Some(&m1), 0, "api", "default")
             .unwrap();
         let r2 = s.get(&m2).unwrap().unwrap();
         assert_eq!(r2.thread_id, m1);
@@ -525,10 +579,10 @@ mod tests {
     fn inbox_returns_unread_for_recipient_only() {
         let s = store();
         let _ = s
-            .send("alice", "bob", "", "for bob", None, None, 0, "api")
+            .send("alice", "bob", "", "for bob", None, None, 0, "api", "default")
             .unwrap();
         let _ = s
-            .send("alice", "carol", "", "for carol", None, None, 0, "api")
+            .send("alice", "carol", "", "for carol", None, None, 0, "api", "default")
             .unwrap();
         let bob = s.inbox("bob", 20, false, None).unwrap();
         assert_eq!(bob.len(), 1);
@@ -543,7 +597,7 @@ mod tests {
     fn inbox_with_include_read_returns_already_read_too() {
         let s = store();
         let id = s
-            .send("alice", "bob", "", "hi", None, None, 0, "api")
+            .send("alice", "bob", "", "hi", None, None, 0, "api", "default")
             .unwrap();
         s.mark_read(&id, "bob").unwrap();
         assert!(s.inbox("bob", 20, false, None).unwrap().is_empty());
@@ -556,7 +610,7 @@ mod tests {
     fn mark_read_by_wrong_subject_returns_forbidden() {
         let s = store();
         let id = s
-            .send("alice", "bob", "", "hi", None, None, 0, "api")
+            .send("alice", "bob", "", "hi", None, None, 0, "api", "default")
             .unwrap();
         assert!(matches!(
             s.mark_read(&id, "carol"),
@@ -579,7 +633,7 @@ mod tests {
     fn mark_read_is_idempotent() {
         let s = store();
         let id = s
-            .send("alice", "bob", "", "hi", None, None, 0, "api")
+            .send("alice", "bob", "", "hi", None, None, 0, "api", "default")
             .unwrap();
         s.mark_read(&id, "bob").unwrap();
         // Second call is OK.
@@ -594,15 +648,15 @@ mod tests {
         let s = store();
         // alice → bob
         let m1 = s
-            .send("alice", "bob", "", "1", None, None, 0, "api")
+            .send("alice", "bob", "", "1", None, None, 0, "api", "default")
             .unwrap();
         // bob → alice (same thread)
         let m2 = s
-            .send("bob", "alice", "", "2", Some(&m1), Some(&m1), 0, "api")
+            .send("bob", "alice", "", "2", Some(&m1), Some(&m1), 0, "api", "default")
             .unwrap();
         // alice → bob again
         let m3 = s
-            .send("alice", "bob", "", "3", Some(&m1), Some(&m2), 0, "api")
+            .send("alice", "bob", "", "3", Some(&m1), Some(&m2), 0, "api", "default")
             .unwrap();
         let bob_view = s.thread(&m1, "bob").unwrap();
         assert_eq!(bob_view.len(), 3);
@@ -624,7 +678,7 @@ mod tests {
     fn delete_marks_message_expired_and_only_for_participants() {
         let s = store();
         let id = s
-            .send("alice", "bob", "", "hi", None, None, 0, "api")
+            .send("alice", "bob", "", "hi", None, None, 0, "api", "default")
             .unwrap();
         // Wrong subject denied.
         assert!(matches!(
@@ -642,7 +696,7 @@ mod tests {
     fn auto_expire_flips_old_messages_to_expired() {
         let s = store();
         let id = s
-            .send("alice", "bob", "", "old", None, None, 1, "api")
+            .send("alice", "bob", "", "old", None, None, 1, "api", "default")
             .unwrap();
         // sent_at + ttl = now + 1. Run the sweeper at now + 5.
         let later = unix_now() + 5;
@@ -655,7 +709,7 @@ mod tests {
     fn auto_expire_leaves_unexpired_alone() {
         let s = store();
         let id = s
-            .send("alice", "bob", "", "fresh", None, None, 86400, "api")
+            .send("alice", "bob", "", "fresh", None, None, 86400, "api", "default")
             .unwrap();
         let n = s.expire_due(unix_now()).unwrap();
         assert_eq!(n, 0);
@@ -667,7 +721,7 @@ mod tests {
         let s = store();
         // Send three messages with explicit sent_at gaps.
         let id_a = s
-            .send("alice", "bob", "", "a", None, None, 0, "api")
+            .send("alice", "bob", "", "a", None, None, 0, "api", "default")
             .unwrap();
         // Advance the clock by waiting through the second; in
         // tests we instead use the cursor against the actual
@@ -676,10 +730,10 @@ mod tests {
         // same second; the index also sorts by message_id
         // DESC as a tiebreaker for determinism.
         let id_b = s
-            .send("alice", "bob", "", "b", None, None, 0, "api")
+            .send("alice", "bob", "", "b", None, None, 0, "api", "default")
             .unwrap();
         let id_c = s
-            .send("alice", "bob", "", "c", None, None, 0, "api")
+            .send("alice", "bob", "", "c", None, None, 0, "api", "default")
             .unwrap();
         // Without a cursor, newest-first.
         let all = s.inbox("bob", 20, false, None).unwrap();
@@ -698,7 +752,7 @@ mod tests {
     fn inbox_limit_caps_at_100() {
         let s = store();
         for i in 0..50 {
-            s.send("alice", "bob", "", &format!("m{i}"), None, None, 0, "api")
+            s.send("alice", "bob", "", &format!("m{i}"), None, None, 0, "api", "default")
                 .unwrap();
         }
         // Requesting 999 yields at most 100 (the hard cap).

@@ -409,6 +409,7 @@ mod tests {
     ) -> InvocationMetric {
         InvocationMetric {
             agent_name: agent.into(),
+            tenant_id: "default".into(),
             peer_alias: "p".into(),
             method: method.into(),
             timestamp_ms: ts_ms,

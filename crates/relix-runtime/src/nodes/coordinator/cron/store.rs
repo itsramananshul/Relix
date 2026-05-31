@@ -99,6 +99,7 @@ impl CronStore {
 
     /// Validate + parse a schedule expression and insert a new
     /// job. Returns the freshly-minted 16-hex `job_id`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         name: &str,
@@ -106,7 +107,14 @@ impl CronStore {
         flow_template: &str,
         prompt: &str,
         subject_id: &str,
+        // GROUP 6: caller's VERIFIED tenant (from InvocationCtx).
+        tenant_id: &str,
     ) -> Result<String, CronStoreError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         if name.trim().is_empty() {
             return Err(CronStoreError::BadInput("name required".into()));
         }
@@ -124,8 +132,8 @@ impl CronStore {
         conn.execute(
             "INSERT INTO cron_jobs (
                  job_id, name, schedule, flow_template, prompt, subject_id,
-                 enabled, created_at, updated_at, next_run_at, run_count
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8, 0)",
+                 enabled, created_at, updated_at, next_run_at, run_count, tenant_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8, 0, ?9)",
             params![
                 job_id,
                 name,
@@ -135,9 +143,32 @@ impl CronStore {
                 subject_id,
                 now,
                 next,
+                tenant,
             ],
         )?;
         Ok(job_id)
+    }
+
+    /// GROUP 6: tenant-scoped lookup — returns the job ONLY when
+    /// it belongs to `tenant`, so a caller scoped to tenant A
+    /// can never read tenant B's job even with B's `job_id`.
+    pub fn get_for_tenant(
+        &self,
+        job_id: &str,
+        tenant: &str,
+    ) -> Result<Option<CronJob>, CronStoreError> {
+        let conn = self.conn.lock().map_err(|_| CronStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT job_id, name, schedule, flow_template, prompt, subject_id,
+                        enabled, created_at, updated_at, last_run_at, next_run_at,
+                        run_count, last_task_id, last_status
+                 FROM cron_jobs WHERE job_id = ?1 AND tenant_id = ?2",
+                params![job_id, tenant],
+                row_to_job,
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn get(&self, job_id: &str) -> Result<Option<CronJob>, CronStoreError> {
@@ -155,16 +186,22 @@ impl CronStore {
         Ok(row)
     }
 
-    /// List jobs filtered by `subject_id` (empty → all jobs).
-    /// Newest-first by `created_at`.
-    pub fn list(&self, subject_id: Option<&str>) -> Result<Vec<CronJobSummary>, CronStoreError> {
+    /// GROUP 6: list jobs for the caller's VERIFIED `tenant`,
+    /// optionally narrowed to one `subject_id`. EVERY row is
+    /// filtered by `tenant_id` so a caller never sees another
+    /// tenant's jobs. Newest-first by `created_at`.
+    pub fn list(
+        &self,
+        tenant: &str,
+        subject_id: Option<&str>,
+    ) -> Result<Vec<CronJobSummary>, CronStoreError> {
         let conn = self.conn.lock().map_err(|_| CronStoreError::Lock)?;
         let sql = if subject_id.is_some() {
             "SELECT job_id, name, schedule, next_run_at, last_run_at, enabled, run_count
-             FROM cron_jobs WHERE subject_id = ?1 ORDER BY created_at DESC"
+             FROM cron_jobs WHERE tenant_id = ?1 AND subject_id = ?2 ORDER BY created_at DESC"
         } else {
             "SELECT job_id, name, schedule, next_run_at, last_run_at, enabled, run_count
-             FROM cron_jobs ORDER BY created_at DESC"
+             FROM cron_jobs WHERE tenant_id = ?1 ORDER BY created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
         let map = |r: &rusqlite::Row| {
@@ -179,10 +216,11 @@ impl CronStore {
             })
         };
         let rows: Vec<CronJobSummary> = if let Some(s) = subject_id {
-            stmt.query_map(params![s], map)?
+            stmt.query_map(params![tenant, s], map)?
                 .collect::<rusqlite::Result<_>>()?
         } else {
-            stmt.query_map([], map)?.collect::<rusqlite::Result<_>>()?
+            stmt.query_map(params![tenant], map)?
+                .collect::<rusqlite::Result<_>>()?
         };
         Ok(rows)
     }
@@ -355,7 +393,10 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              ON cron_jobs(enabled, next_run_at);
          CREATE INDEX IF NOT EXISTS cron_jobs_subject
              ON cron_jobs(subject_id, created_at);",
-    )
+    )?;
+    // GROUP 6: tenant isolation column (idempotent).
+    crate::db::ensure_tenant_id_column(conn, "cron_jobs")?;
+    Ok(())
 }
 
 fn row_to_job(r: &rusqlite::Row) -> rusqlite::Result<CronJob> {
@@ -399,6 +440,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn group6_cron_reads_are_isolated_by_verified_tenant() {
+        // Two tenants create jobs for the SAME subject_id. The
+        // tenant-scoped get/list must return ONLY the caller's
+        // tenant's jobs — never the other tenant's.
+        let s = CronStore::in_memory().unwrap();
+        let a = s
+            .create("a", "1d", "f.sol", "p", "shared-subj", "tenant-a")
+            .unwrap();
+        let b = s
+            .create("b", "1d", "f.sol", "p", "shared-subj", "tenant-b")
+            .unwrap();
+        // get is tenant-scoped: A cannot read B's job by id.
+        assert!(s.get_for_tenant(&a, "tenant-a").unwrap().is_some());
+        assert!(
+            s.get_for_tenant(&b, "tenant-a").unwrap().is_none(),
+            "tenant A must not read tenant B's cron job"
+        );
+        // list is tenant-scoped: each tenant sees only its own.
+        assert_eq!(s.list("tenant-a", Some("shared-subj")).unwrap().len(), 1);
+        assert_eq!(s.list("tenant-b", Some("shared-subj")).unwrap().len(), 1);
+        assert_eq!(s.list("tenant-a", None).unwrap().len(), 1);
+    }
+
+    #[test]
     fn create_then_get_round_trips_every_field() {
         let s = CronStore::in_memory().unwrap();
         let id = s
@@ -408,6 +473,7 @@ mod tests {
                 "flows/chat_template.sol",
                 "summarise",
                 "subj-1",
+                "default",
             )
             .unwrap();
         let j = s.get(&id).unwrap().unwrap();
@@ -426,7 +492,7 @@ mod tests {
     #[test]
     fn create_rejects_bad_schedule() {
         let s = CronStore::in_memory().unwrap();
-        let r = s.create("x", "garbage", "f.sol", "p", "subj");
+        let r = s.create("x", "garbage", "f.sol", "p", "subj", "default");
         assert!(matches!(r, Err(CronStoreError::Schedule(_))));
     }
 
@@ -434,15 +500,15 @@ mod tests {
     fn create_rejects_empty_required_fields() {
         let s = CronStore::in_memory().unwrap();
         assert!(matches!(
-            s.create("", "1d", "f.sol", "p", "subj"),
+            s.create("", "1d", "f.sol", "p", "subj", "default"),
             Err(CronStoreError::BadInput(_))
         ));
         assert!(matches!(
-            s.create("n", "1d", "", "p", "subj"),
+            s.create("n", "1d", "", "p", "subj", "default"),
             Err(CronStoreError::BadInput(_))
         ));
         assert!(matches!(
-            s.create("n", "1d", "f.sol", "p", ""),
+            s.create("n", "1d", "f.sol", "p", "", "default"),
             Err(CronStoreError::BadInput(_))
         ));
     }
@@ -450,15 +516,15 @@ mod tests {
     #[test]
     fn list_filters_by_subject_id() {
         let s = CronStore::in_memory().unwrap();
-        s.create("a", "1d", "f.sol", "p", "subj-1").unwrap();
-        s.create("b", "1d", "f.sol", "p", "subj-2").unwrap();
-        s.create("c", "1d", "f.sol", "p", "subj-1").unwrap();
-        let one = s.list(Some("subj-1")).unwrap();
+        s.create("a", "1d", "f.sol", "p", "subj-1", "default").unwrap();
+        s.create("b", "1d", "f.sol", "p", "subj-2", "default").unwrap();
+        s.create("c", "1d", "f.sol", "p", "subj-1", "default").unwrap();
+        let one = s.list("default", Some("subj-1")).unwrap();
         assert_eq!(one.len(), 2);
         for r in &one {
             assert!(r.name == "a" || r.name == "c");
         }
-        let two = s.list(Some("subj-2")).unwrap();
+        let two = s.list("default", Some("subj-2")).unwrap();
         assert_eq!(two.len(), 1);
         assert_eq!(two[0].name, "b");
     }
@@ -466,15 +532,15 @@ mod tests {
     #[test]
     fn list_with_none_returns_all_subjects() {
         let s = CronStore::in_memory().unwrap();
-        s.create("a", "1d", "f.sol", "p", "subj-1").unwrap();
-        s.create("b", "1d", "f.sol", "p", "subj-2").unwrap();
-        assert_eq!(s.list(None).unwrap().len(), 2);
+        s.create("a", "1d", "f.sol", "p", "subj-1", "default").unwrap();
+        s.create("b", "1d", "f.sol", "p", "subj-2", "default").unwrap();
+        assert_eq!(s.list("default", None).unwrap().len(), 2);
     }
 
     #[test]
     fn update_enabled_disables_then_reenables() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj").unwrap();
+        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
         s.update_field(&id, "enabled", "0").unwrap();
         assert!(!s.get(&id).unwrap().unwrap().enabled);
         s.update_field(&id, "enabled", "1").unwrap();
@@ -484,7 +550,7 @@ mod tests {
     #[test]
     fn update_schedule_recomputes_next_run_at() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj").unwrap();
+        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
         let before = s.get(&id).unwrap().unwrap().next_run_at;
         s.update_field(&id, "schedule", "30m").unwrap();
         let after = s.get(&id).unwrap().unwrap();
@@ -496,7 +562,7 @@ mod tests {
     #[test]
     fn update_unknown_field_rejected() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj").unwrap();
+        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
         assert!(matches!(
             s.update_field(&id, "name", "different"),
             Err(CronStoreError::BadInput(_))
@@ -515,7 +581,7 @@ mod tests {
     #[test]
     fn delete_removes_row_then_returns_not_found_next_time() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj").unwrap();
+        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
         s.delete(&id).unwrap();
         assert!(s.get(&id).unwrap().is_none());
         assert!(matches!(s.delete(&id), Err(CronStoreError::NotFound(_))));
@@ -525,8 +591,8 @@ mod tests {
     fn due_jobs_returns_only_jobs_whose_next_run_is_past() {
         let s = CronStore::in_memory().unwrap();
         // Create a job, then force its next_run_at into the past.
-        let id_due = s.create("due", "1d", "f.sol", "p", "subj").unwrap();
-        let id_future = s.create("future", "1d", "f.sol", "p", "subj").unwrap();
+        let id_due = s.create("due", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id_future = s.create("future", "1d", "f.sol", "p", "subj", "default").unwrap();
         {
             let conn = s.conn.lock().unwrap();
             conn.execute(
@@ -545,7 +611,7 @@ mod tests {
     #[test]
     fn due_jobs_excludes_disabled_rows() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj").unwrap();
+        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
         {
             let conn = s.conn.lock().unwrap();
             conn.execute(
@@ -562,7 +628,7 @@ mod tests {
     fn record_fire_advances_run_count_and_optionally_disables() {
         let s = CronStore::in_memory().unwrap();
         let id = s
-            .create("once", "2026-06-01T00:00:00Z", "f.sol", "p", "subj")
+            .create("once", "2026-06-01T00:00:00Z", "f.sol", "p", "subj", "default")
             .unwrap();
         s.record_fire(&id, 5_000, 6_000, "task-1", true).unwrap();
         let j = s.get(&id).unwrap().unwrap();
@@ -576,7 +642,7 @@ mod tests {
     #[test]
     fn record_fire_recurring_keeps_job_enabled() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("daily", "1d", "f.sol", "p", "subj").unwrap();
+        let id = s.create("daily", "1d", "f.sol", "p", "subj", "default").unwrap();
         s.record_fire(&id, 5_000, 9_000, "task-1", false).unwrap();
         let j = s.get(&id).unwrap().unwrap();
         assert!(j.enabled);
@@ -586,7 +652,7 @@ mod tests {
     #[test]
     fn record_status_updates_last_status_text() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj").unwrap();
+        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
         s.record_status(&id, "completed").unwrap();
         let j = s.get(&id).unwrap().unwrap();
         assert_eq!(j.last_status.as_deref(), Some("completed"));

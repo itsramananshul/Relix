@@ -466,7 +466,14 @@ impl AgentStore {
         created_by: &str,
         subject_id: &str,
         risk_ceiling: &str,
+        // GROUP 6: caller's VERIFIED tenant (from InvocationCtx).
+        tenant_id: &str,
     ) -> Result<String, AgentStoreError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         for (label, val) in [
             ("name", name),
             ("role", role),
@@ -498,9 +505,9 @@ impl AgentStore {
                  allow_sensitivity_tags, deny_sensitivity_tags,
                  approval_required_categories, authorized_approvers,
                  approval_timeout_secs,
-                 created_at, updated_at
+                 created_at, updated_at, tenant_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, '[]',
-                       ?9, '[]', '[]', '[]', '[]', ?10, '[]', 86400, ?11, ?11)",
+                       ?9, '[]', '[]', '[]', '[]', ?10, '[]', 86400, ?11, ?11, ?12)",
             params![
                 agent_id,
                 name,
@@ -513,9 +520,36 @@ impl AgentStore {
                 risk_ceiling,
                 approval_required,
                 now,
+                tenant,
             ],
         )?;
         Ok(agent_id)
+    }
+
+    /// GROUP 6: tenant-scoped lookup by AIC subject — returns the
+    /// profile ONLY when it belongs to `tenant`, so a caller
+    /// scoped to tenant A cannot read tenant B's agent profile.
+    pub fn get_by_subject_for_tenant(
+        &self,
+        subject_id: &str,
+        tenant: &str,
+    ) -> Result<Option<AgentProfile>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let row = conn
+            .query_row(
+                "SELECT agent_id, name, role, title, department, team,
+                        created_by, status, subject_id, surface_allowlist,
+                        risk_ceiling, allow_categories, deny_categories,
+                        allow_sensitivity_tags, deny_sensitivity_tags,
+                        approval_required_categories, authorized_approvers,
+                        approval_timeout_secs,
+                        created_at, updated_at, profile
+                 FROM agent_profiles WHERE subject_id = ?1 AND tenant_id = ?2",
+                params![subject_id, tenant],
+                row_to_agent,
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn get_agent(&self, agent_id: &str) -> Result<Option<AgentProfile>, AgentStoreError> {
@@ -720,7 +754,14 @@ impl AgentStore {
         // `AgentProfile::authorized_approvers`. Empty ⇒
         // `coord.approval.decide` falls back to the role check.
         authorized_approvers: &[String],
+        // GROUP 6: caller's VERIFIED tenant (from InvocationCtx).
+        tenant_id: &str,
     ) -> Result<String, AgentStoreError> {
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         let now = unix_now();
         let approval_id = new_approval_id();
         let groups_json = serde_json::to_string(approver_groups)
@@ -732,8 +773,8 @@ impl AgentStore {
             "INSERT INTO approval_requests (
                  approval_id, agent_id, subject_id, method, capability_category,
                  args_redacted_hash, reason, approver_groups,
-                 requested_at, expires_at, status, task_id, authorized_approvers
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)",
+                 requested_at, expires_at, status, task_id, authorized_approvers, tenant_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)",
             params![
                 approval_id,
                 agent_id,
@@ -747,9 +788,29 @@ impl AgentStore {
                 expires_at,
                 task_id,
                 approvers_json,
+                tenant,
             ],
         )?;
         Ok(approval_id)
+    }
+
+    /// GROUP 6: tenant-scoped approval lookup — returns the row
+    /// ONLY when it belongs to `tenant`, so a caller scoped to
+    /// tenant A cannot read tenant B's approval request by id.
+    pub fn get_approval_for_tenant(
+        &self,
+        approval_id: &str,
+        tenant: &str,
+    ) -> Result<Option<String>, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT status FROM approval_requests WHERE approval_id = ?1 AND tenant_id = ?2",
+                params![approval_id, tenant],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn get_approval(
@@ -1126,6 +1187,7 @@ impl AgentStore {
 
     // ── standing_approvals ────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_standing(
         &self,
         agent_id: &str,
@@ -1134,20 +1196,27 @@ impl AgentStore {
         expires_at: i64,
         granted_by: &str,
         note: &str,
+        // GROUP 6: caller's VERIFIED tenant (from InvocationCtx).
+        tenant_id: &str,
     ) -> Result<String, AgentStoreError> {
         if agent_id.trim().is_empty() || match_category.trim().is_empty() {
             return Err(AgentStoreError::BadInput(
                 "agent_id and match_category required".into(),
             ));
         }
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
         let now = unix_now();
         let standing_id = new_standing_id();
         let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
         conn.execute(
             "INSERT INTO standing_approvals (
                  standing_id, agent_id, match_category, match_path_glob,
-                 expires_at, granted_by, note, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 expires_at, granted_by, note, created_at, tenant_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 standing_id,
                 agent_id,
@@ -1157,9 +1226,26 @@ impl AgentStore {
                 granted_by,
                 note,
                 now,
+                tenant,
             ],
         )?;
         Ok(standing_id)
+    }
+
+    /// GROUP 6: tenant-scoped count of standing approvals for an
+    /// agent — proves cross-tenant denial in SQL.
+    pub fn count_standing_for_tenant(
+        &self,
+        tenant: &str,
+        agent_id: &str,
+    ) -> Result<u64, AgentStoreError> {
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM standing_approvals WHERE tenant_id = ?1 AND agent_id = ?2",
+            params![tenant, agent_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     pub fn list_standing(&self, agent_id: &str) -> Result<Vec<StandingApproval>, AgentStoreError> {
@@ -1355,6 +1441,21 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // rows continue to flow through the categorical checks
     // (which now default-deny when no profile exists).
     ensure_column(conn, "agent_profiles", "profile", "TEXT")?;
+    // GROUP 6: tenant isolation. Add `tenant_id` to the per-caller
+    // agent/approval tables. Idempotent (ensure_column probes
+    // PRAGMA); existing rows default to the reserved 'default'
+    // tenant so single-tenant deployments keep reading their data.
+    // (`startup_tasks` = node-local migration ledger and
+    // `approval_token_blocklist` = global one-shot-token uniqueness
+    // guard are tenant-neutral and intentionally excluded.)
+    for tbl in ["agent_profiles", "approval_requests", "standing_approvals"] {
+        ensure_column(conn, tbl, "tenant_id", "TEXT NOT NULL DEFAULT 'default'")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS agent_profiles_tenant ON agent_profiles(tenant_id);\
+         CREATE INDEX IF NOT EXISTS approval_requests_tenant ON approval_requests(tenant_id);\
+         CREATE INDEX IF NOT EXISTS standing_approvals_tenant ON standing_approvals(tenant_id);",
+    )?;
     Ok(())
 }
 
@@ -1576,6 +1677,65 @@ mod tests {
     // ── agent CRUD ───────────────────────────────────────
 
     #[test]
+    fn group6_approval_and_standing_reads_are_isolated_by_verified_tenant() {
+        let s = store();
+        // approval_requests: two tenants, tenant-scoped get.
+        let a = s
+            .create_approval(
+                "ag", "subj", "m", "c", "", "r", &[], None, 9_999_999_999, &[], "tenant-a",
+            )
+            .unwrap();
+        let b = s
+            .create_approval(
+                "ag", "subj", "m", "c", "", "r", &[], None, 9_999_999_999, &[], "tenant-b",
+            )
+            .unwrap();
+        assert!(s.get_approval_for_tenant(&a, "tenant-a").unwrap().is_some());
+        assert!(
+            s.get_approval_for_tenant(&b, "tenant-a").unwrap().is_none(),
+            "tenant A must not read tenant B's approval request"
+        );
+        // standing_approvals: two tenants for the same agent.
+        s.create_standing("shared-agent", "fetch", None, 9_999_999_999, "op", "n", "tenant-a")
+            .unwrap();
+        s.create_standing("shared-agent", "fetch", None, 9_999_999_999, "op", "n", "tenant-b")
+            .unwrap();
+        assert_eq!(
+            s.count_standing_for_tenant("tenant-a", "shared-agent").unwrap(),
+            1
+        );
+        assert_eq!(
+            s.count_standing_for_tenant("tenant-b", "shared-agent").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn group6_agent_profile_reads_are_isolated_by_verified_tenant() {
+        // An agent profile created under tenant A must not be
+        // readable via the tenant-scoped lookup as tenant B,
+        // even though the caller knows the subject_id.
+        let s = store();
+        s.create_agent(
+            "A", "research", "t", "d", "tm", "creator", "subj-a", "medium", "tenant-a",
+        )
+        .unwrap();
+        // Same tenant + subject → visible.
+        assert!(
+            s.get_by_subject_for_tenant("subj-a", "tenant-a")
+                .unwrap()
+                .is_some()
+        );
+        // Different tenant → NOT visible, even with the subject id.
+        assert!(
+            s.get_by_subject_for_tenant("subj-a", "tenant-b")
+                .unwrap()
+                .is_none(),
+            "tenant B must not read tenant A's agent profile"
+        );
+    }
+
+    #[test]
     fn create_then_get_round_trips_every_field() {
         let s = store();
         let id = s
@@ -1588,6 +1748,7 @@ mod tests {
                 "alice",
                 "subj-1",
                 "medium",
+                "default",
             )
             .unwrap();
         let p = s.get_agent(&id).unwrap().unwrap();
@@ -1606,7 +1767,7 @@ mod tests {
     #[test]
     fn create_rejects_unknown_risk_ceiling() {
         let s = store();
-        let r = s.create_agent("n", "r", "t", "d", "t", "c", "subj", "extreme");
+        let r = s.create_agent("n", "r", "t", "d", "t", "c", "subj", "extreme", "default");
         assert!(matches!(r, Err(AgentStoreError::BadInput(_))));
     }
 
@@ -1614,7 +1775,7 @@ mod tests {
     fn get_by_subject_returns_the_profile() {
         let s = store();
         let id = s
-            .create_agent("n", "r", "t", "d", "t", "c", "subj-x", "low")
+            .create_agent("n", "r", "t", "d", "t", "c", "subj-x", "low", "default")
             .unwrap();
         let p = s.get_by_subject("subj-x").unwrap().unwrap();
         assert_eq!(p.agent_id, id);
@@ -1629,9 +1790,9 @@ mod tests {
     #[test]
     fn list_agents_filters_by_subject_id() {
         let s = store();
-        s.create_agent("a", "r", "t", "d", "t", "c", "subj-1", "low")
+        s.create_agent("a", "r", "t", "d", "t", "c", "subj-1", "low", "default")
             .unwrap();
-        s.create_agent("b", "r", "t", "d", "t", "c", "subj-2", "low")
+        s.create_agent("b", "r", "t", "d", "t", "c", "subj-2", "low", "default")
             .unwrap();
         let one = s.list_agents(Some("subj-1")).unwrap();
         assert_eq!(one.len(), 1);
@@ -1644,7 +1805,7 @@ mod tests {
     fn update_status_validates_and_writes() {
         let s = store();
         let id = s
-            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         s.update_agent_field(&id, "status", "suspended").unwrap();
         let p = s.get_agent(&id).unwrap().unwrap();
@@ -1660,7 +1821,7 @@ mod tests {
     fn update_allow_categories_accepts_comma_separated() {
         let s = store();
         let id = s
-            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         s.update_agent_field(&id, "allow_categories", "browser, fetch, summarise")
             .unwrap();
@@ -1675,7 +1836,7 @@ mod tests {
     fn update_unknown_field_rejected() {
         let s = store();
         let id = s
-            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         assert!(matches!(
             s.update_agent_field(&id, "name", "x"),
@@ -1687,7 +1848,7 @@ mod tests {
     fn soft_delete_sets_status_to_disabled() {
         let s = store();
         let id = s
-            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium")
+            .create_agent("n", "r", "t", "d", "t", "c", "subj", "medium", "default")
             .unwrap();
         s.soft_delete_agent(&id).unwrap();
         assert_eq!(s.get_agent(&id).unwrap().unwrap().status, "disabled");
@@ -1710,7 +1871,7 @@ mod tests {
                 Some("task-1"),
                 unix_now() + 86400,
                 &[],
-            )
+            "default")
             .unwrap();
         let r = s.get_approval(&id).unwrap().unwrap();
         assert_eq!(r.method, "tool.web_post");
@@ -1739,7 +1900,7 @@ mod tests {
                 Some("task-7"),
                 unix_now() + 60,
                 &[],
-            )
+            "default")
             .unwrap();
         let meta = s
             .decide_approval(&id, ApprovalStatus::Approved, "alice", "ok")
@@ -1783,7 +1944,7 @@ mod tests {
     fn decide_rejected_returns_no_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
             .unwrap();
         let meta = s
             .decide_approval(&id, ApprovalStatus::Rejected, "alice", "nope")
@@ -1799,7 +1960,7 @@ mod tests {
     fn decide_refuses_terminal_approval() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
             .unwrap();
         s.decide_approval(&id, ApprovalStatus::Approved, "alice", "")
             .unwrap();
@@ -1814,10 +1975,10 @@ mod tests {
     fn list_pending_returns_only_pending_oldest_first() {
         let s = store();
         let _a = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
             .unwrap();
         let b = s
-            .create_approval("b", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[])
+            .create_approval("b", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
             .unwrap();
         // Decide b → not pending.
         s.decide_approval(&b, ApprovalStatus::Approved, "alice", "")
@@ -1830,7 +1991,7 @@ mod tests {
     fn list_expired_pending_returns_past_deadlines() {
         let s = store();
         let _id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 100, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 100, &[], "default")
             .unwrap();
         // expires_at = 100; query with now = 1000.
         let v = s.list_expired_pending(1000).unwrap();
@@ -1841,7 +2002,7 @@ mod tests {
     fn mark_expired_flips_status() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 100, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 100, &[], "default")
             .unwrap();
         s.mark_expired(&id).unwrap();
         assert_eq!(
@@ -1930,7 +2091,7 @@ mod tests {
         // migration must NOT touch them.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9_999_999_999, &[])
+            .create_approval("a", "s", "m", "c", "", "", &[], None, 9_999_999_999, &[], "default")
             .unwrap();
         let n = s.run_legacy_token_migration_for_test().unwrap();
         assert_eq!(n, 0, "no rows touched: pending row has no token");
@@ -2012,7 +2173,7 @@ mod tests {
     fn create_standing_then_has_active_returns_true() {
         let s = store();
         let _id = s
-            .create_standing("agt-1", "fs", None, unix_now() + 86400, "alice", "")
+            .create_standing("agt-1", "fs", None, unix_now() + 86400, "alice", "", "default")
             .unwrap();
         assert!(s.has_active_standing("agt-1", "fs", unix_now()).unwrap());
         assert!(
@@ -2025,7 +2186,7 @@ mod tests {
     fn has_active_standing_returns_false_after_expiry() {
         let s = store();
         let _id = s
-            .create_standing("agt-1", "fs", None, 100, "alice", "")
+            .create_standing("agt-1", "fs", None, 100, "alice", "", "default")
             .unwrap();
         assert!(!s.has_active_standing("agt-1", "fs", 1000).unwrap());
     }
@@ -2034,7 +2195,7 @@ mod tests {
     fn revoke_standing_drops_the_row() {
         let s = store();
         let id = s
-            .create_standing("agt-1", "fs", None, unix_now() + 60, "alice", "")
+            .create_standing("agt-1", "fs", None, unix_now() + 60, "alice", "", "default")
             .unwrap();
         s.revoke_standing(&id).unwrap();
         assert!(!s.has_active_standing("agt-1", "fs", unix_now()).unwrap());
@@ -2047,11 +2208,11 @@ mod tests {
     #[test]
     fn list_standing_returns_rows_for_agent() {
         let s = store();
-        s.create_standing("agt-1", "fs", None, unix_now() + 60, "alice", "n1")
+        s.create_standing("agt-1", "fs", None, unix_now() + 60, "alice", "n1", "default")
             .unwrap();
-        s.create_standing("agt-1", "browser", None, unix_now() + 60, "alice", "n2")
+        s.create_standing("agt-1", "browser", None, unix_now() + 60, "alice", "n2", "default")
             .unwrap();
-        s.create_standing("agt-2", "fs", None, unix_now() + 60, "alice", "n3")
+        s.create_standing("agt-2", "fs", None, unix_now() + 60, "alice", "n3", "default")
             .unwrap();
         let v = s.list_standing("agt-1").unwrap();
         assert_eq!(v.len(), 2);

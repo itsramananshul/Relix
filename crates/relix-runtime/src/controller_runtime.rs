@@ -3267,6 +3267,9 @@ pub fn register_agent_capabilities(
                     // `coord.approval.decide` can enforce the
                     // check against the caller's subject id.
                     &req.authorized_approvers,
+                    // GROUP 6: stamp the request's VERIFIED tenant
+                    // onto the approval_requests row.
+                    &req.tenant_id,
                 )
                 .map_err(|e| e.to_string())?;
             // When the caller threaded a task_id through the

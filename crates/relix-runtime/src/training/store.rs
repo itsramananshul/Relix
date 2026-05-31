@@ -117,21 +117,57 @@ impl TrainingStore {
     }
 
     pub fn insert(&self, rec: &InteractionRecord) -> Result<(), TrainingStoreError> {
+        self.insert_for_tenant(rec, "default")
+    }
+
+    /// GROUP 6: insert attributed to the caller's VERIFIED tenant.
+    pub fn insert_for_tenant(
+        &self,
+        rec: &InteractionRecord,
+        tenant_id: &str,
+    ) -> Result<(), TrainingStoreError> {
         let conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
-        insert_one(&conn, rec)
+        insert_one(&conn, rec, tenant_id)
     }
 
     pub fn insert_batch(&self, batch: &[InteractionRecord]) -> Result<(), TrainingStoreError> {
+        self.insert_batch_for_tenant(batch, "default")
+    }
+
+    /// GROUP 6: batch insert attributed to a single VERIFIED tenant.
+    pub fn insert_batch_for_tenant(
+        &self,
+        batch: &[InteractionRecord],
+        tenant_id: &str,
+    ) -> Result<(), TrainingStoreError> {
         if batch.is_empty() {
             return Ok(());
         }
         let mut conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
         let tx = conn.transaction()?;
         for rec in batch {
-            insert_one(&tx, rec)?;
+            insert_one(&tx, rec, tenant_id)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// GROUP 6: tenant-scoped lookup. Returns the interaction ONLY
+    /// when it belongs to `tenant` — a caller scoped to tenant A
+    /// asking for tenant B's `interaction_id` (or session_id) gets
+    /// `None`. The `tenant_id = ?` predicate is enforced in SQL.
+    pub fn count_for_tenant_and_session(
+        &self,
+        tenant: &str,
+        session_id: &str,
+    ) -> Result<u64, TrainingStoreError> {
+        let conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM training_interactions WHERE tenant_id = ?1 AND session_id = ?2",
+            params![tenant, session_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     pub fn get(
@@ -492,16 +528,26 @@ impl TrainingStore {
     }
 }
 
-fn insert_one(conn: &Connection, rec: &InteractionRecord) -> Result<(), TrainingStoreError> {
+fn insert_one(
+    conn: &Connection,
+    rec: &InteractionRecord,
+    tenant_id: &str,
+) -> Result<(), TrainingStoreError> {
     let tool_calls_json = serde_json::to_string(&rec.tool_calls)
         .map_err(|e| TrainingStoreError::Encode(e.to_string()))?;
+    let tenant = if tenant_id.trim().is_empty() {
+        "default"
+    } else {
+        tenant_id
+    };
     conn.execute(
         "INSERT OR REPLACE INTO training_interactions \
          (interaction_id, session_id, agent, model, provider, \
           system_prompt, user_message, response, tool_calls_json, \
           token_count, prompt_tokens, completion_tokens, latency_ms, \
-          success, error_kind, recorded_at, quality_score, exported, export_set, anonymized) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+          success, error_kind, recorded_at, quality_score, exported, export_set, anonymized, \
+          tenant_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             rec.interaction_id.as_str(),
             rec.session_id,
@@ -523,6 +569,7 @@ fn insert_one(conn: &Connection, rec: &InteractionRecord) -> Result<(), Training
             rec.exported as i32,
             rec.export_set,
             rec.anonymized as i32,
+            tenant,
         ],
     )?;
     Ok(())
@@ -714,6 +761,17 @@ fn init_schema(conn: &Connection) -> Result<(), TrainingStoreError> {
                  ON training_interactions(anonymized);",
         )?;
     }
+    // GROUP 6: tenant isolation. Idempotent via the column probe;
+    // pre-migration rows default to the reserved 'default' tenant
+    // (safe — single-tenant deployments read as "default").
+    if !column_exists(conn, "training_interactions", "tenant_id")? {
+        conn.execute_batch(
+            "ALTER TABLE training_interactions \
+             ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default';\
+             CREATE INDEX IF NOT EXISTS training_interactions_tenant \
+                 ON training_interactions(tenant_id, session_id);",
+        )?;
+    }
     Ok(())
 }
 
@@ -738,6 +796,39 @@ pub fn default_training_path(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group6_training_reads_are_isolated_by_verified_tenant() {
+        // Two tenants record interactions under the SAME
+        // session_id (the cross-tenant shared key). A read scoped
+        // to tenant A must see ONLY A's interaction.
+        let store = TrainingStore::in_memory().unwrap();
+        let mut a = sample("ia", "alice", 1, true);
+        a.session_id = "shared-session".into();
+        let mut b = sample("ib", "bob", 2, true);
+        b.session_id = "shared-session".into();
+        store.insert_for_tenant(&a, "tenant-a").unwrap();
+        store.insert_for_tenant(&b, "tenant-b").unwrap();
+        assert_eq!(
+            store
+                .count_for_tenant_and_session("tenant-a", "shared-session")
+                .unwrap(),
+            1,
+            "tenant A must see only its own interaction for the shared session"
+        );
+        assert_eq!(
+            store
+                .count_for_tenant_and_session("tenant-b", "shared-session")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_for_tenant_and_session("tenant-c", "shared-session")
+                .unwrap(),
+            0
+        );
+    }
 
     fn sample(id: &str, agent: &str, ts: i64, success: bool) -> InteractionRecord {
         InteractionRecord {

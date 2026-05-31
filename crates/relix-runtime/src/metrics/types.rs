@@ -14,6 +14,14 @@ use serde::{Deserialize, Serialize};
 
 use relix_core::types::RequestId;
 
+/// GROUP 6: the reserved tenant attributed to single-tenant and
+/// pre-multi-tenant rows. Matches the dispatch/SDK default
+/// (`InvocationCtx::tenant_id_or_default`) so a single-tenant
+/// deployment reads its own rows back normally.
+pub fn default_tenant_id() -> String {
+    "default".to_string()
+}
+
 /// One capability invocation as observed by the dispatch
 /// bridge. Every field except `token_count` / `cost_micros` /
 /// `model` is filled in at the dispatch site; the AI-specific
@@ -25,6 +33,16 @@ pub struct InvocationMetric {
     /// unverified-identity path (capability-denied before
     /// identity validation succeeded).
     pub agent_name: String,
+    /// GROUP 6: the VERIFIED tenant this invocation belongs to.
+    /// Populated at the dispatch site from the request's verified
+    /// tenant context (`InvocationCtx` / `RequestEnvelope.tenant_id`),
+    /// NEVER from a wire body. Reads are filtered by this column
+    /// so one tenant can never see another's metrics, even when
+    /// querying a shared key. `"default"` for single-tenant and
+    /// pre-multi-tenant rows so single-tenant deployments keep
+    /// reading their own data.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
     /// Peer alias the metric was recorded on. Empty when the
     /// recorder didn't have an alias handy (e.g. test
     /// harnesses). Set by the controller wiring at boot to
@@ -181,6 +199,7 @@ mod tests {
     fn base() -> InvocationMetric {
         InvocationMetric {
             agent_name: "alice".into(),
+            tenant_id: "default".into(),
             peer_alias: "coord".into(),
             method: "ai.chat".into(),
             timestamp_ms: 100,

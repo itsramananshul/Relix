@@ -4839,6 +4839,7 @@ mod tests {
         // Simulate the dispatch hot path: record the metric.
         col.record_invocation(InvocationMetric {
             agent_name: "alice".into(),
+            tenant_id: "default".into(),
             peer_alias: "ai".into(),
             method: "ai.chat".into(),
             timestamp_ms: 1_700_000_000_000,
@@ -5091,6 +5092,7 @@ mod tests {
         // stream closes).
         col.record_invocation(InvocationMetric {
             agent_name: "alice".into(),
+            tenant_id: "default".into(),
             peer_alias: "ai".into(),
             method: "ai.chat.stream".into(),
             timestamp_ms: 1_700_000_000_000,

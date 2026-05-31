@@ -96,6 +96,11 @@ pub struct GateApprovalRequest {
     /// operator's subject id against it. Empty ⇒ role-based
     /// fallback only.
     pub authorized_approvers: Vec<String>,
+    /// GROUP 6: the request's VERIFIED tenant (from
+    /// `RequestEnvelope::tenant_id`). The coordinator's
+    /// `on_require_approval` closure stamps it on the
+    /// `approval_requests` row so the table is tenant-isolated.
+    pub tenant_id: String,
 }
 
 /// Reasons we surface as `matched_rule` for audit + denial
@@ -534,6 +539,11 @@ fn evaluate_against_view(
                 // `on_require_approval` closure can stamp it
                 // on the freshly-minted approval_requests row.
                 authorized_approvers: view.authorized_approvers.clone(),
+                tenant_id: inputs
+                    .envelope
+                    .tenant_id
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
             });
         }
     }
@@ -813,6 +823,7 @@ mod tests {
                 "creator",
                 &subject,
                 risk_ceiling,
+                "default",
             )
             .unwrap();
         s.update_agent_field(&agent_id, "status", status).unwrap();
@@ -1048,7 +1059,7 @@ mod tests {
     fn active_standing_approval_admits_without_approval_request() {
         let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
         let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
-        s.create_standing(&agent_id, "payments", None, 9_999_999_999, "alice", "")
+        s.create_standing(&agent_id, "payments", None, 9_999_999_999, "alice", "", "default")
             .unwrap();
         let e = env("tool.x", None);
         let c = cap(&["payments"], &[], RiskLevel::Low);
@@ -1085,7 +1096,7 @@ mod tests {
                 None,
                 9_999_999_999,
                 &[],
-            )
+            "default")
             .unwrap();
         let meta = s
             .decide_approval(&approval_id, ApprovalStatus::Approved, "alice", "")
