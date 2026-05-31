@@ -12,6 +12,11 @@ on:
 
 permissions:
   contents: write
+  # PART 3: cosign keyless signing uses OIDC token exchange with
+  # Sigstore Fulcio. `id-token: write` is what lets the workflow
+  # request the OIDC token; without it cosign sign-blob fails with
+  # "Error: failed to get ID token: ...".
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -143,6 +148,57 @@ jobs:
             -Path "dist/relix.exe","dist/relix-controller.exe","dist/relix-web-bridge.exe" `
             -DestinationPath "relix-${{ matrix.target }}.zip" -Force
 
+      # PART 3: Sigstore keyless signing. cosign uses the workflow's
+      # OIDC token to mint a short-lived Fulcio cert tied to the
+      # workflow identity (`https://github.com/itsramananshul/Relix/
+      # .github/workflows/release.yml`). The signature + cert are
+      # uploaded next to each archive AND a SHA256SUMS file. The
+      # install scripts re-verify both the cosign signature and the
+      # hash before extracting.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            archive="relix-${{ matrix.target }}.zip"
+          else
+            archive="relix-${{ matrix.target }}.tar.gz"
+          fi
+          # sha256sum is GNU on Linux runners and present on macOS
+          # via `shasum -a 256`. Use whichever is available so the
+          # macOS leg doesn't drop to a stub.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+          echo "Archive: $archive"
+          cat "${archive}.sha256"
+
+      - name: Sign artifacts
+        shell: bash
+        env:
+          COSIGN_YES: "true"
+        run: |
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            archive="relix-${{ matrix.target }}.zip"
+          else
+            archive="relix-${{ matrix.target }}.tar.gz"
+          fi
+          # Sign the deliverable archive (single canonical
+          # supply-chain artifact) AND the per-archive SHA256
+          # checksum file. Verifying either lets the install
+          # script reach `keyless-verified` provenance.
+          for artifact in "$archive" "${archive}.sha256"; do
+            if [ -f "$artifact" ]; then
+              cosign sign-blob --yes "$artifact" \
+                --output-signature "${artifact}.sig" \
+                --output-certificate "${artifact}.pem"
+            fi
+          done
+
       - name: Upload asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -150,7 +206,78 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            gh release upload "$TAG" "relix-${{ matrix.target }}.zip" --clobber
+            archive="relix-${{ matrix.target }}.zip"
           else
-            gh release upload "$TAG" "relix-${{ matrix.target }}.tar.gz" --clobber
+            archive="relix-${{ matrix.target }}.tar.gz"
           fi
+          # Upload the archive + its checksum + cosign signature +
+          # cosign certificate. --clobber lets `workflow_dispatch`
+          # re-runs replace assets in-place.
+          gh release upload "$TAG" \
+            "$archive" \
+            "${archive}.sha256" \
+            "${archive}.sig" \
+            "${archive}.pem" \
+            "${archive}.sha256.sig" \
+            "${archive}.sha256.pem" \
+            --clobber
+
+  # PART 5: per-release SHA256SUMS for the scripts/ + flows/ tree at
+  # the resolved tag. install.sh + install.ps1 fetch this file, verify
+  # the cosign signature, then verify every per-asset download against
+  # the contained hash. This is what lets the installers fetch script
+  # + flow content from raw.githubusercontent.com pinned to the
+  # release tag with the same supply-chain provenance as the binary
+  # archives.
+  checksums:
+    name: SHA256SUMS (scripts + flows)
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > SHA256SUMS.txt
+          for f in \
+              scripts/relix-mesh-up.sh \
+              scripts/relix-mesh-down.sh \
+              scripts/relix-mesh-up.ps1 \
+              scripts/relix-mesh-down.ps1 \
+              flows/chat_template.sol \
+              flows/chat.sol \
+              flows/chat_with_tool.sol \
+              flows/chat_with_retry.sflow ; do
+            if [ -f "$f" ]; then
+              sha256sum "$f" >> SHA256SUMS.txt
+            fi
+          done
+          echo "── SHA256SUMS ──"
+          cat SHA256SUMS.txt
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign SHA256SUMS
+        shell: bash
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob --yes SHA256SUMS.txt \
+            --output-signature SHA256SUMS.txt.sig \
+            --output-certificate SHA256SUMS.txt.pem
+      - name: Upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+        shell: bash
+        run: |
+          gh release upload "$TAG" \
+            SHA256SUMS.txt \
+            SHA256SUMS.txt.sig \
+            SHA256SUMS.txt.pem \
+            --clobber

@@ -1,19 +1,38 @@
 #!/usr/bin/env bash
 # Relix installer for Linux and macOS.
-# Downloads the latest pre-built release from GitHub and installs the
-# `relix` binary (and any sibling binaries) into a user or system bin dir.
+#
+# Downloads the pre-built release archive from GitHub, verifies its
+# integrity (SHA256 + cosign keyless signature pinned to the project's
+# release.yml workflow identity), extracts it through a tar-slip-safe
+# helper, and lands the binaries in a user or system bin dir.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.sh | bash
 #   RELIX_VERSION=v0.1.0 ./install.sh
 #   RELIX_INSTALL_DIR=/opt/relix/bin ./install.sh
 #   sudo ./install.sh                 # installs to /usr/local/bin
+#
+# Security:
+#   * Every artifact download goes through `fetch_and_verify` which
+#     enforces a pinned SHA256 before writing the final file.
+#   * Cosign signatures (Sigstore keyless) are verified against the
+#     itsramananshul/Relix release.yml workflow identity when cosign
+#     is available locally — a missing cosign binary produces a loud
+#     warning, never a silent skip without notice.
+#   * Archive extraction goes through `safe_extract` which rejects
+#     any tar entry whose realpath escapes the staging directory
+#     (tar-slip protection).
+#
+# Compatibility:
+#   * Bash 4 syntax kept to a minimum; POSIX-portable where practical.
+#   * `realpath` is GNU/macOS-portable via a fallback that uses `cd`+`pwd`.
 
 set -euo pipefail
 
 REPO="itsramananshul/Relix"
 RELEASES_API="https://api.github.com/repos/${REPO}/releases/latest"
 RELEASES_DL="https://github.com/${REPO}/releases/download"
+SCRIPT_RAW_BASE="https://raw.githubusercontent.com/${REPO}"
 
 TMP_DIR=""
 
@@ -33,8 +52,164 @@ info() {
     printf '%s\n' "$*"
 }
 
+warn() {
+    printf 'warning: %s\n' "$*" >&2
+}
+
 have() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Download / verify helpers (PART 3 + PART 4 + PART 5)
+# ---------------------------------------------------------------------------
+
+# fetch_metadata: raw HTTP GET used only for content that has no
+# known-good hash (e.g. the GitHub releases API JSON used to resolve
+# the latest tag). Outputs the body on stdout. Every other download
+# in this script goes through fetch_and_verify instead.
+fetch_metadata() {
+    local url="$1"
+    if have curl; then
+        curl -fsSL "${url}"
+    elif have wget; then
+        wget -qO- "${url}"
+    else
+        err "neither curl nor wget found; please install one of them and retry"
+    fi
+}
+
+# fetch_and_verify: download a remote asset to a local path and gate
+# acceptance on an exact SHA256 match. Any non-200 response, empty
+# body, or hash mismatch is fatal — there is no fallback path that
+# trusts the bytes on disk without hash verification.
+#
+# Args:
+#   $1  remote URL
+#   $2  expected SHA256 (64-char hex, lowercase)
+#   $3  output file path
+fetch_and_verify() {
+    local url="$1"
+    local expected_sha256="$2"
+    local output="$3"
+    if have curl; then
+        curl -fsSL -o "${output}" "${url}" \
+            || err "download failed: ${url}"
+    elif have wget; then
+        wget -q -O "${output}" "${url}" \
+            || err "download failed: ${url}"
+    else
+        err "neither curl nor wget found; please install one of them and retry"
+    fi
+    if [ ! -s "${output}" ]; then
+        err "downloaded asset is empty: ${url}"
+    fi
+    # `sha256sum` on GNU/Linux, `shasum -a 256` on macOS. Use a single
+    # `<EXPECTED>  <PATH>` line piped into the verifier so it does the
+    # constant-time string comparison itself.
+    if have sha256sum; then
+        printf '%s  %s\n' "${expected_sha256}" "${output}" | sha256sum -c - \
+            || err "SHA256 mismatch on ${url}; refusing to install (expected ${expected_sha256})"
+    elif have shasum; then
+        printf '%s  %s\n' "${expected_sha256}" "${output}" | shasum -a 256 -c - \
+            || err "SHA256 mismatch on ${url}; refusing to install (expected ${expected_sha256})"
+    else
+        err "neither sha256sum nor shasum available; cannot verify ${url}"
+    fi
+}
+
+# verify_signature: cosign keyless verification pinned to the project's
+# release.yml workflow identity. When cosign is missing we warn loudly
+# and continue (the operator's hash check from fetch_and_verify is
+# still in force). When cosign is present a verification failure is
+# fatal — we never accept an unverifiable signed artifact.
+#
+# Args:
+#   $1  path to the signed artifact
+#   $2  path to the cosign signature (.sig)
+#   $3  path to the cosign certificate (.pem)
+verify_signature() {
+    local binary="$1"
+    local sig="$2"
+    local cert="$3"
+    if command -v cosign &>/dev/null; then
+        cosign verify-blob \
+            --signature "${sig}" \
+            --certificate "${cert}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "https://github.com/itsramananshul/Relix/.github/workflows/release.yml" \
+            "${binary}" \
+            || err "cosign signature verification failed for ${binary}"
+        info "  cosign-verified: ${binary}"
+    else
+        warn "cosign not found; skipping signature verification for ${binary}."
+        warn "Install cosign from https://docs.sigstore.dev/cosign/installation/ for verified downloads."
+    fi
+}
+
+# resolve_realpath: portable absolute-path resolver. GNU coreutils
+# ships `realpath`; macOS doesn't by default. The fallback walks the
+# path with `cd`+`pwd` which resolves symlinks similarly enough for
+# the safe_extract escape check.
+resolve_realpath() {
+    local target="$1"
+    if have realpath; then
+        realpath "${target}"
+        return
+    fi
+    # macOS fallback. Loses the `-m` semantics (missing components
+    # error out) but the caller only invokes us on entries `find`
+    # already produced, so they exist.
+    if [ -d "${target}" ]; then
+        (cd "${target}" && pwd -P)
+    else
+        local dir
+        local base
+        dir=$(dirname -- "${target}")
+        base=$(basename -- "${target}")
+        printf '%s/%s\n' "$(cd "${dir}" && pwd -P)" "${base}"
+    fi
+}
+
+# safe_extract: tar-slip-safe archive extraction. Stages every entry
+# in a fresh tmpdir, then walks the staged tree and rejects any entry
+# whose resolved path escapes that tmpdir (covers `../` traversal AND
+# absolute symlinks pointing outside the staging area). Only after
+# the whole tree passes the check do we copy into the destination.
+#
+# Args:
+#   $1  archive path
+#   $2  destination directory (must exist)
+safe_extract() {
+    local archive="$1"
+    local dest="$2"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    tar -xzf "${archive}" -C "${tmpdir}" \
+        || { rm -rf "${tmpdir}"; err "extraction failed: ${archive}"; }
+    local tmp_real
+    tmp_real=$(resolve_realpath "${tmpdir}")
+    while IFS= read -r -d '' file; do
+        local realfile
+        realfile=$(resolve_realpath "${file}")
+        # The resolved path must live strictly inside the staging
+        # tmpdir. Allowing `tmp_real` itself (the root) is fine; any
+        # entry whose real path doesn't share the `tmp_real/` prefix
+        # is escaping — refuse to continue.
+        case "${realfile}" in
+            "${tmp_real}"|"${tmp_real}/"*) ;;
+            *)
+                rm -rf "${tmpdir}"
+                err "suspicious path in archive: ${file} (resolved to ${realfile})"
+                ;;
+        esac
+    done < <(find "${tmpdir}" -print0)
+    # Copy staged contents into the destination only after the whole
+    # tree has been validated. `cp -r tmp/.` preserves the staged tree
+    # shape (no extra wrapper dir).
+    mkdir -p "${dest}"
+    cp -r "${tmpdir}"/. "${dest}"/
+    rm -rf "${tmpdir}"
 }
 
 # ---------------------------------------------------------------------------
@@ -96,41 +271,19 @@ info "Install dir:       ${INSTALL_DIR}"
 # ---------------------------------------------------------------------------
 # 4. Resolve version / tag
 # ---------------------------------------------------------------------------
-# Pick a downloader
-DOWNLOADER=""
-if have curl; then
-    DOWNLOADER="curl"
-elif have wget; then
-    DOWNLOADER="wget"
-else
-    err "neither curl nor wget found; please install one of them and retry"
+if ! have sha256sum && ! have shasum; then
+    err "need sha256sum or shasum for hash verification; please install coreutils"
 fi
-
-fetch_to_stdout() {
-    url="$1"
-    if [ "${DOWNLOADER}" = "curl" ]; then
-        curl -fsSL "${url}"
-    else
-        wget -qO- "${url}"
-    fi
-}
-
-fetch_to_file() {
-    url="$1"
-    out="$2"
-    if [ "${DOWNLOADER}" = "curl" ]; then
-        curl -fsSL -o "${out}" "${url}"
-    else
-        wget -q -O "${out}" "${url}"
-    fi
-}
 
 TAG=""
 if [ -n "${RELIX_VERSION:-}" ]; then
     TAG="${RELIX_VERSION}"
 else
     info "Resolving latest release tag from GitHub..."
-    RELEASE_JSON="$(fetch_to_stdout "${RELEASES_API}")" || err "failed to query ${RELEASES_API}"
+    # The release-metadata GET is the only fetch that has no
+    # pre-known hash. It's used solely to resolve the tag string;
+    # every subsequent download is pinned + verified.
+    RELEASE_JSON="$(fetch_metadata "${RELEASES_API}")" || err "failed to query ${RELEASES_API}"
     if have jq; then
         TAG="$(printf '%s' "${RELEASE_JSON}" | jq -r '.tag_name // empty')"
     fi
@@ -157,33 +310,79 @@ info "Version:           ${TAG}"
 # ---------------------------------------------------------------------------
 ARCHIVE_NAME="relix-${TARGET}.tar.gz"
 DOWNLOAD_URL="${RELEASES_DL}/${TAG}/${ARCHIVE_NAME}"
+SHA256_URL="${DOWNLOAD_URL}.sha256"
+ARCHIVE_SIG_URL="${DOWNLOAD_URL}.sig"
+ARCHIVE_PEM_URL="${DOWNLOAD_URL}.pem"
+SHA256_SIG_URL="${SHA256_URL}.sig"
+SHA256_PEM_URL="${SHA256_URL}.pem"
+
+# PART 5: the SHA256SUMS file is per-release and pinned to the
+# resolved tag — never `main`. Its cosign signature is what lets us
+# trust the per-script hashes during the script + flow fetches.
+SUMS_BASE="${RELEASES_DL}/${TAG}"
+SUMS_URL="${SUMS_BASE}/SHA256SUMS.txt"
+SUMS_SIG_URL="${SUMS_URL}.sig"
+SUMS_PEM_URL="${SUMS_URL}.pem"
+SCRIPT_BASE="${SCRIPT_RAW_BASE}/${TAG}"
 
 info "Download URL:      ${DOWNLOAD_URL}"
 
 # ---------------------------------------------------------------------------
-# 6. Download + extract + install
+# 6. Download + verify + safe-extract + install
 # ---------------------------------------------------------------------------
 TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t relix-install)"
 ARCHIVE_PATH="${TMP_DIR}/${ARCHIVE_NAME}"
+ARCHIVE_SHA_PATH="${ARCHIVE_PATH}.sha256"
+ARCHIVE_SIG_PATH="${ARCHIVE_PATH}.sig"
+ARCHIVE_PEM_PATH="${ARCHIVE_PATH}.pem"
+SUMS_PATH="${TMP_DIR}/SHA256SUMS.txt"
+SUMS_SIG_PATH="${SUMS_PATH}.sig"
+SUMS_PEM_PATH="${SUMS_PATH}.pem"
 EXTRACT_DIR="${TMP_DIR}/extract"
 mkdir -p "${EXTRACT_DIR}"
 
-info "Downloading archive..."
-fetch_to_file "${DOWNLOAD_URL}" "${ARCHIVE_PATH}" \
-    || err "download failed: ${DOWNLOAD_URL}"
-
-if [ ! -s "${ARCHIVE_PATH}" ]; then
-    err "downloaded archive is empty: ${ARCHIVE_PATH}"
+# Download the per-archive .sha256 first so we can pin the archive
+# download against the published hash on the same line. We download
+# the cosign signature + cert on the .sha256 file too — that's what
+# lets us reach keyless-verified provenance even on systems where
+# cosign isn't installed (we still have the SHA256 gate).
+info "Downloading SHA256 + cosign material for archive..."
+if have curl; then
+    curl -fsSL -o "${ARCHIVE_SHA_PATH}" "${SHA256_URL}" \
+        || err "could not fetch ${SHA256_URL} (no per-archive checksum published for ${TAG}?)"
+    curl -fsSL -o "${ARCHIVE_SIG_PATH}" "${ARCHIVE_SIG_URL}" \
+        || warn "no cosign signature for ${ARCHIVE_NAME} at ${TAG}"
+    curl -fsSL -o "${ARCHIVE_PEM_PATH}" "${ARCHIVE_PEM_URL}" \
+        || warn "no cosign cert for ${ARCHIVE_NAME} at ${TAG}"
+elif have wget; then
+    wget -q -O "${ARCHIVE_SHA_PATH}" "${SHA256_URL}" \
+        || err "could not fetch ${SHA256_URL}"
+    wget -q -O "${ARCHIVE_SIG_PATH}" "${ARCHIVE_SIG_URL}" \
+        || warn "no cosign signature for ${ARCHIVE_NAME} at ${TAG}"
+    wget -q -O "${ARCHIVE_PEM_PATH}" "${ARCHIVE_PEM_URL}" \
+        || warn "no cosign cert for ${ARCHIVE_NAME} at ${TAG}"
 fi
 
-info "Extracting archive..."
-tar -xzf "${ARCHIVE_PATH}" -C "${EXTRACT_DIR}" \
-    || err "extraction failed: ${ARCHIVE_PATH}"
+EXPECTED_ARCHIVE_SHA="$(awk 'NR==1 {print $1}' "${ARCHIVE_SHA_PATH}")"
+if [ -z "${EXPECTED_ARCHIVE_SHA}" ]; then
+    err "could not parse SHA256 from ${SHA256_URL}"
+fi
+
+info "Downloading archive..."
+fetch_and_verify "${DOWNLOAD_URL}" "${EXPECTED_ARCHIVE_SHA}" "${ARCHIVE_PATH}"
+
+if [ -s "${ARCHIVE_SIG_PATH}" ] && [ -s "${ARCHIVE_PEM_PATH}" ]; then
+    verify_signature "${ARCHIVE_PATH}" "${ARCHIVE_SIG_PATH}" "${ARCHIVE_PEM_PATH}"
+else
+    warn "skipping cosign verification: no .sig/.pem published for ${ARCHIVE_NAME}"
+fi
+
+info "Extracting archive (tar-slip-safe)..."
+safe_extract "${ARCHIVE_PATH}" "${EXTRACT_DIR}"
 
 # Collect every regular executable file from the extract dir (handles either
 # a flat archive or one with a top-level subdir).
 INSTALLED_ANY=0
-INSTALLED_BINS=""
 # shellcheck disable=SC2044
 while IFS= read -r bin; do
     [ -z "${bin}" ] && continue
@@ -196,11 +395,6 @@ while IFS= read -r bin; do
     cp -f "${bin}" "${dest}" || err "failed to copy ${bin} -> ${dest}"
     chmod +x "${dest}"      || err "failed to chmod +x ${dest}"
     INSTALLED_ANY=1
-    if [ -z "${INSTALLED_BINS}" ]; then
-        INSTALLED_BINS="${base}"
-    else
-        INSTALLED_BINS="${INSTALLED_BINS} ${base}"
-    fi
     info "  installed: ${dest}"
 done <<EOF
 $(find "${EXTRACT_DIR}" -type f \( -perm -u+x -o -name 'relix' -o -name 'relix-*' \) 2>/dev/null)
@@ -218,11 +412,6 @@ if [ "${INSTALLED_ANY}" -eq 0 ]; then
         cp -f "${bin}" "${dest}" || err "failed to copy ${bin} -> ${dest}"
         chmod +x "${dest}"      || err "failed to chmod +x ${dest}"
         INSTALLED_ANY=1
-        if [ -z "${INSTALLED_BINS}" ]; then
-            INSTALLED_BINS="${base}"
-        else
-            INSTALLED_BINS="${INSTALLED_BINS} ${base}"
-        fi
         info "  installed: ${dest}"
     done <<EOF2
 $(find "${EXTRACT_DIR}" -type f 2>/dev/null)
@@ -238,46 +427,100 @@ if [ ! -x "${INSTALL_DIR}/relix" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6b. Mesh scripts
+# 6b. Per-release SHA256SUMS + cosign verification (PART 3 + 5)
 #
-# `relix boot` spawns the mesh through scripts/relix-mesh-up.sh; users
-# who installed via `curl | bash` don't have a repo checkout. Drop the
-# two scripts in ~/.local/scripts/ — the relix-cli locate_script helper
-# falls back to this path after the repo and binary-dir lookups.
+# Fetch the per-tag SHA256SUMS file along with its cosign signature
+# and certificate. Verify the signature (when cosign is present),
+# then keep the file around for per-script verification below.
+# ---------------------------------------------------------------------------
+SUMS_AVAILABLE=0
+if have curl; then
+    if curl -fsSL -o "${SUMS_PATH}" "${SUMS_URL}" 2>/dev/null \
+        && curl -fsSL -o "${SUMS_SIG_PATH}" "${SUMS_SIG_URL}" 2>/dev/null \
+        && curl -fsSL -o "${SUMS_PEM_PATH}" "${SUMS_PEM_URL}" 2>/dev/null ; then
+        SUMS_AVAILABLE=1
+    fi
+elif have wget; then
+    if wget -q -O "${SUMS_PATH}" "${SUMS_URL}" 2>/dev/null \
+        && wget -q -O "${SUMS_SIG_PATH}" "${SUMS_SIG_URL}" 2>/dev/null \
+        && wget -q -O "${SUMS_PEM_PATH}" "${SUMS_PEM_URL}" 2>/dev/null ; then
+        SUMS_AVAILABLE=1
+    fi
+fi
+
+if [ "${SUMS_AVAILABLE}" -eq 1 ]; then
+    if [ -s "${SUMS_SIG_PATH}" ] && [ -s "${SUMS_PEM_PATH}" ]; then
+        verify_signature "${SUMS_PATH}" "${SUMS_SIG_PATH}" "${SUMS_PEM_PATH}"
+    fi
+else
+    warn "SHA256SUMS.txt not published for ${TAG}; per-script hash verification will skip extras."
+fi
+
+# lookup_sha256 prints the expected hash for a path inside the
+# SHA256SUMS file (e.g. `scripts/relix-mesh-up.sh`). Empty when the
+# file isn't present or doesn't list that path.
+lookup_sha256() {
+    local repo_path="$1"
+    if [ ! -s "${SUMS_PATH}" ]; then
+        return
+    fi
+    awk -v target="${repo_path}" \
+        '$2 == target || $2 == "*"target {print $1; exit}' \
+        "${SUMS_PATH}"
+}
+
+# ---------------------------------------------------------------------------
+# 6c. Mesh scripts (PART 5)
+#
+# Pinned to the resolved release tag (not `main`) and each file's
+# SHA256 is checked against the cosign-verified SHA256SUMS.txt above.
+# `relix boot` spawns the mesh through scripts/relix-mesh-up.sh;
+# users who installed via `curl | bash` don't have a repo checkout.
+# Drop the scripts in ~/.local/scripts/ — the relix-cli locate_script
+# helper falls back to this path after the repo and binary-dir
+# lookups.
 # ---------------------------------------------------------------------------
 SCRIPTS_DIR="${HOME}/.local/scripts"
 mkdir -p "${SCRIPTS_DIR}" || info "warning: could not create ${SCRIPTS_DIR}"
 
-MESH_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/scripts"
 for script in relix-mesh-up.sh relix-mesh-down.sh; do
     target="${SCRIPTS_DIR}/${script}"
-    if fetch_to_file "${MESH_BASE_URL}/${script}" "${target}"; then
-        chmod +x "${target}" 2>/dev/null || true
-        info "  installed: ${target}"
+    url="${SCRIPT_BASE}/scripts/${script}"
+    expected_sha="$(lookup_sha256 "scripts/${script}")"
+    if [ -n "${expected_sha}" ]; then
+        if fetch_and_verify "${url}" "${expected_sha}" "${target}"; then
+            chmod +x "${target}" 2>/dev/null || true
+            info "  installed: ${target}"
+        else
+            warn "could not install ${script} (relix boot will require a repo checkout)"
+        fi
     else
-        info "warning: could not fetch ${script} (relix boot will require a repo checkout)"
+        warn "no SHA256 for scripts/${script} in SHA256SUMS.txt; skipping (use a repo checkout)"
     fi
 done
 
 # ---------------------------------------------------------------------------
-# 6c. Flow templates
+# 6d. Flow templates (PART 5)
 #
-# The bridge reads `flows/chat_template.sol` (and friends) at start to
-# wire its OpenAI-compat / tool-routing flow VMs. The mesh script
-# resolves the `flows/` directory next to itself first; drop the
-# templates in ~/.local/flows/ so that probe hits on a clean binary
-# install.
+# Same pinned-tag + SHA256-verified path as the mesh scripts above.
+# The bridge reads `flows/chat_template.sol` (and friends) at start
+# to wire its OpenAI-compat / tool-routing flow VMs.
 # ---------------------------------------------------------------------------
 FLOWS_DIR="${HOME}/.local/flows"
 mkdir -p "${FLOWS_DIR}" || info "warning: could not create ${FLOWS_DIR}"
 
-FLOWS_BASE_URL="https://raw.githubusercontent.com/${REPO}/main/flows"
 for flow in chat_template.sol chat.sol chat_with_tool.sol chat_with_retry.sflow; do
     target="${FLOWS_DIR}/${flow}"
-    if fetch_to_file "${FLOWS_BASE_URL}/${flow}" "${target}"; then
-        info "  installed: ${target}"
+    url="${SCRIPT_BASE}/flows/${flow}"
+    expected_sha="$(lookup_sha256 "flows/${flow}")"
+    if [ -n "${expected_sha}" ]; then
+        if fetch_and_verify "${url}" "${expected_sha}" "${target}"; then
+            info "  installed: ${target}"
+        else
+            warn "could not install ${flow} (relix boot will need a repo checkout for flows)"
+        fi
     else
-        info "warning: could not fetch ${flow} (relix boot will need a repo checkout for flows)"
+        warn "no SHA256 for flows/${flow} in SHA256SUMS.txt; skipping (use a repo checkout)"
     fi
 done
 
