@@ -21,6 +21,7 @@ use relix_runtime::dispatch::{build_request_with_tenant, decode_response};
 use relix_runtime::transport::envelope::ResponseResult;
 
 use crate::config::AppState;
+use crate::tenant::SubjectError;
 
 const DEFAULT_PEER: &str = "coordinator";
 
@@ -117,7 +118,11 @@ pub async fn send(
     State(state): State<AppState>,
     Json(req): Json<SendRequest>,
 ) -> Result<Json<SendResponse>, (StatusCode, Json<ApiError>)> {
-    let from = require_field(&req.from_subject_id, "from_subject_id")?;
+    // GROUP 1 PHASE 1A: the sender is the AUTHENTICATED caller —
+    // never the body's `from_subject_id`. A body value that
+    // disagrees with the authenticated subject is a spoof
+    // attempt → 403.
+    let from = require_caller_subject(req.from_subject_id.as_deref())?;
     let to = require_field(&req.to_subject_id, "to_subject_id")?;
     let body = require_field(&req.body, "body")?;
     let subject = req.subject.unwrap_or_default();
@@ -162,6 +167,10 @@ pub async fn inbox(
     Path(subject_id): Path<String>,
     Query(q): Query<InboxQuery>,
 ) -> Result<Json<MessageListResponse>, (StatusCode, Json<ApiError>)> {
+    // GROUP 1 PHASE 1A: a caller may only read their OWN inbox.
+    // The subject is the authenticated caller; the path segment
+    // may only agree with it (or it's a spoof attempt → 403).
+    let subject_id = require_caller_subject(Some(&subject_id))?;
     let limit = q.limit.unwrap_or(20);
     let include_read = q.include_read.unwrap_or(0);
     let since = q.since_message_id.unwrap_or_default();
@@ -177,7 +186,9 @@ pub async fn read(
     Path(message_id): Path<String>,
     Json(req): Json<ReadRequest>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
-    let reader = require_field(&req.reader_subject_id, "reader_subject_id")?;
+    // GROUP 1 PHASE 1A: the reader is the AUTHENTICATED caller —
+    // a caller may only mark their OWN messages read.
+    let reader = require_caller_subject(req.reader_subject_id.as_deref())?;
     if reader.contains('|') || message_id.contains('|') {
         return Err(bad("ids must not contain `|`".into()));
     }
@@ -191,7 +202,9 @@ pub async fn thread(
     Path(thread_id): Path<String>,
     Query(q): Query<ThreadQuery>,
 ) -> Result<Json<ThreadResponse>, (StatusCode, Json<ApiError>)> {
-    let subject = require_field(&q.subject_id, "subject_id")?;
+    // GROUP 1 PHASE 1A: thread reads are scoped to the
+    // AUTHENTICATED caller's subject, never a wire-supplied one.
+    let subject = require_caller_subject(q.subject_id.as_deref())?;
     if subject.contains('|') || thread_id.contains('|') {
         return Err(bad("ids must not contain `|`".into()));
     }
@@ -209,7 +222,9 @@ pub async fn delete(
     Path(message_id): Path<String>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
-    let subject = require_field(&req.subject_id, "subject_id")?;
+    // GROUP 1 PHASE 1A: a caller may only delete their OWN
+    // messages; the subject is the authenticated caller.
+    let subject = require_caller_subject(req.subject_id.as_deref())?;
     if subject.contains('|') || message_id.contains('|') {
         return Err(bad("ids must not contain `|`".into()));
     }
@@ -255,6 +270,44 @@ fn require_field(v: &Option<String>, name: &str) -> Result<String, (StatusCode, 
         return Err(bad(format!("{name} is required")));
     }
     Ok(s.to_string())
+}
+
+/// GROUP 1 PHASE 1A: resolve the authenticated caller subject for
+/// an identity-bound message operation, mapping the auth failure
+/// to this module's HTTP error shape. Identity comes from the
+/// authenticated principal channel ([`crate::tenant::current_subject`]),
+/// never from the request body; a body/path claim may only agree
+/// with it.
+fn require_caller_subject(
+    body_claim: Option<&str>,
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    crate::tenant::require_caller_subject(body_claim).map_err(subject_err)
+}
+
+fn subject_err(e: SubjectError) -> (StatusCode, Json<ApiError>) {
+    match e {
+        SubjectError::Unauthenticated => (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "caller subject not authenticated; the bridge derives identity \
+                        from the authenticated X-Relix-Subject principal channel, not \
+                        the request body"
+                    .into(),
+            }),
+        ),
+        SubjectError::Forbidden {
+            claimed,
+            authenticated,
+        } => (
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: format!(
+                    "subject `{claimed}` does not match the authenticated caller \
+                     `{authenticated}`; a caller may only act as themselves"
+                ),
+            }),
+        ),
+    }
 }
 
 fn bad(msg: String) -> (StatusCode, Json<ApiError>) {

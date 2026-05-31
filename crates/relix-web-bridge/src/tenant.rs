@@ -76,6 +76,100 @@ pub fn current_tenant() -> Option<String> {
     CURRENT_TENANT.try_with(|t| t.clone()).ok()
 }
 
+tokio::task_local! {
+    /// GROUP 1 PHASE 1A — the authenticated caller's subject id
+    /// for this request, resolved by [`tenant_middleware`] from
+    /// the [`SUBJECT_HEADER`] principal header. This is the
+    /// AUTHENTICATED principal channel — the same trust boundary
+    /// as the bearer token and `X-Relix-Tenant` — and is the ONLY
+    /// source of caller identity. Handlers MUST derive
+    /// `from_subject_id` / `reader_subject_id` / `subject_id` from
+    /// here via [`require_caller_subject`], never from the request
+    /// body or path, so an authenticated caller can only act as
+    /// themselves. `None` when no subject header was presented (or
+    /// when called outside the middleware scope, e.g. direct test
+    /// calls that don't set it).
+    pub static CURRENT_SUBJECT: Option<String>;
+}
+
+/// GROUP 1 PHASE 1A — header carrying the authenticated caller's
+/// subject id. Set by the authenticated session / front-end layer
+/// (the principal channel), NEVER read from the request body. The
+/// request body is the untrusted user-content channel; mixing
+/// identity into it let any authenticated caller spoof any sender
+/// and read or delete another user's messages.
+pub const SUBJECT_HEADER: &str = "x-relix-subject";
+
+/// Maximum accepted length of a subject id from the header.
+pub const MAX_SUBJECT_LEN: usize = 256;
+
+/// GROUP 1 PHASE 1A — read the authenticated caller subject bound
+/// by the middleware for this request. `None` when absent.
+pub fn current_subject() -> Option<String> {
+    CURRENT_SUBJECT.try_with(|s| s.clone()).ok().flatten()
+}
+
+/// Parse + sanitise the [`SUBJECT_HEADER`] off the request
+/// headers. Returns `None` for missing / empty / over-long /
+/// non-ASCII-graphic values so a malformed header is treated as
+/// "no authenticated subject" (fail closed downstream).
+pub fn caller_subject_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(SUBJECT_HEADER)?.to_str().ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_SUBJECT_LEN
+        || !trimmed.chars().all(|c| c.is_ascii_graphic())
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// GROUP 1 PHASE 1A — failure modes when reconciling a body /
+/// path subject claim against the authenticated caller subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectError {
+    /// No authenticated caller subject is available for this
+    /// request — identity cannot be enforced, so fail closed
+    /// (HTTP 401) rather than trusting the body.
+    Unauthenticated,
+    /// The body/path asserted a subject that is NOT the
+    /// authenticated caller — a spoofing attempt (HTTP 403).
+    Forbidden {
+        claimed: String,
+        authenticated: String,
+    },
+}
+
+/// GROUP 1 PHASE 1A — resolve the caller's subject id for an
+/// identity-bound operation.
+///
+/// Identity ALWAYS comes from the authenticated principal channel
+/// ([`current_subject`]); the optional `body_claim` (a
+/// `from_subject_id` / `reader_subject_id` / `subject_id` field or
+/// path segment supplied on the wire) may only AGREE with it:
+/// - no authenticated subject            → `Err(Unauthenticated)`
+/// - body claims a DIFFERENT subject     → `Err(Forbidden)`
+/// - body omits, or matches, the subject → `Ok(authenticated)`
+///
+/// A caller can therefore only ever act as themselves; the body
+/// can never override or widen the authenticated identity.
+pub fn require_caller_subject(body_claim: Option<&str>) -> Result<String, SubjectError> {
+    let authed = current_subject()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or(SubjectError::Unauthenticated)?;
+    if let Some(claim) = body_claim.map(str::trim).filter(|c| !c.is_empty())
+        && claim != authed
+    {
+        return Err(SubjectError::Forbidden {
+            claimed: claim.to_string(),
+            authenticated: authed,
+        });
+    }
+    Ok(authed)
+}
+
 /// PART 3 — same as [`current_tenant`] but filters out the
 /// single-tenant sentinel so callers can pass
 /// `Option<&str>` directly to
@@ -350,6 +444,13 @@ pub async fn tenant_middleware(
         .clone()
         .unwrap_or_else(|| DEFAULT_TENANT.to_string());
     req.extensions_mut().insert(TenantId(scope_value.clone()));
+    // GROUP 1 PHASE 1A — resolve the authenticated caller
+    // subject from the principal header BEFORE running the
+    // handler, and bind it as a task-local. Identity-bound
+    // handlers read it via `require_caller_subject` so caller
+    // identity comes from the authenticated channel, never the
+    // request body.
+    let caller_subject = caller_subject_from_headers(req.headers());
     // PART 3 — bind the resolved tenant as a task-local so
     // every downstream wrapper (`call_peer_*`, `proxy_json`,
     // …) can read it without the handler having to thread
@@ -358,7 +459,12 @@ pub async fn tenant_middleware(
     // handler awaits a mesh call, the wrapper inside reads
     // `current_tenant()` and stamps it onto the envelope via
     // `build_request_with_tenant`.
-    let mut resp = CURRENT_TENANT.scope(scope_value, next.run(req)).await;
+    let mut resp = CURRENT_TENANT
+        .scope(
+            scope_value,
+            CURRENT_SUBJECT.scope(caller_subject, next.run(req)),
+        )
+        .await;
     if let Ok(v) = axum::http::HeaderValue::from_str(&header_echo) {
         resp.headers_mut().insert("x-relix-tenant", v);
     }
@@ -510,6 +616,85 @@ mod tests {
             "Bearer abcdef".parse().unwrap(),
         );
         assert_eq!(extract_bearer_from_headers(&h), Some("abcdef"));
+    }
+
+    // ── GROUP 1 PHASE 1A: authenticated-caller-subject gate ──
+    //
+    // `require_caller_subject` is the gate EVERY identity-bound
+    // handler (messaging send / inbox / read / thread / delete,
+    // and the swept siblings) now calls as its first line. These
+    // tests exercise it directly under the same `CURRENT_SUBJECT`
+    // scope the middleware binds, so they prove the handler
+    // behaviour without standing up a full AppState + mesh.
+
+    #[tokio::test]
+    async fn phase1a_caller_authed_as_a_cannot_act_as_b() {
+        // Caller authenticated as subject "A". A body/path that
+        // claims subject "B" (spoof) → Forbidden, which the
+        // handlers surface as HTTP 403. This is the send-as-B,
+        // read-B's-inbox, delete-B's-message attack.
+        let out = CURRENT_SUBJECT
+            .scope(Some("A".to_string()), async {
+                require_caller_subject(Some("B"))
+            })
+            .await;
+        assert_eq!(
+            out,
+            Err(SubjectError::Forbidden {
+                claimed: "B".to_string(),
+                authenticated: "A".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn phase1a_legitimate_caller_acts_as_self() {
+        // Subject A sending as A / reading A's own messages: the
+        // body either omits the subject or names A. Both resolve
+        // to A — admitted.
+        let claimed_self = CURRENT_SUBJECT
+            .scope(Some("A".to_string()), async {
+                require_caller_subject(Some("A"))
+            })
+            .await;
+        assert_eq!(claimed_self, Ok("A".to_string()));
+
+        let omitted = CURRENT_SUBJECT
+            .scope(Some("A".to_string()), async {
+                require_caller_subject(None)
+            })
+            .await;
+        assert_eq!(omitted, Ok("A".to_string()));
+    }
+
+    #[tokio::test]
+    async fn phase1a_no_authenticated_subject_fails_closed() {
+        // No principal header bound → identity cannot be enforced,
+        // so the gate fails closed (HTTP 401) rather than trusting
+        // the body's claim.
+        let bound_none = CURRENT_SUBJECT
+            .scope(None, async { require_caller_subject(Some("A")) })
+            .await;
+        assert_eq!(bound_none, Err(SubjectError::Unauthenticated));
+        // Outside any middleware scope, also unauthenticated.
+        assert_eq!(
+            require_caller_subject(Some("A")),
+            Err(SubjectError::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn phase1a_subject_header_parsing_sanitises() {
+        let mut h = HeaderMap::new();
+        assert!(caller_subject_from_headers(&h).is_none());
+        h.insert(SUBJECT_HEADER, "  subj-1  ".parse().unwrap());
+        assert_eq!(caller_subject_from_headers(&h).as_deref(), Some("subj-1"));
+        // Empty / whitespace-only → None.
+        h.insert(SUBJECT_HEADER, "   ".parse().unwrap());
+        assert!(caller_subject_from_headers(&h).is_none());
+        // Non-ASCII-graphic (control chars / spaces inside) → None.
+        h.insert(SUBJECT_HEADER, "a b".parse().unwrap());
+        assert!(caller_subject_from_headers(&h).is_none());
     }
 
     #[tokio::test]

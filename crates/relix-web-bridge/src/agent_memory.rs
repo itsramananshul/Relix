@@ -67,15 +67,33 @@ pub async fn agent_memory(
     State(state): State<AppState>,
     Query(q): Query<AgentMemoryQuery>,
 ) -> Result<Json<AgentMemoryResponse>, (StatusCode, Json<ApiError>)> {
-    let subject_id = q.subject_id.trim().to_string();
-    if subject_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: "subject_id query param required".into(),
-            }),
-        ));
-    }
+    // GROUP 1 PHASE 1A: a caller may only read their OWN agent /
+    // user memory. The subject is the AUTHENTICATED caller; the
+    // query `subject_id` may only agree with it (else it is a
+    // spoof attempt to read another subject's private memory →
+    // 403). Identity comes from the authenticated principal
+    // channel, never the query string.
+    let subject_id = crate::tenant::require_caller_subject(Some(&q.subject_id)).map_err(|e| {
+        let (code, msg) = match e {
+            crate::tenant::SubjectError::Unauthenticated => (
+                StatusCode::UNAUTHORIZED,
+                "caller subject not authenticated; identity is derived from the \
+                 X-Relix-Subject principal channel, not the query string"
+                    .to_string(),
+            ),
+            crate::tenant::SubjectError::Forbidden {
+                claimed,
+                authenticated,
+            } => (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "subject `{claimed}` does not match authenticated caller \
+                     `{authenticated}`; a caller may only read their own memory"
+                ),
+            ),
+        };
+        (code, Json(ApiError { error: msg }))
+    })?;
     let peer = q.peer.as_deref().unwrap_or(DEFAULT_PEER).to_string();
     let body = call_peer_bytes(&state, &peer, "memory.agent_read", subject_id.as_bytes()).await?;
     let (agent_memory, user_memory) = parse_body(&body).ok_or((
