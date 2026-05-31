@@ -507,7 +507,46 @@ impl BudgetEnforcer {
         action: BudgetAction,
         entry: CacheEntry,
     ) -> Option<BudgetDecision> {
-        let limit_micros = (limit_usd * 1_000_000.0).max(0.0) as u64;
+        // SEC PART 6: an `f64::NAN` or `f64::INFINITY` cast
+        // straight to u64 is undefined behaviour in older
+        // compiler versions and silently produces 0 / u64::MAX
+        // in current ones — either way the operator loses
+        // their cap. FAIL CLOSED: synthesise a Reject decision
+        // with an InvalidLimit cause so the call doesn't slip
+        // through unlimited and the bad-config error is
+        // visible to the caller.
+        if limit_usd.is_nan() || limit_usd.is_infinite() {
+            tracing::warn!(
+                ?agent,
+                limit_usd,
+                "budget enforcer: NaN/inf limit — rejecting all calls in this window",
+            );
+            let breach = BudgetBreach {
+                agent: agent.unwrap_or("").to_string(),
+                window: window.as_str().to_string(),
+                scope: scope.to_string(),
+                limit_micros: 0,
+                actual_micros: entry.cost_micros,
+                resets_at_ms: entry.window_end_ms,
+                cause: format!(
+                    "budget: invalid limit for {scope}{label} {window_lbl} window: \
+                     {limit_usd:?} (NaN or infinite — operator must set a finite USD value)",
+                    label = agent.map(|a| format!(" {a}")).unwrap_or_default(),
+                    window_lbl = window.as_str(),
+                ),
+            };
+            return Some(BudgetDecision::Reject { info: breach });
+        }
+        let limit_micros_f = (limit_usd * 1_000_000.0).max(0.0);
+        // Saturate the post-multiply value via try_from to
+        // avoid wrap-around when limit_usd is implausibly
+        // large (e.g. f64::MAX → multiply overflows the i64
+        // mantissa).
+        let limit_micros = if limit_micros_f >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            limit_micros_f as u64
+        };
         let crossed = entry.cost_micros >= limit_micros && limit_micros > 0;
         let key = match agent {
             Some(a) => (format!("agent:{a}"), window),
@@ -603,10 +642,16 @@ impl BudgetEnforcer {
         let now = now_ms();
         let (window_start, window_end) = window.window_bounds_ms();
         // Fast path — fresh cache, same window.
+        // SEC PART 6: `as_millis()` returns u128. Saturate to
+        // i64::MAX via try_from so an operator-configured
+        // `Duration::MAX` cache_refresh doesn't wrap to a
+        // negative value and short-circuit the freshness check.
+        let cache_refresh_ms =
+            i64::try_from(self.inner.cache_refresh.as_millis()).unwrap_or(i64::MAX);
         if let Ok(g) = self.inner.cache.lock()
             && let Some(entry) = g.get(&key)
             && entry.window_start_ms == window_start
-            && (now - entry.refreshed_at_ms) < self.inner.cache_refresh.as_millis() as i64
+            && (now - entry.refreshed_at_ms) < cache_refresh_ms
         {
             return *entry;
         }
@@ -1006,6 +1051,36 @@ mod tests {
             Some(BudgetAction::AlertOnly)
         );
         assert_eq!(BudgetAction::parse("nope"), None);
+    }
+
+    #[test]
+    fn nan_limit_rejects_calls_instead_of_silently_unlimited() {
+        // SEC PART 6: an operator who fat-fingers a TOML
+        // limit to NaN (e.g. `daily_limit_usd = nan` from a
+        // templater) should NOT get an unlimited budget. The
+        // call must fail closed with a clear cause.
+        let enf = enforcer_with_agent("alice", Some(f64::NAN), None, BudgetAction::Reject);
+        enf.set_cached_for_test("agent:alice", Window::Daily, 100);
+        match enf.check("alice", "ai.chat") {
+            BudgetDecision::Reject { info } => {
+                assert!(
+                    info.cause.contains("NaN") || info.cause.contains("infinite"),
+                    "expected NaN/infinite mention, got: {}",
+                    info.cause
+                );
+            }
+            other => panic!("expected Reject for NaN limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn infinite_limit_rejects_calls_instead_of_silently_unlimited() {
+        let enf = enforcer_with_agent("alice", Some(f64::INFINITY), None, BudgetAction::Reject);
+        enf.set_cached_for_test("agent:alice", Window::Daily, 100);
+        assert!(matches!(
+            enf.check("alice", "ai.chat"),
+            BudgetDecision::Reject { .. }
+        ));
     }
 
     #[test]

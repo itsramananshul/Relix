@@ -145,7 +145,10 @@ impl AuditLog {
         status: AuditStatus,
         error_kind: Option<u32>,
     ) -> Result<(), AuditError> {
-        let latency_ms = draft.started_at.elapsed().as_millis() as u64;
+        // SEC PART 6: `as_millis()` returns u128; cast via
+        // `try_from` so a 584-million-year request saturates
+        // to u64::MAX instead of silently truncating.
+        let latency_ms = u64::try_from(draft.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let ts = Timestamp::now();
         let status_str = match status {
             AuditStatus::Ok => "ok",

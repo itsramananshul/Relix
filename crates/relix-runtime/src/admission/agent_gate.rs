@@ -552,7 +552,9 @@ mod tests {
             mv: 1,
             args: ByteBuf::new(),
             identity_bundle: dummy_bundle(),
-            deadline: Timestamp::now().add_secs(30),
+            deadline: Timestamp::now()
+                .add_secs(30)
+                .expect("test clock not at i64::MAX"),
             surface: surface.map(|s| s.to_string()),
             approval_token: None,
             task_id: None,

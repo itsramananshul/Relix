@@ -144,18 +144,46 @@ impl Timestamp {
     /// Current wall-clock time. NOT for use inside SOL flows — SOL uses the
     /// deterministic `Time.now()` capability (RELIX-7 §7.11). This is fine for
     /// audit and bundle issuance timestamps.
+    ///
+    /// SEC PART 6: panics if the system clock is before the Unix epoch.
+    /// Silently returning `1970-01-01` (the prior behaviour) caused
+    /// impossible-to-debug downstream comparisons; failing loud surfaces the
+    /// real fault — a misconfigured clock — at boot.
     pub fn now() -> Self {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // SEC PART 6: panic explicitly when the system clock is
+        // pre-epoch — never silently return `1970-01-01`. The
+        // `expect`/`unwrap` paths are forbidden by the
+        // relix-core clippy posture, so we pattern-match and
+        // panic with the documented message.
+        let dur = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d,
+            Err(_) => panic!("system clock is before the Unix epoch — check your system clock"),
+        };
+        // `as_secs()` returns u64; convert via try_from so a clock past
+        // i64::MAX (≈year 292277026596) saturates instead of silently
+        // wrapping to a negative timestamp.
+        let secs = i64::try_from(dur.as_secs()).unwrap_or(i64::MAX);
         Self(secs)
     }
 
-    /// Add a duration in seconds.
-    pub fn add_secs(self, secs: i64) -> Self {
-        Self(self.0 + secs)
+    /// SEC PART 6: checked add. Returns `ArithmeticOverflow`
+    /// when `self.0 + secs` would wrap.
+    pub fn add_secs(self, secs: i64) -> Result<Self, TimestampError> {
+        let v = self
+            .0
+            .checked_add(secs)
+            .ok_or(TimestampError::ArithmeticOverflow)?;
+        Ok(Self(v))
     }
+}
+
+/// Errors that can arise when arithmetic on a [`Timestamp`]
+/// would overflow `i64`.
+#[derive(Debug, thiserror::Error)]
+pub enum TimestampError {
+    /// `Timestamp::add_secs` overflowed.
+    #[error("timestamp arithmetic overflow")]
+    ArithmeticOverflow,
 }
 
 /// Error envelope returned by `/relix/rpc/1` per RELIX-1 §1.6.
@@ -240,7 +268,18 @@ mod tests {
     #[test]
     fn timestamp_addition() {
         let t = Timestamp(1000);
-        assert_eq!(t.add_secs(5).0, 1005);
+        assert_eq!(t.add_secs(5).unwrap().0, 1005);
+    }
+
+    #[test]
+    fn timestamp_add_secs_overflow_returns_error() {
+        // SEC PART 6: i64::MAX + 1 must surface as
+        // ArithmeticOverflow, not silently wrap.
+        let t = Timestamp(i64::MAX);
+        match t.add_secs(1) {
+            Err(TimestampError::ArithmeticOverflow) => {}
+            Ok(v) => panic!("expected ArithmeticOverflow, got Ok({})", v.0),
+        }
     }
 
     #[test]

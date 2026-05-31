@@ -181,7 +181,11 @@ impl EventLog {
             .map_err(|e| EventLogError::Io(e.to_string()))?;
 
         self.last_hash = codec::content_hash(&record_bytes);
-        self.next_seq = seq + 1;
+        // SEC PART 6: checked increment. A flow that somehow
+        // accumulated u64::MAX events deserves a hard error
+        // rather than a silent wrap to 0 (which would let a
+        // subsequent append collide with seq 0's hash chain).
+        self.next_seq = seq.checked_add(1).ok_or(EventLogError::SequenceOverflow)?;
         Ok(seq)
     }
 
@@ -296,6 +300,12 @@ pub enum EventLogError {
     /// Integrity check failure (hash chain or signature).
     #[error("integrity: {0}")]
     Integrity(String),
+    /// SEC PART 6: `next_seq + 1` overflowed `u64::MAX`.
+    /// Never reachable in practice — a flow would have to
+    /// accumulate 2^64 events — but a silent wrap would
+    /// collide hash-chain links with the genesis record.
+    #[error("event sequence overflow at u64::MAX")]
+    SequenceOverflow,
 }
 
 #[cfg(test)]
@@ -384,6 +394,30 @@ mod tests {
             | EventLogError::TornWrite(_) => {}
             other => panic!("unexpected error kind: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sequence_overflow_returns_error_not_silent_wrap() {
+        // SEC PART 6: force the in-memory next_seq to
+        // u64::MAX; the next append must fail with
+        // SequenceOverflow instead of wrapping to 0 (which
+        // would let it collide with the genesis record's
+        // hash-chain link).
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("flow.log");
+        let flow = FlowId::new();
+        let key = fresh_key();
+        let mut log = EventLog::open(&path, flow, key.clone()).expect("open");
+        // Reach into the in-memory state — there's no
+        // append-2^64-events shortcut.
+        log.next_seq = u64::MAX;
+        let err = log
+            .append(EventType::FlowStarted, b"x".to_vec())
+            .expect_err("must overflow");
+        assert!(
+            matches!(err, EventLogError::SequenceOverflow),
+            "got {err:?}"
+        );
     }
 
     #[test]

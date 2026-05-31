@@ -77,7 +77,7 @@ pub fn issue_identity(
         &org_root_signing_key.verifying_key(),
         BundleType::Identity,
         lifetime_secs,
-    );
+    )?;
     let payload_bytes = codec::encode(&payload)?;
     let bundle = Bundle::sign(header, payload_bytes, org_root_signing_key)?;
     Ok(bundle)

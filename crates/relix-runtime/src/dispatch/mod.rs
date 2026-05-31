@@ -2551,7 +2551,12 @@ pub fn build_request_with_surface(
         mv: 1,
         args: ByteBuf::from(args),
         identity_bundle: identity,
-        deadline: Timestamp::now().add_secs(deadline_secs_from_now),
+        // SEC PART 6: saturate on overflow. A deadline at
+        // i64::MAX is effectively "no deadline" — safer than
+        // wrapping into the past and causing instant timeouts.
+        deadline: Timestamp::now()
+            .add_secs(deadline_secs_from_now)
+            .unwrap_or(Timestamp(i64::MAX)),
         surface,
         approval_token,
         task_id,
@@ -2585,7 +2590,12 @@ pub fn build_request_with_tenant(
         mv: 1,
         args: ByteBuf::from(args),
         identity_bundle: identity,
-        deadline: Timestamp::now().add_secs(deadline_secs_from_now),
+        // SEC PART 6: saturate on overflow. A deadline at
+        // i64::MAX is effectively "no deadline" — safer than
+        // wrapping into the past and causing instant timeouts.
+        deadline: Timestamp::now()
+            .add_secs(deadline_secs_from_now)
+            .unwrap_or(Timestamp(i64::MAX)),
         surface,
         approval_token,
         task_id,

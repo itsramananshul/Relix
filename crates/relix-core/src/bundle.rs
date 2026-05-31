@@ -170,10 +170,18 @@ impl Bundle {
             });
         }
         const SKEW_SECS: i64 = 30;
-        if now_unix_secs + SKEW_SECS < self.header.not_before {
+        // SEC PART 6: checked arithmetic — a `now` at i64::MAX
+        // would otherwise wrap and silently flip the comparison.
+        let plus_skew = now_unix_secs
+            .checked_add(SKEW_SECS)
+            .ok_or(BundleError::ArithmeticOverflow)?;
+        if plus_skew < self.header.not_before {
             return Err(BundleError::NotYetValid);
         }
-        if now_unix_secs - SKEW_SECS > self.header.not_after {
+        let minus_skew = now_unix_secs
+            .checked_sub(SKEW_SECS)
+            .ok_or(BundleError::ArithmeticOverflow)?;
+        if minus_skew > self.header.not_after {
             return Err(BundleError::Expired);
         }
         self.verify_signature(issuer_pubkey)?;
@@ -182,29 +190,40 @@ impl Bundle {
 }
 
 /// Convenience: construct a header populated with `now()`-based timestamps and
-/// a random `bundle_serial`.
+/// a random `bundle_serial`. Returns `BundleError::ArithmeticOverflow` if the
+/// `now ± skew` or `now + lifetime_secs` calculation would silently wrap in
+/// release mode (only reachable with pathological `lifetime_secs` values or a
+/// system clock at i64::MAX — both deserve a hard error).
 pub fn make_header(
     issuer_pubkey: &VerifyingKey,
     bundle_type: BundleType,
     lifetime_secs: i64,
-) -> BundleHeader {
+) -> Result<BundleHeader, BundleError> {
     use rand::RngCore;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0);
+    // SEC PART 6: checked arithmetic. The 30s skew + caller-
+    // supplied lifetime is normally tiny, but a pathological
+    // input (or a clock at i64::MAX) must surface as an error
+    // instead of silently wrapping.
+    let not_before = now.checked_sub(30).ok_or(BundleError::ArithmeticOverflow)?;
+    let not_after = now
+        .checked_add(lifetime_secs)
+        .ok_or(BundleError::ArithmeticOverflow)?;
     let mut serial = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut serial);
-    BundleHeader {
+    Ok(BundleHeader {
         format_version: 1,
         alg: -8,
         kid: NodeId::from_pubkey(&issuer_pubkey.to_bytes()),
         bundle_type,
         issued_at: now,
-        not_before: now - 30,
-        not_after: now + lifetime_secs,
+        not_before,
+        not_after,
         bundle_serial: serial,
-    }
+    })
 }
 
 /// Bundle-layer errors.
@@ -239,6 +258,12 @@ pub enum BundleError {
     /// Bundle expired (now > not_after + skew).
     #[error("bundle expired")]
     Expired,
+    /// SEC PART 6: a `now ± lifetime` calculation in
+    /// `make_header` (or any future arithmetic on the
+    /// header timestamps) would silently wrap. Returned
+    /// instead of permitting an i64 overflow.
+    #[error("arithmetic overflow building bundle header")]
+    ArithmeticOverflow,
 }
 
 /// Stable wire alias — useful when bundles are written/read as serde maps and the
@@ -265,7 +290,7 @@ mod tests {
     #[test]
     fn sign_and_verify_roundtrip() {
         let key = fresh_key();
-        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600);
+        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600).unwrap();
         let payload = b"hello-payload".to_vec();
         let bundle = Bundle::sign(header, payload, &key).expect("sign");
         bundle
@@ -276,7 +301,7 @@ mod tests {
     #[test]
     fn tampered_payload_fails_verification() {
         let key = fresh_key();
-        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600);
+        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600).unwrap();
         let payload = b"original".to_vec();
         let mut bundle = Bundle::sign(header, payload, &key).expect("sign");
         bundle.payload = ByteBuf::from(b"tampered".to_vec());
@@ -290,7 +315,7 @@ mod tests {
     fn wrong_issuer_key_fails() {
         let key1 = fresh_key();
         let key2 = fresh_key();
-        let header = make_header(&key1.verifying_key(), BundleType::Identity, 3600);
+        let header = make_header(&key1.verifying_key(), BundleType::Identity, 3600).unwrap();
         let bundle = Bundle::sign(header, b"x".to_vec(), &key1).expect("sign");
         // Validate with key2's pubkey — must fail at KidMismatch (caught before sig check).
         let err = bundle
@@ -302,7 +327,7 @@ mod tests {
     #[test]
     fn expired_bundle_rejected() {
         let key = fresh_key();
-        let mut header = make_header(&key.verifying_key(), BundleType::Identity, 1);
+        let mut header = make_header(&key.verifying_key(), BundleType::Identity, 1).unwrap();
         // Set not_after to far in the past.
         header.not_after = now() - 10_000;
         let bundle = Bundle::sign(header, b"x".to_vec(), &key).expect("sign");
@@ -315,7 +340,7 @@ mod tests {
     #[test]
     fn wrong_type_rejected() {
         let key = fresh_key();
-        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600);
+        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600).unwrap();
         let bundle = Bundle::sign(header, b"x".to_vec(), &key).expect("sign");
         let err = bundle
             .validate(&key.verifying_key(), BundleType::PolicyBundle, now())
@@ -326,7 +351,7 @@ mod tests {
     #[test]
     fn bundle_id_is_stable() {
         let key = fresh_key();
-        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600);
+        let header = make_header(&key.verifying_key(), BundleType::Identity, 3600).unwrap();
         let bundle = Bundle::sign(header, b"x".to_vec(), &key).expect("sign");
         let a = bundle.bundle_id().expect("id1");
         let b = bundle.bundle_id().expect("id2");

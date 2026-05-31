@@ -61,8 +61,12 @@ pub fn next_delay_with_rng<R: Rng>(
     cap: Duration,
     prev: Duration,
 ) -> Duration {
-    let base_ms = base.as_millis() as u64;
-    let cap_ms = cap.as_millis() as u64;
+    // SEC PART 6: `Duration::as_millis()` returns u128;
+    // saturate via try_from so a pathological caller-supplied
+    // `Duration::MAX` (≈584 million years) doesn't wrap to a
+    // small ms value and then sample a tiny delay.
+    let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    let cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX);
     if cap_ms == 0 {
         return Duration::from_millis(0);
     }
@@ -70,7 +74,7 @@ pub fn next_delay_with_rng<R: Rng>(
     // a 10-minute prev * 3 still fits comfortably in u64 ms, but
     // pathological caller-supplied prev=u64::MAX would otherwise
     // wrap.
-    let prev_ms = prev.as_millis() as u64;
+    let prev_ms = u64::try_from(prev.as_millis()).unwrap_or(u64::MAX);
     let raw_top = prev_ms.saturating_mul(3);
     let top = raw_top.min(cap_ms).max(base_ms);
     if top <= base_ms {
