@@ -1,12 +1,16 @@
 name: CI
 
-# Manual-only trigger. Enable push / pull_request again here when we
-# want CI to gate every commit; for now contributors run the same
-# gates locally (cargo fmt --all -- --check, cargo clippy --workspace
-# --all-targets -- -D warnings, cargo test --workspace) and CI is
-# kicked off on demand via the GitHub Actions UI or `gh workflow run
-# ci.yml`.
+# Restored: gate every push to main and every PR opened against main
+# in addition to the manual workflow_dispatch entry point. The full
+# fmt / clippy / test / deny matrix runs on every commit so CI catches
+# regressions before review instead of relying on contributors running
+# the same gates locally. heavy-ci.yml stays label-gated; fast-ci.yml
+# already runs on push / pull_request as the cheap fast lane.
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
