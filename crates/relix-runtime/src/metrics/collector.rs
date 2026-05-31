@@ -29,10 +29,12 @@
 //! A second background task runs every hour and deletes rows
 //! older than `retention_days * 86_400_000` ms.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lru::LruCache;
 use relix_core::types::RequestId;
 
 use super::pricing::PriceTable;
@@ -81,15 +83,25 @@ pub struct MetricsCollector {
     /// channel evicts the oldest entry at the [`METRICS_CHANNEL_CAP`]
     /// boundary so the latest signal is always preserved.
     channel: BoundedDropOldestChannel<InvocationMetric>,
-    hints: Arc<Mutex<HashMap<RequestId, AiUsageHint>>>,
-    /// RELIX-7.19 GAP 3: per-request provider-signals join
-    /// cache. Bounded by [`HINT_CACHE_CAP`]; FIFO-cleared on
-    /// overflow same as [`MetricsCollector::hints`].
-    provider_signals: Arc<Mutex<HashMap<RequestId, AiProviderSignalsHint>>>,
-    /// RELIX-7.29 PART 2: per-request self-consistency hint
-    /// cache. Same bounded-FIFO discipline as the other join
-    /// caches.
-    self_consistency: Arc<Mutex<HashMap<RequestId, AiSelfConsistencyHint>>>,
+    /// PART 5: drop-oldest LRU. The pre-fix HashMap path
+    /// cleared the WHOLE cache when it overflowed, which
+    /// dropped every in-flight hint at once. The LRU evicts
+    /// the single oldest entry per insertion, bumps
+    /// `dropped_hints`, and warns at most once per minute via
+    /// `last_warn_ms`.
+    hints: Arc<Mutex<LruCache<RequestId, AiUsageHint>>>,
+    /// PART 5: same drop-oldest discipline as `hints`.
+    provider_signals: Arc<Mutex<LruCache<RequestId, AiProviderSignalsHint>>>,
+    /// PART 5: same drop-oldest discipline as `hints`.
+    self_consistency: Arc<Mutex<LruCache<RequestId, AiSelfConsistencyHint>>>,
+    /// PART 5: lifetime count of hints evicted from the
+    /// drop-oldest LRU caches above. Reported via
+    /// [`Self::dropped_hints`] for operator dashboards.
+    dropped_hints: Arc<AtomicU64>,
+    /// PART 5: last-warning timestamp (ms-since-epoch) for the
+    /// hint-cache overflow warn. Rate-limited to once per
+    /// minute so a sustained overflow doesn't flood logs.
+    last_warn_ms: Arc<AtomicI64>,
     prices: Arc<PriceTable>,
     store: MetricsStore,
     /// RELIX-7.28 Part 1: optional budget enforcer the collector
@@ -251,11 +263,14 @@ impl MetricsCollector {
         // limit; the bounded channel evicts the oldest entry
         // once the cap is hit.
         let channel = BoundedDropOldestChannel::<InvocationMetric>::new(METRICS_CHANNEL_CAP);
+        let cap = NonZeroUsize::new(HINT_CACHE_CAP).expect("HINT_CACHE_CAP > 0");
         let collector = Self {
             channel: channel.clone(),
-            hints: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
-            provider_signals: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
-            self_consistency: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
+            hints: Arc::new(Mutex::new(LruCache::new(cap))),
+            provider_signals: Arc::new(Mutex::new(LruCache::new(cap))),
+            self_consistency: Arc::new(Mutex::new(LruCache::new(cap))),
+            dropped_hints: Arc::new(AtomicU64::new(0)),
+            last_warn_ms: Arc::new(AtomicI64::new(0)),
             prices: Arc::new(prices),
             store: store.clone(),
             budget: Arc::new(Mutex::new(None)),
@@ -349,6 +364,36 @@ impl MetricsCollector {
     pub fn dropped_count(&self) -> u64 {
         self.channel.dropped_count()
     }
+
+    /// PART 5: lifetime count of hints evicted from the
+    /// request-id join LRUs. Bumps on every drop-oldest pop
+    /// across all three caches (ai_usage, provider_signals,
+    /// self_consistency).
+    pub fn dropped_hints(&self) -> u64 {
+        self.dropped_hints.load(Ordering::Relaxed)
+    }
+
+    /// PART 5: bump dropped counter + emit a rate-limited
+    /// warning. At most one warn fires per minute regardless of
+    /// how many evictions land in the interim — the counter is
+    /// the durable signal; the log line is a heads-up.
+    fn note_hint_drop(&self) {
+        self.dropped_hints.fetch_add(1, Ordering::Relaxed);
+        let now = now_ms();
+        let last = self.last_warn_ms.load(Ordering::Relaxed);
+        if now - last >= 60_000
+            && self
+                .last_warn_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                dropped_total = self.dropped_hints.load(Ordering::Relaxed),
+                cap = HINT_CACHE_CAP,
+                "metrics.collector: hint cache evicting LRU entries — drain may be falling behind",
+            );
+        }
+    }
 }
 
 impl MetricsSink for MetricsCollector {
@@ -391,14 +436,22 @@ impl MetricsSink for MetricsCollector {
             Ok(g) => g,
             Err(p) => p.into_inner(), // recover from poisoning — losing one row is fine
         };
-        if g.len() >= HINT_CACHE_CAP {
-            // FIFO eviction is approximated by simply clearing
-            // the cache when it overflows. The hint cache is a
-            // best-effort enrichment path; dropping in bursts
-            // is preferable to unbounded growth.
-            g.clear();
+        // PART 5: drop-oldest-single semantics. When the cache
+        // is already at capacity AND the incoming key is new
+        // (no replacement) we pop the LRU entry explicitly so
+        // we can count + warn on the eviction. The pre-fix code
+        // called HashMap::clear() here, dropping every in-flight
+        // hint at once on a single overflow.
+        let key = hint.request_id;
+        let key_present = g.contains(&key);
+        let evicted = !key_present && g.len() >= g.cap().get();
+        if evicted {
+            g.pop_lru();
         }
-        g.insert(hint.request_id, hint);
+        g.put(key, hint);
+        if evicted {
+            self.note_hint_drop();
+        }
     }
 
     fn attach_provider_signals(&self, hint: AiProviderSignalsHint) {
@@ -406,10 +459,16 @@ impl MetricsSink for MetricsCollector {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if g.len() >= HINT_CACHE_CAP {
-            g.clear();
+        let key = hint.request_id;
+        let key_present = g.contains(&key);
+        let evicted = !key_present && g.len() >= g.cap().get();
+        if evicted {
+            g.pop_lru();
         }
-        g.insert(hint.request_id, hint);
+        g.put(key, hint);
+        if evicted {
+            self.note_hint_drop();
+        }
     }
 
     fn take_provider_signals(&self, request_id: RequestId) -> Option<AiProviderSignalsHint> {
@@ -417,7 +476,7 @@ impl MetricsSink for MetricsCollector {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        g.remove(&request_id)
+        g.pop(&request_id)
     }
 
     fn attach_self_consistency(&self, hint: AiSelfConsistencyHint) {
@@ -425,10 +484,16 @@ impl MetricsSink for MetricsCollector {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if g.len() >= HINT_CACHE_CAP {
-            g.clear();
+        let key = hint.request_id;
+        let key_present = g.contains(&key);
+        let evicted = !key_present && g.len() >= g.cap().get();
+        if evicted {
+            g.pop_lru();
         }
-        g.insert(hint.request_id, hint);
+        g.put(key, hint);
+        if evicted {
+            self.note_hint_drop();
+        }
     }
 
     fn take_self_consistency(&self, request_id: RequestId) -> Option<AiSelfConsistencyHint> {
@@ -436,19 +501,19 @@ impl MetricsSink for MetricsCollector {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        g.remove(&request_id)
+        g.pop(&request_id)
     }
 }
 
 fn take_hint(
-    hints: &Arc<Mutex<HashMap<RequestId, AiUsageHint>>>,
+    hints: &Arc<Mutex<LruCache<RequestId, AiUsageHint>>>,
     req_id: &RequestId,
 ) -> Option<AiUsageHint> {
     let mut g = match hints.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.remove(req_id)
+    g.pop(req_id)
 }
 
 /// PART 4: rolling-window state used by the absolute spend caps.
@@ -864,21 +929,22 @@ mod tests {
         });
     }
 
+    /// PART 5: drop-oldest LRU semantics. The pre-fix path
+    /// cleared the entire cache when overflowed; the LRU now
+    /// evicts only the oldest entry per insertion and bumps
+    /// the `dropped_hints` counter on every eviction.
     #[test]
-    fn hint_cache_overflow_clears_and_continues() {
+    fn part5_hint_cache_drops_only_oldest_on_overflow() {
         let store = MetricsStore::in_memory().unwrap();
         let prices = PriceTable::with_defaults();
         let (col, _h) = MetricsCollector::new(store, prices);
-        // Use a unique 16-byte RequestId per insert by encoding
-        // the loop index into the byte array, so we actually
-        // exercise the overflow path (a u8-seeded key wraps and
-        // overwrites at 256).
         fn unique_rid(i: usize) -> RequestId {
             let mut b = [0u8; 16];
             b[..8].copy_from_slice(&(i as u64).to_le_bytes());
             RequestId(b)
         }
-        for i in 0..(HINT_CACHE_CAP + 10) {
+        let extra = 10;
+        for i in 0..(HINT_CACHE_CAP + extra) {
             col.attach_ai_usage(AiUsageHint {
                 request_id: unique_rid(i),
                 prompt_tokens: 1,
@@ -887,14 +953,28 @@ mod tests {
                 routing_tier: None,
             });
         }
-        // After overflow + 10 more inserts the cache should
-        // hold at most the 10 post-clear entries, proving the
-        // overflow guard ran.
+        // The LRU stays full at the cap (not "≤ extra") because
+        // each insertion past the cap evicts only the LRU
+        // entry, never the entire cache.
         let g = col.hints.lock().unwrap();
-        assert!(
-            g.len() <= 10,
-            "expected ≤10 after overflow, got {}",
+        assert_eq!(
+            g.len(),
+            HINT_CACHE_CAP,
+            "expected cache to stay at cap, got {}",
             g.len()
+        );
+        drop(g);
+        assert_eq!(
+            col.dropped_hints(),
+            extra as u64,
+            "expected dropped_hints to count each LRU eviction"
+        );
+        // And the most recent entries are still resident — the
+        // pre-fix clear-all would have dropped them too.
+        let mut g = col.hints.lock().unwrap();
+        assert!(
+            g.contains(&unique_rid(HINT_CACHE_CAP + extra - 1)),
+            "newest entry must still be in the cache"
         );
     }
 

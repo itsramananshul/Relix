@@ -63,6 +63,11 @@ regex = "1"
 # capability-registration time, replacing the pre-fix linear scan
 # over the manifest's capability vector.
 dashmap = "6"
+# PART 5: drop-oldest semantics for the metrics collector's
+# request-id join caches. Replaces the prior clear-all-on-cap
+# behaviour so a single overflow no longer evicts every
+# in-flight hint.
+lru = { workspace = true }
 
 # RELIX-7.7 — production email channel.
 #
