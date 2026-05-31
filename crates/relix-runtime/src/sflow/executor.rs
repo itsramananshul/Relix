@@ -308,7 +308,16 @@ impl Executor {
             }
             Stmt::SolSleep { secs, .. } => {
                 let s = (*secs).min(MAX_SLEEP_SECS);
-                std::thread::sleep(Duration::from_secs(s));
+                // PART 1: prefer tokio's timer when the executor
+                // is running inside a tokio runtime (production
+                // path runs via `tokio::task::spawn_blocking`
+                // from `flow_runner::run_sflow`, so a Handle is
+                // reachable). Fall back to std::thread::sleep
+                // for pure-sync test invocations.
+                match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h.block_on(tokio::time::sleep(Duration::from_secs(s))),
+                    Err(_) => std::thread::sleep(Duration::from_secs(s)),
+                }
                 Ok(BlockFlow::Continue)
             }
             Stmt::SolAssert { cond, line } => {

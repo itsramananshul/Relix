@@ -387,6 +387,20 @@ fn check_depth_node(
     Ok(())
 }
 
+/// Async wrapper around [`compile_path`] that moves the
+/// blocking file read onto the tokio blocking pool so async
+/// callers (the flow runner, the bridge) never stall a runtime
+/// worker on disk I/O.
+pub async fn compile_path_async(path: std::path::PathBuf) -> Result<Vec<Inst>, YamlFlowError> {
+    let path_for_err = path.clone();
+    tokio::task::spawn_blocking(move || compile_path(&path))
+        .await
+        .map_err(|e| YamlFlowError::Io {
+            path: path_for_err.display().to_string(),
+            cause: format!("spawn_blocking join: {e}"),
+        })?
+}
+
 /// Compile a YAML flow file at the given path. Convenience
 /// wrapper around [`compile_source`].
 pub fn compile_path(path: &Path) -> Result<Vec<Inst>, YamlFlowError> {

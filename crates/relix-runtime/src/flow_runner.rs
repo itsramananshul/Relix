@@ -350,7 +350,12 @@ async fn run_sol(
     chunk_observer: Option<ChunkObserver>,
     last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
-    let bytecode = compile_sol(flow_path)?;
+    // PART 1: SOL compile reads from disk + parses; both block.
+    // Move it to the blocking pool so a tokio worker stays free.
+    let flow_path_owned = flow_path.to_path_buf();
+    let bytecode = tokio::task::spawn_blocking(move || compile_sol(&flow_path_owned))
+        .await
+        .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))??;
     let vm_result = tokio::task::spawn_blocking(move || {
         let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
         if let Some(observer) = chunk_observer {
@@ -389,7 +394,10 @@ async fn run_yaml(
     chunk_observer: Option<ChunkObserver>,
     last_confidence_cell: Option<crate::confidence::LastConfidenceCell>,
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
-    let bytecode = crate::yaml_flow::compile_path(flow_path)
+    // PART 1: file I/O + parsing run on the blocking pool so
+    // we never block a tokio runtime worker on disk.
+    let bytecode = crate::yaml_flow::compile_path_async(flow_path.to_path_buf())
+        .await
         .map_err(|e| FlowRunnerError::Config(format!("yaml flow {}: {e}", flow_path.display())))?;
     let vm_result = tokio::task::spawn_blocking(move || {
         let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
@@ -422,10 +430,18 @@ async fn run_sflow(
     dispatcher: Arc<dyn RemoteCallDispatcher>,
     event_log: Arc<Mutex<EventLog>>,
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
-    let source = std::fs::read_to_string(flow_path)
-        .map_err(|e| FlowRunnerError::Config(format!("read {}: {}", flow_path.display(), e)))?;
-    let program = sflow::compile(&source)
-        .map_err(|e| FlowRunnerError::Config(format!("sflow parse: {e}")))?;
+    // PART 1: file I/O + parsing are blocking. Hand both off to
+    // the blocking pool so the async caller's runtime worker
+    // stays free.
+    let flow_path_owned = flow_path.to_path_buf();
+    let program = tokio::task::spawn_blocking(move || -> Result<_, FlowRunnerError> {
+        let source = std::fs::read_to_string(&flow_path_owned).map_err(|e| {
+            FlowRunnerError::Config(format!("read {}: {}", flow_path_owned.display(), e))
+        })?;
+        sflow::compile(&source).map_err(|e| FlowRunnerError::Config(format!("sflow parse: {e}")))
+    })
+    .await
+    .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))??;
     let chronicle: Arc<dyn sflow::executor::ChronicleSink> =
         Arc::new(EventLogChronicle { log: event_log });
     let exe = sflow::Executor::new(dispatcher, chronicle);
