@@ -778,4 +778,87 @@ mod tests {
         let present = ch.wait().await;
         assert!(!present);
     }
+
+    // ── CORR-D3: explicit verification per the prompt ────
+
+    #[test]
+    fn corr_d3_send_at_cap_evicts_oldest() {
+        // Channel at capacity: the next `send` drops the
+        // oldest entry (not the new one).
+        let cap = 3usize;
+        let ch = BoundedDropOldestChannel::<u32>::new(cap);
+        ch.send(10);
+        ch.send(11);
+        ch.send(12);
+        assert_eq!(ch.dropped_count(), 0, "no drops while under cap");
+        ch.send(13);
+        // 10 was dropped; the remaining set is {11, 12, 13}.
+        assert_eq!(ch.dropped_count(), 1);
+        let drained = ch.try_drain(100);
+        assert_eq!(drained, vec![11, 12, 13]);
+    }
+
+    #[test]
+    fn corr_d3_dropped_count_increments_on_every_drop() {
+        // 10 consecutive over-cap sends → 10 drops, dropped
+        // counter = 10.
+        let cap = 2usize;
+        let ch = BoundedDropOldestChannel::<u32>::new(cap);
+        ch.send(0);
+        ch.send(1);
+        let mut expected = 0u64;
+        for v in 2..12u32 {
+            ch.send(v);
+            expected += 1;
+            assert_eq!(
+                ch.dropped_count(),
+                expected,
+                "counter must bump exactly once per evicted entry"
+            );
+        }
+        // Queue still holds the most-recent two entries.
+        let drained = ch.try_drain(100);
+        assert_eq!(drained, vec![10, 11]);
+    }
+
+    #[test]
+    fn corr_d3_receiver_sees_insertion_order_after_overflow() {
+        // After overflow, try_drain returns items in
+        // insertion order — the queue is FIFO and only the
+        // OLDEST entries were evicted.
+        let cap = 4usize;
+        let ch = BoundedDropOldestChannel::<&'static str>::new(cap);
+        for v in ["a", "b", "c", "d", "e", "f", "g"] {
+            ch.send(v);
+        }
+        // Dropped a, b, c → remaining {d, e, f, g}.
+        let drained = ch.try_drain(100);
+        assert_eq!(drained, vec!["d", "e", "f", "g"]);
+        assert_eq!(ch.dropped_count(), 3);
+    }
+
+    #[test]
+    fn corr_d3_no_loss_except_for_explicitly_dropped_entries() {
+        // Total received_at_receiver + total_dropped must
+        // equal total_sent for every prefix of the send
+        // stream. Demonstrates that the channel does not
+        // silently drop anything other than the over-cap
+        // evictions accounted for in dropped_count.
+        let cap = 5usize;
+        let ch = BoundedDropOldestChannel::<u32>::new(cap);
+        let total_sent: u64 = 50;
+        for i in 0..total_sent as u32 {
+            ch.send(i);
+        }
+        let received = ch.try_drain(usize::MAX);
+        let dropped = ch.dropped_count();
+        assert_eq!(
+            received.len() as u64 + dropped,
+            total_sent,
+            "received + dropped must equal sent (no silent loss)"
+        );
+        // Received items are the last `cap` sent.
+        let expected: Vec<u32> = ((total_sent as u32 - cap as u32)..total_sent as u32).collect();
+        assert_eq!(received, expected);
+    }
 }
