@@ -782,6 +782,7 @@ async fn boot_harness(
             tenant_bindings,
             setup_token: None,
         },
+        logging: crate::config::LoggingSection::default(),
     };
     let base_state = AppState::try_new(cfg.clone()).expect("AppState::try_new");
 

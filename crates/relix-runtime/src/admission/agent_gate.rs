@@ -28,7 +28,7 @@ use std::sync::Arc;
 use relix_core::capability::CapabilityDescriptor;
 use relix_core::identity::VerifiedIdentity;
 
-use crate::approval::{ApprovalToken, TokenError};
+use crate::approval::{ApprovalKeySet, ApprovalToken, TokenError};
 use crate::nodes::coordinator::agent::store::{AgentGateView, AgentStore, ApprovalStatus};
 use crate::transport::envelope::RequestEnvelope;
 
@@ -150,12 +150,16 @@ pub struct GateInputs<'a> {
     /// the caller supplies both — admission paths read
     /// `unix_ms()` once and pass both).
     pub now_ms: i64,
-    /// SEC PART A: HMAC-SHA256 signing key for
-    /// [`crate::approval::ApprovalToken`]. Sourced from
-    /// `RELIX_APPROVAL_TOKEN_KEY` at controller startup.
-    /// Empty / absent = the gate refuses every token-bearing
-    /// call with `approval_token_missing_key`.
-    pub signing_key: &'a [u8],
+    /// P1: Ed25519 verification key set for
+    /// [`crate::approval::ApprovalToken`]. The gate looks up
+    /// the wire token's `signing_key_fingerprint` here to find
+    /// the public key it was signed under. Empty / unwired ⇒
+    /// every token-bearing call fails with
+    /// `approval_token_missing_key` (when the keyset is
+    /// completely empty) or `approval_token_unknown_signer`
+    /// (when the keyset has entries but none matches the
+    /// wire fingerprint).
+    pub keyset: &'a ApprovalKeySet,
     /// SEC PART 1: surface label derived from the transport
     /// layer connection metadata (peer alias from the libp2p
     /// `PeerId` of the calling peer). The gate consults THIS
@@ -207,7 +211,7 @@ pub fn evaluate(store: Option<&AgentStoreHandle>, inputs: GateInputs<'_>) -> Gat
             token_wire,
             inputs.envelope.method.as_str(),
             &inputs.identity.subject_id.to_string(),
-            inputs.signing_key,
+            inputs.keyset,
             inputs.now_ms,
         );
     }
@@ -269,14 +273,14 @@ pub fn evaluate_token(
     token_wire: &str,
     request_method: &str,
     caller_subject_id: &str,
-    signing_key: &[u8],
+    keyset: &ApprovalKeySet,
     now_ms: i64,
 ) -> GateDecision {
     let tok = match ApprovalToken::parse(token_wire) {
         Ok(t) => t,
         Err(e) => return token_deny(&e, None),
     };
-    if let Err(e) = tok.verify_signature(signing_key) {
+    if let Err(e) = tok.verify_signature(keyset) {
         return token_deny(&e, None);
     }
     if let Err(e) = tok.check_method(request_method) {
@@ -580,6 +584,7 @@ fn risk_within_ceiling(level: &str, ceiling: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalSigner;
     use relix_core::capability::RiskLevel;
     use relix_core::identity::VerifiedIdentity;
     use relix_core::types::{NodeId, RequestId, Timestamp, TraceId};
@@ -630,10 +635,12 @@ mod tests {
             deadline: Timestamp::now()
                 .add_secs(30)
                 .expect("test clock not at i64::MAX"),
+            issued_at_ms: 0,
             surface: surface.map(|s| s.to_string()),
             approval_token: None,
             task_id: None,
             tenant_id: None,
+            session_token: None,
         }
     }
 
@@ -645,11 +652,17 @@ mod tests {
         c
     }
 
-    /// Signing key the test suite uses for structured-token
-    /// minting + verification. Stable so tests can issue +
-    /// replay against the same byte sequence.
-    fn test_key() -> Vec<u8> {
-        b"agent-gate-test-key-32-bytes-okx".to_vec()
+    /// P1: Ed25519 signer the test suite uses for structured-
+    /// token minting + verification. Deterministic seed so
+    /// tests can issue + replay against the same key.
+    fn test_signer() -> ApprovalSigner {
+        ApprovalSigner::from_seed([7u8; 32])
+    }
+
+    /// P1: verification keyset built from `test_signer` —
+    /// the single-controller deployment shape.
+    fn test_keyset() -> ApprovalKeySet {
+        ApprovalKeySet::from_signer(&test_signer())
     }
 
     fn run(
@@ -673,7 +686,7 @@ mod tests {
         cap: Option<&CapabilityDescriptor>,
         caller_surface: Option<&str>,
     ) -> GateDecision {
-        let key = test_key();
+        let keyset = test_keyset();
         evaluate(
             Some(store),
             GateInputs {
@@ -682,7 +695,7 @@ mod tests {
                 capability: cap,
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_000,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface,
             },
         )
@@ -718,7 +731,7 @@ mod tests {
         // matched_rule "no_agent_store". Fail-closed now.
         let id = ident(b"x");
         let e = env("m", None);
-        let key = test_key();
+        let keyset = test_keyset();
         let d = evaluate(
             None,
             GateInputs {
@@ -727,7 +740,7 @@ mod tests {
                 capability: None,
                 now: 0,
                 now_ms: 0,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         );
@@ -1085,7 +1098,7 @@ mod tests {
             meta.task_id.as_deref().unwrap_or(""),
             issued_at_ms,
             ttl_ms,
-            &test_key(),
+            &test_signer(),
         )
         .unwrap();
         (wire, approval_id)
@@ -1122,7 +1135,7 @@ mod tests {
         let id = ident(b"subj-1");
         let mut e = env("tool.payments.charge", None);
         e.approval_token = Some(wire);
-        let key = test_key();
+        let keyset = test_keyset();
         let d = evaluate(
             Some(&s),
             GateInputs {
@@ -1131,7 +1144,7 @@ mod tests {
                 capability: None,
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         );
@@ -1158,7 +1171,7 @@ mod tests {
         let id = ident(b"subj-1");
         let mut e = env("tool.terminal", None);
         e.approval_token = Some(wire);
-        let key = test_key();
+        let keyset = test_keyset();
         let d = evaluate(
             Some(&s),
             GateInputs {
@@ -1167,7 +1180,7 @@ mod tests {
                 capability: None,
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         );
@@ -1187,7 +1200,7 @@ mod tests {
         let id = ident(b"subj-B");
         let mut e = env("tool.x", None);
         e.approval_token = Some(wire);
-        let key = test_key();
+        let keyset = test_keyset();
         let d = evaluate(
             Some(&s),
             GateInputs {
@@ -1196,7 +1209,7 @@ mod tests {
                 capability: None,
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         );
@@ -1216,7 +1229,7 @@ mod tests {
         let id = ident(b"subj-1");
         let mut e = env("tool.x", None);
         e.approval_token = Some(wire);
-        let key = test_key();
+        let keyset = test_keyset();
         // now_ms is well past expires_at_ms.
         let d = evaluate(
             Some(&s),
@@ -1226,7 +1239,7 @@ mod tests {
                 capability: None,
                 now: 1_700_000_500,
                 now_ms: 1_700_000_500_000,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         );
@@ -1260,7 +1273,7 @@ mod tests {
         let id = ident(b"subj-1");
         let mut e = env("tool.x", None);
         e.approval_token = Some(wire);
-        let key = test_key();
+        let keyset = test_keyset();
         evaluate(
             Some(s),
             GateInputs {
@@ -1269,7 +1282,7 @@ mod tests {
                 capability: None,
                 now: now_ms / 1_000,
                 now_ms,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         )
@@ -1315,7 +1328,12 @@ mod tests {
         let id = ident(b"subj-1");
         let mut e = env("tool.x", None);
         e.approval_token = Some(wire);
-        let other_key = b"a-completely-different-key-32-by".to_vec();
+        // P1: a wrong-key verifier sees the wire fingerprint
+        // belongs to a different signer → UnknownSigningKey.
+        // Build a keyset that doesn't contain the test_signer
+        // fingerprint at all.
+        let other_signer = ApprovalSigner::from_seed([42u8; 32]);
+        let wrong_keyset = ApprovalKeySet::from_signer(&other_signer);
         let d = evaluate(
             Some(&s),
             GateInputs {
@@ -1324,13 +1342,13 @@ mod tests {
                 capability: None,
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
-                signing_key: &other_key,
+                keyset: &wrong_keyset,
                 caller_surface: None,
             },
         );
         match d {
             GateDecision::Deny(d) => {
-                assert_eq!(d.matched_rule, "approval_token_bad_signature");
+                assert_eq!(d.matched_rule, "approval_token_unknown_signer");
             }
             other => panic!("{other:?}"),
         }
@@ -1345,7 +1363,7 @@ mod tests {
         let id = ident(b"subj-1");
         let mut e = env("tool.x", None);
         e.approval_token = Some(wire);
-        let key = test_key();
+        let keyset = test_keyset();
         let first = evaluate(
             Some(&s),
             GateInputs {
@@ -1354,7 +1372,7 @@ mod tests {
                 capability: None,
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_500,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         );
@@ -1367,7 +1385,7 @@ mod tests {
                 capability: None,
                 now: 1_700_000_000,
                 now_ms: 1_700_000_000_600,
-                signing_key: &key,
+                keyset: &keyset,
                 caller_surface: None,
             },
         );
@@ -1403,7 +1421,7 @@ mod tests {
             let id = ident(b"subj-1");
             let mut e = env("tool.x", None);
             e.approval_token = Some(tampered_wire);
-            let key = test_key();
+            let keyset = test_keyset();
             let d = evaluate(
                 Some(&s),
                 GateInputs {
@@ -1412,7 +1430,7 @@ mod tests {
                     capability: None,
                     now: 1_700_000_000,
                     now_ms: 1_700_000_000_500,
-                    signing_key: &key,
+                    keyset: &keyset,
                     caller_surface: None,
                 },
             );

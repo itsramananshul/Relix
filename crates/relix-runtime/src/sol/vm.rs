@@ -59,6 +59,28 @@ pub struct VM {
     fp: usize,
     program: Vec<Inst>,
     done: bool,
+    /// P6 — per-execution fuel budget. Each successful
+    /// `step()` decrements by 1; reaching 0 halts the VM with
+    /// `VM_ERROR_SENTINEL` and sets `last_error` to the
+    /// fuel-exhaustion cause. Operators size the budget via
+    /// the `[sol] max_steps` config (default
+    /// [`crate::sol::DEFAULT_MAX_STEPS`]) or the per-flow
+    /// `#steps N` directive. Both are clamped to
+    /// [`crate::sol::MAX_STEPS_CEILING`].
+    fuel: u64,
+    /// P6 — how many instructions we have executed since
+    /// construction (or since `with_fuel`). Reported in the
+    /// `FuelExhausted` cause + log line so operators can size
+    /// budgets sensibly.
+    steps_taken: u64,
+    /// P6 — operator-supplied flow name for log lines fired
+    /// when fuel runs out. `None` falls back to "<sol_vm>".
+    flow_name: Option<String>,
+    /// P6 — set when fuel ran out on this execution. Drives
+    /// `fuel_exhausted_steps()` so the flow_runner can lift
+    /// the typed [`crate::sol::SolError::FuelExhausted`] back
+    /// out for callers.
+    fuel_exhausted_steps: Option<u64>,
     /// Relix extension (M6): optional host-side dispatcher for `Inst::RemoteCall`.
     /// `None` means remote calls are forbidden — encountering `RemoteCall` halts
     /// the VM with a `local_dispatch_error`.
@@ -115,7 +137,53 @@ impl VM {
             chunk_observer: None,
             last_confidence: 1.0,
             last_confidence_cell: None,
+            // P6: default fuel matches the operator-config
+            // default; per-flow overrides go through
+            // `with_fuel` after construction.
+            fuel: crate::sol::DEFAULT_MAX_STEPS,
+            steps_taken: 0,
+            flow_name: None,
+            fuel_exhausted_steps: None,
         }
+    }
+
+    /// P6 — override the per-execution fuel budget. Clamped
+    /// to [`crate::sol::MAX_STEPS_CEILING`]; a `fuel` of `0`
+    /// is rewritten to `1` (a flow with zero budget is
+    /// instantly out of fuel — pointless and confusing). Use
+    /// `with_fuel(crate::sol::MAX_STEPS_CEILING)` to lift the
+    /// per-execution cap to the hard ceiling.
+    pub fn with_fuel(mut self, fuel: u64) -> Self {
+        self.fuel = fuel.min(crate::sol::MAX_STEPS_CEILING).max(1);
+        self
+    }
+
+    /// P6 — operator-supplied flow name for the
+    /// fuel-exhaustion log line. Builder-style.
+    pub fn with_flow_name(mut self, name: impl Into<String>) -> Self {
+        self.flow_name = Some(name.into());
+        self
+    }
+
+    /// P6 — `Some(steps_taken)` iff the most recent `run()`
+    /// halted because fuel ran out. Lets the host lift the
+    /// typed [`crate::sol::SolError::FuelExhausted`] back out
+    /// (the public VM contract returns `u64` to stay
+    /// back-compat with `flow_runner`).
+    pub fn fuel_exhausted_steps(&self) -> Option<u64> {
+        self.fuel_exhausted_steps
+    }
+
+    /// P6 — how many instructions this VM has executed since
+    /// construction. Useful for assertions in tests.
+    pub fn steps_taken(&self) -> u64 {
+        self.steps_taken
+    }
+
+    /// P6 — remaining fuel. Exposed for diagnostic surfaces
+    /// + tests.
+    pub fn fuel(&self) -> u64 {
+        self.fuel
     }
 
     pub fn from(program: &[Inst]) -> Self {
@@ -225,6 +293,37 @@ impl VM {
             self.done = true;
             return Some(self.stack.pop().unwrap_or(0));
         }
+
+        // P6: fuel check fires BEFORE the instruction runs so
+        // an attacker cannot squeeze in one final side-effect
+        // by stepping the counter to exactly 0. On exhaustion
+        // we set last_error to a synthetic
+        // RemoteCallError + the typed `fuel_exhausted_steps`
+        // flag, log a WARN with flow name + step count, and
+        // halt with VM_ERROR_SENTINEL.
+        if self.fuel == 0 {
+            self.done = true;
+            self.fuel_exhausted_steps = Some(self.steps_taken);
+            let flow = self.flow_name.as_deref().unwrap_or("<sol_vm>");
+            // Index the last attempted instruction in the
+            // log so operators see where the runaway flow
+            // was when fuel hit zero.
+            let last_inst_ptr = self.inst_ptr;
+            let cause = format!(
+                "sol VM fuel exhausted after {} steps (instruction index {last_inst_ptr})",
+                self.steps_taken
+            );
+            tracing::warn!(
+                flow = %flow,
+                steps = self.steps_taken,
+                last_instruction_index = last_inst_ptr,
+                "sol VM fuel exhausted — flow exceeded its #steps / [sol] max_steps budget"
+            );
+            self.last_error = Some(RemoteCallError::local("<sol_vm>", flow, cause));
+            return Some(VM_ERROR_SENTINEL);
+        }
+        self.fuel -= 1;
+        self.steps_taken = self.steps_taken.saturating_add(1);
 
         let inst = self.program[self.inst_ptr].clone();
         self.inst_ptr += 1;
@@ -1248,5 +1347,124 @@ fn classified_error_kind(err: &RemoteCallError) -> &'static str {
         | error_kinds::APPROVAL_DENIED
         | error_kinds::APPROVAL_REQUIRED => "policy_denied",
         _ => "responder_error",
+    }
+}
+
+#[cfg(test)]
+mod fuel_tests {
+    //! P6 — fuel-counter tests for the VM. These exercise the
+    //! VM directly (no compile / dispatch dance) so the
+    //! assertions are tight and fast.
+
+    use super::*;
+    use crate::sol::bytecode::Inst;
+    use crate::sol::{DEFAULT_MAX_STEPS, MAX_STEPS_CEILING};
+
+    /// Build a VM with bytecode that loops forever via
+    /// `Jump(0)`. Used by every fuel-exhaustion test below.
+    fn loop_forever_vm() -> VM {
+        // Jump(0) → Jump(0) → … One instruction per step;
+        // the VM never hits the program-end branch.
+        VM::from(&[Inst::Jump(0)])
+    }
+
+    #[test]
+    fn p6_default_fuel_matches_default_max_steps() {
+        let vm = VM::new();
+        assert_eq!(vm.fuel(), DEFAULT_MAX_STEPS);
+        assert_eq!(vm.steps_taken(), 0);
+        assert!(vm.fuel_exhausted_steps().is_none());
+    }
+
+    #[test]
+    fn p6_with_fuel_clamps_to_hard_ceiling() {
+        let vm = VM::new().with_fuel(MAX_STEPS_CEILING * 2);
+        assert_eq!(vm.fuel(), MAX_STEPS_CEILING);
+    }
+
+    #[test]
+    fn p6_with_fuel_zero_clamps_to_one() {
+        // A zero budget = instant exhaustion. We rewrite to 1
+        // so the VM still has a single instruction to attempt
+        // (matching the operator's likely intent if they
+        // somehow pass 0).
+        let vm = VM::new().with_fuel(0);
+        assert_eq!(vm.fuel(), 1);
+    }
+
+    #[test]
+    fn p6_loop_with_max_steps_50_returns_fuel_exhausted_after_50_steps() {
+        // P6 test: "A SOL flow that loops 100 times with
+        // max_steps = 50 returns FuelExhausted after 50 steps."
+        let mut vm = loop_forever_vm().with_fuel(50);
+        let exit = vm.run();
+        assert_eq!(exit, VM_ERROR_SENTINEL);
+        assert_eq!(vm.steps_taken(), 50);
+        assert_eq!(vm.fuel_exhausted_steps(), Some(50));
+        let err = vm
+            .last_error()
+            .expect("fuel exhaustion must set last_error");
+        assert!(
+            err.cause.contains("fuel exhausted"),
+            "expected fuel-exhaustion cause, got: {}",
+            err.cause
+        );
+        assert!(
+            err.cause.contains("50 steps"),
+            "cause must report step count: {}",
+            err.cause
+        );
+    }
+
+    #[test]
+    fn p6_terminating_program_within_fuel_completes_successfully() {
+        // P6 test: "A SOL flow that terminates normally
+        // within the fuel limit completes successfully." We
+        // exercise this via a program that produces no
+        // instructions — the VM hits the program-end branch
+        // and returns the (empty) stack top on its first
+        // step. Fuel is not exhausted.
+        let mut vm = VM::from(&[]).with_fuel(100);
+        let exit = vm.run();
+        // Empty program → step() takes the "ip past program"
+        // branch and returns 0. No fuel was consumed; that's
+        // fine — the contract is "no FuelExhausted as long as
+        // the VM terminates inside the budget".
+        assert_eq!(exit, 0);
+        assert!(vm.fuel_exhausted_steps().is_none());
+    }
+
+    #[test]
+    fn p6_fuel_exhaustion_logs_flow_name_when_provided() {
+        // P6 test: "FuelExhausted logs the flow name and step
+        // count." We assert the surface contract via
+        // last_error rather than capturing the tracing event
+        // — the cause string includes both pieces of info.
+        let mut vm = loop_forever_vm()
+            .with_fuel(10)
+            .with_flow_name("dangerous_flow.sol");
+        let exit = vm.run();
+        assert_eq!(exit, VM_ERROR_SENTINEL);
+        let err = vm.last_error().expect("fuel exhaustion sets last_error");
+        // The flow name lands in the `method` field of the
+        // synthetic RemoteCallError so log lines that scrape
+        // `last_error()` see "dangerous_flow.sol".
+        assert_eq!(err.method, "dangerous_flow.sol");
+        assert_eq!(err.peer, "<sol_vm>");
+        assert!(
+            err.cause.contains("fuel exhausted after 10 steps"),
+            "cause: {}",
+            err.cause
+        );
+    }
+
+    #[test]
+    fn p6_subsequent_step_calls_after_exhaustion_return_none() {
+        let mut vm = loop_forever_vm().with_fuel(3);
+        let exit = vm.run();
+        assert_eq!(exit, VM_ERROR_SENTINEL);
+        // VM is done — further step() calls return None
+        // without re-firing the fuel check.
+        assert!(vm.step().is_none());
     }
 }

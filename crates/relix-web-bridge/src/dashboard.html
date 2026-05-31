@@ -515,20 +515,57 @@ function trunc(s, n) {
 
 var Bridge = {
   token: null,
+  authFailed: false,
+  // P4 — fetch the bridge token from /v1/auth/token. The
+  // endpoint requires a setup-token header (SEC PART 3); when
+  // the operator has not configured one the request is
+  // rejected with HTTP 401/403. The bootstrap MUST surface
+  // that failure to the operator instead of silently
+  // continuing with an unauthenticated dashboard.
+  //
+  // Behaviour:
+  //   1. If we have a cached token from a prior load, reuse it.
+  //   2. Otherwise call /v1/auth/token. On 401/403 retry once
+  //      after a 2 s delay (covers a transient network blip).
+  //   3. After the retry, give up: set `authFailed = true` so
+  //      the caller can refuse to render any sections.
   bootstrap: function () {
     var self = this;
     var cached = null;
     try { cached = sessionStorage.getItem('relix-bridge-token'); } catch (e) {}
     if (cached) { this.token = cached; return Promise.resolve(); }
-    return fetch('/v1/auth/token', { credentials: 'same-origin' })
-      .then(function (r) { return r.ok ? r.json() : null; })
+    function fetchOnce() {
+      return fetch('/v1/auth/token', { credentials: 'same-origin' })
+        .then(function (r) { return { status: r.status, ok: r.ok, body: r.ok ? r.json() : null }; });
+    }
+    return fetchOnce()
+      .then(function (resp) {
+        if (resp.ok) return resp.body;
+        // 401 / 403 → wait 2s and retry exactly once. Any
+        // other status → treat as auth failure straight
+        // away (the bridge would not produce a different
+        // status from this endpoint).
+        if (resp.status === 401 || resp.status === 403) {
+          return new Promise(function (resolve) { setTimeout(resolve, 2000); })
+            .then(fetchOnce)
+            .then(function (retry) {
+              if (retry.ok) return retry.body;
+              return null;
+            });
+        }
+        return null;
+      })
       .then(function (j) {
         if (j && j.token) {
           self.token = j.token;
           try { sessionStorage.setItem('relix-bridge-token', self.token); } catch (e) {}
+          return;
         }
+        self.authFailed = true;
       })
-      .catch(function () { /* unauthenticated mode */ });
+      .catch(function () {
+        self.authFailed = true;
+      });
   },
   headers: function (extra) {
     var h = { 'accept': 'application/json' };
@@ -569,7 +606,11 @@ var State = {
   logLines: [],
   logFilter: { level: '', search: '', target: '' },
   selectedTraceA: null,
-  selectedTraceB: null
+  selectedTraceB: null,
+  // P4 — session-expiry probe timer handle. Set by
+  // startSessionExpiryProbe(); cleared when the probe sees
+  // 401/403 and shows the auth-error screen.
+  sessionProbe: null
 };
 
 function initTheme() {
@@ -2307,10 +2348,94 @@ function openModal(title, body) {
 }
 function closeModal() { document.getElementById('modal').classList.remove('open'); }
 
+// P4 — auth-error screen. Replaces the dashboard with a
+// blank "authentication required" panel. Called when
+// Bridge.bootstrap() fails (after one retry), and when the
+// 5-minute session-expiry probe sees a 401/403 from
+// /v1/health. Idempotent: re-calling re-renders the same
+// screen.
+function showAuthErrorScreen(message) {
+  // Clear any active auto-refresh timers so the failing
+  // dashboard does not keep polling once we know we have no
+  // valid session token.
+  for (var k in State.autoRefresh) clearInterval(State.autoRefresh[k]);
+  State.autoRefresh = {};
+  if (State.logStream) { try { State.logStream.close(); } catch (e) {} State.logStream = null; }
+  // Drop any cached token: a stale value would only make
+  // future requests fail with the same status.
+  try { sessionStorage.removeItem('relix-bridge-token'); } catch (e) {}
+  Bridge.token = null;
+  Bridge.authFailed = true;
+  // Replace the page body with the auth-error panel. Using
+  // the existing `el(...)` helper so the safe-DOM-builder
+  // policy (no innerHTML) holds.
+  while (document.body.firstChild) {
+    document.body.removeChild(document.body.firstChild);
+  }
+  var msg = message || 'The bridge refused the bootstrap request.';
+  var screen = el(
+    'div',
+    {
+      class: 'auth-error-screen',
+      style:
+        'min-height:100vh;display:flex;flex-direction:column;align-items:center;' +
+        'justify-content:center;padding:48px;text-align:center;' +
+        'font-family:-apple-system,BlinkMacSystemFont,sans-serif;' +
+        'color:#111;background:#fafafa;'
+    },
+    el('h1', { style: 'font-size:24px;margin:0 0 16px;' }, 'Authentication Required'),
+    el('p', { style: 'max-width:520px;margin:0 0 12px;color:#444;' }, msg),
+    el(
+      'p',
+      { style: 'max-width:520px;margin:0;color:#444;' },
+      'Configure a valid RELIX_SETUP_TOKEN (or [auth] setup_token in ' +
+        'the bridge config), then reload this page.'
+    )
+  );
+  document.body.appendChild(screen);
+}
+
+// P4 — periodic session probe. Every 5 minutes calls
+// GET /v1/health with the cached bearer; if the bridge
+// returns 401 or 403 the session has expired (the
+// bridge_token file was rotated, or the operator revoked
+// the token). Show the auth-error screen so the operator
+// knows to refresh credentials.
+function startSessionExpiryProbe() {
+  if (State.sessionProbe) {
+    clearInterval(State.sessionProbe);
+  }
+  State.sessionProbe = setInterval(function () {
+    fetch('/v1/health', {
+      credentials: 'same-origin',
+      headers: Bridge.headers({})
+    })
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          showAuthErrorScreen('Session token expired or revoked.');
+          clearInterval(State.sessionProbe);
+          State.sessionProbe = null;
+        }
+      })
+      .catch(function () {
+        // Transient network errors are NOT treated as auth
+        // failures — the next tick re-runs the probe.
+      });
+  }, 5 * 60 * 1000);
+}
+
 function initApp() {
   initTheme();
   buildNav();
   Bridge.bootstrap().then(function () {
+    if (Bridge.authFailed) {
+      showAuthErrorScreen(
+        'The bridge bootstrap endpoint refused the request. ' +
+          'This usually means the setup token is missing or wrong.'
+      );
+      return;
+    }
+    startSessionExpiryProbe();
     document.getElementById('chat-send').addEventListener('click', chatSend);
     document.getElementById('chat-clear').addEventListener('click', function () {
       State.chatHistory = []; renderChatHistory();

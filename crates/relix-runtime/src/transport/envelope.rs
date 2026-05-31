@@ -30,6 +30,16 @@ pub struct RequestEnvelope {
     pub identity_bundle: Bundle,
     /// Absolute deadline (`dl`) — unix seconds.
     pub deadline: Timestamp,
+    /// P2 — RELIX-1 §1.7 freshness anchor. Unix milliseconds
+    /// stamped by the issuer when the envelope is built. The
+    /// responder rejects envelopes whose
+    /// `|now_ms - issued_at_ms| > max_clock_skew_ms`
+    /// (`STALE_ENVELOPE`) so a captured envelope cannot be
+    /// replayed past the freshness window. Older clients that
+    /// omit the field surface as `issued_at_ms = 0`, which
+    /// always fails the freshness check on a modern responder.
+    #[serde(default)]
+    pub issued_at_ms: i64,
     /// Surface tag identifying where the call originated.
     /// Operator-asserted (not cryptographically proven). Used
     /// by the agent-employee admission gate to enforce
@@ -67,6 +77,19 @@ pub struct RequestEnvelope {
     /// format stays backwards-compatible with older clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// P5 — wire-encoded session token (per
+    /// [`crate::identity::SessionToken`]). When
+    /// `[identity.session] verify_on_dispatch = true` AND the
+    /// responder has a `SessionIdentityService` wired,
+    /// admission step 6 verifies this token before invoking
+    /// the handler. The token's signed `scopes` MUST include
+    /// the requested capability method or admission denies
+    /// with `SECURITY_DENIED token_insufficient_scope`. Older
+    /// clients that omit the field surface as `None`;
+    /// admission rejects with `SECURITY_DENIED
+    /// session_token_missing` when verification is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
 }
 
 /// RELIX-1 response envelope (alpha fields).

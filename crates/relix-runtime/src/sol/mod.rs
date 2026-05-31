@@ -46,6 +46,62 @@ mod remote_call_compile_tests;
 #[cfg(test)]
 mod remote_call_tests;
 
+/// P6 — default `[sol] max_steps`. A SOL flow that runs more
+/// than this many VM instructions returns
+/// [`SolError::FuelExhausted`] without producing a result.
+/// Picked conservatively so legitimate flows complete and
+/// runaway loops abort quickly.
+pub const DEFAULT_MAX_STEPS: u64 = 100_000;
+
+/// P6 — absolute hard ceiling on the fuel an operator can
+/// assign to a flow (via either `[sol] max_steps` config or a
+/// per-flow `#steps N` directive). Even a config value of
+/// `u64::MAX` is clamped to this number — a SOL flow that
+/// genuinely needs ten million instructions either has a bug
+/// or wants a different runtime.
+pub const MAX_STEPS_CEILING: u64 = 10_000_000;
+
+/// P6 — typed errors surfaced by the SOL fuel / parse path.
+/// `compile_source` still returns `Result<…, String>` for
+/// back-compat with all current callers; new call sites should
+/// prefer [`compile_source_with_directives`], which surfaces
+/// the typed error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SolError {
+    /// VM ran out of fuel (the per-execution max-steps budget
+    /// elapsed). Carries the actual number of instructions
+    /// executed at the moment the budget hit zero, which is
+    /// always equal to the configured budget for that flow
+    /// but useful to surface in logs without recomputing.
+    #[error("sol VM fuel exhausted after {steps_taken} steps")]
+    FuelExhausted { steps_taken: u64 },
+    /// `#steps` directive carried a value that doesn't parse
+    /// as a `u64`.
+    #[error("sol: #steps directive value `{value}` is not a positive integer")]
+    BadStepsDirective { value: String },
+    /// Compile / parse failure surfaced as a single string —
+    /// the existing port's parse pipeline reports its errors
+    /// as a Box<dyn Any> panic, so we re-wrap here.
+    #[error("sol parse: {0}")]
+    Parse(String),
+}
+
+/// P6 — compiled-flow bundle: the bytecode plus the fuel
+/// budget the VM should run it under. `max_steps` is the
+/// effective per-execution fuel after resolving precedence:
+///
+/// 1. `#steps N` directive at the top of the source (highest
+///    priority), CLAMPED to [`MAX_STEPS_CEILING`].
+/// 2. operator-supplied default (e.g. from `[sol] max_steps`
+///    config), CLAMPED to [`MAX_STEPS_CEILING`].
+/// 3. [`DEFAULT_MAX_STEPS`] when the caller passes the
+///    sentinel value `0` for the default.
+#[derive(Debug, Clone)]
+pub struct CompiledFlow {
+    pub bytecode: Vec<bytecode::Inst>,
+    pub max_steps: u64,
+}
+
 /// Public, Result-returning entry point into the SOL compile
 /// pipeline. The verbatim port's internal helpers historically
 /// `process::exit(1)`'d on malformed input — that's been
@@ -60,7 +116,97 @@ mod remote_call_tests;
 /// - Codegen panic (rare, indicates a bug)   → `Err("sol parse: …")`
 ///
 /// On success returns the compiled bytecode the VM expects.
+///
+/// P6: any leading `#steps N` directive is silently stripped
+/// before lexing. The directive's value is NOT propagated by
+/// this function — callers that want to honour the per-flow
+/// fuel override use [`compile_source_with_directives`].
 pub fn compile_source(source: &str) -> Result<Vec<bytecode::Inst>, String> {
+    let (stripped, _maybe_fuel) = strip_steps_directive(source).map_err(|e| e.to_string())?;
+    compile_stripped_source(&stripped)
+}
+
+/// P6 — typed-error variant of [`compile_source`] that ALSO
+/// returns the per-flow fuel budget.
+///
+/// Resolution order for `CompiledFlow.max_steps`:
+///   1. `#steps N` directive at top of source — wins when
+///      present.
+///   2. `default_max_steps` argument — used when the source
+///      has no directive AND the argument is non-zero.
+///   3. [`DEFAULT_MAX_STEPS`] — used when the argument is `0`.
+///
+/// The resolved value is then clamped to [`MAX_STEPS_CEILING`].
+pub fn compile_source_with_directives(
+    source: &str,
+    default_max_steps: u64,
+) -> Result<CompiledFlow, SolError> {
+    let (stripped, directive_fuel) = strip_steps_directive(source)?;
+    let bytecode = compile_stripped_source(&stripped).map_err(SolError::Parse)?;
+    let raw = directive_fuel.unwrap_or(if default_max_steps == 0 {
+        DEFAULT_MAX_STEPS
+    } else {
+        default_max_steps
+    });
+    let max_steps = raw.min(MAX_STEPS_CEILING).max(1);
+    Ok(CompiledFlow {
+        bytecode,
+        max_steps,
+    })
+}
+
+/// Strip leading `#steps N` (and blank / `#`-comment) lines
+/// from `source`. Returns the remainder + the parsed fuel
+/// override when present. Multiple `#steps` lines are an
+/// error (operators get exactly one directive per flow).
+fn strip_steps_directive(source: &str) -> Result<(String, Option<u64>), SolError> {
+    let mut directive_fuel: Option<u64> = None;
+    let mut consumed_bytes: usize = 0;
+    let mut directive_seen = false;
+    for raw_line in source.split_inclusive('\n') {
+        let trimmed = raw_line.trim_start();
+        if trimmed.is_empty() {
+            consumed_bytes += raw_line.len();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("#steps") {
+            if directive_seen {
+                return Err(SolError::BadStepsDirective {
+                    value: "duplicate #steps directive".into(),
+                });
+            }
+            directive_seen = true;
+            let value_str = rest.trim();
+            // Permit trailing comments after the integer:
+            // `#steps 500_000  # tuned for the big report`
+            let first_token = value_str
+                .split(|c: char| c.is_whitespace() || c == '#')
+                .find(|s| !s.is_empty())
+                .unwrap_or("");
+            // Allow `_` thousands separators for readability.
+            let normalised = first_token.replace('_', "");
+            let parsed = normalised
+                .parse::<u64>()
+                .map_err(|_| SolError::BadStepsDirective {
+                    value: first_token.to_string(),
+                })?;
+            if parsed == 0 {
+                return Err(SolError::BadStepsDirective {
+                    value: first_token.to_string(),
+                });
+            }
+            directive_fuel = Some(parsed);
+            consumed_bytes += raw_line.len();
+            continue;
+        }
+        // First non-empty / non-directive line — everything
+        // from here on is the SOL source proper.
+        break;
+    }
+    Ok((source[consumed_bytes..].to_string(), directive_fuel))
+}
+
+fn compile_stripped_source(source: &str) -> Result<Vec<bytecode::Inst>, String> {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let res = catch_unwind(AssertUnwindSafe(|| {
@@ -86,6 +232,17 @@ pub fn compile_path(path: &std::path::Path) -> Result<Vec<bytecode::Inst>, Strin
     let source =
         std::fs::read_to_string(path).map_err(|e| format!("sol: read {}: {e}", path.display()))?;
     compile_source(&source)
+}
+
+/// P6 — typed-error variant of [`compile_path`] that returns
+/// the [`CompiledFlow`] (bytecode + resolved fuel budget).
+pub fn compile_path_with_directives(
+    path: &std::path::Path,
+    default_max_steps: u64,
+) -> Result<CompiledFlow, SolError> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| SolError::Parse(format!("sol: read {}: {e}", path.display())))?;
+    compile_source_with_directives(&source, default_max_steps)
 }
 
 fn panic_to_message(panic: Box<dyn std::any::Any + Send>) -> String {
@@ -137,5 +294,107 @@ mod compile_source_tests {
         // Whatever the parser decides, the bridge must not die.
         let _ = compile_source("");
         let _ = compile_source("   \n\n\n");
+    }
+
+    // ─────────────────────────────────────────────────────
+    // P6 — `#steps` directive + fuel-resolution tests
+    // ─────────────────────────────────────────────────────
+
+    #[test]
+    fn p6_compile_with_directives_uses_default_when_no_directive_present() {
+        let src = "function start() -> str { return \"ok\"; }\n";
+        let compiled = compile_source_with_directives(src, 0).unwrap();
+        assert_eq!(compiled.max_steps, DEFAULT_MAX_STEPS);
+    }
+
+    #[test]
+    fn p6_compile_with_directives_honours_caller_default_when_non_zero() {
+        let src = "function start() -> str { return \"ok\"; }\n";
+        let compiled = compile_source_with_directives(src, 250).unwrap();
+        assert_eq!(compiled.max_steps, 250);
+    }
+
+    #[test]
+    fn p6_steps_directive_overrides_caller_default() {
+        // P6 test: "A flow with #steps 200 overrides the
+        // default max_steps for that flow only."
+        let src = "#steps 200\nfunction start() -> str { return \"ok\"; }\n";
+        let compiled = compile_source_with_directives(src, 100_000).unwrap();
+        assert_eq!(compiled.max_steps, 200);
+    }
+
+    #[test]
+    fn p6_steps_directive_supports_underscore_separators() {
+        let src = "#steps 1_500_000\nfunction start() -> str { return \"ok\"; }\n";
+        let compiled = compile_source_with_directives(src, 0).unwrap();
+        assert_eq!(compiled.max_steps, 1_500_000);
+    }
+
+    #[test]
+    fn p6_hard_ceiling_cannot_be_exceeded_by_any_config_or_directive() {
+        // P6 test: "The hard ceiling of 10_000_000 cannot be
+        // exceeded by any config or directive."
+        let src = format!(
+            "#steps {}\nfunction start() -> str {{ return \"ok\"; }}\n",
+            MAX_STEPS_CEILING * 2
+        );
+        let compiled = compile_source_with_directives(&src, 0).unwrap();
+        assert_eq!(compiled.max_steps, MAX_STEPS_CEILING);
+        // Caller-supplied default at u64::MAX clamps the same way.
+        let plain = "function start() -> str { return \"ok\"; }\n";
+        let compiled = compile_source_with_directives(plain, u64::MAX).unwrap();
+        assert_eq!(compiled.max_steps, MAX_STEPS_CEILING);
+    }
+
+    #[test]
+    fn p6_zero_steps_directive_is_rejected() {
+        // A zero budget = the VM is instantly out of fuel. The
+        // operator almost certainly meant something else;
+        // reject at compile time.
+        let src = "#steps 0\nfunction start() -> str { return \"ok\"; }\n";
+        let res = compile_source_with_directives(src, 0);
+        match res {
+            Err(SolError::BadStepsDirective { value }) => assert_eq!(value, "0"),
+            other => panic!("expected BadStepsDirective, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p6_non_integer_steps_directive_is_rejected() {
+        let src = "#steps lots\nfunction start() -> str { return \"ok\"; }\n";
+        let res = compile_source_with_directives(src, 0);
+        match res {
+            Err(SolError::BadStepsDirective { value }) => assert_eq!(value, "lots"),
+            other => panic!("expected BadStepsDirective, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p6_duplicate_steps_directive_is_rejected() {
+        let src = "#steps 100\n#steps 200\nfunction start() -> str { return \"ok\"; }\n";
+        let res = compile_source_with_directives(src, 0);
+        assert!(matches!(res, Err(SolError::BadStepsDirective { .. })));
+    }
+
+    #[test]
+    fn p6_directive_with_trailing_comment_is_accepted() {
+        let src = "#steps 500_000  # tuned for the big report\n\
+             function start() -> str { return \"ok\"; }\n";
+        let compiled = compile_source_with_directives(src, 0).unwrap();
+        assert_eq!(compiled.max_steps, 500_000);
+    }
+
+    #[test]
+    fn p6_back_compat_compile_source_silently_strips_directive() {
+        // compile_source returns Vec<Inst> — operators using
+        // the legacy API still get a clean compile when the
+        // source has a `#steps` directive (the directive is
+        // simply ignored for fuel; the bytecode is identical
+        // to a source without the directive).
+        let src_with = "#steps 200\nfunction start() -> str { return \"ok\"; }\n";
+        let src_without = "function start() -> str { return \"ok\"; }\n";
+        let a = compile_source(src_with).unwrap();
+        let b = compile_source(src_without).unwrap();
+        assert_eq!(a.len(), b.len(), "directive must not change bytecode");
     }
 }

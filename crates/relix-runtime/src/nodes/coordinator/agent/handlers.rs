@@ -410,10 +410,10 @@ pub fn clamp_approval_token_ttl_secs(configured: Option<u64>) -> u64 {
 /// to flip the waiting task back to `running`. On `rejected`,
 /// returns `ok\n` and calls `fail_task`.
 ///
-/// SEC PART A: `signing_key` is the HMAC-SHA256 key the cap
-/// handler signs the token with. The controller wires it from
-/// `RELIX_APPROVAL_TOKEN_KEY` at startup. An empty slice means
-/// "no key configured" — the decision still completes (status
+/// P1: `signer` is the Ed25519 signer the cap handler signs
+/// the token with. The controller wires it from
+/// `RELIX_APPROVAL_SIGNING_KEY` at startup. `None` means "no
+/// signer configured" — the decision still completes (status
 /// flips on the row) but no token is returned, so operators see
 /// `ok\n` and the caller cannot mint admission-time proof.
 /// Fail-loud: the controller logs the missing env var at boot.
@@ -434,7 +434,7 @@ pub fn handle_approval_decide(
     ctx: &InvocationCtx,
     resume_task: &TaskResumeFn,
     fail_task: &TaskResumeFn,
-    signing_key: &[u8],
+    signer: Option<&crate::approval::ApprovalSigner>,
     token_ttl_secs: u64,
     clock: &dyn relix_core::clock::Clock,
 ) -> HandlerOutcome {
@@ -511,21 +511,17 @@ pub fn handle_approval_decide(
             tracing::warn!(task_id = %tid, error = %e, "coord.approval.decide: task hop failed");
         }
     }
-    // SEC PART A: mint the structured signed token when the
-    // approval was approved. The legacy `ok|<random>\n` wire
-    // shape is preserved — only the contents change to a
-    // base64url(json)-encoded `ApprovalToken`.
+    // P1: mint the Ed25519-signed token when the approval was
+    // approved. The legacy `ok|<random>\n` wire shape is
+    // preserved — only the contents change to a
+    // base64url(json)-encoded Ed25519 `ApprovalToken`.
     let body = match metadata {
-        Some(meta) if !signing_key.is_empty() => {
-            // NOT-DONE 1: source `issued_at_ms` from the
-            // injected clock so the token's TTL window is
-            // deterministic under test.
+        Some(meta) if signer.is_some() => {
+            let signer = signer.expect("checked above");
+            // Source `issued_at_ms` from the injected clock so
+            // the token's TTL window is deterministic under
+            // test.
             let issued_at_ms = clock.now_ms();
-            // DEFERRED 1: token_ttl_secs comes from the
-            // operator-configured `[approval] approval_token_ttl_secs`
-            // (clamped at startup). Convert to ms at the mint
-            // site so the token's `expires_at_ms` field stays
-            // in the wire-native unit.
             let ttl_ms = (token_ttl_secs as i64).saturating_mul(1000);
             match crate::approval::ApprovalToken::issue(
                 &meta.approval_id,
@@ -534,7 +530,7 @@ pub fn handle_approval_decide(
                 meta.task_id.as_deref().unwrap_or(""),
                 issued_at_ms,
                 ttl_ms,
-                signing_key,
+                signer,
             ) {
                 Ok(wire) => format!("ok|{wire}\n"),
                 Err(e) => {
@@ -550,7 +546,7 @@ pub fn handle_approval_decide(
         Some(meta) => {
             tracing::warn!(
                 approval_id = %meta.approval_id,
-                "coord.approval.decide: signing key not configured; approving without token"
+                "coord.approval.decide: Ed25519 signer not configured; approving without token"
             );
             "ok\n".to_string()
         }
@@ -882,8 +878,12 @@ mod tests {
         assert!(body.contains("count=2"));
     }
 
-    fn test_signing_key() -> Vec<u8> {
-        b"handlers-test-signing-key-32bytx".to_vec()
+    fn test_signer() -> crate::approval::ApprovalSigner {
+        crate::approval::ApprovalSigner::from_seed([9u8; 32])
+    }
+
+    fn test_keyset() -> crate::approval::ApprovalKeySet {
+        crate::approval::ApprovalKeySet::from_signer(&test_signer())
     }
 
     #[test]
@@ -900,7 +900,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         ));
@@ -909,7 +909,7 @@ mod tests {
         // SEC PART A: the wire token must parse + verify with
         // the same key the handler signed it with.
         let tok = crate::approval::ApprovalToken::parse(wire).unwrap();
-        tok.verify_signature(&test_signing_key())
+        tok.verify_signature(&test_keyset())
             .expect("token signature must verify");
         assert_eq!(tok.approval_id, id);
         assert_eq!(tok.method, "m");
@@ -918,9 +918,9 @@ mod tests {
 
     #[test]
     fn approval_decide_approves_without_key_omits_token() {
-        // SEC PART A fail-loud path: empty signing key returns
-        // `ok\n` so operators noticing missing tokens reach the
-        // controller boot log warning.
+        // P1 fail-loud path: no signer ⇒ returns `ok\n` so
+        // operators noticing missing tokens reach the controller
+        // boot log warning.
         let s = store();
         let id = s
             .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[])
@@ -933,7 +933,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &[],
+            None,
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         ));
@@ -954,7 +954,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         ));
@@ -999,7 +999,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         );
@@ -1037,7 +1037,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         );
@@ -1072,7 +1072,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         ));
@@ -1142,7 +1142,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             60,
             &relix_core::clock::SystemClock,
         ));
@@ -1173,7 +1173,7 @@ mod tests {
             &fake_ctx(arg.as_bytes()),
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             3_600,
             &relix_core::clock::SystemClock,
         ));
@@ -1293,7 +1293,7 @@ mod tests {
             &ctx,
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         );
@@ -1342,7 +1342,7 @@ mod tests {
             &ctx,
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         );
@@ -1384,7 +1384,7 @@ mod tests {
             &ctx_agent,
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         );
@@ -1401,7 +1401,7 @@ mod tests {
             &ctx_op,
             &resume,
             &fail,
-            &test_signing_key(),
+            Some(&test_signer()),
             APPROVAL_TOKEN_TTL_DEFAULT_SECS,
             &relix_core::clock::SystemClock,
         );

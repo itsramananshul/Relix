@@ -257,6 +257,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // buffer.
     state.log_ring = log_ring;
 
+    // P3: surface the log-stream redaction posture at boot.
+    // The default is `redact_stream = true`; operators who flip
+    // it off see a loud WARN so the posture is obvious.
+    if state.cfg.logging.redact_stream {
+        tracing::info!(
+            "log stream redaction ENABLED (P3) — secrets (bearer tokens, \
+             API keys, JWTs, AWS credentials) are masked before streaming"
+        );
+    } else {
+        tracing::warn!(
+            "log stream redaction is DISABLED (logging.redact_stream = false) — \
+             raw log content is sent over /v1/logs/stream. Re-enable for \
+             production deployments."
+        );
+    }
+
     // W7: spawn the OTel flush loop on startup if the bridge's
     // `[observability.otel]` block enabled the exporter. The
     // exporter is shared with the ObservabilityContext via Arc;

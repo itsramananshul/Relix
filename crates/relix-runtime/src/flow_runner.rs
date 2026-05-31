@@ -353,11 +353,23 @@ async fn run_sol(
     // PART 1: SOL compile reads from disk + parses; both block.
     // Move it to the blocking pool so a tokio worker stays free.
     let flow_path_owned = flow_path.to_path_buf();
-    let bytecode = tokio::task::spawn_blocking(move || compile_sol(&flow_path_owned))
+    let flow_name = flow_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("<sol_flow>")
+        .to_string();
+    let compiled = tokio::task::spawn_blocking(move || compile_sol(&flow_path_owned))
         .await
         .map_err(|e| FlowRunnerError::Vm(format!("spawn_blocking join: {e}")))??;
     let vm_result = tokio::task::spawn_blocking(move || {
-        let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
+        let mut vm_builder = VM::from(&compiled.bytecode)
+            .with_dispatcher(dispatcher)
+            // P6: thread the per-flow fuel budget into the
+            // VM. compile_sol resolves `#steps` directives;
+            // when the source carries one it wins, otherwise
+            // [`crate::sol::DEFAULT_MAX_STEPS`] applies.
+            .with_fuel(compiled.max_steps)
+            .with_flow_name(flow_name);
         if let Some(observer) = chunk_observer {
             vm_builder = vm_builder.with_chunk_observer(observer);
         }
@@ -396,11 +408,22 @@ async fn run_yaml(
 ) -> Result<(u64, Option<RemoteCallError>, Option<String>), FlowRunnerError> {
     // PART 1: file I/O + parsing run on the blocking pool so
     // we never block a tokio runtime worker on disk.
+    let flow_name = flow_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("<yaml_flow>")
+        .to_string();
     let bytecode = crate::yaml_flow::compile_path_async(flow_path.to_path_buf())
         .await
         .map_err(|e| FlowRunnerError::Config(format!("yaml flow {}: {e}", flow_path.display())))?;
     let vm_result = tokio::task::spawn_blocking(move || {
-        let mut vm_builder = VM::from(&bytecode).with_dispatcher(dispatcher);
+        // P6: YAML flows compile via the yaml_flow frontend
+        // which does not honour `#steps`; they get the SOL
+        // crate's default fuel budget.
+        let mut vm_builder = VM::from(&bytecode)
+            .with_dispatcher(dispatcher)
+            .with_fuel(crate::sol::DEFAULT_MAX_STEPS)
+            .with_flow_name(flow_name);
         if let Some(observer) = chunk_observer {
             vm_builder = vm_builder.with_chunk_observer(observer);
         }
@@ -922,19 +945,21 @@ fn append_log(
         .map_err(|e| FlowRunnerError::EventLog(e.to_string()))
 }
 
-fn compile_sol(path: &Path) -> Result<Vec<crate::sol::bytecode::Inst>, FlowRunnerError> {
+fn compile_sol(path: &Path) -> Result<crate::sol::CompiledFlow, FlowRunnerError> {
     if !path.exists() {
         return Err(FlowRunnerError::Config(format!(
             "flow file not found: {}",
             path.display()
         )));
     }
-    // Hand off to the SOL crate's public compile entry point.
-    // It owns the catch_unwind that converts the verbatim port's
-    // panic-on-bad-input into a regular Result so a malformed
-    // flow loaded at startup fails cleanly instead of unwinding
-    // through the controller.
-    crate::sol::compile_path(path).map_err(FlowRunnerError::Config)
+    // P6: route through the directive-aware compile entry
+    // point so any `#steps N` directive at the top of the
+    // source is honoured per-flow. `default_max_steps = 0`
+    // means "use the SOL crate's default", since the flow
+    // runner today has no operator-level [sol] max_steps
+    // wiring.
+    crate::sol::compile_path_with_directives(path, 0)
+        .map_err(|e| FlowRunnerError::Config(e.to_string()))
 }
 
 async fn dial_all_peers(

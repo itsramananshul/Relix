@@ -4,11 +4,15 @@
 //! - the capability registry (method → handler map),
 //! - the policy engine,
 //! - the trust root (org-root pubkey),
-//! - the audit log.
+//! - the audit log,
+//! - the per-tenant policy resolver,
+//! - the replay-nonce cache (P2).
 //!
 //! For every inbound `transport::rpc::Event::Request`, it runs the strict
-//! admission pipeline (alpha steps from RELIX-1 §1.13: 1, 3, 5, 9, 10, 11)
+//! admission pipeline (RELIX-1 §1.13 steps 1, 3, 4 (replay), 5, 9, 10, 11)
 //! and dispatches to the registered handler.
+
+pub mod replay;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -408,19 +412,23 @@ pub struct DispatchBridge {
     /// methods no longer pay 50 string comparisons per inbound
     /// call.
     always_require_methods: Arc<HashSet<String>>,
-    /// SEC PART A: HMAC-SHA256 signing key for
+    /// P1: Ed25519 verification key set for
     /// [`crate::approval::ApprovalToken`]. The controller reads
-    /// `RELIX_APPROVAL_TOKEN_KEY` at startup and installs it
-    /// here; the admission gate threads it through
-    /// `GateInputs::signing_key`. Empty bytes (default) cause
-    /// every token-bearing call to fail with
-    /// `approval_token_missing_key`.
-    ///
-    /// SEC PART 2: wrapped in `Zeroizing` so the bytes are
-    /// wiped from the heap when the DispatchBridge is dropped
-    /// (e.g. controller shutdown) and on every
-    /// `set_approval_token_signing_key` replacement.
-    approval_token_signing_key: zeroize::Zeroizing<Vec<u8>>,
+    /// `RELIX_APPROVAL_SIGNING_KEY` at startup, builds a
+    /// signer, and stores both the signer (for issuance) and
+    /// a keyset derived from it (for verification) here. The
+    /// admission gate threads `&keyset` through
+    /// `GateInputs::keyset`. Empty keyset = every token-bearing
+    /// call fails with `approval_token_missing_key`.
+    approval_keyset: crate::approval::ApprovalKeySet,
+    /// P1: Ed25519 signer used to mint approval tokens on this
+    /// controller. `None` on responder-only nodes that verify
+    /// tokens issued by a separate coordinator. When `Some`,
+    /// the verifying key is also registered in
+    /// `approval_keyset` so a token issued by this controller
+    /// is accepted by this same controller (the typical
+    /// single-controller deployment).
+    approval_signer: Option<crate::approval::ApprovalSigner>,
     /// NOT-DONE 1: clock injection for TTL-sensitive admission
     /// paths (token expiry check at step 8). Defaults to
     /// [`relix_core::clock::SystemClock`]; tests install a
@@ -428,6 +436,30 @@ pub struct DispatchBridge {
     /// [`Self::set_clock`] to drive deterministic boundary
     /// cases without sleeping.
     clock: Arc<dyn relix_core::clock::Clock>,
+    /// P2 — RELIX-1 §1.9 sliding-window nonce cache. Every
+    /// inbound envelope's `rid` is checked against the cache
+    /// before any other admission step beyond decode. Duplicate
+    /// rids inside the freshness window return
+    /// [`error_kinds::REPLAY_REJECTED`].
+    replay_cache: replay::ReplayCache,
+    /// P2 — maximum clock-skew tolerance in ms between the
+    /// caller's `issued_at_ms` and the responder's `now_ms`.
+    /// Envelopes older OR farther in the future than this
+    /// margin are rejected as stale. Default 5 s; tunable per
+    /// deployment via [`Self::set_max_clock_skew_ms`].
+    max_clock_skew_ms: i64,
+    /// P5 — optional session-token verification gate. When
+    /// `Some` AND `verify_on_dispatch_enabled = true`, every
+    /// admitted call MUST carry a wire-encoded session token
+    /// whose signature + expiry + scope cover the requested
+    /// method. Wired by the controller startup alongside the
+    /// session identity service.
+    session_service: Option<Arc<crate::identity::SessionIdentityService>>,
+    /// P5 — operator switch for the session-token gate.
+    /// Mirrors `[identity.session] verify_on_dispatch`.
+    /// Defaults to `false` so existing deployments behave
+    /// unchanged.
+    verify_on_dispatch_enabled: bool,
 }
 
 /// Describe a capability by method name. The gate uses this
@@ -633,7 +665,12 @@ impl DispatchBridge {
             tenant_policy: None,
             audit_partition: None,
             always_require_methods: Arc::new(HashSet::new()),
-            approval_token_signing_key: zeroize::Zeroizing::new(Vec::new()),
+            approval_keyset: crate::approval::ApprovalKeySet::new(),
+            approval_signer: None,
+            replay_cache: replay::ReplayCache::new(replay::DEFAULT_WINDOW_MS),
+            max_clock_skew_ms: replay::DEFAULT_WINDOW_MS,
+            session_service: None,
+            verify_on_dispatch_enabled: false,
             clock: Arc::new(relix_core::clock::SystemClock),
         })
     }
@@ -656,21 +693,90 @@ impl DispatchBridge {
         self.clock.clone()
     }
 
-    /// SEC PART A: install the HMAC-SHA256 signing key the
-    /// admission gate uses to verify
-    /// [`crate::approval::ApprovalToken`] signatures. Idempotent
-    /// — calling twice replaces the prior key. Passing an empty
-    /// byte slice resets the bridge to the "no key"
-    /// configuration, in which case every token-bearing call
-    /// fails with `approval_token_missing_key`.
-    pub fn set_approval_token_signing_key(&mut self, key: Vec<u8>) {
-        self.approval_token_signing_key = zeroize::Zeroizing::new(key);
+    /// P1: install the Ed25519 signer the controller uses to
+    /// mint approval tokens. Also registers the signer's
+    /// verifying key in the local keyset so this controller can
+    /// verify the tokens it issues. Idempotent — calling twice
+    /// replaces the prior signer + replaces the keyset with a
+    /// single-key set built from the new signer.
+    pub fn set_approval_signer(&mut self, signer: crate::approval::ApprovalSigner) {
+        self.approval_keyset = crate::approval::ApprovalKeySet::from_signer(&signer);
+        self.approval_signer = Some(signer);
     }
 
-    /// SEC PART A: borrow the configured signing key. Used by
-    /// unit tests and the controller's startup-self-check log.
-    pub fn approval_token_signing_key(&self) -> &[u8] {
-        &self.approval_token_signing_key
+    /// P1: install an explicit verification keyset. Used by
+    /// responder-only nodes that don't mint tokens themselves
+    /// but accept tokens issued by one or more remote
+    /// signers. Idempotent.
+    pub fn set_approval_keyset(&mut self, keyset: crate::approval::ApprovalKeySet) {
+        self.approval_keyset = keyset;
+    }
+
+    /// P1: borrow the configured signer (when present). Used
+    /// by the controller's startup-self-check log + by tests.
+    pub fn approval_signer(&self) -> Option<&crate::approval::ApprovalSigner> {
+        self.approval_signer.as_ref()
+    }
+
+    /// P1: borrow the configured verification keyset. Always
+    /// returns a handle — empty when no signer is wired.
+    pub fn approval_keyset(&self) -> &crate::approval::ApprovalKeySet {
+        &self.approval_keyset
+    }
+
+    /// P2: set the maximum clock-skew tolerance in ms. The
+    /// admission step rejects envelopes whose
+    /// `|now_ms - issued_at_ms| > max_clock_skew_ms` as
+    /// `REPLAY_REJECTED`. Also resizes the replay cache so the
+    /// freshness window matches the tolerance — any nonce
+    /// past the window is necessarily stale and can be evicted.
+    pub fn set_max_clock_skew_ms(&mut self, max_skew_ms: i64) {
+        let skew = max_skew_ms.max(1);
+        self.max_clock_skew_ms = skew;
+        // Resize the cache by replacing it. Existing entries
+        // are dropped — operators tuning skew live want a
+        // clean window, and the freshness check above the
+        // cache already rejects any envelope older than the
+        // new window.
+        self.replay_cache = replay::ReplayCache::new(skew);
+    }
+
+    /// P2: read the configured maximum clock-skew tolerance in
+    /// ms. Used by tests + the controller startup log.
+    pub fn max_clock_skew_ms(&self) -> i64 {
+        self.max_clock_skew_ms
+    }
+
+    /// P2: borrow a clone of the replay-cache handle so the
+    /// controller startup can spawn the background eviction
+    /// task alongside the bridge.
+    pub fn replay_cache(&self) -> replay::ReplayCache {
+        self.replay_cache.clone()
+    }
+
+    /// P5: install the session identity service used by the
+    /// `verify_on_dispatch` admission gate. The service owns
+    /// the token store and the signing-key bytes — the
+    /// dispatch bridge consults its `verify(wire)` for every
+    /// inbound call. Idempotent — calling twice replaces the
+    /// previous service.
+    pub fn set_session_service(&mut self, service: Arc<crate::identity::SessionIdentityService>) {
+        self.session_service = Some(service);
+    }
+
+    /// P5: flip the `verify_on_dispatch` gate on or off.
+    /// Idempotent. When `true` AND a session service is
+    /// wired, every admitted call MUST carry a valid wire
+    /// session token whose scopes cover the requested method.
+    /// Operators set this via `[identity.session] verify_on_dispatch`.
+    pub fn set_verify_on_dispatch(&mut self, enabled: bool) {
+        self.verify_on_dispatch_enabled = enabled;
+    }
+
+    /// P5: read the configured verify-on-dispatch flag. Used
+    /// by the controller startup self-check log.
+    pub fn verify_on_dispatch_enabled(&self) -> bool {
+        self.verify_on_dispatch_enabled
     }
 
     /// GAP 15 partial: set the global "always require approval"
@@ -1171,14 +1277,60 @@ impl DispatchBridge {
         };
 
         // === Admission step 3: deadline ===
+        // P2 — RELIX-1 §1.7 + the explicit operator request to
+        // drop the 30s grace: the deadline is the deadline. A
+        // request that arrives after `req.deadline` is rejected
+        // with `TIMEOUT` (DEADLINE_EXCEEDED-class). Clock skew
+        // is handled separately by the freshness check below,
+        // which is bounded by `max_clock_skew_ms`, not 30s.
         let now = unix_now();
-        if now > req.deadline.0 + 30 {
+        let now_ms = self.clock.now_ms();
+        if now > req.deadline.0 {
             return self
                 .audit_and_err(
                     req,
                     started_at,
                     "admission:deadline_exceeded",
                     error_kinds::TIMEOUT,
+                )
+                .await;
+        }
+
+        // === Admission step 4a: freshness (RELIX-1 §1.7) ===
+        // P2 — reject envelopes whose `issued_at_ms` is more
+        // than `max_clock_skew_ms` away from `now_ms` in
+        // either direction. Bounds the worst-case replay window
+        // (set to a few seconds rather than 30) so an attacker
+        // who captures a still-fresh envelope has very little
+        // time to act, and lets the replay cache safely evict
+        // entries past the same window.
+        let skew = (now_ms - req.issued_at_ms).abs();
+        if skew > self.max_clock_skew_ms {
+            return self
+                .audit_and_err(
+                    req,
+                    started_at,
+                    "admission:stale_envelope",
+                    error_kinds::REPLAY_REJECTED,
+                )
+                .await;
+        }
+
+        // === Admission step 4b: replay-cache check (RELIX-1 §1.9) ===
+        // P2 — the envelope's `rid` is 16 random bytes (per
+        // `types.rs::RequestId::new`) per envelope, so it
+        // doubles as the replay nonce. Duplicate rid inside
+        // the freshness window → REPLAY_REJECTED.
+        let nonce_hex = hex::encode(req.rid.0);
+        if let Err(replay::ReplayError::Replayed) =
+            self.replay_cache.check_and_insert(&nonce_hex, now_ms)
+        {
+            return self
+                .audit_and_err(
+                    req,
+                    started_at,
+                    "admission:replay_rejected",
+                    error_kinds::REPLAY_REJECTED,
                 )
                 .await;
         }
@@ -1197,6 +1349,70 @@ impl DispatchBridge {
                     .await;
             }
         };
+
+        // === Admission step 6: session-token verification (P5) ===
+        // Spec `identity-employees.md` §H.5 / SessionIdentityConfig:
+        // when `verify_on_dispatch = true` AND a session
+        // service is wired, every admitted call MUST carry a
+        // wire-encoded session token whose signature, expiry,
+        // tenant scoping AND scope-set cover the requested
+        // method. The flag exists purely so existing
+        // deployments stay byte-identical until operators flip
+        // it; when off this step is a no-op.
+        if self.verify_on_dispatch_enabled
+            && let Some(svc) = self.session_service.as_ref()
+        {
+            let Some(token_wire) = req.session_token.as_deref() else {
+                return self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        "session_token_missing".to_string(),
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+            };
+            let v = svc.verify(token_wire);
+            if !v.valid {
+                let reason = v
+                    .reason
+                    .unwrap_or_else(|| "session_token_invalid".to_string());
+                return self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        format!("session_token_invalid: {reason}"),
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+            }
+            // Scope check: the token MUST list the requested
+            // method (exact byte match) in its scopes vector.
+            // Operators that want broader tokens grant the
+            // wildcard scope `"*"` at issue time; the dispatch
+            // gate honours it here.
+            let scope_admits = v.scopes.iter().any(|s| s == "*" || s == &req.method);
+            if !scope_admits {
+                return self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        format!(
+                            "session_token_invalid: token_insufficient_scope \
+                             (method={}, scopes={:?})",
+                            req.method, v.scopes
+                        ),
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+            }
+        }
 
         // === Admission step 7: capability lookup ===
         let Some(handler) = self.handlers.get(&req.method).cloned() else {
@@ -1233,7 +1449,7 @@ impl DispatchBridge {
                     capability: descriptor.as_ref(),
                     now,
                     now_ms,
-                    signing_key: &self.approval_token_signing_key,
+                    keyset: &self.approval_keyset,
                     caller_surface: caller_surface.as_deref(),
                 },
             );
@@ -1730,17 +1946,16 @@ impl DispatchBridge {
                 }
                 let retries = max_retries.min(MAX_RETRY_CAP);
                 for _ in 0..retries {
-                    // PART 6: respect the original admission
+                    // P2: respect the original admission
                     // deadline. The admission step gates the
-                    // first invocation against `req.deadline.0`;
-                    // each retry can add seconds of wall time
-                    // and must NOT push the response past the
-                    // caller's deadline (plus the 30-second
-                    // grace already used elsewhere in admission).
+                    // first invocation against `req.deadline.0`
+                    // strictly (no grace). Each retry can add
+                    // seconds of wall time and must NOT push
+                    // the response past the caller's deadline.
                     // When the budget is gone we stop retrying
                     // and return DEADLINE_EXCEEDED.
                     let now = unix_now();
-                    if now > deadline_unix_secs + 30 {
+                    if now > deadline_unix_secs {
                         return (
                             HandlerOutcome::Err(ErrorEnvelope {
                                 kind: error_kinds::TIMEOUT,
@@ -2028,9 +2243,10 @@ impl DispatchBridge {
             }
         };
 
-        // === Admission step 3: deadline ===
+        // === Admission step 3: deadline (P2 — no grace) ===
         let now = unix_now();
-        if now > req.deadline.0 + 30 {
+        let now_ms = self.clock.now_ms();
+        if now > req.deadline.0 {
             let _ = writer
                 .write_err(error_kinds::TIMEOUT, "admission:deadline_exceeded")
                 .await;
@@ -2040,6 +2256,42 @@ impl DispatchBridge {
                     started_at,
                     "admission:deadline_exceeded",
                     error_kinds::TIMEOUT,
+                )
+                .await;
+            return;
+        }
+
+        // === Admission step 4a: freshness (RELIX-1 §1.7) ===
+        let skew = (now_ms - req.issued_at_ms).abs();
+        if skew > self.max_clock_skew_ms {
+            let _ = writer
+                .write_err(error_kinds::REPLAY_REJECTED, "admission:stale_envelope")
+                .await;
+            let _ = self
+                .audit_and_err(
+                    req,
+                    started_at,
+                    "admission:stale_envelope",
+                    error_kinds::REPLAY_REJECTED,
+                )
+                .await;
+            return;
+        }
+
+        // === Admission step 4b: replay-cache check (RELIX-1 §1.9) ===
+        let nonce_hex = hex::encode(req.rid.0);
+        if let Err(replay::ReplayError::Replayed) =
+            self.replay_cache.check_and_insert(&nonce_hex, now_ms)
+        {
+            let _ = writer
+                .write_err(error_kinds::REPLAY_REJECTED, "admission:replay_rejected")
+                .await;
+            let _ = self
+                .audit_and_err(
+                    req,
+                    started_at,
+                    "admission:replay_rejected",
+                    error_kinds::REPLAY_REJECTED,
                 )
                 .await;
             return;
@@ -2064,6 +2316,72 @@ impl DispatchBridge {
                 return;
             }
         };
+
+        // === Admission step 6: session-token verification (P5) ===
+        if self.verify_on_dispatch_enabled
+            && let Some(svc) = self.session_service.as_ref()
+        {
+            let Some(token_wire) = req.session_token.as_deref() else {
+                let cause = "session_token_missing".to_string();
+                let _ = writer
+                    .write_err(error_kinds::SECURITY_DENIED, cause.clone())
+                    .await;
+                let _ = self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        cause,
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+                return;
+            };
+            let v = svc.verify(token_wire);
+            if !v.valid {
+                let reason = v
+                    .reason
+                    .unwrap_or_else(|| "session_token_invalid".to_string());
+                let cause = format!("session_token_invalid: {reason}");
+                let _ = writer
+                    .write_err(error_kinds::SECURITY_DENIED, cause.clone())
+                    .await;
+                let _ = self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        cause,
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+                return;
+            }
+            let scope_admits = v.scopes.iter().any(|s| s == "*" || s == &req.method);
+            if !scope_admits {
+                let cause = format!(
+                    "session_token_invalid: token_insufficient_scope \
+                     (method={}, scopes={:?})",
+                    req.method, v.scopes
+                );
+                let _ = writer
+                    .write_err(error_kinds::SECURITY_DENIED, cause.clone())
+                    .await;
+                let _ = self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        cause,
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+                return;
+            }
+        }
 
         // === Admission step 7: streaming-handler lookup ===
         let Some(handler) = self.streaming_handlers.get(&req.method).cloned() else {
@@ -2099,7 +2417,7 @@ impl DispatchBridge {
                     capability: descriptor.as_ref(),
                     now,
                     now_ms,
-                    signing_key: &self.approval_token_signing_key,
+                    keyset: &self.approval_keyset,
                     caller_surface: caller_surface.as_deref(),
                 },
             );
@@ -2750,10 +3068,15 @@ pub fn build_request_with_surface(
         deadline: Timestamp::now()
             .add_secs(deadline_secs_from_now)
             .unwrap_or(Timestamp(i64::MAX)),
+        // P2: stamp `issued_at_ms` so the responder's freshness
+        // gate can reject captured envelopes past the
+        // configured clock-skew window.
+        issued_at_ms: unix_now_ms(),
         surface,
         approval_token,
         task_id,
         tenant_id: None,
+        session_token: None,
     };
     codec::encode(&req).unwrap_or_default()
 }
@@ -2789,10 +3112,53 @@ pub fn build_request_with_tenant(
         deadline: Timestamp::now()
             .add_secs(deadline_secs_from_now)
             .unwrap_or(Timestamp(i64::MAX)),
+        // P2: stamp `issued_at_ms` so the responder's freshness
+        // gate can reject captured envelopes past the
+        // configured clock-skew window.
+        issued_at_ms: unix_now_ms(),
         surface,
         approval_token,
         task_id,
         tenant_id,
+        session_token: None,
+    };
+    codec::encode(&req).unwrap_or_default()
+}
+
+/// P5 — full-form envelope builder that also stamps a
+/// session token. Used by callers (typically the bridge) that
+/// participate in `verify_on_dispatch`. Existing callers
+/// continue to use [`build_request_with_tenant`] which sets
+/// `session_token = None`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_with_session(
+    method: impl Into<String>,
+    args: Vec<u8>,
+    identity: Bundle,
+    deadline_secs_from_now: i64,
+    surface: Option<String>,
+    approval_token: Option<String>,
+    task_id: Option<String>,
+    tenant_id: Option<String>,
+    session_token: Option<String>,
+) -> Vec<u8> {
+    let req = RequestEnvelope {
+        pv: 1,
+        rid: relix_core::types::RequestId::new(),
+        tid: relix_core::types::TraceId::new(),
+        method: method.into(),
+        mv: 1,
+        args: ByteBuf::from(args),
+        identity_bundle: identity,
+        deadline: Timestamp::now()
+            .add_secs(deadline_secs_from_now)
+            .unwrap_or(Timestamp(i64::MAX)),
+        issued_at_ms: unix_now_ms(),
+        surface,
+        approval_token,
+        task_id,
+        tenant_id,
+        session_token,
     };
     codec::encode(&req).unwrap_or_default()
 }
@@ -2815,6 +3181,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use relix_core::clock::Clock as _;
     use relix_core::identity::{IdentityBundle, issue_identity};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -3017,7 +3384,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let signing_key = b"clock-test-signing-key-32-bytes!".to_vec();
+        let signer = crate::approval::ApprovalSigner::from_seed([3u8; 32]);
         let wire = crate::approval::ApprovalToken::issue(
             &meta.approval_id,
             &meta.method,
@@ -3025,11 +3392,11 @@ mod tests {
             meta.task_id.as_deref().unwrap_or(""),
             issued_at_ms,
             ttl_ms,
-            &signing_key,
+            &signer,
         )
         .unwrap();
 
-        bridge.set_approval_token_signing_key(signing_key);
+        bridge.set_approval_signer(signer);
         let describe: super::CapabilityDescribeFn = Arc::new(|_method: &str| None);
         let on_require_approval: super::OnRequireApprovalFn =
             Arc::new(|_req, _hint| Ok(String::new()));
@@ -3041,6 +3408,15 @@ mod tests {
 
         let fake_clock = std::sync::Arc::new(relix_core::clock::FakeClock::new(0));
         bridge.set_clock(fake_clock.clone());
+        // P2: this helper drives the FakeClock at small ms
+        // values (~60_000) while `build_request_with_tenant`
+        // stamps `issued_at_ms` from wall-clock — they diverge
+        // by ~1.7e12 ms. The freshness gate would otherwise
+        // reject every envelope as stale. Disable the
+        // freshness gate by widening tolerance to i64::MAX —
+        // the test's purpose is the token's TTL window, not
+        // envelope freshness.
+        bridge.set_max_clock_skew_ms(i64::MAX);
 
         // Caller bundle whose subject_id matches the token's
         // bound subject so the gate's subject-match check
@@ -4826,5 +5202,396 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(body.as_slice(), b"hi");
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // P2 — replay cache + freshness check + no-30s-grace tests
+    // ─────────────────────────────────────────────────────────
+
+    /// Build an envelope with explicit overrides for the
+    /// timestamp fields. Used by the P2 tests to drive the
+    /// freshness gate and the replay cache from synthetic
+    /// time values without sleeping.
+    fn build_request_with_clock(
+        method: &str,
+        bundle: Bundle,
+        deadline_secs_from_now: i64,
+        issued_at_ms: i64,
+        rid: Option<relix_core::types::RequestId>,
+    ) -> Vec<u8> {
+        let envelope = RequestEnvelope {
+            pv: 1,
+            rid: rid.unwrap_or_default(),
+            tid: relix_core::types::TraceId::new(),
+            method: method.into(),
+            mv: 1,
+            args: ByteBuf::from(b"hi".to_vec()),
+            identity_bundle: bundle,
+            deadline: Timestamp::now()
+                .add_secs(deadline_secs_from_now)
+                .unwrap_or(Timestamp(i64::MAX)),
+            issued_at_ms,
+            surface: None,
+            approval_token: None,
+            task_id: None,
+            tenant_id: None,
+            session_token: None,
+        };
+        codec::encode(&envelope).unwrap_or_default()
+    }
+
+    /// Same as [`build_request_with_clock`] but also stamps a
+    /// wire session-token. Used by the P5 tests below.
+    fn build_request_with_session_token(
+        method: &str,
+        bundle: Bundle,
+        deadline_secs_from_now: i64,
+        issued_at_ms: i64,
+        session_token: Option<String>,
+    ) -> Vec<u8> {
+        let envelope = RequestEnvelope {
+            pv: 1,
+            rid: relix_core::types::RequestId::new(),
+            tid: relix_core::types::TraceId::new(),
+            method: method.into(),
+            mv: 1,
+            args: ByteBuf::from(b"hi".to_vec()),
+            identity_bundle: bundle,
+            deadline: Timestamp::now()
+                .add_secs(deadline_secs_from_now)
+                .unwrap_or(Timestamp(i64::MAX)),
+            issued_at_ms,
+            surface: None,
+            approval_token: None,
+            task_id: None,
+            tenant_id: None,
+            session_token,
+        };
+        codec::encode(&envelope).unwrap_or_default()
+    }
+
+    /// Boot an `allow_health_bridge` AND wire a session
+    /// identity service so the P5 verify_on_dispatch gate has
+    /// something to call. Returns the bridge, the issuance
+    /// helper, the bundle, the temp dir, and the org root.
+    fn allow_health_bridge_with_session() -> (
+        DispatchBridge,
+        Arc<crate::identity::SessionIdentityService>,
+        Bundle,
+        TempDir,
+        SigningKey,
+    ) {
+        let (mut bridge, bundle, dir, root) = allow_health_bridge();
+        let store = crate::identity::TokenStore::open_in_memory().unwrap();
+        let cfg = crate::identity::SessionIdentityConfig {
+            enabled: true,
+            session_ttl_secs: 3_600,
+            session_idle_timeout_secs: 0,
+            sweep_interval_secs: 60,
+            verify_on_dispatch: true,
+            ..Default::default()
+        };
+        let svc = Arc::new(
+            crate::identity::SessionIdentityService::new(store, cfg, vec![7u8; 32]).unwrap(),
+        );
+        bridge.set_session_service(svc.clone());
+        bridge.set_verify_on_dispatch(true);
+        (bridge, svc, bundle, dir, root)
+    }
+
+    #[tokio::test]
+    async fn p5_verify_on_dispatch_with_no_token_returns_security_denied() {
+        let (bridge, _svc, bundle, _dir, _root) = allow_health_bridge_with_session();
+        let envelope =
+            build_request_with_session_token("node.health", bundle, 30, unix_now_ms(), None);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(env) => {
+                assert_eq!(env.kind, error_kinds::SECURITY_DENIED);
+                assert!(
+                    env.cause.contains("session_token_missing"),
+                    "cause: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected SECURITY_DENIED, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn p5_verify_on_dispatch_with_expired_token_returns_security_denied() {
+        let (bridge, svc, bundle, _dir, _root) = allow_health_bridge_with_session();
+        // Issue a token then forge its expiry into the past
+        // and re-sign so signature verifies but expiry fails.
+        // The cleanest way is to use the service's own helper:
+        // issue a 1ms token, sleep past it, and verify.
+        let mut tok = svc
+            .issue(&crate::identity::IssueRequest {
+                session_id: "sess-expire".into(),
+                agent_name: "alice".into(),
+                tenant_id: Some("acme".into()),
+                scopes: vec!["node.health".into()],
+                ttl_secs: Some(1),
+            })
+            .unwrap();
+        // Move expiry into the past + re-sign.
+        tok.expires_at_ms = tok.issued_at_ms - 1;
+        // Re-sign by routing through the service's
+        // canonical-bytes + sign path. The simplest is to
+        // mint a brand-new token with a 1ms TTL, then wait a
+        // bit so it actually expires. Avoid relying on
+        // service-private resign helpers.
+        let fresh = svc
+            .issue(&crate::identity::IssueRequest {
+                session_id: "sess-expire-2".into(),
+                agent_name: "alice".into(),
+                tenant_id: Some("acme".into()),
+                scopes: vec!["node.health".into()],
+                ttl_secs: Some(1),
+            })
+            .unwrap();
+        let wire = fresh.to_wire().unwrap();
+        // Wait for the 1s TTL to fully elapse.
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        let envelope =
+            build_request_with_session_token("node.health", bundle, 30, unix_now_ms(), Some(wire));
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(env) => {
+                assert_eq!(env.kind, error_kinds::SECURITY_DENIED);
+                assert!(
+                    env.cause.contains("expired") || env.cause.contains("session_token_invalid"),
+                    "cause: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected SECURITY_DENIED, got {other:?}"),
+        }
+        let _ = tok;
+    }
+
+    #[tokio::test]
+    async fn p5_verify_on_dispatch_with_token_missing_capability_scope_returns_security_denied() {
+        let (bridge, svc, bundle, _dir, _root) = allow_health_bridge_with_session();
+        // Issue a token whose scopes do NOT cover node.health.
+        let tok = svc
+            .issue(&crate::identity::IssueRequest {
+                session_id: "sess-narrow".into(),
+                agent_name: "alice".into(),
+                tenant_id: Some("acme".into()),
+                scopes: vec!["tool.web_fetch".into()],
+                ttl_secs: Some(60),
+            })
+            .unwrap();
+        let wire = tok.to_wire().unwrap();
+        let envelope =
+            build_request_with_session_token("node.health", bundle, 30, unix_now_ms(), Some(wire));
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(env) => {
+                assert_eq!(env.kind, error_kinds::SECURITY_DENIED);
+                assert!(
+                    env.cause.contains("token_insufficient_scope"),
+                    "cause: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected SECURITY_DENIED, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn p5_verify_on_dispatch_admits_when_token_scope_covers_method() {
+        let (bridge, svc, bundle, _dir, _root) = allow_health_bridge_with_session();
+        let tok = svc
+            .issue(&crate::identity::IssueRequest {
+                session_id: "sess-ok".into(),
+                agent_name: "alice".into(),
+                tenant_id: Some("acme".into()),
+                scopes: vec!["node.health".into()],
+                ttl_secs: Some(60),
+            })
+            .unwrap();
+        let wire = tok.to_wire().unwrap();
+        let envelope =
+            build_request_with_session_token("node.health", bundle, 30, unix_now_ms(), Some(wire));
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert!(
+            matches!(resp.res, ResponseResult::Ok(_)),
+            "valid in-scope token must admit, got {:?}",
+            resp.res
+        );
+    }
+
+    #[tokio::test]
+    async fn p5_wildcard_scope_admits_any_method() {
+        // Operators that want broad tokens use the `*` scope.
+        let (bridge, svc, bundle, _dir, _root) = allow_health_bridge_with_session();
+        let tok = svc
+            .issue(&crate::identity::IssueRequest {
+                session_id: "sess-wildcard".into(),
+                agent_name: "alice".into(),
+                tenant_id: Some("acme".into()),
+                scopes: vec!["*".into()],
+                ttl_secs: Some(60),
+            })
+            .unwrap();
+        let wire = tok.to_wire().unwrap();
+        let envelope =
+            build_request_with_session_token("node.health", bundle, 30, unix_now_ms(), Some(wire));
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert!(
+            matches!(resp.res, ResponseResult::Ok(_)),
+            "`*` scope must admit, got {:?}",
+            resp.res
+        );
+    }
+
+    #[tokio::test]
+    async fn p5_verify_off_admits_call_with_no_token_regardless_of_service_wiring() {
+        let (bridge, _bundle, _dir, _root) = allow_health_bridge();
+        // No session_service wired AND verify_on_dispatch off
+        // → existing pre-P5 behaviour is preserved.
+        assert!(!bridge.verify_on_dispatch_enabled());
+        let envelope = build_request("node.health", b"hi".to_vec(), _bundle, 30);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert!(
+            matches!(resp.res, ResponseResult::Ok(_)),
+            "verify-off must preserve pre-P5 behaviour"
+        );
+    }
+
+    #[tokio::test]
+    async fn p2_replayed_nonce_is_rejected_second_time_with_replay_rejected() {
+        let (bridge, bundle, _dir, _root) = allow_health_bridge();
+        let fixed_rid = relix_core::types::RequestId([7u8; 16]);
+        // First call admits.
+        let envelope_1 = build_request_with_clock(
+            "node.health",
+            bundle.clone(),
+            30,
+            unix_now_ms(),
+            Some(fixed_rid),
+        );
+        let resp_bytes_1 = bridge.handle_inbound(envelope_1).await;
+        let resp_1 = decode_response(&resp_bytes_1).unwrap();
+        assert!(
+            matches!(resp_1.res, ResponseResult::Ok(_)),
+            "first observation must admit, got {:?}",
+            resp_1.res
+        );
+        // Second call with the same rid → REPLAY_REJECTED.
+        let envelope_2 =
+            build_request_with_clock("node.health", bundle, 30, unix_now_ms(), Some(fixed_rid));
+        let resp_bytes_2 = bridge.handle_inbound(envelope_2).await;
+        let resp_2 = decode_response(&resp_bytes_2).unwrap();
+        match resp_2.res {
+            ResponseResult::Err(env) => {
+                assert_eq!(env.kind, error_kinds::REPLAY_REJECTED);
+                assert!(
+                    env.cause.contains("replay_rejected"),
+                    "cause: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected REPLAY_REJECTED, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn p2_request_arriving_after_deadline_returns_deadline_exceeded() {
+        let (bridge, bundle, _dir, _root) = allow_health_bridge();
+        // Issue with a NEGATIVE deadline-from-now so the
+        // resulting absolute deadline is already in the past.
+        let envelope = build_request_with_clock("node.health", bundle, -10, unix_now_ms(), None);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(env) => {
+                assert_eq!(env.kind, error_kinds::TIMEOUT);
+                assert!(
+                    env.cause.contains("deadline_exceeded"),
+                    "cause: {}",
+                    env.cause
+                );
+            }
+            other => panic!("expected TIMEOUT, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p2_request_within_skew_tolerance_admits() {
+        // P2 test: "A request arriving 4 seconds after its
+        // issued_at with 5-second skew tolerance is accepted".
+        let (mut bridge, bundle, _dir, _root) = allow_health_bridge();
+        bridge.set_max_clock_skew_ms(5_000);
+        let fake = Arc::new(relix_core::clock::FakeClock::new(1_000_000));
+        bridge.set_clock(fake.clone());
+        // Envelope was issued at the bridge's "current" clock,
+        // then the responder's clock advances 4 seconds.
+        let issued_at_ms = fake.now_ms();
+        fake.set(issued_at_ms + 4_000);
+        let envelope = build_request_with_clock("node.health", bundle, 60, issued_at_ms, None);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        assert!(
+            matches!(resp.res, ResponseResult::Ok(_)),
+            "4s skew with 5s tolerance must admit, got {:?}",
+            resp.res
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p2_request_outside_skew_tolerance_is_rejected_with_replay_rejected() {
+        // P2 test: "A request arriving 6 seconds after its
+        // issued_at with 5-second skew tolerance is rejected".
+        let (mut bridge, bundle, _dir, _root) = allow_health_bridge();
+        bridge.set_max_clock_skew_ms(5_000);
+        let fake = Arc::new(relix_core::clock::FakeClock::new(1_000_000));
+        bridge.set_clock(fake.clone());
+        let issued_at_ms = fake.now_ms();
+        // Responder clock 6 s ahead of issuer → past skew window.
+        fake.set(issued_at_ms + 6_000);
+        let envelope = build_request_with_clock("node.health", bundle, 60, issued_at_ms, None);
+        let resp_bytes = bridge.handle_inbound(envelope).await;
+        let resp = decode_response(&resp_bytes).unwrap();
+        match resp.res {
+            ResponseResult::Err(env) => {
+                assert_eq!(env.kind, error_kinds::REPLAY_REJECTED);
+                assert!(env.cause.contains("stale_envelope"), "cause: {}", env.cause);
+            }
+            other => panic!("expected REPLAY_REJECTED stale, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn p2_eviction_task_removes_expired_nonces() {
+        // P2 test: "The eviction task removes expired nonces."
+        // We exercise the cache directly via the bridge's
+        // replay_cache() handle. Insert a nonce; advance time;
+        // evict; verify the entry is gone.
+        let (bridge, _bundle, _dir, _root) = allow_health_bridge();
+        let cache = bridge.replay_cache();
+        cache.check_and_insert("nonce-evict", 0).unwrap();
+        assert_eq!(cache.len(), 1);
+        let removed = cache.evict_expired(bridge.max_clock_skew_ms() + 1);
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn p2_max_clock_skew_setter_resizes_replay_cache() {
+        let (mut bridge, _bundle, _dir, _root) = allow_health_bridge();
+        bridge.set_max_clock_skew_ms(2_000);
+        assert_eq!(bridge.max_clock_skew_ms(), 2_000);
+        assert_eq!(bridge.replay_cache().window_ms(), 2_000);
+        bridge.set_max_clock_skew_ms(10_000);
+        assert_eq!(bridge.replay_cache().window_ms(), 10_000);
     }
 }

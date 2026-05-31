@@ -15,6 +15,30 @@
 //! The fmt layer is unchanged — stdout still gets every event
 //! verbatim. The dashboard sink is additive.
 //!
+//! ## P3 — secret redaction
+//!
+//! Every line that flows through the SSE response is run
+//! through [`relix_core::redact::redact_secrets`] before being
+//! serialised to the wire. That helper masks API keys (Stripe,
+//! Google, OpenAI / Anthropic shapes), bearer tokens, JWTs,
+//! AWS access-key / session-token pairs, PEM blocks, and the
+//! `password=` / `secret=` / `api_key=` inline-field shapes.
+//! Operators who deliberately want raw content set
+//! `[logging] redact_stream = false`; the bridge logs a
+//! startup WARN in that case.
+//!
+//! ## P3 — single-connection-per-session cap
+//!
+//! The stream endpoint enforces at most one live SSE
+//! connection per authenticated session token. When a second
+//! request arrives bearing the same token, the existing
+//! connection's `cancel` channel is signalled so the running
+//! stream drains and exits — the new connection then takes
+//! over. This prevents an attacker who steals a token from
+//! quietly tailing operator logs alongside the legitimate
+//! dashboard tab without the operator noticing both windows
+//! drop content.
+//!
 //! ## Threading model
 //!
 //! The ring is `Arc<Mutex<VecDeque<LogLine>>>` (the per-write
@@ -24,17 +48,18 @@
 //! slow subscriber sees `Lagged` errors and skips, never wedges
 //! the producer.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::Stream;
+use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{Event as TracingEvent, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
@@ -69,10 +94,20 @@ pub const BROADCAST_CAPACITY: usize = 1024;
 
 /// Shared handle the tracing layer writes into and the SSE
 /// handler reads from. Cheap to clone.
+///
+/// P3: also carries the per-session live-connection registry
+/// so the SSE endpoint can enforce the
+/// one-connection-per-session cap.
 #[derive(Clone)]
 pub struct LogRing {
     inner: Arc<Mutex<VecDeque<LogLine>>>,
     tx: broadcast::Sender<LogLine>,
+    /// P3: per-token live-stream cancel handles. Keyed by
+    /// session token. When a second stream opens for the same
+    /// token, the existing watch sender is replaced and its
+    /// previous value is set to `true` — observers polling the
+    /// receiver drain and close.
+    live_streams: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
 }
 
 impl LogRing {
@@ -81,6 +116,7 @@ impl LogRing {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY))),
             tx,
+            live_streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -113,6 +149,49 @@ impl LogRing {
     /// per active SSE connection.
     pub fn subscribe(&self) -> broadcast::Receiver<LogLine> {
         self.tx.subscribe()
+    }
+
+    /// P3 — claim a stream slot for the given session token.
+    /// Replaces any previous live-stream cancellation handle
+    /// for the same token, signalling the prior stream to
+    /// drain. Returns the [`watch::Receiver`] the new stream
+    /// awaits to learn it has been superseded.
+    pub fn claim_stream_slot(&self, token: &str) -> watch::Receiver<bool> {
+        let (tx, rx) = watch::channel(false);
+        let mut map = self.live_streams.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = map.insert(token.to_string(), tx) {
+            // Signal the previous holder to close. Ignore the
+            // result: a closed receiver means the previous
+            // stream already exited.
+            let _ = prev.send(true);
+        }
+        rx
+    }
+
+    /// P3 — release the per-token slot when an SSE stream
+    /// finishes. Idempotent: if another claim has already
+    /// replaced the slot, this call is a no-op so a
+    /// stale-stream cleanup doesn't tear down the new owner.
+    pub fn release_stream_slot(&self, token: &str, our_sender: &watch::Sender<bool>) {
+        let mut map = self.live_streams.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(current) = map.get(token) {
+            // Compare by sender identity via `same_channel`.
+            // `tokio::sync::watch::Sender` exposes
+            // `same_channel` for this exact case.
+            if current.same_channel(our_sender) {
+                map.remove(token);
+            }
+        }
+    }
+
+    /// P3 — current number of live per-token stream slots. Used
+    /// by tests + future operator surfaces.
+    #[allow(dead_code)]
+    pub fn live_stream_count(&self) -> usize {
+        self.live_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -222,6 +301,39 @@ impl<'a> tracing::field::Visit for MessageVisitor<'a> {
     }
 }
 
+/// P3 — apply the configured redaction policy to a [`LogLine`].
+/// Returns the line untouched when redaction is disabled OR
+/// the message scanned clean of secret-shaped substrings.
+fn redact_line(line: &LogLine, redact_stream: bool) -> LogLine {
+    if !redact_stream {
+        return line.clone();
+    }
+    LogLine {
+        ts_ms: line.ts_ms,
+        level: line.level.clone(),
+        target: line.target.clone(),
+        message: relix_core::redact::redact_secrets(&line.message),
+    }
+}
+
+/// P3 — extract the bearer token presented on the inbound SSE
+/// request. The bridge's auth middleware admits the request
+/// only when this header matches the bridge token (or a
+/// tenant-binding prefix); the value is what we key the
+/// per-session-cap registry on.
+fn extract_session_token(req: &Request) -> Option<String> {
+    let v = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let rest = v
+        .strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))?;
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// `GET /v1/logs/stream` — Server-Sent Events stream of bridge
 /// logs. Emits one `event: log` per line. The dashboard
 /// (Section 18) consumes this with `EventSource`.
@@ -240,40 +352,98 @@ impl<'a> tracing::field::Visit for MessageVisitor<'a> {
 ///      line.
 ///   3. Sends a keep-alive comment every 15s so reverse proxies
 ///      don't close idle connections.
-pub async fn stream(
-    State(state): State<crate::config::AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+///
+/// P3:
+///   - Every line passes through [`relix_core::redact::redact_secrets`]
+///     before being serialised (subject to `[logging] redact_stream`).
+///   - A second connection bearing the same session token
+///     cancels the first.
+pub async fn stream(State(state): State<crate::config::AppState>, req: Request) -> Response {
     let ring = state.log_ring.clone();
+    let redact_stream = state.cfg.logging.redact_stream;
+    let token = match extract_session_token(&req) {
+        Some(t) => t,
+        None => {
+            // The auth middleware should have rejected this
+            // already, but defend in depth: refuse without a
+            // bearer so the per-session cap has a non-empty
+            // key.
+            return (StatusCode::UNAUTHORIZED, "log stream requires bearer auth").into_response();
+        }
+    };
     let snapshot = ring.snapshot();
     let rx = ring.subscribe();
+    let cancel_rx = ring.claim_stream_slot(&token);
+    // Capture a Sender clone for the slot we just claimed so the
+    // post-stream cleanup can `same_channel`-compare against it
+    // and release ONLY if we're still the slot owner.
+    let our_sender = {
+        let map = ring.live_streams.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&token).cloned()
+    };
+    let ring_for_cleanup = ring.clone();
+    let token_for_cleanup = token.clone();
     let s = async_stream::stream! {
         // Replay the ring first. JSON-encode each line; if
         // encoding fails (shouldn't — LogLine is a plain
         // struct) skip the line rather than aborting the
         // stream.
         for line in snapshot {
-            if let Ok(payload) = serde_json::to_string(&line) {
-                yield Ok(Event::default().event("log").data(payload));
+            let safe = redact_line(&line, redact_stream);
+            if let Ok(payload) = serde_json::to_string(&safe) {
+                yield Ok::<_, Infallible>(Event::default().event("log").data(payload));
             }
         }
-        // Then tail the broadcast directly. `Lagged` means we
-        // dropped lines for a slow subscriber — skip and keep
-        // pulling. `Closed` means the producer dropped its
-        // sender (process is shutting down) — end the stream.
+        // Then tail the broadcast directly, racing the cancel
+        // signal that fires when a second connection supersedes
+        // this one. `Lagged` means we dropped lines for a slow
+        // subscriber — skip and keep pulling. `Closed` means
+        // the producer dropped its sender (process is shutting
+        // down) — end the stream.
         let mut rx = rx;
+        let mut cancel_rx = cancel_rx;
         loop {
-            match rx.recv().await {
-                Ok(line) => {
-                    if let Ok(payload) = serde_json::to_string(&line) {
-                        yield Ok(Event::default().event("log").data(payload));
+            tokio::select! {
+                changed = cancel_rx.changed() => {
+                    // `Err` ⇒ the watch sender was dropped
+                    // (slot was released without superseding —
+                    // shouldn't happen on this code path but
+                    // close anyway). `Ok` ⇒ a second connection
+                    // claimed the slot.
+                    match changed {
+                        Ok(()) => {
+                            if *cancel_rx.borrow_and_update() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(line) => {
+                            let safe = redact_line(&line, redact_stream);
+                            if let Ok(payload) = serde_json::to_string(&safe) {
+                                yield Ok(Event::default().event("log").data(payload));
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
             }
         }
+        // Release the per-token slot only if we still own it.
+        // A superseding connection has already replaced the
+        // entry under the same key; releasing then would tear
+        // down the new owner.
+        if let Some(sender) = our_sender.as_ref() {
+            ring_for_cleanup.release_stream_slot(&token_for_cleanup, sender);
+        }
     };
-    Sse::new(s).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Sse::new(s)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 #[cfg(test)]
@@ -369,5 +539,167 @@ mod tests {
                 .iter()
                 .any(|l| l.message.contains("composed-event") && l.level == "WARN")
         );
+    }
+
+    // ─────────────────────────────────────────────────────
+    // P3 — redaction tests
+    // ─────────────────────────────────────────────────────
+
+    fn line_with(msg: &str) -> LogLine {
+        LogLine {
+            ts_ms: 1,
+            level: "INFO".into(),
+            target: "t".into(),
+            message: msg.into(),
+        }
+    }
+
+    #[test]
+    fn p3_log_line_with_bearer_token_is_redacted_before_streaming() {
+        // P3 test: "A log line containing a bearer token is
+        // redacted before streaming."
+        let line = line_with(
+            "outbound request Authorization: Bearer 0123456789abcdef0123456789abcdef0123456789",
+        );
+        let safe = redact_line(&line, true);
+        assert!(
+            !safe
+                .message
+                .contains("0123456789abcdef0123456789abcdef0123456789"),
+            "bearer token leaked: {}",
+            safe.message
+        );
+        assert!(
+            safe.message.contains("REDACTED"),
+            "redaction marker missing: {}",
+            safe.message
+        );
+    }
+
+    #[test]
+    fn p3_log_line_with_api_key_sk_pattern_is_redacted_before_streaming() {
+        // P3 test: "A log line containing an API key matching
+        // sk- pattern is redacted before streaming."
+        let line = line_with("dispatched call with key FAKE_TEST_FIXTURE_REDACTED");
+        let safe = redact_line(&line, true);
+        assert!(
+            !safe
+                .message
+                .contains("FAKE_TEST_FIXTURE_REDACTED"),
+            "API key leaked: {}",
+            safe.message
+        );
+        assert!(safe.message.contains("REDACTED"));
+    }
+
+    #[test]
+    fn p3_log_line_with_jwt_is_redacted_before_streaming() {
+        // P3 test: "A log line containing a JWT is redacted
+        // before streaming."
+        let line = line_with(
+            "session bound token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+             eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0.\
+             SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        );
+        let safe = redact_line(&line, true);
+        assert!(
+            !safe
+                .message
+                .contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+            "JWT leaked: {}",
+            safe.message
+        );
+        assert!(safe.message.contains("REDACTED"));
+    }
+
+    #[test]
+    fn p3_plain_log_line_passes_through_unchanged() {
+        // P3 test: "A plain log line with no secrets passes
+        // through unchanged."
+        let line = line_with("processed task task_id=abc count=42 latency_ms=12");
+        let safe = redact_line(&line, true);
+        assert_eq!(safe.message, line.message);
+    }
+
+    #[test]
+    fn redact_disabled_passes_secrets_through_unchanged() {
+        let line = line_with("Authorization: Bearer 0123456789abcdef0123456789abcdef01234567");
+        let safe = redact_line(&line, false);
+        assert_eq!(safe.message, line.message);
+    }
+
+    // ─────────────────────────────────────────────────────
+    // P3 — connection cap tests
+    // ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn p3_second_connection_with_same_token_closes_the_first() {
+        // P3 test: "A second connection with the same session
+        // token closes the first connection."
+        let ring = LogRing::new();
+        let token = "session-token-abc";
+        let mut first = ring.claim_stream_slot(token);
+        // Initial value is `false` (no cancel yet).
+        assert!(!*first.borrow());
+        assert_eq!(ring.live_stream_count(), 1);
+        // A second claim under the same token replaces the
+        // first slot AND signals the previous holder to drain.
+        let _second = ring.claim_stream_slot(token);
+        // The first receiver observes a change.
+        first.changed().await.expect("first must be notified");
+        assert!(*first.borrow(), "first holder must observe cancel = true");
+        // Only one slot is registered (the new one took over).
+        assert_eq!(ring.live_stream_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn second_connection_with_different_token_does_not_close_first() {
+        let ring = LogRing::new();
+        let first = ring.claim_stream_slot("token-A");
+        let _second = ring.claim_stream_slot("token-B");
+        assert_eq!(ring.live_stream_count(), 2);
+        // First has not been cancelled.
+        assert!(!*first.borrow());
+    }
+
+    #[tokio::test]
+    async fn release_stream_slot_is_no_op_when_slot_already_replaced() {
+        let ring = LogRing::new();
+        // Acquire a slot, retain a clone of its sender, then
+        // replace it. The retained sender should NOT match the
+        // current map entry, so release_stream_slot leaves the
+        // new owner alone.
+        let _rx_old = ring.claim_stream_slot("token-X");
+        let stale_sender = ring
+            .live_streams
+            .lock()
+            .unwrap()
+            .get("token-X")
+            .cloned()
+            .unwrap();
+        let _rx_new = ring.claim_stream_slot("token-X");
+        assert_eq!(ring.live_stream_count(), 1);
+        // Stale releaser is a no-op.
+        ring.release_stream_slot("token-X", &stale_sender);
+        assert_eq!(
+            ring.live_stream_count(),
+            1,
+            "stale release must not evict new owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_stream_slot_evicts_when_called_by_current_owner() {
+        let ring = LogRing::new();
+        let _rx = ring.claim_stream_slot("token-Y");
+        let current = ring
+            .live_streams
+            .lock()
+            .unwrap()
+            .get("token-Y")
+            .cloned()
+            .unwrap();
+        ring.release_stream_slot("token-Y", &current);
+        assert_eq!(ring.live_stream_count(), 0);
     }
 }

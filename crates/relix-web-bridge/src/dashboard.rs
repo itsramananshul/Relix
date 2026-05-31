@@ -362,6 +362,117 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────
+    // P4 — dashboard auth-error contract tests
+    // ─────────────────────────────────────────────────────
+
+    /// P4 test: "Dashboard with no token shows the auth error
+    /// screen and makes no further requests." We assert the
+    /// shape of the bootstrap path: when /v1/auth/token returns
+    /// no token, Bridge.authFailed flips and initApp aborts
+    /// before wiring any handlers — no Bridge.get/post calls
+    /// run.
+    #[tokio::test]
+    async fn page_bootstrap_aborts_when_auth_token_endpoint_refuses() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // The bootstrap function MUST set authFailed = true on
+        // both 401/403 responses and on transport errors.
+        assert!(
+            body.contains("self.authFailed = true"),
+            "bootstrap missing authFailed flag flip"
+        );
+        // initApp MUST check the flag before wiring handlers.
+        assert!(
+            body.contains("if (Bridge.authFailed)"),
+            "initApp does not gate on Bridge.authFailed"
+        );
+        // showAuthErrorScreen is the visible surface.
+        assert!(
+            body.contains("function showAuthErrorScreen("),
+            "showAuthErrorScreen helper is missing"
+        );
+        // Auth-error screen renders the brand-name text the
+        // operator expects.
+        assert!(
+            body.contains("Authentication Required"),
+            "auth error screen body text missing"
+        );
+    }
+
+    /// P4 test: "Dashboard with an invalid token shows the
+    /// auth error screen after one retry." The bootstrap code
+    /// path must explicitly retry exactly once with a 2s
+    /// delay before giving up.
+    #[tokio::test]
+    async fn page_bootstrap_retries_once_with_two_second_delay() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // 2000ms delay before retry.
+        assert!(
+            body.contains("setTimeout(resolve, 2000)"),
+            "bootstrap retry delay is not 2000ms"
+        );
+        // The retry calls the same fetchOnce helper a second
+        // time and bails after that — search for the helper +
+        // its `.then(fetchOnce)` chain.
+        assert!(
+            body.contains("function fetchOnce()") && body.contains(".then(fetchOnce)"),
+            "bootstrap does not retry via fetchOnce"
+        );
+    }
+
+    /// P4 test: "Dashboard with a valid token proceeds
+    /// normally." The bootstrap path stores the token in
+    /// sessionStorage AND lets initApp wire its handlers.
+    #[tokio::test]
+    async fn page_bootstrap_proceeds_when_auth_token_endpoint_returns_token() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // Cached token in sessionStorage round-trips.
+        assert!(
+            body.contains("sessionStorage.setItem('relix-bridge-token'"),
+            "bootstrap missing cache write"
+        );
+        // The success branch reaches startSessionExpiryProbe.
+        assert!(
+            body.contains("startSessionExpiryProbe()"),
+            "bootstrap success path does not start the session probe"
+        );
+    }
+
+    /// P4 test: "Dashboard session that expires shows the
+    /// auth error screen automatically." The probe interval
+    /// is 5 minutes and it checks /v1/health for 401/403.
+    #[tokio::test]
+    async fn page_session_expiry_probe_calls_health_every_five_minutes() {
+        let resp = page().await.into_response();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        // Probe function + 5 min interval expression.
+        assert!(
+            body.contains("function startSessionExpiryProbe()"),
+            "session probe function missing"
+        );
+        assert!(
+            body.contains("5 * 60 * 1000"),
+            "session probe interval is not 5 minutes (5 * 60 * 1000 ms)"
+        );
+        // Probe target is /v1/health.
+        assert!(
+            body.contains("fetch('/v1/health'"),
+            "session probe does not call /v1/health"
+        );
+        // 401/403 from the probe MUST trigger showAuthErrorScreen.
+        assert!(
+            body.contains("r.status === 401 || r.status === 403"),
+            "session probe does not check 401/403"
+        );
+    }
+
     #[test]
     fn resolve_dashboard_source_uses_embedded_when_env_unset() {
         let out = resolve_dashboard_source(None);

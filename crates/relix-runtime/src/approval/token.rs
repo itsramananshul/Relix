@@ -1,7 +1,15 @@
-//! SEC PART A — structured, HMAC-SHA256-signed approval tokens.
+//! Ed25519-signed approval tokens.
 //!
-//! Replaces the pre-fix "any non-empty string" opaque token. A
-//! token now binds itself to:
+//! Replaces the prior HMAC-SHA256 scheme. RELIX spec
+//! `specs/identity-employees.md` §H.5 mandates: "Approver
+//! signs `approval.granted{nonce, decision}` envelope.
+//! Responding node verifies the approver satisfies the policy
+//! criteria." HMAC is symmetric — anyone holding the key can
+//! forge any token. Ed25519 is asymmetric — the signing key
+//! stays private on the issuer; verifiers carry only the
+//! verification (public) key.
+//!
+//! A token now binds itself to:
 //!
 //! - the approval row it was issued for (`approval_id`),
 //! - the exact capability method (`method`) — a token for
@@ -14,38 +22,41 @@
 //!   are rejected,
 //! - a 32-byte random nonce so two tokens for the same
 //!   approval are distinguishable on the consumption
-//!   blocklist (defence in depth — also useful when issuing
-//!   tokens for retries).
+//!   blocklist,
+//! - the verification-key fingerprint (`signing_key_fingerprint`)
+//!   so verifiers can look up the correct public key in the
+//!   trusted key set.
 //!
-//! The signature is HMAC-SHA256 over the canonical
-//! pipe-delimited payload, hex-encoded. The signing key comes
-//! from the [`SIGNING_KEY_ENV`] environment variable. Verify
-//! is constant-time (`subtle::ConstantTimeEq` on top of the
-//! HMAC crate's `verify_slice`, which is already constant-time
-//! — the explicit `subtle` layer documents the property at
-//! the call site and adds defence-in-depth against future
-//! refactors).
+//! The signature is Ed25519 over the canonical pipe-delimited
+//! payload prefixed with the protocol version byte. Verification
+//! uses `ed25519_dalek::VerifyingKey::verify_strict` so weak
+//! signatures (e.g. small-order or non-canonical R / S values)
+//! are rejected.
 //!
-//! Wire shape:
+//! ## Wire shape
 //!
 //! ```text
 //! base64url_nopad( JSON({
-//!   approval_id,    // string
-//!   method,         // string
-//!   subject_id,     // string (hex NodeId)
-//!   session_id,     // string
-//!   issued_at_ms,   // i64
-//!   expires_at_ms,  // i64
-//!   nonce,          // string (64 hex chars = 32 random bytes)
-//!   signature,      // string (64 hex chars = HMAC-SHA256 output)
+//!   version,                  // u8, MUST be 0x02
+//!   approval_id,              // string
+//!   method,                   // string
+//!   subject_id,               // string (hex NodeId)
+//!   session_id,               // string
+//!   issued_at_ms,             // i64
+//!   expires_at_ms,            // i64
+//!   nonce,                    // string (64 hex chars = 32 random bytes)
+//!   signing_key_fingerprint,  // string (hex BLAKE3 prefix of the verifying key)
+//!   signature,                // string (base64url-nopad Ed25519 signature)
 //! }) )
 //! ```
 //!
-//! Canonical signing bytes:
+//! ## Canonical signing bytes
 //!
 //! ```text
-//! approval_id "|" method "|" subject_id "|" session_id
+//! 0x02
+//!     || approval_id "|" method "|" subject_id "|" session_id
 //!     "|" issued_at_ms "|" expires_at_ms "|" nonce
+//!     "|" signing_key_fingerprint
 //! ```
 //!
 //! IDs in Relix are NEVER allowed to contain a `|` character
@@ -53,30 +64,45 @@
 //! delimiter cannot collide. The token-issue path explicitly
 //! rejects any field that does.
 //!
-//! Error variants are mapped 1-to-1 to specific deny causes
-//! the admission gate surfaces in [`SECURITY_DENIED`] errors.
-//! Operators see exactly which check failed (signature /
-//! method / subject / expiry / consume) without leaking
-//! anything sensitive: the cause text never echoes the secret
-//! key or the raw signature bytes.
+//! ## Legacy migration
+//!
+//! Tokens missing the `version` field (or carrying `version =
+//! 0x01`, the legacy HMAC-SHA256 wire) are rejected with
+//! [`TokenError::TokenFormatDeprecated`] at parse time. The
+//! admission gate surfaces this to operators as
+//! `approval_token_format_deprecated` so the corrective
+//! action — restart any agent still holding an HMAC token —
+//! is visible in the policy denial ring.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-type HmacSha256 = Hmac<Sha256>;
+/// Environment variable the runtime reads to source the
+/// Ed25519 signing-key seed. The value MUST be a 32-byte seed
+/// encoded as 64 hex characters. Operators set this on every
+/// controller that issues approval tokens.
+pub const SIGNING_KEY_ENV: &str = "RELIX_APPROVAL_SIGNING_KEY";
 
-/// Environment variable the runtime reads to source the HMAC
-/// signing key. Operators MUST set this on every controller
-/// that runs the admission gate; missing / empty keys cause
-/// the gate to refuse every token-bearing call with
-/// [`TokenError::MissingSigningKey`].
-pub const SIGNING_KEY_ENV: &str = "RELIX_APPROVAL_TOKEN_KEY";
+/// Current canonical wire-format version byte.
+pub const TOKEN_VERSION: u8 = 0x02;
+
+/// Legacy HMAC-SHA256 wire-format version byte. Tokens carrying
+/// this value (or no `version` field at all, which defaults to
+/// `0x01` for the missing case) are rejected with
+/// [`TokenError::TokenFormatDeprecated`].
+pub const TOKEN_VERSION_LEGACY_HMAC: u8 = 0x01;
+
+/// Number of hex characters used for the verification-key
+/// fingerprint. 32 = 128 bits of BLAKE3 prefix — well over the
+/// birthday bound even at trillions of operator-deployed keys.
+const FINGERPRINT_HEX_LEN: usize = 32;
 
 /// Errors surfaced by the token issue / parse / verify pipeline.
 /// Each variant maps to a distinct deny cause so the admission
@@ -91,9 +117,9 @@ pub enum TokenError {
     /// recognised token JSON shape.
     #[error("approval_token: malformed payload ({0})")]
     MalformedPayload(String),
-    /// HMAC-SHA256 signature verification failed. The token's
+    /// Ed25519 signature verification failed. The token's
     /// payload was tampered with, OR it was signed with a
-    /// different key (e.g. the operator rotated the env var).
+    /// different key.
     #[error("approval_token: signature verification failed")]
     BadSignature,
     /// Token TTL elapsed — `now >= expires_at_ms`.
@@ -118,11 +144,17 @@ pub enum TokenError {
     /// blocklist). Replay attempt.
     #[error("approval_token: token already consumed")]
     AlreadyConsumed,
-    /// The `RELIX_APPROVAL_TOKEN_KEY` env var is missing or
-    /// empty. Boot-time fail-loud — the gate refuses every
-    /// token-bearing call.
-    #[error("approval_token: signing key missing (set {SIGNING_KEY_ENV})")]
+    /// The signing-key env var is missing, empty, or
+    /// malformed (not 64 hex characters).
+    #[error(
+        "approval_token: signing key missing or malformed (set {SIGNING_KEY_ENV} to a 64-hex-char Ed25519 seed)"
+    )]
     MissingSigningKey,
+    /// The verification-key fingerprint on the wire is not in
+    /// the configured key set. Operators have not deployed
+    /// the corresponding public key on this responder.
+    #[error("approval_token: unknown signing key fingerprint `{0}`")]
+    UnknownSigningKey(String),
     /// One of the payload fields contains a `|` character,
     /// which would let an attacker re-arrange the canonical
     /// signing bytes. Issued at mint time only; reaching this
@@ -133,6 +165,14 @@ pub enum TokenError {
     /// fail-closed: the gate denies the call.
     #[error("approval_token: store error ({0})")]
     Store(String),
+    /// Legacy HMAC-SHA256 format detected. Operators must
+    /// restart any agent still holding an old token; this
+    /// implementation no longer accepts the HMAC scheme.
+    #[error(
+        "approval_token: deprecated HMAC token format (version={got:#04x}); \
+         restart any agents holding old tokens — only Ed25519 (version={expected:#04x}) accepted"
+    )]
+    TokenFormatDeprecated { got: u8, expected: u8 },
 }
 
 impl TokenError {
@@ -149,9 +189,166 @@ impl TokenError {
             Self::SubjectMismatch => "approval_token_subject_mismatch",
             Self::AlreadyConsumed => "approval_token_consumed",
             Self::MissingSigningKey => "approval_token_missing_key",
+            Self::UnknownSigningKey(_) => "approval_token_unknown_signer",
             Self::ForbiddenDelimiter(_) => "approval_token_malformed",
             Self::Store(_) => "approval_token_store_error",
+            Self::TokenFormatDeprecated { .. } => "approval_token_format_deprecated",
         }
+    }
+}
+
+/// Issuer-side handle: holds the Ed25519 signing key + the
+/// precomputed verification-key fingerprint. Cheap to clone;
+/// the underlying signing-key bytes are zeroized on drop via
+/// `ed25519_dalek::SigningKey`'s `Zeroize` impl.
+#[derive(Clone)]
+pub struct ApprovalSigner {
+    inner: Arc<ApprovalSignerInner>,
+}
+
+impl std::fmt::Debug for ApprovalSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the signing-key bytes. Surface only the
+        // fingerprint so log lines + assertion-failure messages
+        // identify the key without leaking it.
+        f.debug_struct("ApprovalSigner")
+            .field("fingerprint", &self.inner.fingerprint)
+            .finish()
+    }
+}
+
+struct ApprovalSignerInner {
+    signing: SigningKey,
+    verifying: VerifyingKey,
+    fingerprint: String,
+}
+
+impl ApprovalSigner {
+    /// Build a signer from a 32-byte Ed25519 seed. The seed is
+    /// consumed (moved into the signer) and zeroized on drop.
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let signing = SigningKey::from_bytes(&seed);
+        let verifying = signing.verifying_key();
+        let fingerprint = compute_fingerprint(&verifying);
+        // The seed array is on the caller's stack; `signing`
+        // owns its own zeroizing copy. Wipe the caller's copy
+        // here so a debugger snapshot post-call doesn't see it.
+        let mut s = seed;
+        s.zeroize();
+        Self {
+            inner: Arc::new(ApprovalSignerInner {
+                signing,
+                verifying,
+                fingerprint,
+            }),
+        }
+    }
+
+    /// Build a signer from a hex-encoded 32-byte seed string.
+    /// Returns `MissingSigningKey` when the input is not exactly
+    /// 64 hex characters.
+    pub fn from_hex_seed(hex_seed: &str) -> Result<Self, TokenError> {
+        let trimmed = hex_seed.trim();
+        if trimmed.len() != 64 {
+            return Err(TokenError::MissingSigningKey);
+        }
+        let raw = hex::decode(trimmed).map_err(|_| TokenError::MissingSigningKey)?;
+        if raw.len() != 32 {
+            return Err(TokenError::MissingSigningKey);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw);
+        let s = Self::from_seed(arr);
+        // Wipe the intermediate decoded vec too.
+        let mut z = Zeroizing::new(raw);
+        z.zeroize();
+        Ok(s)
+    }
+
+    /// Build a signer by reading `RELIX_APPROVAL_SIGNING_KEY`
+    /// from the environment. Returns `MissingSigningKey` if
+    /// unset, empty, or not a valid 64-hex-char string.
+    ///
+    /// The env value is wrapped in `Zeroizing` so the heap
+    /// allocation backing the read is wiped as soon as this
+    /// function returns.
+    pub fn from_env() -> Result<Self, TokenError> {
+        let raw: Zeroizing<String> = Zeroizing::new(
+            std::env::var(SIGNING_KEY_ENV).map_err(|_| TokenError::MissingSigningKey)?,
+        );
+        Self::from_hex_seed(&raw)
+    }
+
+    /// Hex-prefix fingerprint of the verifying key. Stable
+    /// across boots for the same seed.
+    pub fn fingerprint(&self) -> &str {
+        &self.inner.fingerprint
+    }
+
+    /// Public verifying key derived from the seed. Operators
+    /// distribute this to responders that need to verify
+    /// tokens issued by this signer.
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.inner.verifying
+    }
+
+    fn sign(&self, payload: &[u8]) -> Signature {
+        self.inner.signing.sign(payload)
+    }
+}
+
+/// Verifier-side handle: a registry of fingerprint →
+/// verifying-key entries. The admission gate looks up a wire
+/// token's `signing_key_fingerprint` here to find the public
+/// key it was signed under.
+#[derive(Clone, Default)]
+pub struct ApprovalKeySet {
+    keys: Arc<HashMap<String, VerifyingKey>>,
+}
+
+impl ApprovalKeySet {
+    /// Empty registry. Every verification attempt against an
+    /// empty registry fails with `UnknownSigningKey`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a single-key registry from a signer. This is the
+    /// common single-controller deployment shape.
+    pub fn from_signer(signer: &ApprovalSigner) -> Self {
+        let mut keys = HashMap::with_capacity(1);
+        keys.insert(signer.fingerprint().to_string(), signer.verifying_key());
+        Self {
+            keys: Arc::new(keys),
+        }
+    }
+
+    /// Build from an explicit set of `(fingerprint, key)`
+    /// entries — used by tests + multi-key deployments where
+    /// the responder accepts tokens from more than one issuer.
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, VerifyingKey)>) -> Self {
+        let map: HashMap<String, VerifyingKey> = entries.into_iter().collect();
+        Self {
+            keys: Arc::new(map),
+        }
+    }
+
+    /// True iff the registry has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Number of registered verifying keys.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Look up a verifying key by its fingerprint. Returns
+    /// `None` when the registry has no entry for the
+    /// fingerprint — the verify path maps this to
+    /// `TokenError::UnknownSigningKey`.
+    pub fn get(&self, fingerprint: &str) -> Option<&VerifyingKey> {
+        self.keys.get(fingerprint)
     }
 }
 
@@ -160,6 +357,12 @@ impl TokenError {
 /// signature field is always re-derived at issue time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalToken {
+    /// Wire-format version byte. Always `TOKEN_VERSION` on
+    /// freshly-minted tokens; tokens carrying any other value
+    /// (including the legacy `0x01` HMAC version) are rejected
+    /// at parse time with [`TokenError::TokenFormatDeprecated`].
+    #[serde(default = "default_token_version_legacy")]
+    pub version: u8,
     pub approval_id: String,
     pub method: String,
     pub subject_id: String,
@@ -167,7 +370,22 @@ pub struct ApprovalToken {
     pub issued_at_ms: i64,
     pub expires_at_ms: i64,
     pub nonce: String,
+    /// Hex-prefix BLAKE3 fingerprint of the verifying key
+    /// (`compute_fingerprint(&verifying_key)`). Lets a verifier
+    /// with multiple trusted keys pick the right one. Required
+    /// from `TOKEN_VERSION` onwards.
+    #[serde(default)]
+    pub signing_key_fingerprint: String,
+    /// Base64url-no-pad Ed25519 signature.
     pub signature: String,
+}
+
+fn default_token_version_legacy() -> u8 {
+    // Tokens that omit the `version` field entirely are pre-
+    // Ed25519 HMAC tokens — surface the legacy version byte so
+    // the parse-time check rejects them with the explicit
+    // `TokenFormatDeprecated` cause.
+    TOKEN_VERSION_LEGACY_HMAC
 }
 
 impl ApprovalToken {
@@ -176,10 +394,9 @@ impl ApprovalToken {
     ///
     /// `ttl_ms` is the lifetime from `issued_at_ms`. Tokens
     /// MUST have non-zero TTL — a token that expires the
-    /// moment it is minted is operationally useless and
-    /// almost certainly a misconfiguration. A `ttl_ms <= 0`
-    /// returns `Expired` immediately so the call site
-    /// catches the bug at issue time, not at verify time.
+    /// moment it is minted is operationally useless. A
+    /// `ttl_ms <= 0` returns `Expired` immediately so the call
+    /// site catches the bug at issue time, not at verify time.
     pub fn issue(
         approval_id: &str,
         method: &str,
@@ -187,11 +404,8 @@ impl ApprovalToken {
         session_id: &str,
         issued_at_ms: i64,
         ttl_ms: i64,
-        signing_key: &[u8],
+        signer: &ApprovalSigner,
     ) -> Result<String, TokenError> {
-        if signing_key.is_empty() {
-            return Err(TokenError::MissingSigningKey);
-        }
         if ttl_ms <= 0 {
             return Err(TokenError::Expired {
                 now_ms: issued_at_ms,
@@ -210,7 +424,9 @@ impl ApprovalToken {
         }
         let nonce = mint_nonce();
         let expires_at_ms = issued_at_ms.saturating_add(ttl_ms);
+        let fingerprint = signer.fingerprint().to_string();
         let canonical = canonical_signing_bytes(
+            TOKEN_VERSION,
             approval_id,
             method,
             subject_id,
@@ -218,9 +434,12 @@ impl ApprovalToken {
             issued_at_ms,
             expires_at_ms,
             &nonce,
+            &fingerprint,
         );
-        let signature = sign_hex(signing_key, canonical.as_bytes());
+        let sig = signer.sign(canonical.as_bytes());
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
         let tok = Self {
+            version: TOKEN_VERSION,
             approval_id: approval_id.into(),
             method: method.into(),
             subject_id: subject_id.into(),
@@ -228,6 +447,7 @@ impl ApprovalToken {
             issued_at_ms,
             expires_at_ms,
             nonce,
+            signing_key_fingerprint: fingerprint,
             signature,
         };
         tok.to_wire()
@@ -243,23 +463,48 @@ impl ApprovalToken {
     }
 
     /// Parse the wire form back into an [`ApprovalToken`].
+    /// Rejects legacy HMAC tokens (version `0x01` or missing
+    /// version field) with [`TokenError::TokenFormatDeprecated`].
     /// Does NOT verify the signature; callers MUST follow up
     /// with [`Self::verify_signature`].
     pub fn parse(wire: &str) -> Result<Self, TokenError> {
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(wire)
             .map_err(|e| TokenError::MalformedEncoding(e.to_string()))?;
-        serde_json::from_slice::<Self>(&raw)
-            .map_err(|e| TokenError::MalformedPayload(e.to_string()))
+        let tok: Self = serde_json::from_slice(&raw)
+            .map_err(|e| TokenError::MalformedPayload(e.to_string()))?;
+        if tok.version != TOKEN_VERSION {
+            return Err(TokenError::TokenFormatDeprecated {
+                got: tok.version,
+                expected: TOKEN_VERSION,
+            });
+        }
+        Ok(tok)
     }
 
-    /// Constant-time HMAC verification. Returns
-    /// `Err(TokenError::BadSignature)` on mismatch.
-    pub fn verify_signature(&self, signing_key: &[u8]) -> Result<(), TokenError> {
-        if signing_key.is_empty() {
+    /// Verify the Ed25519 signature against the registered
+    /// verifying key identified by
+    /// [`Self::signing_key_fingerprint`]. Rejects unknown
+    /// fingerprints with [`TokenError::UnknownSigningKey`] and
+    /// signature-mismatch with [`TokenError::BadSignature`].
+    pub fn verify_signature(&self, keyset: &ApprovalKeySet) -> Result<(), TokenError> {
+        if keyset.is_empty() {
             return Err(TokenError::MissingSigningKey);
         }
+        let verifying = keyset
+            .get(&self.signing_key_fingerprint)
+            .ok_or_else(|| TokenError::UnknownSigningKey(self.signing_key_fingerprint.clone()))?;
+        let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(self.signature.as_bytes())
+            .map_err(|_| TokenError::BadSignature)?;
+        if sig_bytes.len() != 64 {
+            return Err(TokenError::BadSignature);
+        }
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let signature = Signature::from_bytes(&sig_arr);
         let canonical = canonical_signing_bytes(
+            self.version,
             &self.approval_id,
             &self.method,
             &self.subject_id,
@@ -267,24 +512,11 @@ impl ApprovalToken {
             self.issued_at_ms,
             self.expires_at_ms,
             &self.nonce,
+            &self.signing_key_fingerprint,
         );
-        let actual = sign_hex(signing_key, canonical.as_bytes());
-        let actual_bytes = actual.as_bytes();
-        let expected_bytes = self.signature.as_bytes();
-        // subtle::ConstantTimeEq returns Choice (0 or 1). The
-        // pre-check on length is also constant w.r.t. the
-        // contents (length is public; padding to equal lengths
-        // would burn cycles for no security benefit). The
-        // contained `ct_eq` is constant w.r.t. the bytes
-        // themselves.
-        if actual_bytes.len() != expected_bytes.len() {
-            return Err(TokenError::BadSignature);
-        }
-        if bool::from(actual_bytes.ct_eq(expected_bytes)) {
-            Ok(())
-        } else {
-            Err(TokenError::BadSignature)
-        }
+        verifying
+            .verify_strict(canonical.as_bytes(), &signature)
+            .map_err(|_| TokenError::BadSignature)
     }
 
     /// Convenience check: token TTL has not elapsed.
@@ -312,10 +544,9 @@ impl ApprovalToken {
     }
 
     /// Convenience check: token's bound `subject_id` matches
-    /// the verified caller. Constant-time compare so a hostile
-    /// caller cannot probe the byte-by-byte difference between
-    /// the stored subject and theirs.
+    /// the verified caller. Byte-for-byte compare.
     pub fn check_subject(&self, caller_subject: &str) -> Result<(), TokenError> {
+        use subtle::ConstantTimeEq;
         let a = self.subject_id.as_bytes();
         let b = caller_subject.as_bytes();
         if a.len() != b.len() {
@@ -330,9 +561,7 @@ impl ApprovalToken {
 
     /// Stable blocklist key for the atomic consume row. Two
     /// tokens are equal-on-blocklist iff their `nonce` AND
-    /// `approval_id` match — both pieces guard against attacker
-    /// reuse without forcing the operator to store the full
-    /// signature.
+    /// `approval_id` match.
     pub fn blocklist_key(&self) -> String {
         let mut h = blake3::Hasher::new();
         h.update(self.nonce.as_bytes());
@@ -342,23 +571,18 @@ impl ApprovalToken {
     }
 }
 
-/// Read the signing key from [`SIGNING_KEY_ENV`]. Returns
-/// [`TokenError::MissingSigningKey`] when unset or empty so
-/// the boot path can fail loud.
-///
-/// SEC PART 2: the key material is wrapped in `Zeroizing<Vec<u8>>`
-/// so it's wiped from the heap when the returned value is
-/// dropped — the dispatch bridge stores its own zeroizing
-/// copy + the env-var-sourced string is the only public
-/// surface.
-pub fn signing_key_from_env() -> Result<Zeroizing<Vec<u8>>, TokenError> {
-    match std::env::var(SIGNING_KEY_ENV) {
-        Ok(v) if !v.is_empty() => Ok(Zeroizing::new(v.into_bytes())),
-        _ => Err(TokenError::MissingSigningKey),
-    }
+/// Compute the verification-key fingerprint. BLAKE3 of the
+/// 32-byte verifying-key bytes, truncated to the first
+/// `FINGERPRINT_HEX_LEN` hex characters.
+pub fn compute_fingerprint(key: &VerifyingKey) -> String {
+    let digest = blake3::hash(&key.to_bytes());
+    let full = digest.to_hex();
+    full[..FINGERPRINT_HEX_LEN].to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonical_signing_bytes(
+    version: u8,
     approval_id: &str,
     method: &str,
     subject_id: &str,
@@ -366,38 +590,47 @@ fn canonical_signing_bytes(
     issued_at_ms: i64,
     expires_at_ms: i64,
     nonce: &str,
+    fingerprint: &str,
 ) -> String {
+    // Prepend the version byte as an ASCII hex pair so the
+    // canonical pre-image is itself UTF-8 — Ed25519 doesn't
+    // care, but a string keeps the test-side equality checks
+    // and the doc match.
     format!(
-        "{approval_id}|{method}|{subject_id}|{session_id}|{issued_at_ms}|{expires_at_ms}|{nonce}"
+        "{version:02x}|{approval_id}|{method}|{subject_id}|{session_id}|\
+         {issued_at_ms}|{expires_at_ms}|{nonce}|{fingerprint}"
     )
-}
-
-fn sign_hex(key: &[u8], payload: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(payload);
-    hex::encode(mac.finalize().into_bytes())
 }
 
 fn mint_nonce() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+/// Read the Ed25519 signing-key seed from the environment and
+/// return a fully-built [`ApprovalSigner`]. Kept as a free
+/// function so the controller startup can call it before any
+/// `DispatchBridge` exists.
+pub fn signer_from_env() -> Result<ApprovalSigner, TokenError> {
+    ApprovalSigner::from_env()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn key() -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(b"test-signing-key-32-bytes-long-x".to_vec())
+    fn fixture_signer() -> ApprovalSigner {
+        ApprovalSigner::from_seed([7u8; 32])
     }
 
-    fn other_key() -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(b"a-different-key-32-bytes-of-yyyy".to_vec())
+    fn other_signer() -> ApprovalSigner {
+        ApprovalSigner::from_seed([42u8; 32])
     }
 
     #[test]
     fn issue_then_parse_round_trips_every_field() {
+        let signer = fixture_signer();
         let wire = ApprovalToken::issue(
             "approval-1",
             "tool.web_read",
@@ -405,10 +638,11 @@ mod tests {
             "session-7",
             1_700_000_000_000,
             60_000,
-            &key(),
+            &signer,
         )
         .unwrap();
         let parsed = ApprovalToken::parse(&wire).unwrap();
+        assert_eq!(parsed.version, TOKEN_VERSION);
         assert_eq!(parsed.approval_id, "approval-1");
         assert_eq!(parsed.method, "tool.web_read");
         assert_eq!(parsed.subject_id, "subject-abc");
@@ -416,47 +650,179 @@ mod tests {
         assert_eq!(parsed.issued_at_ms, 1_700_000_000_000);
         assert_eq!(parsed.expires_at_ms, 1_700_000_060_000);
         assert_eq!(parsed.nonce.len(), 64);
-        assert_eq!(parsed.signature.len(), 64);
+        assert_eq!(parsed.signing_key_fingerprint, signer.fingerprint());
+        // Ed25519 signature is 64 bytes → base64url-no-pad is
+        // ceil(64*4/3) = ~86 chars.
+        assert!(parsed.signature.len() >= 80);
     }
 
     #[test]
-    fn signature_verifies_with_correct_key() {
-        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &key()).unwrap();
+    fn ed25519_token_is_accepted_when_signature_is_valid() {
+        // P1 test: "An Ed25519 token is accepted when the
+        // signature is valid".
+        let signer = fixture_signer();
+        let keyset = ApprovalKeySet::from_signer(&signer);
+        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &signer).unwrap();
         let parsed = ApprovalToken::parse(&wire).unwrap();
-        parsed.verify_signature(&key()).expect("verify");
+        parsed.verify_signature(&keyset).expect("verify accepts");
     }
 
     #[test]
-    fn signature_fails_under_wrong_key() {
-        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &key()).unwrap();
+    fn hmac_token_from_old_format_is_rejected_with_format_deprecated() {
+        // P1 test: "An HMAC token from the old format is
+        // rejected with TOKEN_FORMAT_DEPRECATED".
+        //
+        // Hand-build a legacy-shape token: no `version` field
+        // and a 64-hex-char signature (the old HMAC tag was 64
+        // chars). serde defaults `version` to 0x01 on parse so
+        // the deprecation guard fires.
+        let legacy_json = serde_json::json!({
+            "approval_id": "a",
+            "method": "m",
+            "subject_id": "s",
+            "session_id": "sess",
+            "issued_at_ms": 1_000_i64,
+            "expires_at_ms": 61_000_i64,
+            "nonce": "00".repeat(32),
+            "signature": "0".repeat(64),
+        });
+        let wire = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&legacy_json).unwrap());
+        let err = ApprovalToken::parse(&wire).unwrap_err();
+        match err {
+            TokenError::TokenFormatDeprecated { got, expected } => {
+                assert_eq!(got, TOKEN_VERSION_LEGACY_HMAC);
+                assert_eq!(expected, TOKEN_VERSION);
+            }
+            other => panic!("expected TokenFormatDeprecated, got {other:?}"),
+        }
+        // Explicit `version: 0x01` is also rejected.
+        let mut as_obj = legacy_json.clone();
+        as_obj["version"] = serde_json::json!(0x01_u8);
+        let wire2 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&as_obj).unwrap());
+        match ApprovalToken::parse(&wire2) {
+            Err(TokenError::TokenFormatDeprecated { got, .. }) => assert_eq!(got, 0x01),
+            other => panic!("expected TokenFormatDeprecated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modifying_any_field_invalidates_signature() {
+        // P1 test: "Modifying any field in the token
+        // invalidates the signature".
+        let signer = fixture_signer();
+        let keyset = ApprovalKeySet::from_signer(&signer);
+        let wire = ApprovalToken::issue(
+            "a-orig",
+            "tool.web_read",
+            "subject-1",
+            "sess-1",
+            1_000,
+            60_000,
+            &signer,
+        )
+        .unwrap();
+        let original = ApprovalToken::parse(&wire).unwrap();
+        // Method tampering.
+        {
+            let mut t = original.clone();
+            t.method = "tool.terminal".into();
+            assert_eq!(t.verify_signature(&keyset), Err(TokenError::BadSignature));
+        }
+        // Subject_id tampering.
+        {
+            let mut t = original.clone();
+            t.subject_id = "subject-evil".into();
+            assert_eq!(t.verify_signature(&keyset), Err(TokenError::BadSignature));
+        }
+        // Approval_id tampering.
+        {
+            let mut t = original.clone();
+            t.approval_id = "a-forged".into();
+            assert_eq!(t.verify_signature(&keyset), Err(TokenError::BadSignature));
+        }
+        // Expiry extension.
+        {
+            let mut t = original.clone();
+            t.expires_at_ms += 60_000;
+            assert_eq!(t.verify_signature(&keyset), Err(TokenError::BadSignature));
+        }
+        // Nonce tampering.
+        {
+            let mut t = original.clone();
+            t.nonce = "ff".repeat(32);
+            assert_eq!(t.verify_signature(&keyset), Err(TokenError::BadSignature));
+        }
+        // Session tampering.
+        {
+            let mut t = original.clone();
+            t.session_id = "sess-other".into();
+            assert_eq!(t.verify_signature(&keyset), Err(TokenError::BadSignature));
+        }
+        // Signature byte-flip.
+        {
+            let mut t = original.clone();
+            let mut bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(t.signature.as_bytes())
+                .unwrap();
+            bytes[0] ^= 0x01;
+            t.signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+            assert_eq!(t.verify_signature(&keyset), Err(TokenError::BadSignature));
+        }
+        // Original verifies untouched.
+        original.verify_signature(&keyset).unwrap();
+    }
+
+    #[test]
+    fn token_signed_with_different_key_is_rejected() {
+        // P1 test: "A token signed with a different key is
+        // rejected".
+        let signer_a = fixture_signer();
+        let signer_b = other_signer();
+        // Bridge knows only signer_a's verifying key.
+        let keyset = ApprovalKeySet::from_signer(&signer_a);
+        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &signer_b).unwrap();
         let parsed = ApprovalToken::parse(&wire).unwrap();
+        // The fingerprint on the wire is signer_b's — the
+        // keyset has no entry for it.
+        match parsed.verify_signature(&keyset) {
+            Err(TokenError::UnknownSigningKey(fp)) => {
+                assert_eq!(fp, signer_b.fingerprint());
+            }
+            other => panic!("expected UnknownSigningKey, got {other:?}"),
+        }
+        // If the bridge ALSO trusts signer_b BUT a wire
+        // signature came from signer_a (an attacker who knew
+        // the fingerprint but not the seed), verify rejects
+        // with BadSignature.
+        let mixed_keyset = ApprovalKeySet::from_entries([
+            (signer_a.fingerprint().to_string(), signer_a.verifying_key()),
+            (signer_b.fingerprint().to_string(), signer_b.verifying_key()),
+        ]);
+        // Mint with signer_a but forge fingerprint to signer_b.
+        let mut forged = ApprovalToken::parse(
+            &ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &signer_a).unwrap(),
+        )
+        .unwrap();
+        forged.signing_key_fingerprint = signer_b.fingerprint().to_string();
+        // The fingerprint is in the keyset → the lookup
+        // resolves to signer_b's verifying key, which then
+        // fails to verify signer_a's signature.
         assert_eq!(
-            parsed.verify_signature(&other_key()),
-            Err(TokenError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn signature_fails_after_field_tamper() {
-        let wire =
-            ApprovalToken::issue("a", "tool.web_read", "s", "sess", 1_000, 60_000, &key()).unwrap();
-        let mut parsed = ApprovalToken::parse(&wire).unwrap();
-        // Attacker swaps the method to a higher-privilege one.
-        parsed.method = "tool.terminal".into();
-        assert_eq!(
-            parsed.verify_signature(&key()),
+            forged.verify_signature(&mixed_keyset),
             Err(TokenError::BadSignature)
         );
     }
 
     #[test]
     fn method_mismatch_is_caught_independent_of_signature() {
-        // A token issued for tool.web_read MUST NOT admit
-        // tool.terminal — even when the signature is valid.
-        let wire =
-            ApprovalToken::issue("a", "tool.web_read", "s", "sess", 1_000, 60_000, &key()).unwrap();
+        let signer = fixture_signer();
+        let keyset = ApprovalKeySet::from_signer(&signer);
+        let wire = ApprovalToken::issue("a", "tool.web_read", "s", "sess", 1_000, 60_000, &signer)
+            .unwrap();
         let parsed = ApprovalToken::parse(&wire).unwrap();
-        parsed.verify_signature(&key()).unwrap();
+        parsed.verify_signature(&keyset).unwrap();
         match parsed.check_method("tool.terminal") {
             Err(TokenError::MethodMismatch {
                 token_method,
@@ -472,14 +838,14 @@ mod tests {
 
     #[test]
     fn subject_mismatch_is_caught_via_constant_time_compare() {
-        let wire =
-            ApprovalToken::issue("a", "m", "subject-alice", "sess", 1_000, 60_000, &key()).unwrap();
+        let signer = fixture_signer();
+        let wire = ApprovalToken::issue("a", "m", "subject-alice", "sess", 1_000, 60_000, &signer)
+            .unwrap();
         let parsed = ApprovalToken::parse(&wire).unwrap();
         assert_eq!(
             parsed.check_subject("subject-bob"),
             Err(TokenError::SubjectMismatch)
         );
-        // Same-length-different-content also denied.
         assert_eq!(
             parsed.check_subject("subject-evil!"),
             Err(TokenError::SubjectMismatch)
@@ -489,7 +855,8 @@ mod tests {
 
     #[test]
     fn expired_token_is_rejected() {
-        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &key()).unwrap();
+        let signer = fixture_signer();
+        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &signer).unwrap();
         let parsed = ApprovalToken::parse(&wire).unwrap();
         match parsed.check_not_expired(1_000_000) {
             Err(TokenError::Expired {
@@ -503,30 +870,11 @@ mod tests {
         }
     }
 
-    // ── DEFERRED A: TTL boundary tests via clock injection ──
-    //
-    // `check_not_expired` takes `now_ms` as a parameter — pure
-    // function, no wall-clock dep. These tests verify the
-    // boundary condition explicitly: `now >= expires_at_ms`
-    // rejects, `now < expires_at_ms` admits. Locks the
-    // exclusive-boundary contract documented in the
-    // `TokenError::Expired` variant.
-
-    /// Helper: mint a token with `expires_at_ms = issued + ttl`
-    /// and immediately parse the wire form back. Returns the
-    /// parsed token so the test can drive `check_not_expired`
-    /// against synthetic `now_ms` values without re-hitting
-    /// `unix_ms()`.
-    fn token_with_window(issued_at_ms: i64, ttl_ms: i64) -> ApprovalToken {
-        let wire =
-            ApprovalToken::issue("a", "m", "s", "sess", issued_at_ms, ttl_ms, &key()).unwrap();
-        ApprovalToken::parse(&wire).unwrap()
-    }
-
     #[test]
     fn ttl_boundary_admits_one_ms_before_expiry() {
-        // Verified at `now = issued + 59_999`: token must admit.
-        let tok = token_with_window(1_000, 60_000);
+        let signer = fixture_signer();
+        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &signer).unwrap();
+        let tok = ApprovalToken::parse(&wire).unwrap();
         assert_eq!(tok.expires_at_ms, 61_000);
         tok.check_not_expired(60_999)
             .expect("now = expires - 1 must admit");
@@ -534,11 +882,9 @@ mod tests {
 
     #[test]
     fn ttl_boundary_rejects_exactly_at_expiry() {
-        // Verified at `now = expires_at_ms`: must reject. The
-        // SQL/runtime contract is `now >= expires` ⇒ expired
-        // (exclusive upper bound — a token issued for 0ms is
-        // already expired the moment it is parsed).
-        let tok = token_with_window(1_000, 60_000);
+        let signer = fixture_signer();
+        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1_000, 60_000, &signer).unwrap();
+        let tok = ApprovalToken::parse(&wire).unwrap();
         match tok.check_not_expired(61_000) {
             Err(TokenError::Expired {
                 now_ms,
@@ -547,79 +893,7 @@ mod tests {
                 assert_eq!(now_ms, 61_000);
                 assert_eq!(expires_at_ms, 61_000);
             }
-            other => panic!("expected Expired at the exact expires_at_ms boundary, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ttl_boundary_rejects_one_ms_after_expiry() {
-        // Verified at `now = issued + 60_001`: must reject.
-        let tok = token_with_window(1_000, 60_000);
-        match tok.check_not_expired(61_001) {
-            Err(TokenError::Expired { .. }) => {}
-            other => panic!("expected Expired at expires + 1ms, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ttl_boundary_admits_at_issued_at_ms_with_one_ms_ttl() {
-        // Smallest legal token: `ttl_ms = 1` ⇒ expires_at = issued + 1.
-        // - now = issued       → admits (1 < expires)
-        // - now = issued + 1   → rejects (now == expires)
-        let tok = token_with_window(0, 1);
-        assert_eq!(tok.expires_at_ms, 1);
-        tok.check_not_expired(0).expect("now=0 < expires=1 admits");
-        match tok.check_not_expired(1) {
-            Err(TokenError::Expired { .. }) => {}
-            other => panic!("expected Expired at now=expires=1, got {other:?}"),
-        }
-    }
-
-    // ── NOT-DONE 1: boundary tests via the Clock trait ──
-    //
-    // The three above exercise `check_not_expired` directly.
-    // These additionally exercise the Clock trait integration:
-    // the same boundary cases are driven by an
-    // `Arc<dyn Clock>` rather than a literal `i64` so the
-    // trait-object dispatch path is locked too.
-
-    #[test]
-    fn ttl_boundary_admits_one_ms_before_expiry_via_fake_clock() {
-        use relix_core::clock::{Clock, FakeClock};
-        use std::sync::Arc;
-        let tok = token_with_window(1_000, 60_000);
-        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(60_999));
-        tok.check_not_expired(clock.now_ms())
-            .expect("FakeClock at expires-1 admits");
-    }
-
-    #[test]
-    fn ttl_boundary_rejects_at_expiry_via_fake_clock() {
-        use relix_core::clock::{Clock, FakeClock};
-        use std::sync::Arc;
-        let tok = token_with_window(1_000, 60_000);
-        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(61_000));
-        match tok.check_not_expired(clock.now_ms()) {
-            Err(TokenError::Expired { .. }) => {}
-            other => panic!("FakeClock at expires must reject, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ttl_boundary_rejects_one_ms_after_expiry_via_fake_clock_advance() {
-        use relix_core::clock::{Clock, FakeClock};
-        use std::sync::Arc;
-        let tok = token_with_window(1_000, 60_000);
-        // Hold both an `Arc<FakeClock>` (for `.advance`) and
-        // an `Arc<dyn Clock>` (for the trait-object dispatch
-        // path) — both share the same `AtomicI64` so a single
-        // advance is visible through both handles.
-        let fake = Arc::new(FakeClock::new(60_999));
-        let clock: Arc<dyn Clock> = fake.clone();
-        fake.advance(2);
-        match tok.check_not_expired(clock.now_ms()) {
-            Err(TokenError::Expired { .. }) => {}
-            other => panic!("FakeClock at expires+1 must reject, got {other:?}"),
+            other => panic!("expected Expired at the exact boundary, got {other:?}"),
         }
     }
 
@@ -642,20 +916,16 @@ mod tests {
 
     #[test]
     fn issue_rejects_field_with_pipe_delimiter() {
-        let err = ApprovalToken::issue("a|injected", "m", "s", "sess", 1_000, 60_000, &key())
+        let signer = fixture_signer();
+        let err = ApprovalToken::issue("a|injected", "m", "s", "sess", 1_000, 60_000, &signer)
             .unwrap_err();
         assert_eq!(err, TokenError::ForbiddenDelimiter("approval_id"));
     }
 
     #[test]
-    fn issue_rejects_empty_key_and_non_positive_ttl() {
-        // ApprovalToken::issue returns Result<String, _>, so
-        // the OK branch IS PartialEq — use direct compare here.
-        assert_eq!(
-            ApprovalToken::issue("a", "m", "s", "sess", 0, 60_000, &[]),
-            Err(TokenError::MissingSigningKey)
-        );
-        match ApprovalToken::issue("a", "m", "s", "sess", 0, 0, &key()) {
+    fn issue_rejects_non_positive_ttl() {
+        let signer = fixture_signer();
+        match ApprovalToken::issue("a", "m", "s", "sess", 0, 0, &signer) {
             Err(TokenError::Expired { .. }) => {}
             other => panic!("expected Expired, got {other:?}"),
         }
@@ -663,8 +933,6 @@ mod tests {
 
     #[test]
     fn matched_rule_is_distinct_per_failure_mode() {
-        // Every variant gets its own stable matched_rule so the
-        // policy denial ring can be filtered by failure kind.
         let v: Vec<&'static str> = vec![
             TokenError::MalformedEncoding(String::new()).matched_rule(),
             TokenError::MalformedPayload(String::new()).matched_rule(),
@@ -682,12 +950,14 @@ mod tests {
             TokenError::SubjectMismatch.matched_rule(),
             TokenError::AlreadyConsumed.matched_rule(),
             TokenError::MissingSigningKey.matched_rule(),
+            TokenError::UnknownSigningKey("xxx".into()).matched_rule(),
             TokenError::Store(String::new()).matched_rule(),
+            TokenError::TokenFormatDeprecated {
+                got: 0x01,
+                expected: TOKEN_VERSION,
+            }
+            .matched_rule(),
         ];
-        // MalformedEncoding + MalformedPayload + ForbiddenDelimiter
-        // intentionally fold into one rule (the operator does not
-        // get more value from distinguishing them at audit time).
-        // Every other variant gets a unique rule.
         for r in &v {
             assert!(r.starts_with("approval_token_"));
         }
@@ -695,13 +965,12 @@ mod tests {
 
     #[test]
     fn blocklist_key_is_stable_per_nonce_and_approval_id() {
-        let wire = ApprovalToken::issue("a1", "m", "s", "sess", 1_000, 60_000, &key()).unwrap();
+        let signer = fixture_signer();
+        let wire = ApprovalToken::issue("a1", "m", "s", "sess", 1_000, 60_000, &signer).unwrap();
         let parsed = ApprovalToken::parse(&wire).unwrap();
         let k1 = parsed.blocklist_key();
         let k2 = parsed.blocklist_key();
         assert_eq!(k1, k2);
-        // Different approval_id under the same nonce → different
-        // blocklist key (defence against nonce collisions).
         let mut p2 = parsed.clone();
         p2.approval_id = "a2".into();
         assert_ne!(k1, p2.blocklist_key());
@@ -709,11 +978,9 @@ mod tests {
 
     #[test]
     fn issue_with_distinct_nonces_produces_distinct_blocklist_keys() {
-        // Two tokens issued back-to-back for the same approval
-        // get different nonces → different blocklist keys, so
-        // operator-initiated re-issues don't collide.
-        let w1 = ApprovalToken::issue("a", "m", "s", "sess", 1, 60_000, &key()).unwrap();
-        let w2 = ApprovalToken::issue("a", "m", "s", "sess", 2, 60_000, &key()).unwrap();
+        let signer = fixture_signer();
+        let w1 = ApprovalToken::issue("a", "m", "s", "sess", 1, 60_000, &signer).unwrap();
+        let w2 = ApprovalToken::issue("a", "m", "s", "sess", 2, 60_000, &signer).unwrap();
         let t1 = ApprovalToken::parse(&w1).unwrap();
         let t2 = ApprovalToken::parse(&w2).unwrap();
         assert_ne!(t1.nonce, t2.nonce);
@@ -721,30 +988,49 @@ mod tests {
     }
 
     #[test]
-    fn signing_key_from_env_returns_missing_when_unset() {
-        // We can't safely mutate process env from a test (the
-        // crate forbids unsafe_code, and `set_var` is now
-        // `unsafe`). The empty-env case is the operator's
-        // hardest fail mode, so we cover that here; the
-        // non-empty case is covered indirectly via the gate's
-        // structured-token tests which thread a synthetic key
-        // through `GateInputs::signing_key`.
-        //
-        // To guarantee the var is actually unset for this
-        // assertion, we run inside a fresh process scope. If a
-        // caller pre-set RELIX_APPROVAL_TOKEN_KEY in their
-        // shell the test environment would lie — but cargo
-        // test runs each test with the inherited env, and we
-        // intentionally do NOT lock that down here.
-        if std::env::var(SIGNING_KEY_ENV).is_err() {
-            // SEC PART 2: signing_key_from_env now returns
-            // Zeroizing<Vec<u8>> on the Ok branch; assert
-            // structurally rather than via PartialEq (Zeroizing
-            // doesn't implement Eq).
-            assert!(matches!(
-                signing_key_from_env(),
-                Err(TokenError::MissingSigningKey)
-            ));
-        }
+    fn fingerprint_is_stable_across_signer_constructions() {
+        let s1 = ApprovalSigner::from_seed([3u8; 32]);
+        let s2 = ApprovalSigner::from_seed([3u8; 32]);
+        assert_eq!(s1.fingerprint(), s2.fingerprint());
+        assert_eq!(s1.fingerprint().len(), FINGERPRINT_HEX_LEN);
+        let other = ApprovalSigner::from_seed([4u8; 32]);
+        assert_ne!(s1.fingerprint(), other.fingerprint());
+    }
+
+    #[test]
+    fn from_hex_seed_rejects_malformed_input() {
+        assert_eq!(
+            ApprovalSigner::from_hex_seed("not-hex").unwrap_err(),
+            TokenError::MissingSigningKey
+        );
+        assert_eq!(
+            ApprovalSigner::from_hex_seed("ab").unwrap_err(),
+            TokenError::MissingSigningKey
+        );
+        // Wrong char count.
+        assert_eq!(
+            ApprovalSigner::from_hex_seed(&"a".repeat(63)).unwrap_err(),
+            TokenError::MissingSigningKey
+        );
+        // Right length, invalid hex.
+        assert_eq!(
+            ApprovalSigner::from_hex_seed(&"zz".repeat(32)).unwrap_err(),
+            TokenError::MissingSigningKey
+        );
+        // Valid.
+        let ok = ApprovalSigner::from_hex_seed(&"ab".repeat(32));
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn empty_keyset_rejects_verify() {
+        let signer = fixture_signer();
+        let wire = ApprovalToken::issue("a", "m", "s", "sess", 1, 60_000, &signer).unwrap();
+        let parsed = ApprovalToken::parse(&wire).unwrap();
+        let empty = ApprovalKeySet::new();
+        assert_eq!(
+            parsed.verify_signature(&empty),
+            Err(TokenError::MissingSigningKey)
+        );
     }
 }

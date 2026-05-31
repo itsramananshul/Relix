@@ -55,6 +55,46 @@ pub struct BridgeConfig {
     /// See [`AuthSection`].
     #[serde(default)]
     pub auth: AuthSection,
+    /// P3: logging-stream redaction posture. Absent ⇒ defaults
+    /// to `redact_stream = true`. See [`LoggingSection`].
+    #[serde(default)]
+    pub logging: LoggingSection,
+}
+
+/// `[logging]` — P3 log-stream posture. Today only governs the
+/// SSE log-stream endpoint's redaction policy.
+///
+/// ```toml
+/// [logging]
+/// # Default true. Set false to disable redaction; the bridge
+/// # logs a WARN at startup so the operator's posture is
+/// # visible in the boot log.
+/// redact_stream = true
+/// ```
+#[derive(Clone, Debug, Deserialize)]
+pub struct LoggingSection {
+    /// P3: when `true` (the default), every log line streamed
+    /// out via `GET /v1/logs/stream` is run through
+    /// [`relix_core::redact::redact_secrets`] so API keys,
+    /// bearer tokens, JWTs, AWS credentials, and the other
+    /// well-known secret shapes are masked before they reach
+    /// the dashboard. When `false`, raw log content is sent
+    /// — operator's explicit posture choice; the bridge logs
+    /// a startup WARN so the choice is visible.
+    #[serde(default = "default_redact_stream")]
+    pub redact_stream: bool,
+}
+
+impl Default for LoggingSection {
+    fn default() -> Self {
+        Self {
+            redact_stream: default_redact_stream(),
+        }
+    }
+}
+
+fn default_redact_stream() -> bool {
+    true
 }
 
 /// `[auth]` — multi-tenant binding + trusted-origin

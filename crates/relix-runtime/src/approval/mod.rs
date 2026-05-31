@@ -60,4 +60,7 @@ pub use multi_dispatch::{
     ApprovalSendArgs, MeshSingleChannelDispatch, MultiChannelDispatch, approval_send_method,
 };
 pub use store::{ApprovalDeliveryRow, ApprovalRequestStore, ApprovalStoreError};
-pub use token::{ApprovalToken, SIGNING_KEY_ENV, TokenError, signing_key_from_env};
+pub use token::{
+    ApprovalKeySet, ApprovalSigner, ApprovalToken, SIGNING_KEY_ENV, TOKEN_VERSION, TokenError,
+    compute_fingerprint, signer_from_env,
+};

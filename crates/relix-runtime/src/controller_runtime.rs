@@ -668,32 +668,28 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
         bridge.set_always_require_methods(methods);
     }
-    // SEC PART A: install the HMAC-SHA256 signing key for
-    // structured ApprovalTokens. Sourced from
-    // `RELIX_APPROVAL_TOKEN_KEY`. Missing env var leaves the
-    // bridge in the no-key configuration — every token-bearing
-    // call hits `approval_token_missing_key`. We log loudly so
-    // operators see the missing config at boot.
-    match crate::approval::signing_key_from_env() {
-        Ok(key) => {
+    // P1: install the Ed25519 signing key for ApprovalTokens.
+    // Sourced from `RELIX_APPROVAL_SIGNING_KEY` (64-hex-char
+    // seed). Missing env var leaves the bridge in the no-key
+    // configuration — every token-bearing call hits
+    // `approval_token_missing_key`. We log loudly so operators
+    // see the missing config at boot.
+    match crate::approval::signer_from_env() {
+        Ok(signer) => {
             tracing::info!(
-                key_bytes = key.len(),
-                "approval: structured-token signing key loaded from {} (SEC PART A)",
+                fingerprint = %signer.fingerprint(),
+                "approval: Ed25519 signer loaded from {} (P1)",
                 crate::approval::SIGNING_KEY_ENV
             );
-            // SEC PART 2: hand the bridge the inner bytes and
-            // let `set_approval_token_signing_key` re-wrap.
-            // The intermediate `Vec<u8>` is the value `Zeroizing`
-            // releases on `into_inner`-style consumption; both
-            // sides hold zeroizing copies so nothing lingers.
-            bridge.set_approval_token_signing_key((*key).clone());
+            bridge.set_approval_signer(signer);
         }
         Err(_) => {
             tracing::warn!(
                 env = crate::approval::SIGNING_KEY_ENV,
-                "approval: signing key env var unset; ALL token-bearing \
+                "approval: signing key env var unset or malformed; ALL token-bearing \
                  admission calls will be denied with approval_token_missing_key. \
-                 Set the env var to a 32+ byte secret to enable structured tokens."
+                 Set {} to a 64-hex-char Ed25519 seed to enable structured tokens.",
+                crate::approval::SIGNING_KEY_ENV
             );
         }
     }
@@ -3156,17 +3152,13 @@ pub fn register_agent_capabilities(
             let _ = ts_fail.append_event(task_id, "task.approval_decided", "decision=rejected");
             r.map_err(|e| e.to_string())
         });
-        // SEC PART A: capture the structured-token signing key
-        // at register time so the cap handler can mint
-        // approval tokens without consulting env on every
-        // invocation. Empty bytes when the operator did not
-        // set `RELIX_APPROVAL_TOKEN_KEY` — handler gracefully
-        // omits the token in that case.
-        // SEC PART 2: the closure captures a Zeroizing copy
-        // — Arc-style sharing across spawned handler tasks via
-        // `Zeroizing::clone` keeps every replica wiped on drop.
-        let signing_key: zeroize::Zeroizing<Vec<u8>> = crate::approval::signing_key_from_env()
-            .unwrap_or_else(|_| zeroize::Zeroizing::new(Vec::new()));
+        // P1: capture the Ed25519 signer at register time so
+        // the cap handler can mint approval tokens without
+        // consulting env on every invocation. `None` when the
+        // operator did not set `RELIX_APPROVAL_SIGNING_KEY` —
+        // handler gracefully omits the token in that case.
+        let signer: Option<crate::approval::ApprovalSigner> =
+            crate::approval::signer_from_env().ok();
         // NOT-DONE 1: capture the dispatch clock so the
         // cap handler stamps `issued_at_ms` on each minted
         // token via the same time source the admission gate
@@ -3178,7 +3170,7 @@ pub fn register_agent_capabilities(
                 let s = s.clone();
                 let resume = resume.clone();
                 let fail = fail.clone();
-                let signing_key = signing_key.clone();
+                let signer = signer.clone();
                 let clock = clock_for_decide.clone();
                 async move {
                     handlers::handle_approval_decide(
@@ -3186,7 +3178,7 @@ pub fn register_agent_capabilities(
                         &ctx,
                         &resume,
                         &fail,
-                        &signing_key,
+                        signer.as_ref(),
                         token_ttl_secs,
                         clock.as_ref(),
                     )
@@ -7402,6 +7394,28 @@ fn register_node_type_handlers(
                                 crate::identity::caps::register(bridge, service.clone());
                                 if sess_cfg.session_idle_timeout_secs > 0 {
                                     service.clone().spawn_idle_sweeper();
+                                }
+                                // P5: wire the session identity
+                                // service into the dispatch
+                                // bridge so the
+                                // `verify_on_dispatch` gate has
+                                // something to call. The flag
+                                // is honoured in admission
+                                // step 6 of both unary and
+                                // streaming paths.
+                                bridge.set_session_service(std::sync::Arc::new(service.clone()));
+                                bridge.set_verify_on_dispatch(sess_cfg.verify_on_dispatch);
+                                if sess_cfg.verify_on_dispatch {
+                                    tracing::info!(
+                                        "Session token verification enabled on dispatch. \
+                                         Every capability call requires a valid session token."
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "Session token verification is DISABLED. \
+                                         Capability calls are not authenticated by session tokens. \
+                                         Set [identity.session] verify_on_dispatch = true for production deployments."
+                                    );
                                 }
                                 for (method, doc, mutate) in [
                                     (
