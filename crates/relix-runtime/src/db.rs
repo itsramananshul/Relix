@@ -96,17 +96,192 @@ pub fn log_integrity_warning(conn: &Connection, db_label: &str) {
 
 /// Create the `_relix_migrations` table if it doesn't exist. Every
 /// store that runs migrations should call this once at startup,
-/// then stamp each migration with `record_migration_applied`. The
-/// table is intentionally minimal — version + applied-at — because
-/// the migration *content* lives in the store-specific module
-/// (each store knows its own schema).
+/// then stamp each migration with `record_migration_applied`.
+///
+/// CORR PART 2: the table now carries two surfaces in parallel:
+///
+/// - the legacy `(version INTEGER PRIMARY KEY, applied_at TEXT)`
+///   columns the original migration framework wrote, kept for
+///   back-compat with already-deployed databases;
+/// - new `migration_id TEXT`, `applied_at_ms INTEGER`,
+///   `checksum TEXT` columns the identifier-based framework
+///   ([`is_migration_applied`] / [`apply_migration`]) reads and
+///   writes. Substring-matching error messages
+///   ([`is_migration_already_applied`]) is no longer how the
+///   framework detects already-applied migrations — the
+///   identifier table is the source of truth.
 pub fn ensure_migration_table(conn: &Connection) -> Result<(), SqliteError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _relix_migrations (\
-             version    INTEGER PRIMARY KEY,\
-             applied_at TEXT    NOT NULL\
+             version       INTEGER PRIMARY KEY,\
+             applied_at    TEXT    NOT NULL\
          );",
+    )?;
+    // CORR PART 2: ensure the identifier columns exist.
+    // SQLite's ALTER TABLE doesn't have a portable
+    // ADD-COLUMN-IF-NOT-EXISTS, so we probe via PRAGMA and
+    // emit the ALTER only when missing.
+    add_column_if_missing(conn, "_relix_migrations", "migration_id", "TEXT")?;
+    add_column_if_missing(conn, "_relix_migrations", "applied_at_ms", "INTEGER")?;
+    add_column_if_missing(conn, "_relix_migrations", "checksum", "TEXT")?;
+    // Unique index on `migration_id`. SQLite UNIQUE allows
+    // multiple NULL rows by default (one per legacy version
+    // row that pre-dates the new shape) but rejects duplicate
+    // non-NULL identifiers. The index is non-partial so
+    // `ON CONFLICT(migration_id) DO NOTHING` matches it.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS _relix_migrations_migration_id_idx \
+             ON _relix_migrations(migration_id);",
     )
+}
+
+/// CORR PART 2: probe + add a column on an existing table if
+/// it is not already present. SQLite's pragma_table_info gives
+/// us the live shape without parsing error messages.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<(), SqliteError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+/// CORR PART 2: identifier-based check. Returns `true` when
+/// a row with `migration_id = id` exists in `_relix_migrations`.
+/// Callers use this BEFORE running a migration body so an
+/// already-applied migration is a no-op without going through
+/// the SQLite error path. Never matches error message
+/// substrings.
+pub fn is_migration_applied(conn: &Connection, id: &str) -> Result<bool, SqliteError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM _relix_migrations WHERE migration_id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// CORR PART 2: stamp an identifier-keyed migration as applied.
+/// Uses `INSERT … ON CONFLICT DO NOTHING` so a concurrent boot
+/// of the same migration on the same DB never raises a PK
+/// violation; the `changes()` count lets callers distinguish
+/// applied-now (1) from was-already-applied (0).
+///
+/// `checksum` is a hex-encoded BLAKE3 digest of the SQL the
+/// migration ran; operators reading the table can spot a
+/// tampered migration body.
+pub fn record_migration_applied_by_id(
+    conn: &Connection,
+    id: &str,
+    checksum: &str,
+) -> Result<usize, SqliteError> {
+    let now_ms = unix_now_ms();
+    conn.execute(
+        "INSERT INTO _relix_migrations (migration_id, applied_at_ms, checksum, applied_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(migration_id) DO NOTHING",
+        rusqlite::params![id, now_ms, checksum, chrono_secs_iso()],
+    )
+}
+
+/// CORR PART 2: run `body` exactly once per `id` against
+/// `conn`. The check + write are wrapped in a `BEGIN IMMEDIATE`
+/// transaction so two concurrent boots can race for the same
+/// migration and only one will run it.
+pub fn apply_migration<F>(
+    conn: &mut Connection,
+    id: &str,
+    sql: &str,
+    body: F,
+) -> Result<bool, SqliteError>
+where
+    F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(), SqliteError>,
+{
+    ensure_migration_table(conn)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let already: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM _relix_migrations WHERE migration_id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?;
+    if already > 0 {
+        // Honest commit so the BEGIN IMMEDIATE releases its
+        // lock — a no-op transaction still needs to drop the
+        // database-wide writer slot.
+        tx.commit()?;
+        return Ok(false);
+    }
+    body(&tx)?;
+    let checksum = checksum_sql(sql);
+    let now_ms = unix_now_ms();
+    let affected = tx.execute(
+        "INSERT INTO _relix_migrations (migration_id, applied_at_ms, checksum, applied_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(migration_id) DO NOTHING",
+        rusqlite::params![id, now_ms, checksum, chrono_secs_iso()],
+    )?;
+    tx.commit()?;
+    Ok(affected > 0)
+}
+
+/// CORR PART 2: BLAKE3 digest of the migration body. Operators
+/// reading `_relix_migrations` see a stable hex value per id;
+/// a body change without a new id surfaces as a checksum
+/// mismatch only at audit time (intentional — the framework
+/// does not refuse to boot on a checksum change, but operators
+/// can scan for one).
+pub fn checksum_sql(sql: &str) -> String {
+    hex::encode(blake3::hash(sql.as_bytes()).as_bytes())
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// CORR PART 2: register an already-deployed table with the
+/// identifier framework so a node that upgrades from the pre-
+/// fix path doesn't re-run a CREATE TABLE that would no-op +
+/// confuse the operator's audit. Callers pass the migration
+/// id they want stamped and a check that returns `true` when
+/// the legacy table is already present.
+///
+/// Idempotent — re-calls on a DB that's already been claimed
+/// are no-ops.
+pub fn claim_legacy_migration<F>(conn: &Connection, id: &str, check: F) -> Result<bool, SqliteError>
+where
+    F: FnOnce(&Connection) -> Result<bool, SqliteError>,
+{
+    ensure_migration_table(conn)?;
+    if is_migration_applied(conn, id)? {
+        return Ok(false);
+    }
+    if !check(conn)? {
+        return Ok(false);
+    }
+    let now_ms = unix_now_ms();
+    let affected = conn.execute(
+        "INSERT INTO _relix_migrations (migration_id, applied_at_ms, checksum, applied_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(migration_id) DO NOTHING",
+        rusqlite::params![id, now_ms, "legacy-claimed", chrono_secs_iso()],
+    )?;
+    Ok(affected > 0)
 }
 
 /// Return the highest migration version recorded for this store.
@@ -123,16 +298,22 @@ pub fn current_migration_version(conn: &Connection) -> Result<i64, SqliteError> 
 }
 
 /// Stamp a migration as applied. `version` should be monotonically
-/// increasing. Idempotent — calling twice with the same version is a
-/// no-op (the PK conflict is silently ignored), so re-running a
-/// migration body during development doesn't fail boot.
-pub fn record_migration_applied(conn: &Connection, version: i64) -> Result<(), SqliteError> {
+/// increasing.
+///
+/// CORR PART 2: implementation now uses
+/// `INSERT … ON CONFLICT DO NOTHING` (not the legacy
+/// `INSERT OR IGNORE`) and returns the number of rows actually
+/// inserted so the caller can distinguish "applied just now" from
+/// "was already recorded". Existing callers that throw the result
+/// away keep working unchanged.
+pub fn record_migration_applied(conn: &Connection, version: i64) -> Result<usize, SqliteError> {
     let now = chrono_secs_iso();
-    conn.execute(
-        "INSERT OR IGNORE INTO _relix_migrations (version, applied_at) VALUES (?1, ?2)",
+    let affected = conn.execute(
+        "INSERT INTO _relix_migrations (version, applied_at) VALUES (?1, ?2) \
+         ON CONFLICT(version) DO NOTHING",
         rusqlite::params![version, now],
     )?;
-    Ok(())
+    Ok(affected)
 }
 
 /// Render `SystemTime::now()` as an ISO-8601 second-resolution string
@@ -353,6 +534,135 @@ mod tests {
             &["ALTER TABLE definitely_not_a_table ADD COLUMN x TEXT"],
         );
         assert!(res.is_err(), "real schema error must surface");
+    }
+
+    // ── CORR PART 2: identifier-based migration framework ──
+
+    #[test]
+    fn corr_p2_apply_migration_runs_once_then_is_noop() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn).unwrap();
+        let mut ran = 0;
+        let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY);";
+        let applied = apply_migration(&mut conn, "t.v1", sql, |tx| {
+            ran += 1;
+            tx.execute_batch(sql)
+        })
+        .unwrap();
+        assert!(applied);
+        assert_eq!(ran, 1);
+        // Second call returns false + does NOT re-run.
+        let applied = apply_migration(&mut conn, "t.v1", sql, |tx| {
+            ran += 1;
+            tx.execute_batch(sql)
+        })
+        .unwrap();
+        assert!(!applied);
+        assert_eq!(ran, 1, "body must not re-run for already-applied id");
+        assert!(is_migration_applied(&conn, "t.v1").unwrap());
+    }
+
+    #[test]
+    fn corr_p2_apply_migration_records_checksum_and_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn).unwrap();
+        let sql = "CREATE TABLE x (id INTEGER);";
+        apply_migration(&mut conn, "x.v1", sql, |tx| tx.execute_batch(sql)).unwrap();
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT migration_id, checksum FROM _relix_migrations WHERE migration_id = 'x.v1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "x.v1");
+        assert_eq!(row.1, checksum_sql(sql));
+    }
+
+    #[test]
+    fn corr_p2_concurrent_apply_only_runs_body_once() {
+        // BEGIN IMMEDIATE serialises two threads racing for
+        // the same migration id. Only one body call wins.
+        use std::sync::Arc;
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("race.db");
+        // Initialise the DB so both threads open against an
+        // already-pragma'd file.
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            ensure_migration_table(&c).unwrap();
+        }
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p1 = p.clone();
+        let p2 = p.clone();
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+        let t1 = std::thread::spawn(move || {
+            let mut conn = Connection::open(p1).unwrap();
+            apply_pragmas(&conn).unwrap();
+            let sql = "CREATE TABLE race1 (id INTEGER);";
+            apply_migration(&mut conn, "race.v1", sql, |tx| {
+                c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tx.execute_batch(sql)
+            })
+            .unwrap()
+        });
+        let t2 = std::thread::spawn(move || {
+            let mut conn = Connection::open(p2).unwrap();
+            apply_pragmas(&conn).unwrap();
+            let sql = "CREATE TABLE race1 (id INTEGER);";
+            apply_migration(&mut conn, "race.v1", sql, |tx| {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tx.execute_batch(sql)
+            })
+            .unwrap()
+        });
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+        assert_ne!(r1, r2, "exactly one thread must have applied");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn corr_p2_record_migration_applied_returns_rows_affected() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn).unwrap();
+        ensure_migration_table(&conn).unwrap();
+        let n = record_migration_applied(&conn, 7).unwrap();
+        assert_eq!(n, 1, "first insert applies one row");
+        let n2 = record_migration_applied(&conn, 7).unwrap();
+        assert_eq!(n2, 0, "duplicate insert is dropped by ON CONFLICT");
+    }
+
+    #[test]
+    fn corr_p2_claim_legacy_migration_stamps_pre_fix_db() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_pragmas(&conn).unwrap();
+        // Simulate a pre-fix DB: the user table is already
+        // here, the migration table is fresh.
+        conn.execute_batch("CREATE TABLE legacy_thing (id INTEGER);")
+            .unwrap();
+        let claimed = claim_legacy_migration(&conn, "legacy_thing.v1", |c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='legacy_thing'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
+        .unwrap();
+        assert!(claimed);
+        assert!(is_migration_applied(&conn, "legacy_thing.v1").unwrap());
+        // Repeat is idempotent.
+        let claimed2 = claim_legacy_migration(&conn, "legacy_thing.v1", |_| Ok(true)).unwrap();
+        assert!(!claimed2);
+        // Subsequent apply_migration with the same id no-ops.
+        let applied = apply_migration(&mut conn, "legacy_thing.v1", "should not run", |_| {
+            panic!("body must not run for claimed legacy id");
+        })
+        .unwrap();
+        assert!(!applied);
     }
 
     #[test]

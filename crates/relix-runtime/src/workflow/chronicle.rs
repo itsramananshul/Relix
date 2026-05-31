@@ -104,24 +104,35 @@ impl WorkflowChronicle {
     }
 
     fn init_schema(conn: &Connection) -> Result<(), ChronicleError> {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS workflow_executions (
-                execution_id      TEXT PRIMARY KEY,
-                workflow_name     TEXT NOT NULL,
-                input             TEXT NOT NULL,
-                status            TEXT NOT NULL,
-                result            TEXT NOT NULL,
-                started_at        INTEGER NOT NULL,
-                ended_at          INTEGER NOT NULL,
-                total_latency_ms  INTEGER NOT NULL,
-                steps_json        TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS workflow_executions_name
-                ON workflow_executions(workflow_name, started_at DESC);
-            "#,
-        )
-        .map_err(|e| ChronicleError::Db(e.to_string()))
+        // CORR PART 2: drive schema through the identifier-
+        // based migration framework so the workflow chronicle
+        // schema is tracked in `_relix_migrations`. The legacy
+        // claim makes a node that upgrades from the pre-fix
+        // path stamp v1 without re-running the CREATE.
+        crate::db::claim_legacy_migration(conn, "workflow_chronicle.v1", |c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='workflow_executions'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
+        .map_err(|e| ChronicleError::Db(e.to_string()))?;
+        let body_sql = "CREATE TABLE IF NOT EXISTS workflow_executions (\n                execution_id      TEXT PRIMARY KEY,\n                workflow_name     TEXT NOT NULL,\n                input             TEXT NOT NULL,\n                status            TEXT NOT NULL,\n                result            TEXT NOT NULL,\n                started_at        INTEGER NOT NULL,\n                ended_at          INTEGER NOT NULL,\n                total_latency_ms  INTEGER NOT NULL,\n                steps_json        TEXT NOT NULL\n            );\n            CREATE INDEX IF NOT EXISTS workflow_executions_name\n                ON workflow_executions(workflow_name, started_at DESC);";
+        if !crate::db::is_migration_applied(conn, "workflow_chronicle.v1")
+            .map_err(|e| ChronicleError::Db(e.to_string()))?
+        {
+            conn.execute_batch(body_sql)
+                .map_err(|e| ChronicleError::Db(e.to_string()))?;
+            crate::db::record_migration_applied_by_id(
+                conn,
+                "workflow_chronicle.v1",
+                &crate::db::checksum_sql(body_sql),
+            )
+            .map_err(|e| ChronicleError::Db(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Persist one finished execution.

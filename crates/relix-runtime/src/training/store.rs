@@ -559,6 +559,22 @@ fn group_counts(conn: &Connection, column: &str) -> Result<Vec<GroupedCount>, Tr
 }
 
 fn init_schema(conn: &Connection) -> Result<(), TrainingStoreError> {
+    // CORR PART 2: register schema with the identifier-based
+    // migration framework. Legacy claim makes pre-fix DBs
+    // stamp v1 without re-CREATE; the body migration runs
+    // only on a fresh DB. The post-create ALTER TABLE for
+    // `anonymized` is kept below to remain idempotent against
+    // any DB seen in production.
+    crate::db::claim_legacy_migration(conn, "training_store.v1", |c| {
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='table' AND name='training_interactions'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    })
+    .map_err(|e| TrainingStoreError::Db(e.to_string()))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS training_interactions (\
              interaction_id    TEXT PRIMARY KEY,\

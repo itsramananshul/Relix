@@ -1,0 +1,3 @@
+set prompt = "sflow-smoke|ping"
+step reply: ai.chat "${prompt}"
+return step.reply.result

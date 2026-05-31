@@ -167,6 +167,20 @@ fn insert_one(conn: &Connection, m: &InvocationMetric) -> Result<(), MetricsStor
 }
 
 fn init_schema(conn: &Connection) -> Result<(), MetricsStoreError> {
+    // CORR PART 2: register the metrics_invocations table
+    // with the identifier-based migration framework. Pre-fix
+    // DBs are claimed at v1 without re-CREATE; the post-init
+    // ALTER columns below remain idempotent.
+    crate::db::claim_legacy_migration(conn, "metrics_store.v1", |c| {
+        let n: i64 = c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='table' AND name='metrics_invocations'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    })
+    .map_err(|e| MetricsStoreError::Db(e.to_string()))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS metrics_invocations (\
              id            INTEGER PRIMARY KEY AUTOINCREMENT,\

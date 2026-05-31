@@ -102,25 +102,25 @@ impl PluginRegistry {
     }
 
     fn init_schema(conn: &Connection) -> Result<(), RegistryError> {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS plugins (
-                plugin_id     TEXT    NOT NULL PRIMARY KEY,
-                name          TEXT    NOT NULL,
-                version       TEXT    NOT NULL,
-                description   TEXT    NOT NULL,
-                author        TEXT    NOT NULL,
-                manifest_path TEXT    NOT NULL,
-                status        TEXT    NOT NULL DEFAULT 'registered',
-                error_message TEXT    NOT NULL DEFAULT '',
-                registered_at INTEGER NOT NULL,
-                last_seen_at  INTEGER,
-                capabilities  TEXT    NOT NULL,
-                node_type     TEXT    NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS plugins_status ON plugins(status);
-            "#,
-        )?;
+        // CORR PART 2: track schema in `_relix_migrations`.
+        let body_sql = "CREATE TABLE IF NOT EXISTS plugins (\n                plugin_id     TEXT    NOT NULL PRIMARY KEY,\n                name          TEXT    NOT NULL,\n                version       TEXT    NOT NULL,\n                description   TEXT    NOT NULL,\n                author        TEXT    NOT NULL,\n                manifest_path TEXT    NOT NULL,\n                status        TEXT    NOT NULL DEFAULT 'registered',\n                error_message TEXT    NOT NULL DEFAULT '',\n                registered_at INTEGER NOT NULL,\n                last_seen_at  INTEGER,\n                capabilities  TEXT    NOT NULL,\n                node_type     TEXT    NOT NULL DEFAULT ''\n            );\n            CREATE INDEX IF NOT EXISTS plugins_status ON plugins(status);";
+        crate::db::claim_legacy_migration(conn, "plugin_registry.v1", |c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='plugins'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })?;
+        if !crate::db::is_migration_applied(conn, "plugin_registry.v1")? {
+            conn.execute_batch(body_sql)?;
+            crate::db::record_migration_applied_by_id(
+                conn,
+                "plugin_registry.v1",
+                &crate::db::checksum_sql(body_sql),
+            )?;
+        }
         Ok(())
     }
 

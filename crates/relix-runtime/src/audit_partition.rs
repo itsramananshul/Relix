@@ -115,28 +115,35 @@ impl AuditPartitionStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+        let mut conn = Connection::open(&path).map_err(|e| e.to_string())?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| e.to_string())?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS audit_partition (
-                tenant_id        TEXT    NOT NULL,
-                ts_secs          INTEGER NOT NULL,
-                request_id       TEXT    NOT NULL,
-                caller_name      TEXT    NOT NULL,
-                method           TEXT    NOT NULL,
-                policy_decision  TEXT    NOT NULL,
-                status           TEXT    NOT NULL,
-                error_kind       INTEGER,
-                latency_ms       INTEGER NOT NULL,
-                PRIMARY KEY (tenant_id, ts_secs, request_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_audit_partition_ts
-                ON audit_partition(tenant_id, ts_secs DESC);",
-        )
+        // CORR PART 2: drive schema creation through the
+        // identifier-based migration framework so the
+        // `audit_partition` schema is tracked in
+        // `_relix_migrations`. Re-boots are O(log n) lookups
+        // against the framework, never CREATE TABLE retries.
+        // Legacy claim makes a node that upgrades from the
+        // pre-fix path stamp v1 without re-running the CREATE.
+        let claim_sql = "audit_partition.v1";
+        crate::db::claim_legacy_migration(&conn, "audit_partition.v1", |c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='audit_partition'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
         .map_err(|e| e.to_string())?;
+        let body_sql = "CREATE TABLE IF NOT EXISTS audit_partition (\n                tenant_id        TEXT    NOT NULL,\n                ts_secs          INTEGER NOT NULL,\n                request_id       TEXT    NOT NULL,\n                caller_name      TEXT    NOT NULL,\n                method           TEXT    NOT NULL,\n                policy_decision  TEXT    NOT NULL,\n                status           TEXT    NOT NULL,\n                error_kind       INTEGER,\n                latency_ms       INTEGER NOT NULL,\n                PRIMARY KEY (tenant_id, ts_secs, request_id)\n            );\n            CREATE INDEX IF NOT EXISTS idx_audit_partition_ts\n                ON audit_partition(tenant_id, ts_secs DESC);";
+        crate::db::apply_migration(&mut conn, "audit_partition.v1", body_sql, |tx| {
+            tx.execute_batch(body_sql)
+        })
+        .map_err(|e| e.to_string())?;
+        let _ = claim_sql;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
