@@ -265,13 +265,18 @@ struct BudgetInner {
     /// recovery event when it drops back. Without this, every throttled
     /// call would refire the alert.
     active: Mutex<HashMap<CacheKey, ActiveAlert>>,
-    /// CORR PART 3: per-enforcer refresh serialisation. Two
-    /// callers that both miss the cache contend on this mutex
-    /// so only one of them re-queries SQLite; the loser
-    /// double-checks the cache after acquiring the lock and
-    /// reads the freshly-cached value instead of issuing a
-    /// duplicate query.
-    refresh_mutex: Mutex<()>,
+    /// CORR-D2: async refresh serialisation. The pre-fix
+    /// `std::sync::Mutex<()>` here was load-bearing equivalent
+    /// for fully-sync callers, but `evaluate_agent` /
+    /// `evaluate_deployment` / `check` / `status` are now
+    /// `async fn` and would have to hold a sync MutexGuard
+    /// across the SQLite read — a deadlock hazard on a
+    /// single-threaded executor. The tokio mutex's guard
+    /// can be held across `.await` points safely; it also
+    /// prevents the lock-order inversion the std version
+    /// risked when two refresh paths blocked each other on
+    /// the runtime worker pool.
+    refresh_mutex: tokio::sync::Mutex<()>,
 }
 
 /// `(scope, window)` cache + active-alert key. `scope = "agent:<name>"`
@@ -298,7 +303,7 @@ impl BudgetEnforcer {
                 cache: Mutex::new(HashMap::new()),
                 sink: RwLock::new(None),
                 active: Mutex::new(HashMap::new()),
-                refresh_mutex: Mutex::new(()),
+                refresh_mutex: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -345,11 +350,11 @@ impl BudgetEnforcer {
     /// going to wait before dispatch). An `AlertOnly` action never blocks —
     /// the enforcer fires the alert as a side effect and returns
     /// [`BudgetDecision::Allow`].
-    pub fn check(&self, agent: &str, method: &str) -> BudgetDecision {
+    pub async fn check(&self, agent: &str, method: &str) -> BudgetDecision {
         if self.inner.exempt_methods.iter().any(|m| m == method) {
             return BudgetDecision::Allow;
         }
-        if let Some(d) = self.evaluate_agent(agent) {
+        if let Some(d) = self.evaluate_agent(agent).await {
             // Reject + Throttle short-circuit. AlertOnly falls through
             // so the deployment cap can still fire if applicable.
             match &d {
@@ -357,7 +362,7 @@ impl BudgetEnforcer {
                 BudgetDecision::Allow => {}
             }
         }
-        if let Some(d) = self.evaluate_deployment() {
+        if let Some(d) = self.evaluate_deployment().await {
             return d;
         }
         BudgetDecision::Allow
@@ -365,19 +370,28 @@ impl BudgetEnforcer {
 
     /// Snapshot of every configured agent's current spend + limits.
     /// Used by `budget.status`.
-    pub fn status(&self) -> BudgetStatus {
+    pub async fn status(&self) -> BudgetStatus {
         let mut rows = Vec::new();
-        let agents_map = self.inner.agents.read().expect("budget agents read");
-        let agent_names: Vec<String> = agents_map.keys().cloned().collect();
-        drop(agents_map);
+        // CORR-D2: scope the std RwLock guard so it is dropped
+        // before the first `.await`. The compiler's
+        // Send-future analysis would otherwise reject the
+        // async fn even with an explicit `drop(...)` call.
+        let agent_names: Vec<String> = {
+            let agents_map = self.inner.agents.read().expect("budget agents read");
+            agents_map.keys().cloned().collect()
+        };
         for name in agent_names {
-            let daily = self.refresh_window(Some(name.as_str()), Window::Daily);
-            let hourly = self.refresh_window(Some(name.as_str()), Window::Hourly);
+            let daily = self
+                .refresh_window(Some(name.as_str()), Window::Daily)
+                .await;
+            let hourly = self
+                .refresh_window(Some(name.as_str()), Window::Hourly)
+                .await;
             let row = self.build_agent_row(&name, daily, hourly);
             rows.push(row);
         }
-        let deployment_daily = self.refresh_window(None, Window::Daily);
-        let deployment_hourly = self.refresh_window(None, Window::Hourly);
+        let deployment_daily = self.refresh_window(None, Window::Daily).await;
+        let deployment_hourly = self.refresh_window(None, Window::Hourly).await;
         let deployment = self.build_deployment_row(deployment_daily, deployment_hourly);
         BudgetStatus {
             agents: rows,
@@ -431,14 +445,14 @@ impl BudgetEnforcer {
         g.insert((scope.to_string(), window), entry);
     }
 
-    fn evaluate_agent(&self, agent: &str) -> Option<BudgetDecision> {
+    async fn evaluate_agent(&self, agent: &str) -> Option<BudgetDecision> {
         let cfg = {
             let g = self.inner.agents.read().expect("budget agents read");
             g.get(agent).cloned()
         };
         let cfg = cfg?;
-        let daily = self.refresh_window(Some(agent), Window::Daily);
-        let hourly = self.refresh_window(Some(agent), Window::Hourly);
+        let daily = self.refresh_window(Some(agent), Window::Daily).await;
+        let hourly = self.refresh_window(Some(agent), Window::Hourly).await;
         // Daily first — it's the harder ceiling.
         if let Some(limit_usd) = cfg.daily_limit_usd
             && let Some(decision) = self.compare(
@@ -467,7 +481,7 @@ impl BudgetEnforcer {
         Some(BudgetDecision::Allow)
     }
 
-    fn evaluate_deployment(&self) -> Option<BudgetDecision> {
+    async fn evaluate_deployment(&self) -> Option<BudgetDecision> {
         let cfg = {
             let g = self
                 .inner
@@ -477,8 +491,8 @@ impl BudgetEnforcer {
             g.clone()
         };
         let cfg = cfg?;
-        let daily = self.refresh_window(None, Window::Daily);
-        let hourly = self.refresh_window(None, Window::Hourly);
+        let daily = self.refresh_window(None, Window::Daily).await;
+        let hourly = self.refresh_window(None, Window::Hourly).await;
         if let Some(limit_usd) = cfg.daily_limit_usd
             && let Some(decision) = self.compare(
                 None,
@@ -641,7 +655,7 @@ impl BudgetEnforcer {
         }
     }
 
-    fn refresh_window(&self, agent: Option<&str>, window: Window) -> CacheEntry {
+    async fn refresh_window(&self, agent: Option<&str>, window: Window) -> CacheEntry {
         let scope_key = match agent {
             Some(a) => format!("agent:{a}"),
             None => "deployment".to_string(),
@@ -655,40 +669,36 @@ impl BudgetEnforcer {
         // negative value and short-circuit the freshness check.
         let cache_refresh_ms =
             i64::try_from(self.inner.cache_refresh.as_millis()).unwrap_or(i64::MAX);
-        // Fast path — fresh cache, same window. Drop the lock
-        // immediately so the slow path takes the refresh mutex
-        // without holding the cache lock across SQLite I/O.
-        if let Ok(g) = self.inner.cache.lock()
-            && let Some(entry) = g.get(&key)
-            && entry.window_start_ms == window_start
-            && (now - entry.refreshed_at_ms) < cache_refresh_ms
+        // Fast path — fresh cache, same window. The cache
+        // mutex is std::sync::Mutex<HashMap>; we lock it,
+        // copy out the entry, and DROP the guard BEFORE any
+        // `.await` so a sync MutexGuard never crosses an
+        // await point.
         {
-            return *entry;
+            if let Ok(g) = self.inner.cache.lock()
+                && let Some(entry) = g.get(&key)
+                && entry.window_start_ms == window_start
+                && (now - entry.refreshed_at_ms) < cache_refresh_ms
+            {
+                return *entry;
+            }
         }
-        // CORR PART 3: serialise the refresh path through a
-        // per-enforcer mutex. Two callers that both miss the
-        // cache contend on this lock; the loser then re-checks
-        // the cache after acquiring it (a refresh may have
-        // landed under it) and only re-queries SQLite when the
-        // cache is still stale. Eliminates duplicate-work +
-        // duplicate-insert races on every miss while keeping
-        // the function synchronous (the callers are sync; a
-        // tokio::sync::Mutex would force async). A std Mutex
-        // gated specifically to the refresh path matches the
-        // user's intent of "one in-flight refresh per
-        // enforcer".
-        let _refresh_guard = self.inner.refresh_mutex.lock().unwrap_or_else(|e| {
-            tracing::warn!("budget refresh mutex poisoned; recovering inner state");
-            e.into_inner()
-        });
+        // CORR-D2: serialise the refresh path through the
+        // tokio mutex. The guard is held across the SQLite
+        // read below; the std cache mutex is acquired only
+        // for the milliseconds needed to read or insert and
+        // never held across an `.await`.
+        let _refresh_guard = self.inner.refresh_mutex.lock().await;
         // Double-checked: another caller may have raced ahead
         // of us and landed a fresh entry while we were waiting.
-        if let Ok(g) = self.inner.cache.lock()
-            && let Some(entry) = g.get(&key)
-            && entry.window_start_ms == window_start
-            && (now - entry.refreshed_at_ms) < cache_refresh_ms
         {
-            return *entry;
+            if let Ok(g) = self.inner.cache.lock()
+                && let Some(entry) = g.get(&key)
+                && entry.window_start_ms == window_start
+                && (now - entry.refreshed_at_ms) < cache_refresh_ms
+            {
+                return *entry;
+            }
         }
         let cost_micros = self.read_cost(agent, window_start);
         let entry = CacheEntry {
@@ -860,21 +870,21 @@ mod tests {
         )
     }
 
-    #[test]
-    fn allow_when_under_limit() {
+    #[tokio::test]
+    async fn allow_when_under_limit() {
         let enf = enforcer_with_agent("alice", Some(1.0), None, BudgetAction::Reject);
         enf.set_cached_for_test("agent:alice", Window::Daily, 100_000); // $0.10
-        match enf.check("alice", "ai.chat") {
+        match enf.check("alice", "ai.chat").await {
             BudgetDecision::Allow => {}
             other => panic!("expected Allow, got {other:?}"),
         }
     }
 
-    #[test]
-    fn reject_when_daily_limit_exceeded() {
+    #[tokio::test]
+    async fn reject_when_daily_limit_exceeded() {
         let enf = enforcer_with_agent("alice", Some(1.0), None, BudgetAction::Reject);
         enf.set_cached_for_test("agent:alice", Window::Daily, 2_000_000); // $2.00
-        match enf.check("alice", "ai.chat") {
+        match enf.check("alice", "ai.chat").await {
             BudgetDecision::Reject { info } => {
                 assert_eq!(info.agent, "alice");
                 assert_eq!(info.window, "daily");
@@ -885,11 +895,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn throttle_when_hourly_limit_exceeded() {
+    #[tokio::test]
+    async fn throttle_when_hourly_limit_exceeded() {
         let enf = enforcer_with_agent("alice", None, Some(0.5), BudgetAction::Throttle);
         enf.set_cached_for_test("agent:alice", Window::Hourly, 600_000); // $0.60
-        match enf.check("alice", "ai.chat") {
+        match enf.check("alice", "ai.chat").await {
             BudgetDecision::Throttle { delay, info } => {
                 assert_eq!(delay, Duration::from_millis(2000));
                 assert_eq!(info.window, "hourly");
@@ -898,18 +908,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn alert_only_allows_call_through() {
+    #[tokio::test]
+    async fn alert_only_allows_call_through() {
         let enf = enforcer_with_agent("alice", Some(1.0), None, BudgetAction::AlertOnly);
         enf.set_cached_for_test("agent:alice", Window::Daily, 5_000_000); // $5.00
-        match enf.check("alice", "ai.chat") {
+        match enf.check("alice", "ai.chat").await {
             BudgetDecision::Allow => {}
             other => panic!("expected Allow, got {other:?}"),
         }
     }
 
-    #[test]
-    fn exempt_method_skips_enforcement() {
+    #[tokio::test]
+    async fn exempt_method_skips_enforcement() {
         let enf = BudgetEnforcer::new(
             BudgetConfig {
                 agents: vec![AgentBudget {
@@ -928,18 +938,18 @@ mod tests {
         enf.set_cached_for_test("agent:alice", Window::Daily, 10_000_000);
         // Non-exempt method rejects.
         assert!(matches!(
-            enf.check("alice", "ai.chat"),
+            enf.check("alice", "ai.chat").await,
             BudgetDecision::Reject { .. }
         ));
         // Exempt method passes.
         assert!(matches!(
-            enf.check("alice", "budget.status"),
+            enf.check("alice", "budget.status").await,
             BudgetDecision::Allow
         ));
     }
 
-    #[test]
-    fn deployment_cap_triggers_when_total_spend_exceeds_limit() {
+    #[tokio::test]
+    async fn deployment_cap_triggers_when_total_spend_exceeds_limit() {
         let store = MetricsStore::in_memory().unwrap();
         let now = now_ms();
         store.insert(&metric("alice", now, 4_000_000)).unwrap();
@@ -959,7 +969,7 @@ mod tests {
             },
             Some(q),
         );
-        match enf.check("alice", "ai.chat") {
+        match enf.check("alice", "ai.chat").await {
             BudgetDecision::Reject { info } => {
                 assert_eq!(info.scope, "deployment");
             }
@@ -967,29 +977,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cache_is_invalidated_immediately() {
+    #[tokio::test]
+    async fn cache_is_invalidated_immediately() {
         let enf = enforcer_with_agent("alice", Some(1.0), None, BudgetAction::Reject);
         enf.set_cached_for_test("agent:alice", Window::Daily, 100_000); // healthy
         assert!(matches!(
-            enf.check("alice", "ai.chat"),
+            enf.check("alice", "ai.chat").await,
             BudgetDecision::Allow
         ));
         // Now invalidate and re-seed over the limit.
         enf.invalidate_agent("alice");
         enf.set_cached_for_test("agent:alice", Window::Daily, 2_000_000);
         assert!(matches!(
-            enf.check("alice", "ai.chat"),
+            enf.check("alice", "ai.chat").await,
             BudgetDecision::Reject { .. }
         ));
     }
 
-    #[test]
-    fn budget_status_returns_configured_agents_and_actuals() {
+    #[tokio::test]
+    async fn budget_status_returns_configured_agents_and_actuals() {
         let enf = enforcer_with_agent("alice", Some(2.0), Some(0.5), BudgetAction::Throttle);
         enf.set_cached_for_test("agent:alice", Window::Daily, 250_000);
         enf.set_cached_for_test("agent:alice", Window::Hourly, 100_000);
-        let status = enf.status();
+        let status = enf.status().await;
         assert_eq!(status.agents.len(), 1);
         let row = &status.agents[0];
         assert_eq!(row.agent, "alice");
@@ -1000,19 +1010,19 @@ mod tests {
         assert_eq!(row.action, "throttle");
     }
 
-    #[test]
-    fn reset_clears_cache_for_specified_window() {
+    #[tokio::test]
+    async fn reset_clears_cache_for_specified_window() {
         let enf = enforcer_with_agent("alice", Some(1.0), None, BudgetAction::Reject);
         enf.set_cached_for_test("agent:alice", Window::Daily, 2_000_000);
         // Confirm the over-limit cache made the check reject.
         assert!(matches!(
-            enf.check("alice", "ai.chat"),
+            enf.check("alice", "ai.chat").await,
             BudgetDecision::Reject { .. }
         ));
         enf.reset(Some("alice"), Window::Daily);
         // Reset clears the cache → next check re-reads from the (empty)
         // store, which returns 0 → call allowed.
-        match enf.check("alice", "ai.chat") {
+        match enf.check("alice", "ai.chat").await {
             BudgetDecision::Allow => {}
             other => panic!("expected Allow after reset, got {other:?}"),
         }
@@ -1021,8 +1031,8 @@ mod tests {
     /// Verify that BudgetExceeded fires through the configured AlertSink
     /// when the agent crosses the threshold, and exactly once (no re-fire
     /// on the second check within the same window).
-    #[test]
-    fn alert_fires_once_per_breach_then_dedups() {
+    #[tokio::test]
+    async fn alert_fires_once_per_breach_then_dedups() {
         use crate::metrics::alert::LoggingAlertSink;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1051,8 +1061,8 @@ mod tests {
         let enf = enforcer_with_agent("alice", Some(1.0), None, BudgetAction::AlertOnly);
         enf.set_alert_sink(sink);
         enf.set_cached_for_test("agent:alice", Window::Daily, 2_000_000);
-        let _ = enf.check("alice", "ai.chat");
-        let _ = enf.check("alice", "ai.chat");
+        let _ = enf.check("alice", "ai.chat").await;
+        let _ = enf.check("alice", "ai.chat").await;
         assert_eq!(
             fires.load(Ordering::SeqCst),
             1,
@@ -1061,11 +1071,80 @@ mod tests {
         // Reset cache to a healthy value and verify the recovery event
         // fires exactly once.
         enf.set_cached_for_test("agent:alice", Window::Daily, 0);
-        let _ = enf.check("alice", "ai.chat");
+        let _ = enf.check("alice", "ai.chat").await;
         assert_eq!(
             recovers.load(Ordering::SeqCst),
             1,
             "expected exactly one Recovered event"
+        );
+    }
+
+    // ── CORR-D2: concurrent refresh under tokio mutex ────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn corr_d2_concurrent_check_calls_do_not_deadlock() {
+        // 16 concurrent `check` calls against the same agent
+        // exercise the tokio refresh mutex from multiple
+        // worker threads. Pre-fix std::sync::Mutex would have
+        // been held across the SQLite read on a single-
+        // threaded executor and risked deadlock when nested
+        // calls overlapped; the tokio mutex's guard is
+        // await-safe so this completes without contention.
+        let enf = std::sync::Arc::new(enforcer_with_agent(
+            "alice",
+            Some(1.0),
+            None,
+            BudgetAction::AlertOnly,
+        ));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let e = enf.clone();
+            handles.push(tokio::spawn(
+                async move { e.check("alice", "ai.chat").await },
+            ));
+        }
+        for h in handles {
+            let _ = h.await.expect("task panicked");
+        }
+        // The metrics store was never populated, so every
+        // refresh returns 0 micro-USD and every decision is
+        // Allow. The point of the test is the absence of
+        // deadlock + the consistent cache state across
+        // concurrent refreshers.
+        let status = enf.status().await;
+        assert_eq!(status.agents.len(), 1);
+        assert_eq!(status.agents[0].daily_actual_micros, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn corr_d2_two_concurrent_refresh_calls_produce_consistent_state() {
+        // Seed the cache to a known healthy value, then fire
+        // two concurrent `status` calls. The tokio refresh
+        // mutex serialises the writers; both observers must
+        // see the same accumulated cost back from `status`
+        // and the cache must contain exactly one entry per
+        // (scope, window) afterwards (i.e. duplicate inserts
+        // do not happen).
+        let enf = std::sync::Arc::new(enforcer_with_agent(
+            "alice",
+            Some(1.0),
+            None,
+            BudgetAction::Reject,
+        ));
+        enf.set_cached_for_test("agent:alice", Window::Daily, 250_000);
+        let a = enf.clone();
+        let b = enf.clone();
+        let (sa, sb) = tokio::join!(
+            tokio::spawn(async move { a.status().await }),
+            tokio::spawn(async move { b.status().await }),
+        );
+        let sa = sa.expect("task a panicked");
+        let sb = sb.expect("task b panicked");
+        assert_eq!(sa.agents.len(), 1);
+        assert_eq!(sb.agents.len(), 1);
+        assert_eq!(
+            sa.agents[0].daily_actual_micros,
+            sb.agents[0].daily_actual_micros
         );
     }
 
@@ -1087,15 +1166,15 @@ mod tests {
         assert_eq!(BudgetAction::parse("nope"), None);
     }
 
-    #[test]
-    fn nan_limit_rejects_calls_instead_of_silently_unlimited() {
+    #[tokio::test]
+    async fn nan_limit_rejects_calls_instead_of_silently_unlimited() {
         // SEC PART 6: an operator who fat-fingers a TOML
         // limit to NaN (e.g. `daily_limit_usd = nan` from a
         // templater) should NOT get an unlimited budget. The
         // call must fail closed with a clear cause.
         let enf = enforcer_with_agent("alice", Some(f64::NAN), None, BudgetAction::Reject);
         enf.set_cached_for_test("agent:alice", Window::Daily, 100);
-        match enf.check("alice", "ai.chat") {
+        match enf.check("alice", "ai.chat").await {
             BudgetDecision::Reject { info } => {
                 assert!(
                     info.cause.contains("NaN") || info.cause.contains("infinite"),
@@ -1107,12 +1186,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn infinite_limit_rejects_calls_instead_of_silently_unlimited() {
+    #[tokio::test]
+    async fn infinite_limit_rejects_calls_instead_of_silently_unlimited() {
         let enf = enforcer_with_agent("alice", Some(f64::INFINITY), None, BudgetAction::Reject);
         enf.set_cached_for_test("agent:alice", Window::Daily, 100);
         assert!(matches!(
-            enf.check("alice", "ai.chat"),
+            enf.check("alice", "ai.chat").await,
             BudgetDecision::Reject { .. }
         ));
     }

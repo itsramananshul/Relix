@@ -37,7 +37,7 @@ fn register_status(bridge: &mut DispatchBridge, enforcer: Arc<BudgetEnforcer>) {
         Arc::new(FnHandler(move |_ctx: InvocationCtx| {
             let enforcer = enforcer.clone();
             async move {
-                let status = enforcer.status();
+                let status = enforcer.status().await;
                 match serde_json::to_vec(&status) {
                     Ok(b) => HandlerOutcome::Ok(b),
                     Err(e) => HandlerOutcome::Err(ErrorEnvelope {
@@ -158,11 +158,11 @@ mod tests {
         assert!(methods.contains(&"budget.reset"));
     }
 
-    #[test]
-    fn enforcer_status_is_serialisable_through_the_capability() {
+    #[tokio::test]
+    async fn enforcer_status_is_serialisable_through_the_capability() {
         let enf = fresh_enforcer();
         enf.set_cached_for_test("agent:alice", crate::metrics::BudgetWindow::Daily, 500_000);
-        let body = enf.status();
+        let body = enf.status().await;
         let bytes = serde_json::to_vec(&body).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let agents = parsed.get("agents").and_then(|v| v.as_array()).unwrap();

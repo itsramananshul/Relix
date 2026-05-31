@@ -1534,7 +1534,7 @@ impl DispatchBridge {
         // short-circuits with RESOURCE_EXHAUSTED. AlertOnly returns
         // Allow but fires a BudgetExceeded alert as a side effect.
         if let Some(enforcer) = self.budget_enforcer.as_ref() {
-            match enforcer.check(&verified.name, &req.method) {
+            match enforcer.check(&verified.name, &req.method).await {
                 crate::metrics::BudgetDecision::Allow => {}
                 crate::metrics::BudgetDecision::Throttle { delay, info } => {
                     tracing::warn!(
@@ -2355,7 +2355,7 @@ impl DispatchBridge {
 
         // === RELIX-7.28 Part 1: budget enforcement gate (streaming) ===
         if let Some(enforcer) = self.budget_enforcer.as_ref() {
-            match enforcer.check(&verified.name, &req.method) {
+            match enforcer.check(&verified.name, &req.method).await {
                 crate::metrics::BudgetDecision::Allow => {}
                 crate::metrics::BudgetDecision::Throttle { delay, info: _ } => {
                     tokio::time::sleep(delay).await;

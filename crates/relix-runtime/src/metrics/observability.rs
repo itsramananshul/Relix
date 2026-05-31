@@ -192,7 +192,8 @@ fn register_health_summary(
                     }
                 };
                 let hours = args.hours.unwrap_or(24).clamp(1, 24 * 90);
-                let summary = compute_health_summary(&query, &engine, enforcer.as_ref(), hours);
+                let summary =
+                    compute_health_summary(&query, &engine, enforcer.as_ref(), hours).await;
                 let summary = match summary {
                     Ok(s) => s,
                     Err(e) => {
@@ -237,7 +238,7 @@ fn severity_rank(s: AlertSeverity) -> u8 {
 
 /// Compute the per-agent score + deployment roll-up. Pulled out so unit
 /// tests can exercise the scorer without standing up the bridge.
-pub fn compute_health_summary(
+pub async fn compute_health_summary(
     query: &MetricsQuery,
     engine: &AlertEngine,
     enforcer: Option<&Arc<BudgetEnforcer>>,
@@ -245,7 +246,10 @@ pub fn compute_health_summary(
 ) -> Result<HealthSummary, super::query::MetricsQueryError> {
     let agents = query.list_agents(window_hours)?;
     let active = engine.active_alerts();
-    let budget_status = enforcer.map(|e| e.status());
+    let budget_status = match enforcer {
+        Some(e) => Some(e.status().await),
+        None => None,
+    };
     let mut rows = Vec::with_capacity(agents.len());
     let mut total_cost: u64 = 0;
     let mut total_invocations: u64 = 0;
@@ -472,19 +476,19 @@ mod tests {
         assert_eq!(s, 0);
     }
 
-    #[test]
-    fn compute_health_summary_handles_no_agents() {
+    #[tokio::test]
+    async fn compute_health_summary_handles_no_agents() {
         let store = MetricsStore::in_memory().unwrap();
         let q = MetricsQuery::new(store);
         let engine = AlertEngine::new(q.clone(), AlertThresholds::default());
-        let summary = compute_health_summary(&q, &engine, None, 24).unwrap();
+        let summary = compute_health_summary(&q, &engine, None, 24).await.unwrap();
         assert!(summary.agents.is_empty());
         assert_eq!(summary.deployment.total_invocations, 0);
         assert_eq!(summary.deployment.avg_health_score, 0);
     }
 
-    #[test]
-    fn compute_health_summary_returns_one_row_per_agent() {
+    #[tokio::test]
+    async fn compute_health_summary_returns_one_row_per_agent() {
         let store = MetricsStore::in_memory().unwrap();
         let now = crate::metrics::collector::now_ms();
         for _ in 0..20 {
@@ -502,7 +506,7 @@ mod tests {
         }
         let q = MetricsQuery::new(store);
         let engine = AlertEngine::new(q.clone(), AlertThresholds::default());
-        let summary = compute_health_summary(&q, &engine, None, 24).unwrap();
+        let summary = compute_health_summary(&q, &engine, None, 24).await.unwrap();
         assert_eq!(summary.agents.len(), 1);
         let row = &summary.agents[0];
         assert_eq!(row.agent, "alice");
