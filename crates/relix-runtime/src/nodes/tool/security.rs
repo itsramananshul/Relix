@@ -136,6 +136,339 @@ pub enum SsrfError {
     /// "you hit our blocklist").
     #[error("hostname '{host}' is on the operator blocklist")]
     HostBlocked { host: String },
+    /// SEC PART 6: hostname did NOT match any pattern in the
+    /// operator-supplied `[tool] url_allowlist`. Distinct from
+    /// `HostBlocked` so audit log differentiates the
+    /// "explicit deny" vs "not on the allow-list" verdicts.
+    #[error("hostname '{host}' is not on the url_allowlist")]
+    NotAllowlisted { host: String },
+}
+
+/// SEC PART 6: glob-based host allowlist. Patterns are matched
+/// against the LOWERCASED host portion of a URL. A `*` in a
+/// pattern matches any run of host-legal characters (including
+/// the `.` separator) — operators write `*.openai.com` and
+/// every subdomain matches. Exact strings without `*` match
+/// only the exact host.
+#[derive(Debug, Clone, Default)]
+pub struct UrlAllowlist {
+    patterns: std::sync::Arc<Vec<String>>,
+}
+
+impl UrlAllowlist {
+    pub fn new<I, S>(patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let entries: Vec<String> = patterns
+            .into_iter()
+            .filter_map(|p| {
+                let t = p.as_ref().trim().to_ascii_lowercase();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(strip_scheme_and_path(&t))
+                }
+            })
+            .collect();
+        Self {
+            patterns: std::sync::Arc::new(entries),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.patterns.len()
+    }
+
+    /// True when `host` matches any pattern (or the list is
+    /// empty — empty = "no allowlist configured" = allow). The
+    /// caller decides whether to enforce empty-as-allow or
+    /// empty-as-deny.
+    pub fn allows(&self, host: &str) -> bool {
+        if self.patterns.is_empty() {
+            return true;
+        }
+        let host_lc = host.to_ascii_lowercase();
+        self.patterns.iter().any(|p| glob_match(p, &host_lc))
+    }
+}
+
+/// Strip scheme / path components from an operator-supplied
+/// allowlist entry. `[tool] url_allowlist = ["https://*.openai.com/*"]`
+/// is normalised to `*.openai.com` so the per-request match
+/// only needs to look at the host.
+fn strip_scheme_and_path(raw: &str) -> String {
+    let after_scheme = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .unwrap_or(raw);
+    let host_only = after_scheme.split('/').next().unwrap_or(after_scheme);
+    host_only.to_string()
+}
+
+/// Minimal glob: `*` matches zero or more characters (including
+/// `.`); everything else is a literal byte-by-byte match. We
+/// don't need `?` or character classes for hostname patterns.
+fn glob_match(pattern: &str, host: &str) -> bool {
+    let pat = pattern.as_bytes();
+    let hay = host.as_bytes();
+    glob_match_inner(pat, hay)
+}
+
+fn glob_match_inner(pat: &[u8], hay: &[u8]) -> bool {
+    let mut pi = 0usize;
+    let mut hi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_hi = 0usize;
+    while hi < hay.len() {
+        if pi < pat.len() && pat[pi] == b'*' {
+            star_pi = Some(pi);
+            star_hi = hi;
+            pi += 1;
+        } else if pi < pat.len() && pat[pi] == hay[hi] {
+            pi += 1;
+            hi += 1;
+        } else if let Some(spi) = star_pi {
+            pi = spi + 1;
+            star_hi += 1;
+            hi = star_hi;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// SEC PART 6: DNS-resolution cache with TTL. The cache is
+/// consulted by every outbound HTTP call from a cloud-tier
+/// client so the per-request DNS hit happens at most once
+/// per 5 minutes per host (or per the operator-supplied TTL).
+///
+/// Caching DNS in a security check has a real tradeoff: a
+/// DNS-rebind attack within the TTL window goes undetected.
+/// We mitigate by: (a) keeping the TTL short (300s default),
+/// (b) re-resolving on cache miss synchronously (no stale
+/// extension on errors), and (c) tool-capability handlers
+/// continue to use the uncached `resolve_safe_url` so the
+/// most attacker-reachable surface stays unaffected.
+#[derive(Clone)]
+pub struct DnsCache {
+    inner: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, CachedResolution>>>,
+    ttl_secs: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedResolution {
+    ips: Vec<IpAddr>,
+    expires_at_ms: i64,
+}
+
+impl Default for DnsCache {
+    fn default() -> Self {
+        Self::new(300)
+    }
+}
+
+impl DnsCache {
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            ttl_secs,
+        }
+    }
+
+    /// Resolve `host` to one or more IPs. On cache hit returns
+    /// the pinned list; on miss runs a blocking system resolve
+    /// and stores the result with TTL.
+    pub fn resolve_blocking(&self, host: &str) -> Result<Vec<IpAddr>, SsrfError> {
+        let key = host.to_ascii_lowercase();
+        let now_ms = unix_ms();
+        if let Ok(g) = self.inner.read()
+            && let Some(entry) = g.get(&key)
+            && entry.expires_at_ms > now_ms
+        {
+            return Ok(entry.ips.clone());
+        }
+        let ips = resolve_host_blocking(&key)?;
+        if let Ok(mut g) = self.inner.write() {
+            g.insert(
+                key,
+                CachedResolution {
+                    ips: ips.clone(),
+                    expires_at_ms: now_ms + (self.ttl_secs as i64) * 1_000,
+                },
+            );
+        }
+        Ok(ips)
+    }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// SEC PART 6: cloud-tier SSRF check. Resolves the URL's host
+/// via the supplied [`DnsCache`] (5-min TTL by default), then
+/// rejects with `SsrfError::DnsForbidden` / `IpForbidden`
+/// when any resolved IP is in a private / link-local range.
+/// Skips the `url_allowlist` (cloud-tier callers — LlamaParse,
+/// Tavily, etc. — are exempt by design).
+///
+/// When `enabled == false` returns Ok immediately — the
+/// operator opted out via `[tool] ssrf_protection = false`.
+/// SEC PART 6: process-global SSRF state. Controller startup
+/// installs the toggle + the DnsCache once; the cloud-tier
+/// HTTP client wrappers call [`check_ssrf_cloud_tier_global`]
+/// before each request so the per-provider structs don't have
+/// to thread DnsCache through their constructors.
+static SSRF_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static DNS_CACHE: std::sync::OnceLock<DnsCache> = std::sync::OnceLock::new();
+static URL_ALLOWLIST: std::sync::OnceLock<UrlAllowlist> = std::sync::OnceLock::new();
+
+/// Wire the process-global SSRF state. Called once by the
+/// tool-node startup with the `[tool] ssrf_protection` flag,
+/// the configured `url_allowlist`, and the DNS-cache TTL
+/// (5min default per the spec).
+pub fn install_ssrf_state(enabled: bool, allowlist: UrlAllowlist, dns_ttl_secs: u64) {
+    SSRF_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    let _ = DNS_CACHE.set(DnsCache::new(dns_ttl_secs));
+    let _ = URL_ALLOWLIST.set(allowlist);
+    if !enabled {
+        tracing::warn!(
+            "SSRF protection DISABLED at the tool-node — every outbound HTTP \
+             from a tool capability / cloud-tier client will skip the \
+             private-IP block. Set `[tool] ssrf_protection = true` for production."
+        );
+    }
+}
+
+/// Process-global cloud-tier SSRF check used by the AI tool
+/// HTTP clients (Tavily / Brave / Perplexity / LlamaParse /
+/// Jina / Firecrawl). The state is installed once at boot via
+/// [`install_ssrf_state`]; first call after a fresh process
+/// or a test that didn't install state defaults to
+/// `ssrf_protection = true` + a 300s DNS cache.
+pub fn check_ssrf_cloud_tier_global(raw_url: &str) -> Result<(), SsrfError> {
+    let enabled = SSRF_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let cache = DNS_CACHE.get_or_init(DnsCache::default);
+    check_ssrf_cloud_tier(raw_url, enabled, cache)
+}
+
+/// Process-global tool-capability SSRF check used by
+/// `tool.web_*` / `tool.browser.*`. Same state-install path as
+/// [`check_ssrf_cloud_tier_global`]; additionally enforces the
+/// `[tool] url_allowlist`.
+pub fn check_ssrf_tool_capability_global(raw_url: &str) -> Result<(), SsrfError> {
+    let enabled = SSRF_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let cache = DNS_CACHE.get_or_init(DnsCache::default);
+    let allowlist = URL_ALLOWLIST.get_or_init(UrlAllowlist::default);
+    check_ssrf_tool_capability(raw_url, enabled, cache, allowlist)
+}
+
+/// SEC PART 6: enforce the process-global URL allowlist on a
+/// raw URL. Returns Ok when the allowlist is empty (not
+/// configured) OR the host matches. Tool capability handlers
+/// call this at the top of `resolve_safe_url*`; cloud-tier
+/// callers explicitly bypass via the dedicated entry points.
+fn enforce_global_allowlist(raw_url: &str) -> Result<(), SsrfError> {
+    let allowlist = URL_ALLOWLIST.get_or_init(UrlAllowlist::default);
+    if allowlist.is_empty() {
+        return Ok(());
+    }
+    let url = Url::parse(raw_url).map_err(|e| SsrfError::BadUrl(e.to_string()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| SsrfError::NoHost(raw_url.to_string()))?
+        .to_ascii_lowercase();
+    if !allowlist.allows(&host) {
+        return Err(SsrfError::NotAllowlisted { host });
+    }
+    Ok(())
+}
+
+pub fn check_ssrf_cloud_tier(
+    raw_url: &str,
+    enabled: bool,
+    dns_cache: &DnsCache,
+) -> Result<(), SsrfError> {
+    if !enabled {
+        return Ok(());
+    }
+    let url = Url::parse(raw_url).map_err(|e| SsrfError::BadUrl(e.to_string()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| SsrfError::NoHost(raw_url.to_string()))?
+        .to_ascii_lowercase();
+    if let Some(ip) = parse_literal_ip(&host) {
+        if let Some(reason) = forbidden_ip_reason(ip) {
+            return Err(SsrfError::IpForbidden { ip, reason });
+        }
+        return Ok(());
+    }
+    if let Some(reason) = forbidden_hostname_reason(&host) {
+        return Err(SsrfError::HostnameDenied {
+            host,
+            reason,
+        });
+    }
+    let ips = dns_cache.resolve_blocking(&host)?;
+    if ips.is_empty() {
+        return Err(SsrfError::DnsEmpty { host });
+    }
+    for ip in &ips {
+        if let Some(reason) = forbidden_ip_reason(*ip) {
+            return Err(SsrfError::DnsForbidden {
+                host,
+                ip: *ip,
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// SEC PART 6: tool-capability SSRF + allowlist check. Used by
+/// `tool.web_read` / `tool.web_get` / `tool.web_fetch` /
+/// `tool.browser.*` BEFORE every outbound HTTP. Enforces the
+/// allowlist (cloud-tier skip) on top of the SSRF private-IP
+/// block.
+pub fn check_ssrf_tool_capability(
+    raw_url: &str,
+    enabled: bool,
+    dns_cache: &DnsCache,
+    allowlist: &UrlAllowlist,
+) -> Result<(), SsrfError> {
+    if !enabled {
+        // SSRF check disabled — allowlist still applies when
+        // configured because the operator may want host
+        // restriction even without the private-IP block.
+    } else {
+        check_ssrf_cloud_tier(raw_url, true, dns_cache)?;
+    }
+    if !allowlist.is_empty() {
+        let url = Url::parse(raw_url).map_err(|e| SsrfError::BadUrl(e.to_string()))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| SsrfError::NoHost(raw_url.to_string()))?
+            .to_ascii_lowercase();
+        if !allowlist.allows(&host) {
+            return Err(SsrfError::NotAllowlisted { host });
+        }
+    }
+    Ok(())
 }
 
 /// PH-WEB-BLOCKLIST: operator-curated host blocklist. Cheap-clone
@@ -210,6 +543,11 @@ pub async fn resolve_safe_url(
     allow_http: bool,
     blocklist: &HostBlocklist,
 ) -> Result<SafeUrl, SsrfError> {
+    // SEC PART 6: enforce the process-global tool-capability
+    // URL allowlist (when configured). Cloud-tier callers
+    // skip this branch by calling
+    // `check_ssrf_cloud_tier_global` directly.
+    enforce_global_allowlist(raw)?;
     let (url, lower_host) = match validate_url_pre_dns(raw, allow_http, blocklist)? {
         ValidatedHost::LiteralIp { url, ip } => {
             return Ok(SafeUrl {
@@ -239,6 +577,8 @@ pub fn resolve_safe_url_blocking(
     allow_http: bool,
     blocklist: &HostBlocklist,
 ) -> Result<SafeUrl, SsrfError> {
+    // SEC PART 6: see `resolve_safe_url`.
+    enforce_global_allowlist(raw)?;
     let (url, lower_host) = match validate_url_pre_dns(raw, allow_http, blocklist)? {
         ValidatedHost::LiteralIp { url, ip } => {
             return Ok(SafeUrl {
@@ -842,5 +1182,95 @@ mod tests {
         let e = resolve_safe_url_blocking("https://evil.example.com/", false, &bl)
             .expect_err("blocking path must reject");
         assert!(matches!(e, SsrfError::HostBlocked { .. }), "got {e:?}");
+    }
+
+    // ── SEC PART 6: glob allowlist + DNS cache + SSRF check ──
+
+    #[test]
+    fn url_allowlist_glob_matches_subdomains() {
+        let al = UrlAllowlist::new(["*.openai.com", "api.anthropic.com"]);
+        assert!(al.allows("api.openai.com"));
+        assert!(al.allows("any.subdomain.openai.com"));
+        assert!(al.allows("api.anthropic.com"));
+        assert!(!al.allows("openai.com.evil.com"));
+        assert!(!al.allows("api.gemini.com"));
+        assert!(!al.allows("api.anthropic.com.evil.com"));
+    }
+
+    #[test]
+    fn url_allowlist_strips_scheme_and_path_from_operator_input() {
+        let al = UrlAllowlist::new(["https://*.openai.com/v1/*"]);
+        // The operator wrote a full URL; we normalise to host
+        // pattern for matching.
+        assert!(al.allows("api.openai.com"));
+        assert!(al.allows("foo.bar.openai.com"));
+    }
+
+    #[test]
+    fn url_allowlist_empty_means_no_restriction() {
+        let al = UrlAllowlist::default();
+        assert!(al.is_empty());
+        assert!(al.allows("anything.example"));
+    }
+
+    #[test]
+    fn cloud_tier_ssrf_blocks_loopback_literal() {
+        let cache = DnsCache::new(60);
+        let e = check_ssrf_cloud_tier("https://127.0.0.1/x", true, &cache).unwrap_err();
+        assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
+    }
+
+    #[test]
+    fn cloud_tier_ssrf_blocks_aws_metadata_literal() {
+        let cache = DnsCache::new(60);
+        let e = check_ssrf_cloud_tier("https://169.254.169.254/latest/", true, &cache).unwrap_err();
+        assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
+    }
+
+    #[test]
+    fn cloud_tier_ssrf_passes_when_disabled() {
+        // SSRF disabled at the operator's request: even a
+        // loopback literal passes through.
+        let cache = DnsCache::new(60);
+        check_ssrf_cloud_tier("https://127.0.0.1/", false, &cache)
+            .expect("disabled-protection must skip the IP block");
+    }
+
+    #[test]
+    fn dns_cache_returns_cached_resolution_on_hit() {
+        // Drive the cache with the known-good `localhost`
+        // resolution. Two calls; the second hits the cache —
+        // we verify the second call returns IPs without
+        // re-running the resolver (which the test can't
+        // distinguish externally, so we settle for "both
+        // succeed AND return the same answer").
+        let cache = DnsCache::new(60);
+        let first = cache.resolve_blocking("localhost").unwrap();
+        let second = cache.resolve_blocking("localhost").unwrap();
+        assert_eq!(first, second, "cached resolution must be identical");
+        assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn check_ssrf_tool_capability_blocks_loopback() {
+        let cache = DnsCache::new(60);
+        let allowlist = UrlAllowlist::default();
+        let e = check_ssrf_tool_capability("https://127.0.0.1/", true, &cache, &allowlist)
+            .unwrap_err();
+        assert!(matches!(e, SsrfError::IpForbidden { .. }), "got {e:?}");
+    }
+
+    #[test]
+    fn check_ssrf_tool_capability_allowlist_blocks_unlisted_host() {
+        let cache = DnsCache::new(60);
+        let allowlist = UrlAllowlist::new(["*.openai.com"]);
+        let e = check_ssrf_tool_capability(
+            "https://api.anthropic.com/v1/messages",
+            true,
+            &cache,
+            &allowlist,
+        )
+        .unwrap_err();
+        assert!(matches!(e, SsrfError::NotAllowlisted { .. }), "got {e:?}");
     }
 }

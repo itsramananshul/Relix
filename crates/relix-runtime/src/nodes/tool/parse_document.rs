@@ -556,8 +556,12 @@ async fn try_llama_parse(
         .mime_str("application/pdf")
         .map_err(|e| ParseError::Http(format!("multipart mime: {e}")))?;
     let form = multipart::Form::new().part("file", part);
+    let upload_url = "https://api.cloud.llamaindex.ai/api/parsing/upload";
+    // SEC PART 6: cloud-tier SSRF check.
+    super::security::check_ssrf_cloud_tier_global(upload_url)
+        .map_err(|e| ParseError::Http(format!("llamaparse ssrf: {e}")))?;
     let resp = client
-        .post("https://api.cloud.llamaindex.ai/api/parsing/upload")
+        .post(upload_url)
         .bearer_auth(api_key)
         .multipart(form)
         .send()
@@ -593,6 +597,9 @@ async fn try_llama_parse(
         if now >= deadline {
             return Err(ParseError::Timeout(timeout.as_secs()));
         }
+        // SEC PART 6 — re-check on each poll (DNS-cached).
+        super::security::check_ssrf_cloud_tier_global(&result_url)
+            .map_err(|e| ParseError::Http(format!("llamaparse poll ssrf: {e}")))?;
         let resp = client
             .get(&result_url)
             .bearer_auth(api_key)
@@ -638,6 +645,9 @@ async fn try_jina_reader(
         .build()
         .map_err(|e| ParseError::Http(e.to_string()))?;
     let endpoint = format!("https://r.jina.ai/{url}");
+    // SEC PART 6.
+    super::security::check_ssrf_cloud_tier_global(&endpoint)
+        .map_err(|e| ParseError::Http(format!("jina ssrf: {e}")))?;
     let resp = client
         .get(&endpoint)
         .bearer_auth(api_key)
@@ -668,8 +678,12 @@ async fn try_firecrawl(api_key: &str, url: &str, timeout: Duration) -> Result<St
         .build()
         .map_err(|e| ParseError::Http(e.to_string()))?;
     let payload = serde_json::json!({ "url": url, "formats": ["markdown"] });
+    let firecrawl_url = "https://api.firecrawl.dev/v1/scrape";
+    // SEC PART 6.
+    super::security::check_ssrf_cloud_tier_global(firecrawl_url)
+        .map_err(|e| ParseError::Http(format!("firecrawl ssrf: {e}")))?;
     let resp = client
-        .post("https://api.firecrawl.dev/v1/scrape")
+        .post(firecrawl_url)
         .bearer_auth(api_key)
         .json(&payload)
         .send()

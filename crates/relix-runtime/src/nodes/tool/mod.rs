@@ -181,6 +181,33 @@ pub struct ToolConfig {
     /// doc for the curl recipe.
     #[serde(default)]
     pub blocked_hosts: Vec<String>,
+    /// SEC PART 6: glob host patterns that the tool capability
+    /// handlers (`tool.web_read` / `tool.web_get` /
+    /// `tool.web_fetch` / `tool.browser.*`) are allowed to
+    /// reach. Empty (the default) means NO allowlist filter —
+    /// only the hardcoded SSRF private-range checks fire.
+    /// Cloud-tier HTTP clients (LlamaParse / Jina / Firecrawl /
+    /// Tavily / Brave / Perplexity) are EXEMPT from the
+    /// allowlist — they still get the SSRF private-IP check.
+    /// Each pattern is matched against the lowercased host
+    /// portion of the URL with glob semantics (`*` matches any
+    /// run of host-legal chars, including dots).
+    #[serde(default)]
+    pub url_allowlist: Vec<String>,
+    /// SEC PART 6: master switch for the SSRF private-IP
+    /// blocking. Defaults to `true` (fail-closed). When set
+    /// `false` the controller startup logs a WARNING + every
+    /// outbound HTTP call from a tool capability handler /
+    /// cloud tier client skips the private-IP block (the URL
+    /// allowlist still fires when configured). Intended for
+    /// development against a local model server — production
+    /// MUST leave this `true`.
+    #[serde(default = "default_ssrf_protection")]
+    pub ssrf_protection: bool,
+}
+
+fn default_ssrf_protection() -> bool {
+    true
 }
 
 impl Default for ToolConfig {
@@ -201,6 +228,8 @@ impl Default for ToolConfig {
             web_read: None,
             screen: None,
             blocked_hosts: Vec::new(),
+            url_allowlist: Vec::new(),
+            ssrf_protection: default_ssrf_protection(),
         }
     }
 }

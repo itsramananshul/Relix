@@ -9571,6 +9571,17 @@ fn register_node_type_handlers(
                 .map_err(|e: toml::de::Error| format!("[tool] parse: {e}"))?,
             None => crate::nodes::tool::ToolConfig::default(),
         };
+        // SEC PART 6: install the process-global SSRF state so
+        // every cloud-tier HTTP client (Tavily/Brave/Perplexity/
+        // LlamaParse/Jina/Firecrawl) + every tool capability
+        // handler (web_read/web_get/web_fetch/browser.*) calls
+        // through the same check. `ssrf_protection = false`
+        // logs a startup warning per the spec.
+        crate::nodes::tool::security::install_ssrf_state(
+            tool_cfg.ssrf_protection,
+            crate::nodes::tool::security::UrlAllowlist::new(tool_cfg.url_allowlist.iter()),
+            300,
+        );
         let backend = std::sync::Arc::new(crate::nodes::tool::ToolBackend::new(tool_cfg.clone())?);
         // W3: operator channel for tool.ask_human. Allocated as
         // an empty OnceCell; future controller-side wiring

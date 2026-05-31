@@ -273,8 +273,12 @@ impl WebSearchProvider for TavilyProvider {
             "max_results": n,
             "search_depth": "advanced",
         });
+        let url = "https://api.tavily.com/search";
+        // SEC PART 6: cloud-tier SSRF check (DNS-cached 5 min).
+        super::security::check_ssrf_cloud_tier_global(url)
+            .map_err(|e| SearchError::Http(format!("tavily ssrf: {e}")))?;
         let resp = client
-            .post("https://api.tavily.com/search")
+            .post(url)
             .json(&body)
             .send()
             .await
@@ -359,8 +363,12 @@ impl WebSearchProvider for BraveProvider {
     ) -> Result<Vec<SearchResult>, SearchError> {
         let client = http_client()?;
         let n = clamp_max_results(max_results);
+        let url = "https://api.search.brave.com/res/v1/web/search";
+        // SEC PART 6.
+        super::security::check_ssrf_cloud_tier_global(url)
+            .map_err(|e| SearchError::Http(format!("brave ssrf: {e}")))?;
         let resp = client
-            .get("https://api.search.brave.com/res/v1/web/search")
+            .get(url)
             .query(&[("q", query.to_string()), ("count", n.to_string())])
             .header("X-Subscription-Token", self.api_key.as_str())
             .header("Accept", "application/json")
@@ -457,8 +465,12 @@ impl WebSearchProvider for PerplexityProvider {
                 { "role": "user", "content": content }
             ]
         });
+        let url = "https://api.perplexity.ai/chat/completions";
+        // SEC PART 6.
+        super::security::check_ssrf_cloud_tier_global(url)
+            .map_err(|e| SearchError::Http(format!("perplexity ssrf: {e}")))?;
         let resp = client
-            .post("https://api.perplexity.ai/chat/completions")
+            .post(url)
             .bearer_auth(self.api_key.as_str())
             .json(&body)
             .send()
