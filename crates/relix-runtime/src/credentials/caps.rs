@@ -165,18 +165,28 @@ fn handle_get(store: &CredentialStore, ctx: &InvocationCtx) -> HandlerOutcome {
             retry_after: None,
         });
     };
+    // GATE 2 — fail closed on ownership. Reaching this handler
+    // means the dispatch policy gate already admitted the caller
+    // for `credentials.get`; this is the additional per-secret
+    // ownership scope. Only the credential's named owner may
+    // read it. A credential with NO owner is DENIED by default
+    // (an unscoped secret is not a free-for-all), and there is
+    // deliberately NO hard-coded "operators"/"admin" group
+    // bypass — any elevated cross-owner access must be granted
+    // by explicit policy on a distinct capability, never by a
+    // string literal in this code path.
     let caller = &ctx.caller.name;
     let is_owner = summary.owner_agent.as_deref() == Some(caller.as_str());
-    let is_operator = ctx
-        .caller
-        .groups
-        .iter()
-        .any(|g| g == "operators" || g == "admin");
-    if !(is_owner || is_operator || summary.owner_agent.is_none()) {
+    if !is_owner {
+        let owner_desc = match summary.owner_agent.as_deref() {
+            Some(o) => format!("owned by `{o}`"),
+            None => "unscoped (no owner)".to_string(),
+        };
         return HandlerOutcome::Err(ErrorEnvelope {
             kind: error_kinds::SECURITY_DENIED,
             cause: format!(
-                "credentials: caller `{caller}` is not the owner of `{}`",
+                "credentials: caller `{caller}` is not the owner of `{}` ({owner_desc}); \
+                 access denied",
                 args.name
             ),
             retry_hint: 0,
@@ -330,4 +340,98 @@ fn internal(msg: &str) -> HandlerOutcome {
         retry_hint: 0,
         retry_after: None,
     })
+}
+
+#[cfg(test)]
+mod gate2_ownership_failclosed_tests {
+    use super::*;
+    use relix_core::identity::VerifiedIdentity;
+    use relix_core::types::{NodeId, RequestId, TraceId};
+
+    fn ctx_for(caller_name: &str, groups: Vec<String>, name: &str) -> InvocationCtx {
+        let args = serde_json::to_vec(&serde_json::json!({ "name": name })).unwrap();
+        InvocationCtx {
+            caller: VerifiedIdentity {
+                subject_id: NodeId::from_pubkey(caller_name.as_bytes()),
+                name: caller_name.to_string(),
+                org_id: NodeId::from_pubkey(b"org"),
+                groups,
+                role: String::new(),
+                clearance: String::new(),
+                bundle_id: [0; 32],
+            },
+            trace_id: TraceId::new(),
+            request_id: RequestId([0; 16]),
+            args,
+            tenant_id: None,
+        }
+    }
+
+    fn is_security_denied(outcome: &HandlerOutcome) -> bool {
+        matches!(
+            outcome,
+            HandlerOutcome::Err(e) if e.kind == error_kinds::SECURITY_DENIED
+        )
+    }
+
+    #[test]
+    fn no_owner_credential_is_denied_even_for_operators_and_admin_groups() {
+        // GATE 2: an unscoped (no-owner) credential must DENY by
+        // default. The old code allowed it for everyone via
+        // `summary.owner_agent.is_none()`, and additionally let
+        // anyone in the "operators"/"admin" groups through via a
+        // string-literal bypass. Both are gone.
+        let store = CredentialStore::open_in_memory("test-master-secret").unwrap();
+        store
+            .store(
+                "shared-key",
+                "s3cr3t",
+                CredentialKind::Secret,
+                None, // NO owner
+                None,
+                None,
+                Some("seed"),
+            )
+            .unwrap();
+
+        // Caller is in BOTH legacy-bypass groups — must STILL be denied.
+        let ctx = ctx_for("bob", vec!["operators".into(), "admin".into()], "shared-key");
+        let outcome = handle_get(&store, &ctx);
+        assert!(
+            is_security_denied(&outcome),
+            "no-owner credential must be denied by default, even for operators/admin groups"
+        );
+    }
+
+    #[test]
+    fn owned_credential_denied_to_non_owner_and_allowed_to_owner() {
+        // The fix must not break the gate the other way: the
+        // legitimate owner can still read, a non-owner cannot.
+        let store = CredentialStore::open_in_memory("test-master-secret").unwrap();
+        store
+            .store(
+                "alice-key",
+                "v",
+                CredentialKind::Secret,
+                Some("alice"),
+                None,
+                None,
+                Some("seed"),
+            )
+            .unwrap();
+
+        // Non-owner (even in operators group) → denied.
+        let bob = ctx_for("bob", vec!["operators".into()], "alice-key");
+        assert!(
+            is_security_denied(&handle_get(&store, &bob)),
+            "a non-owner must be denied"
+        );
+
+        // Owner → allowed.
+        let alice = ctx_for("alice", vec![], "alice-key");
+        assert!(
+            matches!(handle_get(&store, &alice), HandlerOutcome::Ok(_)),
+            "the owner must be able to read their own credential"
+        );
+    }
 }

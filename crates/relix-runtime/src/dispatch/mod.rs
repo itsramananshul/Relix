@@ -779,6 +779,16 @@ impl DispatchBridge {
         self.verify_on_dispatch_enabled
     }
 
+    /// GATE 1: whether a session verification service is
+    /// actually wired. The controller boot path consults this
+    /// to FAIL CLOSED when `verify_on_dispatch = true` was
+    /// requested but no service could be constructed — the gate
+    /// must never silently admit unverified calls because the
+    /// service is absent.
+    pub fn session_service_wired(&self) -> bool {
+        self.session_service.is_some()
+    }
+
     /// GAP 15 partial: set the global "always require approval"
     /// method allowlist. Pass a list of method names that
     /// should ALWAYS require operator approval, regardless of
@@ -1359,9 +1369,27 @@ impl DispatchBridge {
         // method. The flag exists purely so existing
         // deployments stay byte-identical until operators flip
         // it; when off this step is a no-op.
-        if self.verify_on_dispatch_enabled
-            && let Some(svc) = self.session_service.as_ref()
-        {
+        if self.verify_on_dispatch_enabled {
+            // GATE 1 (defense in depth): the verify-on-dispatch
+            // gate is ON. If no session service is wired we FAIL
+            // CLOSED rather than short-circuiting past the check
+            // and admitting an unverified call. The controller
+            // already refuses to boot in this state (see
+            // `session_verification_boot_gate`); this guards
+            // against any runtime divergence so the gate can
+            // never silently fail open.
+            let Some(svc) = self.session_service.as_ref() else {
+                return self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        "session_service_unavailable".to_string(),
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+            };
             let Some(token_wire) = req.session_token.as_deref() else {
                 return self
                     .audit_and_err_with_id(
@@ -2318,9 +2346,27 @@ impl DispatchBridge {
         };
 
         // === Admission step 6: session-token verification (P5) ===
-        if self.verify_on_dispatch_enabled
-            && let Some(svc) = self.session_service.as_ref()
-        {
+        if self.verify_on_dispatch_enabled {
+            // GATE 1 (defense in depth): same fail-closed rule as
+            // the unary path — gate ON but no session service
+            // wired means DENY, never admit unverified.
+            let Some(svc) = self.session_service.as_ref() else {
+                let cause = "session_service_unavailable".to_string();
+                let _ = writer
+                    .write_err(error_kinds::SECURITY_DENIED, cause.clone())
+                    .await;
+                let _ = self
+                    .audit_and_err_with_id(
+                        &req,
+                        &verified,
+                        started_at,
+                        cause,
+                        error_kinds::SECURITY_DENIED,
+                        AuditStatus::Denied,
+                    )
+                    .await;
+                return;
+            };
             let Some(token_wire) = req.session_token.as_deref() else {
                 let cause = "session_token_missing".to_string();
                 let _ = writer

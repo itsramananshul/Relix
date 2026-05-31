@@ -7470,6 +7470,41 @@ fn register_node_type_handlers(
                 }
             }
         }
+        // GATE 1 — FAIL CLOSED. If the operator asked for
+        // `verify_on_dispatch = true` but the session
+        // verification service did not wire up (section absent,
+        // `enabled = false`, signing key missing/short, or store
+        // / service init failed), refuse to boot with a specific
+        // diagnostic rather than silently admitting every call
+        // unverified. `verify_on_dispatch` is read from config
+        // directly so this fires even when `enabled = false`
+        // (which skips the wiring block entirely).
+        {
+            let session_sub = cfg
+                .session_identity
+                .as_ref()
+                .and_then(|s| s.session.as_ref());
+            let verify_requested = session_sub.map(|sc| sc.verify_on_dispatch).unwrap_or(false);
+            let enabled = session_sub.map(|sc| sc.enabled).unwrap_or(false);
+            let section_present = session_sub.is_some();
+            let (signing_key_env, signing_key_len) = match session_sub {
+                Some(sc) => (
+                    sc.signing_key_env.clone(),
+                    std::env::var(&sc.signing_key_env)
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                ),
+                None => (String::new(), 0),
+            };
+            session_verification_boot_gate(
+                verify_requested,
+                bridge.session_service_wired(),
+                section_present,
+                enabled,
+                &signing_key_env,
+                signing_key_len,
+            )?;
+        }
         // RELIX-7.18 / GAP 17 PART 2: research-backed identity
         // pipeline. Wired when `[session_identity.research]
         // enabled = true` AND `[ai]` is present AND a search
@@ -10064,5 +10099,117 @@ mod confidence_wiring_tests {
         vm.set_last_confidence_cell(bundle.cell.clone());
         bundle.cell.set(0.73);
         assert!((vm.last_confidence() - 0.73).abs() < 1e-6);
+    }
+}
+
+/// GATE 1 fail-closed decision for `verify_on_dispatch`.
+///
+/// Given whether the operator requested `verify_on_dispatch` and
+/// whether the session verification service actually wired up,
+/// decide whether boot may proceed. Returns `Err(diagnostic)`
+/// when the gate was requested but cannot be enforced — the
+/// caller (controller boot) propagates the error and REFUSES TO
+/// BOOT rather than admitting capability calls unverified.
+///
+/// Behaviour is unchanged when `verify_on_dispatch` is false:
+/// the function returns `Ok(())` regardless of service state.
+///
+/// Factored out of the boot path so the decision is unit-
+/// testable without standing up the whole controller.
+fn session_verification_boot_gate(
+    verify_requested: bool,
+    service_wired: bool,
+    section_present: bool,
+    enabled: bool,
+    signing_key_env: &str,
+    signing_key_len: usize,
+) -> Result<(), String> {
+    // Gate not requested, or it IS requested and the service is
+    // wired: nothing to fail closed on.
+    if !verify_requested || service_wired {
+        return Ok(());
+    }
+    // Requested but unenforceable — build a specific diagnostic
+    // telling the operator exactly what is missing.
+    let reason = if !section_present {
+        "the [identity.session] config section is absent".to_string()
+    } else if !enabled {
+        "[identity.session] enabled = false — set it to true".to_string()
+    } else if signing_key_len < 32 {
+        format!(
+            "the signing key env var `{signing_key_env}` is {signing_key_len} bytes; \
+             at least 32 are required"
+        )
+    } else {
+        "the session token store could not be opened or the service failed to construct \
+         (see the WARN logs above)"
+            .to_string()
+    };
+    Err(format!(
+        "SECURITY: [identity.session] verify_on_dispatch = true but the session \
+         verification service is not available, so capability calls would be admitted \
+         WITHOUT session-token verification. Refusing to boot. Cause: {reason}."
+    ))
+}
+
+#[cfg(test)]
+mod gate1_boot_failclosed_tests {
+    use super::session_verification_boot_gate;
+
+    #[test]
+    fn fails_closed_when_verify_requested_but_section_absent() {
+        let err = session_verification_boot_gate(true, false, false, false, "", 0)
+            .expect_err("must refuse to boot");
+        assert!(err.contains("Refusing to boot"), "err: {err}");
+        assert!(err.contains("config section is absent"), "err: {err}");
+    }
+
+    #[test]
+    fn fails_closed_when_verify_requested_but_session_disabled() {
+        let err = session_verification_boot_gate(
+            true,
+            false,
+            true,
+            false,
+            "RELIX_SESSION_SIGNING_KEY",
+            64,
+        )
+        .expect_err("must refuse to boot");
+        assert!(err.contains("enabled = false"), "err: {err}");
+    }
+
+    #[test]
+    fn fails_closed_when_verify_requested_but_key_too_short() {
+        let err = session_verification_boot_gate(
+            true,
+            false,
+            true,
+            true,
+            "RELIX_SESSION_SIGNING_KEY",
+            12,
+        )
+        .expect_err("must refuse to boot");
+        // The diagnostic must name the env var AND the length.
+        assert!(err.contains("RELIX_SESSION_SIGNING_KEY"), "err: {err}");
+        assert!(err.contains("12 bytes"), "err: {err}");
+        assert!(err.contains("at least 32"), "err: {err}");
+    }
+
+    #[test]
+    fn boots_when_verify_requested_and_service_wired() {
+        // The fix must NOT break the gate the other way: when the
+        // service IS wired, boot proceeds.
+        assert!(
+            session_verification_boot_gate(true, true, true, true, "RELIX_SESSION_SIGNING_KEY", 64)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn boots_unchanged_when_verify_not_requested() {
+        // verify_on_dispatch = false → behaviour unchanged
+        // regardless of whether a service is wired.
+        assert!(session_verification_boot_gate(false, false, false, false, "", 0).is_ok());
+        assert!(session_verification_boot_gate(false, true, true, true, "X", 64).is_ok());
     }
 }
