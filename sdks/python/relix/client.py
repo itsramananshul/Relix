@@ -35,6 +35,8 @@ from .exceptions import (
 )
 
 if TYPE_CHECKING:
+    from .credentials import CredentialsAPI
+    from .identity import IdentityAPI
     from .memory import MemoryAPI
     from .observability import ObservabilityAPI
     from .planning import PlanningAPI
@@ -350,6 +352,8 @@ class RelixClient:
         self._planning: PlanningAPI | None = None
         self._skills: SkillsAPI | None = None
         self._observability: ObservabilityAPI | None = None
+        self._credentials: CredentialsAPI | None = None
+        self._identity: IdentityAPI | None = None
 
     # ---- properties ----------------------------------------------------
 
@@ -398,6 +402,24 @@ class RelixClient:
         if self._observability is None:
             self._observability = ObservabilityAPI(self)
         return self._observability
+
+    @property
+    def credentials(self) -> CredentialsAPI:
+        """Credentials sub-API (``client.credentials.store`` / ``list`` / ``rotate`` / ``revoke`` / ``audit``)."""
+        from .credentials import CredentialsAPI
+
+        if self._credentials is None:
+            self._credentials = CredentialsAPI(self)
+        return self._credentials
+
+    @property
+    def identity(self) -> IdentityAPI:
+        """Identity sub-API (``client.identity.research``)."""
+        from .identity import IdentityAPI
+
+        if self._identity is None:
+            self._identity = IdentityAPI(self)
+        return self._identity
 
     # ---- httpx client management --------------------------------------
 

@@ -334,3 +334,110 @@ export interface ObservabilityAlertHistoryInput {
   agent?: string;
   peer?: string;
 }
+
+// ---------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------
+
+export interface CredentialsStoreInput {
+  name: string;
+  value: string;
+  kind?: string;
+  owner?: string;
+  /** Absolute expiry, unix ms. */
+  expiresAt?: number;
+  rotationIntervalSecs?: number;
+}
+
+export interface CredentialsListInput {
+  owner?: string;
+}
+
+export interface CredentialsRotateInput {
+  name: string;
+  newValue: string;
+}
+
+export interface CredentialMetadata {
+  name: string;
+  kind?: string;
+  owner?: string;
+  createdAtMs?: number;
+  expiresAtMs?: number;
+  rotationIntervalSecs?: number;
+  lastRotatedAtMs?: number;
+  revoked: boolean;
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface CredentialAuditEntry {
+  name: string;
+  action: string;
+  actor?: string;
+  timestampMs?: number;
+  reason?: string;
+  [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------
+
+export interface IdentityResearchInput {
+  subjectName: string;
+  context?: string;
+  peer?: string;
+}
+
+export interface IdentityProfile {
+  displayName?: string;
+  professionalRole?: string;
+  organization?: string;
+  location?: string;
+  expertiseAreas: string[];
+  publicProfiles: Record<string, unknown>[];
+  notableWork: string[];
+  confidence: number;
+  sourcesUsed: string[];
+  synthesisNotes: string;
+  [key: string]: unknown;
+}
+
+export interface ResearchResult {
+  subjectName: string;
+  profile: IdentityProfile;
+  queriesGenerated: string[];
+  resultsConsulted: number;
+  providerUsed: string;
+  approvalId?: string;
+  approvalVerdict?: string;
+  memoryRecordId?: string;
+  approved: boolean;
+  [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------------
+// ApiResult — PART 5 discriminated union
+// ---------------------------------------------------------------------
+
+/**
+ * Discriminated union returned by every single-response SDK method.
+ *
+ * Consumers narrow on the `ok` boolean:
+ * ```ts
+ * const r = await client.chat({ sessionId: "u", message: "hi" });
+ * if (r.ok) {
+ *   console.log(r.data.text);
+ * } else {
+ *   console.error(r.error.message);
+ * }
+ * ```
+ *
+ * Streaming methods (`chatStream`) keep returning
+ * `AsyncIterable<StreamChunk>` directly — the discriminated union is
+ * orthogonal to multi-value protocols.
+ */
+export type ApiResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: RelixError };

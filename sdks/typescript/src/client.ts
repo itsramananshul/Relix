@@ -10,6 +10,8 @@
 
 import { createParser, type EventSourceMessage } from "eventsource-parser";
 
+import { CredentialsAPI } from "./credentials";
+import { IdentityAPI } from "./identity";
 import { MemoryAPI } from "./memory";
 import { ObservabilityAPI } from "./observability";
 import { PlanningAPI } from "./planning";
@@ -318,6 +320,8 @@ export class RelixClient {
   public readonly planning: PlanningAPI;
   public readonly skills: SkillsAPI;
   public readonly observability: ObservabilityAPI;
+  public readonly credentials: CredentialsAPI;
+  public readonly identity: IdentityAPI;
 
   constructor(options: RelixClientOptions = {}) {
     this.bridgeUrl = (options.bridgeUrl ?? DEFAULT_BRIDGE_URL).replace(/\/+$/, "");
@@ -336,6 +340,8 @@ export class RelixClient {
     this.planning = new PlanningAPI(this);
     this.skills = new SkillsAPI(this);
     this.observability = new ObservabilityAPI(this);
+    this.credentials = new CredentialsAPI(this);
+    this.identity = new IdentityAPI(this);
   }
 
   /** `POST /chat`. */

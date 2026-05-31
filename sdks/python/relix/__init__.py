@@ -21,7 +21,13 @@ from .client import (
     ChatResponse,
     ChatUsage,
     RelixClient,
+    SSEParser,
     StreamChunk,
+)
+from .credentials import (
+    CredentialAuditEntry,
+    CredentialMetadata,
+    CredentialsAPI,
 )
 from .exceptions import (
     RelixAuthError,
@@ -29,6 +35,11 @@ from .exceptions import (
     RelixError,
     RelixResponseError,
     RelixTimeoutError,
+)
+from .identity import (
+    IdentityAPI,
+    IdentityProfile,
+    ResearchResult,
 )
 from .memory import (
     DialecticAnswer,
@@ -55,9 +66,14 @@ __all__ = [
     "Alert",
     "ChatResponse",
     "ChatUsage",
+    "CredentialAuditEntry",
+    "CredentialMetadata",
+    "CredentialsAPI",
     "DialecticAnswer",
     "FlushContextResult",
     "HealthSummary",
+    "IdentityAPI",
+    "IdentityProfile",
     "IngestDocumentResult",
     "MemoryResult",
     "PlanResult",
@@ -67,6 +83,8 @@ __all__ = [
     "RelixError",
     "RelixResponseError",
     "RelixTimeoutError",
+    "ResearchResult",
+    "SSEParser",
     "Skill",
     "SkillStats",
     "StreamChunk",

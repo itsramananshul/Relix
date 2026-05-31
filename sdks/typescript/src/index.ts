@@ -6,6 +6,8 @@
  */
 
 export { RelixClient } from "./client";
+export { CredentialsAPI } from "./credentials";
+export { IdentityAPI } from "./identity";
 export { MemoryAPI } from "./memory";
 export { ObservabilityAPI } from "./observability";
 export { PlanningAPI } from "./planning";
@@ -23,12 +25,20 @@ export type {
   AgentDescriptor,
   AgentHealth,
   Alert,
+  ApiResult,
   ChatInput,
   ChatResponse,
   ChatUsage,
+  CredentialAuditEntry,
+  CredentialMetadata,
+  CredentialsListInput,
+  CredentialsRotateInput,
+  CredentialsStoreInput,
   DialecticAnswer,
   FlushContextResult,
   HealthSummary,
+  IdentityProfile,
+  IdentityResearchInput,
   IngestDocumentResult,
   MemoryDialecticInput,
   MemoryFlushContextInput,
@@ -40,6 +50,7 @@ export type {
   PlanResult,
   PlanningPlanInput,
   RelixClientOptions,
+  ResearchResult,
   Skill,
   SkillStats,
   SkillsSearchInput,
