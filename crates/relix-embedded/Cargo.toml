@@ -14,8 +14,13 @@ unsafe_code = "forbid"
 missing_docs = "warn"
 
 [dependencies]
-relix-core = { path = "../relix-core" }
-relix-runtime = { path = "../relix-runtime" }
+# Workspace path deps carry an explicit version pin so cargo-deny
+# (which treats `path = ".."` without a `version` as a wildcard
+# dependency) doesn't flag them as `[wildcard]`. The other workspace
+# members already use the `version = "0.1.0"` pin via the workspace
+# `[workspace.dependencies]` block — these two were missed.
+relix-core = { path = "../relix-core", version = "0.1.0" }
+relix-runtime = { path = "../relix-runtime", version = "0.1.0" }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }

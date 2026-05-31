@@ -1,52 +1,114 @@
 # cargo-deny configuration. Enforced in CI per CONTRIBUTING.md.
 # See https://embarkstudios.github.io/cargo-deny/
+#
+# PART 7 — the spec's baseline policies (allow MIT / Apache-2.0 /
+# BSD-2-Clause / BSD-3-Clause / ISC, deny GPL family, ban openssl,
+# require known sources) are layered ON TOP of the existing allow
+# list so the current libp2p / reqwest / lettre dep graph keeps
+# building. Every additional licence we allow has a justification
+# entry below (or in docs/security-critical-deps.md) — adding a
+# new licence requires PR review.
 
 [graph]
 all-features = false
 
 [licenses]
-# Allowed only — explicit list. Adding a new license requires PR review + an
-# entry in docs/security-critical-deps.md or docs/dependency-licenses.md
-# explaining why the project accepts it.
+# Allowed only — explicit list. PART 7 baseline merged with the
+# entries the current tree requires today.
 allow = [
-    "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
+    # PART 7 baseline
     "MIT",
+    "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    # Required by today's tree:
+    # `Apache-2.0 WITH LLVM-exception` — used by several llvm /
+    # wasmtime adjacent crates and rustc-internal helpers; covered
+    # by upstream LLVM's Apache 2.0 LLVM exception.
+    "Apache-2.0 WITH LLVM-exception",
+    # `Unicode-3.0` — SPDX's current identifier for the Unicode
+    # Data License (the old `Unicode-DFS-2016` spelling was
+    # superseded in 2024). Used by `unicode-ident` ≥ 1.0.13 and
+    # ICU-style transitive deps.
     "Unicode-3.0",
+    # `Zlib` — short permissive licence used by a couple of small
+    # crates (e.g. some tinyvec / foldhash variants).
     "Zlib",
+    # `CC0-1.0` — public-domain dedication. Used by a couple of
+    # small data-only crates pulled in transitively.
     "CC0-1.0",
-    # Community Data License Agreement (permissive). Enters the tree via
-    # `webpki-roots` (via `reqwest` → `hyper-rustls`). Compatible with the
-    # project's Apache-2.0 license and reviewed for distribution implications.
-    # Document chain in docs/security-critical-deps.md.
+    # `CDLA-Permissive-2.0` — Community Data License Agreement
+    # (permissive). Enters the tree via `webpki-roots` (reqwest →
+    # hyper-rustls). Compatible with Apache-2.0 distribution.
     "CDLA-Permissive-2.0",
+    # `0BSD` — BSD Zero Clause. Used by `quoted_printable` via
+    # `lettre`. Functionally identical to public-domain.
+    "0BSD",
 ]
 confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
 wildcards         = "deny"
-deny = []
+
+# PART 7 — explicit crate ban list. Anything added here fails CI on
+# the next deny check.
+[[bans.deny]]
+name = "openssl"
+# rustls is the project standard (reqwest is built with rustls-tls
+# in workspace deps; libp2p uses noise). A direct dep on `openssl`
+# would re-introduce the OpenSSL ABI footprint and force operators
+# to ship libssl at runtime. Block the crate at the workspace
+# boundary so a future PR can't sneak it in unnoticed.
+#
+# `wrappers = ["native-tls"]` carves out exactly one path: the IMAP
+# transport (async-imap → async-native-tls → native-tls → openssl).
+# async-imap 0.11 does not yet have a stable rustls binding; once
+# upstream ships one we remove the wrapper and the ban becomes
+# absolute. Documented in docs/security-critical-deps.md.
+reason = "Use rustls instead — Relix is rustls-only by policy."
+wrappers = ["native-tls"]
 
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-yanked  = "warn"
-# Advisory-by-advisory exceptions. Every entry has a matching record in
-# docs/security-advisories.md with rationale + review condition. No silent
-# suppressions.
+# PART 7 baseline: yanked crates are a hard fail (the publish was
+# explicitly retracted), unmaintained crates are scoped to the whole
+# graph so operators get informational warnings on any unmaintained
+# transitive crate (cargo-deny 0.16+ split the old "warn / deny"
+# severity knob into a scope selector — "warn" became
+# `unmaintained = "all"` plus the absence of an `unmaintained-error`
+# severity-bump, so unmaintained findings surface as warnings the
+# nightly job picks up without failing the per-PR gate).
+yanked       = "deny"
+unmaintained = "all"
+
+# Advisory-by-advisory exceptions. Every entry has a matching record
+# in docs/security-advisories.md with rationale + review condition.
+# No silent suppressions. PART 2's hard-gate on advisories means
+# every ignore here is reviewed twice — once when added, again on
+# every CI run.
 ignore = [
-    # Transitive via libp2p → libp2p-dns → hickory-resolver → hickory-proto.
-    # Alpha M5 demo uses static multiaddrs; no DNS lookups exercised.
-    # Review when libp2p ships a fix-bearing release.
+    # Transitive via libp2p → libp2p-dns → hickory-resolver →
+    # hickory-proto. Alpha M5 demo uses static multiaddrs; no DNS
+    # lookups exercised. Review when libp2p ships a fix-bearing
+    # release.
     "RUSTSEC-2026-0119",
-    # `paste` unmaintained; transitive via libp2p-tcp → if-watch → netlink chain.
-    # Macro-only crate; no runtime security impact.
+    # `paste` unmaintained; transitive via libp2p-tcp → if-watch →
+    # netlink chain. Macro-only crate; no runtime security impact.
     # Review when if-watch migrates off `paste`.
     "RUSTSEC-2024-0436",
+    # `rsa` RUSTSEC-2023-0071 (Marvin Attack / timing sidechannel).
+    # Transitive via `lettre` → `rsa` for DKIM-RSA-SHA256 signing.
+    # Upstream has no safe upgrade available. Relix uses DKIM only
+    # for outbound mail signing on operator-controlled hosts where
+    # an attacker cannot observe RSA decrypt timing; the attack
+    # surface this advisory describes (RSA decrypt on attacker-
+    # influenced input) is not exercised by the DKIM signing path.
+    # Review when upstream `rsa` ships a constant-time
+    # implementation.
+    "RUSTSEC-2023-0071",
 ]
 
 [sources]
