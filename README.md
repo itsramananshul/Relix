@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/itsramananshul/Relix/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/itsramananshul/Relix/ci.yml?branch=main&style=for-the-badge" alt="CI"></a>
   <a href="https://github.com/itsramananshul/Relix/releases"><img src="https://img.shields.io/github/v/release/itsramananshul/Relix?include_prereleases&style=for-the-badge" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="MIT License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg?style=for-the-badge" alt="MIT OR Apache-2.0"></a>
 </p>
 
 ---
@@ -265,4 +265,14 @@ changes.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Licensed under either of [MIT](LICENSE) or [Apache License,
+Version 2.0](LICENSE-APACHE) at your option. The Cargo manifest
+declares `license = "MIT OR Apache-2.0"` on every crate so the
+SPDX dual-license shape that the rest of the Rust ecosystem
+expects (`license-file` consumers, downstream packagers,
+crates.io publish) sees a consistent answer.
+
+Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in the work by you, as
+defined in the Apache-2.0 license, shall be dual licensed as
+above, without any additional terms or conditions.

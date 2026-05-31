@@ -16,7 +16,7 @@ version     = "0.1.0"
 description = "Smallest possible Relix plugin — Python stdlib only."
 author      = "Relix examples"
 homepage    = ""
-license     = "Apache-2.0"
+license     = "MIT OR Apache-2.0"
 
 [[plugin.capabilities.provides]]
 method            = "hello.greet"

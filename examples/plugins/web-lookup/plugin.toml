@@ -16,7 +16,7 @@ version     = "0.1.0"
 description = "Fetch a URL and return the first 500 chars of its body."
 author      = "Relix examples"
 homepage    = ""
-license     = "Apache-2.0"
+license     = "MIT OR Apache-2.0"
 
 [[plugin.capabilities.provides]]
 method            = "web_lookup.fetch"
