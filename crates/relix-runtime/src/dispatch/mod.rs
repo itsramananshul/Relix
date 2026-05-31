@@ -1354,10 +1354,13 @@ impl DispatchBridge {
         // broker is wired or no policy matches the caller, the
         // check returns Allow and the dispatch proceeds.
         if let Some(broker) = self.access_broker.as_ref() {
-            match broker.check(&verified.name, &req.method) {
-                crate::nodes::execution::broker::AccessDecision::Allow => {
-                    broker.record_call(&verified.name);
-                }
+            // CORR PART 3: atomic check + record under one
+            // broker lock. Pre-fix `check()` then
+            // `record_call()` released the lock between the
+            // two calls, letting two concurrent callers both
+            // observe headroom under the rate limit.
+            match broker.atomic_check_and_record(&verified.name, &req.method) {
+                crate::nodes::execution::broker::AccessDecision::Allow => {}
                 crate::nodes::execution::broker::AccessDecision::Deny { reason } => {
                     self.bump_stats(&req.method, StatBucket::Denied, now);
                     self.policy_denials.push(PolicyDenialEntry {
@@ -2165,11 +2168,11 @@ impl DispatchBridge {
         }
 
         // === Per-agent access broker ===
+        // CORR PART 3: atomic check + record under one broker
+        // lock — same race fix as the unary path.
         if let Some(broker) = self.access_broker.as_ref() {
-            match broker.check(&verified.name, &req.method) {
-                crate::nodes::execution::broker::AccessDecision::Allow => {
-                    broker.record_call(&verified.name);
-                }
+            match broker.atomic_check_and_record(&verified.name, &req.method) {
+                crate::nodes::execution::broker::AccessDecision::Allow => {}
                 crate::nodes::execution::broker::AccessDecision::Deny { reason } => {
                     self.bump_stats(&req.method, StatBucket::Denied, now);
                     self.policy_denials.push(PolicyDenialEntry {

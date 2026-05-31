@@ -1004,6 +1004,47 @@ fn panic_no_identity() -> Bundle {
     panic!("DiscoveryOptions::default has no identity; build it explicitly");
 }
 
+/// CORR PART 3: claim the next ephemeral libp2p port via an
+/// `AtomicU16` compare-and-swap so two concurrent
+/// `discover_and_pin` calls inside the same process can never
+/// pick the same port. The pre-fix path called
+/// `rand::random::<u16>()` independently in each caller; with
+/// two callers active at the same instant (e.g. the bridge
+/// starting alongside a flow-inspect helper) the random draw
+/// could collide and the second listener's `bind` would race
+/// the first.
+///
+/// The counter starts at the bottom of the ephemeral range
+/// the previous code used (30_000) and wraps to the same
+/// floor after 5_000 entries so a long-lived process keeps
+/// claiming inside the operator-expected range. The CAS loop
+/// is unconditional progress — the worst case is one CAS
+/// failure per concurrent caller.
+fn claim_next_ephemeral_port() -> u16 {
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(30_000);
+    const FLOOR: u16 = 30_000;
+    const SPAN: u16 = 5_000;
+    loop {
+        let cur = NEXT_PORT.load(std::sync::atomic::Ordering::Relaxed);
+        let next = if !(FLOOR..FLOOR + SPAN - 1).contains(&cur) {
+            FLOOR
+        } else {
+            cur + 1
+        };
+        if NEXT_PORT
+            .compare_exchange(
+                cur,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return cur.max(FLOOR);
+        }
+    }
+}
+
 /// Dial every peer in `opts.peers`, call `node.manifest` against each, and
 /// populate a fresh [`ManifestCache`]. Peers that never reply within the
 /// overall budget are simply absent from the cache — the caller decides
@@ -1030,9 +1071,7 @@ pub async fn discover_and_pin(opts: DiscoveryOptions) -> Option<(ManifestCache, 
     if opts.peers.peers.is_empty() {
         // Build a no-peer client so the bridge still has a usable libp2p
         // instance for future discovery refreshes / lazy dials.
-        let local_port = opts
-            .local_port
-            .unwrap_or_else(|| 30_000 + (rand::random::<u16>() % 5_000));
+        let local_port = opts.local_port.unwrap_or_else(claim_next_ephemeral_port);
         let (client, _events, event_loop) = rpc::new(*opts.client_key, local_port).await.ok()?;
         drop(tokio::spawn(event_loop.run()));
         return Some((

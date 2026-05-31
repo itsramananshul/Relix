@@ -47,6 +47,18 @@ pub struct AccessPolicy {
     pub max_cost_cents_per_hour: u32,
 }
 
+/// CORR PART 3: append a call timestamp inside an already-
+/// locked map, trimming entries outside the 60-second window
+/// so the per-agent vec doesn't grow forever. Free function so
+/// [`AgentAccessBroker::atomic_check_and_record`] can call it
+/// while it already owns the lock.
+fn record_call_locked(counts: &mut HashMap<String, Vec<i64>>, agent: &str, now: i64) {
+    let entry = counts.entry(agent.to_string()).or_default();
+    entry.push(now);
+    let cutoff = now - 60;
+    entry.retain(|ts| *ts >= cutoff);
+}
+
 fn default_calls_per_minute() -> u32 {
     60
 }
@@ -133,13 +145,79 @@ impl AgentAccessBroker {
     /// strict semaphore).
     pub fn record_call(&self, agent: &str) {
         let now = unix_secs();
-        let mut counts = self.call_counts.lock().unwrap();
-        let entry = counts.entry(agent.to_string()).or_default();
-        entry.push(now);
-        // Trim entries older than the 60-second window so
-        // the per-agent vec doesn't grow forever.
-        let cutoff = now - 60;
-        entry.retain(|ts| *ts >= cutoff);
+        let mut counts = self.call_counts.lock().unwrap_or_else(|e| {
+            tracing::warn!("agent access broker counts poisoned; recovering inner state");
+            e.into_inner()
+        });
+        record_call_locked(&mut counts, agent, now);
+    }
+
+    /// CORR PART 3: atomic check + record under a single lock.
+    /// Pre-fix path called `check()` (took + released the lock)
+    /// then `record_call()` (took + released the lock again),
+    /// which let two callers both observe headroom and both
+    /// burn through it concurrently. The atomic variant takes
+    /// the lock once: the rate-limit check reads the live
+    /// counts, and on `Allow` it appends a record before
+    /// releasing the lock — so a concurrent caller observing
+    /// the same instant sees the bumped count and is correctly
+    /// throttled.
+    pub fn atomic_check_and_record(&self, agent: &str, capability: &str) -> AccessDecision {
+        let policy = match self.policies.get(agent) {
+            Some(p) => p,
+            None => {
+                // Unknown agent still goes through the record
+                // step so the operator's `/v1/agents/access`
+                // dashboard counts background traffic too.
+                let now = unix_secs();
+                let mut counts = self.call_counts.lock().unwrap_or_else(|e| {
+                    tracing::warn!("agent access broker counts poisoned; recovering inner state");
+                    e.into_inner()
+                });
+                record_call_locked(&mut counts, agent, now);
+                return AccessDecision::Allow;
+            }
+        };
+        if policy.denied_capabilities.iter().any(|c| c == capability) {
+            return AccessDecision::Deny {
+                reason: format!("agent '{agent}' denied capability '{capability}' by deny list"),
+            };
+        }
+        if !policy.allowed_capabilities.is_empty()
+            && !policy.allowed_capabilities.iter().any(|c| c == capability)
+        {
+            return AccessDecision::Deny {
+                reason: format!("agent '{agent}' has an allow list and '{capability}' isn't on it"),
+            };
+        }
+        let now = unix_secs();
+        let mut counts = self.call_counts.lock().unwrap_or_else(|e| {
+            tracing::warn!("agent access broker counts poisoned; recovering inner state");
+            e.into_inner()
+        });
+        // Inline rate-limit check against the same locked map
+        // so a second caller racing this one observes the
+        // bumped record below.
+        if policy.max_calls_per_minute > 0 {
+            let cutoff = now - 60;
+            if let Some(entry) = counts.get(agent) {
+                let recent = entry.iter().filter(|t| **t >= cutoff).count() as u32;
+                if recent >= policy.max_calls_per_minute {
+                    let oldest = entry
+                        .iter()
+                        .filter(|t| **t >= cutoff)
+                        .min()
+                        .copied()
+                        .unwrap_or(now);
+                    let retry = (oldest + 60 - now).max(1) as u64;
+                    return AccessDecision::RateLimited {
+                        retry_after_secs: retry,
+                    };
+                }
+            }
+        }
+        record_call_locked(&mut counts, agent, now);
+        AccessDecision::Allow
     }
 
     /// Returns `Some(seconds_until_retry)` when the agent
@@ -150,7 +228,10 @@ impl AgentAccessBroker {
         if max_per_minute == 0 {
             return None;
         }
-        let counts = self.call_counts.lock().unwrap();
+        let counts = self.call_counts.lock().unwrap_or_else(|e| {
+            tracing::warn!("agent access broker counts poisoned; recovering inner state");
+            e.into_inner()
+        });
         let entry = counts.get(agent)?;
         let now = unix_secs();
         let cutoff = now - 60;
@@ -348,5 +429,46 @@ mod tests {
         let b = AgentAccessBroker::empty();
         assert_eq!(b.check("anyone", "anything"), AccessDecision::Allow);
         assert!(b.snapshot().is_empty());
+    }
+
+    // ── CORR PART 3: atomic check + record ─────────────────
+
+    #[test]
+    fn corr_p3_atomic_check_and_record_serialises_rate_limit() {
+        // Pre-fix: check() then record_call() across two
+        // calls let two concurrent callers both observe one
+        // remaining token, both record, and exceed the cap.
+        // Post-fix: atomic_check_and_record holds the lock
+        // for the whole transaction so the second caller
+        // observes the first's record before its own check.
+        let b = AgentAccessBroker::new(vec![AccessPolicy {
+            agent: "x".to_string(),
+            allowed_capabilities: vec![],
+            denied_capabilities: vec![],
+            max_calls_per_minute: 1,
+            max_cost_cents_per_hour: 0,
+        }]);
+        assert_eq!(
+            b.atomic_check_and_record("x", "ai.chat"),
+            AccessDecision::Allow
+        );
+        // Second call must be rate-limited, not Allow.
+        match b.atomic_check_and_record("x", "ai.chat") {
+            AccessDecision::RateLimited { .. } => {}
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corr_p3_atomic_check_and_record_unknown_agent_still_allows() {
+        // Unknown agents pass through (no policy), same as
+        // the legacy `check`, but the atomic form still
+        // appends a counter row so dashboards see the
+        // traffic.
+        let b = AgentAccessBroker::empty();
+        assert_eq!(
+            b.atomic_check_and_record("anon", "tool.web_fetch"),
+            AccessDecision::Allow
+        );
     }
 }

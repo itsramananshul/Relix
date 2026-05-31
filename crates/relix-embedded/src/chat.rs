@@ -102,9 +102,19 @@ pub struct ChatResponse {
 /// Per-session conversation history. Bounded ring; thread-safe via a
 /// `Mutex` because cheap clones of `RelixEmbedded` share one
 /// `HistoryStore`.
+///
+/// CORR PART 3: `turn_seq` is a monotonic per-instance counter
+/// used by [`turn_id`] to disambiguate turns. Pre-fix `turn_id`
+/// salted with wall-clock nanos, which can go backwards across
+/// NTP corrections AND repeats within a single nanosecond on
+/// platforms with coarse-resolution clocks, producing colliding
+/// memory ids. The atomic counter is strictly monotonic for the
+/// life of the HistoryStore (which is the life of the
+/// `RelixEmbedded` clone) so two turns can never share an id.
 #[derive(Default)]
 pub(crate) struct HistoryStore {
     sessions: Mutex<HashMap<String, VecDeque<String>>>,
+    turn_seq: std::sync::atomic::AtomicU64,
 }
 
 impl HistoryStore {
@@ -144,6 +154,16 @@ impl HistoryStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         g.get(session_id).map_or(0, VecDeque::len)
+    }
+
+    /// CORR PART 3: monotonic per-instance counter used by
+    /// [`turn_id`] to disambiguate two turns recorded inside
+    /// the same wall-clock nanosecond or across an NTP
+    /// correction. `SeqCst` keeps the order strict across
+    /// concurrent appends from different threads.
+    pub(crate) fn next_turn_seq(&self) -> u64 {
+        self.turn_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -262,7 +282,15 @@ fn persist_turn(
     line: &str,
     tenant_id: Option<&str>,
 ) -> Result<(), EmbeddedError> {
-    let id = turn_id(session_id, line);
+    // CORR PART 3: salt the id with the HistoryStore's
+    // monotonic counter so two turns in the same wall-clock
+    // nanosecond cannot collide. Pre-fix path used
+    // `SystemTime::now()` only, which is non-monotonic across
+    // NTP corrections AND can repeat under coarse-resolution
+    // clocks (Windows historically minted the same nanos value
+    // for back-to-back calls).
+    let seq = runtime.history_store_ref().next_turn_seq();
+    let id = turn_id(session_id, line, seq);
     let mut record = MemoryRecord::new_raw(id, line, session_id);
     record.layer = MemoryLayer::Raw;
     // PART 6: stamp the resolved tenant so tenant-aware
@@ -275,17 +303,18 @@ fn persist_turn(
     Ok(())
 }
 
-fn turn_id(session: &str, body: &str) -> String {
+fn turn_id(session: &str, body: &str, seq: u64) -> String {
     let mut h = blake3::Hasher::new();
     h.update(session.as_bytes());
     h.update(b"|");
     h.update(body.as_bytes());
     h.update(b"|");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    h.update(&nanos.to_le_bytes());
+    // CORR PART 3: salt with the HistoryStore's monotonic
+    // counter (caller-provided) instead of wall-clock nanos.
+    // Strictly monotonic for the life of the HistoryStore;
+    // unaffected by NTP corrections or platform clock
+    // resolution.
+    h.update(&seq.to_le_bytes());
     let hex = h.finalize().to_hex();
     format!("raw-{}", &hex.as_str()[..16])
 }

@@ -163,6 +163,16 @@ pub enum ApprovalError {
          the stored spec has been tampered with: {cause}"
     )]
     SpecTampered { plan_id: String, cause: String },
+
+    /// CORR PART 3: returned when [`ApprovalStore::decide`] loses
+    /// the race against another concurrent decision on the same
+    /// plan. Distinct from [`Self::NotPending`] (which is a stale
+    /// read AFTER the transaction observed a non-pending row) —
+    /// `AlreadyDecided` fires when the transaction's `UPDATE …
+    /// WHERE status = 'pending'` affected zero rows, meaning a
+    /// concurrent decide / expire took the row first.
+    #[error("approval store: plan `{0}` was already decided by a concurrent caller")]
+    AlreadyDecided(String),
 }
 
 /// Cheap-to-clone SQLite-backed approval store.
@@ -423,11 +433,15 @@ impl ApprovalStore {
         note: Option<&str>,
         decided_at_ms: i64,
     ) -> Result<ApprovalRecord, ApprovalError> {
-        let conn = self.lock();
-        // Single transaction: read-check-write so two
-        // concurrent operator calls can't both flip the same
-        // row.
-        let existing_status: Option<String> = conn
+        let mut conn = self.lock();
+        // CORR PART 3: BEGIN IMMEDIATE wraps the read-check-
+        // write so two concurrent decide calls on the same
+        // plan serialise. The UPDATE's `WHERE status = 'pending'`
+        // is load-bearing: when zero rows are affected, the
+        // transaction lost the race and we return AlreadyDecided
+        // instead of falsely reporting success.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing_status: Option<String> = tx
             .query_row(
                 "SELECT status FROM plan_approvals WHERE id = ?1",
                 params![plan_id],
@@ -448,12 +462,18 @@ impl ApprovalStore {
                 status: current,
             });
         }
-        conn.execute(
+        let affected = tx.execute(
             "UPDATE plan_approvals \
              SET status = ?1, decided_at_ms = ?2, decision_note = ?3 \
              WHERE id = ?4 AND status = 'pending'",
             params![new_status.as_str(), decided_at_ms, note, plan_id],
         )?;
+        if affected == 0 {
+            // Lost the race; another decide / expire flipped
+            // the row between our read and our UPDATE.
+            return Err(ApprovalError::AlreadyDecided(plan_id.to_string()));
+        }
+        tx.commit()?;
         drop(conn);
         // PART 9: best-effort decision mirror. Re-entry into
         // the generic store is bounded by the
@@ -478,23 +498,33 @@ impl ApprovalStore {
         cutoff_ms: i64,
         decided_at_ms: i64,
     ) -> Result<Vec<ApprovalRecord>, ApprovalError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, spec_json, workflow_yaml, status, created_at_ms, decided_at_ms, \
-                    decision_note, orchestrator_meta, critic_meta \
-             FROM plan_approvals \
-             WHERE status = 'pending' AND created_at_ms < ?1",
-        )?;
-        let candidates: Vec<ApprovalRecord> = stmt
-            .query_map(params![cutoff_ms], row_to_record)?
-            .collect::<Result<Result<Vec<_>, _>, _>>()
-            .map_err(ApprovalError::Sqlite)??;
-        drop(stmt);
+        let mut conn = self.lock();
+        // CORR PART 3: wrap the entire scan-and-update loop in
+        // one `BEGIN IMMEDIATE` transaction so a concurrent
+        // operator decide can't slip in between our SELECT and
+        // the per-row UPDATEs. Pre-fix path took the SQLite
+        // statement-level lock per row, which let a race like
+        // (operator decides A; expire sees A pending; expire
+        // tries to expire A) corrupt the row's decision_note
+        // semantics. The `status = 'pending'` clause is still
+        // load-bearing inside the transaction — when affected
+        // rows == 0 the row was flipped under us by another
+        // path (shouldn't happen inside this tx, but defensive).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let candidates: Vec<ApprovalRecord> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, spec_json, workflow_yaml, status, created_at_ms, decided_at_ms, \
+                        decision_note, orchestrator_meta, critic_meta \
+                 FROM plan_approvals \
+                 WHERE status = 'pending' AND created_at_ms < ?1",
+            )?;
+            stmt.query_map(params![cutoff_ms], row_to_record)?
+                .collect::<Result<Result<Vec<_>, _>, _>>()
+                .map_err(ApprovalError::Sqlite)??
+        };
         let mut expired = Vec::with_capacity(candidates.len());
         for c in candidates {
-            // Best-effort UPDATE — the `status = pending`
-            // clause guards against a concurrent decide().
-            let rows = conn.execute(
+            let rows = tx.execute(
                 "UPDATE plan_approvals \
                  SET status = 'expired', decided_at_ms = ?1, decision_note = ?2 \
                  WHERE id = ?3 AND status = 'pending'",
@@ -519,6 +549,7 @@ impl ApprovalStore {
                 expired.push(updated);
             }
         }
+        tx.commit()?;
         Ok(expired)
     }
 
@@ -772,6 +803,49 @@ mod tests {
         // Newer record is untouched.
         let new_record = store.get("new").unwrap().unwrap();
         assert_eq!(new_record.status, ApprovalStatus::Pending);
+    }
+
+    // ── CORR PART 3: race on decide() ────────────────────
+
+    #[test]
+    fn corr_p3_concurrent_decide_only_one_succeeds() {
+        // Open a file-backed store so two threads contend on
+        // the same SQLite file. The `BEGIN IMMEDIATE` taken
+        // by `decide` serialises them.
+        use std::sync::Arc;
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("approval.db");
+        let store = ApprovalStore::open(&p).unwrap();
+        store
+            .insert_pending(&fixture_record("race-1", ApprovalStatus::Pending, 100))
+            .unwrap();
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let r1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r1c = r1.clone();
+        let r2c = r2.clone();
+        let t1 = std::thread::spawn(move || {
+            let res = s1.decide("race-1", ApprovalStatus::Approved, Some("one"), 200);
+            if res.is_ok() {
+                r1c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            res
+        });
+        let t2 = std::thread::spawn(move || {
+            let res = s2.decide("race-1", ApprovalStatus::Rejected, Some("two"), 201);
+            if res.is_ok() {
+                r2c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            res
+        });
+        let r1r = t1.join().unwrap();
+        let r2r = t2.join().unwrap();
+        // Exactly one OK; the other returns NotPending or
+        // AlreadyDecided (both are acceptable loser shapes).
+        let oks = r1.load(std::sync::atomic::Ordering::SeqCst)
+            + r2.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(oks, 1, "exactly one decide must succeed: {r1r:?} / {r2r:?}");
     }
 
     #[test]

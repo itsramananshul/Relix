@@ -265,6 +265,13 @@ struct BudgetInner {
     /// recovery event when it drops back. Without this, every throttled
     /// call would refire the alert.
     active: Mutex<HashMap<CacheKey, ActiveAlert>>,
+    /// CORR PART 3: per-enforcer refresh serialisation. Two
+    /// callers that both miss the cache contend on this mutex
+    /// so only one of them re-queries SQLite; the loser
+    /// double-checks the cache after acquiring the lock and
+    /// reads the freshly-cached value instead of issuing a
+    /// duplicate query.
+    refresh_mutex: Mutex<()>,
 }
 
 /// `(scope, window)` cache + active-alert key. `scope = "agent:<name>"`
@@ -291,6 +298,7 @@ impl BudgetEnforcer {
                 cache: Mutex::new(HashMap::new()),
                 sink: RwLock::new(None),
                 active: Mutex::new(HashMap::new()),
+                refresh_mutex: Mutex::new(()),
             }),
         }
     }
@@ -641,13 +649,15 @@ impl BudgetEnforcer {
         let key = (scope_key.clone(), window);
         let now = now_ms();
         let (window_start, window_end) = window.window_bounds_ms();
-        // Fast path — fresh cache, same window.
         // SEC PART 6: `as_millis()` returns u128. Saturate to
         // i64::MAX via try_from so an operator-configured
         // `Duration::MAX` cache_refresh doesn't wrap to a
         // negative value and short-circuit the freshness check.
         let cache_refresh_ms =
             i64::try_from(self.inner.cache_refresh.as_millis()).unwrap_or(i64::MAX);
+        // Fast path — fresh cache, same window. Drop the lock
+        // immediately so the slow path takes the refresh mutex
+        // without holding the cache lock across SQLite I/O.
         if let Ok(g) = self.inner.cache.lock()
             && let Some(entry) = g.get(&key)
             && entry.window_start_ms == window_start
@@ -655,7 +665,31 @@ impl BudgetEnforcer {
         {
             return *entry;
         }
-        // Slow path — re-query the store.
+        // CORR PART 3: serialise the refresh path through a
+        // per-enforcer mutex. Two callers that both miss the
+        // cache contend on this lock; the loser then re-checks
+        // the cache after acquiring it (a refresh may have
+        // landed under it) and only re-queries SQLite when the
+        // cache is still stale. Eliminates duplicate-work +
+        // duplicate-insert races on every miss while keeping
+        // the function synchronous (the callers are sync; a
+        // tokio::sync::Mutex would force async). A std Mutex
+        // gated specifically to the refresh path matches the
+        // user's intent of "one in-flight refresh per
+        // enforcer".
+        let _refresh_guard = self.inner.refresh_mutex.lock().unwrap_or_else(|e| {
+            tracing::warn!("budget refresh mutex poisoned; recovering inner state");
+            e.into_inner()
+        });
+        // Double-checked: another caller may have raced ahead
+        // of us and landed a fresh entry while we were waiting.
+        if let Ok(g) = self.inner.cache.lock()
+            && let Some(entry) = g.get(&key)
+            && entry.window_start_ms == window_start
+            && (now - entry.refreshed_at_ms) < cache_refresh_ms
+        {
+            return *entry;
+        }
         let cost_micros = self.read_cost(agent, window_start);
         let entry = CacheEntry {
             cost_micros,

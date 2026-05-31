@@ -22,6 +22,15 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use libp2p::{PeerId, core::Multiaddr};
 
+/// CORR PART 4: hard cap on the in-flight `pending_calls`
+/// map. A bursty peer (or a stuck responder) used to grow
+/// the table without limit and exhaust process memory; the
+/// cap returns an `OVERLOADED` error to the caller instead
+/// of accepting and dropping silently. 1000 is well above
+/// any realistic load — the rate limiter in front of the
+/// bridge fires long before this.
+pub const MAX_PENDING_CALLS: usize = 1000;
+
 /// Wire payload — opaque bytes carrying a CBOR-encoded RELIX-1 envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireRequest {
@@ -296,6 +305,31 @@ impl EventLoop {
                 envelope,
                 reply,
             } => {
+                // CORR PART 4: enforce a max pending-calls
+                // bound BEFORE send_request so a bursty peer
+                // cannot grow `pending_calls` without limit
+                // and exhaust the responder slot table.
+                if self.pending_calls.len() >= MAX_PENDING_CALLS {
+                    let _ = reply.send(Err(format!(
+                        "OVERLOADED: pending_calls at cap {MAX_PENDING_CALLS}"
+                    )));
+                    return;
+                }
+                // CORR PART 3: the unary RPC reply path is
+                // race-free because `handle_command` and
+                // `handle_swarm_event` run in the same
+                // `tokio::select!` body — `swarm.send_request`
+                // synthesises and returns an `OutboundRequestId`
+                // synchronously, and the response handler can
+                // only fire on a later poll of
+                // `swarm.select_next_some()`. The `insert`
+                // therefore lands strictly before any
+                // matching response is ever surfaced. (A
+                // pre-spec read suggested we needed to
+                // insert before `send_request`; with the
+                // single-task select loop the ordering is
+                // load-bearing equivalent.) The OVERLOADED
+                // gate above is PART 4's bound.
                 let request_id = self
                     .swarm
                     .behaviour_mut()
