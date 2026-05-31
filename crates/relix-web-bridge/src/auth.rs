@@ -159,53 +159,11 @@ fn extract_bearer(req: &Request) -> Option<&str> {
     }
 }
 
-/// Fallback to a `?token=<token>` query parameter — used by SSE
-/// EventSource consumers, which can't set custom headers. Only
-/// recognised when the Authorization header is absent.
-fn extract_query_token(req: &Request) -> Option<String> {
-    let q = req.uri().query()?;
-    for pair in q.split('&') {
-        if let Some(v) = pair.strip_prefix("token=") {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(percent_decode(v));
-            }
-        }
-    }
-    None
-}
-
-fn percent_decode(s: &str) -> String {
-    // Minimal decoder: tokens are hex, so the only thing operators
-    // realistically need is identity. Fall through on anything that
-    // isn't a valid `%XX` byte.
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
-        {
-            out.push((h << 4) | l);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
+/// SEC PART 3 (DELETED): `extract_query_token`, `percent_decode`,
+/// and `hex_val` lived here. They implemented the `?token=`
+/// SSE fallback that the middleware now refuses with HTTP 400.
+/// Removing the parser closes the surface so a future caller
+/// cannot accidentally re-introduce the URL-token path.
 #[derive(Serialize)]
 struct ErrBody {
     error: &'static str,
@@ -221,6 +179,62 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// SEC PART 3: header alternative to `Authorization: Bearer
+/// <setup_token>`. Some operator tooling cannot override the
+/// `Authorization` header (e.g. `curl` users with persistent
+/// auth helpers); they present the setup token via this
+/// dedicated header instead.
+const SETUP_TOKEN_HEADER: &str = "X-Relix-Setup-Token";
+
+fn extract_setup_header(req: &Request) -> Option<String> {
+    req.headers()
+        .get(SETUP_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// SEC PART 3: pull the operator-configured setup token off
+/// the AppState. `None` keeps `/v1/auth/token` returning
+/// HTTP 403.
+fn resolve_setup_token(state: &crate::config::AppState) -> Option<String> {
+    state.setup_token.clone()
+}
+
+fn forbidden_setup_token_unset() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrBody {
+            error: "setup_token not configured — set `[auth] setup_token` in \
+                    bridge.toml or RELIX_SETUP_TOKEN in the environment to \
+                    enable the bootstrap surface",
+        }),
+    )
+        .into_response()
+}
+
+fn unauthorized_setup_token_missing() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrBody {
+            error: "setup token required (Authorization: Bearer <setup_token> \
+                    or X-Relix-Setup-Token: <setup_token>)",
+        }),
+    )
+        .into_response()
+}
+
+fn unauthorized_setup_token_wrong() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrBody {
+            error: "setup token did not match",
+        }),
+    )
+        .into_response()
+}
+
 fn forbidden_csrf() -> Response {
     (StatusCode::FORBIDDEN, Json(ErrBody { error: "csrf" })).into_response()
 }
@@ -230,13 +244,12 @@ fn is_public_path(path: &str) -> bool {
     matches!(path, "/health" | "/dashboard" | "/v1/auth/token") || path.starts_with("/assets/")
 }
 
-/// The OpenAI shim is auth-special: any non-empty bearer wins. We
-/// don't extend this to the streaming SSE form because clients
-/// going through the shim never use EventSource — they consume the
-/// chunked response body directly.
-fn is_openai_shim_path(path: &str) -> bool {
-    path == "/v1/chat/completions"
-}
+// SEC PART 3 (DELETED): `is_openai_shim_path` lived here.
+// The OpenAI shim path is no longer auth-special — it runs
+// the full bearer-token validation pipeline identical to
+// every other authenticated route. Removing the helper
+// makes it impossible to accidentally re-introduce the
+// "any non-empty bearer" bypass.
 
 /// CSRF origin guard. Rejects when:
 /// - `Origin` is present, AND
@@ -285,6 +298,24 @@ fn origin_ok(req: &Request, expected_host: &str, expected_port: u16) -> bool {
 
 /// Axum middleware that enforces the auth + CSRF rules described
 /// in this module's docstring.
+///
+/// SEC PART 3 changes the historical posture in three ways:
+///
+/// 1. The OpenAI shim path is no longer special-cased: it runs the
+///    full bearer-token validation pipeline, identical to every
+///    other authenticated route. A bearer that does not match the
+///    bridge token (or a configured tenant prefix) is rejected
+///    with HTTP 401. Pre-fix path admitted any non-empty bearer.
+/// 2. The `?token=<token>` query-parameter fallback is removed
+///    entirely. EventSource / SSE callers that previously relied
+///    on it now receive HTTP 400 with a message instructing them
+///    to use the `Authorization` header. Allowing the token in a
+///    URL meant it ended up in operator browser history, web-server
+///    access logs, and HTTP referer headers — none of which the
+///    bridge controls.
+/// 3. There is no other change to the bearer-token contract:
+///    valid token → next; missing token → 401; mismatched token →
+///    401; tenant-binding prefix match (when configured) → admit.
 pub async fn auth_middleware(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
 
@@ -294,32 +325,24 @@ pub async fn auth_middleware(State(auth): State<AuthState>, req: Request, next: 
 
     let token = auth.token.value();
 
-    if is_openai_shim_path(&path) {
-        // OpenAI clients always send *some* bearer; we just need it
-        // to be non-empty. CSRF still applies because a malicious
-        // page could fire a chat call too.
-        if !origin_ok(&req, &auth.host, auth.port) {
-            return forbidden_csrf();
-        }
-        return match extract_bearer(&req) {
-            Some(_) => next.run(req).await,
-            None => unauthorized(),
-        };
-    }
-
-    // CSRF first — the answer is cheap to compute and we don't want
-    // to leak whether a token is right or wrong when the origin is
-    // obviously hostile.
+    // CSRF first — the answer is cheap to compute and we don't
+    // want to leak whether a token is right or wrong when the
+    // origin is obviously hostile.
     if !origin_ok(&req, &auth.host, auth.port) {
         return forbidden_csrf();
     }
 
+    // SEC PART 3: refuse `?token=<token>` outright. Pre-fix
+    // path silently accepted it; operators relying on the SSE
+    // fallback now see a structured 400 telling them to use
+    // the Authorization header instead.
+    if has_token_query_param(&req) {
+        return bad_request_query_token_disallowed();
+    }
+
     let provided = match extract_bearer(&req) {
         Some(s) => s.to_string(),
-        None => match extract_query_token(&req) {
-            Some(s) => s,
-            None => return unauthorized(),
-        },
+        None => return unauthorized(),
     };
 
     if ct_eq(&provided, token) {
@@ -342,23 +365,68 @@ pub async fn auth_middleware(State(auth): State<AuthState>, req: Request, next: 
     unauthorized()
 }
 
+/// SEC PART 3: structured 400 returned when a caller still
+/// presents the `?token=<token>` query parameter. Body
+/// instructs them to switch to the `Authorization: Bearer
+/// <token>` header.
+fn bad_request_query_token_disallowed() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrBody {
+            error: "?token query parameter is not supported; use \
+                    `Authorization: Bearer <token>`",
+        }),
+    )
+        .into_response()
+}
+
+/// SEC PART 3: return `true` when the request URI carries a
+/// `token=` query parameter. Used by the middleware to refuse
+/// the historical SSE-token-in-URL flow.
+fn has_token_query_param(req: &Request) -> bool {
+    let Some(q) = req.uri().query() else {
+        return false;
+    };
+    q.split('&').any(|pair| pair.starts_with("token="))
+}
+
 /// `GET /v1/auth/token` — one-time bootstrap so the dashboard can
-/// fetch its token at first load. Two guards:
+/// fetch its token at first load.
 ///
-/// 1. The caller must hit loopback (the bridge already binds
-///    loopback in alpha; this is belt-and-braces).
-/// 2. The caller must NOT already have an `Authorization` header
-///    — if they do, they have a token, so they don't need the
-///    bootstrap.
-///
-/// Returns `{ token: "<hex>" }` on success.
+/// SEC PART 3: pre-fix path accepted any local request — which
+/// meant any process on the operator's machine could exfiltrate
+/// the bridge token by hitting `http://127.0.0.1:<port>/v1/auth/token`.
+/// The endpoint now REQUIRES an operator-configured setup token,
+/// presented as `Authorization: Bearer <setup_token>` (or
+/// `X-Relix-Setup-Token: <setup_token>` for tools that cannot
+/// override the `Authorization` header). The setup token comes
+/// from `[auth] setup_token` in `bridge.toml` or, if absent
+/// there, from the `RELIX_SETUP_TOKEN` env var. When neither is
+/// configured the endpoint returns HTTP 403 — operators must
+/// opt into the bootstrap surface.
 pub async fn bootstrap_token(State(state): State<AppState>, req: Request) -> Response {
-    if req.headers().get(header::AUTHORIZATION).is_some() {
-        return unauthorized();
-    }
     // Cross-origin browser? Refuse.
     if !origin_ok(&req, &state.bridge_host, state.bridge_port) {
         return forbidden_csrf();
+    }
+    // SEC PART 3: setup-token gate. Operators configure
+    // `[auth] setup_token` OR set `RELIX_SETUP_TOKEN`. When
+    // neither is set the endpoint refuses outright; pre-fix
+    // path returned the bridge token to any unauthenticated
+    // loopback caller.
+    let expected_setup = match resolve_setup_token(&state) {
+        Some(s) => s,
+        None => return forbidden_setup_token_unset(),
+    };
+    let presented = extract_bearer(&req)
+        .map(str::to_string)
+        .or_else(|| extract_setup_header(&req));
+    let provided = match presented {
+        Some(p) => p,
+        None => return unauthorized_setup_token_missing(),
+    };
+    if !ct_eq(&provided, &expected_setup) {
+        return unauthorized_setup_token_wrong();
     }
     #[derive(Serialize)]
     struct TokenBody<'a> {
@@ -460,11 +528,16 @@ mod tests {
     }
 
     #[test]
-    fn extract_query_token_handles_simple_param() {
+    fn sec_p3_has_token_query_param_detects_token_in_url() {
+        // SEC PART 3: the `?token=` SSE-fallback parser is
+        // gone; the middleware now uses `has_token_query_param`
+        // to refuse any URL carrying it.
         let r = req_with("/v1/tasks?token=deadbeef&x=1", &[]);
-        assert_eq!(extract_query_token(&r).as_deref(), Some("deadbeef"));
+        assert!(has_token_query_param(&r));
         let r = req_with("/v1/tasks?x=1", &[]);
-        assert!(extract_query_token(&r).is_none());
+        assert!(!has_token_query_param(&r));
+        let r = req_with("/v1/tasks", &[]);
+        assert!(!has_token_query_param(&r));
     }
 
     #[test]
@@ -577,15 +650,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn middleware_protected_with_query_token_passes() {
-        // EventSource fallback path: token in `?token=`.
+    async fn sec_p3_middleware_rejects_token_query_param_with_400() {
+        // SEC PART 3: the `?token=` SSE-fallback path is
+        // removed. Any URL carrying it must be refused
+        // BEFORE the bearer compare so the operator sees
+        // a structured 400 telling them to switch headers.
         let (state, token) = test_state();
         let r = req(
             router(state),
             Request::builder().uri(format!("/v1/tasks?token={token}")),
         )
         .await;
-        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -617,21 +693,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn middleware_openai_shim_accepts_any_non_empty_bearer() {
+    async fn sec_p3_middleware_openai_shim_rejects_wrong_bearer() {
+        // SEC PART 3: the OpenAI shim path runs the full
+        // bearer pipeline. Pre-fix path accepted "Bearer
+        // <anything>". Now a non-matching bearer is 401.
         let (state, _) = test_state();
         let r = req(
             router(state),
             Request::builder()
                 .method("POST")
                 .uri("/v1/chat/completions")
-                .header("authorization", "Bearer sk-anything"),
+                .header("authorization", "Bearer sk-not-the-bridge-token"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sec_p3_middleware_openai_shim_accepts_correct_bridge_token() {
+        // SEC PART 3: the OpenAI shim still admits the
+        // bridge token, identical to every other
+        // authenticated route.
+        let (state, token) = test_state();
+        let r = req(
+            router(state),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token}")),
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn sec_p3_forbidden_setup_token_unset_returns_403_with_helpful_body() {
+        // SEC PART 3: when `[auth] setup_token` and
+        // RELIX_SETUP_TOKEN are both unset, bootstrap_token
+        // returns the "setup_token not configured" body via
+        // this helper. The 403 status + the operator-
+        // readable message are the contract.
+        let resp = forbidden_setup_token_unset();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn sec_p3_unauthorized_setup_token_missing_returns_401() {
+        let resp = unauthorized_setup_token_missing();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn sec_p3_unauthorized_setup_token_wrong_returns_401() {
+        let resp = unauthorized_setup_token_wrong();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn sec_p3_extract_setup_header_reads_dedicated_header() {
+        let r = req_with("/v1/auth/token", &[("x-relix-setup-token", "abc123")]);
+        assert_eq!(extract_setup_header(&r).as_deref(), Some("abc123"));
+        let r = req_with("/v1/auth/token", &[("x-relix-setup-token", "   ")]);
+        assert!(extract_setup_header(&r).is_none());
+        let r = req_with("/v1/auth/token", &[]);
+        assert!(extract_setup_header(&r).is_none());
+    }
+
     #[tokio::test]
-    async fn middleware_openai_shim_rejects_missing_bearer() {
+    async fn sec_p3_middleware_openai_shim_rejects_missing_bearer() {
         let (state, _) = test_state();
         let r = req(
             router(state),

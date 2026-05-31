@@ -560,6 +560,7 @@ mod tests {
             multi_tenant_mode: true,
             trusted_internal_origins: vec!["192.0.2.1".into(), "garbage".into()],
             tenant_bindings: HashMap::new(),
+            setup_token: None,
         };
         let cfg = TenantConfig::from_auth_section(&s);
         // The valid one was kept; the garbage was dropped.
@@ -574,6 +575,7 @@ mod tests {
             multi_tenant_mode: false,
             trusted_internal_origins: vec!["nope".into()],
             tenant_bindings: HashMap::new(),
+            setup_token: None,
         };
         let cfg2 = TenantConfig::from_auth_section(&s2);
         assert!(cfg2.trusted_origins.iter().any(|ip| ip.is_loopback()));

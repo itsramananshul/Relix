@@ -97,6 +97,15 @@ pub struct AuthSection {
     /// the canonical tenant for every request.
     #[serde(default)]
     pub tenant_bindings: std::collections::HashMap<String, String>,
+    /// SEC PART 3: operator-configured setup token guarding
+    /// `GET /v1/auth/token`. Pre-fix path returned the
+    /// bridge token to any loopback caller; the bootstrap
+    /// surface now requires a matching `Authorization:
+    /// Bearer <setup_token>` (or `X-Relix-Setup-Token`)
+    /// header. Falls back to the `RELIX_SETUP_TOKEN` env
+    /// var when this field is unset.
+    #[serde(default)]
+    pub setup_token: Option<String>,
 }
 
 fn default_trusted_origins() -> Vec<String> {
@@ -370,6 +379,13 @@ pub struct AppState {
     /// `auth_middleware` in `crate::auth`. Read-only on the live
     /// state — rotation requires a bridge restart.
     pub bridge_token: crate::auth::BridgeToken,
+    /// SEC PART 3: operator-configured setup token guarding
+    /// the `GET /v1/auth/token` bootstrap endpoint. `None`
+    /// when neither `[auth] setup_token` is in `bridge.toml`
+    /// nor `RELIX_SETUP_TOKEN` is in the environment, in
+    /// which case the bootstrap surface returns HTTP 403 —
+    /// operators must opt in.
+    pub setup_token: Option<String>,
     /// Host portion of the listen address (e.g. `127.0.0.1`).
     /// Used by the CSRF origin guard to verify the request's
     /// `Origin` header matches the bridge's own host.
@@ -550,6 +566,20 @@ impl AppState {
         let bridge_token = crate::auth::BridgeToken::load_or_generate(&token_path)
             .map_err(|e| BridgeError::Config(format!("bridge-token: {e}")))?;
 
+        // SEC PART 3: resolve the setup token guarding
+        // `/v1/auth/token`. `[auth] setup_token` wins; the
+        // env var is the fallback. `None` keeps the
+        // bootstrap surface refusing every caller until the
+        // operator opts in (the bootstrap handler returns
+        // HTTP 403 in that state).
+        let setup_token = cfg
+            .auth
+            .setup_token
+            .clone()
+            .or_else(|| std::env::var("RELIX_SETUP_TOKEN").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         // Parse listen_addr early so the auth/CSRF middleware can
         // compare the request's Origin host against the bridge's
         // own. Failures here mirror the late-parse error in main.rs
@@ -606,6 +636,7 @@ impl AppState {
             intervention_audit,
             mcp_audit: Arc::new(crate::mcp_audit::McpAuditRing::default()),
             bridge_token,
+            setup_token,
             bridge_host,
             bridge_port,
             rate_limits: crate::rate_limit::RateLimits::new(rate_limit_cfg),

@@ -82,7 +82,11 @@ pub async fn chat_ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if let Err(reason) = parse_bearer(&headers) {
+    // SEC PART 3: WS upgrade runs the full bearer
+    // validation pipeline — presence, scheme, non-empty,
+    // AND constant-time compare against the bridge token.
+    // Pre-fix path accepted any non-empty bearer.
+    if let Err(reason) = parse_bearer(&headers, state.bridge_token.value()) {
         return (StatusCode::UNAUTHORIZED, reason).into_response();
     }
     let principal = ws_principal(&headers);
@@ -203,11 +207,16 @@ async fn stream_reply(socket: &mut WebSocket, session_id: &str, reply: &str) {
     let _ = socket.send(Message::Text(done)).await;
 }
 
-/// Verify the bearer header. The alpha bridge is loopback-only,
-/// so we accept any non-empty token — the value isn't matched
-/// against a registry yet. Missing header / wrong scheme / empty
-/// token all return a clear error string for the 401 body.
-pub fn parse_bearer(headers: &HeaderMap) -> Result<(), &'static str> {
+/// SEC PART 3: verify the WebSocket-upgrade bearer header
+/// against the expected bridge token, identical to the
+/// HTTP bearer pipeline. Pre-fix path accepted ANY non-empty
+/// token, so a local process could open a WS by passing
+/// `Bearer x`. The full validation pipeline runs here:
+/// presence, scheme, non-empty, AND constant-time compare
+/// against the expected bridge token. Missing header /
+/// wrong scheme / empty token / mismatched token all
+/// return a structured error suitable for the 401 body.
+pub fn parse_bearer(headers: &HeaderMap, expected_token: &str) -> Result<(), &'static str> {
     let Some(raw) = headers.get(AUTHORIZATION) else {
         return Err("missing Authorization: Bearer <token> header\n");
     };
@@ -223,7 +232,23 @@ pub fn parse_bearer(headers: &HeaderMap) -> Result<(), &'static str> {
     if token.is_empty() {
         return Err("Authorization Bearer token is empty\n");
     }
+    if !ct_eq_ws_token(token, expected_token) {
+        return Err("Authorization Bearer token did not match\n");
+    }
     Ok(())
+}
+
+/// Constant-time string compare for the WS bearer path so
+/// per-byte short-circuits do not leak token-prefix timing.
+fn ct_eq_ws_token(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 /// Split a string into word-shaped emission chunks. Whitespace is
@@ -261,30 +286,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_bearer_accepts_well_formed_header() {
-        assert!(parse_bearer(&hdrs(Some("Bearer abc123"))).is_ok());
-        assert!(parse_bearer(&hdrs(Some("bearer abc123"))).is_ok());
-        assert!(parse_bearer(&hdrs(Some("Bearer    looong-token-here"))).is_ok());
+    fn parse_bearer_accepts_matching_token() {
+        // SEC PART 3: the WS pipeline now compares the
+        // presented token against the expected bridge
+        // token. Non-empty alone is no longer sufficient.
+        assert!(parse_bearer(&hdrs(Some("Bearer abc123")), "abc123").is_ok());
+        assert!(parse_bearer(&hdrs(Some("bearer abc123")), "abc123").is_ok());
     }
 
     #[test]
     fn parse_bearer_rejects_missing_header() {
-        let e = parse_bearer(&hdrs(None)).unwrap_err();
+        let e = parse_bearer(&hdrs(None), "anything").unwrap_err();
         assert!(e.contains("missing"));
     }
 
     #[test]
     fn parse_bearer_rejects_wrong_scheme() {
-        let e = parse_bearer(&hdrs(Some("Basic dXNlcjpwYXNz"))).unwrap_err();
+        let e = parse_bearer(&hdrs(Some("Basic dXNlcjpwYXNz")), "anything").unwrap_err();
         assert!(e.contains("Bearer"));
     }
 
     #[test]
     fn parse_bearer_rejects_empty_token() {
-        let e = parse_bearer(&hdrs(Some("Bearer "))).unwrap_err();
+        let e = parse_bearer(&hdrs(Some("Bearer ")), "anything").unwrap_err();
         assert!(e.contains("empty"));
-        let e = parse_bearer(&hdrs(Some("Bearer    "))).unwrap_err();
+        let e = parse_bearer(&hdrs(Some("Bearer    ")), "anything").unwrap_err();
         assert!(e.contains("empty"));
+    }
+
+    #[test]
+    fn sec_p3_parse_bearer_rejects_mismatched_token() {
+        // SEC PART 3: the WS pipeline runs the full bearer
+        // check. A bearer whose value does not match the
+        // bridge token is refused with a "did not match"
+        // message, not silently admitted.
+        let e = parse_bearer(&hdrs(Some("Bearer wrong-token")), "right-token").unwrap_err();
+        assert!(e.contains("did not match"), "got {e}");
     }
 
     #[test]

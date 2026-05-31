@@ -780,6 +780,7 @@ async fn boot_harness(
             multi_tenant_mode,
             trusted_internal_origins: trusted_origins.iter().map(|s| (*s).to_string()).collect(),
             tenant_bindings,
+            setup_token: None,
         },
     };
     let base_state = AppState::try_new(cfg.clone()).expect("AppState::try_new");
