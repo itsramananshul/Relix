@@ -52,7 +52,7 @@ pub struct ListArgs {
     pub root: Vec<PathBuf>,
     /// GAP 4: switch to bridge mode. Always set when any of
     /// --query / --agent / --min-confidence is provided.
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     /// Filter by source agent (bridge mode only).
     #[arg(long)]
@@ -73,7 +73,7 @@ pub struct ListArgs {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     pub id: String,
     #[arg(long, default_value_t = false)]
@@ -82,7 +82,7 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct EditArgs {
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     pub id: String,
     #[arg(long)]
@@ -105,7 +105,7 @@ pub struct EditArgs {
 
 #[derive(Args, Debug)]
 pub struct DeleteArgs {
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     pub id: String,
     #[arg(long)]
@@ -116,7 +116,7 @@ pub struct DeleteArgs {
 
 #[derive(Args, Debug)]
 pub struct ExportArgs {
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     pub id: String,
     /// Optional output path. When omitted the document is
@@ -133,7 +133,7 @@ pub struct ExportArgs {
 
 #[derive(Args, Debug)]
 pub struct ImportArgs {
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     /// Path to a JSON file with the StoreArgs schema.
     pub file: PathBuf,
@@ -143,7 +143,7 @@ pub struct ImportArgs {
 
 #[derive(Args, Debug)]
 pub struct StatsArgs {
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
     pub json: bool,

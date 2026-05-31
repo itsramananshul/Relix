@@ -84,7 +84,7 @@ pub enum Cmd {
     /// the bridge (capacity 256); resets on bridge restart.
     Audit {
         /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Maximum entries to fetch (capped server-side by ring
         /// capacity).

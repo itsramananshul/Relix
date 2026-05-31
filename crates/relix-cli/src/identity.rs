@@ -78,7 +78,7 @@ pub enum Cmd {
         scopes: Vec<String>,
         #[arg(long)]
         ttl_secs: Option<u64>,
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         raw: bool,
@@ -87,7 +87,7 @@ pub enum Cmd {
     Verify {
         #[arg(long)]
         token: String,
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         raw: bool,
@@ -97,7 +97,7 @@ pub enum Cmd {
     Revoke {
         #[arg(long)]
         session: String,
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         raw: bool,
@@ -107,7 +107,7 @@ pub enum Cmd {
     Tokens {
         #[arg(long)]
         agent: Option<String>,
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         raw: bool,
@@ -123,7 +123,7 @@ pub enum Cmd {
         /// Acme, located in Berlin").
         #[arg(long)]
         context: Option<String>,
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         raw: bool,

@@ -49,7 +49,7 @@ pub struct ExportArgs {
     #[arg(long, default_value = "-")]
     pub out: String,
     /// Bridge HTTP base URL (matches `relix doctor`).
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     /// Bridge bearer token. When absent, the command reads
     /// `~/.relix/bridge-token`.

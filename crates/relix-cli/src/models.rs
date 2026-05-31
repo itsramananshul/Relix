@@ -22,7 +22,7 @@
 
 use clap::{Args, Subcommand};
 
-const DEFAULT_BRIDGE: &str = "http://127.0.0.1:19791";
+const DEFAULT_BRIDGE: &str = crate::defaults::DEFAULT_BRIDGE_URL;
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {

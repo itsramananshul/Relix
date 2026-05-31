@@ -22,7 +22,7 @@ pub enum Cmd {
         /// base64 image to stdout.
         #[arg(long)]
         out: Option<PathBuf>,
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         raw: bool,

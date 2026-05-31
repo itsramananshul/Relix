@@ -24,7 +24,7 @@ pub enum Cmd {
 pub struct RollbackArgs {
     /// Transaction id to roll back.
     pub transaction_id: String,
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -34,7 +34,7 @@ pub struct RollbackArgs {
 pub struct TransactionArgs {
     /// Transaction id to inspect.
     pub transaction_id: String,
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -42,7 +42,7 @@ pub struct TransactionArgs {
 
 #[derive(Args, Debug)]
 pub struct EvidenceArgs {
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long = "action")]
     pub action_id: Option<String>,

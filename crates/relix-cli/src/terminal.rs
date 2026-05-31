@@ -94,7 +94,7 @@ pub enum Cmd {
     /// bridge does the dial-and-call on the operator's behalf.
     AuditHttp {
         /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Target peer alias (default `tool`).
         #[arg(long, default_value = "tool")]

@@ -23,7 +23,7 @@ pub enum Cmd {
     /// lexicographically; first 50 by default. Read-only.
     Blocklist {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Target peer alias.
         #[arg(long, default_value = "tool")]

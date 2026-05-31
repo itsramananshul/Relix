@@ -22,7 +22,7 @@ pub enum Cmd {
     /// output (the bridge's raw response, piped through verbatim).
     Show {
         /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Skip pretty-printing; emit the bridge's raw JSON
         /// body for piping into `jq` or scripts.
@@ -40,7 +40,7 @@ pub enum Cmd {
     /// triage or status-line scripts.
     Health {
         /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Raw JSON instead of the pretty one-line summary.
         #[arg(long, default_value_t = false)]

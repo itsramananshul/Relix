@@ -53,7 +53,7 @@ pub struct BootArgs {
     pub data_dir: Option<PathBuf>,
 
     /// HTTP port the bridge listens on. Default: 19791.
-    #[arg(long, default_value_t = 19791)]
+    #[arg(long, default_value_t = crate::defaults::DEFAULT_BRIDGE_PORT)]
     pub bridge_port: u16,
 
     /// AI provider for the AI node. Defaults to `mock` (no
@@ -70,7 +70,7 @@ pub struct BootArgs {
 #[derive(Args, Debug)]
 pub struct StatusArgs {
     /// Bridge port to poll. Default: 19791.
-    #[arg(long, default_value_t = 19791)]
+    #[arg(long, default_value_t = crate::defaults::DEFAULT_BRIDGE_PORT)]
     pub bridge_port: u16,
 }
 

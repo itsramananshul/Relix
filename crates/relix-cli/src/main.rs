@@ -8,6 +8,7 @@ mod capability;
 mod confidence;
 mod config;
 mod credentials;
+mod defaults;
 mod doctor;
 mod email;
 mod eval;

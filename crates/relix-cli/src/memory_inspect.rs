@@ -29,7 +29,7 @@ pub enum Cmd {
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
-    #[arg(long, default_value = "http://127.0.0.1:9100")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     /// Filter by layer: raw, semantic, observation, model.
     #[arg(long)]
@@ -45,7 +45,7 @@ pub struct ListArgs {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    #[arg(long, default_value = "http://127.0.0.1:9100")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     pub id: String,
     #[arg(long)]
@@ -54,7 +54,7 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct SearchArgs {
-    #[arg(long, default_value = "http://127.0.0.1:9100")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     pub query: String,
     #[arg(long, default_value_t = 20)]
@@ -65,7 +65,7 @@ pub struct SearchArgs {
 
 #[derive(Args, Debug)]
 pub struct InvalidateArgs {
-    #[arg(long, default_value = "http://127.0.0.1:9100")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     pub id: String,
     /// Skip the confirmation prompt. Required for scripted use.
@@ -75,7 +75,7 @@ pub struct InvalidateArgs {
 
 #[derive(Args, Debug)]
 pub struct StatsArgs {
-    #[arg(long, default_value = "http://127.0.0.1:9100")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long)]
     pub json: bool,

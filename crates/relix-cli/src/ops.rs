@@ -24,7 +24,7 @@ pub enum Cmd {
     /// success / fail counts) plus a per-provider one-liner.
     ProvidersHealth {
         /// Bridge HTTP base URL (e.g. `http://127.0.0.1:19791`).
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Raw JSON instead of the pretty one-screen summary.
         #[arg(long, default_value_t = false)]
@@ -37,7 +37,7 @@ pub enum Cmd {
     /// aggregated.
     Capabilities {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Filter by capability prefix (e.g. `tool.web`).
         /// Substring match, case-insensitive. Empty = all.
@@ -52,7 +52,7 @@ pub enum Cmd {
     /// `--threshold-secs` (default 300) without a deadline.
     Stuck {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Stuck threshold in seconds (passed to the bridge).
         #[arg(long, default_value_t = 300i64)]
@@ -67,7 +67,7 @@ pub enum Cmd {
     /// Does NOT send any chat call.
     RouteTest {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Comma-separated candidate list (e.g.
         /// `openai,anthropic`). Order matters — the router uses
@@ -85,7 +85,7 @@ pub enum Cmd {
     /// reset on peer restart.
     DispatchStats {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Target peer alias.
         #[arg(long, default_value = "tool")]
@@ -102,7 +102,7 @@ pub enum Cmd {
     /// don't need bash.
     Smoke {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Chat model used for the round-trip step. Defaults
         /// to `relix-mock` which works without an API key
@@ -116,7 +116,7 @@ pub enum Cmd {
     /// `GET /v1/policy/simulate`.
     PolicySimulate {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Target peer alias.
         #[arg(long, default_value = "tool")]
@@ -137,7 +137,7 @@ pub enum Cmd {
     /// `GET /v1/policy/denials`.
     PolicyDenials {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Target peer alias.
         #[arg(long, default_value = "tool")]
@@ -156,7 +156,7 @@ pub enum Cmd {
     /// capability.
     SessionSearch {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Query string. Required.
         #[arg(long)]
@@ -182,7 +182,7 @@ pub enum Cmd {
     /// file alone.
     Snapshot {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Target peer alias for per-peer endpoints
         /// (dispatch stats + policy denials).
@@ -203,7 +203,7 @@ pub enum Cmd {
     /// inside an ai.chat session, never via this command.
     AgentMemory {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Target peer alias (defaults to `memory`).
         #[arg(long, default_value = "memory")]
@@ -222,7 +222,7 @@ pub enum Cmd {
     /// Settings → Connections → OpenAI API.
     OpenWebuiSetup {
         /// Bridge HTTP base URL (used to fetch the model list).
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Hostname Open WebUI should dial. Defaults to
         /// `host.docker.internal` (the Docker-on-Mac/Windows
@@ -241,7 +241,7 @@ pub enum Cmd {
     /// works through every proxy / shell / tmux.
     Tail {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Filter by event_type substring (case-insensitive).
         /// Empty = all.
@@ -261,7 +261,7 @@ pub enum Cmd {
     /// — shows the H2 one-line summary projection per row.
     Events {
         /// Bridge HTTP base URL.
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         /// Page limit (server caps at 500).
         #[arg(long, default_value_t = 50usize)]
@@ -320,13 +320,13 @@ pub struct PluginArgs {
 #[derive(Subcommand, Debug)]
 pub enum PluginCmd {
     List {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Status {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long = "plugin-id")]
         plugin_id: String,
@@ -334,13 +334,13 @@ pub enum PluginCmd {
         json: bool,
     },
     Reload {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long = "plugin-id")]
         plugin_id: String,
     },
     Disable {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long = "plugin-id")]
         plugin_id: String,
@@ -357,7 +357,7 @@ pub struct MemoryArgs {
 pub enum MemoryCmd {
     /// Embed and store one chunk of text. Hits POST /v1/memory/embed.
     Embed {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long = "subject-id")]
         subject_id: String,
@@ -371,7 +371,7 @@ pub enum MemoryCmd {
     /// Semantic search over a subject's embeddings. Hits POST
     /// /v1/memory/search.
     Search {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long = "subject-id")]
         subject_id: String,
@@ -387,7 +387,7 @@ pub enum MemoryCmd {
     /// Re-embed all existing memory entries for a subject. Hits
     /// POST /v1/memory/embed_all.
     EmbedAll {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long = "subject-id")]
         subject_id: String,
@@ -397,7 +397,7 @@ pub enum MemoryCmd {
     /// GAP 5: Q&A across one subject's Layer 3/4 memory. Hits
     /// POST /v1/memory/dialectic.
     Dialectic {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         observer: String,
@@ -412,7 +412,7 @@ pub enum MemoryCmd {
     /// /v1/memory/ingest. `--content` or `--content-file` must
     /// be supplied; for binary inputs use `--content-base64-file`.
     Ingest {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         observer: String,
@@ -437,7 +437,7 @@ pub enum MemoryCmd {
     /// /v1/memory/ingest_image. `--image-file` is read, base64-
     /// encoded, and posted to the bridge.
     IngestImage {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         observer: String,
@@ -453,7 +453,7 @@ pub enum MemoryCmd {
     /// GAP 5: promote in-context turns to Layer 2. Hits POST
     /// /v1/memory/context_flush.
     Flush {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long = "session-id")]
         session_id: String,
@@ -468,7 +468,7 @@ pub enum MemoryCmd {
     /// table by the anomaly scorer. Hits POST
     /// /v1/memory/quarantine/list.
     QuarantineList {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -480,7 +480,7 @@ pub enum MemoryCmd {
     /// GAP 6: approve a quarantined candidate. Hits POST
     /// /v1/memory/quarantine/approve.
     QuarantineApprove {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         id: String,
@@ -490,7 +490,7 @@ pub enum MemoryCmd {
     /// GAP 6: reject a quarantined candidate. Hits POST
     /// /v1/memory/quarantine/reject.
     QuarantineReject {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         id: String,
@@ -500,7 +500,7 @@ pub enum MemoryCmd {
     /// GAP 7: edit one memory record's text. Hits POST
     /// /v1/memory/records/edit.
     EditRecord {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         id: String,
@@ -512,7 +512,7 @@ pub enum MemoryCmd {
     /// GAP 7: freeze a memory record. Hits POST
     /// /v1/memory/records/freeze.
     FreezeRecord {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         id: String,
@@ -522,7 +522,7 @@ pub enum MemoryCmd {
     /// GAP 7: unfreeze a memory record. Hits POST
     /// /v1/memory/records/unfreeze.
     UnfreezeRecord {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         id: String,
@@ -532,7 +532,7 @@ pub enum MemoryCmd {
     /// GAP 7: bulk-export every record for one source. Hits
     /// POST /v1/memory/export.
     Export {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         source: String,
@@ -545,7 +545,7 @@ pub enum MemoryCmd {
     /// Layer-4 model for one source. Hits POST
     /// /v1/memory/refresh_model.
     RefreshModel {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         source: String,
@@ -563,13 +563,13 @@ pub struct SlackArgs {
 #[derive(Subcommand, Debug)]
 pub enum SlackCmd {
     Status {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     Messages {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -589,7 +589,7 @@ pub enum DiscordCmd {
     /// Print the discord bot's live status. Hits
     /// `/v1/discord/status` and pretty-prints the JSON.
     Status {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -597,7 +597,7 @@ pub enum DiscordCmd {
     /// Print the last N inbound messages from the discord
     /// controller's ring.
     Messages {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -616,7 +616,7 @@ pub struct MsgArgs {
 pub enum MsgCmd {
     /// Send a message from one agent to another.
     Send {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         from: String,
@@ -635,7 +635,7 @@ pub enum MsgCmd {
     },
     /// Read an agent's inbox.
     Inbox {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         subject_id: String,
@@ -648,7 +648,7 @@ pub enum MsgCmd {
     },
     /// Mark a message as read.
     Read {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         message_id: String,
@@ -657,7 +657,7 @@ pub enum MsgCmd {
     },
     /// List every message in a thread.
     Thread {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         thread_id: String,
@@ -668,7 +668,7 @@ pub enum MsgCmd {
     },
     /// Soft delete a message (flips status to expired).
     Delete {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         message_id: String,
@@ -686,7 +686,7 @@ pub struct AgentArgs {
 #[derive(Subcommand, Debug)]
 pub enum AgentCmd {
     List {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value = "")]
         subject_id: String,
@@ -694,7 +694,7 @@ pub enum AgentCmd {
         json: bool,
     },
     Create {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         name: String,
@@ -714,37 +714,37 @@ pub enum AgentCmd {
         risk_ceiling: String,
     },
     Get {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         agent_id: String,
     },
     Enable {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         agent_id: String,
     },
     Suspend {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         agent_id: String,
     },
     Disable {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         agent_id: String,
     },
     ApprovalsPending {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     ApprovalDecide {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         approval_id: String,
@@ -756,7 +756,7 @@ pub enum AgentCmd {
         decided_by: String,
     },
     StandingApprovalGrant {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         agent_id: String,
@@ -772,7 +772,7 @@ pub enum AgentCmd {
         path_glob: String,
     },
     StandingApprovalList {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         agent_id: String,
@@ -780,7 +780,7 @@ pub enum AgentCmd {
         json: bool,
     },
     StandingApprovalRevoke {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         standing_id: String,
@@ -797,7 +797,7 @@ pub struct DelegateArgs {
 pub enum DelegateCmd {
     /// Spawn a delegated child task from a parent.
     Spawn {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         parent_task_id: String,
@@ -812,14 +812,14 @@ pub enum DelegateCmd {
     },
     /// Read a delegated child task's status + result preview.
     Result {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         child_task_id: String,
     },
     /// Cancel a delegated child task.
     Cancel {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         child_task_id: String,
@@ -828,7 +828,7 @@ pub enum DelegateCmd {
     },
     /// List delegated children of a parent task.
     List {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         parent_task_id: String,
@@ -848,7 +848,7 @@ pub enum CronCmd {
     /// List cron jobs. Filter by `--subject-id` to see only
     /// one owner's jobs; omit to see all.
     List {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value = "")]
         subject_id: String,
@@ -857,7 +857,7 @@ pub enum CronCmd {
     },
     /// Create a new cron job.
     Create {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         name: String,
@@ -873,28 +873,28 @@ pub enum CronCmd {
     /// Manually trigger a job. Creates a coordinator task
     /// immediately and dispatches `ai.chat` in the background.
     Trigger {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         job_id: String,
     },
     /// Delete a cron job permanently.
     Delete {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         job_id: String,
     },
     /// Re-enable a previously disabled job.
     Enable {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         job_id: String,
     },
     /// Disable a job without deleting it.
     Disable {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long)]
         job_id: String,
@@ -4396,7 +4396,10 @@ mod tests {
 
     #[test]
     fn port_from_bridge_default() {
-        assert_eq!(port_from_bridge("http://127.0.0.1:19791"), 19791);
+        assert_eq!(
+            port_from_bridge(crate::defaults::DEFAULT_BRIDGE_URL),
+            crate::defaults::DEFAULT_BRIDGE_PORT
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::os_secure::{PermVerdict, inspect_permissions};
 #[derive(Args, Debug)]
 pub struct DoctorArgs {
     /// Bridge HTTP base URL.
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     /// Print the raw `/v1/health` JSON instead of the
     /// opinionated report. Useful for scripts that want to

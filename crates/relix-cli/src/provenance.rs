@@ -33,7 +33,7 @@ pub enum Cmd {
 #[derive(Args, Debug)]
 pub struct ShowArgs {
     pub trace_id: String,
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -43,7 +43,7 @@ pub struct ShowArgs {
 pub struct DiffArgs {
     pub trace_a: String,
     pub trace_b: String,
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -60,7 +60,7 @@ pub struct HistoryArgs {
     /// ISO-8601 upper bound (inclusive).
     #[arg(long)]
     pub to: Option<String>,
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -73,7 +73,7 @@ pub struct AuditArgs {
     pub from: Option<String>,
     #[arg(long)]
     pub to: Option<String>,
-    #[arg(long, default_value = "http://127.0.0.1:19791")]
+    #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
     #[arg(long, default_value_t = false)]
     pub json: bool,

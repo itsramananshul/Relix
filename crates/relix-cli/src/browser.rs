@@ -18,7 +18,7 @@ pub enum Cmd {
     /// the named peer via the bridge proxy. Read-only — open /
     /// close go through the existing libp2p dispatch.
     Sessions {
-        #[arg(long, default_value = "http://127.0.0.1:19791")]
+        #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value = "tool")]
         peer: String,
