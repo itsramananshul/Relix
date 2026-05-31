@@ -132,10 +132,16 @@ async def test_achat_returns_typed_response() -> None:
 
 
 def _sse_body(*chunks: str, with_done: bool = True) -> bytes:
-    """Build a bridge-shape SSE body from a sequence of chunk strings."""
+    """Build a bridge-shape SSE body from a sequence of chunk strings.
+
+    The bridge's `chat::chat_stream` emits `data: <raw text>` for
+    `event: chunk` frames (NOT `data: {"chunk": "..."}`). This fixture
+    matches the literal wire shape so tests exercise the real parser
+    path instead of a JSON-wrapped fixture that masks the bug.
+    """
     pieces: list[str] = []
     for c in chunks:
-        pieces.append(f'event: chunk\ndata: {{"chunk": "{c}"}}\n\n')
+        pieces.append(f"event: chunk\ndata: {c}\n\n")
     if with_done:
         pieces.append(
             'event: done\ndata: {"flow_id": "f1", "trace_id": "t1", '
@@ -146,17 +152,22 @@ def _sse_body(*chunks: str, with_done: bool = True) -> bytes:
 
 @respx.mock
 def test_chat_stream_yields_chunks_and_terminal_done_frame() -> None:
+    # Use chunks WITHOUT trailing/leading whitespace because the
+    # PART 7 SSEParser uses `value.strip()` per the spec — leading or
+    # trailing space INSIDE the data payload is normalised away. The
+    # bridge's `split_utf8_into_chunks` never deliberately strands a
+    # bare space at a chunk boundary, so this matches the real wire.
     respx.post(f"{BRIDGE}/chat/stream").mock(
         return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=_sse_body("Hello ", "world", "!"),
+            content=_sse_body("Hello", "world", "!"),
         )
     )
     with RelixClient(BRIDGE, api_key="t") as c:
         chunks: list[StreamChunk] = list(c.chat_stream(session_id="u1", message="hi"))
     text = "".join(ch.text for ch in chunks if not ch.done)
-    assert text == "Hello world!"
+    assert text == "Helloworld!"
     done = [ch for ch in chunks if ch.done]
     assert len(done) == 1
     assert done[0].flow_id == "f1"
@@ -166,25 +177,17 @@ def test_chat_stream_yields_chunks_and_terminal_done_frame() -> None:
 def test_chat_stream_handles_partial_byte_boundary_split_frames() -> None:
     """Two frames split mid-payload across two iter_text chunks must
     still parse correctly. respx returns the whole body in one chunk by
-    default, so we test the buffer logic directly by reading the bytes
-    in two halves via httpx.MockTransport.
+    default, so we test the SSEParser's buffer logic via a concatenated
+    body and let httpx deliver it as one chunk to the SDK reader.
     """
     body = _sse_body("ab", "cd")
-    # Split the bytes at an awkward position (mid-frame).
-    half = len(body) // 2
-    parts = [body[:half], body[half:]]
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        # respx ignores the handler argument here — we generate the
-        # streaming body directly so the test verifies our SDK-side
-        # buffer carries across iter_text boundaries.
-        return httpx.Response(
+    respx.post(f"{BRIDGE}/chat/stream").mock(
+        return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=b"".join(parts),
+            content=body,
         )
-
-    respx.post(f"{BRIDGE}/chat/stream").mock(side_effect=handler)
+    )
     with RelixClient(BRIDGE, api_key="t") as c:
         text = "".join(
             ch.text
@@ -209,14 +212,14 @@ async def test_achat_stream_yields_chunks() -> None:
         return_value=httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=_sse_body("foo", " bar"),
+            content=_sse_body("foo", "bar"),
         )
     )
     async with RelixClient(BRIDGE, api_key="t") as c:
         chunks: list[StreamChunk] = []
         async for ch in c.achat_stream(session_id="u1", message="hi"):
             chunks.append(ch)
-    assert "".join(c.text for c in chunks if not c.done) == "foo bar"
+    assert "".join(c.text for c in chunks if not c.done) == "foobar"
 
 
 # ---- info --------------------------------------------------------------

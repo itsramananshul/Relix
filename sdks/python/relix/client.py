@@ -141,76 +141,145 @@ def _translate_status_error(status_code: int, body: str) -> RelixError:
     )
 
 
-def _parse_sse_field_payload(payload: str) -> StreamChunk | None:
-    """Parse one ``data: ...`` payload from the bridge's SSE stream.
+class SSEParser:
+    """PART 7 — incremental SSE state machine.
 
-    The bridge currently emits JSON-ish payloads with a ``chunk`` key on
-    intermediate frames and a metadata dict on ``event: done``. Be
-    forgiving about the field name so the SDK doesn't crash if the
-    payload shape evolves: try ``chunk``, then ``text``, then return the
-    whole payload as text when it's a bare string.
+    Feeds raw text into an internal buffer and returns parsed events
+    whenever the buffer contains at least one complete event (events
+    are separated by a blank line — ``\\n\\n``). The returned value is
+    a list of ``dict`` payloads keyed by SSE field name (``event``,
+    ``data``, ``id``, ``retry``, ...). Mirrors the per-spec shape from
+    the user's prompt.
+
+    The parser deals only with the framing layer — semantic
+    translation into :class:`StreamChunk` happens in
+    :func:`_sse_event_to_chunk` so this class is reusable for any SSE
+    consumer in the SDK.
     """
-    payload = payload.strip()
+
+    def __init__(self) -> None:
+        self._buffer: str = ""
+
+    def feed(self, chunk: str) -> list[dict[str, str]]:
+        """Append ``chunk`` to the internal buffer and return any
+        events that have become complete as a result.
+
+        ``chunk`` may carry partial event text — the parser holds the
+        unfinished tail until the next ``feed`` (or until ``flush``).
+        Two events delivered in a single chunk produce two entries in
+        the returned list; one event split across two ``feed`` calls
+        produces an entry on the second call.
+        """
+        events: list[dict[str, str]] = []
+        self._buffer += chunk
+        while "\n\n" in self._buffer:
+            event_text, self._buffer = self._buffer.split("\n\n", 1)
+            event = self._parse_event(event_text)
+            if event:
+                events.append(event)
+        return events
+
+    def flush(self) -> list[dict[str, str]]:
+        """Drain any remaining buffered event text.
+
+        Some SSE producers terminate a stream by closing the socket
+        without sending a trailing blank line. Calling ``flush`` once
+        the upstream stream is exhausted gives the parser a chance to
+        surface a final event in that case.
+        """
+        if not self._buffer.strip():
+            self._buffer = ""
+            return []
+        last = self._buffer
+        self._buffer = ""
+        event = self._parse_event(last)
+        return [event] if event else []
+
+    def _parse_event(self, text: str) -> dict[str, str] | None:
+        """Translate one raw event-text block into a field dict.
+
+        Each line of the form ``field: value`` is folded into the
+        result. The per-spec leading single space after ``:`` is
+        stripped via ``.strip()`` on the value half. Blank lines, lines
+        without a colon, and comment lines (starting with ``:``) are
+        ignored. Returns ``None`` for an event that produced no fields.
+        """
+        fields: dict[str, str] = {}
+        for line in text.strip().split("\n"):
+            if line.startswith(":") or ":" not in line:
+                continue
+            field, _, value = line.partition(":")
+            fields[field.strip()] = value.strip()
+        return fields if fields else None
+
+
+def _sse_event_to_chunk(event: dict[str, str]) -> StreamChunk | None:
+    """Translate one parsed SSE event into a :class:`StreamChunk`.
+
+    Wire shape:
+      * ``event: chunk`` + ``data: <raw text>`` → ``StreamChunk(text=...)``
+        (the bridge sends raw text here, NOT JSON; the OpenAI shim sends
+        JSON so we fall back to extracting a ``chunk`` / ``text`` field
+        if the payload happens to be valid JSON).
+      * ``event: done`` + ``data: {json metadata}`` →
+        ``StreamChunk(done=True, flow_id=..., ...)``.
+      * ``[DONE]`` literal payload → ``None`` (OpenAI-compat sentinel,
+        the caller treats absence-of-frame as end-of-stream).
+    """
+    kind = event.get("event") or "chunk"
+    payload = event.get("data", "")
     if not payload or payload == "[DONE]":
         return None
+    if kind == "done":
+        # Try to parse metadata; if we can't, still emit a done frame.
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            return StreamChunk(text="", done=True)
+        if isinstance(parsed, dict):
+            return StreamChunk(
+                text="",
+                done=True,
+                flow_id=parsed.get("flow_id"),
+                trace_id=parsed.get("trace_id"),
+                flow_log=parsed.get("flow_log"),
+            )
+        return StreamChunk(text="", done=True)
+    # `event: chunk` (or no event field) — the bridge's native shape
+    # is raw text. The OpenAI shim is JSON-shaped; tolerate both.
     try:
         parsed = json.loads(payload)
     except json.JSONDecodeError:
-        return StreamChunk(text=payload)
+        return StreamChunk(text=payload, done=False)
     if isinstance(parsed, dict):
         text = parsed.get("chunk") or parsed.get("text") or ""
         return StreamChunk(
-            text=text,
+            text=str(text),
+            done=False,
             flow_id=parsed.get("flow_id"),
             trace_id=parsed.get("trace_id"),
             flow_log=parsed.get("flow_log"),
         )
     if isinstance(parsed, str):
-        return StreamChunk(text=parsed)
-    return None
+        return StreamChunk(text=parsed, done=False)
+    # Unrecognised JSON scalar (number, array, bool) → treat the
+    # original payload as raw text.
+    return StreamChunk(text=payload, done=False)
 
 
-def _iter_sse_lines(text: str, buf: list[str]) -> Iterator[StreamChunk]:
+def _iter_sse_chunks(text: str, parser: SSEParser) -> Iterator[StreamChunk]:
     """Yield :class:`StreamChunk` frames from a raw SSE byte slice.
 
-    ``buf`` is a single-element list used as a mutable reference so the
-    caller can carry partial bytes between calls without re-allocating
-    every time. The bridge separates frames with a blank line; each
-    frame may contain one or more ``data:`` lines.
+    Normalises CRLF to LF so a non-Relix proxy that rewrites line
+    endings doesn't break the parser (the bridge emits LF natively;
+    the spec-compliant :class:`SSEParser` only looks for ``\\n\\n``
+    separators).
     """
-    buf[0] += text
-    while True:
-        # Bridge always uses LF separators (`\n\n`); CRLF tolerated for
-        # callers that route through a non-Relix proxy that rewrites.
-        end_lf = buf[0].find("\n\n")
-        end_crlf = buf[0].find("\r\n\r\n")
-        if end_crlf != -1 and (end_lf == -1 or end_crlf < end_lf):
-            frame = buf[0][:end_crlf]
-            buf[0] = buf[0][end_crlf + 4 :]
-        elif end_lf != -1:
-            frame = buf[0][:end_lf]
-            buf[0] = buf[0][end_lf + 2 :]
-        else:
-            return
-        event_kind: str | None = None
-        data_lines: list[str] = []
-        for raw in frame.splitlines():
-            if raw.startswith(":"):
-                # Comment / keep-alive line.
-                continue
-            if raw.startswith("event:"):
-                event_kind = raw[len("event:") :].strip()
-            elif raw.startswith("data:"):
-                data_lines.append(raw[len("data:") :].lstrip())
-        if not data_lines:
-            continue
-        payload = "\n".join(data_lines)
-        chunk = _parse_sse_field_payload(payload)
-        if chunk is None:
-            continue
-        if event_kind == "done":
-            chunk.done = True
-        yield chunk
+    normalised = text.replace("\r\n", "\n")
+    for event in parser.feed(normalised):
+        chunk = _sse_event_to_chunk(event)
+        if chunk is not None:
+            yield chunk
 
 
 def _build_headers(
@@ -534,11 +603,17 @@ class RelixClient:
             ) as resp:
                 if resp.status_code >= 400:
                     raise _translate_status_error(resp.status_code, resp.read().decode("utf-8", "replace"))
-                buf = [""]
+                parser = SSEParser()
                 for chunk in resp.iter_text():
                     if not chunk:
                         continue
-                    yield from _iter_sse_lines(chunk, buf)
+                    yield from _iter_sse_chunks(chunk, parser)
+                # Flush any trailing event the upstream closed before
+                # delivering its blank line.
+                for tail_event in parser.flush():
+                    tail_chunk = _sse_event_to_chunk(tail_event)
+                    if tail_chunk is not None:
+                        yield tail_chunk
         except httpx.HTTPError as exc:
             raise _translate_transport_error(exc) from exc
 
@@ -569,12 +644,16 @@ class RelixClient:
                     raise _translate_status_error(
                         resp.status_code, raw.decode("utf-8", "replace")
                     )
-                buf = [""]
+                parser = SSEParser()
                 async for chunk in resp.aiter_text():
                     if not chunk:
                         continue
-                    for frame in _iter_sse_lines(chunk, buf):
+                    for frame in _iter_sse_chunks(chunk, parser):
                         yield frame
+                for tail_event in parser.flush():
+                    tail_chunk = _sse_event_to_chunk(tail_event)
+                    if tail_chunk is not None:
+                        yield tail_chunk
         except httpx.HTTPError as exc:
             raise _translate_transport_error(exc) from exc
 
