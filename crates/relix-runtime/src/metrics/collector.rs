@@ -99,6 +99,11 @@ pub struct MetricsCollector {
     /// expensive call cannot escape a same-window cap by being
     /// the last call before a check.
     budget: Arc<Mutex<Option<Arc<super::budget::BudgetEnforcer>>>>,
+    /// PART 4: absolute spend caps state. Installed once by the
+    /// controller wiring via [`Self::install_absolute_caps`].
+    /// When absent the per-request / hourly / daily checks are
+    /// silently inert.
+    absolute_caps: Arc<std::sync::OnceLock<AbsoluteCapsHandle>>,
 }
 
 /// How many pending AI usage hints we hold in memory while
@@ -254,6 +259,7 @@ impl MetricsCollector {
             prices: Arc::new(prices),
             store: store.clone(),
             budget: Arc::new(Mutex::new(None)),
+            absolute_caps: Arc::new(std::sync::OnceLock::new()),
         };
         let handles = MetricsWorkerHandles {
             store,
@@ -283,6 +289,46 @@ impl MetricsCollector {
         {
             m.enrich_with_hint(&hint, &self.prices);
         }
+    }
+
+    /// PART 4: install the absolute spend caps config + the
+    /// alert sink CostAlerts get dispatched through. Idempotent
+    /// — only the first call binds; later ones are silently
+    /// ignored. Without this wiring the per-request / hourly /
+    /// daily checks are no-ops.
+    pub fn install_absolute_caps(
+        &self,
+        cfg: super::spike_detector::CostAlertsConfig,
+        sink: Arc<dyn super::alert::AlertDeliver>,
+    ) {
+        let _ = self.absolute_caps.set(AbsoluteCapsHandle {
+            cfg,
+            sink,
+            state: Arc::new(Mutex::new(AbsoluteCapsState::default())),
+        });
+    }
+
+    /// PART 4: check an *estimated* per-request cost (USD)
+    /// BEFORE dispatch. Returns `true` when the request should
+    /// proceed; `false` when it exceeds
+    /// `absolute_per_request_cap_usd` and the dispatcher should
+    /// fail closed. Fires a CostAlert on rejection.
+    pub fn check_per_request_estimate(&self, estimated_usd: f64) -> bool {
+        let Some(h) = self.absolute_caps.get() else {
+            return true;
+        };
+        let Some(cap) = h.cfg.absolute_per_request_cap_usd else {
+            return true;
+        };
+        if estimated_usd <= cap {
+            return true;
+        }
+        h.fire(
+            "absolute_per_request_cap_exceeded_pre_dispatch",
+            cap,
+            estimated_usd,
+        );
+        false
     }
 
     /// RELIX-7.28 Part 1: wire the budget enforcer so cost-bearing
@@ -321,6 +367,16 @@ impl MetricsSink for MetricsCollector {
             };
             if let Some(e) = enforcer {
                 e.invalidate_agent(&m.agent_name);
+            }
+            // PART 4: actual-cost gate. Fires CostAlert when this
+            // single request crossed `absolute_per_request_cap_usd`
+            // OR when the rolling hourly / daily windows just
+            // tipped past their caps. Independent of any
+            // statistical baseline.
+            if let Some(h) = self.absolute_caps.get() {
+                let cost_usd = (cost as f64) / 1_000_000.0;
+                let now_secs = (now_ms() / 1_000).max(0);
+                h.observe_actual(cost_usd, now_secs);
             }
         }
         // CORR PART 4: bounded drop-oldest send. Never blocks
@@ -393,6 +449,93 @@ fn take_hint(
         Err(p) => p.into_inner(),
     };
     g.remove(req_id)
+}
+
+/// PART 4: rolling-window state used by the absolute spend caps.
+/// One deque per cap window. Pruned on every observation, so the
+/// memory footprint stays bounded at ~one entry per cost-bearing
+/// metric in the last 24h.
+#[derive(Default)]
+struct AbsoluteCapsState {
+    hourly_events: std::collections::VecDeque<(i64, f64)>,
+    daily_events: std::collections::VecDeque<(i64, f64)>,
+}
+
+/// PART 4: handle installed on the collector. Bundles the config,
+/// the alert sink to deliver CostAlerts through, and the rolling
+/// windows. Cheap to clone (Arc-wrapped state).
+struct AbsoluteCapsHandle {
+    cfg: super::spike_detector::CostAlertsConfig,
+    sink: Arc<dyn super::alert::AlertDeliver>,
+    state: Arc<Mutex<AbsoluteCapsState>>,
+}
+
+impl AbsoluteCapsHandle {
+    fn observe_actual(&self, cost_usd: f64, now_secs: i64) {
+        // Per-request actual cost check.
+        if let Some(cap) = self.cfg.absolute_per_request_cap_usd
+            && cost_usd > cap
+        {
+            self.fire("absolute_per_request_cap_exceeded_actual", cap, cost_usd);
+        }
+        // Roll into the hourly + daily windows and check sums.
+        let mut g = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.hourly_events.push_back((now_secs, cost_usd));
+        g.daily_events.push_back((now_secs, cost_usd));
+        let hour_cutoff = now_secs - 3_600;
+        let day_cutoff = now_secs - 86_400;
+        while let Some(&(t, _)) = g.hourly_events.front() {
+            if t < hour_cutoff {
+                g.hourly_events.pop_front();
+            } else {
+                break;
+            }
+        }
+        while let Some(&(t, _)) = g.daily_events.front() {
+            if t < day_cutoff {
+                g.daily_events.pop_front();
+            } else {
+                break;
+            }
+        }
+        let hourly_sum: f64 = g.hourly_events.iter().map(|(_, c)| *c).sum();
+        let daily_sum: f64 = g.daily_events.iter().map(|(_, c)| *c).sum();
+        drop(g);
+        if let Some(cap) = self.cfg.absolute_hourly_cap_usd
+            && hourly_sum > cap
+        {
+            self.fire("absolute_hourly_cap_exceeded", cap, hourly_sum);
+        }
+        if let Some(cap) = self.cfg.absolute_daily_cap_usd
+            && daily_sum > cap
+        {
+            self.fire("absolute_daily_cap_exceeded", cap, daily_sum);
+        }
+    }
+
+    fn fire(&self, cause: &'static str, cap_usd: f64, actual_usd: f64) {
+        let now_ms = now_ms();
+        let event = super::alert::AlertEvent::Fired(super::alert::ActiveAlert {
+            agent: "deployment".to_string(),
+            kind: super::alert::AlertKind::CostAlert,
+            severity: super::alert::AlertSeverity::Critical,
+            triggered_at_ms: now_ms,
+            threshold: cap_usd,
+            actual: actual_usd,
+            message: cause.to_string(),
+            method: None,
+        });
+        self.sink.deliver(&event);
+        tracing::warn!(
+            cause,
+            cap_usd,
+            actual_usd,
+            "metrics.cost_alerts: absolute spend cap exceeded"
+        );
+    }
 }
 
 /// Owned worker handles returned by [`MetricsCollector::new`].

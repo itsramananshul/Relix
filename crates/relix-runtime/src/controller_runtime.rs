@@ -796,8 +796,15 @@ pub async fn run(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             // CostAlerts when the trigger-rate / hourly-budget
             // limits trip, and so per-request cost estimation
             // is grounded in real model prices.
-            b.sc_stats.install_alert_sink(sink);
+            b.sc_stats.install_alert_sink(sink.clone());
             b.sc_stats.install_price_table(m.collector.prices());
+            // PART 4: install the absolute spend caps on the
+            // metrics collector. Every cost-bearing
+            // record_invocation now checks the rolling hourly,
+            // daily, and per-request caps and emits a CostAlert
+            // on overshoot.
+            m.collector
+                .install_absolute_caps(m.cost_alerts_cfg.clone(), sink);
         }
         // Register confidence.* coordinator caps so operators
         // can call confidence.policy_list / score_history /

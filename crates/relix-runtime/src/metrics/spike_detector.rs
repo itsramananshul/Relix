@@ -76,6 +76,24 @@ pub struct CostAlertsConfig {
     /// the existing `metrics.db`.
     #[serde(default)]
     pub db_path: Option<std::path::PathBuf>,
+    /// PART 4: absolute hourly spend cap, USD. When the
+    /// rolling-hour cost across every model crosses this
+    /// number, the collector fires a CostAlert with cause
+    /// `absolute_hourly_cap_exceeded` — independent of any
+    /// statistical baseline. `None` disables the cap.
+    /// Default: $50/hour.
+    #[serde(default = "default_absolute_hourly_cap_usd")]
+    pub absolute_hourly_cap_usd: Option<f64>,
+    /// PART 4: absolute daily spend cap, USD. Same shape as
+    /// the hourly cap with a 24-hour rolling window. Default
+    /// $500/day.
+    #[serde(default = "default_absolute_daily_cap_usd")]
+    pub absolute_daily_cap_usd: Option<f64>,
+    /// PART 4: absolute per-request cap, USD. Checked BEFORE
+    /// dispatch against the estimated cost and AFTER dispatch
+    /// against the actual `cost_micros`. Default $5/request.
+    #[serde(default = "default_absolute_per_request_cap_usd")]
+    pub absolute_per_request_cap_usd: Option<f64>,
 }
 
 impl Default for CostAlertsConfig {
@@ -88,6 +106,9 @@ impl Default for CostAlertsConfig {
             drift_threshold: default_drift_threshold(),
             retention_days: default_retention_days(),
             db_path: None,
+            absolute_hourly_cap_usd: default_absolute_hourly_cap_usd(),
+            absolute_daily_cap_usd: default_absolute_daily_cap_usd(),
+            absolute_per_request_cap_usd: default_absolute_per_request_cap_usd(),
         }
     }
 }
@@ -109,6 +130,18 @@ fn default_drift_threshold() -> f64 {
 }
 fn default_retention_days() -> u32 {
     7
+}
+
+fn default_absolute_hourly_cap_usd() -> Option<f64> {
+    Some(50.0)
+}
+
+fn default_absolute_daily_cap_usd() -> Option<f64> {
+    Some(500.0)
+}
+
+fn default_absolute_per_request_cap_usd() -> Option<f64> {
+    Some(5.0)
 }
 
 /// Per-tick summary the detector returns. Used by the spawn-task
@@ -524,6 +557,7 @@ mod tests {
             drift_threshold: 0.3,
             retention_days: 7,
             db_path: None,
+            ..Default::default()
         }
     }
 
