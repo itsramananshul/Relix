@@ -1,0 +1,1563 @@
+# Canonical default node policy — covers every capability the
+# Relix runtime registers on a `DispatchBridge`. Copy this file
+# verbatim and a single-node "everything bundled" deployment
+# admits the standard set of capability calls without further
+# editing.
+#
+# Method names are taken from the actual `bridge.register(...)`
+# call sites in `crates/relix-runtime/src/`. The PolicyEngine
+# does EXACT string match on `method`, so every capability
+# needs its own rule — there is no glob support.
+#
+# Group model
+# -----------
+#
+# - `chat-users`     — the default group `scripts/relix-mesh-up.{sh,ps1}`
+#                      mints for every identity. Gets the full
+#                      read + standard write surface so a
+#                      copy-paste deployment of this file Just
+#                      Works.
+# - `operators`      — operator / admin role. Same allow as
+#                      chat-users on every capability; listed
+#                      separately so a deployment that retires
+#                      `chat-users` for tighter isolation can
+#                      flip the rules without restructuring.
+# - `tool-users`     — a deployment that wants to fence tool
+#                      invocations to a narrower group can flip
+#                      every `tool.*` rule below from
+#                      `["chat-users", "operators"]` to
+#                      `["tool-users", "operators"]`.
+# - `controllers`    — the libp2p PeerId-shaped service
+#                      identities mesh-internal calls present
+#                      (e.g. router.heartbeat push, internal
+#                      service-to-service approval mirroring).
+# - `web-bridge-svc` — the service identity the HTTP bridge
+#                      uses when calling into peer nodes. Same
+#                      practical permissions as chat-users for
+#                      the read surface.
+#
+# Every rule explicitly enumerates which groups admit. There
+# are no implicit allow paths (the engine is default-deny).
+
+[admit]
+groups = ["chat-users", "operators", "tool-users", "controllers", "web-bridge-svc"]
+
+# ─────────────────────────────────────────────────────────────
+# node.* — every node exposes these; mesh discovery + ops
+# tooling depend on them.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "node_health"
+method = "node.health"
+allow_groups = ["chat-users", "operators", "tool-users", "controllers", "web-bridge-svc", "guest"]
+
+# node.manifest is what the bridge calls on every peer at
+# startup to learn the capability set. WITHOUT this rule
+# admitting a chat-user, manifest discovery returns
+# POLICY_DENIED and the bridge's CapabilityCache stays empty
+# (the audit-2 CRIT).
+[[rules]]
+name = "node_manifest"
+method = "node.manifest"
+allow_groups = ["chat-users", "operators", "tool-users", "controllers", "web-bridge-svc"]
+
+[[rules]]
+name = "node_dispatch_stats"
+method = "node.dispatch.stats"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "node_policy_simulate"
+method = "node.policy.simulate"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_recent_denials"
+method = "node.policy.recent_denials"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_list"
+method = "node.policy.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_get"
+method = "node.policy.tenant_get"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_list"
+method = "node.audit.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_recent"
+method = "node.audit.tenant_recent"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# ai.* — AI provider surface (model invocation + embeddings +
+# perception_extract for the document-ingest pipeline).
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "ai_chat"
+method = "ai.chat"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "ai_embed"
+method = "ai.embed"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "ai_perception_extract"
+method = "ai.perception_extract"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+# ─────────────────────────────────────────────────────────────
+# memory.* — full memory-node surface. Read (search /
+# recent_for_session / agent_read) + write (write_turn / ingest
+# / edit / freeze) + admin (quarantine / bulk_export / pii).
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "memory_recent_for_session"
+method = "memory.recent_for_session"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_write_turn"
+method = "memory.write_turn"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_search"
+method = "memory.search"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_search_turns"
+method = "memory.search_turns"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_session_search"
+method = "memory.session_search"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_records_search"
+method = "memory.records_search"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_agent_read"
+method = "memory.agent_read"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_agent_write"
+method = "memory.agent_write"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_agent_curate"
+method = "memory.agent_curate"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_curator_status"
+method = "memory.curator_status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_embed"
+method = "memory.embed"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "memory_embed_all"
+method = "memory.embed_all"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_dialectic"
+method = "memory.dialectic"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_ingest_document"
+method = "memory.ingest_document"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_ingest_image"
+method = "memory.ingest_image"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_context_flush"
+method = "memory.context_flush"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_edit_record"
+method = "memory.edit_record"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_freeze_record"
+method = "memory.freeze_record"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_unfreeze_record"
+method = "memory.unfreeze_record"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_quarantine_list"
+method = "memory.quarantine_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_quarantine_approve"
+method = "memory.quarantine_approve"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_quarantine_reject"
+method = "memory.quarantine_reject"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_bulk_export"
+method = "memory.bulk_export"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_request_model_refresh"
+method = "memory.request_model_refresh"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_pii_scan"
+method = "memory.pii_scan"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_anonymize_preview"
+method = "memory.anonymize_preview"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_bulk_anonymize"
+method = "memory.bulk_anonymize"
+allow_groups = ["operators"]
+
+# ── memory.skill_* — the skill-registry surface. ─────────────
+
+[[rules]]
+name = "memory_skill_store"
+method = "memory.skill_store"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_get"
+method = "memory.skill_get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_search"
+method = "memory.skill_search"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_stats"
+method = "memory.skill_stats"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_update"
+method = "memory.skill_update"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_deprecate"
+method = "memory.skill_deprecate"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# knowledge.* — cross-node knowledge transfer (share,
+# accept_shared, group broadcast, recall, revoke).
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "knowledge_share"
+method = "knowledge.share"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_accept_shared"
+method = "knowledge.accept_shared"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "knowledge_group_broadcast"
+method = "knowledge.group_broadcast"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_groups"
+method = "knowledge.groups"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_list_shared"
+method = "knowledge.list_shared"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_recall"
+method = "knowledge.recall"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_revoke"
+method = "knowledge.revoke"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "knowledge_autoshare_stats"
+method = "knowledge.autoshare_stats"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# tool.* — every tool-node capability. read_file / web_fetch /
+# patch are the most-used; the destructive `terminal.*` shell
+# surface stays admin-restricted by default.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "tool_read_file"
+method = "tool.read_file"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_write_file"
+method = "tool.write_file"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_append_file"
+method = "tool.append_file"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_list_dir"
+method = "tool.list_dir"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_search_files"
+method = "tool.search_files"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_patch"
+method = "tool.patch"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_patch_preview"
+method = "tool.patch_preview"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_fuzzy_replace"
+method = "tool.fuzzy_replace"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_binary_sniff"
+method = "tool.binary_sniff"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_pdf"
+method = "tool.pdf"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_parse_document"
+method = "tool.parse_document"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_text_chunk"
+method = "tool.text.chunk"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_screen"
+method = "tool.screen"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_fs_stat"
+method = "tool.fs.stat"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_fs_tree"
+method = "tool.fs.tree"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_fs_audit_recent"
+method = "tool.fs.audit_recent"
+allow_groups = ["operators"]
+
+# ── tool.web.* — outbound HTTP + robots checks. ──────────────
+
+[[rules]]
+name = "tool_web_fetch"
+method = "tool.web_fetch"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_web_get"
+method = "tool.web_get"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_web_read"
+method = "tool.web_read"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_web_extract"
+method = "tool.web_extract"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_web_search"
+method = "tool.web_search"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_web_post"
+method = "tool.web.post"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_web_robots_check"
+method = "tool.web.robots_check"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_web_blocklist_summary"
+method = "tool.web.blocklist_summary"
+allow_groups = ["operators"]
+
+# ── tool.browser.* — operator-scoped browser automation. ─────
+
+[[rules]]
+name = "tool_browser_open_session"
+method = "tool.browser.open_session"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_close_session"
+method = "tool.browser.close_session"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_list_sessions"
+method = "tool.browser.list_sessions"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_navigate"
+method = "tool.browser.navigate"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_get_text"
+method = "tool.browser.get_text"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_click"
+method = "tool.browser.click"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_type_text"
+method = "tool.browser.type_text"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_wait_for_selector"
+method = "tool.browser.wait_for_selector"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_screenshot"
+method = "tool.browser.screenshot"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_browser_capture_read"
+method = "tool.browser.capture_read"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+# ── tool.terminal.* — shell-execution surface. ───────────────
+
+[[rules]]
+name = "tool_terminal_run"
+method = "tool.terminal.run"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_spawn"
+method = "tool.terminal.spawn"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_cancel"
+method = "tool.terminal.cancel"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_sessions"
+method = "tool.terminal.sessions"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_tail"
+method = "tool.terminal.tail"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_audit_recent"
+method = "tool.terminal.audit_recent"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "tool_terminal_shell_open"
+method = "tool.terminal.shell.open"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_shell_close"
+method = "tool.terminal.shell.close"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_shell_input"
+method = "tool.terminal.shell.input"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_shell_control"
+method = "tool.terminal.shell.control"
+allow_groups = ["operators", "tool-users"]
+
+# ── tool.mcp.* — Model Context Protocol bridge surface. ──────
+
+[[rules]]
+name = "tool_mcp_list_servers"
+method = "tool.mcp.list_servers"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_mcp_list_tools"
+method = "tool.mcp.list_tools"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+[[rules]]
+name = "tool_mcp_invoke"
+method = "tool.mcp.invoke"
+allow_groups = ["chat-users", "operators", "tool-users"]
+
+# ─────────────────────────────────────────────────────────────
+# task.* — coordinator task lifecycle (create / update /
+# events / retry / cancel / lineage / todos).
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "task_create"
+method = "task.create"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_update"
+method = "task.update"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_get"
+method = "task.get"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_list"
+method = "task.list"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_list_cursor"
+method = "task.list_cursor"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_count"
+method = "task.count"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_event"
+method = "task.event"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_events"
+method = "task.events"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_recent_events"
+method = "task.recent_events"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_compact_events"
+method = "task.compact_events"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_attempts"
+method = "task.attempts"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_edges"
+method = "task.edges"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_recent_edges"
+method = "task.recent_edges"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_lineage"
+method = "task.lineage"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_subtree_metrics"
+method = "task.subtree_metrics"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_export"
+method = "task.export"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_session_export"
+method = "task.session_export"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_session_search"
+method = "task.session_search"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_recover"
+method = "task.recover"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_retry"
+method = "task.retry"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_replay"
+method = "task.replay"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_pause"
+method = "task.pause"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_resume"
+method = "task.resume"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_freeze"
+method = "task.freeze"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_unfreeze"
+method = "task.unfreeze"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_note"
+method = "task.note"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_mark_investigation"
+method = "task.mark_investigation"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_stuck"
+method = "task.stuck"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_interruption_check"
+method = "task.interruption_check"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "task_transition_check"
+method = "task.transition_check"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "task_observe_interruption"
+method = "task.observe_interruption"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "task_record_awaited"
+method = "task.record_awaited"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "task_record_delegated"
+method = "task.record_delegated"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "task_record_spawned"
+method = "task.record_spawned"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "task_todo_list"
+method = "task.todo_list"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_todo_set"
+method = "task.todo_set"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_todo_update"
+method = "task.todo_update"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# cron.* — scheduled-job surface.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "cron_create"
+method = "cron.create"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_list"
+method = "cron.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_get"
+method = "cron.get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_update"
+method = "cron.update"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_delete"
+method = "cron.delete"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "cron_trigger"
+method = "cron.trigger"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# delegate.* — child-task lifecycle for spawn / poll / cancel.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "delegate_spawn"
+method = "delegate.spawn"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "delegate_result"
+method = "delegate.result"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "delegate_cancel"
+method = "delegate.cancel"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "delegate_list"
+method = "delegate.list"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# agent.* — agent employee permissions CRUD.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "agent_create"
+method = "agent.create"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_get"
+method = "agent.get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_list"
+method = "agent.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_update"
+method = "agent.update"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_delete"
+method = "agent.delete"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_effective_capabilities"
+method = "agent.effective_capabilities"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_standing_approval_create"
+method = "agent.standing_approval.create"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_standing_approval_list"
+method = "agent.standing_approval.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_standing_approval_revoke"
+method = "agent.standing_approval.revoke"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# coord.approval.* + approval.* — operator approval queue.
+# coord.approval.get is one of the audit-2 test cases: a
+# deployment using this policy MUST be able to read approvals.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "coord_approval_pending"
+method = "coord.approval.pending"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "coord_approval_get"
+method = "coord.approval.get"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "coord_approval_decide"
+method = "coord.approval.decide"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "approval_deliver"
+method = "approval.deliver"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "approval_delivery_status"
+method = "approval.delivery_status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "approval_failed_deliveries"
+method = "approval.failed_deliveries"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "approval_list_pending"
+method = "approval.list_pending"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "approval_record_decision"
+method = "approval.record_decision"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# msg.* — agent-to-agent messaging.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "msg_send"
+method = "msg.send"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_inbox"
+method = "msg.inbox"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_read"
+method = "msg.read"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_thread"
+method = "msg.thread"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_delete"
+method = "msg.delete"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# planning.* — spec-driven multi-agent planning.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "planning_create_plan"
+method = "planning.create_plan"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_validate_spec"
+method = "planning.validate_spec"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_list_agents"
+method = "planning.list_agents"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_find_agents"
+method = "planning.find_agents"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_orchestrator_status"
+method = "planning.orchestrator_status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_approve_plan"
+method = "planning.approve_plan"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "planning_reject_plan"
+method = "planning.reject_plan"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "planning_list_approvals"
+method = "planning.list_approvals"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_get_approval"
+method = "planning.get_approval"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_verification_log"
+method = "planning.verification_log"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "planning_export_spec"
+method = "planning.export_spec"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# workflow.* — workflow engine surface.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "workflow_list"
+method = "workflow.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "workflow_run"
+method = "workflow.run"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "workflow_status"
+method = "workflow.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "workflow_validate"
+method = "workflow.validate"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "workflow_reload"
+method = "workflow.reload"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# credentials.* — vault surface. Read = chat-users, mutate =
+# operators.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "credentials_store"
+method = "credentials.store"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "credentials_get"
+method = "credentials.get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "credentials_list"
+method = "credentials.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "credentials_rotate"
+method = "credentials.rotate"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "credentials_revoke"
+method = "credentials.revoke"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "credentials_audit"
+method = "credentials.audit"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# identity.* — session tokens + research-backed identity.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "identity_issue_token"
+method = "identity.issue_token"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "identity_verify_token"
+method = "identity.verify_token"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "identity_revoke_token"
+method = "identity.revoke_token"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "identity_active_tokens"
+method = "identity.active_tokens"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "identity_research"
+method = "identity.research"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# routing.* — operator visibility into the smart-routing layer.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "routing_explain"
+method = "routing.explain"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "routing_list"
+method = "routing.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "routing_resolve"
+method = "routing.resolve"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# belief.* — operator-facing belief-tracker introspection.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "belief_get"
+method = "belief.get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "belief_reset"
+method = "belief.reset"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# judge.* + reasoning.* — verdict + reasoning-engine reads.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "judge_recent_verdicts"
+method = "judge.recent_verdicts"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "judge_stats"
+method = "judge.stats"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "reasoning_status"
+method = "reasoning.status"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# confidence.* — operator-facing confidence + self-consistency
+# stats.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "confidence_policy_list"
+method = "confidence.policy_list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "confidence_score_history"
+method = "confidence.score_history"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "confidence_reset_history"
+method = "confidence.reset_history"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "confidence_self_consistency_stats"
+method = "confidence.self_consistency_stats"
+allow_groups = ["chat-users", "operators"]
+
+# ─────────────────────────────────────────────────────────────
+# execution.* — transactional gateway + evidence surface.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "execution_rollback"
+method = "execution.rollback"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "execution_transaction_get"
+method = "execution.transaction_get"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "execution_evidence"
+method = "execution.evidence"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# metrics.* — per-agent metrics dashboards.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "metrics_agents"
+method = "metrics.agents"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_agent_summary"
+method = "metrics.agent_summary"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_method_breakdown"
+method = "metrics.method_breakdown"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_timeseries"
+method = "metrics.timeseries"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_alerts_active"
+method = "metrics.alerts_active"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_cost_report"
+method = "metrics.cost_report"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_cost_baselines"
+method = "metrics.cost_baselines"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_cost_spike_history"
+method = "metrics.cost_spike_history"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "metrics_ask_human_baselines"
+method = "metrics.ask_human_baselines"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# observability.* + pii.* — health summary + PII gate stats.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "observability_active_alerts"
+method = "observability.active_alerts"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "observability_alert_history"
+method = "observability.alert_history"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "observability_health_summary"
+method = "observability.health_summary"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "pii_scan_stats"
+method = "pii.scan_stats"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "pii_recent_events"
+method = "pii.recent_events"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# budget.* — RELIX-7.28 budget enforcer.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "budget_status"
+method = "budget.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "budget_reset"
+method = "budget.reset"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# training.* — training-data pipeline.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "training_list_interactions"
+method = "training.list_interactions"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "training_get_interaction"
+method = "training.get_interaction"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "training_delete_interaction"
+method = "training.delete_interaction"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "training_export"
+method = "training.export"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "training_score_interaction"
+method = "training.score_interaction"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "training_stats"
+method = "training.stats"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "training_pii_scan"
+method = "training.pii_scan"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "training_anonymize_preview"
+method = "training.anonymize_preview"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# router.* — controller-only heartbeats + operator reads.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "router_heartbeat"
+method = "router.heartbeat"
+allow_groups = ["controllers"]
+
+[[rules]]
+name = "router_log"
+method = "router.log"
+allow_groups = ["controllers"]
+
+[[rules]]
+name = "router_network_summary"
+method = "router.network_summary"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "router_session_list"
+method = "router.session_list"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# telegram.* — channel surface (status read + send + webhook
+# updates).
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "telegram_status"
+method = "telegram.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "telegram_health"
+method = "telegram.health"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "telegram_messages_recent"
+method = "telegram.messages_recent"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "telegram_send"
+method = "telegram.send"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "telegram_approval_send"
+method = "telegram.approval_send"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "telegram_webhook_update"
+method = "telegram.webhook_update"
+allow_groups = ["operators", "web-bridge-svc"]
+
+# ─────────────────────────────────────────────────────────────
+# discord.* — Discord channel surface.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "discord_status"
+method = "discord.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "discord_health"
+method = "discord.health"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "discord_messages_recent"
+method = "discord.messages_recent"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "discord_send"
+method = "discord.send"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "discord_approval_send"
+method = "discord.approval_send"
+allow_groups = ["operators", "controllers"]
+
+# ─────────────────────────────────────────────────────────────
+# slack.* — Slack channel surface.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "slack_status"
+method = "slack.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "slack_health"
+method = "slack.health"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "slack_messages_recent"
+method = "slack.messages_recent"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "slack_send"
+method = "slack.send"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "slack_approval_send"
+method = "slack.approval_send"
+allow_groups = ["operators", "controllers"]
+
+# ─────────────────────────────────────────────────────────────
+# email.* — outbound email + status reads.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "email_send"
+method = "email.send"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "email_send_template"
+method = "email.send_template"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "email_status"
+method = "email.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "email_messages_recent"
+method = "email.messages_recent"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "email_approval_send"
+method = "email.approval_send"
+allow_groups = ["operators", "controllers"]
+
+# ─────────────────────────────────────────────────────────────
+# plugin.* — plugin-host management surface. The `plugin_host.`
+# alias prefix is what .sflow callers see on the wire because
+# the parser preserves the dotted target (`step y:
+# plugin_host.plugin.list ""`). The runtime registers each
+# management cap under BOTH names so we admit both spellings.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "plugin_list"
+method = "plugin.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "plugin_status"
+method = "plugin.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "plugin_reload"
+method = "plugin.reload"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "plugin_disable"
+method = "plugin.disable"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "plugin_host_plugin_list"
+method = "plugin_host.plugin.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "plugin_host_plugin_status"
+method = "plugin_host.plugin.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "plugin_host_plugin_reload"
+method = "plugin_host.plugin.reload"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "plugin_host_plugin_disable"
+method = "plugin_host.plugin.disable"
+allow_groups = ["operators"]
+
+# ─────────────────────────────────────────────────────────────
+# Example plugins shipped under examples/plugins/. These rules
+# admit both the plugin-native method name AND the
+# `plugin_host.<method>` alias the .sflow parser preserves.
+# Operators replacing the example plugins remove these and add
+# rules for their own plugin methods.
+# ─────────────────────────────────────────────────────────────
+
+[[rules]]
+name = "hello_greet"
+method = "hello.greet"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "plugin_host_hello_greet"
+method = "plugin_host.hello.greet"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "web_lookup_fetch"
+method = "web_lookup.fetch"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "plugin_host_web_lookup_fetch"
+method = "plugin_host.web_lookup.fetch"
+allow_groups = ["chat-users", "operators"]

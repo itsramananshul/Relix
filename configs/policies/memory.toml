@@ -1,24 +1,273 @@
-# Memory node policy. Default deny; allow only chat-users for read/write.
+# Memory node policy. Admits the full memory + knowledge +
+# skill surface plus node.* discovery. Default deny; allow only
+# chat-users / operators / web-bridge-svc for read/write.
 
 [admit]
-groups = ["chat-users", "memory-admin", "web-bridge-svc"]
+groups = ["chat-users", "memory-admin", "web-bridge-svc", "operators", "controllers"]
+
+# ── memory.* — turn-based + agent memory ─────────────────────
 
 [[rules]]
-name = "chat_users_read_recent"
+name = "memory_recent_for_session"
 method = "memory.recent_for_session"
-allow_groups = ["chat-users", "web-bridge-svc"]
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
 
 [[rules]]
-name = "chat_users_search"
+name = "memory_search"
 method = "memory.search"
-allow_groups = ["chat-users", "web-bridge-svc"]
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
 
 [[rules]]
-name = "chat_users_write"
+name = "memory_search_turns"
+method = "memory.search_turns"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+[[rules]]
+name = "memory_session_search"
+method = "memory.session_search"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+[[rules]]
+name = "memory_records_search"
+method = "memory.records_search"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+[[rules]]
+name = "memory_write_turn"
 method = "memory.write_turn"
-allow_groups = ["chat-users", "web-bridge-svc"]
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
 
 [[rules]]
-name = "any_caller_health"
+name = "memory_agent_read"
+method = "memory.agent_read"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+[[rules]]
+name = "memory_agent_write"
+method = "memory.agent_write"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+[[rules]]
+name = "memory_agent_curate"
+method = "memory.agent_curate"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_curator_status"
+method = "memory.curator_status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_embed"
+method = "memory.embed"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+[[rules]]
+name = "memory_embed_all"
+method = "memory.embed_all"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_dialectic"
+method = "memory.dialectic"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_ingest_document"
+method = "memory.ingest_document"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_ingest_image"
+method = "memory.ingest_image"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_context_flush"
+method = "memory.context_flush"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_edit_record"
+method = "memory.edit_record"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_freeze_record"
+method = "memory.freeze_record"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_unfreeze_record"
+method = "memory.unfreeze_record"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_quarantine_list"
+method = "memory.quarantine_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_quarantine_approve"
+method = "memory.quarantine_approve"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_quarantine_reject"
+method = "memory.quarantine_reject"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_bulk_export"
+method = "memory.bulk_export"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_request_model_refresh"
+method = "memory.request_model_refresh"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_pii_scan"
+method = "memory.pii_scan"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_anonymize_preview"
+method = "memory.anonymize_preview"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "memory_bulk_anonymize"
+method = "memory.bulk_anonymize"
+allow_groups = ["operators"]
+
+# ── memory.skill_* — skill registry ─────────────────────────
+
+[[rules]]
+name = "memory_skill_store"
+method = "memory.skill_store"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_get"
+method = "memory.skill_get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_search"
+method = "memory.skill_search"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_stats"
+method = "memory.skill_stats"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_update"
+method = "memory.skill_update"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "memory_skill_deprecate"
+method = "memory.skill_deprecate"
+allow_groups = ["operators"]
+
+# ── knowledge.* — cross-node transfer ───────────────────────
+
+[[rules]]
+name = "knowledge_share"
+method = "knowledge.share"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_accept_shared"
+method = "knowledge.accept_shared"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "knowledge_group_broadcast"
+method = "knowledge.group_broadcast"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_groups"
+method = "knowledge.groups"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_list_shared"
+method = "knowledge.list_shared"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_recall"
+method = "knowledge.recall"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "knowledge_revoke"
+method = "knowledge.revoke"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "knowledge_autoshare_stats"
+method = "knowledge.autoshare_stats"
+allow_groups = ["operators"]
+
+# ── node.* — discovery + introspection ──────────────────────
+
+[[rules]]
+name = "node_health"
 method = "node.health"
-allow_groups = ["chat-users", "memory-admin", "web-bridge-svc", "ai-svc", "tool-svc", "guest"]
+allow_groups = [
+  "chat-users",
+  "memory-admin",
+  "web-bridge-svc",
+  "ai-svc",
+  "tool-svc",
+  "operators",
+  "controllers",
+  "guest",
+]
+
+[[rules]]
+name = "node_manifest"
+method = "node.manifest"
+allow_groups = ["chat-users", "memory-admin", "web-bridge-svc", "operators", "controllers"]
+
+[[rules]]
+name = "node_dispatch_stats"
+method = "node.dispatch.stats"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "node_policy_simulate"
+method = "node.policy.simulate"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_recent_denials"
+method = "node.policy.recent_denials"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_list"
+method = "node.policy.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_get"
+method = "node.policy.tenant_get"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_list"
+method = "node.audit.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_recent"
+method = "node.audit.tenant_recent"
+allow_groups = ["operators"]

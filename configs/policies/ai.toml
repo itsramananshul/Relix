@@ -1,14 +1,110 @@
-# AI node policy.
+# AI node policy. Admits the AI provider surface (chat / embed
+# / perception_extract) plus node.* discovery so the bridge can
+# manifest-discover the node and so operators can introspect
+# dispatch stats and tenant-scoped policies.
 
 [admit]
-groups = ["chat-users", "web-bridge-svc"]
+groups = ["chat-users", "web-bridge-svc", "operators", "controllers"]
+
+# ── ai.* — provider surface ────────────────────────────────
 
 [[rules]]
-name = "chat_users_chat"
+name = "ai_chat"
 method = "ai.chat"
-allow_groups = ["chat-users", "web-bridge-svc"]
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
 
 [[rules]]
-name = "any_caller_health"
+name = "ai_embed"
+method = "ai.embed"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+[[rules]]
+name = "ai_perception_extract"
+method = "ai.perception_extract"
+allow_groups = ["chat-users", "web-bridge-svc", "operators"]
+
+# ── node.* — discovery + introspection ─────────────────────
+
+[[rules]]
+name = "node_health"
 method = "node.health"
-allow_groups = ["chat-users", "web-bridge-svc", "memory-admin", "tool-svc", "guest"]
+allow_groups = [
+  "chat-users",
+  "web-bridge-svc",
+  "operators",
+  "controllers",
+  "memory-admin",
+  "tool-svc",
+  "guest",
+]
+
+# Without admitting node.manifest, the bridge cannot discover
+# what capabilities this peer exposes — the audit-2 CRIT.
+[[rules]]
+name = "node_manifest"
+method = "node.manifest"
+allow_groups = ["chat-users", "web-bridge-svc", "operators", "controllers"]
+
+[[rules]]
+name = "node_dispatch_stats"
+method = "node.dispatch.stats"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "node_policy_simulate"
+method = "node.policy.simulate"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_recent_denials"
+method = "node.policy.recent_denials"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_list"
+method = "node.policy.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_get"
+method = "node.policy.tenant_get"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_list"
+method = "node.audit.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_recent"
+method = "node.audit.tenant_recent"
+allow_groups = ["operators"]
+
+# ── budget.* — RELIX-7.28 enforcer reads ───────────────────
+
+[[rules]]
+name = "budget_status"
+method = "budget.status"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "budget_reset"
+method = "budget.reset"
+allow_groups = ["operators"]
+
+# ── observability + pii — colocated with AI on small deploys
+
+[[rules]]
+name = "observability_health_summary"
+method = "observability.health_summary"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "pii_scan_stats"
+method = "pii.scan_stats"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "pii_recent_events"
+method = "pii.recent_events"
+allow_groups = ["operators"]

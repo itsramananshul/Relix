@@ -1,22 +1,77 @@
 # Web bridge node policy.
-# The web bridge accepts inbound chat invocations from the local HTTP server
-# (which presents the logged-in user's identity to the controller), then
-# initiates outbound RPCs to memory / AI / tool peers under that identity.
+# The web bridge accepts inbound chat invocations from the local
+# HTTP server (which presents the logged-in user's identity to
+# the controller), then initiates outbound RPCs to memory / AI /
+# tool / coordinator peers under that identity.
 
 [admit]
-groups = ["chat-users", "tool-users", "guest"]
+groups = ["chat-users", "tool-users", "operators", "controllers", "guest", "web-bridge-svc"]
+
+# ── HTTP-internal surfaces. The bridge registers these as
+# its own coordinator capabilities so admission flows the same
+# way as a peer-to-peer call.
 
 [[rules]]
 name = "chat_users_chat"
 method = "chat"
-allow_groups = ["chat-users"]
+allow_groups = ["chat-users", "operators"]
 
 [[rules]]
 name = "tool_users_chat_with_tool"
 method = "chat_with_tool"
-allow_groups = ["tool-users"]
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+# ── node.* — discovery / health ─────────────────────────────
 
 [[rules]]
-name = "any_caller_health"
+name = "node_health"
 method = "node.health"
-allow_groups = ["chat-users", "tool-users", "guest", "memory-admin", "web-bridge-svc"]
+allow_groups = [
+  "chat-users",
+  "tool-users",
+  "operators",
+  "controllers",
+  "memory-admin",
+  "web-bridge-svc",
+  "guest",
+]
+
+[[rules]]
+name = "node_manifest"
+method = "node.manifest"
+allow_groups = ["chat-users", "tool-users", "operators", "controllers", "web-bridge-svc"]
+
+[[rules]]
+name = "node_dispatch_stats"
+method = "node.dispatch.stats"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "node_policy_simulate"
+method = "node.policy.simulate"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_recent_denials"
+method = "node.policy.recent_denials"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_list"
+method = "node.policy.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_get"
+method = "node.policy.tenant_get"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_list"
+method = "node.audit.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_recent"
+method = "node.audit.tenant_recent"
+allow_groups = ["operators"]

@@ -1,14 +1,306 @@
-# Tool node policy. Only tool-users may invoke tools.
+# Tool node policy. Admits the full tool.* surface plus node.*
+# discovery. `tool-users` is the default group for routine
+# tool calls; `operators` gets the destructive `terminal.*`
+# shell surface and the audit reads.
 
 [admit]
-groups = ["tool-users", "web-bridge-svc"]
+groups = ["tool-users", "web-bridge-svc", "chat-users", "operators", "controllers"]
+
+# ── tool.read/write/list/search/patch ────────────────────────
 
 [[rules]]
-name = "tool_users_fetch"
+name = "tool_read_file"
+method = "tool.read_file"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_write_file"
+method = "tool.write_file"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_append_file"
+method = "tool.append_file"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_list_dir"
+method = "tool.list_dir"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_search_files"
+method = "tool.search_files"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_patch"
+method = "tool.patch"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_patch_preview"
+method = "tool.patch_preview"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_fuzzy_replace"
+method = "tool.fuzzy_replace"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_binary_sniff"
+method = "tool.binary_sniff"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_pdf"
+method = "tool.pdf"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_parse_document"
+method = "tool.parse_document"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_text_chunk"
+method = "tool.text.chunk"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_screen"
+method = "tool.screen"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_fs_stat"
+method = "tool.fs.stat"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_fs_tree"
+method = "tool.fs.tree"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_fs_audit_recent"
+method = "tool.fs.audit_recent"
+allow_groups = ["operators"]
+
+# ── tool.web.* — outbound HTTP ──────────────────────────────
+
+[[rules]]
+name = "tool_web_fetch"
 method = "tool.web_fetch"
-allow_groups = ["tool-users", "web-bridge-svc"]
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
 
 [[rules]]
-name = "any_caller_health"
+name = "tool_web_get"
+method = "tool.web_get"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_web_read"
+method = "tool.web_read"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_web_extract"
+method = "tool.web_extract"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_web_search"
+method = "tool.web_search"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_web_post"
+method = "tool.web.post"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_web_robots_check"
+method = "tool.web.robots_check"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_web_blocklist_summary"
+method = "tool.web.blocklist_summary"
+allow_groups = ["operators"]
+
+# ── tool.browser.* — browser automation ─────────────────────
+
+[[rules]]
+name = "tool_browser_open_session"
+method = "tool.browser.open_session"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_close_session"
+method = "tool.browser.close_session"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_list_sessions"
+method = "tool.browser.list_sessions"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_navigate"
+method = "tool.browser.navigate"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_get_text"
+method = "tool.browser.get_text"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_click"
+method = "tool.browser.click"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_type_text"
+method = "tool.browser.type_text"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_wait_for_selector"
+method = "tool.browser.wait_for_selector"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_screenshot"
+method = "tool.browser.screenshot"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_browser_capture_read"
+method = "tool.browser.capture_read"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+# ── tool.terminal.* — shell-execution; operator-restricted ──
+
+[[rules]]
+name = "tool_terminal_run"
+method = "tool.terminal.run"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_spawn"
+method = "tool.terminal.spawn"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_cancel"
+method = "tool.terminal.cancel"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_sessions"
+method = "tool.terminal.sessions"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_tail"
+method = "tool.terminal.tail"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_audit_recent"
+method = "tool.terminal.audit_recent"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "tool_terminal_shell_open"
+method = "tool.terminal.shell.open"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_shell_close"
+method = "tool.terminal.shell.close"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_shell_input"
+method = "tool.terminal.shell.input"
+allow_groups = ["operators", "tool-users"]
+
+[[rules]]
+name = "tool_terminal_shell_control"
+method = "tool.terminal.shell.control"
+allow_groups = ["operators", "tool-users"]
+
+# ── tool.mcp.* — Model Context Protocol bridge ──────────────
+
+[[rules]]
+name = "tool_mcp_list_servers"
+method = "tool.mcp.list_servers"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_mcp_list_tools"
+method = "tool.mcp.list_tools"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_mcp_invoke"
+method = "tool.mcp.invoke"
+allow_groups = ["tool-users", "chat-users", "operators"]
+
+# ── node.* ──────────────────────────────────────────────────
+
+[[rules]]
+name = "node_health"
 method = "node.health"
-allow_groups = ["tool-users", "web-bridge-svc", "guest", "chat-users"]
+allow_groups = [
+  "tool-users",
+  "web-bridge-svc",
+  "operators",
+  "controllers",
+  "chat-users",
+  "guest",
+]
+
+[[rules]]
+name = "node_manifest"
+method = "node.manifest"
+allow_groups = ["tool-users", "web-bridge-svc", "operators", "controllers", "chat-users"]
+
+[[rules]]
+name = "node_dispatch_stats"
+method = "node.dispatch.stats"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "node_policy_simulate"
+method = "node.policy.simulate"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_recent_denials"
+method = "node.policy.recent_denials"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_list"
+method = "node.policy.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_policy_tenant_get"
+method = "node.policy.tenant_get"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_list"
+method = "node.audit.tenant_list"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "node_audit_tenant_recent"
+method = "node.audit.tenant_recent"
+allow_groups = ["operators"]
