@@ -892,6 +892,87 @@ struct ChatPreflight {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// SEC PART 5: parse `ai.chat` args from EITHER the new
+/// JSON object form (`{"session_id":"…","prompt":"…","history":"…"}`)
+/// OR the legacy pipe-delimited form (`session_id|prompt|history`).
+/// The pipe-delimited form corrupts on `|` characters in
+/// `session_id` or `prompt`; JSON is unambiguous so the
+/// planning callers all send JSON now. Pre-existing callers
+/// (SOL flows, the CLI, etc.) keep working through the
+/// pipe-delimited fallback.
+fn parse_ai_chat_args(args: &[u8]) -> Result<(String, String, String), ErrorEnvelope> {
+    let s = match std::str::from_utf8(args) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(ErrorEnvelope {
+                kind: error_kinds::INVALID_ARGS,
+                cause: format!("ai.chat arg utf8: {e}"),
+                retry_hint: 2,
+                retry_after: None,
+            });
+        }
+    };
+    let trimmed = s.trim_start();
+    if trimmed.starts_with('{') {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            session_id: String,
+            prompt: String,
+            #[serde(default)]
+            history: String,
+        }
+        match serde_json::from_str::<Wire>(trimmed) {
+            Ok(w) => {
+                if w.session_id.is_empty() {
+                    return Err(ErrorEnvelope {
+                        kind: error_kinds::INVALID_ARGS,
+                        cause: "ai.chat: session_id required".to_string(),
+                        retry_hint: 2,
+                        retry_after: None,
+                    });
+                }
+                return Ok((w.session_id, w.prompt, w.history));
+            }
+            Err(e) => {
+                return Err(ErrorEnvelope {
+                    kind: error_kinds::INVALID_ARGS,
+                    cause: format!("ai.chat JSON args decode: {e}"),
+                    retry_hint: 2,
+                    retry_after: None,
+                });
+            }
+        }
+    }
+    let mut parts = s.splitn(3, '|');
+    let session_id = parts.next().unwrap_or("");
+    let prompt = parts.next();
+    let history = parts.next().unwrap_or("");
+    let Some(prompt) = prompt else {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "ai.chat arg must be JSON object {session_id,prompt[,history]} \
+                    or legacy pipe-delimited `session_id|prompt[|history]`"
+                .to_string(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    };
+    if session_id.is_empty() {
+        return Err(ErrorEnvelope {
+            kind: error_kinds::INVALID_ARGS,
+            cause: "ai.chat: session_id required".to_string(),
+            retry_hint: 2,
+            retry_after: None,
+        });
+    }
+    Ok((
+        session_id.to_string(),
+        prompt.to_string(),
+        history.to_string(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn build_chat_preflight(
     args: &[u8],
     provider: &Arc<dyn ChatProvider>,
@@ -913,26 +994,11 @@ async fn build_chat_preflight(
             });
         }
     };
-    let mut parts = s.splitn(3, '|');
-    let session_id = parts.next().unwrap_or("");
-    let prompt = parts.next();
-    let history = parts.next().unwrap_or("");
-    let Some(prompt) = prompt else {
-        return Err(ErrorEnvelope {
-            kind: error_kinds::INVALID_ARGS,
-            cause: "ai.chat arg must be `session_id|prompt[|history]`".to_string(),
-            retry_hint: 2,
-            retry_after: None,
-        });
-    };
-    if session_id.is_empty() {
-        return Err(ErrorEnvelope {
-            kind: error_kinds::INVALID_ARGS,
-            cause: "ai.chat: session_id required".to_string(),
-            retry_hint: 2,
-            retry_after: None,
-        });
-    }
+    // SEC PART 5: JSON-first, pipe-fallback decoder.
+    let (session_id_owned, prompt_owned, history_owned) = parse_ai_chat_args(args)?;
+    let session_id = session_id_owned.as_str();
+    let prompt = prompt_owned.as_str();
+    let history = history_owned.as_str();
 
     // Input guardrail. Same posture as `handle_chat`.
     let guardrail_result = input_guardrail.check(prompt);
@@ -1444,27 +1510,15 @@ async fn handle_chat(
             });
         }
     };
-    // session_id | prompt | history. `history` may contain `|` so splitn(3).
-    let mut parts = s.splitn(3, '|');
-    let session_id = parts.next().unwrap_or("");
-    let prompt = parts.next();
-    let history = parts.next().unwrap_or("");
-    let Some(prompt) = prompt else {
-        return HandlerOutcome::Err(ErrorEnvelope {
-            kind: error_kinds::INVALID_ARGS,
-            cause: "ai.chat arg must be `session_id|prompt[|history]`".to_string(),
-            retry_hint: 2,
-            retry_after: None,
-        });
+    // SEC PART 5: JSON-first, pipe-fallback. See
+    // [`parse_ai_chat_args`].
+    let (session_id_owned, prompt_owned, history_owned) = match parse_ai_chat_args(&ctx.args) {
+        Ok(t) => t,
+        Err(env) => return HandlerOutcome::Err(env),
     };
-    if session_id.is_empty() {
-        return HandlerOutcome::Err(ErrorEnvelope {
-            kind: error_kinds::INVALID_ARGS,
-            cause: "ai.chat: session_id required".to_string(),
-            retry_hint: 2,
-            retry_after: None,
-        });
-    }
+    let session_id = session_id_owned.as_str();
+    let prompt = prompt_owned.as_str();
+    let history = history_owned.as_str();
 
     // Input guardrail. Runs before any model work so a
     // blocked prompt costs nothing past the substring scan +
@@ -2535,6 +2589,47 @@ mod tests {
     use super::*;
     use relix_core::identity::VerifiedIdentity;
     use relix_core::types::{NodeId, RequestId, TraceId};
+
+    // ── SEC PART 5: JSON-first arg parsing ────────────────
+
+    #[test]
+    fn parse_ai_chat_args_pipe_form_round_trips() {
+        let (sid, p, h) = parse_ai_chat_args(b"sess-1|hello world|prior turns").unwrap();
+        assert_eq!(sid, "sess-1");
+        assert_eq!(p, "hello world");
+        assert_eq!(h, "prior turns");
+    }
+
+    #[test]
+    fn parse_ai_chat_args_json_form_round_trips() {
+        let body = br#"{"session_id":"sess-1","prompt":"hello","history":"prior"}"#;
+        let (sid, p, h) = parse_ai_chat_args(body).unwrap();
+        assert_eq!(sid, "sess-1");
+        assert_eq!(p, "hello");
+        assert_eq!(h, "prior");
+    }
+
+    #[test]
+    fn pipe_in_session_id_corrupts_pipe_form_but_json_is_clean() {
+        // Pre-fix: pipe-delimited form puts the `|` inside
+        // session_id into the prompt position. JSON args
+        // are unambiguous.
+        let (sid_pipe, p_pipe, _) = parse_ai_chat_args(b"sess|pwned|hello").unwrap();
+        assert_eq!(sid_pipe, "sess");
+        assert_eq!(p_pipe, "pwned");
+        let body = br#"{"session_id":"sess|pwned","prompt":"hello"}"#;
+        let (sid_json, p_json, _) = parse_ai_chat_args(body).unwrap();
+        assert_eq!(sid_json, "sess|pwned");
+        assert_eq!(p_json, "hello");
+    }
+
+    #[test]
+    fn parse_ai_chat_args_rejects_empty_session_id() {
+        let err = parse_ai_chat_args(b"|prompt").unwrap_err();
+        assert!(err.cause.contains("session_id required"));
+        let err = parse_ai_chat_args(br#"{"session_id":"","prompt":"x"}"#).unwrap_err();
+        assert!(err.cause.contains("session_id required"));
+    }
 
     fn ctx(args: &[u8]) -> InvocationCtx {
         InvocationCtx {

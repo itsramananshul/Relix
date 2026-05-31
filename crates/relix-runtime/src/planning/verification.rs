@@ -313,7 +313,13 @@ impl VerificationHarness {
     async fn evaluate_ai_judge(&self, criterion: &str, output: &str) -> (bool, String) {
         let prompt = build_ai_judge_prompt(criterion, output);
         let session_id = format!("planning-verify-{}", short_rand_id());
-        let arg = format!("{session_id}|{prompt}");
+        // SEC PART 5: JSON-encoded args; see critic.rs.
+        let arg = serde_json::json!({
+            "session_id": session_id,
+            "prompt": prompt,
+            "history": "",
+        })
+        .to_string();
         match self
             .dispatcher
             .dispatch(&self.cfg.verifier_peer, "ai.chat", arg.as_bytes())

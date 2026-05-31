@@ -320,7 +320,13 @@ impl Orchestrator {
     async fn decompose_goal(&self, spec: &PlanSpec) -> (Vec<String>, bool) {
         let prompt = build_decomposition_prompt(spec, &self.registry);
         let session_id = format!("planning-orchestrator-{}", short_rand_id());
-        let arg = format!("{session_id}|{prompt}");
+        // SEC PART 5: JSON-encoded args; see critic.rs.
+        let arg = serde_json::json!({
+            "session_id": session_id,
+            "prompt": prompt,
+            "history": "",
+        })
+        .to_string();
         match self
             .dispatcher
             .dispatch(&self.cfg.orchestrator_peer, "ai.chat", arg.as_bytes())

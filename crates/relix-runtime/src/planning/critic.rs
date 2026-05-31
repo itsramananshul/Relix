@@ -281,7 +281,15 @@ impl CriticLoop {
     async fn invoke_critic(&self, workflow: &Workflow, spec: &PlanSpec) -> CriticVerdict {
         let prompt = build_critic_prompt(workflow, spec);
         let session_id = format!("planning-critic-{}", short_rand_id());
-        let arg = format!("{session_id}|{prompt}");
+        // SEC PART 5: JSON-encoded args so a `|` byte in
+        // session_id or prompt can't corrupt the receiver's
+        // parsing.
+        let arg = serde_json::json!({
+            "session_id": session_id,
+            "prompt": prompt,
+            "history": "",
+        })
+        .to_string();
         match self
             .dispatcher
             .dispatch(&self.cfg.critic_peer, "ai.chat", arg.as_bytes())
