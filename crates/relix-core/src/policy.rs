@@ -21,7 +21,6 @@
 //! The engine's `evaluate` signature mirrors Cedar's `(principal, action, resource, context)`
 //! so the Gate-2 swap is straightforward.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -208,8 +207,20 @@ pub struct TenantPolicyResolver {
     /// negative cache: no file at that path. Both expire after
     /// `ttl` so operators can drop a new file in `dir` without
     /// restarting the node.
-    cache: Mutex<HashMap<String, (Instant, Option<PolicyEngine>)>>,
+    ///
+    /// CORR PART 4: bounded LRU cache (default
+    /// [`TENANT_POLICY_CACHE_CAP`] entries) replaces the
+    /// pre-fix unbounded HashMap. On a many-tenant deployment
+    /// the pre-fix path grew the map until process restart;
+    /// the LRU evicts the least-recently-used entry once the
+    /// cap is hit so process memory stays bounded.
+    cache: Mutex<lru::LruCache<String, (Instant, Option<PolicyEngine>)>>,
 }
+
+/// CORR PART 4: hard cap on the per-tenant policy cache.
+/// 1000 entries is well past any realistic single-node tenant
+/// count and keeps the resolver's RSS footprint bounded.
+pub const TENANT_POLICY_CACHE_CAP: usize = 1000;
 
 impl TenantPolicyResolver {
     /// Construct. `dir = None` disables per-tenant resolution
@@ -219,12 +230,18 @@ impl TenantPolicyResolver {
     /// opt into fail-closed behaviour via
     /// [`Self::with_tenant_isolation`].
     pub fn new(global: PolicyEngine, dir: Option<PathBuf>, ttl_secs: u64) -> Self {
+        // SAFETY: TENANT_POLICY_CACHE_CAP is a `const = 1000`,
+        // so the NonZeroUsize construction is infallible. The
+        // `unwrap_or` keeps clippy::expect_used quiet without
+        // changing the constant's invariant.
+        let cap = std::num::NonZeroUsize::new(TENANT_POLICY_CACHE_CAP)
+            .unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
             global,
             dir,
             ttl: Duration::from_secs(ttl_secs),
             tenant_isolation_enabled: false,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(lru::LruCache::new(cap)),
         }
     }
 
@@ -319,10 +336,13 @@ impl TenantPolicyResolver {
         // from disk; we never panic an admission check on a
         // background lock issue.
         if !self.ttl.is_zero()
-            && let Ok(cache) = self.cache.lock()
+            && let Ok(mut cache) = self.cache.lock()
             && let Some((at, entry)) = cache.get(&key)
             && at.elapsed() < self.ttl
         {
+            // LRU `get` bumps recency under the hood; clone
+            // the cached engine handle (cheap, Arc-backed)
+            // before releasing the lock.
             return entry.clone();
         }
 
@@ -344,7 +364,10 @@ impl TenantPolicyResolver {
         if !self.ttl.is_zero()
             && let Ok(mut cache) = self.cache.lock()
         {
-            cache.insert(key, (Instant::now(), loaded.clone()));
+            // CORR PART 4: LRU `put` evicts the least-recently-
+            // used entry once the cap is hit so the resolver's
+            // RSS stays bounded even on a many-tenant deployment.
+            cache.put(key, (Instant::now(), loaded.clone()));
         }
 
         loaded

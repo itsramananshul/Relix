@@ -33,8 +33,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
 use relix_core::types::RequestId;
 
 use super::pricing::PriceTable;
@@ -77,7 +75,12 @@ pub trait MetricsSink: Send + Sync {
 /// Production sink. Cheap to clone (couple of `Arc`s).
 #[derive(Clone)]
 pub struct MetricsCollector {
-    tx: mpsc::UnboundedSender<InvocationMetric>,
+    /// CORR PART 4: bounded drop-oldest channel replaces the
+    /// pre-fix `mpsc::UnboundedSender`. A stuck drain task
+    /// used to let the queue grow without bound; the bounded
+    /// channel evicts the oldest entry at the [`METRICS_CHANNEL_CAP`]
+    /// boundary so the latest signal is always preserved.
+    channel: BoundedDropOldestChannel<InvocationMetric>,
     hints: Arc<Mutex<HashMap<RequestId, AiUsageHint>>>,
     /// RELIX-7.19 GAP 3: per-request provider-signals join
     /// cache. Bounded by [`HINT_CACHE_CAP`]; FIFO-cleared on
@@ -112,14 +115,139 @@ pub const BATCH_INTERVAL_MS: u64 = 100;
 /// Maximum number of metrics flushed in one transaction.
 pub const BATCH_SIZE: usize = 100;
 
+/// CORR PART 4: hard cap on the in-flight metrics queue. The
+/// pre-fix path used `mpsc::unbounded_channel` so a stuck drain
+/// task (DB locked, fsync stall) let the queue grow without
+/// limit. The bounded queue drops the OLDEST entry once the
+/// cap is hit so the latest signal is always preserved and the
+/// dropped_hints counter exposes the symptom to operators.
+pub const METRICS_CHANNEL_CAP: usize = 10_000;
+
+/// CORR PART 4: bounded, drop-oldest queue used by the metrics
+/// collector + training recorder. Cheap to clone — backed by
+/// `Arc<Mutex<VecDeque>>` + `Notify` so the sender can evict
+/// the oldest entry (tokio::sync::mpsc only supports drop-
+/// newest via try_send).
+pub struct BoundedDropOldestChannel<T> {
+    inner: Arc<BoundedDropOldestInner<T>>,
+}
+
+struct BoundedDropOldestInner<T> {
+    queue: Mutex<std::collections::VecDeque<T>>,
+    notify: tokio::sync::Notify,
+    cap: usize,
+    dropped: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl<T> Clone for BoundedDropOldestChannel<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> BoundedDropOldestChannel<T> {
+    /// New empty channel with `cap` entries of headroom.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            inner: Arc::new(BoundedDropOldestInner {
+                queue: Mutex::new(std::collections::VecDeque::with_capacity(cap.min(1024))),
+                notify: tokio::sync::Notify::new(),
+                cap: cap.max(1),
+                dropped: std::sync::atomic::AtomicU64::new(0),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Push a value. When the queue is at capacity the
+    /// oldest entry is evicted and the dropped counter is
+    /// bumped. Never blocks. Wakes one parked receiver.
+    pub fn send(&self, value: T) {
+        let mut q = self.inner.queue.lock().unwrap_or_else(|e| {
+            tracing::warn!("BoundedDropOldestChannel mutex poisoned; recovering inner state");
+            e.into_inner()
+        });
+        while q.len() >= self.inner.cap {
+            q.pop_front();
+            self.inner
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        q.push_back(value);
+        drop(q);
+        self.inner.notify.notify_one();
+    }
+
+    /// Drain up to `max` entries from the front, returning
+    /// them in insertion order. Empty Vec when the queue
+    /// is empty.
+    pub fn try_drain(&self, max: usize) -> Vec<T> {
+        let mut q = self.inner.queue.lock().unwrap_or_else(|e| {
+            tracing::warn!("BoundedDropOldestChannel mutex poisoned; recovering inner state");
+            e.into_inner()
+        });
+        let n = max.min(q.len());
+        q.drain(..n).collect()
+    }
+
+    /// Number of items dropped from the front due to cap
+    /// pressure since this channel was created.
+    pub fn dropped_count(&self) -> u64 {
+        self.inner
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mark the channel closed and wake any parked receiver
+    /// so it can observe the close and exit.
+    pub fn close(&self) {
+        self.inner
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Block (async) until the queue has at least one entry or
+    /// the channel is closed. Returns `false` when the channel
+    /// was closed AND the queue is empty.
+    pub async fn wait(&self) -> bool {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            {
+                let q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if !q.is_empty() {
+                    return true;
+                }
+                if self.is_closed() {
+                    return false;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
 impl MetricsCollector {
     /// Build a collector around the given `store` + price
     /// table. The drain + retention tasks are spawned via
     /// [`MetricsCollector::spawn_workers`].
     pub fn new(store: MetricsStore, prices: PriceTable) -> (Self, MetricsWorkerHandles) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        // CORR PART 4: bounded drop-oldest channel replaces the
+        // pre-fix unbounded mpsc. A stuck drain task (DB locked,
+        // fsync stall) used to let the queue grow without
+        // limit; the bounded channel evicts the oldest entry
+        // once the cap is hit.
+        let channel = BoundedDropOldestChannel::<InvocationMetric>::new(METRICS_CHANNEL_CAP);
         let collector = Self {
-            tx,
+            channel: channel.clone(),
             hints: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
             provider_signals: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
             self_consistency: Arc::new(Mutex::new(HashMap::with_capacity(HINT_CACHE_CAP))),
@@ -129,7 +257,7 @@ impl MetricsCollector {
         };
         let handles = MetricsWorkerHandles {
             store,
-            receiver: Some(rx),
+            channel: Some(channel),
         };
         (collector, handles)
     }
@@ -168,6 +296,13 @@ impl MetricsCollector {
         };
         *g = Some(enforcer);
     }
+
+    /// CORR PART 4: lifetime count of metrics dropped from the
+    /// front of the queue due to cap pressure. Operators read
+    /// this via the dashboard to detect a stuck drain task.
+    pub fn dropped_count(&self) -> u64 {
+        self.channel.dropped_count()
+    }
 }
 
 impl MetricsSink for MetricsCollector {
@@ -188,19 +323,11 @@ impl MetricsSink for MetricsCollector {
                 e.invalidate_agent(&m.agent_name);
             }
         }
-        match self.tx.send(m) {
-            Ok(()) => {}
-            Err(_) => {
-                // Receiver dropped — drain task is gone. We
-                // never want to panic on the hot path. The
-                // first error is loud (warn); subsequent
-                // attempts silently drop because the controller
-                // will be tearing down anyway.
-                tracing::warn!(
-                    "metrics: drain task receiver dropped; further metrics will be silently lost"
-                );
-            }
-        }
+        // CORR PART 4: bounded drop-oldest send. Never blocks
+        // and never panics; when the queue is at cap the
+        // oldest entry is evicted and the `dropped_count`
+        // counter is bumped.
+        self.channel.send(m);
     }
 
     fn attach_ai_usage(&self, hint: AiUsageHint) {
@@ -274,7 +401,10 @@ fn take_hint(
 /// drain loop exits when the collector's sender is dropped.
 pub struct MetricsWorkerHandles {
     store: MetricsStore,
-    receiver: Option<mpsc::UnboundedReceiver<InvocationMetric>>,
+    /// CORR PART 4: the receiver side of the bounded drop-
+    /// oldest channel. Holds an `Arc` clone of the same
+    /// channel the collector pushes into.
+    channel: Option<BoundedDropOldestChannel<InvocationMetric>>,
 }
 
 /// Retention configuration handed to the worker.
@@ -302,13 +432,13 @@ impl MetricsWorkerHandles {
     /// current tokio runtime. Returns `JoinHandle`s purely
     /// for tests; production code drops them.
     pub fn spawn(self, retention: RetentionConfig) -> SpawnedMetrics {
-        let rx = self
-            .receiver
+        let channel = self
+            .channel
             .expect("MetricsWorkerHandles::spawn called twice");
         let drain_store = self.store.clone();
         let retention_store = self.store.clone();
         let drain = tokio::spawn(async move {
-            run_drain_loop(rx, drain_store).await;
+            run_drain_loop(channel, drain_store).await;
         });
         let retention_task = tokio::spawn(async move {
             run_retention_loop(retention_store, retention).await;
@@ -326,30 +456,36 @@ pub struct SpawnedMetrics {
     pub retention: tokio::task::JoinHandle<()>,
 }
 
-async fn run_drain_loop(mut rx: mpsc::UnboundedReceiver<InvocationMetric>, store: MetricsStore) {
+async fn run_drain_loop(channel: BoundedDropOldestChannel<InvocationMetric>, store: MetricsStore) {
     let mut batch: Vec<InvocationMetric> = Vec::with_capacity(BATCH_SIZE);
     let mut tick = tokio::time::interval(Duration::from_millis(BATCH_INTERVAL_MS));
     // Skip the first immediate tick — interval fires at t=0.
     tick.tick().await;
     loop {
+        // CORR PART 4: drain the bounded channel in batches.
+        // Drain on either a new push (notify) or a flush
+        // tick, whichever comes first.
         tokio::select! {
             biased;
-            recv = rx.recv() => {
-                match recv {
-                    Some(m) => {
-                        batch.push(m);
-                        if batch.len() >= BATCH_SIZE {
-                            flush_batch(&store, &mut batch);
-                        }
-                    }
-                    None => {
-                        // Sender dropped — flush remaining and exit.
+            present = channel.wait() => {
+                if !present {
+                    // Channel closed AND queue empty.
+                    flush_batch(&store, &mut batch);
+                    return;
+                }
+                let drained = channel.try_drain(BATCH_SIZE);
+                for m in drained {
+                    batch.push(m);
+                    if batch.len() >= BATCH_SIZE {
                         flush_batch(&store, &mut batch);
-                        return;
                     }
                 }
             }
             _ = tick.tick() => {
+                let drained = channel.try_drain(BATCH_SIZE);
+                for m in drained {
+                    batch.push(m);
+                }
                 if !batch.is_empty() {
                     flush_batch(&store, &mut batch);
                 }
@@ -400,13 +536,10 @@ pub(crate) fn now_ms() -> i64 {
 /// Drains the channel until empty.
 #[cfg(test)]
 pub fn flush_for_test(
-    rx: &mut mpsc::UnboundedReceiver<InvocationMetric>,
+    channel: &BoundedDropOldestChannel<InvocationMetric>,
     store: &MetricsStore,
 ) -> Result<usize, MetricsStoreError> {
-    let mut batch = Vec::new();
-    while let Ok(m) = rx.try_recv() {
-        batch.push(m);
-    }
+    let batch = channel.try_drain(usize::MAX);
     let n = batch.len();
     store.insert_batch(&batch)?;
     Ok(n)
@@ -620,5 +753,29 @@ mod tests {
             "expected ≤10 after overflow, got {}",
             g.len()
         );
+    }
+
+    // ── CORR PART 4: bounded drop-oldest channel ─────────
+
+    #[test]
+    fn corr_p4_bounded_channel_drops_oldest_on_overflow() {
+        // Push cap+5 entries; expect the channel to keep the
+        // most recent `cap` and report 5 drops.
+        let cap = 4usize;
+        let ch = BoundedDropOldestChannel::<u32>::new(cap);
+        for i in 0..(cap + 5) {
+            ch.send(i as u32);
+        }
+        let drained = ch.try_drain(100);
+        assert_eq!(drained, vec![5, 6, 7, 8], "must keep the newest cap items");
+        assert_eq!(ch.dropped_count(), 5, "must report all evictions");
+    }
+
+    #[tokio::test]
+    async fn corr_p4_bounded_channel_wait_returns_false_on_close_empty() {
+        let ch = BoundedDropOldestChannel::<u32>::new(4);
+        ch.close();
+        let present = ch.wait().await;
+        assert!(!present);
     }
 }

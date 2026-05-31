@@ -94,6 +94,13 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 # Storage
 rusqlite = { version = "0.34", features = ["bundled", "blob", "functions"] }
 
+# CORR PART 4: bounded LRU cache used by the per-tenant policy
+# resolver (max 1000 entries) and the embedded chat HistoryStore
+# (max 10000 sessions). Replaces ad-hoc HashMap caches that grew
+# without limit on long-lived nodes serving many tenants /
+# sessions.
+lru = "0.12"
+
 # Async runtime + transport
 tokio = { version = "1.40", features = ["full"] }
 futures = "0.3"

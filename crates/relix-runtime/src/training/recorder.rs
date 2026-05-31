@@ -21,8 +21,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
 use super::pii::PiiAnonymizer;
 use super::store::TrainingStore;
 use super::types::{InteractionRecord, ToolCallRecord};
@@ -53,11 +51,21 @@ pub trait InteractionSink: Send + Sync {
 /// the recorder uses instead of the global one.
 #[derive(Clone)]
 pub struct InteractionRecorder {
-    tx: mpsc::UnboundedSender<InteractionRecord>,
+    /// CORR PART 4: bounded drop-oldest channel replaces the
+    /// pre-fix `mpsc::UnboundedSender`. A stuck drain task
+    /// (DB locked, fsync stall) used to let interactions
+    /// queue without limit; the bounded channel evicts the
+    /// oldest entry at [`TRAINING_CHANNEL_CAP`] and exposes
+    /// the dropped count for operator dashboards.
+    channel: crate::metrics::collector::BoundedDropOldestChannel<InteractionRecord>,
     store: TrainingStore,
     anonymizer: Arc<PiiAnonymizer>,
     agent_policies: Arc<AgentTrainingPolicies>,
 }
+
+/// CORR PART 4: hard cap on the in-flight training-recorder
+/// queue. Same posture as [`crate::metrics::collector::METRICS_CHANNEL_CAP`].
+pub const TRAINING_CHANNEL_CAP: usize = 10_000;
 
 pub const BATCH_INTERVAL_MS: u64 = 100;
 pub const BATCH_SIZE: usize = 100;
@@ -117,23 +125,31 @@ impl InteractionRecorder {
         anonymizer: Arc<PiiAnonymizer>,
         agent_policies: Arc<AgentTrainingPolicies>,
     ) -> (Self, RecorderWorkerHandles) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let channel = crate::metrics::collector::BoundedDropOldestChannel::<InteractionRecord>::new(
+            TRAINING_CHANNEL_CAP,
+        );
         (
             Self {
-                tx,
+                channel: channel.clone(),
                 store: store.clone(),
                 anonymizer,
                 agent_policies,
             },
             RecorderWorkerHandles {
                 store,
-                receiver: Some(rx),
+                channel: Some(channel),
             },
         )
     }
 
     pub fn store(&self) -> TrainingStore {
         self.store.clone()
+    }
+
+    /// CORR PART 4: lifetime count of records dropped from the
+    /// front of the queue due to cap pressure.
+    pub fn dropped_count(&self) -> u64 {
+        self.channel.dropped_count()
     }
 }
 
@@ -158,11 +174,11 @@ impl InteractionSink for InteractionRecorder {
         if active.enabled() {
             apply_anonymizer(&mut rec, &active);
         }
-        if self.tx.send(rec).is_err() {
-            tracing::warn!(
-                "training: drain task receiver dropped; further interactions will be silently lost"
-            );
-        }
+        // CORR PART 4: bounded drop-oldest send. Never blocks
+        // and never panics; when the queue is at cap the
+        // oldest entry is evicted and the channel's lifetime
+        // dropped_count is bumped.
+        self.channel.send(rec);
     }
 }
 
@@ -217,7 +233,10 @@ pub fn anonymize_record(rec: &InteractionRecord, anon: &PiiAnonymizer) -> Intera
 /// retention loops.
 pub struct RecorderWorkerHandles {
     store: TrainingStore,
-    receiver: Option<mpsc::UnboundedReceiver<InteractionRecord>>,
+    /// CORR PART 4: bounded channel handle the drain loop
+    /// consumes from. `Option` so the spawn call can move it
+    /// out exactly once.
+    channel: Option<crate::metrics::collector::BoundedDropOldestChannel<InteractionRecord>>,
 }
 
 #[derive(Clone, Debug)]
@@ -242,13 +261,13 @@ pub struct SpawnedRecorder {
 
 impl RecorderWorkerHandles {
     pub fn spawn(self, retention: RetentionConfig) -> SpawnedRecorder {
-        let rx = self
-            .receiver
+        let channel = self
+            .channel
             .expect("RecorderWorkerHandles::spawn called twice");
         let drain_store = self.store.clone();
         let retention_store = self.store.clone();
         let drain = tokio::spawn(async move {
-            run_drain_loop(rx, drain_store).await;
+            run_drain_loop(channel, drain_store).await;
         });
         let retention_task = tokio::spawn(async move {
             run_retention_loop(retention_store, retention).await;
@@ -260,28 +279,34 @@ impl RecorderWorkerHandles {
     }
 }
 
-async fn run_drain_loop(mut rx: mpsc::UnboundedReceiver<InteractionRecord>, store: TrainingStore) {
+async fn run_drain_loop(
+    channel: crate::metrics::collector::BoundedDropOldestChannel<InteractionRecord>,
+    store: TrainingStore,
+) {
     let mut batch: Vec<InteractionRecord> = Vec::with_capacity(BATCH_SIZE);
     let mut tick = tokio::time::interval(Duration::from_millis(BATCH_INTERVAL_MS));
     tick.tick().await;
     loop {
         tokio::select! {
             biased;
-            recv = rx.recv() => {
-                match recv {
-                    Some(rec) => {
-                        batch.push(rec);
-                        if batch.len() >= BATCH_SIZE {
-                            flush_batch(&store, &mut batch);
-                        }
-                    }
-                    None => {
+            present = channel.wait() => {
+                if !present {
+                    flush_batch(&store, &mut batch);
+                    return;
+                }
+                let drained = channel.try_drain(BATCH_SIZE);
+                for rec in drained {
+                    batch.push(rec);
+                    if batch.len() >= BATCH_SIZE {
                         flush_batch(&store, &mut batch);
-                        return;
                     }
                 }
             }
             _ = tick.tick() => {
+                let drained = channel.try_drain(BATCH_SIZE);
+                for rec in drained {
+                    batch.push(rec);
+                }
                 if !batch.is_empty() {
                     flush_batch(&store, &mut batch);
                 }

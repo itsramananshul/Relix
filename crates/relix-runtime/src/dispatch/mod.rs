@@ -108,38 +108,90 @@ pub struct PolicyDenialEntry {
 }
 
 /// W2-007d: bounded ring of recent [`PolicyDenialEntry`]s on
-/// the local DispatchBridge. FIFO eviction; default capacity
-/// 256. Resets on bridge restart.
+/// the local DispatchBridge.
+///
+/// CORR PART 4: the eviction policy is now **time-windowed**
+/// in addition to count-bounded. Pre-fix FIFO eviction let a
+/// noisy attacker fill the ring with low-signal denials and
+/// thereby push the high-signal evidence of *their* attempt
+/// off the back of the ring. The time window
+/// ([`POLICY_DENIAL_WINDOW_SECS`], 1h by default) means every
+/// denial older than the window is dropped at insert time so
+/// the ring carries a true 1-hour sample regardless of how
+/// many entries arrived during it. The count cap
+/// ([`POLICY_DENIAL_HARD_CAP`]) still applies as a memory
+/// ceiling — beyond it the oldest entry is dropped.
 #[derive(Debug)]
 pub struct PolicyDenialRing {
     entries: std::sync::Mutex<std::collections::VecDeque<PolicyDenialEntry>>,
+    /// Hard memory cap. Once reached, even time-windowed
+    /// trimming yields to FIFO eviction.
     capacity: usize,
+    /// Time window in seconds. Entries with `at < now - window`
+    /// are dropped at every push.
+    window_secs: i64,
 }
 
 /// W2-007d: default ring capacity. Same convention as the
 /// other in-memory rings (fs / terminal / mcp audit).
 pub const POLICY_DENIAL_RING_DEFAULT: usize = 256;
 
+/// CORR PART 4: hard cap on the policy-denial ring's count.
+/// Operators querying `node.policy.recent_denials` see at most
+/// this many entries per request.
+pub const POLICY_DENIAL_HARD_CAP: usize = 10_000;
+
+/// CORR PART 4: time window (1 hour) for the policy-denial
+/// ring. Older entries are dropped at insert time so the ring
+/// always reflects the last hour of activity even when a
+/// noisy attacker fills the count cap with low-signal denials.
+pub const POLICY_DENIAL_WINDOW_SECS: i64 = 3600;
+
 impl Default for PolicyDenialRing {
     fn default() -> Self {
-        Self::new(POLICY_DENIAL_RING_DEFAULT)
+        Self::new(POLICY_DENIAL_HARD_CAP)
     }
 }
 
 impl PolicyDenialRing {
     pub fn new(capacity: usize) -> Self {
+        Self::with_window(capacity, POLICY_DENIAL_WINDOW_SECS)
+    }
+
+    /// CORR PART 4: build with an explicit time window. Lets
+    /// tests verify the time-windowed eviction behaviour
+    /// deterministically without waiting an hour.
+    pub fn with_window(capacity: usize, window_secs: i64) -> Self {
         Self {
-            entries: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
-            capacity: capacity.max(1),
+            entries: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                capacity.min(1024),
+            )),
+            capacity: capacity.clamp(1, POLICY_DENIAL_HARD_CAP),
+            window_secs: window_secs.max(1),
         }
     }
 
     pub fn push(&self, e: PolicyDenialEntry) {
+        let now = e.at;
+        let cutoff = now.saturating_sub(self.window_secs);
         let mut g = self.entries.lock().unwrap_or_else(|e| {
             tracing::warn!("policy denial ring poisoned; recovering inner state");
             e.into_inner()
         });
-        if g.len() == self.capacity {
+        // Trim entries that fell outside the window. The ring
+        // is in insertion order so a `while front older than
+        // cutoff: pop_front` walk is O(k) where k is the
+        // number of expired entries.
+        while let Some(front) = g.front() {
+            if front.at < cutoff {
+                g.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Hard count cap — pre-fix FIFO behaviour kicks in only
+        // after time-windowing has done its job.
+        while g.len() >= self.capacity {
             g.pop_front();
         }
         g.push_back(e);
@@ -486,6 +538,20 @@ pub struct CapStats {
 /// sparkline at the dashboard's natural column width without
 /// bloating the per-row footprint.
 pub const RECENT_LATENCIES_CAP: usize = 32;
+
+/// CORR PART 4: hard cap on the cardinality of distinct
+/// method names tracked in `capability_stats`. Pre-fix path
+/// grew this map unbounded; a hostile caller could mint fresh
+/// method names per request and force the bridge to allocate
+/// per-method counter rows forever. Beyond this cap the
+/// per-method counters route into [`CAPABILITY_STATS_OVERFLOW_KEY`].
+pub const CAPABILITY_STATS_CAP: usize = 10_000;
+
+/// CORR PART 4: synthetic method-name key the bridge increments
+/// on behalf of every distinct method name that arrived after
+/// the cardinality cap. Operators see "we hit the cap N times"
+/// rather than losing observability outright.
+pub const CAPABILITY_STATS_OVERFLOW_KEY: &str = "__capability_stats_overflow__";
 
 /// RELIX-7.19: hard ceiling on `Retry` action `max_retries`.
 /// Operators that configure a higher value get clamped silently
@@ -965,7 +1031,30 @@ impl DispatchBridge {
             .capability_stats
             .write()
             .expect("capability_stats write lock");
-        let row = g.entry(method.to_string()).or_default();
+        // CORR PART 4: hard cap on distinct method names that
+        // are tracked. A misbehaving / hostile caller can
+        // generate unlimited fresh method names; pre-fix path
+        // grew this map unbounded. When the cap is hit,
+        // counters for an unknown method route into the
+        // shared `__overflow__` bucket so observability isn't
+        // dropped on the floor, but the cardinality stays
+        // bounded.
+        let row_key: String = if !g.contains_key(method) && g.len() >= CAPABILITY_STATS_CAP {
+            // Track the overflow event itself in a single
+            // counter row so operators see the symptom
+            // ("we've hit the cap N times for distinct
+            // unseen methods").
+            let overflow = g
+                .entry(CAPABILITY_STATS_OVERFLOW_KEY.to_string())
+                .or_default();
+            overflow.unknown_method = overflow.unknown_method.saturating_add(1);
+            overflow.last_invoked_at = now;
+            overflow.last_error_at = Some(now);
+            CAPABILITY_STATS_OVERFLOW_KEY.to_string()
+        } else {
+            method.to_string()
+        };
+        let row = g.entry(row_key).or_default();
         row.last_invoked_at = now;
         match bucket {
             StatBucket::Ok => {
@@ -3379,12 +3468,23 @@ mod tests {
 
     #[test]
     fn policy_denial_ring_default_capacity_matches_const() {
+        // CORR PART 4: default ring uses POLICY_DENIAL_HARD_CAP
+        // (10000) as the count ceiling, with time-windowed
+        // eviction on top. Push only POLICY_DENIAL_RING_DEFAULT
+        // entries (well under both caps and inside the time
+        // window with `at = NOW + i`) so the test asserts
+        // "everything we pushed is retained" rather than the
+        // pre-fix "saturates at 256". The hard-cap behaviour
+        // is covered by `corr_p4_policy_denial_hard_cap_caps_at_max`.
         let r = PolicyDenialRing::default();
         assert!(r.is_empty());
-        // Push capacity + 50 entries; ring should saturate at default.
-        for i in 0..(POLICY_DENIAL_RING_DEFAULT + 50) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for i in 0..POLICY_DENIAL_RING_DEFAULT {
             r.push(PolicyDenialEntry {
-                at: i as i64,
+                at: now_secs + i as i64,
                 method: "m".into(),
                 caller_subject_id: "x".into(),
                 caller_name: "x".into(),
@@ -3393,6 +3493,57 @@ mod tests {
             });
         }
         assert_eq!(r.len(), POLICY_DENIAL_RING_DEFAULT);
+    }
+
+    #[test]
+    fn corr_p4_policy_denial_time_window_evicts_old_entries() {
+        // Build a ring with a short 10s window so we can prove
+        // time-based eviction without waiting an hour. Push
+        // entries at t=0..3, then push one at t=100 — only
+        // entries with `at >= 100 - 10 = 90` survive, i.e. the
+        // 100 push.
+        let r = PolicyDenialRing::with_window(POLICY_DENIAL_HARD_CAP, 10);
+        for i in 0..4 {
+            r.push(PolicyDenialEntry {
+                at: i,
+                method: format!("m{i}"),
+                caller_subject_id: "x".into(),
+                caller_name: "x".into(),
+                rule: "default_deny".into(),
+                reason: "no rule".into(),
+            });
+        }
+        assert_eq!(r.len(), 4);
+        r.push(PolicyDenialEntry {
+            at: 100,
+            method: "m_late".into(),
+            caller_subject_id: "x".into(),
+            caller_name: "x".into(),
+            rule: "default_deny".into(),
+            reason: "no rule".into(),
+        });
+        // The four old entries fell out of the 10s window.
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn corr_p4_policy_denial_hard_cap_caps_at_max() {
+        // With a 1-entry window so time-based trim doesn't
+        // mask the count cap, and a hard cap of 4, pushing 6
+        // entries should leave 4 in the ring.
+        let r = PolicyDenialRing::with_window(4, 1_000_000);
+        for i in 0..6 {
+            r.push(PolicyDenialEntry {
+                at: i,
+                method: format!("m{i}"),
+                caller_subject_id: "x".into(),
+                caller_name: "x".into(),
+                rule: "default_deny".into(),
+                reason: "no rule".into(),
+            });
+        }
+        // Hard cap is 4 (we passed it as `capacity`).
+        assert!(r.len() <= 4, "got {}", r.len());
     }
 
     #[test]

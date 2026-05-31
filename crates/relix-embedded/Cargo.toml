@@ -25,6 +25,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
+# CORR PART 4: bounded session cache for HistoryStore.
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

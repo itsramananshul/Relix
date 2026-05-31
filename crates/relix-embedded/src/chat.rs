@@ -17,7 +17,7 @@
 //! a Layer-1 `Raw` record so cross-process inspection + later
 //! search keep working.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -111,10 +111,32 @@ pub struct ChatResponse {
 /// memory ids. The atomic counter is strictly monotonic for the
 /// life of the HistoryStore (which is the life of the
 /// `RelixEmbedded` clone) so two turns can never share an id.
-#[derive(Default)]
+///
+/// CORR PART 4: `sessions` is now an `LruCache` capped at
+/// [`MAX_SESSIONS`] entries. Pre-fix `HashMap` grew without
+/// limit on long-lived embedded deployments serving thousands
+/// of distinct session ids (one new session per browser tab).
+/// LRU eviction drops the least-recently-used session — its
+/// history is lost, but the next call from that session id
+/// just starts a fresh ring, which is the desired behaviour.
 pub(crate) struct HistoryStore {
-    sessions: Mutex<HashMap<String, VecDeque<String>>>,
+    sessions: Mutex<lru::LruCache<String, VecDeque<String>>>,
     turn_seq: std::sync::atomic::AtomicU64,
+}
+
+/// CORR PART 4: hard cap on the in-memory session history
+/// table. 10000 is far more than the operator-supplied
+/// embedded session count any sensible deployment runs.
+pub const MAX_SESSIONS: usize = 10_000;
+
+impl Default for HistoryStore {
+    fn default() -> Self {
+        let cap = std::num::NonZeroUsize::new(MAX_SESSIONS).expect("MAX_SESSIONS > 0");
+        Self {
+            sessions: Mutex::new(lru::LruCache::new(cap)),
+            turn_seq: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 impl HistoryStore {
@@ -123,7 +145,11 @@ impl HistoryStore {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let entry = g.entry(session_id.to_string()).or_default();
+        // CORR PART 4: LRU semantics — get_or_insert_mut
+        // returns a mutable handle, refreshing recency. When
+        // the cap is hit, `put`-style inserts evict the LRU
+        // entry; `get_or_insert_mut` does the same.
+        let entry = g.get_or_insert_mut(session_id.to_string(), VecDeque::default);
         entry.push_back(line);
         while entry.len() > HISTORY_MAX_TURNS {
             entry.pop_front();
@@ -131,15 +157,16 @@ impl HistoryStore {
     }
 
     pub(crate) fn render(&self, session_id: &str) -> String {
-        let g = match self.sessions.lock() {
+        let mut g = match self.sessions.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // `get` bumps LRU recency.
         let Some(entry) = g.get(session_id) else {
             return String::new();
         };
         let mut out = String::new();
-        for line in entry {
+        for line in entry.iter() {
             out.push_str(line);
             if !line.ends_with('\n') {
                 out.push('\n');
@@ -149,7 +176,7 @@ impl HistoryStore {
     }
 
     pub(crate) fn turns_for(&self, session_id: &str) -> usize {
-        let g = match self.sessions.lock() {
+        let mut g = match self.sessions.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };

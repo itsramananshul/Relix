@@ -18,6 +18,10 @@ missing_docs = "warn"
 # fire in `#[cfg(test)]` modules).
 
 [dependencies]
+# CORR PART 4: bounded LRU for the per-tenant policy resolver
+# cache. Pre-fix path used an unbounded HashMap which on a
+# many-tenant deployment grew until process restart.
+lru.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
