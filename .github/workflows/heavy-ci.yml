@@ -82,14 +82,16 @@ jobs:
           command: check licenses bans sources
 
   audit:
-    name: cargo audit (advisory visibility)
+    name: cargo audit (advisories — hard gate)
     needs: filter
     if: needs.filter.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Audit non-fatal in heavy CI: visibility for reviewers, no merge block.
-    # Hard enforcement lives in nightly-security.yml.
-    continue-on-error: true
+    # Hard gate: a PR touching a transitive dep with a known CVE must
+    # fail this job. Per-advisory exceptions live in `deny.toml`
+    # `[advisories] ignore` (mirrored in docs/security-advisories.md)
+    # with documented rationale and review condition — no silent
+    # suppression here.
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
