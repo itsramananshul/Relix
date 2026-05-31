@@ -23,7 +23,14 @@
 //! that touch these paths must preserve byte equality; tests in `tests/`
 //! enforce this property.
 
-#![forbid(unsafe_code)]
+// CORR-D1: relaxed from `forbid` to `deny` so the single
+// `#[allow(unsafe_code)]` site on the Windows parent-dir
+// fsync helper (`eventlog::fsync_parent_dir_windows`) can
+// call into Win32's `CreateFileW + FlushFileBuffers +
+// CloseHandle`. Every other site in this crate remains
+// `deny`'d by default — only the load-bearing FFI call
+// carries the allow.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 // Per CONTRIBUTING.md: unwrap/expect forbidden in non-test code paths. The
 // cfg_attr scopes the lint so it does not fire on `#[cfg(test)]` modules.

@@ -10,7 +10,13 @@ repository.workspace = true
 authors.workspace = true
 
 [lints.rust]
-unsafe_code = "forbid"
+# CORR-D1: relaxed from `forbid` to `deny` because the Windows
+# parent-directory fsync path needs `unsafe` to call into Win32
+# (CreateFileW + FlushFileBuffers + CloseHandle). The single
+# call site that uses `unsafe` carries `#[allow(unsafe_code)]`
+# and a load-bearing safety comment; every other site in the
+# crate remains denied by default.
+unsafe_code = "deny"
 missing_docs = "warn"
 
 # Per CONTRIBUTING.md: unwrap/expect forbidden in non-test code, fine in tests.
@@ -41,6 +47,26 @@ async-trait.workspace = true
 # the `acquire` await. Time + macros only; the rest of
 # relix-core stays runtime-agnostic.
 tokio = { workspace = true, features = ["time"] }
+
+# CORR-D1: Windows directory fsync. EventLog::append flushes
+# the parent directory's metadata after writing the per-flow
+# log file so a crash between the file's `sync_data` and the
+# directory entry's commit does not lose the new record. The
+# Unix path uses `File::open(parent).sync_all()`; the Windows
+# path needs CreateFileW with FILE_FLAG_BACKUP_SEMANTICS +
+# FlushFileBuffers, which is not in `std::fs`. Pulled in only
+# for Windows targets so non-Windows builds carry no extra
+# dependency.
+[target.'cfg(windows)'.dependencies]
+# CORR-D1: `Win32_Security` is needed because CreateFileW's
+# signature takes `*const SECURITY_ATTRIBUTES` — windows-sys
+# 0.52 only exposes the function when the security types it
+# references are also pulled in via their feature.
+windows-sys = { version = "0.52", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+] }
 
 [dev-dependencies]
 proptest.workspace = true

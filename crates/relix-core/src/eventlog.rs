@@ -179,26 +179,24 @@ impl EventLog {
         self.file
             .sync_data()
             .map_err(|e| EventLogError::Io(e.to_string()))?;
-        // CORR PART 5: after the file contents are durable on
-        // disk, also fsync the parent directory inode so the
-        // newly-recorded entry survives a crash even when the
-        // directory metadata was not yet flushed. On Unix the
-        // canonical fix is `File::open(parent).sync_all()`. On
-        // Windows `std::fs` does not expose a directory-handle
-        // fsync (opening a directory as `File` requires
-        // `FILE_FLAG_BACKUP_SEMANTICS`, which is not in
-        // `OpenOptions`); NTFS journals directory entries so
-        // the file's own `sync_data` above is sufficient for
-        // durability on that platform. This is a real platform
-        // fact, not a design preference — see the PART 5
-        // notes in the PR description.
-        #[cfg(unix)]
-        {
-            if let Some(parent) = self.path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
+        // CORR-D1: after the file's data is durable, fsync
+        // the parent directory inode so the newly-created
+        // / extended entry survives a crash even when the
+        // directory metadata was not yet flushed. The cross-
+        // platform helper uses `File::open(parent).sync_all()`
+        // on Unix and `CreateFileW + FlushFileBuffers` on
+        // Windows via `windows-sys`; both targets now provide
+        // real directory durability. A best-effort `let _`
+        // here matches the file's `sync_data` posture: a
+        // failed dir-fsync is logged via tracing and ignored
+        // so a partial-failure write path doesn't crash the
+        // caller's flow.
+        if let Err(e) = fsync_parent_dir(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "event log: parent-directory fsync failed; data is still file-synced",
+            );
         }
 
         self.last_hash = codec::content_hash(&record_bytes);
@@ -378,6 +376,107 @@ pub enum EventLogError {
     },
 }
 
+/// CORR-D1: cross-platform parent-directory fsync. Flushes
+/// the parent directory's inode so that an entry created /
+/// modified inside it survives a crash even when the
+/// directory metadata was not yet committed.
+///
+/// On Unix this is `File::open(parent).sync_all()`; on
+/// Windows it opens the directory with
+/// `FILE_FLAG_BACKUP_SEMANTICS` (required to open a directory
+/// handle) and calls `FlushFileBuffers` via `windows-sys`.
+/// Returns `Err` if the parent could not be opened OR the
+/// flush call failed; the EventLog caller logs and continues.
+pub fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or(path);
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        fsync_parent_dir_windows(parent)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No platform-specific path available; nothing to do.
+        let _ = parent;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn fsync_parent_dir_windows(parent: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
+    };
+
+    // Wide-encoded NUL-terminated path (CreateFileW expects
+    // UTF-16 LE with a trailing 0).
+    let wide: Vec<u16> = parent
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 buffer
+    // that outlives the CreateFileW call. We pass:
+    // - dwDesiredAccess = GENERIC_WRITE. FlushFileBuffers'
+    //   documented requirement is that the handle was opened
+    //   with one of GENERIC_WRITE / FILE_APPEND_DATA /
+    //   FILE_WRITE_DATA; without it, FlushFileBuffers returns
+    //   ERROR_ACCESS_DENIED on the handle.
+    // - dwShareMode = READ | WRITE | DELETE so other handles
+    //   to the directory keep working (including operators
+    //   that delete files inside it).
+    // - lpSecurityAttributes = null (default ACL).
+    // - dwCreationDisposition = OPEN_EXISTING (we never
+    //   create — error out if the parent is missing).
+    // - dwFlagsAndAttributes = FILE_FLAG_BACKUP_SEMANTICS
+    //   (required to open a directory handle on Windows).
+    // - hTemplateFile = 0 (no template).
+    // The returned HANDLE is checked against
+    // INVALID_HANDLE_VALUE before use and closed on every
+    // path via CloseHandle.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `handle` was just returned by CreateFileW and
+    // checked against INVALID_HANDLE_VALUE. FlushFileBuffers
+    // takes a single HANDLE and returns 0 on failure.
+    let flush_ok = unsafe { FlushFileBuffers(handle) };
+    let flush_err = if flush_ok == 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    // SAFETY: same handle, exactly one close. Ignore the
+    // return — we already captured the flush outcome and a
+    // failure to close a freshly-opened handle is a
+    // diagnostic rather than a hard error.
+    let _ = unsafe { CloseHandle(handle) };
+    match flush_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +616,68 @@ mod tests {
         assert_eq!(MAX_RECORDS_PER_READ, 100_000);
         let err = EventLogError::TooManyRecords { limit: 100 };
         assert!(err.to_string().contains("100"));
+    }
+
+    // ── CORR-D1: cross-platform parent-directory fsync ──
+
+    #[test]
+    fn corr_d1_fsync_parent_dir_succeeds_on_real_path() {
+        // A real, existing file path inside a tempdir: the
+        // helper must open + flush the parent without error.
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("flow.log");
+        std::fs::write(&path, b"x").expect("write");
+        fsync_parent_dir(&path).expect("fsync parent dir on existing file");
+    }
+
+    #[test]
+    fn corr_d1_fsync_parent_dir_succeeds_for_dir_path_directly() {
+        // Calling with a directory path resolves `parent =
+        // path.parent().unwrap_or(path)`; the helper still
+        // opens + flushes the closest valid directory above.
+        let dir = TempDir::new().expect("tmp");
+        fsync_parent_dir(dir.path()).expect("fsync parent of a dir path");
+    }
+
+    #[test]
+    fn corr_d1_fsync_parent_dir_errors_for_nonexistent_parent() {
+        // Pointing at a path whose parent does not exist must
+        // surface the OS error rather than silently succeed.
+        // Use a sufficiently bogus path that both platforms
+        // reject. On Windows we use an invalid drive letter
+        // that real machines do not have mapped; on Unix we
+        // use a deep nonexistent prefix.
+        let bogus = if cfg!(windows) {
+            std::path::PathBuf::from("Z:\\\\corr_d1_does_not_exist_zzz\\\\flow.log")
+        } else {
+            std::path::PathBuf::from("/proc/0/corr_d1_does_not_exist_zzz/flow.log")
+        };
+        assert!(
+            fsync_parent_dir(&bogus).is_err(),
+            "expected error for nonexistent parent {bogus:?}"
+        );
+    }
+
+    #[test]
+    fn corr_d1_eventlog_append_calls_fsync_parent_dir() {
+        // We cannot observe fsync directly, but we can verify
+        // the code path: every successful `append` returns
+        // Ok, and the file content is durable enough that a
+        // fresh `read_records` against the same path reads
+        // back what we wrote. (The helper is called
+        // unconditionally inside `append` — a failed
+        // dir-fsync logs and continues, so this test runs on
+        // both platforms regardless of the underlying
+        // filesystem's fsync semantics.)
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("flow.log");
+        let flow = FlowId::new();
+        let key = fresh_key();
+        let mut log = EventLog::open(&path, flow, key.clone()).expect("open");
+        log.append(EventType::FlowStarted, b"x".to_vec())
+            .expect("append");
+        let recs = read_records(&path).expect("read");
+        assert_eq!(recs.len(), 1);
     }
 
     #[test]
