@@ -8,9 +8,10 @@
  * * `POST /v1/planning/validate`
  */
 
-import { doJsonRequest, isObject, type RelixClient } from "./client";
+import { doJsonRequest, isObject, runRequest, type RelixClient } from "./client";
 import type {
   AgentDescriptor,
+  ApiResult,
   PlanResult,
   PlanningPlanInput,
 } from "./types";
@@ -18,43 +19,57 @@ import type {
 export class PlanningAPI {
   constructor(private readonly client: RelixClient) {}
 
-  async plan(input: PlanningPlanInput): Promise<PlanResult> {
-    const body: Record<string, unknown> = { spec: input.spec };
-    if (input.maxAgents !== undefined) {
-      body.max_agents = input.maxAgents;
-    }
-    if (input.dryRun !== undefined) {
-      body.dry_run = input.dryRun;
-    }
-    if (input.peer) {
-      body.peer = input.peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/planning/plan", body);
-    return parsePlanResult(data);
+  async plan(input: PlanningPlanInput): Promise<ApiResult<PlanResult>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = { spec: input.spec };
+      if (input.maxAgents !== undefined) {
+        body.max_agents = input.maxAgents;
+      }
+      if (input.dryRun !== undefined) {
+        body.dry_run = input.dryRun;
+      }
+      if (input.peer) {
+        body.peer = input.peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/planning/plan", body);
+      return parsePlanResult(data);
+    });
   }
 
-  async agents(peer?: string): Promise<AgentDescriptor[]> {
-    const params = peer ? { peer } : undefined;
-    const data = await doJsonRequest(this.client, "GET", "/v1/planning/agents", undefined, params);
-    return parseAgents(data);
+  async agents(peer?: string): Promise<ApiResult<AgentDescriptor[]>> {
+    return runRequest(async () => {
+      const params = peer ? { peer } : undefined;
+      const data = await doJsonRequest(
+        this.client,
+        "GET",
+        "/v1/planning/agents",
+        undefined,
+        params,
+      );
+      return parseAgents(data);
+    });
   }
 
-  async searchAgents(task: string, peer?: string): Promise<AgentDescriptor[]> {
-    const body: Record<string, unknown> = { task };
-    if (peer) {
-      body.peer = peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/planning/agents/search", body);
-    return parseAgents(data);
+  async searchAgents(task: string, peer?: string): Promise<ApiResult<AgentDescriptor[]>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = { task };
+      if (peer) {
+        body.peer = peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/planning/agents/search", body);
+      return parseAgents(data);
+    });
   }
 
-  async validate(spec: string, peer?: string): Promise<Record<string, unknown>> {
-    const body: Record<string, unknown> = { spec };
-    if (peer) {
-      body.peer = peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/planning/validate", body);
-    return isObject(data) ? data : {};
+  async validate(spec: string, peer?: string): Promise<ApiResult<Record<string, unknown>>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = { spec };
+      if (peer) {
+        body.peer = peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/planning/validate", body);
+      return isObject(data) ? data : {};
+    });
   }
 }
 

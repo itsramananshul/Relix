@@ -15,8 +15,9 @@
  * polyglot consumer.
  */
 
-import { doJsonRequest, isObject, type RelixClient } from "./client";
+import { doJsonRequest, isObject, runRequest, type RelixClient } from "./client";
 import type {
+  ApiResult,
   CredentialAuditEntry,
   CredentialMetadata,
   CredentialsListInput,
@@ -28,77 +29,91 @@ export class CredentialsAPI {
   constructor(private readonly client: RelixClient) {}
 
   /** Store a new credential. Returns the bridge's response dict. */
-  async store(input: CredentialsStoreInput): Promise<Record<string, unknown>> {
-    // SDK kwarg → bridge wire-field translation: `owner` →
-    // `owner_agent`, `expiresAt` → `expires_at_ms`.
-    const body: Record<string, unknown> = {
-      name: input.name,
-      value: input.value,
-    };
-    if (input.kind !== undefined) {
-      body.kind = input.kind;
-    }
-    if (input.owner !== undefined) {
-      body.owner_agent = input.owner;
-    }
-    if (input.expiresAt !== undefined) {
-      body.expires_at_ms = input.expiresAt;
-    }
-    if (input.rotationIntervalSecs !== undefined) {
-      body.rotation_interval_secs = input.rotationIntervalSecs;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/credentials", body);
-    return isObject(data) ? data : {};
+  async store(
+    input: CredentialsStoreInput,
+  ): Promise<ApiResult<Record<string, unknown>>> {
+    return runRequest(async () => {
+      // SDK kwarg → bridge wire-field translation: `owner` →
+      // `owner_agent`, `expiresAt` → `expires_at_ms`.
+      const body: Record<string, unknown> = {
+        name: input.name,
+        value: input.value,
+      };
+      if (input.kind !== undefined) {
+        body.kind = input.kind;
+      }
+      if (input.owner !== undefined) {
+        body.owner_agent = input.owner;
+      }
+      if (input.expiresAt !== undefined) {
+        body.expires_at_ms = input.expiresAt;
+      }
+      if (input.rotationIntervalSecs !== undefined) {
+        body.rotation_interval_secs = input.rotationIntervalSecs;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/credentials", body);
+      return isObject(data) ? data : {};
+    });
   }
 
   /** List credentials. `owner` filters by owning subject id. */
-  async list(input: CredentialsListInput = {}): Promise<CredentialMetadata[]> {
-    const params = input.owner ? { owner_agent: input.owner } : undefined;
-    const data = await doJsonRequest(this.client, "GET", "/v1/credentials", undefined, params);
-    return parseList(data);
+  async list(input: CredentialsListInput = {}): Promise<ApiResult<CredentialMetadata[]>> {
+    return runRequest(async () => {
+      const params = input.owner ? { owner_agent: input.owner } : undefined;
+      const data = await doJsonRequest(this.client, "GET", "/v1/credentials", undefined, params);
+      return parseList(data);
+    });
   }
 
   /** Fetch one credential's metadata (never the value). */
-  async get(name: string): Promise<CredentialMetadata> {
-    const data = await doJsonRequest(
-      this.client,
-      "GET",
-      `/v1/credentials/${encodeURIComponent(name)}`,
-    );
-    return parseMetadata(data);
+  async get(name: string): Promise<ApiResult<CredentialMetadata>> {
+    return runRequest(async () => {
+      const data = await doJsonRequest(
+        this.client,
+        "GET",
+        `/v1/credentials/${encodeURIComponent(name)}`,
+      );
+      return parseMetadata(data);
+    });
   }
 
   /** Rotate the credential to `newValue`. Archives the old value. */
-  async rotate(input: CredentialsRotateInput): Promise<Record<string, unknown>> {
-    const body = { new_value: input.newValue };
-    const data = await doJsonRequest(
-      this.client,
-      "POST",
-      `/v1/credentials/${encodeURIComponent(input.name)}/rotate`,
-      body,
-    );
-    return isObject(data) ? data : {};
+  async rotate(input: CredentialsRotateInput): Promise<ApiResult<Record<string, unknown>>> {
+    return runRequest(async () => {
+      const body = { new_value: input.newValue };
+      const data = await doJsonRequest(
+        this.client,
+        "POST",
+        `/v1/credentials/${encodeURIComponent(input.name)}/rotate`,
+        body,
+      );
+      return isObject(data) ? data : {};
+    });
   }
 
   /** Soft-delete the credential. The audit log keeps the row. */
-  async revoke(name: string): Promise<Record<string, unknown>> {
-    const data = await doJsonRequest(
-      this.client,
-      "POST",
-      `/v1/credentials/${encodeURIComponent(name)}/revoke`,
-      {},
-    );
-    return isObject(data) ? data : {};
+  async revoke(name: string): Promise<ApiResult<Record<string, unknown>>> {
+    return runRequest(async () => {
+      const data = await doJsonRequest(
+        this.client,
+        "POST",
+        `/v1/credentials/${encodeURIComponent(name)}/revoke`,
+        {},
+      );
+      return isObject(data) ? data : {};
+    });
   }
 
   /** Recent audit-log entries for one credential. */
-  async audit(name: string): Promise<CredentialAuditEntry[]> {
-    const data = await doJsonRequest(
-      this.client,
-      "GET",
-      `/v1/credentials/${encodeURIComponent(name)}/audit`,
-    );
-    return parseAudit(data);
+  async audit(name: string): Promise<ApiResult<CredentialAuditEntry[]>> {
+    return runRequest(async () => {
+      const data = await doJsonRequest(
+        this.client,
+        "GET",
+        `/v1/credentials/${encodeURIComponent(name)}/audit`,
+      );
+      return parseAudit(data);
+    });
   }
 }
 

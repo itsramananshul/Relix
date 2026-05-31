@@ -1,6 +1,12 @@
 /**
  * End-to-end tests for ``RelixClient`` (chat, streaming, info, auth,
  * header propagation, error mapping).
+ *
+ * PART 5: single-response methods return `ApiResult<T>`. Each test
+ * narrows on the discriminated union (`if (!res.ok) ...`) before
+ * reading the success payload. Streaming methods (`chatStream`) keep
+ * their `AsyncIterable<StreamChunk>` shape — the ApiResult wrapping
+ * does not apply to multi-value protocols.
  */
 
 import {
@@ -36,11 +42,14 @@ describe("RelixClient.chat", () => {
       }),
     );
     const client = makeClient(mock);
-    const resp = await client.chat({ sessionId: "u1", message: "hello" });
-    expect(resp.text).toBe("hi there");
-    expect(resp.flowId).toBe("f1");
-    expect(resp.traceId).toBe("t1");
-    expect(resp.taskId).toBe("task-1");
+    const res = await client.chat({ sessionId: "u1", message: "hello" });
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data.text).toBe("hi there");
+    expect(res.data.flowId).toBe("f1");
+    expect(res.data.traceId).toBe("t1");
+    expect(res.data.taskId).toBe("task-1");
   });
 
   it("sends X-Relix-Tenant and Authorization headers", async () => {
@@ -67,38 +76,44 @@ describe("RelixClient.chat", () => {
     expect(last.headers["x-relix-tenant"]).toBe("default");
   });
 
-  it("throws RelixAuthError on 401", async () => {
+  it("returns ApiResult ok=false with RelixAuthError on 401", async () => {
     const mock = new FetchMock();
     mock.on("POST", `${BRIDGE}/chat`, () => textResponse("bad token", 401));
     const client = makeClient(mock);
-    await expect(client.chat({ sessionId: "u1", message: "hi" })).rejects.toBeInstanceOf(
-      RelixAuthError,
-    );
+    const res = await client.chat({ sessionId: "u1", message: "hi" });
+    expect(res.ok).toBe(false);
+    if (res.ok) {
+      throw new Error("expected ok=false");
+    }
+    expect(res.error).toBeInstanceOf(RelixAuthError);
   });
 
-  it("throws RelixResponseError with status code on 500", async () => {
+  it("returns ApiResult ok=false with RelixResponseError + status on 500", async () => {
     const mock = new FetchMock();
     mock.on("POST", `${BRIDGE}/chat`, () => textResponse("boom", 500));
     const client = makeClient(mock);
-    try {
-      await client.chat({ sessionId: "u1", message: "hi" });
-      fail("expected throw");
-    } catch (err) {
-      expect(err).toBeInstanceOf(RelixResponseError);
-      expect((err as RelixResponseError).statusCode).toBe(500);
-      expect((err as RelixResponseError).body).toBe("boom");
+    const res = await client.chat({ sessionId: "u1", message: "hi" });
+    expect(res.ok).toBe(false);
+    if (res.ok) {
+      throw new Error("expected ok=false");
     }
+    expect(res.error).toBeInstanceOf(RelixResponseError);
+    expect((res.error as RelixResponseError).statusCode).toBe(500);
+    expect((res.error as RelixResponseError).body).toBe("boom");
   });
 
-  it("throws RelixConnectionError on network failure", async () => {
+  it("returns ApiResult ok=false with RelixConnectionError on network failure", async () => {
     const mock = new FetchMock();
     mock.on("POST", `${BRIDGE}/chat`, () => {
       throw new Error("ECONNREFUSED");
     });
     const client = makeClient(mock);
-    await expect(client.chat({ sessionId: "u1", message: "hi" })).rejects.toBeInstanceOf(
-      RelixConnectionError,
-    );
+    const res = await client.chat({ sessionId: "u1", message: "hi" });
+    expect(res.ok).toBe(false);
+    if (res.ok) {
+      throw new Error("expected ok=false");
+    }
+    expect(res.error).toBeInstanceOf(RelixConnectionError);
   });
 });
 
@@ -169,15 +184,18 @@ describe("RelixClient.chatStream", () => {
 });
 
 describe("RelixClient.info", () => {
-  it("returns the bridge info dict", async () => {
+  it("returns the bridge info dict wrapped in ApiResult", async () => {
     const mock = new FetchMock();
     mock.on("GET", `${BRIDGE}/v1/info`, () =>
       jsonResponse({ system: "relix", version: "0.1.0", model: "mock" }),
     );
     const client = makeClient(mock);
-    const info = await client.info();
-    expect(info.system).toBe("relix");
-    expect(info.version).toBe("0.1.0");
+    const res = await client.info();
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data.system).toBe("relix");
+    expect(res.data.version).toBe("0.1.0");
   });
 });
 

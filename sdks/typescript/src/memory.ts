@@ -8,8 +8,9 @@
  * * `POST /v1/memory/context_flush`
  */
 
-import { doJsonRequest, isObject, type RelixClient } from "./client";
+import { doJsonRequest, isObject, runRequest, type RelixClient } from "./client";
 import type {
+  ApiResult,
   DialecticAnswer,
   FlushContextResult,
   IngestDocumentResult,
@@ -24,64 +25,74 @@ export class MemoryAPI {
   constructor(private readonly client: RelixClient) {}
 
   /** Semantic search over the subject's persistent memory. */
-  async search(input: MemorySearchInput): Promise<MemoryResult[]> {
-    const body: Record<string, unknown> = {
-      subject_id: input.subjectId,
-      target: input.target ?? "agent",
-      query: input.query,
-      limit: input.limit ?? 5,
-    };
-    if (input.peer) {
-      body.peer = input.peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/memory/search", body);
-    return parseSearchResults(data);
+  async search(input: MemorySearchInput): Promise<ApiResult<MemoryResult[]>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = {
+        subject_id: input.subjectId,
+        target: input.target ?? "agent",
+        query: input.query,
+        limit: input.limit ?? 5,
+      };
+      if (input.peer) {
+        body.peer = input.peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/memory/search", body);
+      return parseSearchResults(data);
+    });
   }
 
   /** Ingest a text / markdown / code / pdf document. */
-  async ingestDocument(input: MemoryIngestDocumentInput): Promise<IngestDocumentResult> {
-    const body: Record<string, unknown> = {
-      subject_id: input.subjectId,
-      observer_id: input.observerId ?? "sdk-typescript",
-      source: input.source ?? "sdk",
-      content: input.content,
-      content_type: input.contentType ?? "markdown",
-    };
-    if (input.chunkSizeChars !== undefined) {
-      body.chunk_size_chars = input.chunkSizeChars;
-    }
-    if (input.peer) {
-      body.peer = input.peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/memory/ingest", body);
-    return parseIngestResult(data);
+  async ingestDocument(
+    input: MemoryIngestDocumentInput,
+  ): Promise<ApiResult<IngestDocumentResult>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = {
+        subject_id: input.subjectId,
+        observer_id: input.observerId ?? "sdk-typescript",
+        source: input.source ?? "sdk",
+        content: input.content,
+        content_type: input.contentType ?? "markdown",
+      };
+      if (input.chunkSizeChars !== undefined) {
+        body.chunk_size_chars = input.chunkSizeChars;
+      }
+      if (input.peer) {
+        body.peer = input.peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/memory/ingest", body);
+      return parseIngestResult(data);
+    });
   }
 
   /** Ask the memory store to synthesise an answer to a question. */
-  async dialectic(input: MemoryDialecticInput): Promise<DialecticAnswer> {
-    const body: Record<string, unknown> = {
-      observer_id: input.observerId ?? "sdk-typescript",
-      subject_id: input.subjectId,
-      question: input.question,
-    };
-    if (input.peer) {
-      body.peer = input.peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/memory/dialectic", body);
-    return parseDialectic(data);
+  async dialectic(input: MemoryDialecticInput): Promise<ApiResult<DialecticAnswer>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = {
+        observer_id: input.observerId ?? "sdk-typescript",
+        subject_id: input.subjectId,
+        question: input.question,
+      };
+      if (input.peer) {
+        body.peer = input.peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/memory/dialectic", body);
+      return parseDialectic(data);
+    });
   }
 
   /** Explicit context-window flush for `sessionId`. */
-  async flushContext(input: MemoryFlushContextInput): Promise<FlushContextResult> {
-    const body: Record<string, unknown> = {
-      session_id: input.sessionId,
-      keep_recent_n: input.keepRecent ?? 5,
-    };
-    if (input.peer) {
-      body.peer = input.peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/memory/context_flush", body);
-    return parseFlushResult(data);
+  async flushContext(input: MemoryFlushContextInput): Promise<ApiResult<FlushContextResult>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = {
+        session_id: input.sessionId,
+        keep_recent_n: input.keepRecent ?? 5,
+      };
+      if (input.peer) {
+        body.peer = input.peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/memory/context_flush", body);
+      return parseFlushResult(data);
+    });
   }
 }
 

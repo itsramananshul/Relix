@@ -7,32 +7,42 @@
  * * `GET  /v1/skills/:id`
  */
 
-import { doJsonRequest, isObject, type RelixClient } from "./client";
-import type { Skill, SkillStats, SkillsSearchInput } from "./types";
+import { doJsonRequest, isObject, runRequest, type RelixClient } from "./client";
+import type { ApiResult, Skill, SkillStats, SkillsSearchInput } from "./types";
 
 export class SkillsAPI {
   constructor(private readonly client: RelixClient) {}
 
-  async search(input: SkillsSearchInput = {}): Promise<Skill[]> {
-    const params: Record<string, unknown> = {
-      q: input.query,
-      agent: input.agent,
-      min_confidence: input.minConfidence,
-      limit: input.limit,
-      peer: input.peer,
-    };
-    const data = await doJsonRequest(this.client, "GET", "/v1/skills", undefined, params);
-    return parseSkills(data);
+  async search(input: SkillsSearchInput = {}): Promise<ApiResult<Skill[]>> {
+    return runRequest(async () => {
+      const params: Record<string, unknown> = {
+        q: input.query,
+        agent: input.agent,
+        min_confidence: input.minConfidence,
+        limit: input.limit,
+        peer: input.peer,
+      };
+      const data = await doJsonRequest(this.client, "GET", "/v1/skills", undefined, params);
+      return parseSkills(data);
+    });
   }
 
-  async stats(): Promise<SkillStats> {
-    const data = await doJsonRequest(this.client, "GET", "/v1/skills/stats");
-    return parseStats(data);
+  async stats(): Promise<ApiResult<SkillStats>> {
+    return runRequest(async () => {
+      const data = await doJsonRequest(this.client, "GET", "/v1/skills/stats");
+      return parseStats(data);
+    });
   }
 
-  async get(skillId: string): Promise<Skill> {
-    const data = await doJsonRequest(this.client, "GET", `/v1/skills/${encodeURIComponent(skillId)}`);
-    return parseSkillRow(data);
+  async get(skillId: string): Promise<ApiResult<Skill>> {
+    return runRequest(async () => {
+      const data = await doJsonRequest(
+        this.client,
+        "GET",
+        `/v1/skills/${encodeURIComponent(skillId)}`,
+      );
+      return parseSkillRow(data);
+    });
   }
 }
 

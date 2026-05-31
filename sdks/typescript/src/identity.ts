@@ -7,8 +7,9 @@
  * Matches the Python `client.identity` surface field-for-field.
  */
 
-import { doJsonRequest, isObject, type RelixClient } from "./client";
+import { doJsonRequest, isObject, runRequest, type RelixClient } from "./client";
 import type {
+  ApiResult,
   IdentityProfile,
   IdentityResearchInput,
   ResearchResult,
@@ -25,16 +26,18 @@ export class IdentityAPI {
    * blocks until the operator votes (up to five minutes); the SDK
    * respects the bridge's deadline.
    */
-  async research(input: IdentityResearchInput): Promise<ResearchResult> {
-    const body: Record<string, unknown> = { subject_name: input.subjectName };
-    if (input.context !== undefined) {
-      body.context = input.context;
-    }
-    if (input.peer !== undefined) {
-      body.peer = input.peer;
-    }
-    const data = await doJsonRequest(this.client, "POST", "/v1/identity/research", body);
-    return parseResearch(data);
+  async research(input: IdentityResearchInput): Promise<ApiResult<ResearchResult>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = { subject_name: input.subjectName };
+      if (input.context !== undefined) {
+        body.context = input.context;
+      }
+      if (input.peer !== undefined) {
+        body.peer = input.peer;
+      }
+      const data = await doJsonRequest(this.client, "POST", "/v1/identity/research", body);
+      return parseResearch(data);
+    });
   }
 }
 

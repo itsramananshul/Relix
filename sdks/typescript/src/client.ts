@@ -17,12 +17,14 @@ import { ObservabilityAPI } from "./observability";
 import { PlanningAPI } from "./planning";
 import { SkillsAPI } from "./skills";
 import {
+  ApiResult,
   ChatInput,
   ChatResponse,
   ChatUsage,
   RelixAuthError,
   RelixClientOptions,
   RelixConnectionError,
+  RelixError,
   RelixResponseError,
   RelixTimeoutError,
   StreamChunk,
@@ -262,6 +264,40 @@ export async function doJsonRequest(
   }
 }
 
+/**
+ * PART 5 — wrap an async producer in the `ApiResult<T>` discriminated
+ * union. Any `RelixError` thrown by the producer maps to
+ * `{ ok: false, error }`; any other throw is converted into a
+ * `RelixError` so the API surface never leaks an untyped exception.
+ *
+ * Used by every single-response SDK method on `RelixClient` and the
+ * sub-APIs. Streaming methods (`chatStream`) keep their
+ * `AsyncIterable<StreamChunk>` shape — the discriminated union is
+ * orthogonal to multi-value protocols.
+ */
+export async function runRequest<T>(
+  producer: () => Promise<T>,
+): Promise<ApiResult<T>> {
+  try {
+    const data = await producer();
+    return { ok: true, data };
+  } catch (err) {
+    if (err instanceof RelixError) {
+      return { ok: false, error: err };
+    }
+    if (err instanceof Error) {
+      return {
+        ok: false,
+        error: new RelixConnectionError(`unexpected SDK error: ${err.message}`),
+      };
+    }
+    return {
+      ok: false,
+      error: new RelixConnectionError(`unexpected SDK error: ${String(err)}`),
+    };
+  }
+}
+
 /** Assemble a final URL with optional query string. */
 function buildUrl(
   base: string,
@@ -344,17 +380,23 @@ export class RelixClient {
     this.identity = new IdentityAPI(this);
   }
 
-  /** `POST /chat`. */
-  async chat(input: ChatInput): Promise<ChatResponse> {
-    const body: Record<string, unknown> = {
-      session_id: input.sessionId,
-      message: input.message,
-    };
-    if (input.agent) {
-      body.agent = input.agent;
-    }
-    const data = await doJsonRequest(this, "POST", "/chat", body);
-    return parseChatResponse(data);
+  /**
+   * `POST /chat`. Returns the bridge's chat response wrapped in an
+   * `ApiResult<ChatResponse>` discriminated union — callers branch on
+   * `result.ok` instead of try/catch.
+   */
+  async chat(input: ChatInput): Promise<ApiResult<ChatResponse>> {
+    return runRequest(async () => {
+      const body: Record<string, unknown> = {
+        session_id: input.sessionId,
+        message: input.message,
+      };
+      if (input.agent) {
+        body.agent = input.agent;
+      }
+      const data = await doJsonRequest(this, "POST", "/chat", body);
+      return parseChatResponse(data);
+    });
   }
 
   /**
@@ -453,9 +495,11 @@ export class RelixClient {
     }
   }
 
-  /** `GET /v1/info`. */
-  async info(): Promise<Record<string, unknown>> {
-    const data = await doJsonRequest(this, "GET", "/v1/info");
-    return isObject(data) ? data : {};
+  /** `GET /v1/info`. ApiResult-wrapped. */
+  async info(): Promise<ApiResult<Record<string, unknown>>> {
+    return runRequest(async () => {
+      const data = await doJsonRequest(this, "GET", "/v1/info");
+      return isObject(data) ? data : {};
+    });
   }
 }

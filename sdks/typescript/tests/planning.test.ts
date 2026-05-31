@@ -1,6 +1,9 @@
 /**
  * Tests for ``client.planning.*``, ``client.skills.*``, and
  * ``client.observability.*``.
+ *
+ * All single-response methods now return `ApiResult<T>` (PART 5);
+ * each test narrows on `.ok` before reading `.data`.
  */
 
 import { RelixClient } from "../src";
@@ -25,15 +28,18 @@ describe("client.planning.plan", () => {
       }),
     );
     const c = client(mock);
-    const plan = await c.planning.plan({
+    const res = await c.planning.plan({
       spec: "research and write",
       maxAgents: 3,
       dryRun: true,
     });
-    expect(plan.workflowYaml.startsWith("name: example")).toBe(true);
-    expect(plan.orchestratorActivated).toBe(false);
-    expect(plan.criticApproved).toBe(true);
-    expect(plan.agentsSelected).toEqual(["researcher", "writer"]);
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data.workflowYaml.startsWith("name: example")).toBe(true);
+    expect(res.data.orchestratorActivated).toBe(false);
+    expect(res.data.criticApproved).toBe(true);
+    expect(res.data.agentsSelected).toEqual(["researcher", "writer"]);
     const body = JSON.parse(mock.lastCall().body ?? "{}");
     expect(body.dry_run).toBe(true);
     expect(body.max_agents).toBe(3);
@@ -50,10 +56,13 @@ describe("client.planning.agents", () => {
       ]),
     );
     const c = client(mock);
-    const agents = await c.planning.agents();
-    expect(agents).toHaveLength(2);
-    expect(agents[0]?.name).toBe("alpha");
-    expect(agents[0]?.capabilities).toContain("ai.chat");
+    const res = await c.planning.agents();
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data).toHaveLength(2);
+    expect(res.data[0]?.name).toBe("alpha");
+    expect(res.data[0]?.capabilities).toContain("ai.chat");
   });
 
   it("accepts a {agents: [...]} wrapped response", async () => {
@@ -62,9 +71,12 @@ describe("client.planning.agents", () => {
       jsonResponse({ agents: [{ name: "alpha", description: "" }] }),
     );
     const c = client(mock);
-    const agents = await c.planning.agents();
-    expect(agents).toHaveLength(1);
-    expect(agents[0]?.name).toBe("alpha");
+    const res = await c.planning.agents();
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data).toHaveLength(1);
+    expect(res.data[0]?.name).toBe("alpha");
   });
 });
 
@@ -87,15 +99,18 @@ describe("client.skills.search", () => {
       }),
     );
     const c = client(mock);
-    const skills = await c.skills.search({
+    const res = await c.skills.search({
       query: "research",
       minConfidence: 0.7,
       limit: 10,
     });
-    expect(skills).toHaveLength(1);
-    expect(skills[0]?.id).toBe("s1");
-    expect(skills[0]?.confidence).toBe(0.8);
-    expect(skills[0]?.usageCount).toBe(12);
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data).toHaveLength(1);
+    expect(res.data[0]?.id).toBe("s1");
+    expect(res.data[0]?.confidence).toBe(0.8);
+    expect(res.data[0]?.usageCount).toBe(12);
     const url = mock.lastCall().url;
     expect(url).toMatch(/min_confidence=0\.7/);
     expect(url).toMatch(/q=research/);
@@ -126,9 +141,12 @@ describe("client.skills.stats", () => {
       }),
     );
     const c = client(mock);
-    const stats = await c.skills.stats();
-    expect(stats.totalSkills).toBe(12);
-    expect(stats.avgConfidence).toBeCloseTo(0.74);
+    const res = await c.skills.stats();
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data.totalSkills).toBe(12);
+    expect(res.data.avgConfidence).toBeCloseTo(0.74);
   });
 });
 
@@ -146,11 +164,14 @@ describe("client.observability.health", () => {
       }),
     );
     const c = client(mock);
-    const h = await c.observability.health({ hours: 24 });
-    expect(Object.keys(h.agents).sort()).toEqual(["alpha", "beta"]);
-    expect(h.agents.alpha?.score).toBe(92.3);
-    expect(h.deployment?.score).toBe(78.0);
-    expect(h.windowHours).toBe(24);
+    const res = await c.observability.health({ hours: 24 });
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(Object.keys(res.data.agents).sort()).toEqual(["alpha", "beta"]);
+    expect(res.data.agents.alpha?.score).toBe(92.3);
+    expect(res.data.deployment?.score).toBe(78.0);
+    expect(res.data.windowHours).toBe(24);
   });
 });
 
@@ -169,9 +190,12 @@ describe("client.observability.alerts", () => {
       ]),
     );
     const c = client(mock);
-    const alerts = await c.observability.alerts();
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0]?.kind).toBe("cost_spike");
+    const res = await c.observability.alerts();
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data).toHaveLength(1);
+    expect(res.data[0]?.kind).toBe("cost_spike");
   });
 
   it("accepts a {alerts: [...]} wrapped shape", async () => {
@@ -180,8 +204,11 @@ describe("client.observability.alerts", () => {
       jsonResponse({ alerts: [{ id: "a1", kind: "low_confidence", severity: "info" }] }),
     );
     const c = client(mock);
-    const alerts = await c.observability.alerts();
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0]?.kind).toBe("low_confidence");
+    const res = await c.observability.alerts();
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data).toHaveLength(1);
+    expect(res.data[0]?.kind).toBe("low_confidence");
   });
 });

@@ -7,10 +7,11 @@
  * * `GET /v1/observability/alerts/history?limit=N&agent=...`
  */
 
-import { doJsonRequest, isObject, type RelixClient } from "./client";
+import { doJsonRequest, isObject, runRequest, type RelixClient } from "./client";
 import type {
   AgentHealth,
   Alert,
+  ApiResult,
   HealthSummary,
   ObservabilityAlertHistoryInput,
   ObservabilityHealthInput,
@@ -19,46 +20,54 @@ import type {
 export class ObservabilityAPI {
   constructor(private readonly client: RelixClient) {}
 
-  async health(input: ObservabilityHealthInput = {}): Promise<HealthSummary> {
-    const params: Record<string, unknown> = {
-      hours: input.hours,
-      peer: input.peer,
-    };
-    const data = await doJsonRequest(
-      this.client,
-      "GET",
-      "/v1/observability/health",
-      undefined,
-      params,
-    );
-    return parseHealth(data);
+  async health(input: ObservabilityHealthInput = {}): Promise<ApiResult<HealthSummary>> {
+    return runRequest(async () => {
+      const params: Record<string, unknown> = {
+        hours: input.hours,
+        peer: input.peer,
+      };
+      const data = await doJsonRequest(
+        this.client,
+        "GET",
+        "/v1/observability/health",
+        undefined,
+        params,
+      );
+      return parseHealth(data);
+    });
   }
 
-  async alerts(peer?: string): Promise<Alert[]> {
-    const data = await doJsonRequest(
-      this.client,
-      "GET",
-      "/v1/observability/alerts",
-      undefined,
-      peer ? { peer } : undefined,
-    );
-    return parseAlerts(data);
+  async alerts(peer?: string): Promise<ApiResult<Alert[]>> {
+    return runRequest(async () => {
+      const data = await doJsonRequest(
+        this.client,
+        "GET",
+        "/v1/observability/alerts",
+        undefined,
+        peer ? { peer } : undefined,
+      );
+      return parseAlerts(data);
+    });
   }
 
-  async alertHistory(input: ObservabilityAlertHistoryInput = {}): Promise<Alert[]> {
-    const params: Record<string, unknown> = {
-      limit: input.limit,
-      agent: input.agent,
-      peer: input.peer,
-    };
-    const data = await doJsonRequest(
-      this.client,
-      "GET",
-      "/v1/observability/alerts/history",
-      undefined,
-      params,
-    );
-    return parseAlerts(data);
+  async alertHistory(
+    input: ObservabilityAlertHistoryInput = {},
+  ): Promise<ApiResult<Alert[]>> {
+    return runRequest(async () => {
+      const params: Record<string, unknown> = {
+        limit: input.limit,
+        agent: input.agent,
+        peer: input.peer,
+      };
+      const data = await doJsonRequest(
+        this.client,
+        "GET",
+        "/v1/observability/alerts/history",
+        undefined,
+        params,
+      );
+      return parseAlerts(data);
+    });
   }
 }
 

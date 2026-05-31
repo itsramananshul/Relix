@@ -1,5 +1,8 @@
 /**
  * Tests for ``client.memory.*``.
+ *
+ * Single-response methods return `ApiResult<T>` (PART 5); each test
+ * narrows on `.ok` before reading `.data`.
  */
 
 import { RelixClient } from "../src";
@@ -24,15 +27,18 @@ describe("client.memory.search", () => {
       }),
     );
     const c = client(mock);
-    const results = await c.memory.search({
+    const res = await c.memory.search({
       query: "pricing",
       subjectId: "u1",
       limit: 5,
     });
-    expect(results).toHaveLength(2);
-    expect(results[0]?.id).toBe("e1");
-    expect(results[0]?.text).toBe("pricing");
-    expect(results[0]?.score).toBeCloseTo(0.93);
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data).toHaveLength(2);
+    expect(res.data[0]?.id).toBe("e1");
+    expect(res.data[0]?.text).toBe("pricing");
+    expect(res.data[0]?.score).toBeCloseTo(0.93);
   });
 
   it("sends the expected request body shape (snake_case keys)", async () => {
@@ -55,9 +61,12 @@ describe("client.memory.search", () => {
       jsonResponse([{ embedding_id: "e1", score: 0.5, chunk_text: "x" }]),
     );
     const c = client(mock);
-    const results = await c.memory.search({ query: "x", subjectId: "u1" });
-    expect(results).toHaveLength(1);
-    expect(results[0]?.id).toBe("e1");
+    const res = await c.memory.search({ query: "x", subjectId: "u1" });
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data).toHaveLength(1);
+    expect(res.data[0]?.id).toBe("e1");
   });
 });
 
@@ -75,14 +84,17 @@ describe("client.memory.ingestDocument", () => {
       }),
     );
     const c = client(mock);
-    const result = await c.memory.ingestDocument({
+    const res = await c.memory.ingestDocument({
       subjectId: "u1",
       content: "# notes",
       contentType: "markdown",
       source: "notes.md",
     });
-    expect(result.chunksCreated).toBe(3);
-    expect(result.contentType).toBe("markdown");
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data.chunksCreated).toBe(3);
+    expect(res.data.contentType).toBe("markdown");
     const body = JSON.parse(mock.lastCall().body ?? "{}");
     expect(body.subject_id).toBe("u1");
     expect(body.content_type).toBe("markdown");
@@ -101,13 +113,16 @@ describe("client.memory.dialectic", () => {
       }),
     );
     const c = client(mock);
-    const ans = await c.memory.dialectic({
+    const res = await c.memory.dialectic({
       question: "what?",
       subjectId: "u1",
     });
-    expect(ans.answer).toContain("concise");
-    expect(ans.confidence).toBeCloseTo(0.82);
-    expect(ans.supportingObservations).toHaveLength(1);
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data.answer).toContain("concise");
+    expect(res.data.confidence).toBeCloseTo(0.82);
+    expect(res.data.supportingObservations).toHaveLength(1);
   });
 });
 
@@ -118,8 +133,11 @@ describe("client.memory.flushContext", () => {
       jsonResponse({ flushed_count: 7, kept_count: 5 }),
     );
     const c = client(mock);
-    const r = await c.memory.flushContext({ sessionId: "s1", keepRecent: 5 });
-    expect(r.flushedCount).toBe(7);
-    expect(r.keptCount).toBe(5);
+    const res = await c.memory.flushContext({ sessionId: "s1", keepRecent: 5 });
+    if (!res.ok) {
+      throw new Error(`expected ok=true: ${res.error.message}`);
+    }
+    expect(res.data.flushedCount).toBe(7);
+    expect(res.data.keptCount).toBe(5);
   });
 });
