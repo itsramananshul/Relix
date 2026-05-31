@@ -299,17 +299,30 @@ impl TrainingStore {
         if ids.is_empty() {
             return Ok(0);
         }
+        // PART 2: collapse the per-id UPDATE loop into a single
+        // statement that uses `WHERE interaction_id IN (?, ?, …)`.
+        // Chunked at 500 to stay well under SQLite's per-statement
+        // parameter cap (SQLITE_MAX_VARIABLE_NUMBER) across hosts.
+        const CHUNK: usize = 500;
         let mut conn = self.conn.lock().map_err(|_| TrainingStoreError::Lock)?;
         let tx = conn.transaction()?;
         let mut n = 0usize;
-        {
-            let mut stmt = tx.prepare(
+        for chunk in ids.chunks(CHUNK) {
+            // Bind positions: ?1 = export_set, ?2.. = each id.
+            let placeholders: String = (0..chunk.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
                 "UPDATE training_interactions SET exported = 1, export_set = ?1 \
-                 WHERE interaction_id = ?2 AND exported = 0",
-            )?;
-            for id in ids {
-                n += stmt.execute(params![export_set, id.as_str()])?;
+                 WHERE interaction_id IN ({placeholders}) AND exported = 0"
+            );
+            let mut bind: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + chunk.len());
+            bind.push(rusqlite::types::Value::Text(export_set.to_string()));
+            for id in chunk {
+                bind.push(rusqlite::types::Value::Text(id.as_str().to_string()));
             }
+            n += tx.execute(&sql, rusqlite::params_from_iter(bind.iter()))?;
         }
         tx.commit()?;
         Ok(n)

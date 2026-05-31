@@ -798,8 +798,12 @@ impl KnowledgeService {
         }
         let mut out = RevokeResult::default();
         let now = unix_now();
+        // PART 2: pre-fetch every observation in one SELECT
+        // instead of N individual `store.get` calls.
+        let id_refs: Vec<&str> = observation_ids.iter().map(String::as_str).collect();
+        let prefetched = self.store.get_many(&id_refs)?;
         for id in observation_ids {
-            let rec = self.store.get(id)?;
+            let rec = prefetched.get(id).cloned();
             let Some(rec) = rec else {
                 out.missing_ids.push(id.clone());
                 continue;
@@ -875,8 +879,27 @@ impl KnowledgeService {
         // diffing CLI output get deterministic results).
         let mut per_target: std::collections::BTreeMap<String, (u64, Vec<String>)> =
             std::collections::BTreeMap::new();
+        // PART 2: pre-fetch every source observation in one
+        // SELECT, then materialise the full set of derived
+        // copy ids and pre-fetch those in a second SELECT.
+        // This collapses what was N(sources) + N(sources × shares)
+        // round-trips into two.
+        let source_id_refs: Vec<&str> = source_observation_ids.iter().map(String::as_str).collect();
+        let sources_prefetched = self.store.get_many(&source_id_refs)?;
+        let mut copy_ids: Vec<String> = Vec::new();
         for source_id in source_observation_ids {
-            let rec = match self.store.get(source_id)? {
+            if let Some(rec) = sources_prefetched.get(source_id)
+                && rec.source == caller_agent
+            {
+                for target in rec.shared_with.iter() {
+                    copy_ids.push(mint_copy_id(source_id, target));
+                }
+            }
+        }
+        let copy_id_refs: Vec<&str> = copy_ids.iter().map(String::as_str).collect();
+        let copies_prefetched = self.store.get_many(&copy_id_refs)?;
+        for source_id in source_observation_ids {
+            let rec = match sources_prefetched.get(source_id).cloned() {
                 Some(r) => r,
                 None => {
                     out.missing_source_ids.push(source_id.clone());
@@ -894,7 +917,7 @@ impl KnowledgeService {
                 let entry = per_target
                     .entry(target.clone())
                     .or_insert_with(|| (0, Vec::new()));
-                let copy = match self.store.get(&copy_id)? {
+                let copy = match copies_prefetched.get(&copy_id).cloned() {
                     Some(c) => c,
                     None => {
                         entry.1.push(copy_id);

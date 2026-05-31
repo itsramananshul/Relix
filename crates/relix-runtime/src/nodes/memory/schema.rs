@@ -579,6 +579,47 @@ impl LayeredMemoryStore {
         row.transpose()
     }
 
+    /// PART 2: batch fetch by id. Folds an N+1 of `get(id)` into
+    /// a single `WHERE id IN (?, ?, …)` lookup. Returns a map
+    /// keyed by id; absent ids simply do not appear, mirroring
+    /// `get` returning `None`. Input is chunked at 500 ids to
+    /// stay under SQLite's per-statement parameter cap across
+    /// hosts. Iteration order is irrelevant — callers index by id.
+    pub fn get_many(
+        &self,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, MemoryRecord>, LayeredMemoryError> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        const CHUNK: usize = 500;
+        let conn = self.conn.lock().map_err(|_| LayeredMemoryError::Lock)?;
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders: String = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, layer, text, source, tags, created_at, valid_from, valid_to, observed_at, embedding, \
+                    shareable, shared_with, shared_by, share_policy, \
+                    source_trust, frozen, last_edited_ms, consolidated, tenant_id, superseded_by \
+                 FROM memory_records WHERE id IN ({placeholders})"
+            );
+            let bind: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|id| rusqlite::types::Value::Text((*id).to_string()))
+                .collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(bind.iter()), row_to_record)?;
+            for r in rows {
+                let rec = r??;
+                out.insert(rec.id.clone(), rec);
+            }
+        }
+        Ok(out)
+    }
+
     /// Paginated list of records. Filtered optionally by
     /// `layer` and `source`. Ordered by `created_at DESC` for
     /// "most recent first" operator surfaces; ties broken on

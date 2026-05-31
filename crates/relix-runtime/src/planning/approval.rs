@@ -522,32 +522,35 @@ impl ApprovalStore {
                 .collect::<Result<Result<Vec<_>, _>, _>>()
                 .map_err(ApprovalError::Sqlite)??
         };
+        // PART 2: collapse the per-row UPDATE loop into a
+        // single statement. The decision_note depends on each
+        // row's created_at_ms, so we compute it inline with
+        // SQLite string concatenation. The transaction still
+        // serialises this with the prior SELECT, so the
+        // candidates list and the UPDATE see the same snapshot
+        // of pending rows.
+        if !candidates.is_empty() {
+            tx.execute(
+                "UPDATE plan_approvals \
+                 SET status = 'expired', \
+                     decided_at_ms = ?1, \
+                     decision_note = 'expired after ' || \
+                         ((?1 - created_at_ms) / 1000) || 's (created_at_ms=' || \
+                         created_at_ms || ', cutoff_ms=' || ?2 || ')' \
+                 WHERE status = 'pending' AND created_at_ms < ?2",
+                params![decided_at_ms, cutoff_ms],
+            )?;
+        }
         let mut expired = Vec::with_capacity(candidates.len());
         for c in candidates {
-            let rows = tx.execute(
-                "UPDATE plan_approvals \
-                 SET status = 'expired', decided_at_ms = ?1, decision_note = ?2 \
-                 WHERE id = ?3 AND status = 'pending'",
-                params![
-                    decided_at_ms,
-                    format!(
-                        "expired after {}s (created_at_ms={}, cutoff_ms={cutoff_ms})",
-                        (decided_at_ms - c.created_at_ms) / 1000,
-                        c.created_at_ms,
-                    ),
-                    c.plan_id,
-                ],
-            )?;
-            if rows > 0 {
-                let mut updated = c;
-                updated.status = ApprovalStatus::Expired;
-                updated.decided_at_ms = Some(decided_at_ms);
-                updated.decision_note = Some(format!(
-                    "expired after {}s",
-                    (decided_at_ms - updated.created_at_ms) / 1000
-                ));
-                expired.push(updated);
-            }
+            let mut updated = c;
+            updated.status = ApprovalStatus::Expired;
+            updated.decided_at_ms = Some(decided_at_ms);
+            updated.decision_note = Some(format!(
+                "expired after {}s",
+                (decided_at_ms - updated.created_at_ms) / 1000
+            ));
+            expired.push(updated);
         }
         tx.commit()?;
         Ok(expired)
