@@ -1,5 +1,7 @@
 # Task Recovery — Operator Playbook
 
+_Version: 0.4.1_
+
 Concrete steps for diagnosing and acting on interrupted or failed
 Tasks. Companion to [`interruption-semantics.md`](interruption-semantics.md)
 (the contract) and [`retry-model.md`](retry-model.md) (what retries
@@ -88,18 +90,16 @@ every `RemoteCallIssued` / `RemoteCallFailed` for forensic detail.
 ### Re-run from scratch (most common)
 
 ```bash
-# C2c.1 retry primitive: validate state + budget, emit
-# task.retry_requested, flip to retrying. Refused by default for
-# non-retryable failure classes (policy_denied / invalid_args /
-# permanent); use --force to override.
+# Retry primitive: validate state + budget, emit task.retry_requested,
+# flip to retrying. Refused by default for non-retryable failure
+# classes (policy_denied / invalid_args / permanent); use --force to
+# override.
 relix-cli task retry --peer ... --identity ... --client-key ... \
     --task-id <hex>
 
-# Re-run with the same flow_template + params. The bridge does this
-# automatically for /chat requests; for CLI tasks you run flow-run
-# yourself. The flow's success/failure path drives task.update,
-# which opens a NEW attempt row (#N+1) and closes it with the
-# terminal outcome.
+# Re-run with the same flow_template + params. The flow's
+# success/failure path drives task.update, which opens a NEW attempt
+# row (#N+1) and closes it with the terminal outcome.
 relix-cli flow-run --flow flows/chat_template.sol \
     --identity ... --client-key ... --peers peers.toml
 ```

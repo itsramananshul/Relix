@@ -8,11 +8,10 @@ arrives, plus a terminal `done` (or `error`) frame.
 ## Where the stream comes from
 
 The `ChatProvider` trait has a `generate_reply_stream` method.
-The mock provider streams word-by-word with a 20ms gap so dev
+The mock provider streams word-by-word with a 20 ms gap so dev
 flows behave like real streaming without a key. The
-OpenAI-compatible provider streams real per-token deltas by
-parsing the upstream `data: <json>\n\n` SSE frames from the
-provider's `/v1/chat/completions` response.
+OpenAI-compatible, Anthropic, and Gemini providers override it
+with native SSE token streaming against their upstream APIs.
 
 End-to-end provider-native streaming through the **mesh** still
 goes through the synchronous `ai.chat` capability — the chat
@@ -27,10 +26,15 @@ provider streaming primitive is already in place to consume it.
 The upgrade request must carry an `Authorization: Bearer <token>`
 header. A missing header, a non-`Bearer` scheme, or an empty
 token returns 401 before the WebSocket upgrade completes. The
-alpha bridge is loopback-only and accepts any non-empty token —
-the value isn't matched against a registry yet. Full identity
-verification still runs **inside** the mesh on every responder
-admission.
+bearer value is compared against the bridge token using a
+constant-time comparison — any mismatch returns 401. Full
+identity verification also runs **inside** the mesh on every
+responder admission.
+
+The per-principal concurrent-WebSocket cap (`[mesh.rate_limits]
+ws_max_concurrent`, default 5) is checked before the upgrade.
+Exceeding it returns 429 with `{"error":"rate_limit_exceeded",
+"retry_after_secs":60,"ws_limit":N}`.
 
 ## Wire format
 
@@ -69,7 +73,7 @@ const ws = new WebSocket("ws://127.0.0.1:19791/ws/chat", [], {
   // client put the token in the URL query and have the server
   // accept it there too (post-alpha). For node / desktop
   // clients use the per-library header API:
-  headers: { Authorization: "Bearer demo-token" },
+  headers: { Authorization: "Bearer <bridge-token>" },
 });
 
 ws.onopen = () => {
@@ -106,7 +110,7 @@ import asyncio, json
 import websockets
 
 async def main():
-    headers = {"Authorization": "Bearer demo-token"}
+    headers = {"Authorization": "Bearer <bridge-token>"}
     uri = "ws://127.0.0.1:19791/ws/chat"
     async with websockets.connect(uri, extra_headers=headers) as ws:
         await ws.send(json.dumps({
@@ -134,9 +138,9 @@ asyncio.run(main())
 | | `POST /chat/stream` (SSE) | `GET /ws/chat` (WebSocket) |
 |---|---|---|
 | Wire | `text/event-stream` (`event: chunk`, `event: done`) | One JSON frame per message |
-| Auth | None today (loopback) | `Authorization: Bearer <token>` (any non-empty) |
+| Auth | `Authorization: Bearer <token>` (constant-time compare) | `Authorization: Bearer <token>` (constant-time compare) |
 | Direction | Server → client only | Bidirectional (alpha sends one request frame) |
-| Chunking | Byte-sized slices of the full reply | Word-sized chunks with a 20ms gap |
+| Chunking | Byte-sized slices of the full reply | Word-sized chunks with a 20 ms gap |
 | Final frame | `event: done` with `flow_id` / `trace_id` JSON | `{ "type": "done", "session_id": ..., "text": ... }` |
 | When to use | OpenAI-compatible client integration, browsers without WS auth | App-level chat UIs, dev tools, anything that wants a real WS |
 

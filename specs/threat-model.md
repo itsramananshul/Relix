@@ -1,6 +1,9 @@
 # Relix Threat Model — Alpha
 
-This is the initial threat model. Updated per gate per `SECURITY.md`.
+Version: 0.4.1
+
+This is the threat model for the current alpha. Updated per security gate per
+`SECURITY.md`.
 
 ## Attacker Classes Covered
 
@@ -55,8 +58,8 @@ This is the initial threat model. Updated per gate per `SECURITY.md`.
 
 - **A6 — Insider with admin role.** Out of scope. Org-internal trust assumed for alpha. Threat-model expansion at Gate 3.
 - **A7 — Cross-org federation partner.** Out of scope. Federation not implemented in alpha.
-- **A8 — Side-channel attacks on the local secrets vault.** Out of scope. Standard OS-level file-permission discipline; HSM at Gate 3.
-- **A9 — Supply-chain attack on dependencies.** Baseline `cargo audit` only. Full supply-chain hardening at Gate 3.
+- **A8 — Side-channel attacks on the local secrets vault.** Partially mitigated: the credential vault uses Argon2id KDF + AES-256-GCM at rest with `Zeroizing<>` in-memory hygiene. Full HSM-backed protection deferred to Gate 3.
+- **A9 — Supply-chain attack on dependencies.** Baseline `cargo audit` only. The plugin subsystem adds optional per-plugin controls (`publisher_key` Ed25519 manifest signature, `binary_sha256` binary hash pin). Full supply-chain hardening at Gate 3.
 
 ## Assets
 
@@ -68,6 +71,8 @@ This is the initial threat model. Updated per gate per `SECURITY.md`.
 | User session JWT | Relix Web | per-user | Browser session takeover |
 | Conversation history | Memory node SQLite | memory-node operator | Privacy breach |
 | Audit logs | Per responder local | per-node operator | Audit trail blinding (detectable via gaps) |
+| Credential vault | Coordinator SQLite (`credentials.db`) | coordinator operator | Exposure of all stored API keys and tokens |
+| Approval signing key (`RELIX_APPROVAL_SIGNING_KEY`) | Coordinator process env | coordinator operator | Ability to forge approval tokens for any method |
 
 ## Attack Surface Per Node
 
@@ -101,11 +106,43 @@ This is the initial threat model. Updated per gate per `SECURITY.md`.
 If any of the following are violated, the alpha is compromised regardless of test results:
 
 - Identity verified on every responder before any handler logic runs.
-- Policy evaluated on every responder.
+- Agent gate evaluated (when configured) before the policy engine; gate is
+  fail-closed for missing store and missing profile.
+- Policy evaluated on every responder; tenant isolation deny fires before
+  per-method rules when enabled.
 - Audit emitted on every responder for every cross-node call.
 - AI provider keys present ONLY in the AI node.
 - Web backend makes no LLM provider call in `RELIX_MODE`.
 - Routing decisions live only in SOL flows.
+- Credential vault master secret never written to disk; derived keys and
+  plaintext values held only in `Zeroizing<>` heap memory.
+- Approval token signing key (`RELIX_APPROVAL_SIGNING_KEY`) held only in
+  coordinator process memory; never transmitted over the mesh.
+
+## Shipped security controls not in original model
+
+The following controls were added after the initial threat model was written
+and are now enforced in code:
+
+- **Fail-closed agent gate** — missing agent store or missing profile is a
+  deny, not a no-op. The legacy silent-allow behaviour was removed.
+- **Ed25519 approval tokens** — replaces the deprecated HMAC-SHA256 scheme.
+  v0x01 tokens are refused at parse. See
+  [`approval-tokens.md`](../docs/approval-tokens.md).
+- **Encrypted credential vault** — AES-256-GCM + Argon2id at rest. Legacy
+  SHA-256 vaults refused at open. See
+  [`credentials.md`](../docs/credentials.md).
+- **Plugin sandbox** — Linux seccomp (23-syscall deny list) + rlimits;
+  TLS loopback transport with per-plugin cert pinning; binary SHA-256 and
+  publisher-key signature verification.
+- **Tenant isolation** — `TenantPolicyResolver` fail-closed deny when
+  `tenant_id` is absent in multi-tenant mode.
+- **Surface check fix** — agent gate reads transport-layer `caller_surface`
+  (trusted); `envelope.surface` is ignored for admission.
+- **Mesh PII gate** — optional inbound args scanning with block/redact/log
+  actions and `pii_events.sqlite` audit trail.
+- **Secret redaction** — 13 secret-kind patterns applied to log output and
+  error messages via `redact_secrets`.
 
 ## Known Limitations (Tracked)
 

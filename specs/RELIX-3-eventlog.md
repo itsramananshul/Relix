@@ -1,6 +1,6 @@
 # RELIX-3 — Event Log + Flow Coordinator
 
-**Status:** Frozen target. Alpha implements core append + chain + audit indexing; defers snapshots (SIMP-005) and full replay-equivalence (SIMP-008).
+**Version:** 0.4.1 | **Status:** Frozen target. Alpha implements core append + chain + audit indexing; defers snapshots (SIMP-005) and full replay-equivalence (SIMP-008).
 
 ## 3.1 Responsibilities
 
@@ -18,10 +18,15 @@ The Event Log is the per-flow, append-only, hash-chained, signed record of every
 
 ## 3.3 Event Record
 
-Fields: `flow_id` (16-byte), `event_seq` (u64), `ts` (tag(1); ordering/ops only — not consumed by replay), `type` (u8), `payload` (CBOR), `prev_hash` (32 bytes), `sig` (64 bytes Ed25519).
+Fields: `flow_id` (16-byte), `event_seq` (u64), `ts` (tag(1); ordering/ops only — not consumed by replay), `kind` (snake_case string; see §3.4), `payload` (CBOR), `prev_hash` (32 bytes), `signature` (64 bytes Ed25519).
+
+**Disk framing:** each record is preceded by a 4-byte big-endian length field; the CBOR record bytes follow immediately. This framing is used by both the event log and the audit log.
+
+> **Alpha wire note:** The frozen-target spec describes `type` as a `u8` integer. The implemented wire format serialises the event kind as a snake_case string (e.g. `"flow_started"`), not a numeric discriminant. The field is named `kind` in the Rust struct. Callers reading raw log files MUST expect a string, not an integer.
 
 ## 3.4 Event Types (stable enum, ≥ 1024 reserved)
 
+**Target set (19 types):**
 ```
 1  FlowStarted               2  RemoteCallIssued
 3  RemoteCallCompleted       4  StreamOpened
@@ -34,6 +39,20 @@ Fields: `flow_id` (16-byte), `event_seq` (u64), `ts` (tag(1); ordering/ops only 
 17 FlowFailed               18 FlowCompleted
 19 Migrated
 ```
+
+**Alpha wire values** — the 7 variants implemented in v0.4.1, serialised as snake_case strings:
+
+| Wire string | Meaning |
+|---|---|
+| `"flow_started"` | Flow execution began. |
+| `"remote_call_issued"` | Outbound RPC issued (LOG-BEFORE-ACT). |
+| `"remote_call_completed"` | Outbound RPC returned successfully. |
+| `"remote_call_failed"` | Outbound RPC returned an error or timed out. |
+| `"stream_chunk_received"` | One chunk received on a streaming call. |
+| `"flow_completed"` | Flow reached a terminal success state. |
+| `"flow_failed"` | Flow reached a terminal failure state. |
+
+All other target-set types are declared but not currently emitted by the runtime. Log readers MUST tolerate unknown string values (forward-compatibility).
 
 ## 3.5 Sequencing and Durability
 
@@ -61,11 +80,14 @@ SOL has no direct access to wall clock or RNG. `Time.now()` and `Random.bytes(n)
 
 ---
 
-## Alpha Implementation Notes
+## Alpha Implementation Notes (v0.4.1)
 
 Alpha ships:
 - Append-only log per flow with hash chain + Ed25519 signature.
-- Event types: `FlowStarted`, `RemoteCallIssued`, `RemoteCallCompleted`, `StreamChunkReceived`, `FlowCompleted`, `FlowFailed`. Other types stubbed.
+- Disk framing: 4-byte big-endian length prefix + CBOR record (see §3.3).
+- Event kinds: 7 variants implemented — `flow_started`, `remote_call_issued`, `remote_call_completed`, `remote_call_failed`, `stream_chunk_received`, `flow_completed`, `flow_failed`. Wire format: snake_case strings (not u8 integers).
+- Sequence overflow at `u64::MAX` returns `SequenceOverflow` error (not silent wrap).
+- On `EventLog::open`: parent directories are created, and the existing chain is replayed and verified before accepting appends.
 - Synchronous SOL means no parking — but log-before-act is still honored.
 - No snapshots (SIMP-005); replay from `event_seq=0`.
 - No `RandomDrawn` / `WallClockRead` yet (SOL doesn't expose them); alpha flows are deterministic by absence of these calls.

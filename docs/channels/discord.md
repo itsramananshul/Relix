@@ -93,6 +93,9 @@ operator_user_id       = ""          # reserved for future use
 messages_ring_capacity = 200
 poll_interval_secs     = 2
 
+# Optional: enables persistent polling cursor (FIX 2).
+# state_db_path = "dev-data/discord-state.sqlite"
+
 [discord.memory_peer]
 addr = "/ip4/127.0.0.1/tcp/19711"
 
@@ -119,6 +122,35 @@ returns the controller's view of `get_me`. Send a message in the
 channel from a non-bot account; the bot should reply within
 `poll_interval_secs`, and `GET /v1/discord/messages/recent` should
 list the inbound row.
+
+## Polling cursor and persistence (FIX 2)
+
+On first boot, the controller fetches the most recent message id
+(`?limit=1`) to seed the polling watermark — this prevents replaying
+channel history on startup. Subsequent polls use
+`GET /channels/:id/messages?after=:last_id`.
+
+By default the cursor is in-memory only and is lost on restart. To
+persist it across restarts, set:
+
+```toml
+[discord]
+state_db_path = "dev-data/discord-state.sqlite"
+```
+
+This enables the `DiscordWatermarkStore` — a SQLite WAL database with
+the schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS discord_watermarks (
+    channel_id TEXT PRIMARY KEY,
+    last_message_id TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+```
+
+With `state_db_path` configured, a restart resumes from the last
+persisted watermark rather than seeding from scratch.
 
 ## Slash commands
 
@@ -164,16 +196,56 @@ audit who tried to talk to the bot.
 ## Bot self-loop protection
 
 After the controller's first successful `get_me`, every poll
-filters out messages whose `author.id` matches the bot's own
-user id. The `author.bot` flag is also checked, so messages
-from *other* bots are skipped too. This means a chat reply the
-controller itself posts can't re-trigger the controller in the
-next poll cycle.
+filters out messages whose `author.bot` flag is set. The
+`author.id == bot_identity.user_id` guard is applied as a
+second layer. This two-layer defence means self-loop protection
+is structural — no caller code can forget to check the flag.
+
+## Approval interactions
+
+The `discord.approval_send` capability delivers approval-request
+messages to the configured Discord channel with **Approve** /
+**Deny** buttons built from Discord's Message Component API.
+
+Inbound button clicks arrive via the bridge webhook:
+
+```
+POST /v1/channels/discord/interact
+```
+
+The bridge verifies the Ed25519 signature Discord signs every
+interaction with. Set:
+
+```
+RELIX_BRIDGE_DISCORD_PUBLIC_KEY=<hex-encoded-ed25519-public-key>
+```
+
+If this env var is unset the `/v1/channels/discord/interact` endpoint
+returns 503. The signed bytes are `timestamp_header_bytes ++
+body_bytes`; `verify_strict` (canonical encoding, no malleability) is
+used. Interaction types handled:
+
+- Type 1 (PING) → responds with `{"type":1}` (PONG).
+- Type 3 (MESSAGE_COMPONENT) → parses the custom_id
+  (`approve:<id>` / `deny:<id>`), records the decision, updates
+  the approval message with an ephemeral ack.
+
+The bridge also accepts:
+
+```
+POST /v1/channels/discord/events
+```
+
+for future Events API integration (currently fast-ack only).
+
+## Health capability
+
+`discord.health` (FIX 49) returns a `ChannelHealthSnapshot` JSON
+document. The health mode reported is `"polling"`.
 
 ## Wire shape
 
-The controller exposes two read-only mesh capabilities the
-bridge proxies for the dashboard:
+The controller exposes read-only mesh capabilities the bridge proxies:
 
 | Capability | Wire body |
 |---|---|
@@ -183,13 +255,21 @@ bridge proxies for the dashboard:
 `content_preview` is truncated to 100 chars and stripped of
 tabs/newlines so each row stays parseable.
 
+Outbound messages are split at **1900 characters**
+(`DISCORD_MAX_MESSAGE_LEN`). Discord's API limit is 2000; the 100-char
+margin prevents issues with whitespace and encoding edge cases. Only
+the first chunk threads as a reply under the original user message;
+subsequent chunks are posted standalone.
+
 ## HTTP / CLI surfaces
 
 Bridge endpoints:
 
 ```
-GET /v1/discord/status
-GET /v1/discord/messages/recent?limit=20
+GET  /v1/discord/status
+GET  /v1/discord/messages/recent?limit=20
+POST /v1/channels/discord/interact
+POST /v1/channels/discord/events
 ```
 
 CLI (one-shot snapshots):
@@ -204,43 +284,46 @@ Both support `--json` for raw payloads.
 ## Security notes
 
 - The bot token is never echoed to logs or returned via HTTP.
-  It lives only in the env var `RELIX_DISCORD_BOT_TOKEN`.
-- The bridge has no Discord-specific authentication — same
+  It lives only in the env var referenced by `token_env` in the
+  TOML (e.g. `RELIX_DISCORD_BOT_TOKEN`).
+- The bridge has no Discord-specific HTTP authentication — same
   posture as every other surface, "local/dev only; put a reverse
   proxy with auth in front for production."
+- Approval interactions require a valid Ed25519 signature
+  (`RELIX_BRIDGE_DISCORD_PUBLIC_KEY`); unsigned or malformed
+  requests are rejected with 401.
 - The polling controller dials the memory / ai / coordinator
   peers with its own signed identity bundle (minted off the
   org root). Per-call admission (identity → policy → handler →
   audit) runs on every dispatch — Discord traffic enjoys no
   bypass.
 - Rate limit handling: 429 responses honour Discord's
-  `retry_after` (a float in seconds, clamped 1..30s). 5xx
-  uses exponential backoff (1s, 2s, 4s — max 3 retries).
-  Other 4xx is never retried (config / permissions problem).
+  `retry_after` (a float in seconds, ceiling to integer, clamped
+  1..30s). 5xx uses exponential backoff (1s, 2s, 4s — max 3
+  retries). Other 4xx is never retried (config / permissions
+  problem).
 
 ## Non-goals (deliberately)
 
 - **No Gateway/WebSocket client.** The spec asks for REST
   polling to keep operations simple — no `READY` handshake, no
   heartbeat thread, no resume.
-- **No webhook receiver.** Discord supports it; the controller
-  does not. Polling is uniform across deployments.
 - **No formal slash command registration.** The bot does not
   call `POST /applications/:app_id/commands`. Content-detection
   works without operator action.
-- **No approval-notifier loop.** Telegram has one (operator
-  chat for `task.list awaiting_input`); Discord does not yet.
-  `operator_user_id` is reserved for that future feature.
-- **No persistent session store.** In-memory state only. A
-  restart loses the polling cursor and any in-flight subject
-  mappings; the next poll resumes from the most recent message.
+- **No approval-notifier polling loop.** The `discord.approval_send`
+  capability and the bridge interaction webhook are fully wired.
+  A background loop that polls the coordinator for `awaiting_input`
+  tasks and pro-actively posts notifications (like Telegram's
+  notifier) has not yet been built; `operator_user_id` is reserved
+  for that feature.
 
 See [`../current-limitations.md`](../current-limitations.md) for
 the alpha-wide list of deferred features.
 
 ## See also
 
-- [index.md](index.md) — overview of all three channels.
+- [index.md](index.md) — overview of all four channels.
 - [`../channel-node-architecture.md`](../channel-node-architecture.md) —
   the design contract.
 - [`../configuration.md`](../configuration.md) — full env-var

@@ -41,17 +41,23 @@ One binary (`relix-controller`) whose behaviour is selected by
 `[controller] node_type` in the per-node TOML. Plus one separate
 binary for the HTTP front (`relix-web-bridge`).
 
+The full set of valid `node_type` values is enforced at boot
+(`SUPPORTED_CONTROLLER_NODE_TYPES`). Unrecognised values are now
+**hard errors** — they no longer produce a silent no-op process.
+
 | `node_type`    | Default port | Purpose                                                                |
 |----------------|--------------|------------------------------------------------------------------------|
 | `memory`       | 19711        | SQLite + FTS5 session store, vector embeddings, persistent agent memory |
 | `ai`           | 19712        | `ai.chat` / `ai.embed` — provider-agnostic chat + embeddings           |
-| `tool`         | 19713        | File system jail, SSRF-guarded web client, allowlisted terminal, headless browser, MCP, PDF, text chunk |
-| `coordinator`  | 19714        | Durable Task ledger, delegation, agent-to-agent messaging, scheduler   |
+| `coordinator`  | 19714        | Durable Task ledger, delegation, agent-to-agent messaging, scheduler, approval gate |
 | `telegram`     | 19715        | Telegram bot bridge (opt-in via `RELIX_TELEGRAM=1`)                    |
 | `discord`      | 19716        | Discord bot bridge (opt-in via `RELIX_DISCORD=1`)                      |
 | `slack`        | 19717        | Slack bot bridge (opt-in via `RELIX_SLACK=1`)                          |
+| `email`        | configurable | Email channel bridge — SMTP outbound + IMAP inbound (opt-in)           |
 | `plugin_host`  | 19718        | Loads subprocess plugins over `relix-plugin-v1` (opt-in via `RELIX_PLUGINS=1`) |
+| `tool`         | 19713        | File system jail, SSRF-guarded web client, allowlisted terminal, headless browser, MCP, PDF, text chunk |
 | `router`       | configurable | Mesh observability + heartbeat aggregator (control plane only — never routes requests) |
+| *(internal)*   | —            | `pii_gate`, `pii_gate_coordinator`, and `execution` are cross-cutting runtime modules, not node types you configure directly |
 | *(bridge)*     | 19791        | HTTP front + OpenAI shim + dashboard — its own binary, not a `node_type` |
 
 Every node — including the bridge — runs the same admission pipeline
@@ -139,10 +145,10 @@ the default + opt-in configuration:
    Channels (opt-in; each polls its platform and forwards to the
    chat flow via the memory + ai peers, persists to memory):
 
-   ┌──────────┐  ┌─────────┐  ┌────────┐
-   │ telegram │  │ discord │  │ slack  │
-   │  :19715  │  │ :19716  │  │ :19717 │
-   └──────────┘  └─────────┘  └────────┘
+   ┌──────────┐  ┌─────────┐  ┌────────┐  ┌─────────────────────┐
+   │ telegram │  │ discord │  │ slack  │  │ email               │
+   │  :19715  │  │ :19716  │  │ :19717 │  │ (configurable port) │
+   └──────────┘  └─────────┘  └────────┘  └─────────────────────┘
 ```
 
 Each box is a real OS process with its own PID. The bringup script
@@ -280,7 +286,11 @@ What happens when you `POST /v1/chat/completions` against the bridge.
    `RemoteCallCompleted` (with body length + latency) or
    `RemoteCallFailed` (with kind + cause). The per-flow log on the
    *caller* side has the same `request_id` as the responder's audit
-   record, so `relix-flow-inspect` can join them.
+   record, so the `relix-flow-inspect` binary can join them offline.
+   Flow logs land at
+   `$RELIX_DATA_DIR/flow-runner/flows/<flow_id>.log`
+   (or `~/.relix/flow-runner/flows/<flow_id>.log` when the env var
+   is unset).
 
 ## The `chat_with_tool` walk-through
 
@@ -321,20 +331,28 @@ Everything that runs.
   `Client`, an event receiver, and an `EventLoop` to spawn.
 - `dispatch/` — `DispatchBridge` (the admission pipeline above) +
   `Handler` trait.
-- `sol/` — the ported SOL VM with the `remote_call` extension.
+- `sol/` — the ported SOL VM with the `remote_call` and
+  `remote_call_stream` extensions. `.yml`/`.yaml` flows are lowered
+  to SOL before execution.
 - `flow_runner.rs` — host-side bridge between the SOL VM and the
   libp2p client; writes the per-flow event log.
 - `manifest/` — `NodeManifest`, `ManifestProvider` (built by node-type
   init), `ManifestCache`, and the discovery client `discover_and_pin`
   that hands back both the cache and a long-lived `MeshClient`.
-- `nodes/` — node-type implementations: `memory/`, `ai/`, `tool/`,
-  `web_bridge/`. Each `register(...)` wires its handlers into the
-  dispatch bridge and pushes its descriptors into the manifest
-  provider.
+- `nodes/` — node-type implementations (13 modules):
+  `ai/`, `channels/`, `coordinator/`, `discord/`, `email/`,
+  `execution/`, `memory/`, `pii_gate/`, `pii_gate_coordinator/`,
+  `router/`, `slack/`, `telegram/`, `tool/`, `web_bridge/`.
+  Each `register(...)` wires its handlers into the dispatch bridge and
+  pushes its descriptors into the manifest provider.
+  `web_bridge/` inside this crate is a stub for the local HTTP/SSE
+  endpoint (M9 work); it is distinct from the standalone
+  `relix-web-bridge` binary, which is the production HTTP front.
 - `controller_runtime.rs` — what `relix-controller`'s `main()` calls:
   load identity + trust root + policy, build the dispatch bridge,
-  register builtins + node-type handlers, start the transport, dial
-  configured peers, and loop on inbound events.
+  wire optional subsystems (metrics, budget, PII gate, training,
+  confidence), register builtins + node-type handlers, start the
+  transport, dial configured peers, and loop on inbound events.
 
 ### `relix-controller`
 
@@ -350,19 +368,30 @@ external HTTP origins itself (those live on the tool node).
 
 ### `relix-cli`
 
-Operator commands.
+Operator commands (installed as `relix`). Core subcommands:
 
-- `identity init-org --root-key <file> --org <label>` — mint an
-  Ed25519 org-root and its companion `.pub` (the trust file).
-- `identity mint --root-key <root> --name <subject> --groups <list>
-  --out <bundle>` — issue a signed IdentityBundle.
-- `identity inspect --bundle <file> --root-key <root>` — print a
-  bundle's claims and verification status.
-- `ping --peer <multiaddr> --identity <bundle> --client-key <key>` —
-  call `node.health` against a peer (full admission pipeline runs).
-- `flow-run --flow <path> --identity <bundle> --client-key <key>
-  --peers <file>` — compile a SOL file and execute it against a
-  configured peer alias map.
+- `identity` — org keypair generation, bundle minting, inspection,
+  session token issue/verify/revoke.
+- `ping` — raw libp2p health check against any peer.
+- `task` — coordinator Task ledger (create, update, get, list, watch,
+  retry, export, and more).
+- `capability` — inspect capabilities advertised by a peer.
+- `ops` — operator snapshot surface: dispatch stats, policy simulate,
+  policy denials, session search, agent/cron/delegate/msg/memory/
+  plugin sub-surfaces.
+- `email`, `metrics`, `observe`, `pii`, `training`, `knowledge`,
+  `confidence`, `belief`, `approval`, `credentials`, `judge`,
+  `reasoning`, `routing`, `planning` — domain-specific HTTP surfaces.
+- `router` — router node control plane (network summary, peer table,
+  session list) over libp2p.
+- `workflow` — multi-agent workflow engine (list, run, validate, trace).
+- `boot` / `stop` / `status` / `setup` — mesh lifecycle wrappers.
+- `flow-run` — compile and execute a SOL flow against a live mesh.
+- `sol` / `flow` — SOL template authoring helpers.
+- `doctor` — bridge health check, exits 1 on any FAIL.
+- `update` — self-update from the GitHub release.
+
+Full subcommand reference: [`operator-guide.md`](operator-guide.md) (or run `relix --help`).
 
 ### `relix-flow-inspect`
 
@@ -391,8 +420,9 @@ and caches the result in a `ManifestCache`. The cache backs two things:
    peer advertises the method.
 
 Static aliases (`"memory"`, `"ai"`, etc.) still work; capability:
-routing is additive. Manifests are **not signed** in the alpha — that's
-a Gate 2 item, documented in [`current-limitations.md`](current-limitations.md).
+routing is additive. Manifests are Ed25519-signed by the node's key
+(`ManifestProvider` is built with the node's signing key at boot),
+preventing capability spoofing.
 
 ## Connection reuse
 
@@ -428,11 +458,11 @@ splice" loop in the bridge. We deliberately don't. The reasons:
   the openai SDK, curl, a custom UI) gets the same orchestration. We
   do not need to teach every frontend about tool calls.
 
-The trade-off is that the alpha can't ask the LLM "what tool should I
-call?" — the flow file picks the tool. Real tool-use integration
-(Anthropic-style `tool_use`, OpenAI tools) needs the durable yield
-model that lands at Gate 2. The alpha demonstrates the architecture
-on a fixed flow; the architecture generalises.
+The current constraint is that the flow file picks the tool
+statically. Richer tool-use integration (Anthropic-style `tool_use`,
+OpenAI tools) that lets the LLM decide at runtime builds on the
+durable yield model — the SOL and coordinator surfaces are already
+in place to support it.
 
 ## Streaming and WebSockets
 
@@ -449,11 +479,11 @@ The `ChatProvider` trait carries a `generate_reply_stream`
 method that the mock and OpenAI-compatible providers override —
 mock streams word-by-word, OpenAI-compatible parses upstream
 `data: <json>\n\n` SSE frames and yields per-token deltas.
-End-to-end mesh streaming through `ai.chat` still goes through
-the synchronous request/response path; the bridge currently
-chunks the materialised reply word-by-word over both endpoints.
-Real provider-token-to-client streaming through the mesh lands
-post-alpha; the trait surface is already in place to consume it.
+End-to-end mesh streaming through `ai.chat` goes through the
+synchronous request/response path; the bridge chunks the materialised
+reply word-by-word over both endpoints. The `remote_call_stream` opcode
+(shipped in 0.4) supports streamed peer responses via
+`/relix/rpc/stream/1` substreams when the responder and flow opt in.
 See [`websocket.md`](websocket.md).
 
 ## Flow languages
@@ -490,6 +520,27 @@ HTTP. Each capability is registered under both the bare manifest
 name (`hello.greet`) and the prefixed alias (`plugin_host.hello.greet`)
 so SOL and `.sflow` callers both reach the same handler. Detail:
 [`plugins.md`](plugins.md).
+
+## Major subsystems
+
+These subsystems are wired at boot by `controller_runtime.rs` on top
+of the core admission pipeline. They are activated by the corresponding
+TOML section; absent or `enabled = false` leaves the node
+byte-for-byte identical to its pre-subsystem behaviour.
+
+| Subsystem | Config section | What it adds |
+|-----------|---------------|--------------|
+| **Planning** | `[planning]` | Multi-step planner + critic; runs inside the coordinator to break natural-language specs into delegated sub-tasks |
+| **Knowledge-share** | `[knowledge]` + `[knowledge_trust]` | Peer-to-peer observation transfer with Ed25519-bound provenance; trust config lists allowed source nodes by public key |
+| **Training** | `[training]` | Records agent interactions to SQLite; optional PII anonymisation; quality-scored export for fine-tuning |
+| **Confidence / reasoning** | `[confidence]` | Per-method rolling-window confidence scorer; feeds the judge + belief-state engine |
+| **Metrics / observability / alerting** | `[metrics]` + `[observability]` | SQLite metrics store, cost tracking, OTLP export, alert engine with configurable thresholds and fan-out targets |
+| **Credentials vault** | `[credentials]` | Encrypted at-rest credential store; `RELIX_<NAME>` JIT injection into tool args at dispatch time |
+| **Approval gate + Ed25519 tokens** | `[approval]` | Per-method approval requirements; `coord.approval.decide` mints Ed25519-signed tokens; expiry loop runs every 60 s; `RELIX_APPROVAL_SIGNING_KEY` env var required |
+| **Mesh PII gate** | `[mesh_pii]` | Inline regex scan of every `RequestEnvelope.args` before handler dispatch; actions: `block`, `redact` (default), `log_only`; writes a separate `pii_events.sqlite` chronicle |
+| **Plugin sandbox** | `plugin_host` node type | Subprocess plugins over `relix-plugin-v1`; each capability registered under bare name + `plugin_host.<method>` alias |
+| **Tenant isolation** | `[policy] dir` + `[audit] partition_by_tenant` | Per-tenant policy files; per-tenant SQLite audit mirror (`audit-partition.db`); queryable via `node.audit.tenant_list` / `node.audit.tenant_recent` |
+| **Budget enforcer** | `[budget]` | Per-caller spend caps; dormant when no caps are configured |
 
 ## Next
 

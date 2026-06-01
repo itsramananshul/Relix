@@ -7,6 +7,132 @@ If you have not booted Relix before, start with
 [`getting-started.md`](getting-started.md). This guide assumes you have
 the workspace built and you want to know how to operate it.
 
+## CLI quick-reference
+
+`relix` (the installed wrapper for `relix-cli`) exposes 40+ subcommands grouped below. Each accepts `--help` for full flag documentation.
+
+### Mesh lifecycle
+
+| Command | Purpose |
+|---|---|
+| `relix setup` / `relix reconfigure` | Seven-page interactive wizard — provider, API key, channels, confidence, subsystems. |
+| `relix boot` | Start the local mesh from `~/.relix/config.toml`; opens dashboard in browser. |
+| `relix stop` | Kill `relix-controller` and `relix-web-bridge` by name (idempotent). |
+| `relix status` | Bridge health + topology snapshot + local DB sizes. |
+| `relix install [--check] [--fix]` | Check (and optionally install) Docker, Ollama, and Qdrant. |
+| `relix update [--dry-run] [--yes]` | Self-update binary from GitHub releases. |
+| `relix doctor [--json]` | One-command bridge health check; exits non-zero on any FAIL. |
+
+### Identity
+
+| Command | Purpose |
+|---|---|
+| `relix identity init-org --root-key <PATH> --org <LABEL>` | Generate an org-root Ed25519 keypair. |
+| `relix identity mint --root-key <PATH> --name <N> [--groups <G,...>] [--out <PATH>]` | Mint a signed identity bundle. |
+| `relix identity inspect --bundle <PATH> --root-key <PATH>` | Decode + verify a bundle. |
+| `relix identity issue` / `verify` / `revoke` / `tokens` | Session-token management (bridge HTTP). |
+| `relix identity research --subject <NAME>` | Web + LLM identity research; persists to memory. |
+
+### Observability + operations
+
+| Command | Purpose |
+|---|---|
+| `relix observe [--once] [--alerts] [--health]` | Live crossterm TUI dashboard; press `q` to quit. |
+| `relix metrics summary / alerts / cost / timeseries` | Agent performance metrics. |
+| `relix pii stats / events` | PII detection counters and recent events. |
+| `relix ops snapshot` | One-shot observable state dump (health + topology + dispatch stats + denials). |
+| `relix ops stuck [--threshold-secs 300]` | Tasks running longer than threshold. |
+| `relix ops tail` | Live tail of the task firehose via poll loop. |
+| `relix ops smoke` | End-to-end mesh smoke test; exits 1 on failure. |
+| `relix ops capabilities [--filter PREFIX]` | All capabilities across cached topology peers. |
+| `relix ops dispatch-stats` | Per-capability invocation + latency counters. |
+| `relix ops policy-simulate / policy-denials` | Policy engine dry-run and recent deny ring. |
+| `relix ops session-search --query <Q>` | Full-text search across chat-turn chronicle events. |
+| `relix ops agent-memory --subject-id <ID>` | Read persistent agent + user memory for a subject. |
+| `relix ops open-webui-setup` | Print copy-paste Open WebUI connection settings. |
+| `relix ops events [--csv]` | Recent cross-task events. |
+| `relix ops cron list / create / trigger / delete / enable / disable` | Cron job management. |
+| `relix ops agent list / create / get / enable / suspend / disable` | Agent employee records. |
+| `relix ops agent approvals-pending / approval-decide / standing-approval-*` | Agent approval lifecycle. |
+| `relix ops delegate spawn / result / cancel / list` | Delegated child task management. |
+| `relix ops msg send / inbox / read / thread / delete` | Agent-to-agent messaging. |
+| `relix ops memory embed / search / ingest / dialectic / flush / quarantine-* / export` | Vector memory surfaces. |
+| `relix ops plugin list / status / reload / disable` | Plugin host management. |
+| `relix ops discord / slack` | Channel status + recent messages. |
+
+### Workflow and flows
+
+| Command | Purpose |
+|---|---|
+| `relix workflow list / run / validate / trace / reload` | Multi-agent workflow engine. |
+| `relix flow yaml [--template <NAME>]` | Print a YAML flow template (chat / tool / multi-agent / sequential). |
+| `relix sol templates / new` | SOL workflow authoring helpers. |
+| `relix flow-run --flow <PATH.sol> --identity <BUNDLE> --client-key <KEY> --peers <TOML>` | Execute a SOL flow against a live mesh via libp2p. |
+| `relix build [SPEC]` | Full planning pipeline with optional approval gate. |
+| `relix planning agents / search / validate / plan` | Multi-agent planning pipeline. |
+
+### AI + model surface
+
+| Command | Purpose |
+|---|---|
+| `relix models list / health` | Provider + model inventory with quarantine counters. |
+| `relix routing explain --message <TEXT>` | Classify a message with the ComplexityClassifier. |
+| `relix reasoning status` | Per-component reasoning engine summary. |
+| `relix judge verdicts / stats` | Judge model verdict ring and counters. |
+| `relix confidence policies / history / reset` | Per-step confidence scoring inspector. |
+| `relix belief show / reset` | LLM-driven belief tracker inspector. |
+| `relix training stats / list / show / export / delete` | Training data pipeline. |
+| `relix knowledge share / broadcast / groups / shared / revoke` | Agent-to-agent knowledge transfer. |
+
+### Security + credentials + approvals
+
+| Command | Purpose |
+|---|---|
+| `relix credentials store / list / rotate / revoke / audit / migrate-kdf / rotate-vault-key` | Encrypted credential vault. |
+| `relix approval delivery-status / get` | Approval delivery inspector. |
+| `relix eval guardrails [--quick]` | Red-team guardrail eval suite. |
+
+### Sessions + execution + provenance
+
+| Command | Purpose |
+|---|---|
+| `relix sessions list / show / search` | Two-sink session debugger. |
+| `relix execution rollback / transaction / evidence` | Transactional gateway + evidence. |
+| `relix provenance show / diff / history / audit` | Provenance registry inspector. |
+
+### Personas, skills, and memory
+
+| Command | Purpose |
+|---|---|
+| `relix souls list / edit <AGENT>` | SOUL.md persona file management. |
+| `relix skills list / run <NAME>` | SKILL.md library discovery and inspection. |
+| `relix memory list / show / search / invalidate / stats` | Four-layer memory store inspector. |
+
+### Data and export
+
+| Command | Purpose |
+|---|---|
+| `relix export {--session\|--agent\|--all} [--format json\|markdown\|csv]` | Conversation history export. |
+| `relix email send / status / test` | Email channel operator surface. |
+
+### libp2p direct surfaces
+
+| Command | Purpose |
+|---|---|
+| `relix ping --peer <ADDR>` | Raw libp2p health check against one peer. |
+| `relix task create / get / list / update / watch / retry / recover / …` | Coordinator task ledger (libp2p). |
+| `relix capability ls / show` | Peer capability inspection (libp2p). |
+| `relix topology show` | Bridge topology snapshot. |
+| `relix router status / peers / sessions` | Router Node control plane (libp2p). |
+| `relix mcp servers / tools / audit` | MCP registry inspector. |
+| `relix terminal sessions / audit / cancel` | Terminal tool control. |
+| `relix fs audit` | Filesystem audit snapshot. |
+| `relix web blocklist` | Web tool blocked-hosts snapshot. |
+| `relix browser sessions` | Browser session list. |
+| `relix tool screen` | Screen capture via the tool node. |
+
+---
+
 ## Booting the mesh
 
 The supported way to bring up the local mesh is the bringup script:
@@ -167,7 +293,7 @@ In **Settings → Connections → OpenAI API**:
 |---|---|
 | API Base URL | `http://host.docker.internal:19791/v1` (Open WebUI in Docker on macOS/Windows) |
 | | `http://127.0.0.1:19791/v1` (Open WebUI running natively) |
-| API Key | any non-empty string — the bridge ignores it |
+| API Key | the bridge bearer token from `~/.relix/bridge-token` (required; the bridge validates it) |
 | Model picker | shows `relix-mock` by default, plus whatever your AI node was configured with (e.g. `relix-openrouter`) |
 
 Conversations stick to a session id that is a stable hash of the first
@@ -175,9 +301,10 @@ system + user message — the same conversation lands in the same memory
 bucket as it grows. Subsequent turns from the same conversation read
 history from the memory node.
 
-The shim drops `system` messages, OpenAI tool-call payloads, and
-sampling controls (`temperature`, `top_p`, ...) in the alpha. They are
-accepted in the request but not forwarded; full detail in
+The shim preserves `system` messages (prepended as `[SYSTEM N]\n...\n\n`
+blocks) and rejects `tools` / `tool_calls` / `role:"tool"` with 400. Sampling
+controls (`temperature`, `top_p`, ...) are accepted but ignored at the
+provider side. Full detail in
 [`streaming-and-openai-shim.md`](streaming-and-openai-shim.md).
 
 ## Triggering `tool.web_fetch`

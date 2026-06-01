@@ -1,5 +1,7 @@
 # @relix/sdk — TypeScript SDK for Relix
 
+> Version 0.4.1
+
 Typed TypeScript client for the [Relix](https://github.com/itsramananshul/Relix) AI agent mesh platform. Wraps the Relix web bridge's HTTP surface — chat (one-shot + streaming), memory (search, ingest, dialectic, context flush), planning, skills, and observability.
 
 ## Installation
@@ -179,6 +181,20 @@ The bridge stamps the value onto every audit row and routes memory / policy / au
 | `tenantId`   | `"default"`                | Value of the `X-Relix-Tenant` header.                                    |
 | `timeout`    | `30_000`                   | Per-request timeout (ms).                                                |
 | `fetch`      | `globalThis.fetch`          | Override the fetch impl (tests, edge runtimes that need a polyfill).     |
+
+## Comparison with the Rust `relix-sdk` crate
+
+The Rust crate (`crates/relix-sdk`) is a leaner client that covers only the
+core bridge surface: `GET /v1/info`, `POST /chat`, `POST /chat/stream` (SSE),
+`POST /v1/memory/embed`, and `POST /v1/memory/search`. It does not expose
+planning, skills, observability, or the dialectic / context-flush memory
+endpoints.
+
+One notable difference: the Rust SDK's `search()` method hard-codes
+`top_k: 10` with no configurable override. The TypeScript SDK exposes a
+`limit` parameter that is forwarded to the bridge. When calling the Rust SDK
+from a context where a different result count is needed, use `relix-embedded`
+directly or the Python/TypeScript SDKs instead.
 
 ## Documentation
 

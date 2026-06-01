@@ -1,5 +1,7 @@
 # Agents
 
+_Version: 0.4.1_
+
 In Relix, an **agent** is a first-class employee record: an identity,
 a job (role / department / team), a permission scope, and a
 lifecycle (`active` / `suspended` / `disabled`). When an inbound
@@ -8,9 +10,9 @@ runs a five-phase **agent gate** between identity verification and
 the policy engine — additive narrowing, never widening — and can
 pause execution until an operator approves it.
 
-When the caller has no agent profile, the gate is a no-op and the
-existing policy behaviour applies unchanged. Existing deployments
-without profiles see today's exact pipeline.
+When the caller has no agent profile, the gate **denies** with
+`AGENT_NO_PROFILE` (fail-closed). When the agent store is not wired
+at all, every call is denied with `AGENT_STORE_NOT_CONFIGURED`.
 
 ## Identity
 
@@ -42,8 +44,9 @@ The agent gate runs in this order; the first match wins.
 1. **Status.** `suspended` → `agent_suspended` deny.
    `disabled` → `agent_disabled` deny. Anything other than `active`
    is denied.
-2. **Surface allowlist.** When non-empty, the request envelope's
-   `surface` field must match one of the agent's allowed surfaces
+2. **Surface allowlist.** When non-empty, the transport-layer-derived
+   `caller_surface` (peer alias, not the envelope's `surface` field —
+   which is untrusted) must match one of the agent's allowed surfaces
    (e.g. `dashboard`, `telegram`, `flow`). Empty allowlist = all
    surfaces.
 3. **Risk ceiling.** The called capability's `risk_level` is
@@ -69,10 +72,11 @@ chronicle event + Telegram notification (when wired) and the call
 waits.
 
 The **approval-token fast path**: when an inbound envelope carries
-an `approval_token`, the gate looks it up — if approved, unconsumed,
-matching the method, and not expired, the gate admits with
-`consumed_approval_id` set and the bridge consumes the token (single
-use; second use fails).
+an `approval_token`, the gate verifies its Ed25519 signature, checks
+expiry and method match, then atomically records it in the
+`approval_token_blocklist`. Single use only — a second use fails with
+`approval_token_consumed`. See [`approval-tokens.md`](approval-tokens.md)
+for the token format.
 
 ## Creating an agent profile
 

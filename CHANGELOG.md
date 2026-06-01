@@ -7,6 +7,88 @@ once a stable release is cut.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-01
+
+Release engineering fix for the `aarch64-unknown-linux-gnu` cross build.
+
+### Fixed
+
+- **`Cross.toml` arm64 OpenSSL**: added `pre-build` hook that installs
+  `libssl-dev:arm64` inside the cross container, fixing the link
+  failure for `aarch64-unknown-linux-gnu` release targets.
+
+### Changed
+
+- Workspace version bumped to `0.4.1`.
+
+## [0.4.0] - 2026-05-31
+
+Headline features shipped in the 0.4 series (on top of the 0.1 mesh
+foundation). No wire-format or config-breaking changes from 0.3.
+
+### Added
+
+- **Multi-agent planning pipeline** (`[planning]`) — coordinator-side
+  planner + critic that decomposes natural-language specs into
+  delegated sub-tasks. Inspect via `relix planning plan`.
+- **Knowledge-share** (`[knowledge]` + `[knowledge_trust]`) —
+  peer-to-peer observation transfer with Ed25519-bound provenance.
+  Source trust configured per public key; `allow_unbound_sources = false`
+  is the fail-closed default.
+- **Training pipeline** (`[training]`) — interaction recording to
+  SQLite, optional PII anonymisation, quality scorer, OpenAI-format
+  export via `relix training export`.
+- **Confidence / reasoning engine** (`[confidence]`) — per-method
+  rolling-window confidence scorer; feeds the judge + belief-state
+  engine. Inspect via `relix confidence history`.
+- **Metrics, observability, and alerting** (`[metrics]`,
+  `[observability]`) — SQLite metrics store, cost-by-model tracking,
+  OTLP export, configurable alert thresholds with fan-out targets.
+  Live TUI via `relix observe`.
+- **Credentials vault** (`[credentials]`) — AES-GCM encrypted at-rest
+  credential store; JIT secret injection into tool args via
+  `{{secret:<name>}}`. Managed via `relix credentials`.
+- **Approval gate + Ed25519 approval tokens** (`[approval]`) —
+  per-method approval requirements; `coord.approval.decide` mints
+  Ed25519-signed tokens (TTL 30–86400 s, default 300 s). Standing
+  approvals and out-of-band delivery channels supported.
+  `RELIX_APPROVAL_SIGNING_KEY` env var required for token minting.
+- **Mesh PII gate** (`[mesh_pii]`) — inline regex scan of every
+  inbound `RequestEnvelope.args` before handler dispatch; actions
+  `block`, `redact` (default), `log_only`. Writes `pii_events.sqlite`
+  chronicle; queryable via `relix pii stats/events`.
+- **Plugin sandbox** — `plugin_host` node type; each capability
+  registered under bare name + `plugin_host.<method>` alias.
+- **Tenant isolation** — per-tenant policy files (`[policy] dir`);
+  per-tenant SQLite audit mirror (`[audit] partition_by_tenant`);
+  queryable via `node.audit.tenant_list` / `node.audit.tenant_recent`.
+- **Budget enforcer** (`[budget]`) — per-caller spend caps; dormant
+  when no caps are configured.
+- **`email` controller node type** — SMTP outbound + IMAP inbound
+  channel bridge; manageable via `relix email`.
+- **YAML flow format** — `.yml`/`.yaml` flows lowered to SOL before
+  VM execution; dispatched by `FlowRunner` alongside `.sol` and
+  `.sflow`.
+- **Streaming `remote_call_stream`** — SOL VM opcode + flow-runner
+  dispatcher over `/relix/rpc/stream/1` substreams with chunk
+  observer and cancel signal.
+- **Per-tenant audit partition** (GAP 23C) — `AuditPartitionStore`
+  SQLite mirror with tenant sanitisation; two new built-in caps
+  `node.audit.tenant_list` and `node.audit.tenant_recent`.
+- **Transactional gateway** (`[execution]`) — three-tier action
+  classification (auto-compensated / human-rollback / blocked),
+  persistent `TransactionStore`, `EvidenceStore` with PII redaction
+  and state-diff capture. CLI surface: `relix execution`.
+
+### Changed
+
+- **`validate_controller_node_type` (SEC §13)** — unknown `node_type`
+  values are now hard errors at boot. Previously they produced a
+  silent no-op process that appeared healthy.
+- **Node-type set expanded** — `SUPPORTED_CONTROLLER_NODE_TYPES` now
+  includes `email` alongside `memory`, `ai`, `coordinator`,
+  `telegram`, `discord`, `slack`, `plugin_host`, `tool`.
+
 ## [0.1.5] - 2026-05-25
 
 Boot-loop polish on top of the v0.1.4 install fixes. No
@@ -261,7 +343,9 @@ First public alpha. Everything below is real and ships.
   `scripts/relix-mesh-up.sh` (POSIX), with `relix-mesh-down.sh` for
   shutdown.
 
-[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/itsramananshul/Relix/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.1
+[0.4.0]: https://github.com/itsramananshul/Relix/releases/tag/v0.4.0
 [0.1.5]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.5
 [0.1.1]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.1
 [0.1.0]: https://github.com/itsramananshul/Relix/releases/tag/v0.1.0

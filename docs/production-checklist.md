@@ -10,6 +10,28 @@ admission pipeline enforces). This doc is intentionally
 checkbox-style — each item is a concrete verification or
 configuration operators perform before traffic lands.
 
+## Required env vars (hard requirements, not optional)
+
+These env vars are **fail-closed** — absent or invalid values cause the
+relevant subsystem to deny every call. Set them before starting the
+coordinator.
+
+- [ ] **`RELIX_APPROVAL_SIGNING_KEY` set on every coordinator that
+      issues approval tokens.** 64 hex chars = 32 raw bytes (Ed25519
+      seed). Generate with `openssl rand -hex 32`. An empty or absent
+      key causes `approval_token_missing_key` on every token-bearing
+      call — the entire approval fast-path is inoperative.
+- [ ] **`RELIX_CREDENTIAL_KEY` set when `[credentials] enabled = true`.**
+      Arbitrary secret string used as the implicit `v1` vault key.
+      Absent key → `CredentialError::NoActiveKeyVersion`; vault refuses
+      to open.
+- [ ] **Bridge bearer token readable by the coordinator and any
+      operator tooling.** Auto-generated at first bridge boot to
+      `~/.relix/bridge-token` (mode 0600). The `relix doctor` command
+      checks this file's permissions. Pass the token to HTTP clients via
+      `Authorization: Bearer <token>`; never put it in a URL query param
+      (the bridge rejects those with 400).
+
 ## Pre-flight: identity + transport
 
 - [ ] **Org root mint is offline.** `relix-cli identity init-org`
@@ -38,14 +60,13 @@ configuration operators perform before traffic lands.
 ## Network posture
 
 - [ ] **Bridge binds to loopback (`127.0.0.1`).** Confirmed via
-      `[bridge] listen_addr = "127.0.0.1:19791"`. Non-loopback
-      binds without a reverse proxy + auth in front are an
-      operational mistake; the bridge has no HTTP auth in alpha
-      (see [`bridge-invariants.md`](bridge-invariants.md)). At
-      startup the bridge emits a `bridge: listen_addr` warning
-      when this binding is anything except `127.0.0.1` or `::1`;
-      that warning is the operator's last reminder before
-      traffic flows.
+      `[bridge] listen_addr = "127.0.0.1:19791"`. The bridge enforces
+      bearer-token auth + CSRF guard on all non-public routes, but
+      for any internet-facing exposure a reverse proxy with TLS + external
+      auth is still mandatory. At startup the bridge emits a WARN when
+      `listen_addr` is not loopback — that warning is the operator's last
+      reminder before traffic flows. See [`deployment.md`](deployment.md)
+      for the full auth posture.
 - [ ] **Reverse proxy with TLS + auth.** nginx / Caddy / cloud
       LB / cloudflare-tunnel — whichever fits. mTLS for
       machine-to-machine, OAuth or session for human-to-machine.
@@ -105,13 +126,15 @@ tighten it** before going live.
       verified subject_id. Confirm log rotation is in place
       (`logrotate` / Windows Event Log policies); the runtime
       never truncates.
-- [ ] **Auth at the HTTP boundary.** The bridge's
-      `/v1/config/*` and `/v1/tasks/*` endpoints have NO HTTP
-      auth in alpha — that's the reverse proxy's job. The
-      proxy's auth identity becomes the bridge's "operator"
-      surrogate; operator intervention audit ring (M57) ties
-      every mutation to a correlation_id (M68) that operators
-      grep across the audit log.
+- [ ] **Auth at the HTTP boundary verified.** The bridge
+      enforces bearer-token auth on `/v1/config/*`, `/v1/tasks/*`,
+      and all other non-public endpoints. Confirm that the bridge
+      bearer token from `~/.relix/bridge-token` is rotated into
+      your reverse proxy / automation credentials and is NOT
+      committed to any repository. The proxy's external auth identity
+      becomes the bridge's "operator" surrogate; operator intervention
+      audit ring (M57) ties every mutation to a correlation_id (M68)
+      that operators grep across the audit log.
 
 **Honest scope:** there is no built-in RBAC API yet. The
 operator-intervention surfaces (M57/M60/M62/M65/M71/M72/M76)
@@ -214,28 +237,45 @@ enable only what your flows actually need.
 Run this once after every deployment change:
 
 ```bash
+TOKEN=$(cat ~/.relix/bridge-token)
+
+# 0. One-command health check (permissions + bridge + all components)
+relix doctor
+
 # 1. Bridge health
 curl -s http://127.0.0.1:19791/v1/health | jq '{
   uptime_secs, coordinator_configured, peer_count, peers_expired
 }'
 
 # 2. Provider sanity (replace 'openai' with your defaults)
-curl -s -X POST http://127.0.0.1:19791/v1/config/providers/openai/test \
+curl -s -H "Authorization: Bearer $TOKEN" \
+  -X POST http://127.0.0.1:19791/v1/config/providers/openai/test \
   | jq '{ok, elapsed_ms, detail}'
 
 # 3. Task ledger reads back
-curl -s 'http://127.0.0.1:19791/v1/tasks/cursor?limit=5' | jq '.items[0:5]'
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:19791/v1/tasks/cursor?limit=5' | jq '.items[0:5]'
 
 # 4. Operator intervention audit accessible
-curl -s 'http://127.0.0.1:19791/v1/intervention/recent?limit=5' \
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:19791/v1/intervention/recent?limit=5' \
   | jq '.items | length'
 
 # 5. Firehose responds (close after 1 event or 2 seconds)
-timeout 2 curl -sN 'http://127.0.0.1:19791/v1/tasks/events/stream' \
+timeout 2 curl -sN -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:19791/v1/tasks/events/stream' \
   | head -n 1
 
-# 6. State machine self-check
+# 6. State machine self-check (dashboard is public, no token required)
 curl -s 'http://127.0.0.1:19791/dashboard' > /dev/null && echo "dashboard OK"
+
+# 7. Approval signing key present (if coordinator uses approval tokens)
+[ -n "$RELIX_APPROVAL_SIGNING_KEY" ] && echo "RELIX_APPROVAL_SIGNING_KEY set" \
+  || echo "WARNING: RELIX_APPROVAL_SIGNING_KEY not set"
+
+# 8. Credential vault key present (if credentials enabled)
+[ -n "$RELIX_CREDENTIAL_KEY" ] && echo "RELIX_CREDENTIAL_KEY set" \
+  || echo "INFO: RELIX_CREDENTIAL_KEY not set (credentials disabled?)"
 ```
 
 If any of the above fail, **do not flow live traffic**. Check

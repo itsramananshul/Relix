@@ -253,27 +253,34 @@ the streamed text.
 
 ### OpenAI shim drops fields (SIMP-020)
 
-`/v1/chat/completions` accepts the full request shape and ignores:
+`/v1/chat/completions` accepts the full request shape. The current
+behavior:
 
-- `system` messages (only the last `user` message becomes the prompt;
-  the first system + user message hashes into the session id).
-- `tools` / `tool_choice` / `function_call`.
+- `system` messages are **preserved** and prepended as
+  `[SYSTEM N]\n<content>\n\n` blocks before the last user message.
+- `tools` / `tool_choice` / `function_call` fields and `role:"tool"`
+  messages are **rejected with 400** (not silently dropped).
 - `temperature`, `top_p`, `n`, `presence_penalty`, `frequency_penalty`,
   `max_tokens`, `logprobs`, `response_format`, ... (sampling and
-  format controls are provider-side).
+  format controls) are accepted but not forwarded; handled provider-side.
 - Multimodal `content` arrays (only text-string content is supported).
 
 The shim is a translation layer to make Open WebUI work, not a full
 OpenAI API. Full surface is in
 [`streaming-and-openai-shim.md`](streaming-and-openai-shim.md).
 
-### Bridge holds no `Authorization` semantics
+### Bridge bearer token is loopback-scoped, not internet-grade auth
 
-The OpenAI shim reads the `Authorization: Bearer ...` header and
-**ignores it**. The bridge is bound to `127.0.0.1` only; auth in
-front of the bridge is the operator's responsibility (reverse proxy,
-local socket, etc.). Do not expose the bridge port to a network
-without a fronting authn/authz layer.
+The bridge enforces a bearer token on all non-public routes (stored
+at `~/.relix/bridge-token`). For loopback-only deployments (the
+default) this is sufficient. However:
+
+- The `Authorization: Bearer` header must match the token exactly —
+  any other value receives 401.
+- For deployments exposed beyond loopback, a reverse proxy with
+  TLS + external auth is still required. The bearer token is a local
+  shared secret, not a substitute for mTLS or OAuth.
+- `/health` and `/dashboard` are public (no auth) by design.
 
 ## Provider gaps
 

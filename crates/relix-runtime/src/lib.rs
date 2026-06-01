@@ -4,6 +4,13 @@
 //! dispatch bridge, capability registry, manifest exchange, and node-type
 //! implementations.
 //!
+//! The primary entry point for production use is
+//! [`controller_runtime::run`], which is called by the `relix-controller`
+//! binary after parsing the TOML config and initialising tracing. All node
+//! types (memory, AI, tool, coordinator, web bridge) are implemented here;
+//! the binary crates are thin wrappers that hand off immediately to this
+//! crate.
+//!
 //! Module layout:
 //! - [`transport`] — libp2p wrapper inherited from OpenPrem INFRA (RELIX-1 transport).
 //! - [`sol`] — SOL VM with cross-node `remote_call` extension (RELIX-7 alpha).
@@ -11,6 +18,10 @@
 //! - [`manifest`] — node manifest construction + on-connect exchange (RELIX-5).
 //! - [`coordinator`] — per-flow event-log ownership (RELIX-3 / RELIX-8 alpha).
 //! - [`nodes`] — node-type implementations (memory, ai, tool, web_bridge).
+//! - [`controller_runtime`] — top-level `async fn run` that boots a full
+//!   Relix node from a TOML config path.
+//! - [`audit_partition`] — SQLite per-tenant audit mirror used by
+//!   `relix-flow-inspect --audit-partition`.
 
 // Unsafe is denied crate-wide by default. The ONLY exception is the
 // Linux plugin sandbox in `plugin::loader` (seccomp + setrlimit via a

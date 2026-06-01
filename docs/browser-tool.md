@@ -29,14 +29,18 @@ Concrete: the operator can:
   `status` field reads `unconnected`.
 - Close a session (`tool.browser.close_session`).
 
-The operator CANNOT today:
+The operator CANNOT today (with `backend = "none"`):
 
 - Navigate (`tool.browser.navigate`) — returns
-  `BackendNotConnected` with the reason "operator selected
-  backend=\"none\" — capability surface is wired but no real
-  browser backend ships in this Relix build yet".
+  `BackendNotConnected`.
 - Read page text (`tool.browser.get_text`) — same.
 - Screenshot (`tool.browser.screenshot`) — same.
+- Click (`tool.browser.click`) — same (W2-002a).
+- Type text (`tool.browser.type_text`) — same (W2-002a).
+- Wait for selector (`tool.browser.wait_for_selector`) — same (W2-002a).
+- Read failure screenshots (`tool.browser.capture_read`) — requires
+  `screenshot_on_failure_dir` to be configured and a live backend that
+  produces failure PNGs (W2-002f).
 
 ## Config
 
@@ -45,7 +49,7 @@ The operator CANNOT today:
 # One of: "none" | "headless_chrome" | "playwright" | "webdriver"
 # - "none" (default) wires the surface but returns
 #   BackendNotConnected on every navigate / get_text /
-#   screenshot.
+#   screenshot / click / type_text / wait_for_selector.
 # - "headless_chrome" requires --features browser-headless-chrome.
 #   PH-BROWSER-FEATURES ships a scaffold; PH-BROWSER-HC will
 #   land the live Chrome DevTools Protocol driver.
@@ -62,6 +66,15 @@ max_sessions = 16
 # Per-call deadline (seconds). Returned in error envelopes
 # even when the scaffold has nothing to time out yet.
 call_timeout_secs = 30
+# W2-002: URL of the operator-supplied WebDriver daemon
+# (chromedriver / geckodriver). Only used when backend = "webdriver".
+# Default: chromedriver's standard port.
+webdriver_url = "http://127.0.0.1:9515"
+# W2-002c: optional directory where the backend persists a PNG
+# screenshot every time navigate / click / type_text fails on a
+# live tab. Required for tool.browser.capture_read to work.
+# The directory must already exist; it is NOT created automatically.
+# screenshot_on_failure_dir = "/tmp/relix-screenshots"
 ```
 
 Selecting a backend whose feature flag isn't compiled into
@@ -162,3 +175,22 @@ right pattern to reuse for navigate: validate the URL up-front
 + refuse private-network targets unless the operator
 explicitly opts in via a future `[tool.browser] allow_private`
 toggle.
+
+### `tool.browser.capture_read` security
+
+Reads a failure-screenshot PNG from `screenshot_on_failure_dir` by
+filename. The handler enforces:
+
+- Filename must end with `.png`.
+- Filename must not contain `/`, `\`, `..`, `\0`, or `:`.
+- Maximum filename length: 256 characters.
+- After joining with `screenshot_on_failure_dir`, the resulting path is
+  canonicalized and checked to ensure it remains inside the configured
+  directory (escape check).
+
+### `tool.browser.type_text` — credential-safe tracing
+
+`type_text` logs the **character count** of the typed text, not the text
+content itself. This ensures that credentials, passwords, or other
+sensitive strings typed into browser form fields are not captured in
+tracing output or the audit log.

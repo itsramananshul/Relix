@@ -1,5 +1,7 @@
 # Interruption Semantics
 
+_Version: 0.4.1_
+
 What it means when the Coordinator marks a Task `interrupted`, what
 the recovery scan does, and — equally important — what it deliberately
 does NOT do.
@@ -8,19 +10,25 @@ does NOT do.
 
 `TaskStore::recover_interrupted(now_secs)`:
 
-1. SELECT all rows where `status = 'running'` AND `started_at IS NOT
-   NULL` AND `max_runtime_secs IS NOT NULL` AND `(started_at +
-   max_runtime_secs) < now_secs`.
+1. SELECT all rows where `status = 'running'` AND `max_runtime_secs
+   IS NOT NULL` AND `COALESCE(current_attempt.started_at,
+   task.started_at) + max_runtime_secs < now_secs`. The scan keys off
+   the **current attempt's** `started_at` so a retry whose new attempt
+   is within the deadline is not falsely flagged because attempt #1 ran
+   out.
 2. For each candidate, in a single transaction, UPDATE
    `status = 'interrupted'`, `last_failure_reason = 'deadline_exceeded
    started_at=N max_runtime_secs=N now=N'`, `last_failure_class =
    'timeout'`, and `updated_at = now`. The UPDATE re-checks
    `status = 'running'` so an in-flight `task.update` from a long-lived
    executor cannot be silently overwritten.
-3. INSERT a `task.interrupted` event into `task_events` with a payload
-   describing why.
-4. COMMIT.
-5. Return the list of recovered task ids.
+3. Close the open `task_attempts` row as `interrupted` with
+   `failure_class = 'timeout'`.
+4. INSERT `task.interrupted`, `task.attempt_finished`, and
+   `task.terminal_summary` events into `task_events` describing the
+   transition.
+5. COMMIT.
+6. Return the list of recovered task ids.
 
 It runs in two places:
 

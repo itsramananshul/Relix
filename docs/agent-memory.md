@@ -5,10 +5,6 @@ Patterned on Hermes's `MEMORY.md` + `USER.md` pair — see
 [`docs/proposals/hermes-full-analysis.md`](proposals/hermes-full-analysis.md)
 section 4.1 for the design lineage and rationale.
 
-This is the foundation layer. Vector embeddings, cross-agent
-memory sharing, and richer scoping are explicitly out of scope
-and land in later waves.
-
 ## What it is
 
 Two text stores, keyed by the agent's `subject_id`:
@@ -142,11 +138,13 @@ bridge response.
 
 Both hit `GET /v1/memory/agent?subject_id=<id>&peer=<alias>`
 on the bridge, which proxies `memory.agent_read` to the memory
-node.
+node. Note: this endpoint enforces `require_caller_subject` —
+the `?subject_id=` must match the authenticated caller subject
+(`X-Relix-Subject` header); mismatch returns 403.
 
 ## Storage
 
-A new SQLite table on the memory node's existing database:
+Two SQLite tables on the memory node's main database (`db_path`):
 
 ```sql
 CREATE TABLE agent_memory (
@@ -156,28 +154,45 @@ CREATE TABLE agent_memory (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (subject_id, target)
 );
+
+-- turns carries flushed column added by memory.context_flush
+CREATE TABLE turns (
+    id         INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    flushed    INTEGER NOT NULL DEFAULT 0
+);
 ```
 
 One row per `(subject_id, target)`. UPSERT on every write.
 Subject isolation is by primary key — agent A's row literally
 cannot contain agent B's content.
 
+The `agent_memory` table has no tenant isolation column; it uses
+`subject_id` as its sole primary key. Multi-tenant deployments
+should scope subject IDs per tenant at the identity layer.
+
 ## Configuration
 
 ### Memory node
 
-No new config — the memory node grows the `turns` / `agent_memory`
-tables automatically on first start. Note: the old FTS5-over-turns
-capability is now called `memory.search_turns`; the name
-`memory.search` is taken by the new vector-embedding semantic
-search (see [`docs/vector-memory.md`](./vector-memory.md)).
-Optional `[memory.embedding_peer]` enables the new
-`memory.embed` / `memory.search` / `memory.embed_all` surface.
+The `turns` and `agent_memory` tables are auto-created on first
+start from `db_path`. No extra config is needed beyond setting
+`db_path`.
+
+Key note on naming: `memory.search_turns` is the FTS5
+keyword-search capability over `turns`; `memory.search` is the
+cosine-similarity search over the embedding store
+([`vector-memory.md`](vector-memory.md)); `memory.records_search`
+is the four-layer Qdrant-backed search — all three are distinct.
+See [`memory.md`](memory.md) for the full capability index.
 
 ### AI node
 
-To enable memory injection, the AI controller's config grows an
-optional `[ai.memory_peer]` section:
+To enable memory injection, add an optional `[ai.memory_peer]`
+section:
 
 ```toml
 [ai.memory_peer]
@@ -186,22 +201,15 @@ addr = "/ip4/127.0.0.1/tcp/19711"
 # deadline_secs = 5     # default; ai.chat memory fetch budget
 ```
 
-When `[ai.memory_peer]` is missing, the AI node boots without
-outbound mesh capability and memory injection is silently
+When `[ai.memory_peer]` is missing, memory injection is silently
 skipped. Existing chat behavior is unchanged.
-
-The AI controller uses the same identity bundle and signing key
-the heartbeat sender uses (`<identity.key_path>.bundle`).
-Missing bundle → warn + skip; chat keeps serving.
 
 ## Memory Curator
 
 A background process that periodically asks the AI peer to
 consolidate redundant entries, remove stale information, and
 keep each agent's memory lean and useful. Patterned on
-Hermes's curator subsystem (`agent/curator.py`, 1781 lines) but
-scoped to just the two memory targets that already exist —
-no skills, no procedural memory, no cross-agent state.
+Hermes's curator subsystem.
 
 ### What it does
 
@@ -230,8 +238,6 @@ returns pipe-delimited summary with:
 
 ### How to enable it
 
-The memory controller's config grows a new section:
-
 ```toml
 [memory.curator]
 enabled = true              # master switch
@@ -242,18 +248,30 @@ min_chars_to_curate = 100   # skip agents below this threshold
 addr = "/ip4/127.0.0.1/tcp/19712"
 alias = "ai"                # default
 deadline_secs = 30          # ai.chat budget (slow; give it room)
+
+# Optional: coordinator peer for chronicle events
+[memory.curator.coord_peer]
+addr = "/ip4/127.0.0.1/tcp/19713"
+alias = "coordinator"
+deadline_secs = 10
 ```
+
+Additional config keys for the four-layer promotion pipeline
+(enabled when `[memory.qdrant]` is also configured):
+
+| Key | Default | Effect |
+|---|---|---|
+| `promotion_enabled` | `false` | Enables LayerPromoter background task |
+| `promotion_interval_secs` | `300` | Promoter tick (5 min) |
+| `promotion_batch_size` | `20` | Records per promotion stage per tick |
+| `dialectic_model` | `"openrouter/anthropic/claude-3-5-haiku"` | Model used for dialectic synthesis |
 
 When `[memory.curator]` is missing entirely, the scheduler is
 not spawned AND `memory.agent_curate` returns
 `RESPONDER_INTERNAL` with a clear "AI dispatcher not
-configured" message. The capability stays advertised so
-operators can see it in the manifest; calls just fail loud
-rather than silently no-op.
-
-When `enabled = false`, the scheduler is not spawned but the
-capability is still wired — operators can curate manually via
-the dashboard or `POST /v1/memory/curate`.
+configured" message. When `enabled = false`, the scheduler is
+not spawned but the capability is still wired — operators can
+curate manually.
 
 ### How to trigger manually
 
@@ -284,19 +302,19 @@ Response shape:
 }
 ```
 
-**Status** — `GET /v1/memory/curator/status?peer=memory`.
-Honest scope: the runtime's `CuratorState` lives in-process on
-the memory node and isn't yet reachable via a capability. The
-endpoint surfaces what the bridge knows (configured peer alias)
-plus an explicit `bridge_note` field naming the gap. Manual
-curation through `/v1/memory/curate` works end-to-end; the
-scheduler-wide stats land when a follow-up
-`memory.curator_status` capability ships.
+**Curator status** — `GET /v1/memory/curator/status?peer=memory`.
+
+The `memory.curator_status` capability is fully implemented and
+returns live data from the in-process `CuratorState` on the
+memory node. Response is pipe-delimited `key=value` pairs
+including `last_run_at`, `next_run_at`, `running`,
+`agents_reviewed`, `agents_curated`, and `total_chars_saved`.
+The bridge endpoint is a thin proxy onto this capability.
 
 ### What the curation prompt does
 
-The prompt is templated and tested verbatim (`tests::
-build_curation_prompt_contains_delimiter_cap_and_content`):
+The prompt is templated (tested verbatim in
+`tests::build_curation_prompt_contains_delimiter_cap_and_content`):
 
 ```
 Curate the following agent memory. Rules:
@@ -344,15 +362,12 @@ unchanged contents on the next read.
 Operators searching for "what did the agent say about X last
 week" hit the **session search** surface. Unlike persistent
 agent memory (above), session search is a query over the
-coordinator's chat-turn chronicle: every `chat.user_turn` /
-`chat.assistant_turn` event landed by the bridge's chat flow
-(W5) is searchable.
+coordinator's chat-turn chronicle.
 
 ### Surfaces
 
-Every surface routes to the same coordinator capability
-`task.session_search` so the results stay consistent across
-clients.
+Every surface routes to coordinator capability
+`task.session_search` so results stay consistent.
 
 **From a SOL flow** — agents call the tool-node proxy:
 
@@ -362,10 +377,9 @@ let hits: str = remote_call("tool", "memory.session_search", "alice|kubernetes|1
 
 Wire: `subject_id|query|limit`. Empty `subject_id` searches
 every session; non-empty restricts to sessions owned by that
-subject (joined through `tasks.owner_subject_id`). Limit
-defaults to 20, capped at 100.
+subject. Limit defaults to 20, capped at 100.
 
-Reply is a JSON array; each entry is:
+Reply is a JSON array; each entry:
 
 ```jsonc
 {
@@ -378,30 +392,18 @@ Reply is a JSON array; each entry is:
 }
 ```
 
-`score` is `1.0` for every hit today; reserved for a BM25
-score when FTS5 indexing of the chronicle lands.
+`score` is `1.0` for every hit today; reserved for BM25 when
+FTS5 indexing of the chronicle lands.
 
-**From the CLI** — operators search the same chronicle:
+**From the CLI**:
 
 ```bash
-# Find every turn that mentioned "kubernetes"
 relix-cli ops session-search --query kubernetes
-
-# Restrict to one agent's sessions
 relix-cli ops session-search --query kubernetes --subject-id <hex>
-
-# JSON for piping into jq
 relix-cli ops session-search --query kubernetes --json | jq '.results | length'
 ```
 
-**From the dashboard** — `#/session-search` (under Memory in
-the sidebar) renders the same search with a form: query
-input, subject_id filter, 10/20/50/100 limit selector, and a
-results list where every `session_id` links straight to
-`GET /v1/sessions/export?session=...` so the operator can pop
-the full transcript open.
-
-**From an HTTP client** — the bridge endpoint:
+**From HTTP** — the bridge endpoint:
 
 ```
 GET /v1/memory/sessions/search?q=<query>&subject_id=<id>&limit=<n>
@@ -410,37 +412,28 @@ GET /v1/memory/sessions/search?q=<query>&subject_id=<id>&limit=<n>
 → 503 when no memory peer is wired
 ```
 
+Requires `[memory.curator.coord_peer]` to be configured so the
+memory node can proxy through to the coordinator.
+
 ### What it indexes
 
 Only chronicle events of type `chat.user_turn` and
-`chat.assistant_turn`. Those land on a per-turn basis through
-the bridge's chat flow (`flow.rs::record_chat_turn`). The
-search ignores task lifecycle events, capability invocations,
-and the per-turn payload of persistent agent memory.
-
-### Operator-only "search everything"
-
-When `subject_id` is empty, the gate skips the
-`tasks.owner_subject_id` join and returns hits from every
-session the coordinator knows about. That's the operator
-debugging path — agents calling through the tool node always
-have a subject_id on their bundle, so this branch only fires
-when the bridge or CLI explicitly leaves the filter blank.
+`chat.assistant_turn`. The search ignores task lifecycle events,
+capability invocations, and the per-turn payload of persistent
+agent memory.
 
 ## What's deliberately NOT here
 
-- **Vector embeddings.** Memory is keyword text. Future waves.
-- **Cross-agent shared memory.** Each `subject_id` owns its row.
+- **Cross-agent shared memory.** Each `subject_id` owns its row
+  in `agent_memory`. Cross-agent sharing lives in the four-layer
+  store's `share_policy` / `shared_with` fields — see
+  [`four-layer-memory.md`](four-layer-memory.md).
 - **Per-session scoping** on persistent memory. Persistent
-  memory is global per-agent across all sessions; session
-  search is the per-session-scoped surface for chat-turn
-  history.
-- **Per-team / department scoping.** No grouping today.
+  memory is global per-agent across all sessions.
 - **Auto-eviction.** Agents must remove old entries themselves.
 - **BM25 / FTS5 ranking.** Session search uses `LIKE '%q%'`
-  today. Score is always 1.0; the FTS5 index is a follow-up
-  that doesn't change the wire shape.
-- **Operator-side editing.** Dashboard + CLI are READ-ONLY.
-
-When these become real needs (and they will) they land as
-follow-up tracks on top of the foundation here.
+  today. Score is always 1.0; FTS5 indexing is a follow-up.
+- **Operator-side editing of agent blobs.** Dashboard + CLI are
+  read-only for the `agent_memory` table. Operator editing of
+  four-layer records is covered in
+  [`four-layer-memory.md`](four-layer-memory.md).

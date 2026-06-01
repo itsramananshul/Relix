@@ -1,9 +1,27 @@
 # Event Contract
 
-The S2 typed-event-envelope wire contract. Companion to
-[`event-vocabulary.md`](event-vocabulary.md) (the naming
-conventions) and [`task-runtime.md`](task-runtime.md) (the
-schema + capability wire format).
+> Version 0.4.1
+
+The S2 typed-event-envelope wire contract for the **Coordinator's
+`task_events` chronicle**. This document covers that one store.
+Additional event stores exist and have their own schemas; see the
+table below.
+
+| Store | SQLite file | Accessed via |
+|---|---|---|
+| Task chronicle | `<coordinator-data>/tasks.db` (`task_events` table) | `/v1/tasks/:id/events` HTTP endpoint, `task.events` capability |
+| Alert chronicle | `~/.relix/<node>/alerts.sqlite` (`alert_events` table) | `observability.alert_history` capability |
+| Observability Sink A | `~/.relix/<ai-node>/metadata.db` (`metadata_events` table) | `SessionDebugger` + OTel export |
+| Observability Sink B | `~/.relix/<ai-node>/content.db` (`content_events` table) | `SessionDebugger` only; never exported via OTel |
+| PII audit chronicle | `~/.relix/<node>/pii_events.sqlite` (`pii_events` table) | `pii.recent_events` capability |
+| Audit partition mirror | `~/.relix/<node>/audit-partition.db` (`audit_partition` table) | `node.audit.tenant_list`, `node.audit.tenant_recent` capabilities |
+
+All on-disk CBOR event records (flow logs, per-node audit logs) use
+4-byte big-endian length framing: each record is preceded by a
+4-byte big-endian length field followed by the CBOR-encoded record
+bytes. This framing applies to `relix-core::eventlog` and
+`relix-core::audit` files; it does NOT apply to the SQLite-backed
+stores listed above.
 
 Read this when:
 

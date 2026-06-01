@@ -1,6 +1,6 @@
 # STATE OF RELIX
 
-**Audit timestamp:** 2026-05-21 · 403 commits on `main` · HEAD `bb14a6b`
+**Audit timestamp:** 2026-05-21 (original) · reconciled against 0.4.1 codebase 2026-06-01
 **Purpose:** read-only snapshot of what exists, what's partial, what's
 proposal-only. Written for someone who has never read this codebase.
 
@@ -18,8 +18,10 @@ small hand-written **SOL flow files** (a tiny imperative DSL with a
 `remote_call(peer, method, args)` primitive). There is no central
 gateway — the HTTP bridge that fronts OpenAI-compatible clients is just
 another peer on the mesh. The whole thing is honest about what it
-**does not** do: no plugin loading, no DHT discovery,
-no rate limiting beyond allow/deny. The differentiating posture is
+**does not** do: no DHT discovery,
+no rate limiting beyond the BudgetEnforcer spend caps (no per-method token-bucket throttling).
+As of 0.4.1 subprocess plugins ARE supported (`node_type = "plugin_host"`);
+dynamic WASM loading is still absent. The differentiating posture is
 operator-facing transparency — every dispatched call, denial, retry,
 and chronicle event is queryable by both a dashboard and CLI, and the
 codebase contains a docs/current-limitations.md and per-feature
@@ -329,19 +331,28 @@ CBOR-encoded (not pipe-delimited like the rest).
 
 Reaper loops: stale-peer flip (90s), expired-session drop (300s).
 
-### 3.12 What is **not** a capability
+### 3.12 What is **not** a capability (as of 0.4.1)
 
-The Telegram channel scaffold (`relix-telegram` crate) ships
-config + identity-derivation + a `BotApi` trait + a `MockBotApi` test
-double — but **no live HTTPS implementation and no controller binary
-wiring**. There's no `telegram.*` method registered today.
+All three chat channels (Telegram, Discord, Slack) and the email channel
+are fully wired. Each registers `<channel>.status`, `<channel>.messages_recent`,
+`<channel>.send`, `<channel>.health`, and `<channel>.approval_send`
+capabilities on their respective controller nodes. The scaffold-only
+note from the original audit no longer applies.
 
 ---
 
 ## 4. WHAT THE DASHBOARD SHOWS
 
+**0.4.1 update:** The operator dashboard was fully rebuilt as of May 31, 2026 into
+a single self-contained `dashboard.html` (CSS + JS inline, no external deps, no CDN)
+with **18 top-level sections** — expanded from the original 12. New sections in 0.4.1:
+Chat, Memory (inspector, dialectic, quarantine), Approvals, Skills, Sessions, Reasoning,
+Credentials, Identity, Multi-Tenant, Planning, Workflows, and a live Logs stream
+(`GET /v1/logs/stream` SSE). The subsection inventory below reflects the
+pre-rebuild structure and is annotated where sections have changed materially.
+
 Served by `relix-web-bridge` at `GET /dashboard` as a single static
-HTML file with inline JS (no build step). Twelve top-level pages, each
+HTML file with inline JS (no build step). Eighteen top-level sections, each
 addressable via `#/<route>` and `data-page="<route>"` in
 `crates/relix-web-bridge/src/dashboard.html`.
 
@@ -433,7 +444,7 @@ addressable via `#/<route>` and `data-page="<route>"` in
 
 ### 4.11 `#/telegram`
 
-- Bot token status, webhook config, allowed user groups, recent-message ring. **Scaffold UI** — the live HTTPS client is not implemented.
+- Bot token status, webhook config, allowed user groups, recent-message ring. ~~**Scaffold UI** — the live HTTPS client is not implemented.~~ **[SHIPPED in 0.4.1 — live HTTPS client, long-poll + webhook mode, approval notifier, voice transcription. See §6.1.]**
 
 ### 4.12 `#/config`
 
@@ -864,11 +875,17 @@ Test coverage:
 
 This closes SIMP-019.
 
-### 6.6 Manifests are not signed
+### 6.6 Manifests are signed (shipped as of 0.4.1) ~~[was: gap]~~
 
-`NodeManifest` is sent as plain CBOR. A peer can lie about its own
-capabilities; the bridge trusts what it receives. Gate 2 wraps in a
-`Bundle(BundleType::NodeManifest)`. SIMP-006.
+`NodeManifest` is now sent inside a `SignedManifest` envelope (Ed25519,
+TOFU pinning) as of RELIX-5 PART 2. `ManifestProvider::signed_snapshot`
+signs `CBOR(NodeManifest)` with the node's own key; `discover_and_pin`
+verifies the signature and cross-checks the signer pubkey against the
+Noise-authenticated PeerId. The bridge no longer blindly trusts
+self-reported capability lists. ~~SIMP-006 was the original tracking
+entry; the alpha signing mechanism differs from the full
+`BundleType::NodeManifest` bundle chain targeted for Gate 2 — that
+upgrade is still future, but basic manifest integrity is real today.~~
 
 ### 6.7 Identity bundles have one delegation level
 
@@ -958,45 +975,41 @@ paused; see §7.
 
 ---
 
-## 7. WHAT IS PLANNED BUT NOT STARTED
+## 7. WHAT IS PLANNED BUT NOT STARTED (0.4.1 update)
 
 Anything that has a docs / proposal / decision-pending entry but no
-implementation.
+implementation. Items from the original list that have since shipped are
+annotated.
 
 ### 7.1 Proposals
 
-**Only one proposal file ships today** — written and committed in
-this session:
-
 | Proposal | Status |
 | --- | --- |
-| `docs/proposals/agent-employee-permissions.md` | Design pass, awaiting sign-off (see §8) |
+| `docs/proposals/agent-employee-permissions.md` | **Shipped end-to-end** in 0.4.1 (see §8). |
 
 ### 7.2 Replay UX V2
 
-Design pass drafted in this session's chat (not written to a file).
-Three slices proposed:
+Still not started. Three slices were proposed:
 - **Slice A** — lineage breadcrumb + side-by-side chronicle comparison
 - **Slice B** — event-level diff chips + screenshot side-by-side + outcome-coloured retry pills
 - **Slice C** — replay endpoint extensions (`overrides`, `mode: execute|dryrun`)
 
-User explicitly paused this track to prioritize the agent-employee
-permission model.
+This track was explicitly paused. The replay primitive (`task.replay`,
+dashboard duration-delta banner) exists; the UX comparison surface does not.
 
 ### 7.3 Decisions-pending entries (`docs/internal/decisions-pending.md`)
 
-Twelve numbered D-### entries with operator-recommendations. Recent
-status: D-001 through D-007 marked `defer`. D-008 through D-010 marked
-`shipped`. Open / future: token throttling, MCP transport completion,
+Prior state: D-001 through D-007 marked `defer`, D-008 through D-010 marked
+`shipped`. Open / future: token throttling, MCP HTTP+SSE legacy transport,
 multi-org boundaries — not actively in a slice.
 
-### 7.4 Other "docs without code" items
+### 7.4 Other "docs without code" items (annotated)
 
-- `docs/channel-node-architecture.md` — Telegram channel architecture; only the scaffold is built (see §6.1).
-- `docs/replay-model.md` — names the SOL VM as synchronous, frames why pause-and-resume is hard.
-- `docs/plugin-foundations.md` — explicitly **not** an implementation plan; sketches constraints any future plugin system must respect.
-- `docs/multi-node-bringup.md` — describes the `relix-mesh-up.ps1` flow, not new architecture.
-- `docs/dashboard-redesign.md` — design refs for sections of the current dashboard; some redesign items are implemented, others not (notably the deeper Telegram settings page).
+- `docs/channel-node-architecture.md` — scaffold scaffolding; **stale** — Telegram, Discord, Slack, Email are all shipped. The "NOT in scope" bullets (webhook, voice, multiple channels) are now shipped.
+- `docs/replay-model.md` — still accurate: SOL VM is synchronous, pause-and-resume is still hard.
+- `docs/plugin-foundations.md` — **partially stale**: the subprocess plugin system ships as of 0.4.1 (§6.1d). The M1/M2/M3 constraints remain correct; WASM sandbox and marketplace are still future.
+- `docs/multi-node-bringup.md` — describes `relix-mesh-up.ps1` flow; still accurate.
+- `docs/dashboard-redesign.md` — the 18-section operator dashboard rebuild shipped (May 31, 2026). Some redesign refs are still useful for context.
 - `docs/production-checklist.md` — operational gates for a hypothetical production deploy. Not a track.
 
 ### 7.5 Specs / SIMP entries deferred to Gate 2
@@ -1004,11 +1017,11 @@ multi-org boundaries — not actively in a slice.
 Mentioned throughout `docs/current-limitations.md` and in source comments:
 - SIMP-002 — Intermediate Authority layer for identity bundles
 - SIMP-003 — CRL / revocation gossip
-- SIMP-006 — manifest signing
+- ~~SIMP-006 — manifest signing~~ **[PARTIALLY SHIPPED in 0.4.1 — Ed25519 SignedManifest + TOFU; full BundleType::NodeManifest chain deferred to Gate 2]**
 - SIMP-007 / -017 — DHT / capability gossip
 - SIMP-016 — typed CDDL replaces `String`-shaped args at SOL boundaries
 - SIMP-018 — typed flow arguments (replaces character-level template substitution)
-- SIMP-019 — provider-native streaming
+- ~~SIMP-019 — provider-native streaming~~ **[SHIPPED in 0.4.1; see §6.5]**
 - SIMP-020 — OpenAI shim field coverage
 
 ---
@@ -1140,26 +1153,39 @@ Operators inspect persistent memory via:
 
 Full doc: [`agent-memory.md`](agent-memory.md).
 
-### 9.3 What is missing
+### 9.3 Status as of 0.4.1 (shipped and remaining gaps)
 
-- **No vector embeddings.** Search is FTS5 keyword only over
-  per-turn data. The new persistent-memory layer has no
-  search at all (operators / agents look it up by
-  subject_id).
-- **No cross-agent memory sharing.** Each `subject_id` row is
-  isolated; no team / department / org grouping.
-- **No per-session scope** on persistent memory. Memory is
-  global per-agent across all sessions.
-- **No auto-eviction.** Operators must remove old entries
-  manually (or rely on agent self-curation when that lands).
-- **No background curator.** Hermes runs a scheduled review
-  loop that archives stale skills and consolidates memory
-  entries via an auxiliary LLM. Relix does not. Future track.
-- **No write-time PII validation.** Bodies are accepted
-  verbatim; secrets / PII / huge documents are persisted
-  as-is.
-- **No memory time-bounding.** A 6-month-old session and a
-  fresh session look identical to `recent_for_session`.
+**Shipped since the original audit:**
+
+- **Vector embeddings (Qdrant + Layer 2/3/4 store).** The four-layer
+  `LayeredMemoryStore` ships with per-tenant Qdrant collections, a
+  background embedding pipeline, layer promoter, consolidation archiver,
+  anomaly scorer, quarantine flow, and integrity auditor. FTS5 search
+  remains on the legacy `MemoryStore`; semantic search via `memory.search`
+  and `memory.records_search` targets the vector layers.
+- **Cross-agent knowledge sharing.** Eight `knowledge.*` capabilities
+  (share, broadcast, recall, accept_shared, autoshare_stats, signed
+  payloads, group resolver, auto-share background task). Per-group
+  policies control which layers propagate automatically.
+- **Background curator.** `ConsolidationArchiver` (6h interval),
+  `MemoryIntegrityAuditor` (24h), and the layer promoter loop are all
+  running background tasks. The curator scheduler (`memory.curator_status`)
+  is also real.
+- **Write-time PII validation.** `PiiAnonymizer` runs at record-time;
+  `BulkAnonymizeRecords` can retroactively clean a store.
+- **Bi-temporal validity.** `valid_from` / `valid_to` / `superseded_by`
+  columns with `supersede()`, `as_of()`, and `supersedes_chain()` helpers.
+
+**Remaining honest gaps:**
+
+- **Per-session scope** on persistent memory — the `scope` column +
+  vocabulary decision is deferred; a future commit will add it.
+- **Hard-delete cascade** — the inspector uses `invalidate` (soft), not
+  physical row deletion + Qdrant point removal.
+- **Memory time-bounding on `recent_for_session`** — the FTS5 layer
+  still treats all sessions equally by recency; no date-window filter.
+- **Separate low-priority Qdrant archive segment** — infeasible in the
+  current single-collection deployment without a breaking schema change.
 
 ---
 
@@ -1271,8 +1297,12 @@ Two-stage evaluation:
 2. Per-method `[[rules]]` — first matching rule wins. Default deny.
 
 Each `Decision` is `Allow { matched_rule }` or `Deny { reason,
-matched_rule }`. A `RequireApproval` variant is reserved but not
-implemented.
+matched_rule }`. The admission pipeline also has a `RequireApproval`
+path via the agent gate (`GateDecision::RequireApproval`) and the
+`always_require_methods` allowlist in `[approval]` — these are wired
+as of 0.4.1 (see §8). The `PolicyEngine` itself remains allow/deny only;
+the approval path is an additional step in the dispatch pipeline that
+runs before policy.
 
 ### 10.4 What's missing for the Active-Directory-grade vision
 
@@ -1280,15 +1310,19 @@ The user's framing (mentioned in this session) is "a policy + identity
 system as rich as Active Directory" — not what's in the codebase
 today. Specifically missing:
 
-- **Categorical permissions.** Today policies are per-method. There is
-  no "this agent can browse but not pay" abstraction; that's the
-  agent-employee proposal (§8).
+- **Categorical permissions.** Now shipped via the agent gate (§8):
+  per-agent `deny_categories` / `allow_categories`, risk ceiling,
+  surface allowlist. Still not in the `PolicyEngine` TOML itself.
 - **Resource-level permissions.** "Can write to `~/inbox/` but not
   `/secrets/`" is not expressible. Only method-level.
-- **Time-bounded / standing approvals.** Not implemented.
-- **Per-call approval prompts.** No `RequireApproval` decision.
-- **Group hierarchies.** Groups are flat strings. No transitive
-  membership ("operators inherits from chat-users").
+- **Time-bounded / standing approvals.** Standing approvals are shipped
+  (`standing_approvals` table, `agent.standing_approval.*` caps).
+  Time-bounded token TTL is also real (per-agent `approval_timeout_secs`).
+- **Per-call approval prompts.** Now wired: `GateDecision::RequireApproval`
+  is produced by the agent gate and handled by the bridge's
+  `AgentGateBindings::on_require_approval` closure.
+- **Group hierarchies.** Groups are still flat strings. No transitive
+  membership is implemented.
 - **Cedar-grade policy DSL.** Current policy is a thin allowlist. The
   source comments name Cedar as the Gate-2 target.
 - **Delegation chains.** Only the org root can sign IdentityBundles.
@@ -1305,50 +1339,46 @@ today. Specifically missing:
 
 ## 11. THE PLUGIN / ECOSYSTEM VISION
 
-### 11.1 What exists today
+### 11.1 What exists today (0.4.1)
 
-`docs/plugin-foundations.md` is explicit: **today there is no plugin
-loading**. The capability set on a controller is determined at compile
-time. Three things in the codebase are plugin-like:
+**A subprocess-based plugin system ships** (see §6.1d). `node_type =
+"plugin_host"` scans a `plugin_dir`, spawns each plugin binary,
+negotiates the `relix-plugin-v1` HTTP/JSON protocol over a TLS
+loopback, and registers each declared capability on the dispatch bridge.
+The plugin host enforces RLIMIT_AS / RLIMIT_CPU / RLIMIT_NOFILE sandbox
+limits on POSIX; on Windows the limits are a no-op (enforced by
+`ensure_enforceable()`). Optional publisher-key Ed25519 signature
+verification on manifests lets operators require signed plugins.
 
-- **`CapabilityDescriptor`** as a unit of discovery. A plugin would
-  ship a `(method_name, descriptor, handler)` triple. The dispatch
-  bridge already accepts these via `register()`.
-- **SOL flows** as composable units. Drop a new `.sol` file into
-  `flows/` and reference it from any controller config without
-  rebuilding. **Flows are NOT plugins** — they're orchestration
-  scripts that consume plugins. An attacker who can write a `.sol`
-  file is bounded by the admission pipeline; an attacker who can
-  write a capability handler is not.
-- **Policy files** as deployment-time configuration. Adding /
-  removing a capability from `requires_groups` is a non-code
-  deployment change.
+Three other plugin-like primitives remain:
 
-### 11.2 What is missing for an outside-app-as-a-node ecosystem
+- **`CapabilityDescriptor`** as the unit of capability advertising.
+- **SOL / Sflow / YAML flows** as orchestration scripts that consume
+  capabilities without extending them.
+- **Policy files** as deployment-time access control over any capability
+  (built-in or plugin-provided).
 
-For a third party to plug in their app as a Relix node, they would
-need:
+The note from `docs/plugin-foundations.md` about "no plugin loading"
+reflects the pre-0.4.1 state and is now stale for the subprocess layer.
 
-- **A stable wire ABI for capability registration.** Today handlers
-  are Rust `async fn`s registered via `DispatchBridge::register`. No
-  dynamic loading, no C ABI, no WASM sandbox, no gRPC handler-server
-  pattern.
-- **A trust + signature model.** Outside-app handlers would need to
-  prove they came from a trusted source. The proposal's posture is
-  "a plugin manifest signed by a trusted issuer", but no such
-  manifest format exists yet.
-- **A sandbox.** The admission pipeline is policy-level, not
-  process-level. A misbehaving handler can reach the host. A real
-  ecosystem needs at minimum a WASM sandbox or sub-process
-  isolation.
-- **A package format.** No `.relix-plugin` archive format, no
-  signing convention, no install path.
-- **A registry / discovery mechanism.** No marketplace, no DHT-based
-  capability advertisement (DHT is configured in libp2p but inert —
-  SIMP-007).
-- **Versioning + compatibility checking.** `CapabilityDescriptor` has
-  `major_version` but the runtime does not enforce it across plugin
-  loads.
+### 11.2 What is still missing for a full outside-app-as-a-node ecosystem
+
+The subprocess plugin system closes the sandbox and stable-ABI gaps for
+the common case. What remains for a production plugin ecosystem:
+
+- **WASM runtime.** The subprocess model requires a native binary. A
+  WASM sandbox would allow language-agnostic, lighter-weight plugins
+  without spawning OS processes. Deliberate non-goal for now.
+- **Automatic restart on crash.** A panicking plugin stays down until
+  the operator calls `plugin.reload`. No watchdog today.
+- **Remote plugin discovery.** Plugins must be on the same host as the
+  `plugin_host` node; no DHT or URL-based install. DHT remains inert
+  (SIMP-007).
+- **Marketplace hosted infrastructure.** Hosted registry, signing CA,
+  payment processor, and web frontend are permanently
+  CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL (GAP 19).
+- **`CapabilityDescriptor.major_version` enforcement.** The runtime
+  registers without checking version compatibility.
 
 ### 11.3 Architectural constraints any future plugin system must respect
 
@@ -1365,13 +1395,16 @@ From `docs/plugin-foundations.md`:
 
 ## 12. HONEST GAPS
 
+**0.4.1 update (2026-06-01):** Several items below have shipped since the
+original audit. Each entry is annotated with its current status.
+
 What's missing for Relix to be "real" — the gaps that block actual
 deployment as a multi-agent operating layer rather than a developer
 demo. Ranked by impact.
 
-### 12.1 No agent-employee permission model
+### 12.1 ~~No agent-employee permission model~~ **[SHIPPED — see §8]**
 
-The single largest gap. Every "agent" today is just an
+~~The single largest gap. Every "agent" today is just an
 IdentityBundle in some groups. There is no:
 - Per-agent permission scope expressed in categorical terms
 - Approval flow for sensitive actions
@@ -1380,7 +1413,15 @@ IdentityBundle in some groups. There is no:
 - Standing approvals
 
 Without this, Relix is "OpenAI-shim + tools" not "operating layer for
-many agents". Design proposal exists (§8); implementation is zero.
+many agents". Design proposal exists (§8); implementation is zero.~~
+
+As of 0.4.1 this is fully shipped end-to-end (see §8 for detail):
+agent profile store, coordinator capabilities, bridge HTTP routes,
+dispatch-pipeline integration, Telegram approval bridge, and dashboard
+`#/agents` + `#/approvals` pages. Honest remaining limits: surface
+field is operator-asserted (not cryptographically bound until SIMP-002),
+multi-approver workflows are not yet in scope (single-approver ships),
+and the dashboard does not push real-time approval notifications.
 
 ### 12.2 No mid-flow pause / resume
 
@@ -1407,33 +1448,70 @@ No CRL. No revocation gossip. Bundle lifetime is the only mitigation
 (default 24h). For real multi-team / multi-app deployments, this is
 insufficient.
 
-### 12.5 No plugin / dynamic load
+### 12.5 ~~No plugin / dynamic load~~ **[SHIPPED — see §6.1d]**
 
-Every capability is compiled in. A third-party tool wanting to
+~~Every capability is compiled in. A third-party tool wanting to
 register itself as a Relix capability has to fork the repo. No WASM
 sandbox, no signed plugin manifest format, no marketplace. The
 existing `CapabilityDescriptor` is the right primitive — but the
-loading + sandbox layers are not built.
+loading + sandbox layers are not built.~~
 
-### 12.6 No vector / semantic memory
+As of 0.4.1 the subprocess-based plugin system ships (§6.1d):
+`node_type = "plugin_host"`, `plugin.toml` manifests with optional
+Ed25519 publisher-key signing, sandbox limits (RLIMIT_AS / RLIMIT_CPU /
+RLIMIT_NOFILE on POSIX), TLS loopback transport, SQLite registry, four
+management capabilities, bridge + dashboard + CLI surfaces, Python and
+Rust SDK examples. Remaining non-goals (deliberate): no WASM runtime,
+no auto-restart on crash, no remote plugin discovery, no marketplace
+hosted infrastructure (CONFIRMED-EXTERNAL-INFRASTRUCTURE-FINAL per
+GAP 19).
 
-Memory is SQLite + FTS5 keyword search. No embeddings. No per-task
+### 12.6 ~~No vector / semantic memory~~ **[SHIPPED — see §9 and Part 6]**
+
+~~Memory is SQLite + FTS5 keyword search. No embeddings. No per-task
 memory. No cross-session synthesis. For any agent that needs to
 remember things in a way that survives session boundaries, this is
-not enough.
+not enough.~~
 
-### 12.7 Streaming is fake
+As of 0.4.1 the four-layer memory system ships: Raw (SQLite+FTS5),
+Semantic (Qdrant vector, per-tenant collections), Observation, and Model
+layers with bi-temporal validity. Background curator, layer promoter,
+consolidation archiver, anomaly scorer, quarantine flow, integrity
+auditor, inspector edit/freeze/export, and dialectic synthesis are all
+real. Per-tenant Qdrant isolation is enforced when
+`[memory.qdrant] tenant_isolation = true`. Remaining honest gaps:
+scope-to-context is deferred (needs a `scope` column + vocabulary
+decision), hard-delete cascade uses `invalidate` not physical delete,
+and a separate low-priority Qdrant archive segment is infeasible without
+a breaking schema change.
 
-The bridge consumes the AI provider's stream eagerly into a buffer,
+### 12.7 ~~Streaming is fake~~ **[SHIPPED — see §6.5; SIMP-019 closed]**
+
+~~The bridge consumes the AI provider's stream eagerly into a buffer,
 then slices the buffer into 24-byte SSE chunks. For Open WebUI this
-is invisible; for latency-sensitive UIs it's a real ceiling. SIMP-019.
+is invisible; for latency-sensitive UIs it's a real ceiling. SIMP-019.~~
 
-### 12.8 Telegram is scaffold-only
+As of 0.4.1 end-to-end token streaming is real and opt-in via a single
+config line. Tokens flow from the provider's SSE response through the
+libp2p `/relix/rpc/stream/1` substream, the SOL VM's
+`remote_call_stream` opcode, and the bridge's SSE response to the HTTP
+client with no intermediate materialisation. The same admission pipeline
+(identity → agent gate → policy → access broker → audit) runs on the
+streaming path. See §6.5 for the full architecture and test coverage.
 
-The dashboard has a Telegram settings page. The crate has a `BotApi`
+### 12.8 ~~Telegram is scaffold-only~~ **[SHIPPED — see §6.1; Discord §6.1b; Slack §6.1c; Email §7.7]**
+
+~~The dashboard has a Telegram settings page. The crate has a `BotApi`
 trait. There is no live HTTPS implementation and no controller
 binary wiring. Operators cannot actually send a Telegram message
-through Relix today.
+through Relix today.~~
+
+As of 0.4.1 all four channels are fully wired. Telegram ships a live
+HTTPS client (reqwest + rustls), webhook mode, voice transcription via
+`audio_peer`, and operator approval notifications. Discord and Slack
+ship REST polling clients with persistent watermark stores. Email ships
+SMTP/IMAP/DKIM with template support and OAuth2. All four channels
+register `approval_send` for the OOB approval delivery matrix.
 
 ### 12.9 No DHT-based discovery
 
@@ -1441,11 +1519,20 @@ through Relix today.
 discovers capabilities through `node.manifest` calls to known peers,
 but cannot find new peers from the network. SIMP-007 / -017.
 
-### 12.10 No cost-aware throttling
+### 12.10 ~~No cost-aware throttling~~ **[PARTIALLY SHIPPED]**
 
-`CapabilityDescriptor::cost_class` exists but the runtime does not
+~~`CapabilityDescriptor::cost_class` exists but the runtime does not
 read it. A caller that floods `ai.chat` burns the provider's per-key
-budget; the policy engine has nothing to say about it.
+budget; the policy engine has nothing to say about it.~~
+
+As of 0.4.1 a `BudgetEnforcer` enforces per-agent and deployment-wide
+daily/hourly spend caps before dispatch. A `CostSpikeDetector` builds
+durable baselines and fires `ProviderCostSpike` alerts. An
+`AlertEngine` evaluates error-rate, P95 latency, cost/hour, and
+zero-success thresholds with a `MultiChannelAlertSink`. Cost-class-aware
+per-method rate throttling (the original gap) is still not implemented
+— the policy engine remains allow/deny only. The BudgetEnforcer enforces
+at the spending level; sub-method cost-class throttling is deferred.
 
 ### 12.11 No replay-debug UX
 
@@ -1455,11 +1542,18 @@ chronicle comparison, no event-level diff, no per-step screenshot
 diff. For "why did this run fail and the next succeed", operators
 read the chronicle by hand. Design exists (paused per user request).
 
-### 12.12 Manifests are not signed
+### 12.12 ~~Manifests are not signed~~ **[PARTIALLY SHIPPED — see §6.6]**
 
-A peer can lie about its own capabilities. The bridge trusts what it
+~~A peer can lie about its own capabilities. The bridge trusts what it
 receives. For any deployment where mesh peers are not all under one
-administrator, this is unsafe. SIMP-006.
+administrator, this is unsafe. SIMP-006.~~
+
+As of 0.4.1 manifests are signed with Ed25519 + TOFU pinning
+(`SignedManifest`). The signer pubkey is cross-checked against the
+Noise-authenticated PeerId so self-asserted keys cannot bypass the
+crypto boundary. The full `BundleType::NodeManifest` bundle chain
+described in the RELIX-4 spec is a Gate 2 upgrade; the alpha signing
+mechanism provides practical integrity for single-operator deployments.
 
 ---
 
@@ -1473,7 +1567,10 @@ administrator, this is unsafe. SIMP-006.
 | `relix-cli` | Developer + operator CLI. 15 subcommands across libp2p dial-and-call and HTTP-to-bridge. |
 | `relix-flow-inspect` | Read flow event logs + audit logs. `--replay-verify` walks hash chains and verifies signatures. |
 | `relix-web-bridge` | HTTP front: chat shim, OpenAI shim, dashboard host, task bridge, observability proxies. ~30 modules. |
-| `relix-telegram` | Telegram channel scaffold (config, identity-derivation, BotApi trait, MockBotApi, session-store). No live HTTPS implementation. |
+| `relix-telegram` | Telegram channel node: live HTTPS client (reqwest+rustls), long-poll + webhook mode, slash commands, approval notifier, voice transcription path. |
+| `relix-discord` | Discord channel node: REST polling client, persistent watermark store, approval_send. |
+| `relix-slack` | Slack channel node: REST polling client, Block-Kit messages, historical-message filter, approval_send. |
+| `relix-embedded` | In-process runtime for host-app embedding: `RelixEmbedded` builder, chat + memory_ingest + memory_search. No libp2p or bridge. |
 
 ## Appendix B — Key file pointers
 
@@ -1497,6 +1594,20 @@ administrator, this is unsafe. SIMP-006.
 | End-to-end smoke (bash) | `scripts/demo-smoke.sh` |
 | Decisions pending | `docs/internal/decisions-pending.md` |
 | Agent-employee proposal | `docs/proposals/agent-employee-permissions.md` |
+| Approval delivery (OOB matrix) | `crates/relix-runtime/src/approval/` |
+| Credential vault (AES-256-GCM/Argon2id) | `crates/relix-runtime/src/credentials/` |
+| Session identity tokens | `crates/relix-runtime/src/identity/session.rs` |
+| Agent gate (admission) | `crates/relix-runtime/src/admission/agent_gate.rs` |
+| Layered memory + Qdrant | `crates/relix-runtime/src/nodes/memory/` |
+| Knowledge share | `crates/relix-runtime/src/knowledge/` |
+| Training pipeline + PII | `crates/relix-runtime/src/training/` |
+| Confidence / self-consistency | `crates/relix-runtime/src/confidence/` |
+| Planning + workflow engine | `crates/relix-runtime/src/planning/` + `crates/relix-runtime/src/workflow/` |
+| Metrics + BudgetEnforcer + AlertEngine | `crates/relix-runtime/src/metrics/` |
+| OTel export + two-sink observability | `crates/relix-runtime/src/observability/` |
+| Plugin host + sandbox | `crates/relix-runtime/src/plugin/` |
+| Manifest signing (SignedManifest) | `crates/relix-runtime/src/manifest/` |
+| Signed manifests + TOFU pinning | `crates/relix-runtime/src/manifest/cache.rs` |
 
 ## Appendix C — How to read the chronicle event vocabulary
 

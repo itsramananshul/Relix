@@ -8,9 +8,9 @@ where genuine gaps remain.
 
 | Feature | SOL | Sflow |
 |---|---|---|
-| List literal `[a, b, c]` | ✅ `Ast::ExprList`, `Inst::PushList(n)` | ✅ `Expr::ListLit`, stored as `SflowValue::List(Vec<String>)` |
+| List literal `[a, b, c]` | ✅ `Ast::ExprList`, `Inst::PushList(n)` | ✅ `Expr::ListLit`, stored as `SflowValue::List(Vec<SflowValue>)` (F11) |
 | Empty list `[]` | ✅ | ✅ |
-| Map literal `{ "k": v, … }` | ✅ `Ast::ExprMap`, `Inst::PushMap(n)` | ✅ `Expr::MapLit`, stored as `SflowValue::Map(Vec<(String, String)>)` |
+| Map literal `{ "k": v, … }` | ✅ `Ast::ExprMap`, `Inst::PushMap(n)` | ✅ `Expr::MapLit`, stored as `SflowValue::Map(Vec<(String, SflowValue)>)` (F11) |
 | Empty map `{}` | ✅ | ✅ |
 | `list_len` / `_get` / `_push` / `_contains` / `_join` / `_split` | ✅ each = one dedicated `Inst::*` opcode | ✅ each = an arm in `eval_builtin` |
 | `map_get` / `_set` / `_has` / `_keys` / `_len` / `_del` | ✅ each = one dedicated `Inst::*` opcode | ✅ each = an arm in `eval_builtin` |
@@ -19,22 +19,23 @@ where genuine gaps remain.
 | `for x in lst { … }` iteration | ✅ via `Inst::ListLen` / `Inst::ListGet` | ✅ F9 — `for x in <list>` binds each element as `SflowValue::String` (loop var restored after `end`) |
 | Nested lists / maps | ✅ F11 — `Inst::ListGetList` / `Inst::MapGetMap` typed accessors; `ListJoin` recurses via `heap_display` | ✅ F11 — `SflowValue::List(Vec<SflowValue>)` / `Map(Vec<(String, SflowValue)>)`; `list_get_list` / `map_get_map` typed accessors |
 | Type tracking | ✅ `Type::List` / `Type::Map` in the analyzer; `let xs: list = …` checked | ❌ — Sflow has no `let` / type annotations |
-| Heterogeneous elements | ✅ values are raw `u64` heap refs | ⚠ — Sflow stores all elements as `String`; non-string values stringify on insert |
+| Heterogeneous elements | ✅ values are raw `u64` heap refs | ✅ F11 — Sflow stores typed `SflowValue` (String, List, Map); stringification happens at display/interpolation time, not at store time |
 
 ## Where the languages intentionally diverge
 
-### Sflow stringifies everything outside its rich slots
+### Sflow stringifies at the boundary, not at store time
 
-Sflow's design philosophy: every value is a `String` in
-expression and step contexts. The list/map work added a typed
-`SflowValue` enum that's stored in `vars`, but the moment a
-value crosses into a step argument, `${…}` interpolation, or a
-condition, it stringifies. Lists become `a|b|c`; maps become
-`k1=v1;k2=v2`.
+Since F11, Sflow stores values as a typed `SflowValue` enum —
+`SflowValue::String(String)`, `SflowValue::List(Vec<SflowValue>)`,
+and `SflowValue::Map(Vec<(String, SflowValue)>)`. Nested lists and
+maps are represented faithfully inside the variable store.
 
-This means a list / map produced inside a Sflow flow can be
-passed to a capability that expects a pipe-delimited payload
-without any extra `list_join(…, "|")` step.
+Stringification happens only when a value crosses a boundary into
+a step argument, `${…}` interpolation, or a condition: lists become
+`a|b|c`, maps become `k1=v1;k2=v2`. This means a typed list or map
+produced inside a Sflow flow can be passed to a capability that
+expects a pipe-delimited payload without any extra `list_join(…, "|")`
+step.
 
 SOL has no analogue — there is no implicit stringification.
 A SOL flow that wants to pass a list to `remote_call` calls

@@ -9,15 +9,24 @@ The full OpenPrem SOL toolchain — lexer, parser, semantic analyzer, bytecode c
 ```
 crates/relix-runtime/src/sol/
   mod.rs           # pub mod bytecode; pub mod analyzer; ...
-  lexer.rs         (383 LOC)   Token / source → Token stream
-  parser.rs        (707 LOC)   Tokens → Program AST
-  analyzer.rs      (457 LOC)   Symbol table + type checking
-  bytecode.rs      (641 LOC)   AST → Vec<Inst>; Inst enum
-  vm.rs            (318 LOC)   Stack-based VM; pub fn step() / run()
-  init.rs          (25  LOC)   Pipeline: sources → Vec<VM>
-  util.rs          (57  LOC)
-  cli.rs           (56  LOC, unused; kept for upstream parity)
+                   # exports DEFAULT_MAX_STEPS, MAX_STEPS_CEILING, SolError,
+                   # CompiledFlow, compile_source_with_directives, ...
+  lexer.rs         (453 LOC)   Token / source → Token stream
+  parser.rs        (1362 LOC)  Tokens → Program AST (includes list/map/try/for)
+  analyzer.rs      (852 LOC)   Symbol table + type checking
+  bytecode.rs      (1037 LOC)  AST → Vec<Inst>; Inst enum (all opcodes including
+                               RemoteCall, RemoteCallStream, Try/Catch, List/Map)
+  vm.rs            (1773 LOC)  Stack-based VM; pub fn step() / run(); fuel budget;
+                               heap; try-handler stack; fault/raise_malformed path
+  init.rs          (28  LOC)   Pipeline: sources → Vec<VM>
+  util.rs          (111 LOC)
+  cli.rs           (129 LOC, unused; kept for upstream parity)
 ```
+
+The LOC counts above are current as of v0.4.1. They have grown
+substantially from the initial M6 port as Relix-specific extensions
+(fuel budget, try/catch, list/map opcodes, RemoteCallStream,
+last_confidence) were layered on top.
 
 ## 2. VM model
 
@@ -122,10 +131,107 @@ Authoritative copies live in `specs/alpha-simplifications.md`:
 
 ## 9. What stays out of scope for M6
 
-- No `try / catch` in SOL — a `RemoteCallError` aborts the flow with `FlowFailed{error}`. SOL programs cannot recover.
 - No `parallel { }` blocks — calls are strictly sequential.
 - No `Time.now` / `Random.bytes` capability surfaces yet.
 - No replay-mode VM execution.
 - No SOL-side typed structs across the wire — strings only.
 
 These remain documented as future work in `specs/alpha-simplifications.md` and `specs/RELIX-7-sol.md`.
+
+---
+
+## 10. Relix extensions layered on top of the M6 baseline
+
+The sections below document the Relix-specific additions to the ported
+OpenPrem runtime. None of these modified the original upstream files —
+they were added in separate passes (F2, F5–F8, F11, P6, RELIX-2,
+RELIX-7.19).
+
+### 10.1 Fuel budget / `#steps` directive (P6)
+
+Every execution has an instruction budget controlled by two constants
+in `sol/mod.rs`:
+
+```rust
+pub const DEFAULT_MAX_STEPS: u64 = 100_000;
+pub const MAX_STEPS_CEILING: u64 = 10_000_000;
+```
+
+The fuel check fires **before** each instruction. When the counter
+reaches zero the VM returns `SolError::FuelExhausted { steps_taken }`
+rather than executing a final instruction.
+
+`compile_source_with_directives(source, default_max_steps)` honours a
+leading `#steps N` directive in the source (wins over the caller's
+default; clamped to `MAX_STEPS_CEILING`). `compile_source` strips the
+directive for backward compatibility and does not apply it.
+
+The YAML frontend always passes `DEFAULT_MAX_STEPS`; the `#steps`
+directive is a `.sol`-only feature.
+
+### 10.2 `try` / `catch` / `rethrow` (F2)
+
+Three new opcodes in `bytecode.rs`:
+
+```
+TryEnter(catch_pc)   — push TryHandler { catch_pc, fp_at_enter, stack_len_at_enter }
+TryExit              — pop handler on clean path
+Rethrow              — re-dispatch via try_dispatch_error(); halt if no handler
+```
+
+`try_dispatch_error()` in `vm.rs` pops the nearest handler, restores
+`fp`, truncates the operand stack to `stack_len_at_enter`, and jumps to
+`catch_pc`. Malformed-bytecode faults go through `raise_malformed` and
+bypass the try-handler stack entirely — they are always terminal.
+
+### 10.3 List and map heap objects (F5–F8, F11)
+
+`HeapObject` now has two additional variants:
+
+```rust
+HeapObject::List(Vec<u64>)
+HeapObject::Map(Vec<(String, u64)>)
+```
+
+`Map` is a `Vec`-of-pairs (not a `HashMap`) so iteration is
+insertion-order deterministic. The full set of list/map opcodes added:
+
+`PushList(n)`, `PushMap(n)`, `ListLen`, `ListGet`, `ListPush`,
+`ListContains`, `ListJoin`, `ListSplit`, `MapGet`, `MapSet`, `MapHas`,
+`MapKeys`, `MapLen`, `MapDel`, `ListGetList` (F11), `MapGetMap` (F11).
+
+`list_join` and `list_contains` stringify nested objects via
+`heap_display`: nested lists become `|`-separated, nested maps become
+`k=v;`-separated. `ListGetList` and `MapGetMap` return a typed heap
+reference and produce a catchable `VM_ERROR_SENTINEL` (kind `mesh_error`)
+when the element is the wrong type or out of bounds.
+
+### 10.4 `RemoteCallStream` (RELIX-2)
+
+A second remote-call opcode that calls `dispatcher.remote_call_stream`
+instead of `dispatcher.remote_call`:
+
+```rust
+Inst::RemoteCallStream
+```
+
+Stack contract is identical to `RemoteCall` (push `peer`, `method`,
+`arg`; pop in reverse order). The dispatcher's `remote_call_stream`
+method opens a `/relix/rpc/stream/1` substream and fires the VM's
+`chunk_observer` (wired via `VM::with_chunk_observer`) once per
+arriving frame. The VM still collects the whole body and pushes a
+single result string — streaming is observable only by the external
+chunk observer. The default trait implementation falls back to a
+single `remote_call`.
+
+### 10.5 `last_confidence` register (RELIX-7.19)
+
+```rust
+Inst::LoadLastConfidence
+```
+
+`VM` carries a `last_confidence: f32` field (default `1.0`). It is
+updated either by the host calling `VM::set_last_confidence(v)` or,
+in production, via a shared `LastConfidenceCell` (atomic). The opcode
+pushes the value widened to `f64` bits for the VM's float slot. The
+builtin `last_confidence() -> float` calls this opcode.

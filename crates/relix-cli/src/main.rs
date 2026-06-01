@@ -1,4 +1,17 @@
-//! relix-cli — developer and operator CLI.
+//! # relix-cli — developer and operator CLI
+//!
+//! Multi-subcommand binary for interacting with a live Relix mesh from the
+//! command line. Every subcommand dials a peer's libp2p multiaddr, runs
+//! through the full admission pipeline (identity → policy → handler →
+//! audit), and prints the result. No subcommand owns persistent state.
+//!
+//! Key subcommand groups: `identity` (issue/verify bundles), `ping`
+//! (health + capability probe), `task` (Coordinator ledger), `capability`
+//! (manifest inspection), `topology` (mesh peer table via the bridge),
+//! `memory` (direct memory-node queries), `workflow` (SOL flow
+//! list/validate/run/trace), and many more — run `relix-cli --help` for
+//! the full list. Operator-facing subcommands require a valid identity
+//! bundle (`--identity`) and a 32-byte signing key (`--client-key`).
 
 mod approval;
 mod belief;

@@ -243,8 +243,11 @@ function start() -> str { return "a" + "b" + "c"; }
 **Integer overflow** is wrapping at the host's `i64` boundary
 (`(a + b) as u64` is what the VM does). No trap.
 
-**Division by zero** on integers panics inside the Rust process — there
-is no SOL-level recovery (the VM's `IntDiv` performs `a / b` directly).
+**Division by zero** on integers is a recoverable fault. `IntDiv` uses
+`checked_div`; a zero divisor (or `i64::MIN / -1` overflow) records a
+structured fault, halts the VM with `VM_ERROR_SENTINEL`, and sets
+`last_error`. It does **not** panic the host process. Wrap the call in
+`try { … } catch any { … }` to recover.
 
 ### 4.2 Comparison
 
@@ -727,8 +730,13 @@ These VM events route to the nearest enclosing `try` handler:
 - `Rethrow` opcode (either an explicit `rethrow;` or a synthesised
   `Rethrow` after no catch matched).
 
-Other VM errors (stack underflow, unknown opcode) panic the host
-process. They are bugs, not user-recoverable.
+Other VM integrity faults (stack underflow, bad heap reference,
+out-of-bounds index, invalid `PushConst` payload, allocation-ceiling
+breach) are caught internally by the VM's `pop()` / `raise_malformed`
+path. They halt the VM with `VM_ERROR_SENTINEL` and a `last_error`
+describing the fault. The worker does **not** panic on malformed
+bytecode; only logic bugs inside the Rust VM implementation itself
+(unreachable arms) can produce a panic.
 
 ### 8.2 rethrow
 
@@ -843,17 +851,66 @@ compiles to a program that ends without invoking any user code.
 | `list_get_list` / `map_get_map` runtime error, no outer try | `u64::MAX` | `Some(...)` with `kind = 0` and `cause` describing the builtin |
 | `rethrow` with no outer try | `u64::MAX` | the original `last_error` is preserved |
 | `remote_call` invoked with no dispatcher attached | `u64::MAX` | `kind = 0`, cause names the gap |
-| Other VM bugs (stack underflow, GetField on a non-struct) | host process panics | not applicable |
+| VM integrity fault (stack underflow, bad heap ref, division by zero, allocation ceiling, invalid opcode payload) | `u64::MAX` (`VM_ERROR_SENTINEL`) | `Some(...)` with `kind = 0`, cause describes the fault |
 
-### 11.4 What is not bounded
+### 11.4 What is bounded and what is not
 
-- Loop iterations.
-- Recursion depth.
-- Heap size.
-- Operand stack depth.
+**Bounded:**
 
-A SOL program can OOM the host. The Sflow executor's 100-iteration cap
-does not apply to SOL.
+- **Instruction count.** Every SOL execution has a fuel budget.
+  The default is `DEFAULT_MAX_STEPS = 100_000` instructions.
+  The hard ceiling is `MAX_STEPS_CEILING = 10_000_000`.
+  A per-flow `#steps N` directive (see `§11.5`) or the caller-supplied
+  `default_max_steps` argument may raise the budget up to the ceiling.
+  When the budget hits zero the VM halts with `SolError::FuelExhausted`
+  — runaway loops exhaust fuel before the host is killed.
+- **Per-allocation element count.** `ALLOC_CEILING = 1 << 24`
+  (16,777,216 elements) limits any single `NewArray`, `PushList`,
+  `PushMap`, or `StoreLocal` growth request. Attempts above the ceiling
+  halt with a structured VM fault.
+
+**Not bounded:**
+
+- Recursion depth (deep recursion consumes host stack).
+- Total heap entries across all allocations (bounded only by host RAM).
+- Operand stack depth within the allocation ceiling.
+
+The Sflow executor's 100-iteration cap does not apply to SOL.
+
+### 11.5 Per-flow fuel budget (`#steps N`)
+
+A SOL source file may open with a `#steps N` directive that overrides
+the caller's default budget:
+
+```sol
+#steps 500_000   # tuned for a large search flow
+function start() -> str { ... }
+```
+
+Rules:
+
+- Must appear at the top of the file before any non-comment,
+  non-blank line.
+- `N` must be a positive decimal integer. Underscores are allowed as
+  thousands separators: `#steps 1_500_000`.
+- Trailing line comments are allowed: `#steps 500_000  # note`.
+- A duplicate `#steps` line is `SolError::BadStepsDirective`.
+- `#steps 0` is `SolError::BadStepsDirective`.
+- The value is clamped to `MAX_STEPS_CEILING` — no flow can exceed the
+  ceiling even with an explicit directive.
+
+Fuel resolution order in `compile_source_with_directives`:
+
+1. `#steps N` directive in source (wins; clamped to `MAX_STEPS_CEILING`).
+2. `default_max_steps` argument from the caller (if non-zero; clamped).
+3. `DEFAULT_MAX_STEPS` (when the caller passes 0).
+
+`compile_source` (the back-compat form) silently strips the directive
+and does not apply it — fuel is not tracked when using that function.
+
+YAML flows compiled through the YAML frontend always use
+`DEFAULT_MAX_STEPS`; the `#steps` directive is not supported in
+`.yml`/`.yaml` files.
 
 ---
 

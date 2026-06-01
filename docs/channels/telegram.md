@@ -35,9 +35,14 @@ For every inbound text message:
    *"I'm having trouble reaching my brain right now. Please try
    again in a moment."*
 6. When an `operator_chat_id` is configured a background notifier
-   polls the coordinator every 15 s for tasks in `awaiting_input`
-   and posts a one-line "Approval required" message (deduped
-   across polls).
+   polls the coordinator every `approval_poll_interval_secs`
+   (default 15 s) for tasks in `awaiting_input` and posts a
+   one-line "Approval required" message (deduped in-memory across
+   polls; dedup resets on restart).
+7. Voice messages are routed to `tool.audio.transcribe` when the
+   optional `[telegram.audio_peer]` section is configured. Without
+   it the bot sends a static "voice transcription not configured"
+   reply.
 
 ## Setup
 
@@ -170,18 +175,25 @@ similar id bot) on Telegram, or read it out of
 Set `RELIX_TELEGRAM_OPERATOR_CHAT_ID` to a numeric chat_id (your
 own DM or a group) to receive an approval-required notification any
 time a task enters `awaiting_input`. The notifier polls every 15 s
-by default; tweak via `[telegram] approval_poll_interval_secs`.
+by default (`approval_poll_interval_secs = 15`); tweak via the
+TOML field.
 
 The notification body:
 
 ```
-Approval required
+⏳ Approval required
 Task: <task_id>
-Agent: (see dashboard)
-Action: (awaiting_input)
-Reason: <task title>
+Agent: <subject_short>
+Action: <method>
+Reason: <reason>
 Reply /approve <task_id> or /reject <task_id>
 ```
+
+The notification is delivered with an inline keyboard so the operator
+can tap **✅ Approve** or **❌ Deny** directly in the chat. The
+keyboard callback data uses `/approve <id>` and `/deny <id>` (Telegram
+limits `callback_data` to 64 bytes). The notification text and the
+slash-command parser both accept `/reject` as the rejection command.
 
 `/approve` and `/reject` are operator-only — they are rejected with
 "Approval commands are operator-only." when the caller's chat_id
@@ -199,8 +211,8 @@ The commands the controller actually understands (see
 | `/status` | Mesh-side summary: bot online state, messages seen, allow-list mode. |
 | `/memory` | Show the caller's persistent agent + user memory blobs. |
 | `/forget` | Clear the caller's agent + user memory. |
-| `/approve <task_id>` | Mark an `awaiting_input` task as `running` and append a `task.approval_granted` chronicle event. Operator-only. |
-| `/reject <task_id>` | Flip an `awaiting_input` task to `failed` and append `task.approval_rejected`. Operator-only. |
+| `/approve <task_id>` | Mark an `awaiting_input` task as approved and append a chronicle event. Operator-only. |
+| `/reject <task_id>` | Flip an `awaiting_input` task to rejected and append a chronicle event. Operator-only. |
 
 Telegram appends `@<bot_username>` to slash commands sent in group
 chats; the parser strips it transparently. Command heads are
@@ -208,13 +220,78 @@ case-insensitive (`/Help`, `/HELP` → `Help`). Unknown slash commands
 fall through to the chat-flow path so they're not silently
 swallowed.
 
+## Delivery mode
+
+The controller defaults to Telegram's `getUpdates` long-poll. To
+use webhook mode instead:
+
+```toml
+[telegram]
+mode        = "webhook"
+webhook_url = "https://bot.example.com/v1/channels/telegram/webhook"
+```
+
+Both fields must be set — if `webhook_url` is absent or empty,
+the controller falls back to long-poll regardless of `mode`
+(`effective_mode()` logic). Webhook mode calls `setWebhook` at
+startup. The bridge webhook route:
+
+```
+POST /v1/channels/telegram/webhook
+```
+
+validates the source IP against Telegram's CIDRs
+(`149.154.160.0/20` and `91.108.4.0/22`) before processing the
+update body.
+
+## Session persistence
+
+By default the channel stores `(chat_id, message_id) → task_id`
+mappings in memory only; they are lost on restart.
+
+To persist sessions across restarts:
+
+```toml
+[telegram]
+session_db_path = "dev-data/telegram-sessions.sqlite"
+```
+
+This enables `SqliteSessionStore` — a SQLite WAL database with the
+`telegram_sessions` table. A background TTL sweep runs every hour
+(`DEFAULT_SWEEP_INTERVAL = 3600 s`) and removes sessions idle for
+more than `session_ttl_hours` (default 24 h). Active sessions are
+bumped on every lookup so they survive the sweep. When
+`session_db_path` is omitted, `InMemorySessionStore` is used and
+sessions are not swept.
+
+## Voice messages
+
+When `[telegram.audio_peer]` is configured, voice messages are
+routed to `tool.audio.transcribe`:
+
+```toml
+[telegram.audio_peer]
+addr         = "/ip4/127.0.0.1/tcp/19720"
+alias        = "tool"
+deadline_secs = 90
+```
+
+Without this section the bot sends a static reply explaining
+that voice transcription is not configured.
+
+## Health capability
+
+`telegram.health` (FIX 49) returns a `ChannelHealthSnapshot` JSON
+document. The health mode reported is `"long_poll"` (or `"webhook"`
+when webhook mode is active).
+
 ## Security notes
 
 - The bot token is the channel's single point of authentication. It
   is never logged, never echoed back via HTTP, and never serialised
-  into the controller config. It only lives in `RELIX_TELEGRAM_BOT_TOKEN`
-  (controller process env) and optionally `bridge-secrets.toml`
-  (mode 0600, gitignored).
+  into the controller config. It only lives in the env var referenced
+  by `token_env` (e.g. `RELIX_TELEGRAM_BOT_TOKEN`) and optionally
+  `bridge-secrets.toml` (mode 0600, gitignored).
 - `subject_id` derivation is **deterministic** but not authenticated:
   a Telegram account ID is the only thing the channel sees. Apply
   permit lists in adversarial settings; Telegram's accounts are not
@@ -225,15 +302,16 @@ swallowed.
 - Telegram updates older than the last processed `update_id` are
   not replayed across restarts (Telegram's offset semantics handle
   this). Updates that arrive during a restart are buffered by
-  Telegram (24h) and picked up on next poll.
+  Telegram (24 h) and picked up on next poll.
 
 ## HTTP / CLI surfaces
 
 Bridge endpoints:
 
 ```
-GET /v1/telegram/status
-GET /v1/telegram/messages/recent?limit=20
+GET  /v1/telegram/status
+GET  /v1/telegram/messages/recent?limit=20
+POST /v1/channels/telegram/webhook
 ```
 
 CLI (one-shot snapshots):
@@ -262,11 +340,11 @@ flows that want to call the capabilities directly).
 
 ## See also
 
-- [index.md](index.md) — overview of all three channels.
+- [index.md](index.md) — overview of all four channels.
 - [`../channel-node-architecture.md`](../channel-node-architecture.md) —
   the design contract.
 - [`../current-limitations.md`](../current-limitations.md) — what
-  alpha deliberately omits (group chats, media, multi-channel
-  session unification).
+  alpha deliberately omits (group chats, multi-channel session
+  unification).
 - [`../configuration.md`](../configuration.md) — full env-var
   reference for the mesh boot script.

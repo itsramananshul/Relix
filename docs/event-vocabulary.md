@@ -1,16 +1,24 @@
 # Event Vocabulary
 
-The Coordinator's `task_events` table is the runtime's audit trail
-for what happened on a Task. This document is the **stable
-contract** for the event names runtime components emit and the
-payload conventions operator tooling expects. Priority C of the
-operator-platform-maturation roadmap.
+> Version 0.4.1
+
+This document covers **all** stable event-type string vocabularies
+across Relix's event stores. The Coordinator's `task_events` table
+is one store among several; each has its own event-type contract.
+Sections below cover: task-chronicle events, observability Sink A
+metadata events, and alert chronicle events.
+
+This document is the **stable contract** for the event names runtime
+components emit and the payload conventions operator tooling expects.
+Priority C of the operator-platform-maturation roadmap.
 
 Stick to this vocabulary when adding new event emitters. Drift is
 expensive once dashboards and parsers start pattern-matching on
 specific names.
 
-## Why this matters
+## Task-chronicle vocabulary
+
+### Why this matters
 
 `event_type` is a free string at the database level (so operators
 can attach their own custom events via `task.event`), but the
@@ -22,7 +30,7 @@ compatibility shim breaks any dashboard polling on it.
 The current set is small enough to audit; this doc keeps it that
 way.
 
-## The current vocabulary
+### The current task-chronicle vocabulary
 
 All names use dot-separated namespacing (`subsystem.event`). The
 subsystem prefix groups related events visually in a chronicle
@@ -87,7 +95,59 @@ string they want. The convention is:
   them, but readable rendering across tools depends on flat
   single-line payloads).
 
-## Payload format contract
+## Observability Sink A — `metadata_events` vocabulary
+
+Sink A (`metadata_events` table, `metadata.db`) records AI-node
+session events. The `event_type` column holds one of seven
+implemented string values. These are **serialized as snake\_case**
+and used by `SessionDebugger` to assemble readable timelines. The
+`EventType` enum in `relix-core::eventlog` is a separate,
+unrelated system (flow-log CBOR records on disk); do not conflate
+the two.
+
+| `event_type` string | Meaning |
+|---|---|
+| `model_call` | A call to an AI model provider; carries `model_name`, `token_count`, `cost_cents`, `latency_ms` |
+| `tool_call` | A tool dispatch; carries `tool_name`, `latency_ms`, `success` |
+| `memory_op` | A memory read or write operation |
+| `approval` | An approval request or decision event |
+| `session` | Session open/close boundary; `success = true` marks a clean close |
+| `error` | A handler-level error; carries `error_type` |
+| `cost` | A cost-tracking event (e.g. budget threshold crossed) |
+
+Other strings pass through as-is; the 7 above are the ones
+`SessionDebugger::render_summary` has named handling for.
+
+These events use the same `event_id` (UUID string) that links
+metadata rows (Sink A) to content rows (Sink B). The OTel exporter
+filters by `events.enabled_events` before exporting spans; only
+event types explicitly listed in the config are forwarded.
+
+## Alert chronicle — `alert_events` vocabulary
+
+The alert chronicle (`alerts.sqlite`, `alert_events` table) stores
+every alert transition emitted by the `AlertEngine`. The
+`event_type` column holds one of two values:
+
+| `event_type` string | Meaning |
+|---|---|
+| `alert.fired` | Alert crossed from healthy to above-threshold (edge-triggered) |
+| `alert.recovered` | Alert cleared back to healthy |
+
+The `metric` column holds the `AlertKind::as_str()` value:
+`error_rate`, `p95_latency`, `cost_per_hour`, `zero_success`,
+`low_confidence`, `budget_exceeded`, `provider_cost_spike`,
+`ask_human_rate_drift`, `cost_alert`.
+
+The `severity` column is `"warning"` or `"critical"` on fired rows
+and `NULL` on recovered rows. Timestamps are ISO-8601 UTC with
+millisecond precision.
+
+These events are accessible via the `observability.alert_history`
+capability (`limit`, `agent` args) and are not mixed with the
+Coordinator's `task_events` chronicle.
+
+## Task-chronicle payload format contract
 
 Payloads are free strings at the database level. The runtime-
 emitted events follow these conventions; operator-defined events

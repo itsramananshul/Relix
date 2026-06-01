@@ -1,5 +1,7 @@
 # Task API — Bridge HTTP Surface
 
+_Version: 0.4.1_
+
 The bridge exposes the Coordinator's task ledger as a JSON HTTP
 API. Every endpoint is **read-only or operator-action only**;
 the bridge stays translation-only and adds no orchestration
@@ -15,9 +17,17 @@ expected to remain stable through Gate 1; additive changes
 
 ### `GET /v1/tasks?limit=N&offset=N&status=...`
 
-Offset-paginated list, oldest-updated first... wait, **most-
-recently-updated first**. Use when you need a simple page through
-the full ledger and don't care about strict snapshot stability.
+Offset-paginated list, **most-recently-updated first**. Use when you
+need a simple page through the full ledger and don't care about strict
+snapshot stability.
+
+Query parameters (all optional):
+
+- `limit=N` — page size; default 50, clamped server-side to max 200.
+- `offset=N` — skip the first N rows; default 0. Use `offset=50&limit=50`
+  for page 2.
+- `status=<string>` — filter to one status value (e.g. `running`,
+  `failed`).
 
 Response:
 
@@ -27,8 +37,6 @@ Response:
   ...
 ]
 ```
-
-Cap: `limit` is clamped server-side (default 50, max 200).
 
 **Use cursor pagination (`/v1/tasks/cursor`) for any live ledger
 with concurrent writes** — offset pagination can repeat or skip
@@ -344,6 +352,30 @@ even when the runtime ignores it.
 Rejects (409) terminal states: `completed` / `failed` /
 `cancelled`. See `docs/failure-modes.md` for the
 operator playbook around the flow-still-running case.
+
+### `POST /v1/tasks/:id/mark-investigation`
+
+Set or clear the investigation marker on a task. Body:
+
+```json
+{ "marked": true, "reason": "repeated timeouts on AI peer" }
+```
+
+`marked: false` clears the marker; `reason` is optional on clear.
+
+Response:
+
+```json
+{ "task_id": "...", "investigation_marked_at": 1700000000 }
+```
+
+`investigation_marked_at` is `null` when the marker was cleared.
+
+The coordinator also sets this marker automatically when anti-thrash
+detection fires (`ANTI_THRASH_THRESHOLD = 3` consecutive failures with
+the same `failure_class`). The investigation marker is visible in `GET
+/v1/tasks/:id` under `investigation_marked_at` and
+`investigation_reason`.
 
 ### `POST /v1/tasks/recover`
 

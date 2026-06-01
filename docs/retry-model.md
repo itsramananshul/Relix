@@ -1,5 +1,7 @@
 # Retry Model
 
+_Version: 0.4.1_
+
 What `retry_policy`, `max_retries`, and `retry_count` mean **today**
 versus what they will mean once bounded auto-retry lands. Read this
 before relying on any retry behaviour in production.
@@ -113,11 +115,11 @@ Two reasons, both load-bearing:
    schema change, and gating bounded-retry behind it is the right
    call.
 
-When bounded auto-retry lands it will require: (a) a `task_attempts`
-table or equivalent, (b) capability-level idempotency declarations
-the bridge can read at retry-decision time, and (c) a documented
-backoff curve. This is post-C1 work; C1 just establishes the
-vocabulary.
+The `task_attempts` table is fully implemented (see
+[`attempt-lineage.md`](attempt-lineage.md)). What bounded auto-retry
+still requires is: (a) capability-level idempotency declarations the
+bridge can read at retry-decision time, and (b) a documented backoff
+curve. Both are post-C1 work.
 
 ## What operators can rely on today
 

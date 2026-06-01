@@ -34,30 +34,48 @@ Both installers do the same four things:
 4. Save your configuration to `~/.relix/config.toml`.
 
 Set `RELIX_INSTALL_DIR=/opt/relix/bin` or
-`RELIX_VERSION=v0.1.1` before piping if you want to override
+`RELIX_VERSION=v0.4.1` before piping if you want to override
 defaults.
 
 ## The setup wizard
 
-`relix setup` is an interactive five-page wizard. It runs
+`relix setup` is an interactive seven-page wizard. It runs
 automatically right after install; you can also run it any time
 later to change provider, rotate keys, or add a channel.
+
+**Non-terminal guard:** when stdin is not a TTY (for example in a
+`curl | bash` or `irm | iex` pipeline), the wizard detects this,
+saves the prior config or defaults, and exits cleanly — it prints a
+message directing you to run `relix setup` in a terminal. No raw
+mode is entered.
+
+**Docker / Qdrant prompt (page 1, pre-flight):** before entering
+the wizard proper, the setup checks Docker, Ollama, and Qdrant. If
+Qdrant is not running you are offered:
+
+```
+[1] with memory   (requires Docker + Qdrant)
+[2] without memory
+```
+
+Default is `[2]` on blank input or closed stdin. If you choose
+`[1]` and Docker is not running, the wizard exits with an
+actionable message — start Docker, then re-run `relix setup`.
 
 The pages are:
 
 ```
 ╔══════════════════════════════════════════╗
 ║      RELIX — Relay Intelligence          ║
-║              Exchange  v0.1.1            ║
+║              Exchange  v0.4.1            ║
 ║                                          ║
 ║         The OS for AI Agents             ║
 ║                                          ║
-║      Press Enter to begin setup          ║
-║      (Ctrl-C to cancel)                  ║
 ╚══════════════════════════════════════════╝
 ```
 
-Press **Enter**. Then:
+The Welcome page auto-advances — you do not need to press Enter.
+Then:
 
 ```
 Choose your AI provider
@@ -100,20 +118,21 @@ points you at [@BotFather](https://t.me/BotFather); the Discord
 prompt points at the Developer Portal; the Slack prompt at the
 app config's OAuth section.
 
-Finally the confirmation page:
+**Page 6 — Confidence:** a single toggle enables the confidence
+scoring subsystem. Displays defaults for `window_size` and
+`p95_latency_baseline_ms`.
 
-```
-Ready to save configuration
+**Page 7 — Subsystems:** two toggles — credential vault and
+approval delivery. Enabling the vault generates a 32-byte random
+master key (printed once to stdout; save it — it is not
+recoverable). The approval channel defaults to `dashboard`.
 
-Provider:  openrouter
-API key:   sk-or-ab••••••••     (first 8 chars then bullets)
-Channels:  Telegram
+**Confirmation page:** shows a diff of what changed from the prior
+config. Press **Enter** to save; left-arrow / `b` / `B` to go
+back; Ctrl-C to cancel.
 
-Press Enter to save, Ctrl-C to cancel.
-```
-
-Press **Enter**. The wizard writes `~/.relix/config.toml`
-(`chmod 600` on POSIX — it holds your secrets) and exits.
+The wizard writes `~/.relix/config.toml` (`chmod 600` on POSIX — it
+holds your secrets) and exits.
 
 ## Boot the mesh
 
@@ -153,34 +172,52 @@ Once the dashboard is up, point any OpenAI-compatible client at
 the bridge — the official Python SDK, Open WebUI, LobeChat,
 Cursor, etc.:
 
+The bridge requires a bearer token. After `relix boot`, the token is
+printed to the terminal and stored in `~/.relix/bridge-token`. Pass it
+in the `Authorization` header:
+
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:19791/v1", api_key="unused")
+import pathlib
+token = pathlib.Path("~/.relix/bridge-token").expanduser().read_text().strip()
+client = OpenAI(base_url="http://127.0.0.1:19791/v1", api_key=token)
 client.chat.completions.create(
     model="relix-openrouter",            # or relix-openai, relix-mock, ...
     messages=[{"role": "user", "content": "hello"}],
 )
 ```
 
-The bridge's API-key header is ignored — the real provider key
-lives only on the AI node, sourced from `~/.relix/config.toml`.
+The real provider key lives only on the AI node, sourced from
+`~/.relix/config.toml`; the bridge token is a separate local
+secret that guards the HTTP surface.
 
-For a quick smoke test from the shell:
+For a quick smoke test from the shell (replace `<token>` with the
+value in `~/.relix/bridge-token`):
 
 ```sh
 curl http://127.0.0.1:19791/health
-# -> {"status":"ok",...}
+# -> ok  (public, no auth required)
+
+TOKEN=$(cat ~/.relix/bridge-token)
 
 curl -X POST http://127.0.0.1:19791/chat \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"session_id":"demo","message":"hello"}'
 ```
 
 Each response carries a `flow_id`, `trace_id`, and `flow_log`
-path so you can replay exactly what the orchestration did:
+path so you can inspect exactly what the orchestration did:
 
 ```sh
+# Using the relix-flow-inspect binary (reads per-flow event logs):
 relix-flow-inspect --flow <flow_log path>
+
+# Or execute a SOL flow live against a running mesh:
+relix flow-run --flow flows/my-flow.sol \
+    --identity dev-keys/local-bridge.aic \
+    --client-key dev-keys/local-bridge.key \
+    --peers dev-data/local/peers.toml
 ```
 
 ## Stream tokens over WebSocket
@@ -191,8 +228,10 @@ provider emits text, terminated by a `done` frame with the
 assembled reply.
 
 ```js
+// Read the token from ~/.relix/bridge-token (bridge validates it).
+const token = "<contents of ~/.relix/bridge-token>";
 const ws = new WebSocket("ws://127.0.0.1:19791/ws/chat", [], {
-  headers: { Authorization: "Bearer dev-token" },
+  headers: { Authorization: `Bearer ${token}` },
 });
 ws.onopen = () => ws.send(JSON.stringify({
   session_id: "demo",

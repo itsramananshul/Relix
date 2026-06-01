@@ -6,6 +6,7 @@ Relix ships **two** flow languages side-by-side:
 |---|---|---|
 | `.sol` | Rust-like SOL | Power users; existing chat flows; anything that wants typed locals and `{}` blocks |
 | `.sflow` | Step-based Sflow | Operator-authored flows; error recovery via try/catch; loops with caps; lightweight conditional routing |
+| `.yml` / `.yaml` | YAML flow | Operators who prefer YAML syntax; lowers to SOL and runs the same VM — see [`yaml-flow-reference.md`](yaml-flow-reference.md) |
 
 The `flow_runner` dispatches on extension. Both languages share
 the same `RemoteCallDispatcher`, the same per-flow event log,
@@ -50,6 +51,12 @@ A real little programming language ported verbatim from OpenPrem
   `remote_call("coord", "msg.send", …)`. Both forms are
   expressions; the result is the child task id / message id
   (`str`).
+- `last_confidence() -> float` — returns the confidence score
+  (`[0.0, 1.0]`) of the most recently completed `remote_call` in
+  this execution context. Returns `1.0` (neutral) before any call
+  has completed. The score is stamped by the host's confidence
+  scorer after each dispatch; reading it is a single atomic load.
+  See `sol-language-reference.md §7.7` for scoring details.
 
 ### 1.1 List & map literals
 
@@ -268,16 +275,24 @@ end
 until <condition>
   <statements>
 end
+
+for <var> in <list_var>
+  <statements>
+end
 ```
 
 - `loop N times` runs the body 0..N-1 times. `${loop.iter}` is
   the 0-indexed iteration counter, available inside the body.
 - `while` runs the body while the condition is true.
 - `until` is sugar for `while not <condition>`.
+- `for x in list_var` (F9) iterates over a list variable, binding each
+  element to `x` in the body. The loop variable is restored to its
+  prior binding (or removed if it was unset before the loop) after
+  `end`. `${loop.iter}` is also available inside a `for` body.
 
-**Iteration cap: 100 per loop** (configurable in the
-coordinator config under `[sol] max_loop_iters = N`). When hit,
-the executor writes `sol.loop_limit_hit` to the chronicle and
+**Iteration cap: 100 per loop** (configurable by the operator;
+wired by the flow runner via `Executor::with_max_loop_iters`). When
+hit, the executor writes `sol.loop_limit_hit` to the chronicle and
 breaks out — never crashes, never hangs.
 
 ### 2.6 Error handling

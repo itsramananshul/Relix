@@ -340,7 +340,8 @@ Fields:
 
 Failures that route to a `try` handler: `call` / `stream`
 failures, `list_get_list` / `map_get_map` runtime errors. Other
-SOL errors (stack underflow, etc.) are bugs and panic the host.
+VM integrity faults (stack underflow, bad heap reference) halt the
+VM with `VM_ERROR_SENTINEL` but do not panic the host process.
 
 ## Variable scoping
 
@@ -405,6 +406,37 @@ limitations are deliberate:
 These are not bugs; they are the trade-off for keeping the
 runtime a pure SOL VM.
 
+## File and nesting limits
+
+| Limit | Value | When checked |
+|---|---|---|
+| Max YAML file size | 10 MiB | Before YAML parsing (stat + re-check after read) |
+| Max nesting depth | 20 | Before lowering, via bounded traversal |
+
+Files exceeding 10 MiB produce `YamlFlowError::FileTooLarge`.
+Flows exceeding depth 20 produce `YamlFlowError::NestingTooDeep`.
+Both checks happen before any SOL compilation.
+
+## Security: injection allowlists
+
+Every user-supplied value that would be interpolated verbatim into
+the emitted SOL source is validated against a strict regex allowlist
+before emission. Values that fail validation produce
+`YamlFlowError::InvalidCondition` or `YamlFlowError::InvalidScalar`
+rather than a compile error at the SOL layer — operators see the
+violation at the YAML step that caused it.
+
+| Field | Allowed characters |
+|---|---|
+| `if.condition` | `A-Za-z0-9_.\s()!=<>&\|` — SOL boolean predicate chars only |
+| `let.value` when `type: int` | `-?[0-9]+` |
+| `let.value` when `type: float` | `-?[0-9]+(\.[0-9]+)?` |
+| `let.value` when `type: bool` | `true` or `false` only |
+| `let.value` when `type: list`/`map` (string form) | `[\[\]{}:,\s"A-Za-z0-9_.\-]+` |
+
+Additionally, any string value containing a `"` character is rejected
+with a Semantic error (SOL has no string escape sequences — SIMP-016).
+
 ## Errors
 
 Four categories, each surfaced with an actionable message
@@ -416,6 +448,10 @@ and the exact source position of the offending node:
 | `YamlFlowError::Semantic` | YAML parses but violates the schema — unknown step name, missing required field, conflicting variable types, `catch.kind` outside the recognised set, `let.type` outside the supported scalar set, value shape mismatch, etc. | Real line + column of the offending node, from the saphyr-annotated tree. **Nested errors report the nested node's line, not the outer step.** |
 | `YamlFlowError::Lower` | The YAML frontend emitted SOL the compiler rejected. This is a frontend bug; the error includes the SOL error, the lowered source, AND the path of the last successfully-lowered step so the bug can be reproduced. | Step path of the last lowered step. |
 | `YamlFlowError::Io` | File read failure (only via `compile_path`). Carries the file path the bridge / CLI tried to open. | n/a (file-level). |
+| `YamlFlowError::InvalidCondition` | `if.condition` contains characters outside the allowlist. | Offending step node. |
+| `YamlFlowError::InvalidScalar` | A scalar `value` (int/float/bool/collection) contains characters outside its allowlist, or a string contains `"`. | Offending `let` node. |
+| `YamlFlowError::FileTooLarge` | File exceeds 10 MiB. | File-level. |
+| `YamlFlowError::NestingTooDeep` | Flow nesting depth exceeds 20. | Offending node. |
 
 A typical Semantic error message:
 

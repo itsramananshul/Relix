@@ -10,7 +10,7 @@ The workflow engine lives in `crates/relix-runtime/src/workflow/`. Workflow file
 relix workflow list                                       # show the catalog
 relix workflow validate examples/workflows/chat-then-summarize.workflow
 relix workflow run chat-then-summarize --input "Why is the sky blue?"
-relix workflow trace <execution-id>                       # look up a past run
+relix workflow status <execution-id>                      # look up a past run
 ```
 
 ## File format
@@ -84,13 +84,18 @@ Two edges from the same source — one `success`, one `failure` — give classic
 ### Failure handling
 A step whose dispatch returned ERR routes along the matching `failure` (or `always`) edge if one exists. The error cause is bound to `{{<step>.output}}` so the failure handler can include it. A failed step with no matching failure or always edge stops the workflow and produces `WorkflowResult { status: failed }` with the agent name and the cause in the result string.
 
+### Cooperative cancellation
+
+Execution can be stopped mid-run via a `CancellationFlag`. The flag is checked before each dispatch (after a `yield_now()` so event-drain tasks can process the preceding step's completion). When the flag fires, the executor records a `Cancelled` event and returns `ExecutionStatus::Cancelled` with the reason string. The flag is wired by the verification harness when a required-step check fails; callers can also pass one explicitly through `execute_with_cancellation`.
+
 ### Execution status
 
-| status            | meaning                                                                |
-|-------------------|------------------------------------------------------------------------|
-| `success`         | Every executed step succeeded and the final result resolved.           |
-| `partially_failed`| Workflow completed (failure handler recovered) but trace contains an err step. |
-| `failed`          | A step failed with no failure handler; workflow stopped.               |
+| status            | meaning                                                                             |
+|-------------------|-------------------------------------------------------------------------------------|
+| `success`         | Every executed step succeeded and the final result resolved.                        |
+| `partially_failed`| Workflow completed (failure handler recovered) but trace contains an err step.      |
+| `failed`          | A step failed with no failure handler; workflow stopped.                            |
+| `cancelled`       | A `CancellationFlag` was set mid-execution (e.g. by the verification harness).      |
 
 ## Validation
 
@@ -104,9 +109,23 @@ A step whose dispatch returned ERR routes along the matching `failure` (or `alwa
 
 Parse errors carry exact `(line, column)` positions; validation errors name the offending field, variable, or cycle path.
 
+## WorkflowStore security
+
+`WorkflowStore` applies three layers of defense before reading a file from disk:
+
+1. **Name validation** — `validate_name` rejects names that are empty, contain `/`, `\`, `..`, or a NUL byte, or resolve to anything other than a single normal path component. This catches drive-prefix attacks and other platform-specific edge cases the substring checks above might miss.
+2. **Canonicalization check** — after joining the validated name to the store directory, both paths are `canonicalize()`d; the resolved path must still start with the canonical store directory, blocking symlink escapes.
+3. **Size cap** — the file is `stat`-ed before opening; files over `MAX_WORKFLOW_BYTES` (4 MiB) are rejected with a `TooLarge` error without reading any bytes into memory.
+
+`StoreError::InvalidName` is returned for steps 1 and 2; `StoreError::TooLarge` for step 3. `workflow.reload` clears the in-memory cache so updated files on disk take effect without a coordinator restart.
+
+## Tenant isolation
+
+`WorkflowChronicle` attributes every finished execution to a `tenant_id`. `workflow.status` looks up the record with `get_for_tenant`, scoping the read to the verified caller tenant. The legacy `record()` / `get()` paths write and read the reserved `'default'` tenant.
+
 ## HTTP API
 
-The bridge exposes four endpoints at `/v1/workflows`:
+The bridge exposes five endpoints at `/v1/workflows`:
 
 | method + path                                       | purpose                              |
 |-----------------------------------------------------|--------------------------------------|
@@ -122,7 +141,7 @@ The bridge exposes four endpoints at `/v1/workflows`:
 { "name": "chat-then-summarize", "input": "Hi", "stream": false }
 ```
 
-When `stream: true`, the response is `text/event-stream` carrying live per-step events:
+When `stream: true`, the endpoint returns `text/event-stream` via the `workflow.run.stream` capability carrying live per-step events:
 
 | event name        | payload                                                   |
 |-------------------|-----------------------------------------------------------|
@@ -131,17 +150,20 @@ When `stream: true`, the response is `text/event-stream` carrying live per-step 
 | `step_completed`  | `{ agent, peer, capability, latency_ms, output }`         |
 | `step_failed`     | `{ agent, peer, capability, latency_ms, error }`          |
 | `finished`        | full execution record (same shape `workflow run` returns) |
+| `cancelled`       | `{ agent, reason }` — emitted when a `CancellationFlag` fires mid-run |
+
+`execution_id` in the `started` event is a 32-character hex string (16 random bytes). It is the key used by `workflow.status` to retrieve the persisted record.
 
 ## Capability surface
 
-The coordinator registers five capabilities the bridge forwards to:
+The coordinator registers six capabilities the bridge forwards to:
 
 - `workflow.run`        — unary execution; returns the full execution record.
-- `workflow.run.stream` — streaming variant emitting per-step JSON frames.
+- `workflow.run.stream` — streaming variant emitting per-step JSON frames over SSE.
 - `workflow.list`       — enumerate every workflow in the directory.
 - `workflow.status`     — fetch a past execution by id.
 - `workflow.validate`   — type-check a source string without touching the catalog.
-- `workflow.reload`     — drop the workflow-file cache so freshly-edited files pick up without a coordinator restart.
+- `workflow.reload`     — drop the workflow-file cache so freshly-edited `.workflow` files pick up without a coordinator restart.
 
 ## Persistence
 
@@ -156,12 +178,12 @@ agents:
   responder:
     peer: ai
     capability: ai.chat
-    input: "session|{{workflow.input}}|"
+    input: "{{workflow.input}}"
     output: responder
   summarizer:
     peer: ai
     capability: ai.chat
-    input: "session|Summarise: {{responder.output}}|"
+    input: "Summarise: {{responder.output}}"
     output: summary
 flow:
   start: responder

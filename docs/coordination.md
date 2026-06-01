@@ -1,5 +1,7 @@
 # Coordination
 
+_Version: 0.4.1_
+
 The Coordinator is the Relix peer that owns the **durable Task ledger**
 and is the home for everything multi-agent: task state, delegation,
 agent-to-agent messaging, approvals, and the cron scheduler. It runs
@@ -51,7 +53,7 @@ alias = "coordinator"
 ```
 
 - `POST /chat` → `task.create(title="chat: ...", flow_template="flows/chat_template.sol",
-  params_json={session_id, message})` → events `task.created` +
+  params_json={session_id, message})` → events `task.create` +
   `flow.started` → flow runs → event `task.completed`/`task.failed`
   + `task.update(status=completed|failed)`.
 - `POST /chat_with_tool` → same shape plus a pre-execution
@@ -102,14 +104,43 @@ file = "configs/policies/<run>.toml"
 [coordinator]
 db_path = "dev-data/<run>/tasks.db"
 max_list = 200
+recovery_scan = true        # default; set false for forensic investigation
+
+# Optional: background chronicle compaction
+# [coordinator.retention]
+# enabled = false
+# max_task_age_days = 30
+# max_events_per_task = 500
+# compact_interval_h = 24
+# max_passes_per_run = 10
+
+# Optional: AI peer for drift embedding / session search
+# [coordinator.ai_peer]
+# addr = "/ip4/127.0.0.1/tcp/19712"
+# alias = "ai"
+# deadline_secs = 10
 
 [peers]
 ```
 
-Defaults (`max_list = 200`, schema in
-`crates/relix-runtime/src/nodes/coordinator/mod.rs::init_schema`) are
-fine for the local mesh. The Coordinator also serves `node.health` and
-`node.manifest` like every other controller.
+Full `[coordinator]` config reference:
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `db_path` | PathBuf | **required** | SQLite file; parent dirs created on first start |
+| `max_list` | usize | `200` | Hard ceiling for `task.list` + event queries |
+| `recovery_scan` | bool | `true` | On startup, flips overdue `running` tasks to `interrupted`; set `false` for forensic investigation |
+| `retention.enabled` | bool | `false` | Master switch for background chronicle retention loop |
+| `retention.max_task_age_days` | u32 | `30` | Age cutoff in days for event deletion candidates |
+| `retention.max_events_per_task` | u32 | `500` | Per-task event count cap (0 = disabled) |
+| `retention.compact_interval_h` | u32 | `24` | Background loop interval in hours |
+| `retention.max_passes_per_run` | u32 | `10` | Max bounded-delete passes per loop run |
+| `ai_peer.addr` | String | (none) | libp2p multiaddr of AI peer for drift embedding / session search |
+| `ai_peer.alias` | String | `"ai"` | Mesh alias for outbound AI calls |
+| `ai_peer.deadline_secs` | i64 | `10` | Per-call deadline |
+
+The Coordinator also serves `node.health` and `node.manifest` like every
+other controller.
 
 Pass `-NoCoordinator` to the bringup script to skip the Coordinator
 entirely — the bridge stays operational; the only loss is that
@@ -119,21 +150,112 @@ nothing remembers a chat across bridge restarts.
 
 All wire formats are pipe-delimited UTF-8 strings (alpha SIMP-016).
 Empty fields are valid — skip a field by leaving its slot empty.
+The coordinator registers 37+ task capabilities plus the delegate,
+cron, routing, messaging, and agent sub-surfaces listed below.
+
+### Task ledger
 
 | Method | Arg | Returns |
 |---|---|---|
-| `task.create` | `title\|flow_template\|params_json\|owner_subject_id` (owner defaults to caller's `subject_id`) | `<task_id>` (32 hex chars) |
-| `task.update` | `task_id\|status\|result\|flow_id\|flow_log_path\|error_kind\|error_cause` | `ok\n` |
-| `task.event`  | `task_id\|event_type\|payload` | `<event_id>` (integer) |
-| `task.get`    | `task_id` | multi-line `key=value` summary + `events:` JSON |
-| `task.list`   | `` or `<limit>` (default 50, max from config) | one `task_id\tstatus\ttitle\n` per line |
+| `task.create` | `title\|flow_template\|params_json\|owner_subject_id\|retry_policy\|max_retries\|max_runtime_secs` | `<task_id>` (32 hex) |
+| `task.update` | `task_id\|status\|result\|flow_id\|flow_log_path\|error_kind\|error_cause\|failure_class\|trace_id` | `ok\n` |
+| `task.event` | `task_id\|event_type\|payload` | `<event_id>` (integer) |
+| `task.get` | `task_id` | multi-line `key=value` summary + `events:` JSON array |
+| `task.list` | `` or `limit\|offset\|status` (default limit 50) | `task_id\tstatus\ttitle\n` per row |
+| `task.list_cursor` | `` or `limit\|status\|cursor` (cursor = `<updated_at>:<task_id>`) | rows + `next_cursor=<value>\n` |
+| `task.count` | `` or `<status>` | `count=N\n` |
+| `task.events` | `task_id\|after_id\|limit\|type\|order` | JSON event per line |
+| `task.recover` | (empty) | `<task_id>\n` per recovered + `recovered=N\n` |
+| `task.attempts` | `task_id` | tab-delimited attempt rows |
+| `task.retry` | `task_id` | `accepted attempt=N of_budget=M\n` / `exhausted` / INVALID_ARGS |
+| `task.replay` | `task_id` | new `task_id\n` (clones task; adds `retried_from` edge) |
+| `task.export` | `task_id` | JSON `{schema_version:1, exported_at, task_id, task, attempts}` |
+| `task.compact_events` | `max_age_secs\|mode` (mode default `dry-run`) | JSON dry-run report |
+| `task.edges` | `task_id` | tab-delimited edge rows |
+| `task.recent_edges` | `since_edge_id\|limit` | same shape, newest-first |
+| `task.note` | `task_id\|note_text` | `event_id=N\n` |
+| `task.mark_investigation` | `task_id\|1or0\|reason` | `ok\n` |
+| `task.pause` | `task_id\|reason` | `ok prior_status=<status>\n` |
+| `task.resume` | `task_id` | `ok prior_status=<status>\n` |
+| `task.freeze` | `task_id\|reason` | `ok prior_status=<status>\n` |
+| `task.unfreeze` | `task_id` | `ok prior_status=<status>\n` |
+| `task.lineage` | `task_id\|max_depth` | JSON lineage graph |
+| `task.subtree_metrics` | `task_id\|max_depth` | JSON metrics object |
+| `task.stuck` | `threshold_secs` | JSON array of stuck-task rows |
+| `task.todo_set` | `task_id\|text1\ntext2\n...` | tab-delimited todo rows + `count=N\n` |
+| `task.todo_list` | `task_id` | same shape |
+| `task.todo_update` | `task_id\|todo_id\|status` (open/done) | JSON TodoItem |
+| `task.interruption_check` | `task_id` | `status\npause_generation\nfreeze_generation\n` |
+| `task.observe_interruption` | `task_id\|type\|generation_observed\|observer_subject_id` | `event_id=N\n` |
+| `task.record_spawned` | `parent\|child\|branch_id\|context_id\|producer` | `edge_id=N event_id=M\n` |
+| `task.record_delegated` | `parent\|child\|reason\|producer` | `edge_id=N event_id=M\n` |
+| `task.record_awaited` | `parent\|awaited\|reason\|producer` | `edge_id=N event_id=M\n` |
+| `task.transition_check` | `task_id\|target_status` | `allowed=true/false\ncurrent_status=...\n` |
+| `task.recent_events` | `since_event_id\|limit\|event_type` | JSON array with `task_id` per event |
+| `task.session_export` | `session_id\|limit` | JSON array of ChatTurn |
+| `task.session_search` | `subject_id\|query\|limit` | JSON array of SessionSearchHit |
 
-`task.update` preserves fields you omit — the empty slot means "don't
-change this column". `status` is opaque to the Coordinator; the bridge
-uses the canonical `pending` / `running` / `completed` / `failed` /
-`abandoned` strings but the Coordinator itself does not enforce a state
-machine. That keeps the surface minimal; tighter state-machine
-enforcement is a Gate 2 item.
+`task.create` trailing fields (`retry_policy`, `max_retries`, `max_runtime_secs`) are optional
+— omitting them keeps earlier callers working. `task.update` trailing fields (`failure_class`,
+`trace_id`) are also optional. `task.update` preserves any field you leave empty.
+
+The Coordinator enforces a state machine on `status` via
+`is_allowed_transition(from, to)`. Canonical status vocabulary:
+`pending` → `running` → `completed` | `failed` | `cancelled`;
+also `retrying`, `interrupted`, `awaiting_input`, `paused`, `frozen`.
+
+### Delegation
+
+| Method | Arg | Returns |
+|---|---|---|
+| `delegate.spawn` | `parent_task_id\|goal\|context\|target_subject_id\|depth` | `<child_task_id>\n` |
+| `delegate.result` | `<child_task_id>` | `status\|result_preview\|completed_at\n` (`-1` if not terminal) |
+| `delegate.cancel` | `<child_task_id>\|<reason>` | `ok\n` |
+| `delegate.list` | `<parent_task_id>` | `<child_id>\t<goal>\t<status>\t<created_at>\n` per row + `count=N\n` |
+
+### Agent employee model
+
+| Method | Arg | Returns |
+|---|---|---|
+| `agent.create` | `name\|role\|title\|department\|team\|created_by\|subject_id\|risk_ceiling` | `<agent_id>\n` |
+| `agent.get` | `agent_id` | pipe-delimited KV |
+| `agent.list` | `` or `subject_id` | tab-delimited rows + `count=N\n` |
+| `agent.update` | `agent_id\|field\|value` | `ok\n` |
+| `agent.delete` | `agent_id` | `ok\n` |
+| `agent.standing_approval.create` | ... | `<standing_id>\n` |
+| `agent.standing_approval.list` | `agent_id` | rows + `count=N\n` |
+| `agent.standing_approval.revoke` | `standing_id` | `ok\n` |
+| `coord.approval.pending` | (empty) | JSON list |
+| `coord.approval.decide` | `approval_id\|decision\|reason` | `ok\n` (+ optional `approval_token`) |
+| `coord.approval.poll` | `approval_id` | status row |
+
+### Cron scheduler
+
+| Method | Arg | Returns |
+|---|---|---|
+| `cron.create` | `name\|schedule\|flow_template\|prompt\|subject_id` | `<job_id>\n` |
+| `cron.list` | `` or `subject_id` | summary rows |
+| `cron.get` | `job_id` | pipe-delimited KV |
+| `cron.update` | `job_id\|field\|value` (field ∈ enabled/schedule/prompt) | `ok\n` |
+| `cron.delete` | `job_id` | `ok\n` |
+| `cron.trigger` | `job_id` | `<task_id>\n` or `skipped previous_task_id=...\n` |
+
+### Routing
+
+| Method | Arg | Returns |
+|---|---|---|
+| `routing.resolve` | JSON InboundMessage | JSON `{decision, rules_evaluated}` |
+| `routing.list` | (none) | JSON array of RoutingRule |
+
+### Agent-to-agent messaging
+
+| Method | Arg | Returns |
+|---|---|---|
+| `msg.send` | `from\|to\|subject\|body\|thread_id\|reply_to\|ttl_secs\|origin_surface` | `<message_id>\n` |
+| `msg.inbox` | `subject_id\|limit\|include_read\|since_message_id` | tab rows + `count=N\n` |
+| `msg.read` | `message_id\|reader_subject_id` | `ok\n` |
+| `msg.thread` | `thread_id\|subject_id` | tab rows (oldest-first) + `count=N\n` |
+| `msg.delete` | `message_id\|subject_id` | `ok\n` |
 
 ## CLI
 
@@ -171,18 +293,34 @@ survive intact, identical timestamps and payload. The CLI calls during
 the outage time out cleanly; the next call after restart returns the
 preserved record.
 
-## What restarts do NOT recover
+## What restarts do and do NOT recover
 
-The Coordinator is a **task ledger**, not a resume engine:
+The Coordinator is a **task ledger**, not a resume engine.
+
+**What the startup recovery scan DOES:** When `[coordinator]
+recovery_scan = true` (the default), the Coordinator runs
+`recover_interrupted(now_secs)` at boot. It finds every task whose
+`status = 'running'` AND `max_runtime_secs` is set AND the deadline
+(`started_at + max_runtime_secs`) has passed, and flips each one to
+`interrupted` with `last_failure_class = 'timeout'`. The scan emits
+`task.interrupted`, `task.attempt_finished`, and `task.terminal_summary`
+chronicle events. See [`interruption-semantics.md`](interruption-semantics.md)
+for the full contract.
+
+**What it does NOT do:**
 
 - A flow that was mid-execution when the bridge died is **not** resumed
-  automatically. The bridge does not know how to pick up a half-finished
-  SOL flow because the alpha SOL VM does not yield (SIMP-001).
-- A task left in status `running` after a Coordinator restart stays in
-  `running` until an operator updates it. There is no automatic
-  "abandoned" sweep. Sweep + retry is an operator gesture, not a
-  background daemon. See [`replay-model.md`](replay-model.md) for the
-  honest framing of what this gives you and what it doesn't.
+  automatically. The bridge cannot pick up a half-finished SOL flow.
+- Tasks without `max_runtime_secs` set are left in `running` — the
+  scan cannot distinguish "slow but alive" from "dead executor" without
+  a timeout boundary. Set `max_runtime_secs` to get automatic sweep.
+- `interrupted` tasks are NOT re-executed. The operator (or a future
+  bounded-retry primitive) decides what to do next.
+
+Set `[coordinator] recovery_scan = false` to preserve stale `running`
+rows intact for forensic investigation. The on-demand `task.recover`
+capability still works regardless. See [`replay-model.md`](replay-model.md)
+for the honest framing of what this gives you and what it doesn't.
 
 ## Trust + audit
 
@@ -202,101 +340,32 @@ The Coordinator inherits Relix's per-peer admission posture verbatim:
 
 ## Delegation
 
-One agent spawns another as a subtask. Builds on the same task
-ledger — the child is a full first-class task with
-`origin_surface = "delegation"` — and is enforced through a
-hard depth cap.
+One agent spawns another as a subtask. The wire cap table is in the
+Capabilities section above; the full design — executor loop, depth cap,
+hardening, and examples — is in [`delegation.md`](delegation.md).
 
-| Method            | Arg                                                              | Returns |
-|-------------------|------------------------------------------------------------------|---------|
-| `delegate.spawn`  | `parent_task_id\|goal\|context\|target_subject_id\|depth`        | `<child_task_id>\n` |
-| `delegate.result` | `<child_task_id>`                                                | `status\|result_preview\|completed_at\n` (`-1` if not terminal) |
-| `delegate.cancel` | `<child_task_id>\|<reason>`                                      | `ok\n` |
-| `delegate.list`   | `<parent_task_id>`                                               | `<child_task_id>\t<goal_preview>\t<status>\t<created_at>\n` per row + `count=N\n` |
-
-`delegate.spawn` writes a `delegated_to` edge from parent to
-child, flips the parent to `awaiting_input`, and writes a
-`task.awaiting` chronicle event on the parent. A background
-executor on the coordinator polls for `origin_surface =
-"delegation"` + `status = "pending"` children, dispatches
-`ai.chat` with the goal + context, flips the child to
-`completed` / `failed`, and writes a `delegate.child_completed`
-chronicle event on the parent that flips it back to `running`.
-
-Depth is capped two ways: the caller's `depth` integer is
-rejected if `>= max_depth` (default 3), AND an independent
-walk of the `delegated_to` ancestor chain has to report a
-depth below the cap. A caller that under-reports `depth` still
-gets caught by the second check.
-
-HTTP surface:
-
-```
-POST /v1/delegate/spawn                     { parent_task_id, goal, context?, target_subject_id?, depth }
-GET  /v1/delegate/result/:child_task_id
-POST /v1/delegate/cancel/:child_task_id     { reason? }
-GET  /v1/delegate/list/:parent_task_id
-```
-
-Source: `crates/relix-runtime/src/nodes/coordinator/delegate/`
-(`mod.rs` registers the four capabilities; `handlers.rs` owns
-the wire contracts; `executor.rs` runs the dispatcher loop).
+Source: `crates/relix-runtime/src/nodes/coordinator/delegate/`.
 
 ## Agent-to-agent messaging
 
-Direct point-to-point channel between two agents that lives
-independently of the task ledger. Distinct from delegation:
-delegation creates a child task and the parent waits on its
-outcome; messaging is a mail drop — sender posts, recipient
-reads + replies, no task is created. A single
-`msg.sent` chronicle event lands on the coordinator's
-bookkeeping task (`msg-bookkeeping-system`) per send so audit
-records from / to / thread without storing the body.
+Direct point-to-point channel between two agents. The wire cap table
+is in the Capabilities section above. Lifecycle: `delivered → read →
+expired`. Soft-delete sets `status = expired`. `ttl_secs = 0` means no
+auto-expire; non-zero sets the deadline relative to `sent_at`.
 
-| Method       | Arg                                                                                | Returns |
-|--------------|------------------------------------------------------------------------------------|---------|
-| `msg.send`   | `from\|to\|subject\|body\|thread_id\|reply_to\|ttl_secs\|origin_surface`           | `<message_id>\n` |
-| `msg.inbox`  | `subject_id\|limit\|include_read\|since_message_id`                                | tab rows + `count=N\n` |
-| `msg.read`   | `message_id\|reader_subject_id`                                                    | `ok\n` |
-| `msg.thread` | `thread_id\|subject_id`                                                            | tab rows (oldest-first) + `count=N\n` |
-| `msg.delete` | `message_id\|subject_id`                                                           | `ok\n` |
+HTTP surface: see [`messaging.md`](messaging.md).
 
-Lifecycle: `delivered → read → expired`. Soft-delete writes
-`status = expired` so the row stays visible to audit but
-disappears from operator inboxes. `ttl_secs = 0` means "no
-auto-expire"; a non-zero value sets the auto-expire deadline
-relative to `sent_at`.
-
-HTTP surface:
-
-```
-POST   /v1/messages                          { from, to, subject, body, thread_id?, reply_to?, ttl_secs?, origin_surface }
-GET    /v1/messages/inbox/:subject_id        ?limit=&include_read=&since=
-POST   /v1/messages/:message_id/read         { reader_subject_id }
-GET    /v1/messages/thread/:thread_id        ?subject_id=
-DELETE /v1/messages/:message_id              { subject_id }
-```
-
-Source: `crates/relix-runtime/src/nodes/coordinator/messaging/`
-(handlers + `MessageStore` SQLite table).
+Source: `crates/relix-runtime/src/nodes/coordinator/messaging/`.
 
 ## Approvals
 
-A capability invocation can be gated on an explicit operator
-decision. The coordinator owns the pending-approvals queue;
-the bridge proxies the read + decide surface.
-
-| Method                              | Arg                                | Returns |
-|-------------------------------------|------------------------------------|---------|
-| `coord.approval.pending`            | (empty)                            | JSON list of pending approvals |
-| `coord.approval.decide`             | `<approval_id>\|<approve\|deny>\|<reason>` | `ok\n` |
-| `agent.standing_approval.create`    | `<agent_id>\|<method>\|<ttl_secs>` | `<standing_id>\n` |
-| `agent.standing_approval.list`      | `<agent_id>`                       | rows + `count=N\n` |
-| `agent.standing_approval.revoke`    | `<standing_id>`                    | `ok\n` |
-
-A standing approval pre-authorises a `(subject, method)` pair
-for `ttl_secs`; pending approvals are the one-off
-operator-decision queue.
+A capability invocation can be gated on an explicit operator decision.
+The coordinator owns the pending-approvals queue. The wire caps are in
+the Capabilities section above. Approval tokens are Ed25519-signed
+structured objects — see [`approval-tokens.md`](approval-tokens.md)
+for the full token format. A background `run_approval_expire_loop`
+ticks once per minute, sweeps expired approvals, and transitions linked
+tasks to `failed` with `error_cause = "approval_timeout"`.
 
 HTTP surface:
 
@@ -304,17 +373,12 @@ HTTP surface:
 GET    /v1/approvals                                       — pending list
 POST   /v1/approvals/:approval_id/decide                   { decision, reason? }
 GET    /v1/agents/:agent_id/standing-approvals
-POST   /v1/agents/:agent_id/standing-approvals             { method, ttl_secs }
+POST   /v1/agents/:agent_id/standing-approvals             { category, expires_at, note, path_glob? }
 DELETE /v1/standing-approvals/:standing_id
 ```
 
-A background `run_approval_expire_loop` ticks once per minute,
-sweeps expired approvals, and writes the deny outcome to the
-chronicle.
-
 Source: `crates/relix-runtime/src/nodes/coordinator/agent/`
-plus the `coord.approval.*` registrations in
-`crates/relix-runtime/src/controller_runtime.rs`.
+plus `crates/relix-runtime/src/controller_runtime.rs`.
 
 ## Scheduler
 
@@ -324,18 +388,57 @@ capabilities are `cron.create`, `cron.list`, `cron.get`,
 is `/v1/cron/jobs[/...]`. See [`scheduler.md`](scheduler.md)
 for the full design.
 
+## Anti-thrash detection
+
+When `task.update` carries a `failure_class` and that class matches the
+previous `last_failure_class` consecutively for
+`ANTI_THRASH_THRESHOLD = 3` times, the Coordinator automatically marks
+the task for investigation (`investigation_marked_at`,
+`investigation_reason = "auto-marked: N consecutive failures with
+class=X"`) and emits both `task.thrash_detected` and
+`task.investigation_marked` chronicle events in the same transaction.
+
+This is atomic with the update — a task that crosses the threshold on
+the third failure is marked in the same write. The investigation mark
+can be cleared by an operator via `task.mark_investigation <id>|0`.
+
+## Cooperative pause and freeze
+
+Two independent interruption signals:
+
+- **Pause** (`task.pause` / `task.resume`): sets `status = paused` /
+  `pending`, bumps `pause_generation`, emits `task.pause_requested` /
+  `task.resume_requested`. Only available from
+  `pending`, `running`, `retrying` statuses.
+- **Freeze** (`task.freeze` / `task.unfreeze`): sets `status = frozen`
+  / `pending`, stamps `frozen_at`, bumps `freeze_generation`, emits
+  `task.freeze_requested` / `task.unfreeze_requested`. Available from
+  `pending`, `running`, `retrying`, `paused`, `awaiting_input`.
+
+Runtime workers observe these via `task.interruption_check` (reads
+`pause_generation` + `freeze_generation` atomically) and acknowledge
+via `task.observe_interruption` (emits `task.pause_observed` /
+`task.resume_observed` / `task.freeze_propagated`).
+
+The 8 chronicle events for pause/freeze are:
+`task.pause_requested`, `task.resume_requested`, `task.pause_observed`,
+`task.resume_observed`, `task.freeze_requested`, `task.unfreeze_requested`,
+`task.freeze_propagated`. The generation counters and `frozen_at` /
+`frozen_reason` columns are stored in the `tasks` table.
+
+**Note:** No runtime worker currently polls these signals — the
+scaffolding is complete but the cooperative yield loop is a follow-up.
+
 ## Open / NOT in scope
 
 See [`current-limitations.md`](current-limitations.md). Specifically
 the Coordinator does **not** yet:
 
-- Track multiple attempts per task as first-class records (the
-  `latest_flow_id` / `latest_flow_log_path` are *latest*-only; previous
-  attempts live only in the flow logs they point to).
-- Enforce a state-machine on `status`.
-- Auto-detect crashed executors.
+- Auto-detect crashed executors without `max_runtime_secs` set.
+- Re-launch tasks after interrupt — `interrupted` is a terminal observation,
+  not a re-queue signal.
 - Reconcile across multiple Coordinator instances (single-instance only
-  in the alpha; leadership election is Gate 2).
+  in alpha; leadership election is Gate 2).
 
 ## See also
 

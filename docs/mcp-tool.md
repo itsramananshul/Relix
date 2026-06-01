@@ -5,6 +5,9 @@ Model Context Protocol plus a **live stdio runtime**
 (PH-MCP-RUNTIME, D-009 closed). HTTP transport still returns
 `RuntimeNotConnected` until the HTTP client lands.
 
+Relix targets **MCP protocol version `2024-11-05`** (sent in the
+`initialize` request's `protocolVersion` field).
+
 ## Honesty contract
 
 > If actual MCP execution requires a later runtime decision,
@@ -81,6 +84,12 @@ Validation enforced at startup:
 When `[tool.mcp]` is absent the capability family is NOT
 registered.
 
+**Boot-time HTTP discovery:** when the tool node starts and `[tool.mcp]`
+is present, HTTP-transport servers are probed via a non-blocking
+`tokio::spawn` call (`McpRegistry::discover_http_tools`). This does
+**not** block tool node startup — a probe failure is logged but does not
+prevent the node from accepting other requests.
+
 ## Why ship the registry before the client?
 
 1. **Operator visibility**: dashboard + CLI show declared
@@ -110,8 +119,10 @@ These land in the live-client milestone, not this scaffold.
 
 ## Future milestones
 
-- **CW5-A**: stdio MCP client. Spawn the configured program,
-  speak MCP over stdin/stdout, project discovered tools.
+- **CW5-A**: stdio MCP client — **shipped** (PH-MCP-RUNTIME, D-009
+  closed). `tool.mcp.invoke` against `stdio` transport servers now
+  spawns the subprocess, runs the MCP `initialize` handshake, and
+  dispatches `tools/call` live.
 - **CW5-B**: HTTP MCP client. POST against the configured URL.
 - **CW5-C**: live capability discovery — replace the
   `declared_tools` static cache with what the server actually

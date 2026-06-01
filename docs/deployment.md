@@ -47,12 +47,12 @@ the `peers.toml` file referenced by each controller's config
 
 To stand up:
 
-1. **Mint a shared org root.** `relix-cli identity init-org`
-   on any machine; copy the resulting `<run>-org-root.pub` to
-   every other host.
+1. **Mint a shared org root.** `relix-cli identity init-org
+   --root-key <PATH> --org <LABEL>` on an isolated machine;
+   copy the resulting `<run>-org-root.pub` to every other host.
 2. **Per host, generate an identity bundle** signed by the
-   shared org root: `relix-cli identity mint --org-root ...
-   --node-name memory-1 --groups core --out
+   shared org root: `relix-cli identity mint --root-key
+   <PATH> --name memory-1 --groups core --out
    dev-keys/memory-1.aic`.
 3. **Edit each controller TOML** with that host's listen
    address (replace `127.0.0.1` with the bind address) and
@@ -85,11 +85,17 @@ pull-point table you can drop into a runbook.
 
 #### Mandatory hardening
 
-1. **Reverse proxy in front of the bridge.** The bridge has no
-   HTTP auth ([`bridge-invariants.md`](bridge-invariants.md)).
-   Put nginx / Caddy / a cloud load balancer in front with
-   TLS + auth (mTLS, OAuth, basic auth — whatever your
-   environment requires).
+1. **Reverse proxy in front of the bridge.** The bridge
+   enforces bearer-token authentication on all non-public
+   routes (token stored at `~/.relix/bridge-token`; CSRF
+   guard compares Origin against the listen address; rate
+   limiting per principal). However, the bearer token
+   provides loopback-scoped security only — it is not a
+   substitute for a reverse proxy with TLS + external auth
+   when the bridge must be reachable beyond loopback. Put
+   nginx / Caddy / a cloud load balancer in front with TLS
+   + auth (mTLS, OAuth, basic auth — whatever your
+   environment requires) for any internet-facing deployment.
 2. **Bind the bridge to loopback only.** `[bridge] listen_addr
    = "127.0.0.1:19791"`. The reverse proxy reaches it over
    the loopback interface.
@@ -155,6 +161,29 @@ executor). Plan for:
 
 A `ulimit` / cgroup wrapper per node is the standard answer
 until per-tenant caps land at a future gate.
+
+## Required environment variables for production
+
+Before running the coordinator in production with approval tokens or
+credential vault, two environment variables **must** be set. Both are
+fail-closed: absent or invalid values cause every affected call to be
+denied.
+
+| Variable | Required when | Format | Effect if absent |
+|---|---|---|---|
+| `RELIX_APPROVAL_SIGNING_KEY` | Coordinator issues approval tokens | 64 hex chars (32 raw bytes, Ed25519 seed) | Every token-bearing call fails: `approval_token_missing_key` |
+| `RELIX_CREDENTIAL_KEY` | `[credentials] enabled = true` | Arbitrary secret string (default `v1` vault key) | Vault refuses to open: `NoActiveKeyVersion` |
+
+Generate a signing key seed (bash):
+
+```bash
+openssl rand -hex 32
+# -> 64-char hex string; export as RELIX_APPROVAL_SIGNING_KEY
+```
+
+The bridge bearer token (`~/.relix/bridge-token`) is auto-generated
+at first boot — no manual step needed. Expose it to HTTP clients via
+your reverse-proxy auth layer rather than hard-coding it anywhere.
 
 ## Topology
 

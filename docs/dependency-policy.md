@@ -13,12 +13,12 @@ serde.workspace         = true
 tokio.workspace         = true
 ```
 
-Internal crates carry an explicit `version = "0.1.0"` in the workspace declaration so cargo-deny does not flag them as wildcard dependencies:
+Internal crates carry an explicit `version` (matching the workspace version, currently `0.4.1`) in the workspace declaration so cargo-deny does not flag them as wildcard dependencies:
 
 ```toml
 [workspace.dependencies]
-relix-core    = { path = "crates/relix-core",    version = "0.1.0" }
-relix-runtime = { path = "crates/relix-runtime", version = "0.1.0" }
+relix-core    = { path = "crates/relix-core",    version = "0.4.1" }
+relix-runtime = { path = "crates/relix-runtime", version = "0.4.1" }
 ```
 
 **Rule:** member crates never use bare `path = "..."` for internal deps. The workspace is the source of truth for versions.

@@ -2,6 +2,25 @@
 
 W2-008g — operator walkthrough for containerized deploys.
 
+## Docker and Qdrant in the setup wizard
+
+`relix setup` checks Docker availability at startup via
+`docker info`. If Docker is not running when you choose
+**"with memory"** (Qdrant) during setup, the wizard exits
+with an actionable message — start Docker and re-run
+`relix setup`.
+
+Qdrant is installed by `relix install --fix` using:
+
+```bash
+docker run -d --name relix-qdrant \
+    -p 6333:6333 -p 6334:6334 qdrant/qdrant
+```
+
+The **"without memory"** option (the default) skips Qdrant
+entirely and runs without vector memory. You can add memory
+later by re-running `relix setup` and choosing option `[1]`.
+
 The repo ships a multi-stage `Dockerfile` at the workspace
 root that builds `relix-controller`, `relix-web-bridge`,
 and `relix-cli` and packages them into a slim Debian
@@ -108,6 +127,11 @@ ownership.
   k8s manifests using this image as the base.
 - **Production-grade hardening**: the image runs as a
   non-root user, but doesn't include seccomp / AppArmor
-  profiles. The bridge has no auth at the HTTP layer
-  (see `docs/bridge-invariants.md`); put a reverse proxy
-  with auth in front before exposing beyond loopback.
+  profiles. The bridge enforces bearer-token auth on all
+  non-public routes, but for internet-facing deployments you
+  still need a reverse proxy with TLS + external auth in front
+  (see `docs/deployment.md` and `docs/bridge-invariants.md`).
+  The bridge bearer token is stored at `~/.relix/bridge-token`
+  inside the container; mount a persistent volume or read it
+  from the container logs on first start to use it from
+  external clients.

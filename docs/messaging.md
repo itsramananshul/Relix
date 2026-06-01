@@ -6,6 +6,11 @@ created per message; the audit trail is one `msg.sent`
 chronicle event on a dedicated bookkeeping task. Bodies stay
 out of the chronicle.
 
+> This document covers the **coordinator `msg.*` capability** —
+> agent-to-agent signalling inside the mesh. For the email
+> **channel node** that watches an IMAP inbox and sends SMTP
+> replies, see [channels/email.md](channels/email.md).
+
 ## Why this exists separately from delegation
 
 Both are agent-to-agent primitives, but they answer different

@@ -1,5 +1,7 @@
 # Multi-node bringup
 
+**Version: 0.4.1**
+
 Concrete recipes for running the Relix mesh across more than one
 machine. The single-host quickstart in
 [`getting-started.md`](getting-started.md) is the right starting
@@ -196,6 +198,15 @@ callers it should see.
 For (a), see the policy used by `scripts/relix-mesh-up.sh`.
 For (b), every peer's policy must include `node.health` and
 `node.manifest` for every caller that will discover it.
+
+**Wire protocols used in this topology:**
+- Unary RPC: `/relix/rpc/1` (libp2p `request_response`, CBOR)
+- Streaming: `/relix/rpc/stream/1` (libp2p stream, length-prefixed CBOR frames)
+- Manifest responses are fully Ed25519-signed `SignedManifest` envelopes.
+  The bridge pins each peer's signing key via TOFU on first contact and
+  rejects manifests with a different key on subsequent refreshes. TOFU
+  pins are in-memory; a bridge restart clears them and re-pins from the
+  first received manifest.
 
 ## Identity distribution
 

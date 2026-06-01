@@ -64,7 +64,7 @@ Both installers do the same four things:
    pick provider, paste API key, tick channels, confirm.
 4. Save your choices to `~/.relix/config.toml`.
 
-Set `RELIX_VERSION=v0.1.1` to pin a specific release.
+Set `RELIX_VERSION=v0.4.1` to pin a specific release.
 
 ## Quick start
 
@@ -116,6 +116,40 @@ config reference, including the `[ai.memory_peer]` knobs for
 automatic conversation-history injection and optional RAG over
 the vector store.
 
+## CLI overview
+
+`relix` is the unified operator CLI. Key subcommands:
+
+| Subcommand | What it does |
+|---|---|
+| `boot` / `stop` / `status` | Start / stop / inspect the local mesh |
+| `setup` | Re-run the interactive wizard (provider, API key, channels) |
+| `doctor` | Bridge health check; exits 1 on any FAIL |
+| `update` | Self-update to the latest GitHub release |
+| `identity` | Org keypair generation, bundle minting, session tokens |
+| `ping` | Raw libp2p health check against any peer |
+| `task` | Coordinator Task ledger — create, list, get, watch, retry, export |
+| `ops` | Operator snapshot surface — dispatch stats, policy simulate, agent/cron/delegate/msg surfaces |
+| `workflow` | Multi-agent workflow engine — list, run, validate, trace |
+| `planning` | Planner + critic pipeline — plan, search, validate |
+| `metrics` | Agent performance metrics — summary, alerts, cost, timeseries |
+| `observe` | Live TUI observability dashboard |
+| `pii` | PII detection stats and event history |
+| `training` | Training pipeline — list, show, export, delete |
+| `knowledge` | Knowledge-share — groups, share, broadcast, revoke |
+| `confidence` | Confidence scorer — policies, history, reset |
+| `credentials` | Credential vault — store, list, rotate, revoke, audit |
+| `approval` | Approval delivery inspector |
+| `email` | Email channel — send, status, test |
+| `execution` | Transactional gateway — rollback, transaction, evidence |
+| `flow-run` | Compile and run a `.sol` flow against a live mesh |
+| `router` | Router node control plane — network summary, peers, sessions |
+| `mcp` | MCP registry inspector |
+| `sessions` | Two-sink session debugger |
+| `models` | Provider + model inventory |
+
+Run `relix --help` or `relix <subcommand> --help` for flags.
+
 ## What's in the mesh
 
 | Node          | Default port | What it does                                                                |
@@ -123,11 +157,12 @@ the vector store.
 | `memory`      | 19711        | SQLite + FTS5 chat memory, vector embeddings, persistent agent memory       |
 | `ai`          | 19712        | `ai.chat` / `ai.embed` — `mock` / `openai` / `anthropic` / `openrouter` / `xai` / `gemini` / `local` |
 | `tool`        | 19713        | File system, web (SSRF-guarded), terminal, headless browser, MCP, PDF, text |
-| `coordinator` | 19714        | Durable task ledger, delegation, agent-to-agent messaging, cron scheduler   |
+| `coordinator` | 19714        | Durable task ledger, delegation, agent-to-agent messaging, cron scheduler, approval gate |
 | `telegram`    | 19715        | Telegram bot bridge (opt-in)                                                |
 | `discord`     | 19716        | Discord bot bridge (opt-in)                                                 |
 | `slack`       | 19717        | Slack bot bridge (opt-in)                                                   |
-| `plugin_host` | 19718        | Loads subprocess plugins over `relix-plugin-v1` (opt-in)                    |
+| `email`       | configurable | Email channel bridge — SMTP outbound + IMAP inbound (opt-in)               |
+| `plugin_host` | 19718        | Loads subprocess plugins over `relix-plugin-v1` (opt-in)                   |
 | `web-bridge`  | 19791        | HTTP front, OpenAI shim, dashboard                                          |
 
 Every node is its own OS process with its own libp2p identity. Every
@@ -149,17 +184,43 @@ signed audit record**. No bypass switch.
   and pause/resume/cancel/replay primitives. [docs/coordination.md](docs/coordination.md).
 - **Scheduled work.** `cron.create` accepts cron expressions, duration
   intervals, or one-shot timestamps. [docs/scheduler.md](docs/scheduler.md).
-- **Channels.** Telegram, Discord, and Slack bots that route through
-  the same SOL chat flow as the HTTP bridge and persist conversations
-  in `memory`. [docs/channels/index.md](docs/channels/index.md).
+- **Channels.** Telegram, Discord, Slack, and Email channels route
+  through the same SOL chat flow as the HTTP bridge and persist
+  conversations in `memory`. [docs/channels/index.md](docs/channels/index.md).
+- **Multi-agent planning.** The coordinator's planning pipeline
+  (planner + critic) decomposes natural-language specs into delegated
+  sub-tasks. Inspect via `relix planning plan --spec "..."`.
+- **Knowledge-share.** Agents can share observations peer-to-peer with
+  Ed25519-bound provenance. Source trust is configured per public key
+  (`[knowledge_trust]`).
+- **Training pipeline.** Interaction recording → PII anonymisation →
+  quality scoring → OpenAI-format export. Controlled via `[training]`.
+- **Confidence and reasoning.** Per-method rolling confidence scores
+  feed the judge + belief-state engine (`[confidence]`,
+  `relix confidence history`).
+- **Metrics, observability, and alerting.** SQLite metrics store, cost
+  tracking by model, OTLP export, configurable alert thresholds
+  (`[metrics]`, `relix metrics`, `relix observe`).
+- **Credentials vault.** Encrypted at-rest credential store; JIT
+  injection into tool args via `{{secret:<name>}}` placeholders
+  (`[credentials]`, `relix credentials`).
+- **Approval gate.** Per-method approval tokens (Ed25519-signed, TTL
+  30–86400 s). `RELIX_APPROVAL_SIGNING_KEY` env var required.
+  Standing approvals and out-of-band delivery channels supported.
+- **Mesh PII gate.** Inline regex scan of every inbound arg before
+  handler dispatch; actions: `block`, `redact` (default), `log_only`.
+  Writes a separate `pii_events.sqlite` chronicle (`[mesh_pii]`,
+  `relix pii`).
+- **Tenant isolation.** Per-tenant policy files + per-tenant SQLite
+  audit mirror. Query via `node.audit.tenant_recent`.
 - **Plugins.** Any language that can speak HTTP can ship a plugin —
   declared in `plugin.toml`, loaded as a subprocess by `plugin_host`,
   callable from SOL and `.sflow` like any built-in. Python (stdlib
   only) and Rust SDK examples ship. [docs/plugins.md](docs/plugins.md).
-- **Two flow languages.** `.sol` is a Rust-flavoured imperative DSL
-  for one-shot orchestration. `.sflow` is a line-oriented step DSL
-  with `try/catch`, loops, variables, and `${var}` interpolation for
-  longer recipes. [docs/sol.md](docs/sol.md).
+- **Three flow formats.** `.sol` is a Rust-flavoured imperative DSL;
+  `.sflow` is a line-oriented step DSL with `try/catch`, loops, and
+  `${var}` interpolation; `.yml`/`.yaml` is a YAML frontend that
+  lowers to SOL. [docs/sol.md](docs/sol.md).
 - **MCP support.** Register external MCP servers as proxied
   capabilities via `tool.mcp.*`.
 - **Dashboard.** Topology, tasks, cron jobs, audit log,

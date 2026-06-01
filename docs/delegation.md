@@ -1,5 +1,7 @@
 # Delegation
 
+_Version: 0.4.1_
+
 Delegation lets one agent spawn another as a subtask, wait for the
 result, and continue. It runs on the **coordinator** node — there's
 no new node type — and builds on the existing `task_edges` table
@@ -173,7 +175,14 @@ already terminal.
 | `delegate.cancel` | `<child_task_id>\|<reason>` | `ok\n` |
 | `delegate.list`   | `<parent_task_id>` | `<child>\t<goal>\t<status>\t<created_at>\n` per row + `count=N\n` |
 
-The bridge proxies all four as JSON at `/v1/delegate/*`.
+The bridge proxies all four as JSON at `/v1/delegate/*`:
+
+| Method | Path | Body / Query |
+|---|---|---|
+| POST | `/v1/delegate/spawn` | `{parent_task_id, goal, context?, target_subject_id?, depth?}` |
+| GET | `/v1/delegate/result/:child_id` | — |
+| POST | `/v1/delegate/cancel/:child_id` | `{reason?}` |
+| GET | `/v1/delegate/list/:parent_id` | — |
 
 ## What happens to results
 

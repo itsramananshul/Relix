@@ -7,12 +7,14 @@ and posts the reply back as a threaded reply. Same architecture
 as Telegram + Discord; the three channels coexist on the mesh
 as independent peers.
 
-The bot uses Slack's Web API over HTTPS. **No Socket Mode, no
-Events API webhooks.** The controller calls
-`conversations.history` on a configurable cadence and pulls
-messages newer than its last-seen `ts`. Simpler operationally;
-the trade-off is a 2-second baseline cadence between message
-arrival and visible reply.
+The bot uses Slack's Web API over HTTPS. **No Socket Mode.** The
+controller calls `conversations.history` on a configurable cadence
+and pulls messages newer than its last-seen `ts`. Simpler
+operationally; the trade-off is a 2-second baseline cadence between
+message arrival and visible reply.
+
+Approval interactions arrive via the bridge webhook (see
+[Approval interactions](#approval-interactions)).
 
 ## Setup
 
@@ -100,6 +102,9 @@ operator_user_id       = ""          # reserved for future use
 messages_ring_capacity = 200
 poll_interval_secs     = 2
 
+# Optional: enables historical-message filter (FIX 4).
+# state_db_path = "dev-data/slack-state.sqlite"
+
 [slack.memory_peer]
 addr = "/ip4/127.0.0.1/tcp/19711"
 
@@ -136,16 +141,42 @@ poll passes `oldest=<last-seen-ts>` so Slack only returns new
 arrivals. The cursor is in-memory only — a restart resumes from
 "channel tail" rather than replaying.
 
+### Historical-message filter (FIX 4)
+
+On first boot a `SlackBotStartStore` records the current timestamp
+so the controller can ignore messages that pre-date the bot. Set:
+
+```toml
+[slack]
+state_db_path = "dev-data/slack-state.sqlite"
+```
+
+This creates an SQLite WAL database with the `slack_bot_start`
+table:
+
+```sql
+CREATE TABLE IF NOT EXISTS slack_bot_start (
+    channel_id TEXT PRIMARY KEY,
+    bot_start_ts TEXT NOT NULL,
+    recorded_at_ms INTEGER NOT NULL
+);
+```
+
+The first-write wins (`INSERT OR IGNORE`): the timestamp is never
+overwritten on subsequent boots, so the filter is stable across
+restarts. When `state_db_path` is omitted the filter is disabled
+and the controller processes from the channel tail on every cold
+start.
+
 **Deliberate non-goals:**
 - No Socket Mode WebSocket. The handshake + heartbeat thread is
   not built.
-- No Events API receiver. The bot does not bind a public URL.
 - No formal slash-command registration. The bot does not call
   `POST /api/apps.commands.list` or maintain a manifest. Slash
   commands are detected by content.
-- No approval-notifier loop. `operator_user_id` is reserved for
-  a future feature.
-- No persistent session store. In-memory state only.
+- No approval-notifier polling loop. `operator_user_id` is
+  reserved for a future feature. The `slack.approval_send`
+  capability and the bridge interaction webhook are fully wired.
 
 ## Slash commands
 
@@ -197,10 +228,52 @@ channel_join, …) or `bot_id` set, before the controller sees
 it. After the first successful `auth.test`, the polling loop
 adds a `user_id == bot.user_id` check as a second layer.
 
+## Approval interactions
+
+The `slack.approval_send` capability delivers approval-request
+messages to the configured Slack channel as Block Kit messages with
+**Approve** / **Deny** action buttons.
+
+Inbound button clicks arrive via the bridge webhook:
+
+```
+POST /v1/channels/slack/interact
+```
+
+The bridge verifies Slack's HMAC-SHA256 request signature. Set:
+
+```
+RELIX_BRIDGE_SLACK_SIGNING_SECRET=<signing-secret>
+```
+
+If this env var is unset, `/v1/channels/slack/interact` and
+`/v1/channels/slack/events` return 503. Signature verification:
+basestring = `"v0:" + timestamp + ":" + raw-body`; the
+`X-Slack-Signature` header must start with `"v0="`. Replay window
+is 5 minutes (`MAX_SIGNATURE_AGE_SECS = 300`).
+
+The bridge also accepts:
+
+```
+POST /v1/channels/slack/events
+```
+
+for URL verification challenges and future Events API event types
+(currently fast-ack only, same HMAC gate).
+
+When an approval decision is recorded, the original Block Kit
+message is updated in-place via `chat.update` to reflect the
+decision.
+
+## Health capability
+
+`slack.health` (FIX 49) returns a `ChannelHealthSnapshot` JSON
+document. The health mode reported is `"polling"`.
+
 ## Wire shape
 
-The controller exposes two read-only mesh capabilities the
-bridge proxies for the dashboard:
+The controller exposes read-only mesh capabilities the bridge
+proxies for the dashboard:
 
 | Capability | Wire body |
 |---|---|
@@ -215,8 +288,10 @@ tabs/newlines.
 Bridge endpoints:
 
 ```
-GET /v1/slack/status
-GET /v1/slack/messages/recent?limit=20
+GET  /v1/slack/status
+GET  /v1/slack/messages/recent?limit=20
+POST /v1/channels/slack/interact
+POST /v1/channels/slack/events
 ```
 
 CLI (one-shot snapshots):
@@ -231,10 +306,14 @@ Both support `--json` for raw payloads.
 ## Security notes
 
 - The bot token is never echoed to logs or returned via HTTP.
-  It lives only in the env var `RELIX_SLACK_BOT_TOKEN`.
-- The bridge has no Slack-specific authentication — same
+  It lives only in the env var referenced by `token_env` in the
+  TOML (e.g. `RELIX_SLACK_BOT_TOKEN`).
+- The bridge has no Slack-specific HTTP authentication — same
   posture as every other surface: "local/dev only; put a
   reverse proxy with auth in front for production."
+- Approval interactions require a valid HMAC-SHA256 signature
+  (`RELIX_BRIDGE_SLACK_SIGNING_SECRET`); unsigned, malformed,
+  or stale (> 5 min) requests are rejected before processing.
 - The polling controller dials the memory / ai / coordinator
   peers with its own signed identity bundle (minted off the
   org root). Per-call admission (identity → policy → handler
@@ -258,7 +337,7 @@ the alpha-wide list of deferred features.
 
 ## See also
 
-- [index.md](index.md) — overview of all three channels.
+- [index.md](index.md) — overview of all four channels.
 - [`../channel-node-architecture.md`](../channel-node-architecture.md) —
   the design contract.
 - [`../configuration.md`](../configuration.md) — full env-var

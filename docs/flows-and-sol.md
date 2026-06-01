@@ -49,8 +49,6 @@ What you don't get (in the alpha):
 
 - Typed flow arguments (the bridge does template-string substitution
   via `{{PLACEHOLDER}}` markers). SIMP-018.
-- Streaming returns from `remote_call`. The opcode is synchronous and
-  returns one buffer. SIMP-006 / SIMP-019.
 - Provider-side LLM tool-calling integration. SIMP-010.
 - Loops over `remote_call` results that branch on response shape.
   You can write loops, but the bodies still return strings; for
@@ -79,6 +77,68 @@ any responder error (policy denied, handler internal error, transport
 failure) the VM halts with `VM_ERROR_SENTINEL` and the host surfaces
 the `RemoteCallError` (`peer`, `method`, `kind`, `cause`) to the
 caller. Subsequent `remote_call`s in the same flow do not run.
+
+## The `remote_call_stream` opcode (RELIX-2)
+
+```sol
+let result: str = remote_call_stream(peer_alias, method, args);
+```
+
+Same type signature and error contract as `remote_call`. The difference
+is at the host layer: the flow runner opens a `/relix/rpc/stream/1`
+substream and fires the VM's chunk observer once per arriving Chunk
+frame. From the SOL author's perspective the call is still
+synchronous — the opcode returns a single concatenated result string.
+The streaming benefit is external: when a chunk observer is wired (the
+web bridge uses one for HTTP SSE), each chunk reaches the client before
+the VM has finished collecting.
+
+If the dispatcher has no streaming implementation, the default trait
+method falls back to a single `remote_call` and reports the whole body
+as one chunk.
+
+## Flow file formats
+
+`FlowRunner` dispatches on file extension:
+
+| Extension | Pipeline |
+|---|---|
+| `.sol` | SOL compile pipeline → stack VM |
+| `.sflow` | Sflow AST executor |
+| `.yml` / `.yaml` | YAML frontend → lowered SOL → stack VM |
+
+YAML flows execute on the **identical** SOL VM as hand-written `.sol`
+files — no separate runtime. See
+[`yaml-flow-reference.md`](yaml-flow-reference.md) for the full YAML
+format.
+
+Both SOL and YAML paths run the VM inside `tokio::task::spawn_blocking`
+(SIMP-014).
+
+## Per-flow instruction budget (`#steps`)
+
+Every SOL flow has a fuel budget. The defaults:
+
+| Constant | Value |
+|---|---|
+| `DEFAULT_MAX_STEPS` | 100,000 instructions |
+| `MAX_STEPS_CEILING` | 10,000,000 instructions (hard ceiling) |
+
+A hand-written `.sol` file may override the budget with a `#steps N`
+directive at the very top of the source:
+
+```sol
+#steps 500_000
+function start() -> str { ... }
+```
+
+`compile_path_with_directives` reads and honours the directive.
+YAML flows always use `DEFAULT_MAX_STEPS`; the `#steps` directive is
+not supported in `.yml`/`.yaml` files.
+
+When the budget is exhausted the VM halts with `SolError::FuelExhausted`
+rather than running indefinitely. This means runaway loops exhaust fuel
+before they exhaust host memory.
 
 ## Argument wire formats (SIMP-016)
 

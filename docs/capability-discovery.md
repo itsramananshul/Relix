@@ -28,6 +28,10 @@ with:
 | `sensitivity_tags` | Free-form tags policy-engine can match (e.g. `reads:internal`, `external:network`, `fs:write`, `parse:html`). |
 | `requires_groups` | Minimum-claim groups required to call (structural pre-filter before policy). |
 | `policy_attachment_point` | The id policy rules attach to (defaults to method_name). |
+| `risk_level` | `unknown` / `safe` / `low` / `medium` / `high` / `critical`. `unknown` means unaudited; flagged as a deployment warning. |
+| `description` | *(optional)* One-sentence human-readable description. Used by `relix-cli capability ls` and planners. |
+| `categories` | *(optional)* Free-form category tags (e.g. `fetch`, `summarise`, `persist`). |
+| `environment_requirements` | *(optional)* Runtime requirements (e.g. `network:outbound`, `api_key:openai`). |
 
 Descriptors are not metadata-on-the-side; they are **the** authoritative
 description of what the responder will do.
@@ -37,12 +41,15 @@ description of what the responder will do.
 Two layers:
 
 1. **Per-node `node.manifest` capability.** Each controller exposes
-   `node.manifest`, an unauthenticated-by-the-handler RPC that
-   returns the list of `CapabilityDescriptor` for that node. The
-   admission pipeline still gates it (policy controls who may
-   call), but the handler itself just emits the local manifest.
+   `node.manifest`. As of RELIX-5 PART 2, the handler returns a fully
+   signed `SignedManifest` envelope — Ed25519-signed CBOR of `NodeManifest`,
+   including the signer's raw public key and a BLAKE3 fingerprint. The
+   receiving bridge verifies the signature and pins the signer key via
+   TOFU (Trust On First Use). The admission pipeline still gates who may
+   call `node.manifest`; the response itself is now cryptographically
+   authenticated.
 2. **Bridge-side `ManifestCache`** (see
-   `crates/relix-runtime/src/manifest.rs`). At bridge startup, the
+   `crates/relix-runtime/src/manifest/mod.rs`). At bridge startup, the
    bridge dials each configured peer alias and pulls its manifest.
    The cache lives on `AppState.manifest_cache` (an
    `Arc<ManifestCache>`) and is consulted by:
@@ -52,9 +59,18 @@ Two layers:
      peer registered `ai.chat`).
    - the bridge's M10 capability-routing path generally.
 
-Discovery is **periodic**: the bridge refreshes manifests every
-60 seconds (A.4). A failed refresh leaves the previous cache in
-place; the bridge does not flap.
+Discovery is **periodic**: the bridge calls `MeshClient::spawn_refresh_loop`
+with a caller-configured period. The bridge binary wires 60 seconds (A.4),
+but this is a configuration choice at the call site, not a hardcoded constant
+in the manifest module. A failed refresh leaves the previous cache entry
+intact (`ManifestCache::last_refreshed_at` is only updated on a successful
+insert); the bridge does not flap.
+
+**TOFU pin lifetime:** pins are in-memory only and are lost on bridge restart.
+A restarting bridge re-pins from the first `SignedManifest` it receives for
+each peer — the first-seen fingerprint becomes the trusted key. If a peer
+rolls its signing key, the bridge must be restarted (or the pin store cleared)
+to accept the new key.
 
 ## What discovery does NOT do today
 

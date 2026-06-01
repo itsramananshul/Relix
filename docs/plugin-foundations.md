@@ -1,45 +1,94 @@
 # Plugin + Packaging Foundations
 
-How Relix capabilities are distributed today (statically linked
-into the controller binary), what plugin support might look like,
-and the architectural constraints any future plugin system must
-satisfy. Track 5 of the autonomous roadmap.
+How Relix capabilities are structured, how the shipped
+subprocess plugin system works, and the architectural constraints
+the system was designed to satisfy. Track 5 of the autonomous
+roadmap.
 
-This is a **foundations document**: it documents the current state
-honestly and sketches the trust + loading model that a future
-plugin system must respect. It is **not** an implementation plan
-for a plugin marketplace.
+This document has two parts:
 
-## Today: static linkage, no plugin loading
+1. **Current state (0.4.1)** — the subprocess plugin system is
+   shipped. The `plugin_host` node type, `PluginLoader`,
+   `PluginDispatcher`, and `relix-plugin-sdk` crate are all
+   implemented and in production. See [`docs/plugins.md`](plugins.md)
+   for the operator and plugin-author reference.
+
+2. **Historical background** — the constraint analysis (M1–M7)
+   and Loading Model Options (A–D) sections below were written
+   before the loader landed. They remain accurate as
+   architectural rationale and are preserved for context. The
+   "sketched, not chosen" framing in the Options section is
+   historical: Option B (out-of-process subprocess) is the
+   implemented path.
+
+---
+
+## Current state: subprocess plugin system (shipped in 0.4.1)
 
 The capability set on any given controller is determined at
-**compile time**:
+**compile time** for built-in node types. The `plugin_host` node
+type adds **runtime-loaded** subprocess plugins on top of the
+static capability set.
 
 ```
 controller binary
 ├── relix-core           (types, identity, policy, audit)
 ├── relix-runtime        (libp2p, SOL VM, dispatch bridge, node impls)
-└── (the nodes module owns the registered capabilities)
+│   └── plugin_host node (PluginLoader + PluginDispatcher + registry)
+└── (the nodes module owns the registered built-in capabilities)
 ```
 
 When the bringup script spins up `relix-controller` with
-`[controller] node_type = "tool"`, the controller calls
-`crate::nodes::tool::register(bridge, ...)` which wires the
-specific tool capabilities into the dispatch bridge. There is no
-runtime plugin loading, no dynamic library dlopen, no WASM
-sandbox, no remote code download.
+`[controller] node_type = "plugin_host"`, the controller
+scans `plugin_dir` at depth 1 for `plugin.toml` manifests,
+validates and spawns each plugin as a subprocess, and registers
+the plugin's declared capabilities on the dispatch bridge.
 
-**This is deliberate.** Every alpha capability has been audited as
-part of the source tree review. The admission pipeline can prove
-that a `policy_denied` is final (the responder did not execute the
-handler) precisely because the handler is a static Rust function
-inside the controller process.
+### What the loader provides (0.4.1)
 
-## The packaging surface that already exists
+- `PluginLoader::spawn` — validates the manifest, gates on
+  `binary_sha256` and `publisher_key` signatures, applies the
+  Unix sandbox (`RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_NOFILE`,
+  `RLIMIT_CORE=0`, `PR_SET_NO_NEW_PRIVS`, seccomp BPF on
+  Linux), mints a per-plugin bearer token and TLS cert, spawns
+  the subprocess, and returns an `Arc<LoadedPlugin>` once the
+  health probe succeeds.
+- `PluginDispatcher` — speaks the `relix-plugin-v1` wire
+  protocol: newline-delimited JSON over loopback TLS with pinned
+  cert. No plaintext HTTP path exists.
+- `PluginRegistry` — SQLite-backed store tracking
+  `(plugin_id, name, version, status, error_message,
+  last_seen_at, capabilities)` across reboots.
+- `relix-plugin-sdk` — Rust SDK for plugin authors. Handles TLS
+  binding, port announcement, bearer validation, and JSON
+  framing. Plugin authors call `PluginServer::new()`,
+  `.register(method, handler)`, and `.serve()`.
 
-Three things ARE plugin-like in the alpha and are worth naming:
+The M6 constraint ("resource bounds enforced by the loader") is
+now satisfied by the rlimit + seccomp sandbox. The M5 constraint
+("descriptors signed") is satisfied by the `publisher_key` +
+`.sig` verification gate for distributed plugins.
 
-### 1. `CapabilityDescriptor` as the unit of discovery
+---
+
+## Historical background: design constraints (pre-0.4.1)
+
+The sections below document the constraints that shaped the
+plugin system design. The "not yet implemented" framing is
+historical; the system is now shipped.
+
+### Before the loader: static linkage only
+
+The capability set was determined entirely at compile time. There
+was no runtime plugin loading, no dynamic library dlopen, no WASM
+sandbox, no remote code download. This was deliberate: every
+alpha capability was audited as part of the source tree review.
+
+### The packaging surface that already existed
+
+Three things were plugin-like in the alpha and are worth naming:
+
+#### 1. `CapabilityDescriptor` as the unit of discovery
 
 A capability is a `(method_name, descriptor, handler)` triple
 registered on the dispatch bridge. The descriptor is the part
@@ -48,16 +97,12 @@ that runs. See
 [`docs/capability-discovery.md`](capability-discovery.md) for the
 field-by-field reference.
 
-A "plugin" — in the future — would ship a descriptor + a handler.
-
-### 2. SOL flows as composable units
+#### 2. SOL flows as composable units
 
 A SOL flow template (`flows/*.sol`) is a small, version-controlled
 program that calls into capabilities. Operators can drop a new
 `.sol` file into `flows/` and reference it from any controller
-config without rebuilding the runtime. The bridge's
-`[flow] template_path` and `tool_template_path` are how this
-shows up today.
+config without rebuilding the runtime.
 
 Flows are NOT plugins; they're orchestration scripts that consume
 plugins. The distinction is load-bearing: an attacker who can
@@ -66,7 +111,7 @@ the bridge's identity do, which is bounded. An attacker who can
 write a capability handler can do anything the controller process
 can do, which is much more.
 
-### 3. Policy files as deployment-time configuration
+#### 3. Policy files as deployment-time configuration
 
 `configs/policies/*.toml` is the operator's allowlist. Adding or
 removing a capability from a controller's `requires_groups` set,
@@ -74,10 +119,12 @@ or scoping the policy rule to a specific group, is a non-code
 deployment change. This is the operator-facing analogue of a
 plugin install/uninstall.
 
-## What a plugin system would have to satisfy
+---
 
-These are the **mandatory** constraints. A design that doesn't
-satisfy all of them is not acceptable.
+## What a plugin system had to satisfy (M1–M7)
+
+These were the **mandatory** constraints. The shipped system
+satisfies all of them to the degree noted.
 
 ### M1 — The admission pipeline cannot be bypassed
 
@@ -87,12 +134,18 @@ handler must accept exactly the same `(InvocationCtx, args)` shape
 the static handlers do, and the dispatch bridge must call it
 inside the same pipeline. No plugin-private "trusted" path.
 
+*Status: satisfied.* Plugin capabilities go through the same
+`PolicyEngine` and audit log as built-in capabilities.
+
 ### M2 — Plugins cannot grant themselves trust
 
 The trust root is the org's Ed25519 secret. A plugin cannot mint
 identities, modify policy, or write to the audit log out-of-band.
 If a plugin needs to perform a privileged action, it does so by
 calling another capability — going through the same pipeline.
+
+*Status: satisfied.* The plugin subprocess has no access to the
+host's identity bundle or policy store.
 
 ### M3 — Plugins are auditable from source
 
@@ -103,85 +156,99 @@ before installation. "Pull from a registry by SHA-256" is OK if
 the source is reproducibly built; "fetch and run an unsigned
 binary" is not.
 
+*Status: satisfied by the `binary_sha256` field and the
+`publisher_key` / `.sig` verification gate.* The operator pins
+the binary hash in the manifest. The loader refuses binaries that
+don't match.
+
 ### M4 — Plugin sensitivity tags must be honest
 
 The descriptor's `sensitivity_tags` field is what policy authors
 use to decide who can call. A plugin that lies about its
-sensitivity (e.g. claims `parse:html` but actually writes to the
-filesystem) breaks the operator's mental model of what the
-policy file admits. There is no automated way to verify this
-today; the alpha relies on source review.
+sensitivity breaks the operator's mental model. There is no
+automated verification; the system relies on source review for
+distributed plugins and on the `publisher_key` gate for signed
+distribution.
 
 ### M5 — Capability descriptors are signed
 
 When dynamic plugin loading lands, descriptors must be signed by
-a key the operator trusts (probably the org root, or a
-delegated capability-signing subkey). Unsigned descriptors are
-rejected at load time. This prevents a compromised plugin
-distribution channel from silently rewriting `requires_groups`
-to admit everybody.
+a key the operator trusts. Unsigned descriptors are rejected at
+load time.
+
+*Status: partially satisfied.* The `publisher_key` field signs
+the manifest (including capability declarations) at the TOML
+level. The signature is over the full manifest bytes, which
+includes the `[[plugin.capabilities.provides]]` entries.
 
 ### M6 — Resource bounds enforced by the loader
 
 A plugin handler that allocates 100 GB on every call should fail
-**at the loader's enforcement boundary**, not by crashing the
-controller. The simplest enforcement is a per-call budget the
-dispatch bridge tracks; richer would be `cgroup`-style isolation
-when the plugin is a separate process.
+at the loader's enforcement boundary, not by crashing the
+controller.
+
+*Status: satisfied on Linux/Unix.* The loader applies
+`RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_NOFILE`, and `RLIMIT_CORE=0`
+via `pre_exec`. Linux additionally applies `PR_SET_NO_NEW_PRIVS`
+and a seccomp BPF filter. On Windows the loader fails closed
+(`LoadError::SandboxUnenforceable`) unless all caps are set to 0.
 
 ### M7 — No network egress without an explicit capability
 
-A plugin that wants to call out to the internet must declare it in
-its descriptor (`environment_requirements: ["network:outbound"]`)
-AND obtain explicit policy admission. The loader rejects plugins
-whose runtime tries to dial without the declaration. (Pragmatic
-note: this is hard to enforce in-process; the most robust answer
-is "external network capabilities must be separate peers like
-`tool.web_fetch` already is".)
+A plugin that wants to call out to the internet must declare it
+and obtain explicit policy admission.
 
-## Loading model options (sketched, not chosen)
+*Status: partially satisfied by process isolation.* The
+subprocess boundary means the plugin's network calls don't go
+through the host's capability pipeline. Full enforcement (seccomp
+`connect` restriction or network namespace) is not yet wired.
+
+---
+
+## Loading model options (historical analysis)
+
+The options below were analyzed before the loader was built.
+Option B is the implemented path.
 
 ### Option A — Static-only forever
 
-Plugins distributed as Rust crates, the operator rebuilds the
-controller. The current model. Pros: maximum auditability, no
+Plugins distributed as Rust crates; the operator rebuilds the
+controller. The pre-0.4.1 model. Pros: maximum auditability, no
 loader complexity, no sandbox attack surface. Cons: ergonomically
 heavy for ecosystem growth.
 
 Recommended for: production deployments where the capability set
 changes monthly, not weekly. Source-trust model is unambiguous.
 
-### Option B — Out-of-process capability nodes
+### Option B — Out-of-process capability nodes (IMPLEMENTED)
 
-A new controller binary per plugin. The plugin "installs" by
-spinning up a new peer with its own identity bundle and policy
-admission, exactly the same way `memory` / `ai` / `tool` are
-separate peers today. Pros: clean trust boundary (an OS process),
+A subprocess per plugin. The plugin "installs" by shipping a
+binary + `plugin.toml` into `plugin_dir`. The `plugin_host` node
+spawns it, sandboxes it, and registers its capabilities on the
+dispatch bridge. Pros: clean trust boundary (an OS process),
 existing pipeline applies. Cons: process overhead per plugin,
-plugin author must understand controller config.
+plugin author must implement or use the SDK.
 
-Recommended for: anything that does I/O, holds credentials, or
-needs distinct rate limits. This is **the path the alpha already
-takes** for memory / ai / tool / coordinator.
+**This is the implemented path in 0.4.1.** See
+[`docs/plugins.md`](plugins.md) for the full reference.
 
 ### Option C — In-process WASM modules
 
-A static loader that pulls signed WASM modules. The dispatch
-bridge gets a `WasmHandler` variant that bounds memory + CPU
-per call. Pros: rich plugin ecosystem possible. Cons: substantial
-sandbox engineering, WASM-bridge for non-trivial I/O is a tower
-of complexity, and a WASM bug becomes a CVE in our binary.
+A static loader that pulls signed WASM modules. Pros: rich plugin
+ecosystem possible. Cons: substantial sandbox engineering,
+WASM-bridge for non-trivial I/O is complex, and a WASM bug
+becomes a CVE in the binary.
 
-Recommended for: only if Option B's process-per-plugin overhead
-becomes a real bottleneck (which it probably won't at alpha
-scale).
+Not implemented. Revisit only if Option B's process-per-plugin
+overhead becomes a real bottleneck.
 
 ### Option D — Dynamic Rust dylib
 
 `libloading` + ABI compatibility. Strongly discouraged: Rust ABI
 isn't stable, plugin must be rebuilt for every controller version,
-and `unsafe` boundary at the load point. Lists here only because
-it's an option that always gets proposed; **rejected**.
+and there's an `unsafe` boundary at the load point. **Rejected.**
+
+---
 
 ## Forbidden surface area (do not build)
 
@@ -192,8 +259,7 @@ Any future plugin work must NOT include any of these:
   central-registry shape contradicts the peer-native architecture
   the rest of Relix is built on.
 - **Remote code execution.** A capability that takes a code blob
-  and runs it. There is `tool.patch` (apply a unified diff to
-  a file) but it does not execute anything; that's intentional.
+  and runs it.
 - **Browser automation.** A plugin that drives a real browser is
   effectively `tool.execute_arbitrary_javascript`. Out of scope
   forever.
@@ -203,54 +269,19 @@ Any future plugin work must NOT include any of these:
   deputy attacks.
 - **Unsigned distribution.** No "pull from URL, run it" path. M5.
 
-## Suggested next concrete steps (when this work is greenlit)
-
-The realistic first slice is to **document better what's already
-plugin-like** and clean up the rough edges, NOT introduce a
-loader:
-
-1. **Manifest evolution (small):** ✅ shipped. `description`,
-   `categories`, `environment_requirements` are present on
-   `CapabilityDescriptor` (P1 from
-   [`docs/capability-discovery.md`](capability-discovery.md)),
-   surfaced via `/v1/capabilities` (P2) and `relix-cli
-   capability ls/get` (P3). `relix-cli capability validate`
-   ships a 7-rule linter operators can run pre-deploy / in CI:
-    - non-empty `method_name`
-    - `method_name` follows `<namespace>.<action>` convention
-    - non-empty `policy_attachment_point`
-    - no duplicate `method_name` across descriptors
-    - sensitivity_tags follow `<namespace>:<tag>` form
-    - environment_requirements follow `<key>:<value>` form
-    - `requires_groups` non-empty (every capability
-      policy-gated to at least one group)
-2. **Capability package convention (doc-only):** specify the
-   on-disk layout an Option-B "plugin as separate peer" should
-   take: `plugins/<name>/` with `controller.toml`,
-   `policy-fragment.toml`, `README.md`. The bringup script can
-   then optionally compose plugin fragments.
-3. **Plugin trust audit doc:** a short reviewer-facing checklist
-   ("before merging a new capability, verify: descriptor matches
-   the handler's actual side effects; sensitivity tags are
-   complete; the test suite covers the failure paths; the policy
-   change is operator-acceptable").
-4. **Signed descriptor scaffolding:** in advance of any
-   out-of-process plugin loading, define the signature shape over
-   `CapabilityDescriptor` so the load-time verification is ready
-   when the loader lands.
-
-Each of these is incremental and preserves every invariant. None
-implements a plugin loader; that's deliberate.
+---
 
 ## See also
 
+- [`docs/plugins.md`](plugins.md) — operator and plugin-author
+  reference for the shipped subprocess plugin system.
 - [`docs/architecture.md`](architecture.md) — the peer model that
   is already Relix's primary "plugin" mechanism.
 - [`docs/capability-discovery.md`](capability-discovery.md) —
-  what plugins would expose for discovery.
+  what plugins expose for discovery.
 - [`docs/security.md`](security.md) — the admission pipeline that
-  must continue to apply to plugin-registered capabilities.
+  continues to apply to plugin-registered capabilities.
 - [`crates/relix-core/src/capability.rs`](../crates/relix-core/src/capability.rs)
-  — the descriptor type a plugin would emit.
-- [`specs/alpha-simplifications.md`](../specs/alpha-simplifications.md)
-  — what's been deliberately deferred at Gate 1.
+  — the descriptor type a plugin emits.
+- [`crates/relix-plugin-sdk/`](../crates/relix-plugin-sdk/) —
+  the Rust SDK for plugin authors.

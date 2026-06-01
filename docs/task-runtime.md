@@ -1,5 +1,7 @@
 # Task Runtime
 
+_Version: 0.4.1_
+
 The Task is Relix's durable orchestration unit. One Task = one logical
 piece of work — a chat turn, a tool flow, a future scheduled agent run
 — with a stable id, a status field, and an event chronicle.
@@ -52,9 +54,13 @@ CREATE TABLE task_events (
 CREATE INDEX task_events_task ON task_events(task_id, event_id);
 ```
 
-Two tables, one foreign key, no triggers. C1 grew the `tasks` row by
-seven columns and added one index; the migration is idempotent
-`ALTER TABLE ADD COLUMN` so older databases upgrade in place.
+The base schema above; the live database also contains
+`task_attempts` (C2a per-attempt timeline — see
+[`attempt-lineage.md`](attempt-lineage.md)), `task_edges`
+(cross-task lineage edges), and `task_todos` (per-task todo lists).
+All columns beyond the base set are added via idempotent
+`ALTER TABLE ADD COLUMN` migrations at startup, so older databases
+upgrade in place. Migration version is tracked in `_relix_migrations`.
 
 ## Status convention
 
@@ -72,10 +78,13 @@ by the bridge and recommended for other callers (C1 expansion):
 | `failed` | Final attempt failed and the task will not retry. `last_failure_class` + `last_failure_reason` filled. |
 | `cancelled` | Operator explicitly cancelled an active task. |
 
-The Coordinator does **not** enforce transitions. A caller can write
-`status = "blueberry"` and the Coordinator will store it. CLI tooling
-assumes the convention; nothing breaks if you don't, but tooling will
-display whatever you write. State-machine enforcement is a Gate 2 item.
+The Coordinator enforces transitions via `is_allowed_transition(from,
+to)`. A caller attempting an illegal transition (e.g. `completed →
+running`) receives `INVALID_ARGS`. Unknown status values used in
+`task.update` are only accepted if they follow a valid from-status.
+CLI tooling assumes the canonical vocabulary; operators who write
+non-standard values will see them displayed verbatim but some
+dashboard features may not recognise them.
 
 See [`runtime-lifecycle.md`](runtime-lifecycle.md) for the canonical
 transition diagram, [`interruption-semantics.md`](interruption-semantics.md)
@@ -197,7 +206,7 @@ expensive once dashboards start pattern-matching on these names.
 
 | `event_type` | Emitted by | Payload convention |
 |---|---|---|
-| `task.created` | bridge, immediately after `task.create` succeeds | flow_template path |
+| `task.create` | Coordinator, on task creation (chronicle event auto-emitted) | flow_template path |
 | `flow.started` | bridge, before invoking `FlowRunner::run` | flow_template path |
 | `capability.invoked` | bridge, before a capability call it knows about | `method=... target=...` (target optional) |
 | `capability.completed` | (reserved; not emitted yet) | capability method |
@@ -237,7 +246,8 @@ events=[{"id":1,"ts":1779235935,"type":"checkpoint","payload":"memory.write_turn
 
 ### `task.list`
 
-Request: `` (empty = default 50) or `<limit>` (integer).
+Request: `` (empty = defaults) or `limit|offset|status`
+(all optional; defaults: limit 50, offset 0, all statuses).
 
 Response: one task per line, tab-delimited:
 ```
@@ -246,7 +256,8 @@ Response: one task per line, tab-delimited:
 
 Sorted by `updated_at DESC` so the most recently touched task is first.
 The Coordinator clamps `limit` to `[coordinator] max_list` (default
-200).
+200). For stable pagination under concurrent writes, prefer
+`task.list_cursor`.
 
 ## Bridge integration (B1, wired)
 
@@ -319,16 +330,12 @@ follow-up.
 
 See [`current-limitations.md`](current-limitations.md). Highlights:
 
-- No multi-attempt tracking — only `latest_*` columns. Previous
-  attempts live in the flow logs the bridge wrote, not in the
-  Coordinator's database.
-- No bounded auto-retry today — `retry_policy` + `max_retries` are
-  metadata for operators, not an executor primitive. See
-  [`retry-model.md`](retry-model.md) for the rationale.
+- No bounded auto-retry — `retry_policy` + `max_retries` are metadata
+  for operators and the explicit `task.retry` primitive; no background
+  auto-retry loop exists today. See [`retry-model.md`](retry-model.md).
 - The recovery scan promotes `running` past `max_runtime_secs` to
   `interrupted` but does NOT re-launch. See
   [`interruption-semantics.md`](interruption-semantics.md).
-- No state-machine enforcement — `status` is a free string.
 - Single Coordinator instance only. Leadership election + multi-leader
   reconciliation is Gate 2.
 - `params_json` is opaque to the Coordinator — no validation, no

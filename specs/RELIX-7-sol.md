@@ -63,14 +63,40 @@ Single-threaded per flow. Concurrent calls via `parallel { ... }` compile to mul
 
 ## Alpha Implementation Notes
 
-Alpha ships:
-- Reuses OpenPrem SOL VM (`crates/relix-runtime/src/sol/`) verbatim.
-- Adds one new bytecode instruction: `Inst::RemoteCall { peer_idx, method_idx, args_slot }`.
-- VM dispatches `RemoteCall` to a callback registered by the coordinator; the callback performs the RPC synchronously (blocks VM thread) and returns the result on the operand stack.
-- Stream consumption uses a similar synchronous yield mechanism but accepts chunked results; each chunk delivery returns a `Some(payload)` until terminal `None`.
-- No `parallel { }`, `try/catch`, `Time.now`, `Random.bytes`, or `?` operator in alpha SOL.
-- Restrictions: alpha SOL flows MUST NOT use any constructs not yet implemented; the analyzer is unchanged from OpenPrem, so attempts to use undeclared functions fail at compile time.
+### What is actually shipped in v0.4.1
+
+The target spec above describes `yield_call`, `yield_stream_*`,
+`yield_approval_wait`, `yield_timer`, etc. **None of these opcodes
+exist in the current implementation.** The shipped opcodes are:
+
+- `Inst::RemoteCall` — synchronous unary RPC (the shipped form of
+  what this spec calls `yield_call`). The VM blocks the thread and
+  returns one result buffer.
+- `Inst::RemoteCallStream` (RELIX-2) — same synchronous contract from
+  the SOL author's perspective; fires a chunk observer on the host
+  side as each frame arrives via `/relix/rpc/stream/1`.
+
+The yield/suspend/resume model described in §7.4 and §7.8 is a
+**long-term target** that has not yet been built. Readers using this
+spec as a current implementation reference should treat every opcode
+name in §7.4 as a planned future name, not a current one.
+
+Additional Relix extensions shipped on top of the OpenPrem port:
+
+- `try` / `catch` / `rethrow` (`TryEnter`, `TryExit`, `Rethrow`) — F2.
+- List and map heap objects + all `list_*` / `map_*` opcodes — F5–F8, F11.
+- Fuel budget: `DEFAULT_MAX_STEPS = 100_000`, `MAX_STEPS_CEILING = 10_000_000`,
+  `#steps N` directive, `SolError::FuelExhausted` — P6.
+- `last_confidence()` / `Inst::LoadLastConfidence` — RELIX-7.19.
+
+### Invariant 1 caveat
+
+§7.2 invariant 1 ("SOL execution is deterministic given a fixed event
+log") is **not yet enforced**. There is no replay-infrastructure in the
+current code (SIMP-008). Event logs are written and can be inspected,
+but the VM is not replay-driven. This invariant is a target, not a
+current guarantee.
 
 Alpha SOL flows live in `flows/*.sol` and are loaded by the controller per `configs/*.toml` `[session.<name>] source = "..."`.
 
-Yield/replay-equivalence (RELIX-7 §7.15) is partial in alpha — see SIMP-001 and SIMP-008.
+See SIMP-001 and SIMP-008 in `specs/alpha-simplifications.md`.

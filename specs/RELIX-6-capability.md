@@ -1,6 +1,6 @@
 # RELIX-6 — Capability Descriptor Format
 
-**Status:** Frozen target. Alpha implements minimal descriptor (inline schemas; no CDDL stdlib yet).
+**Version:** 0.4.1 | **Status:** Frozen target. Alpha implements minimal descriptor (inline schemas; no CDDL stdlib yet).
 
 ## 6.1 Responsibilities
 
@@ -54,23 +54,47 @@ Runtime: wire-level args validated against current responder CDDL.
 
 ---
 
-## Alpha Implementation Notes
+## Alpha Implementation Notes (v0.4.1)
 
-Alpha ships:
-- Capability descriptor as a Rust struct in `relix-core::capability`:
-  ```
-  CapabilityDescriptor {
-    method_name: String,
-    major_version: u32,
-    kind: CapabilityKind,
-    sensitivity_tags: Vec<String>,
-    policy_attachment_point: String,
-    requires_groups: Vec<String>,  // alpha shortcut for requires_credential_claims
-  }
-  ```
+Alpha ships the following `CapabilityDescriptor` struct in `relix-core::capability`:
+
+```rust
+pub struct CapabilityDescriptor {
+    pub method_name: String,
+    pub major_version: u32,
+    pub kind: CapabilityKind,            // unary | stream_out
+    pub idempotency: Idempotency,        // idempotent | at_most_once | at_least_once_safe
+    pub cost_class: CostClass,           // cheap | expensive | external_paid
+    pub sensitivity_tags: Vec<String>,
+    pub policy_attachment_point: String,
+    pub requires_groups: Vec<String>,    // alpha shortcut for requires_credential_claims
+
+    // Optional advisory metadata (T4 P1); omitted from wire when None/empty:
+    pub description: Option<String>,
+    pub categories: Vec<String>,
+    pub environment_requirements: Vec<String>,
+    pub risk_level: RiskLevel,           // unknown | safe | low | medium | high | critical
+}
+```
+
+Supporting enums (all serialised as snake_case strings):
+
+| Type | Variants |
+|------|---------|
+| `CapabilityKind` | `unary`, `stream_out` |
+| `Idempotency` | `idempotent`, `at_most_once`, `at_least_once_safe` |
+| `CostClass` | `cheap`, `expensive`, `external_paid` |
+| `RiskLevel` | `unknown` (default), `safe`, `low`, `medium`, `high`, `critical` |
+
+`RiskLevel::Unknown` means unaudited; flagged as a deployment warning by `relix-cli capability validate`.
+
+The optional fields (`description`, `categories`, `environment_requirements`) are omitted from the CBOR wire encoding when `None`/empty — backward-compatible with pre-T4-P1 manifests.
+
+The following spec §6.4 fields are **not** present in alpha: `minor_version`, `patch_version`, `args_type`, `return_type`, `error_kinds`, `requires_signed_envelope`, `requires_credential_claims`, `since`, `deprecated_in`, `removed_in`, `superseded_by`, `notes`.
+
 - Args and return schemas not formally declared; alpha capabilities accept and return hand-defined CBOR structs (Rust types deriving `Serialize`/`Deserialize`).
-- Capabilities registered by node binaries at startup; advertised in node manifest.
-- Versioning: alpha capabilities are all `major=1, minor=0, patch=0`; first deprecation/removal cycle exercised at Gate 2.
+- Capabilities registered by node binaries at startup; advertised in the node manifest.
+- Versioning: alpha capabilities are all `major=1`; first deprecation/removal cycle exercised at Gate 2.
 
 Alpha capability set:
 - `memory.search` (unary)

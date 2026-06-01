@@ -1,25 +1,29 @@
 # Runtime Observability
 
+> Version 0.4.1
+
 How an operator reconstructs what the Relix mesh actually did. A
 mental model + a tour of the primitives. Index doc, not a
 reference — every section points at the deep-dive.
 
-## Three layers, three audiences
+## Observability layers
 
-Relix's observability stack has three layers, each with its own
+Relix's observability stack has five layers, each with its own
 authoritative source and its own audience:
 
 | Layer | Source | Audience | Reference |
 |---|---|---|---|
-| **Per-peer admission audit** | Each controller's `audit.log` (hash-chained + signed) | Auditor — proves what each peer did, attested by the peer's key | [`audit-trails.md`](audit-trails.md) |
-| **Per-flow execution trace** | Per-flow event log under `dev-data/flow-runner/flows/<flow_id>.log` | Flow author — proves what the SOL VM did during one run | [`audit-trails.md`](audit-trails.md) |
+| **Per-peer admission audit** | Each controller's `audit.log` (hash-chained + signed CBOR) | Auditor — proves what each peer did, attested by the peer's key | [`audit-trails.md`](audit-trails.md) |
+| **Per-flow execution trace** | Per-flow event log under `~/.relix/flow-runner/flows/<flow_id>.log` | Flow author — proves what the SOL VM did during one run | [`audit-trails.md`](audit-trails.md) |
 | **Per-task metadata + chronicle** | Coordinator's SQLite ledger | Operator — answers "what happened on task X" without crossing trust boundaries | This doc + [`task-runtime.md`](task-runtime.md) |
+| **Per-agent invocation metrics** | `metrics.sqlite` + alert chronicle in `alerts.sqlite` | Operator — error rates, latency, cost, budget spend, active alerts | [Metrics API](#metrics-capabilities) below |
+| **Two-sink session tracing** | `MetadataSink` (Sink A, safe for export) and `ContentSink` (Sink B, local-only) | AI-node operator / compliance — full session replay with provenance diffing | [Session tracing](#two-sink-session-tracing) below |
 
-The three are **independent on purpose**: an auditor verifying a
-peer doesn't need to trust the caller's flow log; a flow author
-debugging a stuck step doesn't need access to other peers'
-audit logs; an operator triaging a dashboard alert can stay in
-the Coordinator until they need deep forensics.
+The five are **independent on purpose**: an auditor verifying a
+peer doesn't need to trust the caller's flow log; an operator
+watching error rates doesn't need access to prompt content; a
+compliance reviewer with Sink A can export metadata to OTel without
+ever touching Sink B.
 
 ## What's correlated across layers
 
@@ -35,7 +39,11 @@ Every layer shares two ids that act as join keys:
   Identifies one caller → responder round-trip. Appears in the
   responder's audit record and in the caller's flow log's
   `RemoteCallIssued` / `RemoteCallCompleted` / `RemoteCallFailed`
-  records.
+  records. The `ResponseEnvelope.aid` is a server-minted UUIDv4
+  that identifies the audit row; it is distinct from `request_id`.
+- **`event_id`** (UUID string) — links Sink A metadata rows to
+  their optional Sink B content rows. OTel export reads only
+  Sink A and never touches Sink B.
 
 `task_id` lives only at the Coordinator layer — it's an
 operator-facing key. The bridge surfaces it in chat responses
@@ -58,6 +66,13 @@ row.
 | What's the mesh capable of? | `GET /v1/capabilities` |
 | Which peers are alive & fresh? | `GET /v1/topology` |
 | Trigger recovery scan | `POST /v1/tasks/recover` |
+| Per-agent error rate, latency, cost | `metrics.agent_summary` / `metrics.agents` capability |
+| Per-method breakdown | `metrics.method_breakdown` capability |
+| Time-series buckets | `metrics.timeseries` capability |
+| Active alerts | `observability.active_alerts` capability |
+| Recent alert history | `observability.alert_history` capability |
+| Per-agent health dashboard | `observability.health_summary` capability |
+| Cost breakdown by agent + method | `metrics.cost_report` capability |
 
 CLI equivalents are documented in
 [`operator-guide.md`](operator-guide.md).
@@ -111,71 +126,312 @@ ledger (e.g. an ad-hoc operator query you'll run once). Offset
 pagination silently repeats / skips rows when `updated_at` ties
 shift between page requests; cursors don't.
 
-## What this stack does NOT do
+## Metrics capabilities
+
+RELIX-7.11 registers six per-agent metrics capabilities on every
+node that boots with `[metrics] enabled = true`, plus three
+baseline caps:
+
+| Capability | Args (JSON) | Notes |
+|---|---|---|
+| `metrics.agents` | `{hours?: u32}` | Lists every agent with an `AgentSummary`; default `hours=24` |
+| `metrics.agent_summary` | `{agent: str, hours?: u32}` | Single-agent summary with P50/P95/P99 latency |
+| `metrics.method_breakdown` | `{agent: str, method?: str, hours?: u32}` | Per-method breakdown for one or all methods |
+| `metrics.timeseries` | `{agent: str, hours?: u32, bucket_minutes?: u32}` | Time-series buckets; default 5-minute buckets |
+| `metrics.alerts_active` | (none) | Returns current `Vec<ActiveAlert>` from the in-memory dedup map |
+| `metrics.cost_report` | `{hours?: u32}` | Cost breakdown by agent + method |
+| `metrics.cost_baselines` | `{provider?: str, limit?: u32}` | Recent baseline windows |
+| `metrics.ask_human_baselines` | `{agent?: str, limit?: u32}` | Recent ask-human rate windows |
+| `metrics.cost_spike_history` | `{limit?: u32}` | Recent spike records from `cost_baselines.db` |
+
+`hours=0` is treated as the default (24). The `agent` parameter
+is required for `agent_summary`, `method_breakdown`, and
+`timeseries`. Percentiles (P50/P95/P99) are computed in Rust
+over the raw latency column using the nearest-rank method.
+
+### Data store
+
+All invocation rows are written to
+`~/.relix/<node-name>/metrics.sqlite` (WAL mode). The background
+drain task batches up to 100 rows per 100 ms pass. A retention
+sweep prunes rows older than `retention_days` (default 30) every
+`retention_sweep_interval_secs` (default 3600).
+
+The `metrics_invocations` table includes a `tenant_id` column
+(added via idempotent `ALTER TABLE`); all metric reads are
+SQL-filtered by the verified `tenant_id` from the dispatch
+context.
+
+### Alert engine
+
+The `AlertEngine` evaluates threshold conditions every
+`alert_interval_secs` (default 60) over the metrics store. It
+fires six threshold kinds and two statistical kinds:
+
+| Kind | Trigger | Default threshold |
+|---|---|---|
+| `error_rate` | error\_rate\_pct above threshold in eval window | 10% |
+| `p95_latency` | P95 latency above threshold in eval window | 5000 ms |
+| `cost_per_hour` | cost in the last 60 minutes above threshold | $1.00 (1 000 000 µ-USD) |
+| `zero_success` | traffic present but zero successes in window | 10 min window |
+| `provider_cost_spike` | recent cost avg > baseline avg × spike factor | 3× |
+| `ask_human_rate_drift` | recent ask-human rate > baseline × drift factor | 3× |
+| `low_confidence` | per-capability confidence score below threshold | wired by §7.19 |
+| `budget_exceeded` | BudgetEnforcer trips a spend cap | see BudgetEnforcer |
+| `cost_alert` | absolute spend cap breached (independent window) | see CostSpikeDetector |
+
+Alerts are **edge-triggered**: `Fired` emits only on the first
+healthy → above-threshold transition; `Recovered` emits once when
+the condition clears. The same condition staying above threshold
+across ticks does NOT re-fire. Dedup key: `(agent, method?, kind)`.
+
+`LowConfidence` uses per-method dedup. The `ProviderCostSpike`
+kind uses the synthetic agent name `"baseline:model:<model>"`
+so it doesn't collide with per-agent `AlertEngine` keys.
+
+Alert events are persisted to `alerts.sqlite` via
+`ChronicleAlertSink`. The `MultiChannelAlertSink` fans alerts out
+to configured Telegram / Discord / Slack / Email targets over the
+mesh capability bus (non-blocking per-target `tokio::spawn`).
+
+### BudgetEnforcer
+
+`BudgetEnforcer` enforces per-agent and deployment-wide hourly/daily
+spend caps before every dispatch. Three actions:
+
+- **`Throttle`** (default) — delays the call by `throttle_backoff_ms`
+  (default 2000 ms).
+- **`Reject`** — returns `RESOURCE_EXHAUSTED` immediately.
+- **`AlertOnly`** — fires a `BudgetExceeded` alert but allows the
+  call through.
+
+Security invariants:
+- NaN or Infinite limit values **fail-closed** with
+  `BudgetDecision::Reject`.
+- Agent cap is evaluated first; `Reject`/`Throttle` from the agent
+  cap short-circuits the deployment cap check.
+- Methods listed in `exempt_methods` bypass budget checks entirely.
+- The spend cache is invalidated immediately when any `cost > 0`
+  metric is written, and refreshes from SQLite at
+  `cache_refresh_secs` (default 60).
+
+Configure in `[budget]`:
+
+```toml
+[budget]
+throttle_backoff_ms  = 2000
+cache_refresh_secs   = 60
+exempt_methods       = ["node.health"]
+
+[[budget.agents]]
+agent              = "my-agent"
+daily_limit_usd    = 10.0
+hourly_limit_usd   = 2.0
+action_on_exceed   = "throttle"   # "throttle" | "reject" | "alert_only"
+
+[budget.deployment]
+daily_limit_usd  = 100.0
+action_on_exceed = "reject"
+```
+
+### CostSpikeDetector and absolute caps
+
+`CostSpikeDetector` computes baseline windows in `cost_baselines.db`
+and is disabled by default (`[metrics.cost_alerts] enabled = false`).
+Minimum tick interval is enforced at 60 s regardless of config.
+
+The `[metrics.cost_alerts]` block also carries absolute caps that
+are **always evaluated** when the detector is enabled:
+
+| Key | Default |
+|---|---|
+| `absolute_hourly_cap_usd` | `50.0` |
+| `absolute_daily_cap_usd` | `500.0` |
+| `absolute_per_request_cap_usd` | `5.0` |
+
+The per-request cap is checked pre-dispatch via
+`MetricsCollector::check_per_request_estimate` before the call is
+forwarded to the handler. Hourly and daily caps are checked
+post-dispatch against rolling windows.
+
+### Alert delivery configuration
+
+```toml
+[metrics.alerts]
+chronicle_path = "~/.relix/my-node/alerts.sqlite"
+
+[[metrics.alerts.targets]]
+channel    = "telegram"   # "telegram" | "discord" | "slack" | "email"
+peer       = "telegram"
+chat_id    = "<chat-id>"
+
+[[metrics.alerts.targets]]
+channel    = "email"
+peer       = "email"
+to         = "ops@example.com"
+subject    = "Relix alert"
+```
+
+## Observability health dashboard
+
+Three capabilities under `observability.*` expose the live health
+state (registered when metrics are enabled):
+
+| Capability | Args (JSON) | Response |
+|---|---|---|
+| `observability.active_alerts` | (none) | `Vec<ActiveAlert>` sorted by severity then triggered\_at |
+| `observability.alert_history` | `{limit?: usize, agent?: str}` | Last N chronicle rows from `alerts.sqlite`; default `limit=50`, clamp `[1, 1000]` |
+| `observability.health_summary` | `{hours?: u32}` | `HealthSummary` with per-agent scores + deployment summary |
+
+### Health score formula
+
+Each agent receives a score in `[0, 100]` computed as:
+
+```
+weighted  = 40% × error_factor
+          + 30% × latency_factor
+          + 20% × confidence_factor   (full credit if no confidence wired)
+          + 10% × budget_factor       (full credit if no budget configured)
+score     = (weighted × reliability_multiplier) − (active_alerts × 5)
+clamped to [0, 100]
+```
+
+Where:
+- `error_factor` = linear penalty up to 25% error → 0 pts; capped at 0.
+- `latency_factor` = linear penalty from 2000 ms soft baseline to 10 000 ms → 0 pts.
+- `confidence_factor` = `avg_confidence` (0.0–1.0); absent → 1.0 (full credit).
+- `budget_factor` = linear 0%→100% utilisation → 0 pts; absent → 1.0.
+- `reliability_multiplier` = `1 − error_pct/50` (reaches 0 at 50% errors).
+- Each active alert subtracts 5 points after the multiplier.
+
+Status thresholds: `green` ≥ 80 / `yellow` ≥ 50 / `red` < 50.
+
+## Two-sink session tracing
+
+AI nodes that boot with `[observability] two_sink.enabled = true`
+operate a two-sink model:
+
+- **Sink A — `MetadataSink`** (`metadata_events` table in
+  `metadata.db`): stores event metadata only — no prompt or
+  response content. Long retention. Safe to export. Used as the
+  OTel export source.
+- **Sink B — `ContentSink`** (`content_events` table in
+  `content.db`): stores prompt, response, tool args, and tool
+  output. Short retention (default 7 days). **Local-only.**
+  Linked to Sink A rows by `event_id`. The OTel exporter never
+  reads Sink B.
+
+The two sinks share an `event_id` UUID string as the join key.
+A `SessionDebugger` assembles read-only timelines from both sinks
+for operators who have access to the node directly.
+
+Session status classification:
+
+- `"completed"` — a `session`-typed event with `success = true`
+  exists.
+- `"stalled"` — no end event and `now − last_event_ts > 300 s`.
+- `"running"` — otherwise.
+
+A `ProvenanceRegistry` (`provenance.db`) pins
+`model_id / policy_version / skill_map / tool_map` per trace for
+regression diffing between deploys.
+
+Configure in `[observability]`:
+
+```toml
+[observability]
+
+[observability.two_sink]
+enabled               = true
+metadata_db_path      = "~/.relix/my-ai/metadata.db"    # required when enabled
+content_db_path       = "~/.relix/my-ai/content.db"     # default: sibling content.db
+provenance_db_path    = "~/.relix/my-ai/provenance.db"  # default: sibling provenance.db
+content_retention_days = 7
+```
+
+## OTel export
+
+OTel OTLP/HTTP export is off by default (`otel.enabled = false`).
+When enabled, the `OtelExporter` translates `MetadataEvent` rows
+(Sink A only) into OTLP spans using an attribute whitelist.
+
+Allowed attribute keys (default set):
+`event_type`, `session_id`, `agent_id`, `latency_ms`,
+`token_count`, `cost_cents`, `model`, `tool`, `success`,
+`error_type`. Any key not in the whitelist is dropped at build
+time. Per-event-type export is opt-in via
+`events.enabled_events` (empty by default — buffer nothing).
+
+Configure in `[observability.otel]`:
+
+```toml
+[observability.otel]
+enabled      = true
+endpoint     = "http://otel-collector:4318/v1/traces"
+service_name = "relix-runtime"   # default
+events       = ["model_call", "tool_call", "error"]
+```
+
+OTel span IDs are derived as BLAKE3(session\_id) and
+BLAKE3(event\_id) truncated to the required lengths. The
+`service.name` attribute in OTLP uses the configured value;
+the scope version is the crate version from `CARGO_PKG_VERSION`.
+
+`flush` uses `reqwest` with a 10 s timeout. HTTP errors are
+logged at `error` level; the pending buffer is always drained
+regardless of HTTP success so the buffer never grows unbounded.
+
+## What the task-chronicle stack does NOT do
 
 Be explicit about the boundaries:
 
-- **No live SSE / WebSocket** — the events endpoint is long-poll
-  by design. A real SSE wrapper is gated on operator demand;
-  long-poll covers every alpha use case and adds no
-  bridge-owned state.
-- **No event compaction or retention** — the chronicle grows
-  unbounded. Operators who need retention add it externally
-  today; the design doc is in
-  [`chronicle-retention.md`](chronicle-retention.md) (when
-  written). No destructive deletion has been implemented.
-- **No metrics endpoint** — no Prometheus, no OpenTelemetry
-  integration. Operator scripts on top of `task.count` /
-  `task.list_cursor` get the same data without us inheriting a
-  metrics-system dependency.
-- **No alert routing** — operators wire `task.count?status=failed`
-  > 0 into their own alerting; the runtime doesn't own
-  notification.
+- **No live SSE / WebSocket on the task chronicle** — the events
+  endpoint is long-poll by design.
+- **No event compaction or retention on the task chronicle** — the
+  chronicle grows unbounded. Operators who need retention add it
+  externally today.
 - **No cross-mesh correlation** — `trace_id` is generated per
-  bridge; two bridges minting trace_ids do not coordinate. Add
-  a per-organisation prefix in operator tooling if you need
+  bridge; two bridges minting trace_ids do not coordinate. Add a
+  per-organisation prefix in operator tooling if you need
   cross-mesh joins.
 
 ## Operator on-call workflow
 
-A small mental model that ties the pieces together:
-
 1. **Triage by counts.** `task count --status failed` or
    `task count --status interrupted` shows the size of the
    problem.
-2. **Page through the relevant tasks.** `task list --status
+2. **Check the health dashboard.** `observability.health_summary`
+   shows per-agent scores and firing alerts — if an agent is
+   `red`, check `observability.active_alerts` for the specific
+   condition.
+3. **Page through the relevant tasks.** `task list --status
    failed --limit 50` (or `/v1/tasks/cursor?status=failed`).
    Each row has a task_id + a status; you're looking for
    patterns (same failure_class? same flow_template?).
-3. **Pick one to investigate.** `task get --pretty` (or
+4. **Pick one to investigate.** `task get --pretty` (or
    `/v1/tasks/:id/lineage`) shows the chronology with attempt
    grouping + the failure-class callout.
-4. **Drop into forensics if the chronicle isn't enough.** Take
+5. **Drop into forensics if the chronicle isn't enough.** Take
    the `latest_flow_log_path` from the task body and run
    `relix-flow-inspect --flow $path --human`. Cross-reference
-   any responder error via `--audit dev-data/<peer>/audit.log
+   any responder error via `--audit ~/.relix/<peer>/audit.log
    --trace <trace_id>`.
-5. **Act.** `task retry --task-id $id` for retryable failures.
+6. **Act.** `task retry --task-id $id` for retryable failures.
    `task update --status cancelled` for give-ups. `task recover`
    if the row is stuck `running` past its deadline.
-
-The whole loop is a finite number of commands; every command
-hits typed APIs; every API is documented in
-[`task-api.md`](task-api.md).
 
 ## See also
 
 - [`task-api.md`](task-api.md) — the HTTP surface.
-- [`event-contract.md`](event-contract.md) — typed event
-  envelopes.
-- [`event-vocabulary.md`](event-vocabulary.md) — event-type
-  naming.
-- [`audit-trails.md`](audit-trails.md) — per-peer +
-  per-flow forensics.
+- [`event-contract.md`](event-contract.md) — typed event envelopes
+  for the task chronicle and other event stores.
+- [`event-vocabulary.md`](event-vocabulary.md) — event-type naming
+  for all event stores.
+- [`audit-trails.md`](audit-trails.md) — per-peer + per-flow
+  forensics, plus the tenant partition mirror and evidence store.
 - [`runtime-lifecycle.md`](runtime-lifecycle.md) — status
   transitions.
-- [`attempt-lineage.md`](attempt-lineage.md) — per-attempt
-  rows.
+- [`attempt-lineage.md`](attempt-lineage.md) — per-attempt rows.
 - [`task-recovery.md`](task-recovery.md) — operator playbook.
 - [`operator-guide.md`](operator-guide.md) — running the mesh,
   logs, common failures.

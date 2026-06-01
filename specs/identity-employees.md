@@ -75,12 +75,30 @@ deny_when: args.amount > 100000
 `require_approval` is a third outcome alongside `allow` / `deny`. On match:
 
 1. Responding node suspends the request.
-2. Emits `approval.requested` event to the network.
-3. Approval node(s) deliver to qualified humans.
-4. Approver signs `approval.granted{nonce, decision}` envelope.
-5. Responding node verifies the approver satisfies the policy criteria, executes, returns result.
+2. Coordinator persists an `approval_delivery` row and dispatches the request
+   to the configured channel (dashboard, Slack, email, Telegram, Discord).
+3. Operator reviews and records a decision via `approval.record_decision`.
+4. **Controller (coordinator) mints an Ed25519-signed approval token** after
+   the operator decision is recorded. The operator authorises; the controller
+   signs. The approver does NOT sign the token — the token is issued by the
+   coordinator's `ApprovalSigner` using `RELIX_APPROVAL_SIGNING_KEY`.
+5. Agent presents the token on the next call. Responding node verifies the
+   token (signature, method binding, subject binding, expiry, replay
+   blocklist) via `evaluate_token` and, on success, executes the handler.
 
-Approval flows are uncircumventable: no code path on the responding node lets a `require_approval` decision proceed without a valid signed approval.
+> **Spec delta from original design:** §H.5 as originally written said
+> "Approver signs `approval.granted{nonce, decision}` envelope." The shipped
+> implementation instead has the **controller** issue an Ed25519-signed
+> structured token after the operator decision; the approver never holds a
+> signing key. This is intentional: HMAC is symmetric (forger holds the same
+> key); Ed25519 is asymmetric (verifier holds only the public key). Token
+> format v0x01 (HMAC-SHA256) is rejected at parse. All production tokens
+> are v0x02 (Ed25519). See
+> [`approval-tokens.md`](../docs/approval-tokens.md).
+
+Approval flows are uncircumventable: no code path on the responding node lets
+a `require_approval` decision proceed without a valid, unexpired, unplayed
+Ed25519 approval token.
 
 ## H.6 Enforcement Pipeline (Strict Order)
 
@@ -129,4 +147,22 @@ This framing is the strongest production differentiator Relix has against every 
 
 ## Alpha Status
 
-The alpha implements a simplified form of this model. See `specs/alpha-simplifications.md` for the deltas (single-key trust model, allowlist policy DSL instead of Cedar, no approval flows yet, no CRL gossip). The architectural shape — identity-bundle wire format, enforcement pipeline ordering, audit-on-responder — is unchanged.
+The alpha implements a simplified form of this model. See
+`specs/alpha-simplifications.md` for the full delta list. Summary of the
+current shipping state versus this spec:
+
+| Spec item | Shipped? | Notes |
+|---|---|---|
+| Single-key trust model (SIMP-002) | Shipped as simplification | No IA hierarchy; org root signs directly |
+| Allowlist policy DSL (SIMP-004) | Shipped | Cedar deferred to Gate 2 |
+| AIC + GMC split | Partially | Combined into `IdentityBundle` in alpha |
+| Approval flows (§H.5) | Shipped (0.4.1) | Ed25519 tokens, not approver-signed envelopes (see §H.5 note) |
+| Standing approvals | Shipped | `store.has_active_standing()` checked before `RequireApproval` |
+| No CRL gossip (SIMP-003) | Simplification | Short-lived bundles are the mitigation |
+| Surface check (§H.6 step 3) | Shipped | Gate reads transport-layer `caller_surface`; `envelope.surface` ignored |
+| Fail-closed missing profile | Shipped (0.4.1) | Was silent-allow; now `AGENT_NO_PROFILE` deny |
+| Encrypted credential vault | Shipped (0.4.1) | AES-256-GCM + Argon2id; see [`credentials.md`](../docs/credentials.md) |
+| Plugin sandbox | Shipped (0.4.1) | Linux seccomp + rlimits + TLS loopback |
+
+The architectural invariants — identity-bundle wire format, enforcement
+pipeline ordering, audit-on-responder — are unchanged from the original design.

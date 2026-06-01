@@ -1,11 +1,9 @@
-# Tool Node Security Model (M9)
+# Tool Node Security Model
 
-The tool node introduces Relix's first **external-action capability**:
-`tool.web_fetch`. It performs an HTTPS GET of a single URL on the node's
-behalf and returns the body text to the SOL flow that called it.
-
-It is also the first capability that can reach arbitrary endpoints on the
-host network, so it ships with a deliberately conservative safety model.
+The tool node exposes Relix's external-action capabilities: web fetch,
+filesystem access, terminal execution, browser automation, MCP dispatch,
+document parsing, and more. Any capability that touches the outside
+world ships with a deliberately conservative safety model.
 **Fail closed** is the default everywhere.
 
 ## Architecture
@@ -19,7 +17,9 @@ no special HTTP bypass, no bridge-side execution.
 bridge --remote_call--> tool node
                        ├─ admission pipeline (identity / policy / audit)
                        └─ ToolBackend.fetch(url, cap)
+                          ├─ operator blocklist check  (HostBlocklist)
                           ├─ security::resolve_safe_url   (SSRF guard)
+                          ├─ url_allowlist check       (UrlAllowlist)
                           └─ reqwest::Client.get(...)
 ```
 
@@ -154,21 +154,32 @@ acceptable because redirects are rare. Verified by
 
 ## SSRF Defence (`security::resolve_safe_url`)
 
-Every call goes through these checks **before** any HTTP I/O:
+Every outbound web call goes through these checks **before** any HTTP I/O,
+in the order listed. All checks also run on every redirect target:
 
-1. **Scheme allowlist** — `https` always; `http` only when
+1. **Operator blocklist** (`blocked_hosts`) — case-insensitive **exact**
+   hostname match. Runs before scheme/DNS validation so a blocked host
+   never reaches the resolver. Configure via `[tool] blocked_hosts = [...]`.
+   Matching is exact-only; subdomains are NOT blocked unless listed
+   separately (see [Blocklist semantics](#blocklist-semantics)).
+2. **Scheme allowlist** — `https` always; `http` only when
    `[tool] allow_http = true` (default `false`). `file://`, `ftp://`,
    `gopher://`, custom schemes, and missing schemes are all denied.
-2. **Literal-IP check** — if the URL host parses as an IP, it is matched
+3. **Literal-IP check** — if the URL host parses as an IP, it is matched
    against the forbidden ranges (no DNS needed).
-3. **Hostname denylist** — exact match for `localhost`,
+4. **Hostname denylist** — exact match for `localhost`,
    `metadata.google.internal`, and similar; suffix match for
    `.local`, `.internal`, `.intranet`, `.lan`, `.corp`, `.home`,
    `.private`.
-4. **DNS resolution** — the host is resolved via the OS resolver and
+5. **DNS resolution** — the host is resolved via the OS resolver and
    **every** returned address must be safe. A mixed-result resolution
    (one safe IP + one private IP) is rejected as DNS-rebind bait.
-5. **Body cap + content-type filter** — non-text/non-json/non-html
+6. **URL allowlist** (`url_allowlist`) — glob host patterns; empty = no
+   restriction. Only fires when the list is non-empty. Cloud-tier clients
+   (LlamaParse, Jina, Firecrawl, Tavily, etc.) are **exempt** from this
+   check but still subject to the private-IP block. Configure via
+   `[tool] url_allowlist = ["*.example.com"]`.
+7. **Body cap + content-type filter** — non-text/non-json/non-html
    responses are rejected; bodies that exceed the per-request cap (the
    smaller of `[tool] max_bytes` and any `|N` suffix in the SOL arg)
    are aborted mid-stream.
@@ -185,6 +196,31 @@ IPv6 — `::`, `::1`, `fe80::/10` link-local, `fc00::/7` ULA,
 `fec0::/10` deprecated site-local, `2001:db8::/32` documentation,
 multicast, plus IPv4-mapped (`::ffff:0:0/96`) and IPv4-compatible
 embeddings of any of the IPv4 forbidden ranges.
+
+### Blocklist semantics
+
+`blocked_hosts` is an **exact hostname match** (case-insensitive). Listing
+`evil.example.com` blocks only that exact hostname — NOT `www.evil.example.com`
+or `evil.example.com.br`. To block a subtree, list each hostname explicitly.
+This matches the per-hostname granularity of feeds like URLhaus and avoids
+accidentally blocking unrelated domains.
+
+`url_allowlist` uses glob patterns where `*` matches any run of characters
+**including** the `.` separator, so `*.openai.com` matches
+`api.openai.com`, `platform.openai.com`, etc. Patterns are stripped of
+scheme and path at configuration time: `https://api.example.com/v1/`
+normalises to `api.example.com`. When the list is empty (default) no
+allowlist filtering occurs.
+
+### `ssrf_protection = false`
+
+Setting `[tool] ssrf_protection = false` **disables the private-IP block
+for ALL outbound HTTP** — both tool capability handlers and cloud-tier
+clients (LlamaParse, Jina, Firecrawl, etc.). The controller logs a WARNING
+at startup. The `url_allowlist` still fires when configured.
+
+This setting is intended for development against a local model server. It
+**must not** be set in production.
 
 ### Honest limitations
 
@@ -212,7 +248,7 @@ embeddings of any of the IPv4 forbidden ranges.
   On a shared host, operators should add an iptables / Windows-Firewall
   outbound deny for RFC 1918 networks to the tool node's user account.
 
-## Capability descriptor
+## Capability descriptors
 
 `tool.web_fetch` is registered with:
 
@@ -220,14 +256,47 @@ embeddings of any of the IPv4 forbidden ranges.
 - `idempotency = AtMostOnce` — same URL may return different bodies; do
   not retry on `responder_internal`.
 - `cost_class = ExternalPaid` — touches the outside world.
+- `risk = Medium`.
 - `sensitivity_tags = ["external:network", "egress:http"]`.
 - `requires_groups = ["chat-users"]`.
 
-Policy can attach to `tool.web_fetch` directly. The alpha policy gives
-the same `chat-users` group access as `ai.chat` and `memory.*`; tighten
-this on real deployments by issuing a separate `tool-users` group.
+`tool.terminal.run` is registered with:
 
-## Wire format (alpha)
+- `idempotency = AtMostOnce`
+- `cost_class = ExternalPaid`
+- `risk = High`
+- `requires_groups = ["operators"]`
+
+Policy can attach to any capability directly. The alpha policy gives
+`chat-users` access to web and memory capabilities; terminal and browser
+require `operators`. Tighten further by issuing narrower group scopes.
+
+## Output Guard
+
+Every tool reply passes through `ToolOutputGuard::inspect` before returning
+to the caller. Two risks are mitigated:
+
+- **Prompt injection via tool output** — a fetched web page containing
+  "ignore previous instructions" would otherwise inject those instructions
+  into the model's context on the next turn.
+- **Pathologically large output** — uncapped tool output could exhaust
+  the model's context window.
+
+Processing order (the earlier check sets the verdict):
+
+1. **Suspicious JSON keys** — keys containing `system_prompt`,
+   `instructions`, or `ignore_previous` (case-insensitive substring) in
+   any JSON payload. Checked first so structured injection reports the
+   stronger key-shaped signal.
+2. **Injection phrases** — same phrase set as the AI input guardrail.
+3. **Truncation** — output exceeding 50 000 characters is truncated;
+   `"\n...[truncated]"` is appended. Truncated replies still succeed
+   (logged at WARN).
+
+`injection_detected = true` maps to `HandlerFailed`. `truncated = true`
+passes through with a WARN log.
+
+## Wire format (`tool.web_fetch`)
 
 ```
 arg:     "<url>"            // GET <url>, cap at [tool] max_bytes
@@ -235,11 +304,11 @@ arg:     "<url>"            // GET <url>, cap at [tool] max_bytes
 return:  body bytes (UTF-8 only — non-UTF-8 responses are an error)
 ```
 
-Errors map to `ErrorEnvelope`:
+Error mapping for all web capabilities:
 
 | Cause | `kind` |
 |---|---|
-| SSRF reject, scheme reject, invalid url | `policy_denied` (6) |
+| SSRF reject, scheme reject, invalid url, blocklist hit, not-allowlisted | `policy_denied` (6) |
 | Body too large, non-text content-type, non-utf8 body | `invalid_args` (5) |
 | Non-2xx HTTP | `responder_internal` (11) |
 | reqwest transport failure | `transport` (1) |

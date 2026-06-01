@@ -1,208 +1,175 @@
 # Channel Node Architecture
 
 A **channel node** is a Relix peer whose job is to translate between
-an asynchronous external messaging surface (Telegram chat, SMS,
-email, IRC, …) and the Task-native runtime. Channels are
-deliberately **task-first**: every inbound message becomes a Task,
-every outbound reply is the closing of a Task attempt (or a
-checkpoint event), and the operator surfaces (`/v1/tasks`,
-`relix-cli task get`) treat channel-originated work identically to
-HTTP-originated work.
+an asynchronous external messaging surface (Telegram, Discord, Slack,
+email) and the mesh runtime. Channels are deliberately **task-first**:
+every inbound message becomes a Task, every outbound reply is the
+closing of a Task attempt (or a checkpoint event), and the operator
+surfaces (`/v1/tasks`, `relix-cli task get`) treat channel-originated
+work identically to HTTP-originated work.
 
-This document is the **design contract**. Telegram is the first
-channel and the rest of this doc names it concretely, but the same
-shape applies to future channels.
+This document is the **design contract** shared by all four channel
+implementations.
 
 ## TL;DR
 
 - **Channel = task source.** It does not orchestrate, does not plan,
   does not retry. It creates Tasks, marks attempt boundaries, and
   forwards results.
-- **SOL still owns orchestration.** The channel hands the
-  task_id + raw user input to a SOL flow (`flows/channel_*.sol`)
-  via the same FlowRunner path the bridge uses. The flow decides
-  what to call.
-- **Identity is per-channel.** Telegram users do NOT get Relix
+- **The controller calls `ai.chat` directly.** Each channel calls
+  `memory.recent_for_session` (last 10 turns) → optional
+  `routing.resolve` → `ai.chat` → two `memory.write_turn` calls.
+  The `flow_template` config key exists but is reserved and not
+  currently validated or wired.
+- **Identity is per-channel.** Users do NOT get Relix
   IdentityBundles. They get a channel-scoped derived identity tied
-  to their Telegram user id, and a policy gate that admits
+  to their platform user id, and a policy gate that admits
   whichever Relix capability set the operator chooses.
 - **Async by default.** Channels can deliver replies seconds,
-  minutes, or hours after the inbound message (long-running flows,
-  awaiting_input, retries). The channel keeps the chat thread →
-  task_id mapping so it can re-find the conversation when a flow
+  minutes, or hours after the inbound message (long-running work,
+  awaiting_input). The channel keeps the chat thread → task_id
+  mapping so it can re-find the conversation when a request
   finishes.
 
 ## Non-goals (deliberate)
 
-This phase ships the **architecture and scaffold**, not a working
-bot. Specifically NOT in scope tonight:
-
-- Sending a token-authenticated message over the actual Telegram
-  Bot API. Tokens are configured via the dashboard's Telegram
-  settings page; the live HTTPS client wiring lands once the
-  scaffold's BotApi trait has a `reqwest`-backed impl alongside
-  the existing `MockBotApi`.
-- Long-poll vs webhook delivery model decision (both are valid;
-  the architecture supports either).
-- Multi-channel session bridging (one user on Telegram + the same
-  user on a web bridge).
-- Group chats. The first slice is 1:1 DM only.
-- Voice / image / file uploads. Text-only first slice.
+- **Multi-channel session bridging** — a user on Telegram and the
+  same user on the web bridge today get two unrelated sessions.
+  Unifying them needs a "channel-linked identity" model; out of
+  scope.
+- **Group chats.** The first slice is 1:1 DM / single-channel only.
+- **Streaming responses.** Telegram does not natively support token
+  streaming. Reserved for a future iteration using repeated message
+  edits.
+- **No approval-notifier polling loop for Discord + Slack.**
+  `operator_user_id` is reserved. The `approval_send` capability
+  and bridge interaction webhooks are fully wired; a background loop
+  that proactively polls for `awaiting_input` tasks (like Telegram's
+  notifier) has not been built for these channels.
 
 ## Architecture
 
-### Where the node lives
+### Where the nodes live
 
 ```
-   ┌────────────────┐                   ┌──────────────────┐
-   │   Telegram     │  Bot API (HTTPS)  │  relix-telegram  │
-   │   (external)   │ ◄──────────────►  │  (channel node)  │
-   └────────────────┘                   └────────┬─────────┘
-                                                 │ libp2p (Noise XK + Yamux)
-                                                 │ same admission pipeline as
-                                                 │ every other peer
-                                                 ▼
-                                       ┌──────────────────┐
-                                       │   relix mesh     │
-                                       │  coordinator,    │
-                                       │  ai, memory,     │
-                                       │  tool, ...       │
-                                       └──────────────────┘
+   ┌──────────────────────────────────────────────────────────────┐
+   │                  External messaging platforms                 │
+   │   Telegram API   Discord API   Slack Web API   IMAP / SMTP   │
+   └───────┬────────────────┬──────────────┬──────────────┬───────┘
+           │                │              │              │
+           ▼                ▼              ▼              ▼
+   ┌────────────┐  ┌──────────────┐  ┌──────────┐  ┌──────────┐
+   │  relix-    │  │  relix-      │  │  relix-  │  │  relix-  │
+   │  telegram  │  │  discord     │  │  slack   │  │  email   │
+   │  (ch node) │  │  (ch node)   │  │ (ch node)│  │ (ch node)│
+   └─────┬──────┘  └──────┬───────┘  └────┬─────┘  └────┬─────┘
+         │                │               │              │
+         └────────────────┴───────────────┴──────────────┘
+                          │ libp2p (Noise XK + Yamux)
+                          │ same admission pipeline as every other peer
+                          ▼
+                ┌──────────────────┐
+                │   relix mesh     │
+                │  coordinator,    │
+                │  ai, memory,     │
+                │  tool, ...       │
+                └──────────────────┘
 ```
 
-The `relix-telegram` crate is a **controller** like every other
-node — same identity bundle, same policy file, same audit log. The
-Telegram-specific surface (HTTPS to Telegram, the channel-side
-session storage) is entirely on one side of the controller; the
-other side speaks libp2p like any other Relix peer.
+Each channel crate is a **controller** like every other node — same
+identity bundle, same policy file, same audit log. The
+platform-specific surface (HTTPS to the platform API, the
+channel-side session storage) is entirely on one side; the other
+side speaks libp2p like any other Relix peer.
 
 ### Process boundary
 
-`relix-telegram` runs as its own OS process started by the bringup
-script (next to `relix-controller`-spawned `memory` / `ai` / `tool`
-peers). It does NOT live inside the bridge. Reasons:
+Each channel controller runs as its own OS process started by the
+bringup script (next to `relix-controller`-spawned `memory` / `ai`
+/ `tool` peers). They do NOT live inside the bridge. Reasons:
 
-1. **Different failure modes.** Telegram Bot API outages should not
-   take chat HTTP requests down.
+1. **Different failure modes.** A platform API outage should not
+   take HTTP chat requests down.
 2. **Different identity needs.** The bridge's identity is "operator
-   surface"; the channel's is "channel ingestor" — these get
+   surface"; each channel's is "channel ingestor" — these get
    different policy admissions.
-3. **Different lifecycle.** Bridge is request/response; the channel
-   is long-poll or webhook.
+3. **Different lifecycle.** Bridge is request/response; channels
+   are long-poll, IMAP IDLE, or webhook.
 
 ### What the channel does on each inbound message
 
 ```
-1. Receive Telegram update (long-poll OR webhook handler).
-2. Look up / derive ChannelSubject from chat_id + user_id.
-3. Apply per-chat rate limit + simple sanitisation.
-4. Call coordinator: task.create(
-       title="telegram: <truncated message>",
-       flow_template="flows/channel_telegram.sol",
-       params_json={chat_id, user_id, message_id, text},
-       retry_policy=none,
-       max_runtime_secs=<configured channel timeout>)
-5. Persist (chat_id, message_id) → task_id mapping in the
-   channel's local SQLite (separate from the Coordinator's DB).
-6. Run the SOL flow via FlowRunner (same path as the bridge):
-       - task.update(status=running, trace_id=<minted>)
-       - FlowRunner::run with flow_template above
-       - on completion: task.update(status=completed, result=...,
-         flow_id=..., flow_log_path=...)
-       - on failure: task.update(status=failed, error_*, failure_class=...)
-7. Once the flow completes, post the result back to Telegram as
-   a reply to the original message (look up the chat from the
-   persisted mapping).
+1. Receive platform update (long-poll, IMAP IDLE, or webhook handler).
+2. Record in bounded ring + state (messages_seen, last_message_at).
+3. Derive / look up ChannelSubject from (channel_id, user_id).
+4. Permit-list check (allowed_users / allowed_senders). Blocked
+   callers get a static error reply; the ring entry is still recorded.
+5. Parse slash command (if applicable).
+6. For chat messages:
+       a. Emit typing indicator (Telegram only).
+       b. memory.recent_for_session(session_id, 10)
+       c. Optional: routing.resolve (coordinator decision)
+       d. ai.chat(session_id, history)
+       e. memory.write_turn × 2 (user + assistant halves)
+       f. Deliver reply to the originating surface.
+7. task.create(origin_surface=<channel>)
+   task.event("task.<channel>.inbound")
+   task.update(status=completed|failed)
 ```
-
-Steps 4-6 are **identical** to what the bridge does on `POST /chat`.
-The only differences are step 7 (channel-specific delivery) and the
-fact that step 1 is event-driven rather than request/response.
 
 ### Async outbound delivery
 
-Because steps 4-7 can take arbitrarily long (the flow might call
-`tool.web_fetch` plus `ai.chat` plus another tool call, totalling
-tens of seconds), the channel does NOT block the inbound update
-handler. The handler:
+Because the ai.chat call can take tens of seconds (tool calls,
+coordinator approval gates, etc.), the channel does NOT block the
+inbound update handler. The handler spawns a tokio task that runs
+the entire pipeline and delivers the reply when it finishes. The
+inbound poll loop (or webhook server) returns immediately.
 
-1. Persists the mapping.
-2. Spawns a tokio task that does steps 4-7.
-3. Returns to the long-poll loop immediately.
-
-That tokio task can complete in 50ms or 50 minutes. When it
-finishes, it uses the chat_id from its closure to post the reply.
-**Telegram never sees a "typing forever" indicator** — the response
-arrives whenever the flow finishes.
-
-For flows that the SOL author wants to acknowledge mid-execution
-(e.g. "looking that up, one moment..."), the flow can append a
-`task.event` with a known type and the channel polls those events
-to relay them. This is **optional** and not in the first slice;
-the protocol seam is reserved.
+All RPC calls — memory, ai, coordinator — are best-effort. A
+failure at any step logs WARN, the pipeline degrades gracefully
+(empty history, static fallback reply), and the task is marked
+failed. Send failures do not panic.
 
 ## Identity model
 
-Telegram users do not have Relix IdentityBundles. The channel
-node creates a **derived subject** per Telegram user:
+Platform users do not have Relix IdentityBundles. Each channel
+creates a **derived subject** per (channel, user) pair:
 
-- `subject_id = blake3("telegram:" + user_id + ":" + chat_id)[..32]`
-- `groups = ["channel-telegram-users"]` (or whatever the operator
-  configures via the channel's TOML).
-- `display_name = "telegram:<username>"`
+| Channel | Hash input | Key types |
+|---|---|---|
+| telegram | `"telegram:{user_id}:{chat_id}"` | both i64 |
+| discord | `"discord:{user_id}:{channel_id}"` | both &str |
+| slack | `"slack:{user_id}:{channel_id}"` | both &str |
+| email | derived from RFC 5322 threading headers | n/a |
 
-This derived identity is **the channel node's IdentityBundle's
-subject_id when forwarding** — the channel acts as a Relix peer
-that says "I am facilitating a request for user X." Two
-consequences:
+All three chat channels use blake3 on the namespaced string. Email
+derives the session from `email-thread:<References[0]>` →
+`email-thread:<In-Reply-To>` → `email-thread:<Message-ID>`.
+Namespacing means a Discord user and a Telegram user with the same
+numeric id never collide.
 
-1. The Coordinator's audit log records `caller_subject_id =
-   <channel's bundle subject>` and the channel sets `owner_subject_id`
-   on `task.create` to the derived per-user subject. Operators can
-   query "all Tasks owned by telegram:<user_id>" without parsing.
-2. Per-user policy is enforced at the **flow's** capability calls,
-   not at the channel's `task.create`. So a flow that calls
-   `ai.chat` runs under the channel's identity (admitted to
-   `chat-users` group); `tool.web_fetch` ditto. If the operator
-   wants per-Telegram-user rate limiting they apply it at the
-   channel's rate limiter (step 3 above).
-
-This is the same trust model as the bridge: the bridge identity
-is the one the mesh trusts; the bridge is responsible for
-verifying its incoming HTTP request. The channel identity is the
-one the mesh trusts; the channel is responsible for verifying its
-inbound Telegram updates (signed via the Telegram Bot API's TLS).
+The channel acts as a Relix peer that says "I am facilitating a
+request for user X." The coordinator audit log records
+`caller_subject_id = <channel's bundle subject>` and the channel
+sets `owner_subject_id` on `task.create` to the derived per-user
+subject. This is the same trust model as the bridge.
 
 ## Configuration shape
 
-```toml
-# channel-telegram.toml — same shape as any controller TOML.
-[controller]
-identity_bundle = "dev-keys/local-telegram.aic"
-client_key      = "dev-keys/local-telegram.key"
-data_dir        = "dev-data/local-telegram"
-policy_path     = "configs/policies/local.toml"
-peers_path      = "dev-data/local/peers.toml"
+Every channel TOML shares a `[controller]` header plus a
+channel-specific section. Full per-channel config references are in
+the individual channel docs. Key fields common to all chat channels:
 
-# Telegram-specific section.
-[telegram]
-# Source for the Bot API token. The token MUST NOT live in this
-# file; the operator either sets the env var or passes a path to
-# a secret-management binary.
-bot_token_env   = "RELIX_TELEGRAM_BOT_TOKEN"
-# Delivery mode: "long_poll" (default, no public ingress) or
-# "webhook" (requires a TLS-terminating proxy).
-mode            = "long_poll"
-# Per-chat rate limit. Conservative default.
-max_inbound_per_chat_per_minute = 6
-# SOL flow template that runs for each inbound message.
-flow_template   = "flows/channel_telegram.sol"
-# Hard ceiling on per-message flow runtime. The Coordinator's
-# recovery scan flips overdue rows to interrupted.
-max_runtime_secs = 60
-# Coordinator alias (must match the [peers] entry).
-coordinator_alias = "coordinator"
-```
+| Field | Default | Notes |
+|---|---|---|
+| `token_env` | required | Env var name holding the bot token. |
+| `allowed_users` / `allowed_senders` | `[]` | Empty = allow everyone. |
+| `messages_ring_capacity` | `200` | Bounded in-memory ring for dashboard. |
+| `poll_interval_secs` | `2` (Discord/Slack), `1` (Telegram) | REST poll cadence. |
+| `state_db_path` | absent | Optional SQLite for persistent state (FIX 2, FIX 4). |
+| `[<channel>.memory_peer]` | required | `addr`, `alias`, `deadline_secs`. |
+| `[<channel>.ai_peer]` | required | `deadline_secs` default 60 s. |
+| `[<channel>.coord_peer]` | required | `deadline_secs` default 10 s. |
 
 The `[controller]` section is shared with every other controller
 TOML; the bringup script generates it the same way it generates
@@ -210,118 +177,144 @@ TOML; the bringup script generates it the same way it generates
 
 ## Capabilities the channel node consumes
 
+Every channel consumes:
 - `task.create` — mint the per-message task.
 - `task.update` — open + close the attempt, set terminal status.
-- `task.event` — checkpoint events for SOL-mid-flight progress.
-- `ai.chat` / `memory.*` / `tool.*` — whatever the channel's SOL
-  flow uses. Same admission pipeline as the bridge's flows.
+- `task.event` — inbound event tagging.
+- `memory.recent_for_session` / `memory.write_turn` — history reads/writes.
+- `routing.resolve` — optional routing decision.
+- `ai.chat` / `dispatch_chat` — model invocation.
 
-The channel does NOT need its own capability surface (it doesn't
-respond to RPCs from other peers). It is a **client-only** peer
-in the alpha.
+Additional per-channel capabilities (registered by the channel as a
+**server**, not a consumer):
 
-## Capabilities the channel node does NOT consume
+| Capability | Direction | Present on |
+|---|---|---|
+| `<ch>.status` | read-only | all four |
+| `<ch>.messages_recent` | read-only | all four |
+| `<ch>.send` | mutating | all four |
+| `<ch>.approval_send` | mutating | all four (PART 8) |
+| `<ch>.health` | read-only | Telegram, Discord, Slack (FIX 49) |
+| `telegram.webhook_update` | mutating | Telegram only (FIX 1) |
+| `email.send_template` | mutating | Email only |
 
-- `task.recover` — operator concern, not channel.
-- `task.retry` — operator decides; the channel does not auto-retry
-  a Telegram message.
-- `task.list` / `task.get` / `task.attempts` — operator concern.
+## Persistent state per channel
 
-This list is enforced by the policy file (channel's group should
-only admit the four creation/update/event capabilities + the
-flow's own capability set).
+| Channel | Store | SQLite table | Opt-in config |
+|---|---|---|---|
+| Discord | `DiscordWatermarkStore` | `discord_watermarks` | `state_db_path` |
+| Slack | `SlackBotStartStore` | `slack_bot_start` | `state_db_path` |
+| Telegram | `SqliteSessionStore` | `telegram_sessions` | `session_db_path` |
+| Email | none | — | — |
 
-## SOL flow shape
+All SQLite stores use WAL mode, `synchronous=NORMAL`,
+`busy_timeout=5000 ms`. The Telegram session store runs a TTL sweep
+every `DEFAULT_SWEEP_INTERVAL = 3600 s`; sessions idle longer than
+`session_ttl_hours` (default 24 h) are removed. Active sessions are
+bumped on every lookup to survive the sweep.
 
-A first-cut `flows/channel_telegram.sol`:
+## Message formatting
 
-```
-# Reads channel-supplied params from heap:
-#   {{CHAT_ID}}, {{USER_ID}}, {{MESSAGE_ID}}, {{TEXT}}
-# Writes a turn to memory (per-user session keyed on user_id).
-# Calls ai.chat with whatever context the flow author wants.
-# Returns the reply text.
+The shared `channels.rs` module provides formatting helpers used by
+all three chat channels:
 
-PUSH_S "telegram:user-{{USER_ID}}"           # session id
-PUSH_S "{{TEXT}}"
-REMOTE_CALL "memory" "memory.write_turn"
-REMOTE_CALL "memory" "memory.read_session"
-REMOTE_CALL "capability:ai.chat" "ai.chat"
-```
-
-Identical primitives to the bridge's flow templates. SOL stays the
-orchestration authority.
+| Function | Purpose |
+|---|---|
+| `format_for_discord(text)` | Splits at `DISCORD_MAX_MESSAGE_LEN = 1900` chars. Only the first chunk threads as a reply; subsequent chunks are posted standalone. |
+| `format_for_telegram_markdown_v2(text)` | Single-pass MarkdownV2 escaping with fenced-code-block awareness. Does **not** preserve inline markdown (`*bold*`, `_italic_`) — those chars are escaped. |
+| `format_for_slack_mrkdwn(text)` | Converts `**bold**` → `*bold*`, strips code-fence language hints. |
+| `format_for_slack_blocks(text)` | Flat `section` Block Kit array only (no headers, dividers, or action buttons). |
+| `split_at_boundary(text, max_chars)` | Paragraph > sentence > line > space > hard cut. |
 
 ## Failure semantics
 
-Inbound failure modes and where they land:
+All RPC calls (memory, ai, coordinator) are best-effort. Failures
+log WARN; the pipeline degrades gracefully:
 
-| Failure | Where it shows |
+| Failure | Outcome |
 |---|---|
-| Telegram API outage on inbound | Channel logs WARN; long-poll resumes when the API is back. Inbound updates DELIVERED LATER (Telegram queues them) become tasks then. |
-| Channel rate-limited | Channel returns a static "rate limited, try again in N seconds" reply via Telegram without creating a Task. |
-| `task.create` fails | Channel logs ERROR (NOT fail-soft like the bridge — without a Task there is no record of the message). Sends a one-line "I couldn't accept that message right now" reply. Falls back to logging the raw message to the channel's local DB for forensic recovery. |
-| Flow fails | Same as bridge: `task.failed` event, `last_failure_class` set. Channel posts the failure cause to Telegram (one-line). |
-| Flow times out | Recovery scan flips to `interrupted`. Channel polls and posts "your request timed out after N seconds" reply. |
-| Outbound Telegram API failure | Channel retries 3x with exponential backoff (transient), then appends a `channel.delivery_failed` task event and gives up. The Task itself is `completed` — the reply text exists; just couldn't be delivered. |
+| Platform API outage on inbound | Channel logs WARN; polling resumes when API recovers. Telegram queues undelivered updates for 24 h. |
+| Permit-list rejection | Static "You are not authorized" reply sent; inbound still recorded in ring. |
+| `memory.recent_for_session` fails | History is empty; ai.chat proceeds with no prior context. |
+| `ai.chat` fails or returns empty | User receives: "I'm having trouble reaching my brain right now. Please try again in a moment." |
+| Send failure (Discord) | Handler returns; ring entry still recorded; task marked failed. |
+| Outbound Telegram failure | 3 retries with exponential backoff; gives up after transient exhaustion. |
 
 ## What this design protects against
 
 - **No autonomous retries of mutations.** The channel does not
-  loop on flow failures. Operator-initiated retry only.
-- **No hidden orchestration.** SOL owns the flow; the channel is
-  glue.
+  loop on failures. Operator-initiated retry only.
 - **No bypass of the admission pipeline.** Channel calls
   capabilities exactly as the bridge does — every call goes
   through identity → policy → handler → audit.
-- **No token leakage.** Bot token lives in env or secret manager,
-  never in a config file. The channel logs token reference
-  (env var name) but never the value.
+- **No token leakage.** Bot tokens and SMTP/IMAP passwords live
+  in env vars or a secret manager, never in a config file. The
+  channel logs the env var name but never the value.
+- **No self-loop.** Discord and Slack drop bot-authored messages
+  at the parse layer (structural defence). Telegram drops updates
+  with neither `text` nor `voice_file_id`.
 
 ## Open questions (deferred)
 
-- **Delivery model** (long_poll vs webhook) — both supported by
-  the config; first slice picks long_poll because it requires no
-  public ingress. Webhook adds an axum endpoint and TLS
-  termination concerns; ship after long_poll proves the model.
 - **Multi-channel session unification** — a user on both Telegram
-  and the web bridge today gets two unrelated sessions. Unifying
-  them needs a "channel-linked identity" model; out of scope for
-  the first channel.
-- **Streaming responses.** Open WebUI streams reply tokens as they
-  arrive; Telegram does not natively support that (it has message
-  editing). A streaming mode for Telegram would edit the in-flight
-  reply message repeatedly. Out of scope tonight.
-- **Group chats / mentions / commands.** Bot commands like
-  `/help` and `/status` need a dispatcher; mentions need parsing.
-  Reserved for the next channel iteration.
+  and the web bridge today gets two unrelated sessions. A
+  "channel-linked identity" model is out of scope.
+- **Streaming responses** — Telegram does not natively support
+  streaming; a streaming mode would need repeated message edits.
+  Reserved for a future iteration.
+- **Group chats** — multi-user group session management and
+  `@mention` routing are out of scope for the first slice.
+- **Discord + Slack approval-notifier polling loop** — the proactive
+  "post when a task enters awaiting_input" pattern (already
+  implemented for Telegram) is reserved for Discord and Slack.
 
 ## Trust boundary summary
 
-| Trust dimension | Web bridge | Channel node |
+| Trust dimension | Web bridge | Channel nodes |
 |---|---|---|
-| Inbound auth | None (operator's reverse proxy) | Telegram TLS + bot token |
-| Identity mapped to subject | bridge bundle | derived per-user (`telegram:user_id:chat_id`) |
+| Inbound auth | None (operator's reverse proxy) | Platform TLS + bot token / credentials |
+| Identity mapped to subject | bridge bundle | derived per-user (namespaced blake3) |
+| Inbound signature verification | n/a | Discord: Ed25519; Slack: HMAC-SHA256; Telegram webhook: CIDR guard; Email: optional Mailgun HMAC |
 | Per-user rate limit | No (proxy-level) | Yes (channel config) |
 | Admission pipeline | Yes | Yes |
 | Auto-retry | No | No |
-| Orchestration | No (SOL flow) | No (SOL flow) |
-| Persistence ownership | Coordinator | Coordinator (+ tiny channel-local mapping DB) |
+| Orchestration | No (direct ai.chat) | No (direct ai.chat) |
+| Persistence ownership | Coordinator | Coordinator (+ optional channel-local SQLite) |
 
-## Code organisation (when implementation lands)
+## Code organisation
+
+Each channel client crate (`relix-telegram`, `relix-discord`,
+`relix-slack`) contains:
 
 ```
-crates/
-  relix-telegram/
-    src/
-      main.rs           # controller bootstrap (identity, policy, libp2p, run loop)
-      config.rs         # parse [telegram] section
-      session_store.rs  # SQLite mapping (chat_id, message_id) -> task_id
-      ingest.rs         # long-poll loop OR webhook handler
-      flow_runner.rs    # task.create + update + dispatch to FlowRunner
-      delivery.rs       # outbound POST to Telegram Bot API (with retry)
-      derived_identity.rs # blake3 of channel:user_id:chat_id
+src/
+  lib.rs           # pub trait (BotApi / DiscordApi / SlackApi)
+  config.rs        # crate-level config struct (bot_token_env, channel_id, …)
+  live.rs          # reqwest-backed live implementation
+  mock.rs          # in-memory mock for tests
+  messages.rs      # IncomingMessage, OutgoingMessage, ParseMode, …
+  identity.rs      # derive_channel_subject (blake3 namespaced hash)
+  approval.rs      # SingleChannelDispatch impl + signature verification
+  session_store.rs # (telegram only) InMemorySessionStore + SqliteSessionStore
 ```
+
+The runtime controller lives in
+`crates/relix-runtime/src/nodes/<channel>/` with modules:
+
+```
+config.rs      # runtime-layer TOML config (token_env, peers, rings, …)
+state.rs       # ChannelState + ChannelHealth (FIX 49)
+ring.rs        # MessageRing (bounded inbound ring)
+controller.rs  # polling/webhook loop, per-message handler
+client.rs      # outbound mesh RPC (memory, ai, coordinator calls)
+commands.rs    # slash-command parser + static reply strings
+mod.rs         # capability registration + handler dispatch
+```
+
+Email runtime lives in
+`crates/relix-runtime/src/nodes/email/` with `config.rs`,
+`state.rs`, `ring.rs`, `controller.rs`, `client.rs`, `commands.rs`,
+`smtp.rs`, `imap.rs`, `dkim.rs`, and `mod.rs`.
 
 ## See also
 

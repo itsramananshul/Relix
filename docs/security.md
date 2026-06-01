@@ -1,5 +1,7 @@
 # Security Model
 
+Version: 0.4.1
+
 This document describes what the alpha actually enforces, in code, today.
 What it does **not** enforce is in
 [`current-limitations.md`](current-limitations.md). If you are evaluating
@@ -57,7 +59,7 @@ Lifetime defaults to 24h. Bundle verification happens **on the
 responder** for every inbound call:
 
 ```
-admission step 5: validate_identity_bundle(bundle, trust_root, now)
+admission step 3: validate_identity_bundle(bundle, trust_root, now)
     -> verifies the signature with the configured trust root,
     -> checks not_before <= now <= not_after,
     -> rejects with error_kind = IDENTITY_INVALID on any failure.
@@ -118,17 +120,25 @@ on every inbound `/relix/rpc/1` request:
    `TIMEOUT` + error audit.
 3. **Validate identity bundle.** Signature + lifetime against the
    configured trust root → `IDENTITY_INVALID` on any failure.
-4. **Capability lookup.** No registered handler for the method →
+4. **Agent gate.** When the responder has agent profiles configured, a
+   five-phase admission check runs here (see §"Agent gate" below). This
+   step sits between identity verification and the policy engine.
+5. **Capability lookup.** No registered handler for the method →
    `UNKNOWN_METHOD` + error audit.
-5. **Policy evaluation.** No matching allow rule → `POLICY_DENIED` +
-   denied audit. **The handler is not called.**
-6. **Dispatch.** Handler runs with verified caller identity + raw
+6. **Policy evaluation.** `TenantPolicyResolver` applies the per-method
+   allow/deny rules for the caller's tenant. No matching allow rule →
+   `POLICY_DENIED` + denied audit. **The handler is not called.**
+7. **Dispatch.** Handler runs with verified caller identity + raw
    argument bytes.
-7. **Audit.** Final record with status (`ok` / `error` / `denied`),
+8. **Audit.** Final record with status (`ok` / `error` / `denied`),
    policy decision string, and `error_kind` if any.
 
-A handler can only ever observe step 6. Steps 1–5 are not bypassable
-by handler code; steps 7 always runs.
+A handler can only ever observe step 7. Steps 1–6 are not bypassable
+by handler code; step 8 always runs.
+
+`GateDecision::Allow` from the agent gate does NOT bypass the policy
+engine. The gate only narrows; it never widens. Policy evaluation (step 6)
+always follows.
 
 ## Audit log
 
@@ -231,10 +241,19 @@ tracing log records every redirect rejection as a structured WARN line.
   WARN; **every method is still default-denied** until you add a rule
   for it. The permissive engine only relaxes the global `[admit]`
   groups check, not per-method allow rules.
-- Missing identity bundle → admission step 5 rejects with
+- Missing identity bundle → admission step 3 rejects with
   `IDENTITY_INVALID` and the responder writes an audit record with
   caller `<unverified>`.
 - Missing or invalid trust file → controller refuses to start.
+- **No agent store wired** → admission step 4 returns
+  `AGENT_STORE_NOT_CONFIGURED` deny. This is not a no-op — it is a
+  deny on every call.
+- **No agent profile for caller** → admission step 4 returns
+  `AGENT_NO_PROFILE` deny. The legacy silent-allow behaviour was
+  removed; missing profiles are now fail-closed.
+- **Tenant isolation enabled with missing tenant_id** →
+  `TenantPolicyResolver` returns `SECURITY_DENIED`. No call proceeds
+  without a valid tenant identifier when isolation is on.
 - DNS resolution that returns no addresses, or any forbidden address →
   `tool.web_fetch` rejects without contacting the origin.
 - Audit write failure → logged at `error!` level; the response still
@@ -279,17 +298,47 @@ These are all listed in
       not be able to reach internal infrastructure beyond the
       hostnames you intend it to fetch.
 
-## Agent gate (optional second admission step)
+## Agent gate
 
-When the responder has agent profiles configured (see
-[`agents.md`](agents.md)), an additional **agent gate** runs between
-the identity-bundle check (step 3) and the policy evaluation (step
-5). It compares the caller's subject_id against the agent ledger and
-applies a five-phase check (status / surface allowlist / risk
-ceiling / deny lists / allow lists), with an optional
-"approval-required" path that pauses the call until an operator
-approves it. The gate **narrows** policy, never widens it — policy
-remains the floor. Empty agent ledger ⇒ gate is a no-op.
+The agent gate runs at admission step 4 — between identity-bundle
+verification and the policy engine. It applies up to eight sequential
+checks against the caller's agent profile:
+
+1. **No store wired** → `AGENT_STORE_NOT_CONFIGURED` deny.
+2. **`profile = "allow-all"`** → `Allow { matched_rule:
+   "allow_all_profile" }`. Runs before status check; auditable as a
+   distinct bypass.
+3. **Status** — `suspended` → `agent_suspended`; `disabled` →
+   `agent_disabled`; any value other than `active` →
+   `agent_status_unknown`.
+4. **Surface check** — the gate reads `GateInputs::caller_surface`,
+   which is the **transport-layer peer alias** (trusted). The
+   `RequestEnvelope.surface` field is explicitly **ignored** for
+   admission. A forged `envelope.surface` cannot bypass a surface
+   allowlist.
+5. **Risk ceiling** — `safe(0) < low(1) < medium(2) < high(3) <
+   critical(4)`; unknown risk ranks as 4.
+6. **Deny lists** — categories then sensitivity tags.
+7. **Allow lists** — categories; all sensitivity tags of the
+   capability must be in the allowlist.
+8. **Approval-required** — if a standing approval exists for the
+   category → `Allow { matched_rule: "standing_approval:<category>" }`;
+   otherwise → `RequireApproval`.
+
+Default pass (no rule triggered) → `Allow { matched_rule:
+"agent_gate_pass" }`.
+
+**No profile, no access.** Callers without an agent profile in the
+store receive `AGENT_NO_PROFILE` deny. The legacy "gate is a no-op for
+missing profiles" behaviour was removed.
+
+**Approval tokens.** Token-bearing calls bypass the eight phases and
+enter `evaluate_token` directly. See
+[`approval-tokens.md`](approval-tokens.md) for the full token
+verification chain.
+
+For the delivery matrix, escalation, and per-agent configuration see
+[`agents.md`](agents.md).
 
 ## HTTP bridge authentication
 
@@ -402,11 +451,167 @@ happened. Issue a fresh provider key via the provider's rotation
 flow, and for Relix-issued libp2p secrets delete the old file
 and let the next start regenerate it.
 
+## Tenant policy isolation
+
+`TenantPolicyResolver` resolves per-method policy for each call with
+an optional per-tenant override file (`{dir}/{tenant_id}.policy.toml`).
+When `tenant_isolation_enabled = true` in the resolver config, any call
+whose `tenant_id` is absent, empty, or whitespace-only is denied with
+`error_kind = SECURITY_DENIED` before the policy file is consulted.
+This is fail-closed isolation: no tenant, no access.
+
+The resolver uses an LRU cache (cap 1000) with a configurable TTL per
+entry. Tenant IDs are sanitised to `[A-Za-z0-9_]` (other chars → `_`);
+`None` / empty → `"default"`.
+
+## Mesh PII gate
+
+When `[mesh_pii]` is enabled, every `RequestEnvelope.args` byte string
+is scanned for PII before the dispatch bridge routes to a handler. The
+gate is zero-overhead when disabled (`enabled = false`, the default).
+
+Three actions on detection:
+
+| Action | Effect on call |
+|---|---|
+| `block` | Short-circuit; caller receives `POLICY_DENIED`. Handler does not run. |
+| `redact` | `args` is rewritten in place with PII replaced. Handler sees redacted args. |
+| `log_only` | Call proceeds unchanged. PII event row written for audit. |
+
+Default action is `redact`.
+
+All three actions write a `pii_event` row to `pii_events.sqlite` when
+PII spans are detected. Query via `pii.scan_stats` and
+`pii.recent_events` capabilities.
+
+```toml
+[mesh_pii]
+enabled          = false         # default; set true to activate
+action           = "redact"      # "block" | "redact" | "log_only"
+scan_args        = true
+scan_responses   = false         # expensive for SSE; off by default
+exempt_methods   = []
+# chronicle_path = "data/pii_events.sqlite"   # default: data_dir/pii_events.sqlite
+```
+
+## Plugin sandbox
+
+Every external plugin runs as a child process. The sandbox applied
+before the plugin executable starts:
+
+**All Unix systems:**
+- `RLIMIT_AS` = `max_memory_mb × 1024 × 1024` (default 512 MiB)
+- `RLIMIT_CPU` = `max_cpu_secs` (default 30 s)
+- `RLIMIT_NOFILE` = 100 file descriptors
+- `RLIMIT_CORE` = 0 (no core dumps)
+
+**Linux additionally:**
+- `prctl(PR_SET_NO_NEW_PRIVS, 1)` — prevents privilege escalation
+  via exec.
+- Seccomp BPF, default-allow with explicit KillProcess deny list for 23
+  syscalls: `init_module`, `finit_module`, `delete_module`,
+  `kexec_load`, `kexec_file_load`, `mount`, `umount2`, `pivot_root`,
+  `chroot`, `reboot`, `ptrace`, `perf_event_open`, `capset`, `setuid`,
+  `setgid`, `setreuid`, `setregid`, `setresuid`, `setresgid`, `bpf`,
+  `swapon`, `swapoff`.
+- Supported seccomp architectures: `x86_64`, `aarch64`. Other
+  architectures get rlimits + `PR_SET_NO_NEW_PRIVS` but not seccomp.
+
+**Windows / non-Unix:** if any sandbox cap is non-zero, `ensure_enforceable()`
+returns `LoadError::SandboxUnenforceable` and the plugin is **not
+loaded**. To run a plugin on Windows, set all three caps to `0` in the
+config (removes all OS-level resource bounds). This is a known
+limitation; do not run untrusted plugins on Windows in this state.
+
+### TLS loopback transport
+
+Plugin ↔ host communication uses TLS over loopback (`127.0.0.1`):
+
+- A fresh self-signed certificate is minted per plugin per launch
+  (IP SAN `127.0.0.1` only).
+- The dispatcher pins the exact DER certificate. A different cert
+  at the same port → TLS handshake failure.
+- A per-plugin random bearer token (32 bytes, hex-encoded) is passed
+  to the plugin process via `RELIX_PLUGIN_BEARER`. Wrong bearer →
+  `401 unauthorized: bearer mismatch`.
+
+### Supply-chain guards in `plugin.toml`
+
+| Field | Effect |
+|---|---|
+| `publisher_key` | 64-hex Ed25519 public key. When present, the loader reads `<manifest>.sig` (128-hex Ed25519 sig over raw TOML bytes) and refuses load on missing or invalid signature. |
+| `binary_sha256` | 64-hex SHA-256 of the plugin binary. Checked at spawn; mismatch refuses load. |
+
+Both fields are optional. Omitting them relaxes the respective guard.
+
+## Secret redaction (`redact_secrets`)
+
+`relix_core::redact::redact_secrets(input)` replaces matched secrets in
+any string with `[REDACTED:<KIND>]`. It is applied to log output, error
+messages, and tool arguments before they leave the process boundary.
+
+Thirteen secret kinds are matched:
+
+| Kind | Pattern anchor |
+|---|---|
+| `ANTHROPIC_KEY` | `sk-ant-` |
+| `OPENAI_KEY` | `sk-` (after Anthropic/Stripe) |
+| `STRIPE_KEY` | `sk_live_` |
+| `SLACK_TOKEN` | `xoxb-` |
+| `GITHUB_PAT` | `ghp_` / `github_pat_` |
+| `GITHUB_OAUTH` | `gho_` |
+| `GOOGLE_KEY` | `AIza` |
+| `AWS_KEY` | `AKIA` + 16 uppercase-base32 chars |
+| `AWS_TEMP_CREDENTIAL` | `ASIA` + 16 uppercase-base32 chars |
+| `JWT` | 3-segment base64url (≥20 chars each) separated by `.` |
+| `BEARER_TOKEN` | `Bearer ` prefix |
+| `PRIVATE_KEY_BLOCK` | `-----BEGIN * PRIVATE KEY-----` block |
+| `INLINE_SECRET` | `api_key`/`password`/`secret`/`token`/`auth` = `…` |
+
+All matchers enforce a word-boundary on the leading side. Public-key
+PEM blocks are intentionally not redacted.
+
+`UntrustedText` is a companion type that wraps operator-or-user-supplied
+content. It intentionally does not implement `Display`; callers must call
+`wrap_for_prompt()` (adds `--- BEGIN/END UNTRUSTED DATA ---` fences) or
+`as_raw()` to signal the intended use. This prevents prompt-injection
+vectors from accidentally flowing into signed envelopes.
+
+## Encrypted credential vault
+
+Credentials (API keys, OAuth tokens, arbitrary secrets) are stored
+AES-256-GCM encrypted with Argon2id key derivation. The vault is
+documented fully in [`credentials.md`](credentials.md). Key points for
+the security model:
+
+- Vault format v1 (SHA-256 KDF, no salt) is **refused at open** —
+  operators must migrate with `relix credentials migrate-kdf`.
+- `credentials.get` enforces caller-equals-owner; no admin bypass.
+- Derived keys and decrypted values are `Zeroizing<>` — wiped on drop.
+- The master secret is read from `RELIX_CREDENTIAL_KEY` (or the env var
+  named in `master_key_env`); it is never written to disk.
+
+## Approval tokens
+
+Out-of-band operator approvals produce Ed25519-signed tokens that the
+agent presents to the admission gate. Token details are in
+[`approval-tokens.md`](approval-tokens.md). Key points:
+
+- Tokens are structured JSON objects (~300–400 chars), **not** HMAC hex
+  strings. The HMAC scheme (v0x01) is rejected at parse.
+- `RELIX_APPROVAL_SIGNING_KEY` is required on every controller that
+  issues tokens. An empty key set causes every token-bearing call to
+  fail `approval_token_missing_key`.
+- Replay is prevented by a BLAKE3-keyed blocklist with atomic
+  `INSERT OR IGNORE` semantics. Replay produces `approval_token_consumed`.
+
 ## See also
 
 - [`tool-node-security.md`](tool-node-security.md) — full SSRF model.
 - [`agents.md`](agents.md) — the agent gate, identity minting,
   permission model.
+- [`approval-tokens.md`](approval-tokens.md) — Ed25519 approval tokens.
+- [`credentials.md`](credentials.md) — encrypted credential vault.
 - [`configuration.md`](configuration.md) — every policy rule, trust
   file, identity bundle path.
 - [`current-limitations.md`](current-limitations.md) — what the alpha

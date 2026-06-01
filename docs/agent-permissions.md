@@ -1,5 +1,7 @@
 # Agent employee permission model
 
+_Version: 0.4.1_
+
 Relix treats every agent as a first-class **employee record**: an
 identity (the AIC bundle), a job (role / title / department /
 team), a permission scope (categorical allow + deny lists, a risk
@@ -30,8 +32,9 @@ policy file remains the floor — categorical permissions can
 **never** widen what policy denies.
 
 When a caller has **no agent profile** keyed by their
-`subject_id`, the gate is a no-op. Existing deployments
-without profiles see today's exact behavior.
+`subject_id`, the gate denies with `AGENT_NO_PROFILE` (fail-closed).
+When the agent store is not wired at all, the gate denies with
+`AGENT_STORE_NOT_CONFIGURED`. Neither is a no-op.
 
 ## The five-phase gate
 
@@ -41,8 +44,10 @@ The gate evaluates checks in this order. The first match wins:
    `disabled` → `agent_disabled` deny. Anything other than
    `active` is denied.
 2. **Surface.** When `surface_allowlist` is non-empty, the
-   request envelope's `surface` field must match one of the
-   allowed surfaces. Empty allowlist = all surfaces.
+   transport-layer-derived `caller_surface` (peer alias) must match one
+   of the allowed surfaces. The envelope's `surface` field is ignored
+   for admission — it is operator-asserted and untrusted.
+   Empty allowlist = all surfaces.
 3. **Risk ceiling.** Compares the called capability's
    `risk_level` against the agent's `risk_ceiling`. Order:
    `safe < low < medium < high < critical`. Above the
@@ -161,11 +166,14 @@ approval covers the category:
    (`#/approvals`), CLI (`relix-cli ops agent approval-decide`),
    the `/approve <approval_id>` Telegram command, or
    `POST /v1/approvals/:id/decide`.
-5. Approval mints a **one-shot** 32-hex `approval_token`.
-   The agent retries the same call with `approval_token`
-   on the envelope.
-6. The gate admits the retried call and consumes the
-   token. Replay fails (`APPROVAL_TOKEN_INVALID`).
+5. Approval mints a **one-shot approval token** — an Ed25519-signed
+   structured object (see [`approval-tokens.md`](approval-tokens.md)
+   for the wire format; it is not a random hex string).
+   The agent retries the same call with `approval_token` on the
+   envelope.
+6. The gate admits the retried call and atomically records the token
+   in `approval_token_blocklist` (`INSERT OR IGNORE`). Replay fails
+   with `approval_token_consumed`.
 
 ### Auto-expire
 
@@ -239,15 +247,18 @@ ignored on admission).
   — operators can grow / shrink an agent's profile without
   re-issuing the AIC. The more restrictive of the two
   wins on every call.
-- **One-shot tokens.** `approval_token` is consumed on
-  first admission. A second use fails with
-  `APPROVAL_TOKEN_INVALID`. This is enforced by the
-  store's `consume_approval_token` method which only
-  succeeds against `status = 'approved'`.
-- **Surface is operator-asserted, not signed.** A
-  compromised bridge could forge the surface tag. The
-  surface gate raises the cost of misuse but is not a
-  hard wall. Signing surfaces is a follow-up.
+- **One-shot tokens.** The approval token is consumed on first
+  admission via an atomic `INSERT OR IGNORE` into
+  `approval_token_blocklist` using a BLAKE3-keyed blocklist key.
+  A second use fails with `approval_token_consumed`. The token is
+  an Ed25519-signed structured object — see
+  [`approval-tokens.md`](approval-tokens.md).
+- **Surface is transport-layer-derived.** The gate reads
+  `caller_surface` from the transport layer (peer alias), not from the
+  request envelope's `surface` field (which is operator-asserted and
+  ignored for admission). A forged `envelope.surface` cannot bypass a
+  surface allowlist. The derivation is based on the TCP port-to-alias
+  map populated at `PeerConnected` time.
 - **Args redaction.** The audit log stores a BLAKE3 hash
   of the method (used as the redaction handle) — the raw
   args never land in the approval table. The hash lets

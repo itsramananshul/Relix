@@ -1,6 +1,6 @@
 # RELIX-5 — Node Manifest Format
 
-**Status:** Frozen target. Alpha implements minimal manifest (SIMP-007 — no gossip).
+**Version:** 0.4.1 | **Status:** Frozen target. Alpha implements minimal manifest (SIMP-007 — no gossip).
 
 ## 5.1 Responsibilities
 
@@ -51,7 +51,7 @@ A controller MUST NOT serve any capability before steps 1–6.
 
 ## 5.9 Refresh
 
-On change to capabilities, endpoints, or runtime — or at 50% of lifetime. Increment `manifest_version`, re-sign, publish digest via gossip.
+On change to capabilities, endpoints, or runtime — increment `manifest_version`, re-sign, publish digest via gossip. The "50% of lifetime" trigger does not apply in alpha (see Alpha Implementation Notes). Refresh period in alpha is operator-configured via the caller of `spawn_refresh_loop`.
 
 ## 5.10 Stale Manifest
 
@@ -59,11 +59,29 @@ A peer holding an expired manifest treats the node as unreachable and refreshes;
 
 ---
 
-## Alpha Implementation Notes
+## Alpha Implementation Notes (v0.4.1)
 
 Alpha ships:
-- Manifest fields: `node_id`, `node_name`, `node_type`, `manifest_version`, `org_id`, `endpoints`, `capability_advertisement` (inline), `policy_bindings.node_policy_path` (filesystem path for alpha, not bundle id), `runtime.version`.
+
+- **Signing mechanism:** `ManifestProvider::signed_snapshot(now_ms)` produces a `SignedManifest` envelope: `CBOR(NodeManifest)` signed with the node's Ed25519 key (`ed25519_dalek`). This is **not** the RELIX-4 `BundleType::NodeManifest` bundle chain described in §5.1; the full bundle chain is Gate 2 work.
+
+  `SignedManifest` wire fields:
+  - `body: Vec<u8>` — CBOR-encoded `NodeManifest`
+  - `signature: [u8; 64]` — Ed25519 signature over `body` bytes
+  - `signer_fingerprint: String` — `hex(blake3(signer_pubkey_bytes))`
+  - `signer_pubkey: [u8; 32]` — raw Ed25519 public key (no prior out-of-band distribution required)
+  - `signed_at_ms: i64` — millisecond timestamp of signing
+
+- **Receiver verification order:** (1) decode envelope; (2) `blake3(signer_pubkey_bytes)` must equal `signer_fingerprint`; (3) Ed25519 signature over body bytes must verify; (4) TOFU pin check (see below); (5) freshness check `(now_ms - signed_at_ms) <= DEFAULT_MANIFEST_TTL_SECS * 1000`.
+
+- **TOFU pinning:** first observed `signer_fingerprint` for a given `node_id` is pinned in `KnownNodesRegistry`. Subsequent manifests from the same node must present the same fingerprint. Pins are **in-memory only** — lost on process restart. A restarting receiver re-pins from the first inbound manifest.
+
+- **Freshness window:** `DEFAULT_MANIFEST_TTL_SECS = 300` (5 minutes). This is applied by the **receiver** on each manifest exchange. Manifests have **no embedded expiry field** (`not_after`); the 5-minute freshness window is the sole staleness mechanism in alpha.
+
+- **Refresh:** caller-configured period passed to `MeshClient::spawn_refresh_loop`. The bridge binary wires 60 s (A.4). There is no "refresh at 50% of lifetime" logic in alpha.
+
+- **Manifest fields:** `node_id`, `node_name`, `node_type` (free-form string; not an enum), `manifest_version` (always 1 at boot in alpha), `org_id`, `endpoints`, `capabilities` (inline `Vec<CapabilityDescriptor>`).
+
 - No IA cosignature (SIMP-002); single-signed by node key.
 - No gossip (SIMP-007); manifest exchanged on connect via `node.manifest` RPC.
-- 7-day default `not_after`.
-- `node_type` enum covers alpha set: `memory`, `ai`, `tool`, `web_bridge`, `presentation`, `dev_cli`.
+- `manifest_version` is always `1` today (static per binary launch); event-sourced version increment is Gate 2 work.

@@ -1,5 +1,7 @@
 # Scheduler
 
+_Version: 0.4.1_
+
 Lets agents (and operators) schedule their own future work.
 "Send me a summary at 9am every Monday." "Re-run this flow in
 30 minutes." "Fire once on June 1st." Lives on the
@@ -197,6 +199,6 @@ chronicle accessible via `#/tasks/<id>`.
 | `cron.get`    | `<job_id>`                                             | pipe-delim `key=value` body |
 | `cron.update` | `<job_id>\|<field>\|<value>` (field ∈ enabled/schedule/prompt) | `ok\n` |
 | `cron.delete` | `<job_id>`                                             | `ok\n` |
-| `cron.trigger`| `<job_id>`                                             | `<task_id>\n` |
+| `cron.trigger`| `<job_id>`                                             | `<task_id>\n` or `skipped previous_task_id=...\n` |
 
 The bridge proxies all six as JSON at `/v1/cron/jobs[/...]`.

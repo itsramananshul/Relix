@@ -1,5 +1,7 @@
 # Agent employee model — operator handbook
 
+_Version: 0.4.1_
+
 Relix runs every inbound mesh call through an **agent gate**
 before the policy engine fires. The gate looks up an
 **agent profile** keyed by the caller's `subject_id` and
@@ -7,7 +9,9 @@ enforces a five-step admission contract per profile:
 
 1. **Status** — `active` proceeds; `suspended` / `disabled` deny.
 2. **Surface** — when the profile has a `surface_allowlist`,
-   the envelope's `surface` field must match.
+   the transport-layer-derived `caller_surface` (peer alias, not the
+   envelope's `surface` field — which is operator-asserted and untrusted)
+   must match.
 3. **Risk ceiling** — the called capability's `risk_level`
    must fit under the agent's `risk_ceiling`.
 4. **Categorical permissions** — capability categories +
@@ -18,10 +22,11 @@ enforces a five-step admission contract per profile:
    approval matches, the gate pauses the calling task and
    creates a pending approval row for the operator.
 
-Callers without an agent profile flow through unchanged
-(backward-compat). The policy engine still runs after the
-gate Allows; categorical permissions only ever **narrow**
-what policy already permits.
+Callers without an agent profile are **denied** with
+`AGENT_NO_PROFILE` (fail-closed). Callers whose agent store is not
+wired are denied with `AGENT_STORE_NOT_CONFIGURED`. The policy engine
+still runs after the gate Allows; categorical permissions only ever
+**narrow** what policy already permits.
 
 The shipped implementation lives across four files:
 
@@ -130,7 +135,8 @@ subsequent steps don't run.
      suspended → AGENT_SUSPENDED deny
      disabled  → AGENT_DISABLED  deny
 2. surface check
-     surface_allowlist non-empty AND envelope.surface not in list
+     surface_allowlist non-empty AND caller_surface (transport-derived
+     peer alias; NOT envelope.surface, which is untrusted) not in list
        → AGENT_SURFACE_DENIED deny
 3. deny lists
      any capability category in deny_categories
@@ -195,16 +201,20 @@ curl -X POST localhost:9100/v1/approvals/<approval_id>/decide \
     -d '{"decision":"rejected","reason":"out-of-scope"}'
 ```
 
-The `approved` response carries a **one-shot token**. The
-calling agent passes that token back on the retry via the
-envelope's `approval_token` field; the gate validates it
-(correct agent, correct method, status=approved,
-unconsumed), marks it consumed, and admits the call.
+The `approved` response carries a **one-shot approval token** — an
+Ed25519-signed structured object (not a random hex string). See
+[`approval-tokens.md`](approval-tokens.md) for the exact wire format.
+The calling agent passes that token back on the retry via the
+envelope's `approval_token` field; the gate verifies the signature,
+checks expiry, confirms the method and subject match, then atomically
+inserts a row in `approval_token_blocklist` (`INSERT OR IGNORE`) so
+two concurrent replays cannot both succeed. A second use is denied with
+`approval_token_consumed`.
 
 A pending approval auto-expires after the agent's
-`approval_timeout_secs` (default 24h). The expiry loop
-flips status to `expired`; subsequent token replays land as
-`APPROVAL_TOKEN_INVALID`.
+`approval_timeout_secs` (default 24 h). The expiry loop (60 s)
+flips status to `expired` and transitions linked tasks to `failed`
+with `error_cause = "approval_timeout"`.
 
 `GET /v1/approvals` lists pending approvals (newest first).
 The dashboard page reads from this.

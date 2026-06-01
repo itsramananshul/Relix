@@ -1,9 +1,10 @@
 # Attempt Lineage
 
+_Version: 0.4.1_
+
 What a "task attempt" is, where it's stored, what events it emits,
 and how the recovery scan, the retry primitive, and operator tooling
-interact with it. This is the C2a expansion of
-[`task-runtime.md`](task-runtime.md).
+interact with it. The per-attempt timeline (C2a) is fully implemented.
 
 ## TL;DR
 
@@ -122,11 +123,7 @@ For operators: `task get --pretty` shows this mapping. For scripts:
 - **No automatic flow execution.** `task.retry` updates metadata;
   it doesn't ask anyone to re-run the flow. That's the operator's
   job today (via `relix-cli flow-run` or by re-driving through the
-  bridge).
-
-These are all Gate 2 work and are flagged in
-[`runtime-lifecycle.md`](runtime-lifecycle.md) and
-[`retry-model.md`](retry-model.md).
+  bridge). Bounded auto-retry is Gate 2 work.
 
 ## See also
 

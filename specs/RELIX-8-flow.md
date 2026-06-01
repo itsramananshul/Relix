@@ -59,14 +59,29 @@ In-flight flows continue on their captured `definition_version`. New flows use l
 
 ---
 
-## Alpha Implementation Notes
+## Alpha Implementation Notes (v0.4.1)
 
-Alpha ships:
-- States: `Created`, `Running`, `Completed`, `Failed`. (No `Suspended` because synchronous SOL doesn't park; no `Cancelling`/`Cancelled` flow yet; no `Archived`/`Purged` lifecycle.)
+The target spec above describes a durable yield/suspend/resume model,
+90-day archival, migration, and full replay. **None of these are
+implemented in v0.4.1.** The body of this spec is a frozen target for
+Gate 2+, not a description of current behavior.
+
+What is shipped:
+
+- States: `Created`, `Running`, `Completed`, `Failed`. No `Suspended`
+  (SOL execution is synchronous — no parking), no `Cancelling` /
+  `Cancelled` flow state, no `Archived` / `Purged` lifecycle.
 - Flow IDs: 16-byte random (UUIDv4 — UUIDv7 at Gate 2).
-- Ownership: implicit — the controller that handles the trigger RPC owns the flow.
-- Identity propagation: implicit — outbound calls within the flow carry the original caller's identity (least privilege).
-- No migration, no archival, no version pinning yet (alpha has one version of each flow loaded at a time).
-- Replay: `relix-flow-inspect --replay-verify` checks event log integrity; no bytecode re-execution (SIMP-008).
+- Ownership: implicit — the controller that handles the trigger RPC
+  owns the flow for its duration.
+- Identity propagation: implicit — outbound calls within the flow carry
+  the original caller's identity (least privilege).
+- Three file formats: `.sol` (hand-written), `.sflow` (AST executor),
+  `.yml`/`.yaml` (lowered to SOL). All share the same event log format.
+- No migration, no archival, no version pinning yet.
+- Replay: `relix-flow-inspect --replay-verify` checks event log
+  integrity (hash-chain verification); no bytecode re-execution
+  (SIMP-008). The replay target in §8.11 is not yet built.
 
-The `flow_id` is captured by `RemoteCallIssued` events, making cross-node correlation work even though the flow lifecycle is minimal.
+The `flow_id` is captured by `RemoteCallIssued` events, making
+cross-node correlation work even though the flow lifecycle is minimal.

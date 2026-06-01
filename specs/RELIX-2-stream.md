@@ -1,6 +1,6 @@
 # RELIX-2 — Streaming / Substream Protocol
 
-**Status:** Frozen target. Alpha implements a simplified variant (SIMP-006).
+**Version:** 0.4.1 | **Status:** Frozen target. Alpha implements a simplified variant (SIMP-006).
 
 ## 2.1 Responsibilities
 
@@ -16,7 +16,7 @@ Bidirectional, credit-controlled, in-order, typed chunk-delivery between two Rel
 
 ## 2.3 Transport
 
-Over `/relix/stream/1`. One Relix stream = one Yamux substream. Per-connection cap: 256 concurrent streams.
+Over `/relix/rpc/stream/1`. One Relix stream = one Yamux substream. Per-connection cap: 256 concurrent streams.
 
 ## 2.4 Frames (CBOR with `t` discriminator)
 
@@ -49,12 +49,24 @@ Approval flows are unary RPCs with long deadlines. Streams are for sequences of 
 
 ---
 
-## Alpha Implementation Notes
+## Alpha Implementation Notes (v0.4.1)
 
-Alpha ships a minimal variant for AI token streaming only:
-- Frames: `open`, `chunk(seq, payload, fin)`, `error(payload)`. No `ready` (initial credit implicit / unbounded). No `credit` (no flow control; small chunks). No `heartbeat`. No `cancel` (close the connection to abort).
-- Identity check at open: yes.
+Alpha ships a minimal variant for AI token streaming only, running over the libp2p protocol identifier `/relix/rpc/stream/1` (not the frozen-target identifier `/relix/stream/1` — see §2.3 above for the target; the alpha wire ID is the production one).
+
+**Alpha frame variants** (CBOR, length-prefixed with 4-byte big-endian length; max frame 1 MiB):
+
+| Variant | Fields | Direction | Notes |
+|---------|--------|-----------|-------|
+| `Header` | `responder: NodeId`, `aid: ByteBuf`, `processed_at: Timestamp` | responder → caller | First frame; carries audit id (server-minted UUIDv4) and responder identity. |
+| `Chunk` | `ByteBuf` (payload) | responder → caller | Unbounded sequence of data chunks. No `seq` field; no `fin` flag — stream end signalled by `End` frame. |
+| `End` | (none) | responder → caller | Clean stream termination. |
+| `Err` | `kind: u32`, `cause: String` | responder → caller | Error termination. `kind` maps to `error_kinds` constants. |
+
+No `open`, `ready`, `credit`, `cancel`, or `heartbeat` frames in alpha. Flow control is implicit (small chunks; no backpressure). To abort a stream, close the connection.
+
+- Caller sends the `RequestEnvelope` (same CBOR shape as unary) as a length-prefixed frame before reading responses.
+- Identity is verified on the request envelope using the same admission pipeline as unary; per-chunk identity is not re-checked.
 - Cross-restart resumption: not supported.
 - Per RELIX-3, each received chunk is recorded as a separate `StreamChunkReceived` event in the flow log.
 
-This subset is enough for `flows/chat.sol` to consume Anthropic-streamed tokens through the AI node.
+This subset is enough for `flows/chat.sol` to consume streamed tokens through the AI node.
