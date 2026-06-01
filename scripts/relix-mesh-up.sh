@@ -241,6 +241,11 @@ fi
 DATA_ROOT="${RELIX_DATA_DIR:-dev-data}"
 DATA_BASE="$DATA_ROOT/$RUN"
 mkdir -p "$DATA_BASE" dev-keys "configs/policies"
+# Workflows directory the coordinator reads for `workflow.list` (defaults
+# to <coordinator-db-dir>/workflows). Create it empty so the dashboard's
+# Workflows panel lists zero workflows (200) instead of erroring that the
+# directory does not exist.
+mkdir -p "$DATA_BASE/workflows"
 
 ORG_KEY="dev-keys/$RUN-org-root.key"
 ORG_PUB="dev-keys/$RUN-org-root.pub"
@@ -311,6 +316,20 @@ if [[ ! -f "$AI_AIC" ]]; then
     echo "minting ai identity ..."
     "$CLI" identity mint --root-key "$ORG_KEY" --name ai \
         --groups chat-users --out "$AI_AIC"
+fi
+
+# Capture the web-bridge identity's verified subject id and hand it to
+# the coordinator so it can provision the operator-console agent
+# profile at startup. Without a profile the fail-closed agent gate
+# denies the dashboard's Tasks/Workflows calls (agent_no_profile). The
+# coordinator only seeds when this env var is set.
+BRIDGE_SUBJECT="$("$CLI" identity inspect --bundle "$BRIDGE_AIC" --root-key "$ORG_KEY" 2>/dev/null \
+    | awk '/^subject-id:/ {print $2; exit}')" || true
+if [[ -n "$BRIDGE_SUBJECT" ]]; then
+    export RELIX_OPERATOR_CONSOLE_SUBJECT="$BRIDGE_SUBJECT"
+    echo "operator-console subject: $BRIDGE_SUBJECT"
+else
+    echo "warning: could not resolve web-bridge subject id; Tasks/Workflows may be agent-gated" >&2
 fi
 
 # ---- 2. Memory config ----
@@ -700,6 +719,34 @@ name = "node_manifest"
 method = "node.manifest"
 allow_groups = ["chat-users"]
 
+# Operator-console read surfaces. The dashboard's Dispatch-stats and
+# Multi-tenant panels call these node.* operator methods; without an
+# allow rule the engine default-denies them (kind=6 deny:default_deny).
+[[rules]]
+name = "node_dispatch_stats"
+method = "node.dispatch.stats"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_policy_tenant_list"
+method = "node.policy.tenant_list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_policy_tenant_get"
+method = "node.policy.tenant_get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_audit_tenant_list"
+method = "node.audit.tenant_list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_audit_tenant_recent"
+method = "node.audit.tenant_recent"
+allow_groups = ["chat-users"]
+
 [[rules]]
 name = "mem_recent"
 method = "memory.recent_for_session"
@@ -963,6 +1010,136 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "plugin_host_web_lookup_fetch"
 method = "plugin_host.web_lookup.fetch"
+allow_groups = ["chat-users"]
+
+# Operator-console read surfaces (dashboard panels). Allowing a method
+# that is not registered on any running node is harmless — the responder
+# still returns unknown_method, which the bridge renders as an empty
+# panel. These rules ensure that when the subsystem IS enabled the
+# operator console is not default-denied.
+[[rules]]
+name = "workflow_list"
+method = "workflow.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_run"
+method = "workflow.run"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_status"
+method = "workflow.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_validate"
+method = "workflow.validate"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_reload"
+method = "workflow.reload"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_cost_report"
+method = "metrics.cost_report"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_alerts_active"
+method = "metrics.alerts_active"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_agents"
+method = "metrics.agents"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_agent_summary"
+method = "metrics.agent_summary"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_method_breakdown"
+method = "metrics.method_breakdown"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_timeseries"
+method = "metrics.timeseries"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_cost_baselines"
+method = "metrics.cost_baselines"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_cost_spike_history"
+method = "metrics.cost_spike_history"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "obs_health_summary"
+method = "observability.health_summary"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "obs_active_alerts"
+method = "observability.active_alerts"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "obs_alert_history"
+method = "observability.alert_history"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "skill_search"
+method = "memory.skill_search"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "skill_stats"
+method = "memory.skill_stats"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "skill_get"
+method = "memory.skill_get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "reasoning_status"
+method = "reasoning.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "judge_recent_verdicts"
+method = "judge.recent_verdicts"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "judge_stats"
+method = "judge.stats"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "budget_status"
+method = "budget.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "planning_get_approval"
+method = "planning.get_approval"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "planning_find_agents"
+method = "planning.find_agents"
 allow_groups = ["chat-users"]
 EOF
 

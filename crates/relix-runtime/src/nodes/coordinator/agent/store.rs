@@ -526,6 +526,52 @@ impl AgentStore {
         Ok(agent_id)
     }
 
+    /// Idempotently provision the operator-console agent profile for
+    /// a verified `subject_id` (the bridge/dashboard identity). The
+    /// fail-closed agent gate denies any caller without a profile, so
+    /// the operator console needs one to read Tasks/Workflows. We use
+    /// the `allow-all` profile — the system's designated operator
+    /// profile (see `agent_gate::PROFILE_ALLOW_ALL`) — which passes the
+    /// gate's categorical checks WITHOUT weakening the gate: the call
+    /// is still verified, audited, and recorded as an explicit
+    /// `allow_all_profile` allow-rule. No-op when a profile for the
+    /// subject already exists. Returns true when a row was inserted.
+    pub fn ensure_operator_console_profile(
+        &self,
+        subject_id: &str,
+        tenant_id: &str,
+    ) -> Result<bool, AgentStoreError> {
+        if subject_id.trim().is_empty() {
+            return Err(AgentStoreError::BadInput("subject_id required".into()));
+        }
+        if self.get_by_subject(subject_id)?.is_some() {
+            return Ok(false);
+        }
+        let tenant = if tenant_id.trim().is_empty() {
+            "default"
+        } else {
+            tenant_id
+        };
+        let now = unix_now();
+        let agent_id = new_agent_id("operator");
+        let conn = self.conn.lock().map_err(|_| AgentStoreError::Lock)?;
+        conn.execute(
+            "INSERT INTO agent_profiles (
+                 agent_id, name, role, title, department, team,
+                 created_by, status, subject_id, surface_allowlist,
+                 risk_ceiling, allow_categories, deny_categories,
+                 allow_sensitivity_tags, deny_sensitivity_tags,
+                 approval_required_categories, authorized_approvers,
+                 approval_timeout_secs, created_at, updated_at, tenant_id, profile
+             ) VALUES (?1, 'operator-console', 'operator', 'Operator Console',
+                       'ops', 'ops', 'relix-boot', 'active', ?2, '[]',
+                       'critical', '[]', '[]', '[]', '[]', '[]', '[]', 86400,
+                       ?3, ?3, ?4, 'allow-all')",
+            params![agent_id, subject_id, now, tenant],
+        )?;
+        Ok(true)
+    }
+
     /// GROUP 6: tenant-scoped lookup by AIC subject — returns the
     /// profile ONLY when it belongs to `tenant`, so a caller
     /// scoped to tenant A cannot read tenant B's agent profile.

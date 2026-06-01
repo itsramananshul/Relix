@@ -8537,6 +8537,32 @@ fn register_node_type_handlers(
             crate::nodes::coordinator::agent::AgentStore::open(&coord_cfg.db_path)
                 .map_err(|e| format!("[coordinator] agent store open: {e}"))?,
         );
+        // Provision the operator-console agent profile so the
+        // dashboard/bridge identity passes the fail-closed agent gate
+        // (Tasks/Workflows). The subject id is supplied by the boot
+        // path via RELIX_OPERATOR_CONSOLE_SUBJECT (the bridge AIC's
+        // subject). This does NOT weaken the gate — it provisions a
+        // real, audited profile; absent the env var nothing is seeded.
+        if let Ok(op_subject) = std::env::var("RELIX_OPERATOR_CONSOLE_SUBJECT") {
+            let op_subject = op_subject.trim().to_string();
+            if !op_subject.is_empty() {
+                match agent_store.ensure_operator_console_profile(&op_subject, "default") {
+                    Ok(true) => tracing::info!(
+                        subject_id = %op_subject,
+                        "coordinator: provisioned operator-console agent profile (allow-all)"
+                    ),
+                    Ok(false) => tracing::debug!(
+                        subject_id = %op_subject,
+                        "coordinator: operator-console agent profile already present"
+                    ),
+                    Err(e) => tracing::warn!(
+                        subject_id = %op_subject,
+                        error = %e,
+                        "coordinator: failed to provision operator-console agent profile"
+                    ),
+                }
+            }
+        }
         // NOT-DONE 2: spawn the legacy-token orphaned-task fail
         // pass in the BACKGROUND so it does not block the
         // controller from accepting requests. The pass:

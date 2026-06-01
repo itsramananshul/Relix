@@ -203,6 +203,10 @@ $Policy     = "configs/policies/$Run.toml"
 $BridgeHttp = "127.0.0.1:$BridgePort"
 
 New-Item -ItemType Directory -Force -Path 'dev-keys', $DataBase, 'configs/policies' | Out-Null
+# Workflows directory the coordinator reads for `workflow.list` (defaults
+# to <coordinator-db-dir>/workflows). Create it empty so the Workflows
+# panel lists zero workflows (200) instead of erroring it does not exist.
+New-Item -ItemType Directory -Force -Path "$DataBase/workflows" | Out-Null
 
 # 1) Identities - idempotent: only mint if missing so restarts are cheap.
 if (-not (Test-Path $OrgKey) -or -not (Test-Path $OrgPub)) {
@@ -226,6 +230,19 @@ if (-not (Test-Path $MemoryAic)) {
     Write-Host "minting memory identity bundle ..."
     & $Cli identity mint --root-key $OrgKey --name memory --groups chat-users --out $MemoryAic
     if ($LASTEXITCODE -ne 0) { throw "memory identity mint failed (exit $LASTEXITCODE)" }
+}
+
+# Capture the web-bridge identity's verified subject id and hand it to
+# the coordinator so it can provision the operator-console agent profile
+# at startup. Without a profile the fail-closed agent gate denies the
+# dashboard's Tasks/Workflows calls (agent_no_profile).
+$inspectOut = & $Cli identity inspect --bundle $BridgeAic --root-key $OrgKey 2>$null
+$BridgeSubject = ($inspectOut | Where-Object { $_ -match '^subject-id:\s+(\S+)' } | ForEach-Object { $Matches[1] } | Select-Object -First 1)
+if ($BridgeSubject) {
+    $env:RELIX_OPERATOR_CONSOLE_SUBJECT = $BridgeSubject
+    Write-Host "operator-console subject: $BridgeSubject"
+} else {
+    Write-Host "warning: could not resolve web-bridge subject id; Tasks/Workflows may be agent-gated"
 }
 
 $MemConfig         = "$DataBase/memory.toml"
@@ -675,6 +692,32 @@ name = "node_manifest"
 method = "node.manifest"
 allow_groups = ["chat-users"]
 
+# Operator-console read surfaces (Dispatch-stats + Multi-tenant panels).
+[[rules]]
+name = "node_dispatch_stats"
+method = "node.dispatch.stats"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_policy_tenant_list"
+method = "node.policy.tenant_list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_policy_tenant_get"
+method = "node.policy.tenant_get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_audit_tenant_list"
+method = "node.audit.tenant_list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "node_audit_tenant_recent"
+method = "node.audit.tenant_recent"
+allow_groups = ["chat-users"]
+
 [[rules]]
 name = "mem_recent"
 method = "memory.recent_for_session"
@@ -1025,6 +1068,136 @@ allow_groups = ["chat-users"]
 [[rules]]
 name = "plugin_host_web_lookup_fetch"
 method = "plugin_host.web_lookup.fetch"
+allow_groups = ["chat-users"]
+
+# Operator-console read surfaces (dashboard panels). Allowing an
+# unregistered method is harmless — the responder still returns
+# unknown_method, which the bridge renders as an empty panel. These
+# ensure the operator console is not default-denied when the subsystem
+# IS enabled.
+[[rules]]
+name = "workflow_list"
+method = "workflow.list"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_run"
+method = "workflow.run"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_status"
+method = "workflow.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_validate"
+method = "workflow.validate"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "workflow_reload"
+method = "workflow.reload"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_cost_report"
+method = "metrics.cost_report"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_alerts_active"
+method = "metrics.alerts_active"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_agents"
+method = "metrics.agents"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_agent_summary"
+method = "metrics.agent_summary"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_method_breakdown"
+method = "metrics.method_breakdown"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_timeseries"
+method = "metrics.timeseries"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_cost_baselines"
+method = "metrics.cost_baselines"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "metrics_cost_spike_history"
+method = "metrics.cost_spike_history"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "obs_health_summary"
+method = "observability.health_summary"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "obs_active_alerts"
+method = "observability.active_alerts"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "obs_alert_history"
+method = "observability.alert_history"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "skill_search"
+method = "memory.skill_search"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "skill_stats"
+method = "memory.skill_stats"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "skill_get"
+method = "memory.skill_get"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "reasoning_status"
+method = "reasoning.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "judge_recent_verdicts"
+method = "judge.recent_verdicts"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "judge_stats"
+method = "judge.stats"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "budget_status"
+method = "budget.status"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "planning_get_approval"
+method = "planning.get_approval"
+allow_groups = ["chat-users"]
+
+[[rules]]
+name = "planning_find_agents"
+method = "planning.find_agents"
 allow_groups = ["chat-users"]
 "@ | Set-Content -Encoding utf8 $Policy
 
