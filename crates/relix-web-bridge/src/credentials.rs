@@ -93,7 +93,7 @@ pub async fn store(
     if let Some(r) = req.rotation_interval_secs {
         body.insert("rotation_interval_secs".into(), Value::from(r));
     }
-    match call_peer_json(&state, &peer, "credentials.store", &Value::Object(body)).await {
+    match call_peer_json(&state, &peer, "credentials.store", &Value::Object(body), false).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -109,7 +109,7 @@ pub async fn list(
     if let Some(o) = q.owner_agent {
         body.insert("owner_agent".into(), Value::from(o));
     }
-    match call_peer_json(&state, &peer, "credentials.list", &Value::Object(body)).await {
+    match call_peer_json(&state, &peer, "credentials.list", &Value::Object(body), true).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -126,7 +126,7 @@ pub async fn get(
     }
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "name": name });
-    match call_peer_json(&state, &peer, "credentials.get", &body).await {
+    match call_peer_json(&state, &peer, "credentials.get", &body, true).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -143,7 +143,7 @@ pub async fn rotate(
     }
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "name": name, "new_value": req.new_value });
-    match call_peer_json(&state, &peer, "credentials.rotate", &body).await {
+    match call_peer_json(&state, &peer, "credentials.rotate", &body, false).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -164,7 +164,7 @@ pub async fn revoke(
     if let Some(r) = req.reason {
         body.insert("reason".into(), Value::from(r));
     }
-    match call_peer_json(&state, &peer, "credentials.revoke", &Value::Object(body)).await {
+    match call_peer_json(&state, &peer, "credentials.revoke", &Value::Object(body), false).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -185,7 +185,7 @@ pub async fn audit(
     if let Some(l) = q.limit {
         body.insert("limit".into(), Value::from(l as u64));
     }
-    match call_peer_json(&state, &peer, "credentials.audit", &Value::Object(body)).await {
+    match call_peer_json(&state, &peer, "credentials.audit", &Value::Object(body), true).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -202,11 +202,22 @@ fn bad_request(msg: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Clean "feature not enabled" body returned (HTTP 200) when the
+/// responder reports UNKNOWN_METHOD for a read-only credential call, so
+/// the dashboard renders an empty vault rather than a 502 error box.
+fn unavailable(method: &str) -> Value {
+    serde_json::json!({
+        "available": false,
+        "reason": format!("capability '{method}' is not enabled on this deployment"),
+    })
+}
+
 async fn call_peer_json(
     state: &AppState,
     alias: &str,
     method: &str,
     args: &Value,
+    graceful_unknown_method: bool,
 ) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
@@ -285,6 +296,17 @@ async fn call_peer_json(
             })
         }
         ResponseResult::Err(env) => {
+            // Credential vault not enabled on this deployment (default
+            // boot has no [credentials] master key) → UNKNOWN_METHOD.
+            // For read-only dashboard calls (list/get/audit) return a
+            // clean "unavailable" marker (HTTP 200) so the panel shows
+            // an empty vault instead of a 502. Mutating calls keep the
+            // hard error. Admission is unchanged.
+            if graceful_unknown_method
+                && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
+            {
+                return Ok(unavailable(method));
+            }
             let status = if env.kind == relix_core::types::error_kinds::INVALID_ARGS {
                 StatusCode::BAD_REQUEST
             } else if env.kind == relix_core::types::error_kinds::SECURITY_DENIED {

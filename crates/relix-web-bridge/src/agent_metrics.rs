@@ -407,6 +407,15 @@ async fn call_peer_json(
             })
         }
         ResponseResult::Err(env) => {
+            // UNKNOWN_METHOD means the coordinator did not register the
+            // metrics capability — the agent-metrics feature is not
+            // enabled on this deployment (default boot). These are all
+            // read-only dashboard queries, so return a clean
+            // "unavailable" marker (HTTP 200) instead of a 502; the
+            // panels render empty. Admission is unchanged.
+            if env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD {
+                return Ok(unavailable(method));
+            }
             let status = if env.kind == relix_core::types::error_kinds::INVALID_ARGS {
                 StatusCode::BAD_REQUEST
             } else {
@@ -428,6 +437,16 @@ async fn call_peer_json(
         )
             .into_response()),
     }
+}
+
+/// Clean "feature not enabled" body returned (HTTP 200) when the
+/// responder reports UNKNOWN_METHOD for a read-only metrics call, so
+/// the dashboard renders an empty panel rather than a 502 error box.
+fn unavailable(method: &str) -> Value {
+    serde_json::json!({
+        "available": false,
+        "reason": format!("capability '{method}' is not enabled on this deployment"),
+    })
 }
 
 #[cfg(test)]

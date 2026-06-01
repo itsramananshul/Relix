@@ -58,7 +58,7 @@ pub async fn delivery_status(
     }
     let peer = q.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
     let body = serde_json::json!({ "approval_id": approval_id });
-    match call_peer_json(&state, &peer, "approval.delivery_status", &body).await {
+    match call_peer_json(&state, &peer, "approval.delivery_status", &body, true).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -93,7 +93,7 @@ pub async fn failed_deliveries(
         Some(l) => serde_json::json!({ "limit": l }),
         None => serde_json::json!({}),
     };
-    match call_peer_json(&state, &peer, "approval.failed_deliveries", &body).await {
+    match call_peer_json(&state, &peer, "approval.failed_deliveries", &body, true).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -129,7 +129,7 @@ pub async fn pending_list(
         Some(l) => serde_json::json!({ "limit": l }),
         None => serde_json::json!({}),
     };
-    match call_peer_json(&state, &peer, "approval.list_pending", &body).await {
+    match call_peer_json(&state, &peer, "approval.list_pending", &body, true).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -192,7 +192,7 @@ pub async fn record_decision(
         "decision": body.decision,
         "note": body.note,
     });
-    match call_peer_json(&state, &peer, "approval.record_decision", &args).await {
+    match call_peer_json(&state, &peer, "approval.record_decision", &args, false).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -233,7 +233,9 @@ pub async fn get_approval(
     // The coordinator cap takes raw `approval_id` bytes (not
     // JSON), so we call the binary helper instead of the JSON
     // helper for this method.
-    match call_peer_raw_to_json(&state, &peer, "coord.approval.get", approval_id.as_bytes()).await {
+    match call_peer_raw_to_json(&state, &peer, "coord.approval.get", approval_id.as_bytes(), true)
+        .await
+    {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(resp) => resp,
     }
@@ -250,6 +252,7 @@ async fn call_peer_raw_to_json(
     alias: &str,
     method: &str,
     arg_bytes: &[u8],
+    graceful_unknown_method: bool,
 ) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
@@ -316,6 +319,16 @@ async fn call_peer_raw_to_json(
             })
         }
         ResponseResult::Err(env) => {
+            // Optional-feature capability not registered on this
+            // deployment (default boot has no approval store). For the
+            // read-only dashboard surface, return a clean "unavailable"
+            // marker (HTTP 200) so the panel renders empty instead of a
+            // 502. Admission is unchanged — the responder still refused.
+            if graceful_unknown_method
+                && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
+            {
+                return Ok(unavailable(method));
+            }
             // DEFERRED C: surface the cap's "not found" deny as
             // an HTTP 404 so the CLI / dashboard can switch on
             // status code without sniffing the cause text.
@@ -351,6 +364,7 @@ async fn call_peer_json(
     alias: &str,
     method: &str,
     args: &Value,
+    graceful_unknown_method: bool,
 ) -> Result<Value, axum::response::Response> {
     use axum::response::IntoResponse;
     let mesh = match state.mesh_client.as_ref() {
@@ -429,6 +443,11 @@ async fn call_peer_json(
             })
         }
         ResponseResult::Err(env) => {
+            if graceful_unknown_method
+                && env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD
+            {
+                return Ok(unavailable(method));
+            }
             let status = if env.kind == relix_core::types::error_kinds::INVALID_ARGS {
                 StatusCode::BAD_REQUEST
             } else {
@@ -450,4 +469,14 @@ async fn call_peer_json(
         )
             .into_response()),
     }
+}
+
+/// Clean "feature not enabled" body returned (HTTP 200) when the
+/// responder reports UNKNOWN_METHOD for a read-only approval call, so
+/// the dashboard renders an empty panel rather than a 502 error box.
+fn unavailable(method: &str) -> Value {
+    serde_json::json!({
+        "available": false,
+        "reason": format!("capability '{method}' is not enabled on this deployment"),
+    })
 }
