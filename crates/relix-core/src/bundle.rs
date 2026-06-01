@@ -189,6 +189,37 @@ impl Bundle {
     }
 }
 
+/// Default lifetime for a locally-minted node/service identity bundle:
+/// **365 days**. Self-hosted Relix meshes mint their own identities off a
+/// local org root, so the lifetime is sized for unattended infra — long
+/// enough that normal continuous operation never reaches expiry, while
+/// keeping expiry as a real revocation backstop (SIMP-003). Short-lived
+/// human-login bundles can still override this with a smaller value.
+pub const DEFAULT_IDENTITY_LIFETIME_SECS: i64 = 365 * 24 * 60 * 60;
+
+/// How long before `not_after` a bundle is considered due for renewal:
+/// **30 days**. A running mesh (or a boot/`identity ensure` pass) that finds
+/// a bundle inside this window re-mints it ahead of expiry so the identity
+/// never lapses. Must be smaller than [`DEFAULT_IDENTITY_LIFETIME_SECS`].
+pub const DEFAULT_RENEWAL_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
+
+impl BundleHeader {
+    /// Seconds remaining until `not_after` relative to `now_unix_secs`.
+    /// Negative once the bundle has expired. Saturating so a pathological
+    /// header can never panic or wrap.
+    pub fn seconds_until_expiry(&self, now_unix_secs: i64) -> i64 {
+        self.not_after.saturating_sub(now_unix_secs)
+    }
+
+    /// True when the bundle is at or past its renewal window — i.e. it has
+    /// expired OR is within `renewal_window_secs` of `not_after`. This is the
+    /// single decision both boot-time self-heal and the running-mesh renewal
+    /// loop use to decide whether to re-mint ahead of expiry.
+    pub fn needs_renewal(&self, now_unix_secs: i64, renewal_window_secs: i64) -> bool {
+        self.seconds_until_expiry(now_unix_secs) <= renewal_window_secs
+    }
+}
+
 /// Convenience: construct a header populated with `now()`-based timestamps and
 /// a random `bundle_serial`. Returns `BundleError::ArithmeticOverflow` if the
 /// `now ± skew` or `now + lifetime_secs` calculation would silently wrap in
@@ -346,6 +377,45 @@ mod tests {
             .validate(&key.verifying_key(), BundleType::PolicyBundle, now())
             .expect_err("must fail");
         assert!(matches!(err, BundleError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn needs_renewal_fires_only_inside_window() {
+        let key = fresh_key();
+        // Fresh 1-year bundle: far from expiry → no renewal.
+        let header = make_header(
+            &key.verifying_key(),
+            BundleType::Identity,
+            DEFAULT_IDENTITY_LIFETIME_SECS,
+        )
+        .unwrap();
+        let now = now();
+        assert!(
+            !header.needs_renewal(now, DEFAULT_RENEWAL_WINDOW_SECS),
+            "a fresh 1-year bundle must not be due for renewal"
+        );
+        assert!(header.seconds_until_expiry(now) > DEFAULT_RENEWAL_WINDOW_SECS);
+
+        // Simulate a near-expiry bundle: 10 days of life left, 30-day window.
+        let mut near = header.clone();
+        near.not_after = now + 10 * 24 * 60 * 60;
+        assert!(
+            near.needs_renewal(now, DEFAULT_RENEWAL_WINDOW_SECS),
+            "a bundle 10 days from expiry must renew under a 30-day window"
+        );
+
+        // Already-expired bundle is also "needs renewal" (negative remaining).
+        let mut expired = header;
+        expired.not_after = now - 10_000;
+        assert!(expired.needs_renewal(now, DEFAULT_RENEWAL_WINDOW_SECS));
+        assert!(expired.seconds_until_expiry(now) < 0);
+    }
+
+    #[test]
+    fn default_lifetime_is_one_year() {
+        // Guards against an accidental regression back to a short lifetime.
+        assert_eq!(DEFAULT_IDENTITY_LIFETIME_SECS, 365 * 24 * 60 * 60);
+        assert!(DEFAULT_RENEWAL_WINDOW_SECS < DEFAULT_IDENTITY_LIFETIME_SECS);
     }
 
     #[test]

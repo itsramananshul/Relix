@@ -298,25 +298,36 @@ BRIDGE_LOG="$DATA_BASE/bridge.log";     BRIDGE_ERR="$DATA_BASE/bridge.err.log"
 
 # ---- 1. Identity bundles + org root ----
 
+# Days before a bundle's not_after at which boot (and the renewal loop)
+# re-mints it. Matches relix-core DEFAULT_RENEWAL_WINDOW_SECS (30 days).
+RENEWAL_WINDOW_DAYS="${RELIX_IDENTITY_RENEWAL_WINDOW_DAYS:-30}"
+
+# The org root is the trust anchor: mint once, never re-mint. Re-minting it
+# would change org_id and invalidate every leaf bundle signed under it.
 if [[ ! -f "$ORG_KEY" || ! -f "$ORG_PUB" ]]; then
     echo "minting org root ..."
     "$CLI" identity init-org --root-key "$ORG_KEY" --org "$RUN"
 fi
-if [[ ! -f "$BRIDGE_AIC" ]]; then
-    echo "minting bridge identity ..."
-    "$CLI" identity mint --root-key "$ORG_KEY" --name web-bridge \
-        --groups chat-users --out "$BRIDGE_AIC"
-fi
-if [[ ! -f "$MEMORY_AIC" ]]; then
-    echo "minting memory identity ..."
-    "$CLI" identity mint --root-key "$ORG_KEY" --name memory \
-        --groups chat-users --out "$MEMORY_AIC"
-fi
-if [[ ! -f "$AI_AIC" ]]; then
-    echo "minting ai identity ..."
-    "$CLI" identity mint --root-key "$ORG_KEY" --name ai \
-        --groups chat-users --out "$AI_AIC"
-fi
+
+# Leaf identities are SELF-HEALING. `identity ensure` (re)mints a bundle
+# when it is missing, expired, signed by a stale/foreign org root, or
+# within RENEWAL_WINDOW_DAYS of expiry — otherwise it is a cheap no-op.
+# This is why a fresh install always boots (no pre-minted, already-expired
+# bundle can wedge it) and why a long-running mesh never lapses. Locally
+# minted bundles get the 365-day relix-core default lifetime.
+ensure_identity() {  # name  out  [groups]
+    local _name="$1" _out="$2" _groups="${3:-chat-users}"
+    "$CLI" identity ensure --root-key "$ORG_KEY" --name "$_name" \
+        --groups "$_groups" --renewal-window-days "$RENEWAL_WINDOW_DAYS" \
+        --out "$_out"
+}
+ensure_identity web-bridge "$BRIDGE_AIC"
+ensure_identity memory     "$MEMORY_AIC"
+ensure_identity ai         "$AI_AIC"
+
+# Bundles the periodic renewal loop re-checks while the mesh runs
+# ("name|path" entries). Channel/plugin bundles append themselves below.
+RENEWABLE_BUNDLES=("web-bridge|$BRIDGE_AIC" "memory|$MEMORY_AIC" "ai|$AI_AIC")
 
 # Capture the web-bridge identity's verified subject id and hand it to
 # the coordinator so it can provision the operator-console agent
@@ -1348,34 +1359,26 @@ if [[ "$NO_COORDINATOR" -eq 0 ]]; then
 fi
 
 if [[ "$TELEGRAM_ENABLED" -eq 1 ]]; then
-    if [[ ! -f "$TELEGRAM_BUNDLE" ]]; then
-        "$CLI" identity mint --root-key "$ORG_KEY" --name telegram \
-            --groups chat-users --out "$TELEGRAM_BUNDLE"
-    fi
+    ensure_identity telegram "$TELEGRAM_BUNDLE"
+    RENEWABLE_BUNDLES+=("telegram|$TELEGRAM_BUNDLE")
     start_node "telegram" "$CONTROLLER" "$TELEGRAM_CONFIG" \
         "$TELEGRAM_LOG" "$TELEGRAM_ERR" "relix_runtime=info,relix_telegram=info"
 fi
 if [[ "$DISCORD_ENABLED" -eq 1 ]]; then
-    if [[ ! -f "$DISCORD_BUNDLE" ]]; then
-        "$CLI" identity mint --root-key "$ORG_KEY" --name discord \
-            --groups chat-users --out "$DISCORD_BUNDLE"
-    fi
+    ensure_identity discord "$DISCORD_BUNDLE"
+    RENEWABLE_BUNDLES+=("discord|$DISCORD_BUNDLE")
     start_node "discord" "$CONTROLLER" "$DISCORD_CONFIG" \
         "$DISCORD_LOG" "$DISCORD_ERR" "relix_runtime=info,relix_discord=info"
 fi
 if [[ "$SLACK_ENABLED" -eq 1 ]]; then
-    if [[ ! -f "$SLACK_BUNDLE" ]]; then
-        "$CLI" identity mint --root-key "$ORG_KEY" --name slack \
-            --groups chat-users --out "$SLACK_BUNDLE"
-    fi
+    ensure_identity slack "$SLACK_BUNDLE"
+    RENEWABLE_BUNDLES+=("slack|$SLACK_BUNDLE")
     start_node "slack" "$CONTROLLER" "$SLACK_CONFIG" \
         "$SLACK_LOG" "$SLACK_ERR" "relix_runtime=info,relix_slack=info"
 fi
 if [[ "$PLUGINS_ENABLED" -eq 1 ]]; then
-    if [[ ! -f "$PLUGIN_HOST_BUNDLE" ]]; then
-        "$CLI" identity mint --root-key "$ORG_KEY" --name plugin-host \
-            --groups chat-users --out "$PLUGIN_HOST_BUNDLE"
-    fi
+    ensure_identity plugin-host "$PLUGIN_HOST_BUNDLE"
+    RENEWABLE_BUNDLES+=("plugin-host|$PLUGIN_HOST_BUNDLE")
     start_node "plugin-host" "$CONTROLLER" "$PLUGIN_HOST_CONFIG" \
         "$PLUGIN_HOST_LOG" "$PLUGIN_HOST_ERR"
 fi
@@ -1456,6 +1459,9 @@ echo "Ctrl-C to stop."
 
 # ---- 17. Block until interrupted or a child dies ----
 
+# Re-check identity bundles this often while running (seconds). 12h default.
+RENEW_INTERVAL_SECS="${RELIX_IDENTITY_RENEW_INTERVAL_SECS:-43200}"
+_last_renew=$SECONDS
 while true; do
     for pid in "${PIDS[@]}"; do
         if ! kill -0 "$pid" 2>/dev/null; then
@@ -1463,5 +1469,17 @@ while true; do
             exit 1
         fi
     done
+    # Periodic identity renewal: re-mint any bundle within its renewal
+    # window so a mesh running for months never lapses. Cheap no-op when
+    # healthy. The refreshed bundle on disk is adopted by a node on its
+    # next restart (identity is loaded at boot; no hot-reload yet) — but
+    # combined with the 365-day lifetime and boot-time self-heal this keeps
+    # a long-running mesh valid with no operator action.
+    if (( SECONDS - _last_renew >= RENEW_INTERVAL_SECS )); then
+        for _entry in "${RENEWABLE_BUNDLES[@]}"; do
+            ensure_identity "${_entry%%|*}" "${_entry#*|}" >/dev/null 2>&1 || true
+        done
+        _last_renew=$SECONDS
+    fi
     sleep 1
 done

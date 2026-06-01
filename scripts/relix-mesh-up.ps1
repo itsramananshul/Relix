@@ -208,29 +208,44 @@ New-Item -ItemType Directory -Force -Path 'dev-keys', $DataBase, 'configs/polici
 # panel lists zero workflows (200) instead of erroring it does not exist.
 New-Item -ItemType Directory -Force -Path "$DataBase/workflows" | Out-Null
 
-# 1) Identities - idempotent: only mint if missing so restarts are cheap.
+# 1) Identities. The org root is the trust anchor: mint once, never re-mint
+#    (re-minting would change org_id and invalidate every leaf bundle).
 if (-not (Test-Path $OrgKey) -or -not (Test-Path $OrgPub)) {
     Write-Host "minting org root ..."
     & $Cli identity init-org --root-key $OrgKey --org $Run
     if ($LASTEXITCODE -ne 0) { throw "identity init-org failed (exit $LASTEXITCODE)" }
 }
-if (-not (Test-Path $BridgeAic)) {
-    Write-Host "minting bridge identity bundle ..."
-    & $Cli identity mint --root-key $OrgKey --name web-bridge --groups chat-users --out $BridgeAic
-    if ($LASTEXITCODE -ne 0) { throw "identity mint failed (exit $LASTEXITCODE)" }
+
+# Days before not_after at which boot (and the renewal loop) re-mints a
+# bundle. Matches relix-core DEFAULT_RENEWAL_WINDOW_SECS (30 days).
+$RenewalWindowDays = if ($env:RELIX_IDENTITY_RENEWAL_WINDOW_DAYS) { [int]$env:RELIX_IDENTITY_RENEWAL_WINDOW_DAYS } else { 30 }
+
+# Leaf identities are SELF-HEALING: `identity ensure` (re)mints a bundle
+# when it is missing, expired, signed by a stale/foreign org root, or
+# within the renewal window — otherwise a cheap no-op. This is why a fresh
+# install always boots (no pre-minted, already-expired bundle can wedge it)
+# and why a long-running mesh never lapses. Locally minted bundles get the
+# 365-day relix-core default lifetime.
+function Ensure-Identity($Name, $Out, $Groups = 'chat-users') {
+    & $Cli identity ensure --root-key $OrgKey --name $Name --groups $Groups `
+        --renewal-window-days $RenewalWindowDays --out $Out
+    if ($LASTEXITCODE -ne 0) { throw "identity ensure for $Name failed (exit $LASTEXITCODE)" }
 }
-# Memory node's identity bundle. Needed so the memory node can
-# dial the AI peer to call ai.embed for the vector-memory
-# pipeline (and the agent_curate AI peer when [memory.curator]
-# is enabled). Without this bundle the embedding dispatcher
-# stays empty and memory.embed / memory.search return
+Ensure-Identity 'web-bridge' $BridgeAic
+
+# Memory node's identity bundle. Needed so the memory node can dial the AI
+# peer to call ai.embed for the vector-memory pipeline (and the agent_curate
+# AI peer when [memory.curator] is enabled). Without this bundle the
+# embedding dispatcher stays empty and memory.embed / memory.search return
 # "embedding dispatcher not configured".
 $MemoryAic = "dev-keys/$Run-memory.bundle"
-if (-not (Test-Path $MemoryAic)) {
-    Write-Host "minting memory identity bundle ..."
-    & $Cli identity mint --root-key $OrgKey --name memory --groups chat-users --out $MemoryAic
-    if ($LASTEXITCODE -ne 0) { throw "memory identity mint failed (exit $LASTEXITCODE)" }
-}
+Ensure-Identity 'memory' $MemoryAic
+
+# Bundles the periodic renewal loop re-checks while the mesh runs.
+$script:RenewableBundles = @(
+    @{ Name = 'web-bridge'; Out = $BridgeAic },
+    @{ Name = 'memory';     Out = $MemoryAic }
+)
 
 # Capture the web-bridge identity's verified subject id and hand it to
 # the coordinator so it can provision the operator-console agent profile
@@ -1486,10 +1501,8 @@ try {
         # but the .bundle has to be minted off the org root, so we
         # call relix-cli once if it's missing.
         $TelegramBundlePath = "dev-keys/$Run-telegram.bundle"
-        if (-not (Test-Path $TelegramBundlePath)) {
-            & $Cli identity mint --root-key $OrgKey --name telegram --groups chat-users --out $TelegramBundlePath
-            if ($LASTEXITCODE -ne 0) { throw "telegram identity mint failed" }
-        }
+        Ensure-Identity 'telegram' $TelegramBundlePath
+        $script:RenewableBundles += @{ Name = 'telegram'; Out = $TelegramBundlePath }
         Write-Host "starting telegram controller ..."
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $TelegramConfig -OutLog $TelegramLog -ErrLog $TelegramErr -RustLog 'relix_runtime=info,relix_telegram=info') )
     }
@@ -1499,30 +1512,24 @@ try {
         # generates its .key on first boot, but the .bundle is
         # minted off the org root and persisted across restarts.
         $DiscordBundlePath = "dev-keys/$Run-discord.bundle"
-        if (-not (Test-Path $DiscordBundlePath)) {
-            & $Cli identity mint --root-key $OrgKey --name discord --groups chat-users --out $DiscordBundlePath
-            if ($LASTEXITCODE -ne 0) { throw "discord identity mint failed" }
-        }
+        Ensure-Identity 'discord' $DiscordBundlePath
+        $script:RenewableBundles += @{ Name = 'discord'; Out = $DiscordBundlePath }
         Write-Host "starting discord controller ..."
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $DiscordConfig -OutLog $DiscordLog -ErrLog $DiscordErr -RustLog 'relix_runtime=info,relix_discord=info') )
     }
 
     if ($SlackEnabled) {
         $SlackBundlePath = "dev-keys/$Run-slack.bundle"
-        if (-not (Test-Path $SlackBundlePath)) {
-            & $Cli identity mint --root-key $OrgKey --name slack --groups chat-users --out $SlackBundlePath
-            if ($LASTEXITCODE -ne 0) { throw "slack identity mint failed" }
-        }
+        Ensure-Identity 'slack' $SlackBundlePath
+        $script:RenewableBundles += @{ Name = 'slack'; Out = $SlackBundlePath }
         Write-Host "starting slack controller ..."
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $SlackConfig -OutLog $SlackLog -ErrLog $SlackErr -RustLog 'relix_runtime=info,relix_slack=info') )
     }
 
     if ($PluginsEnabled) {
         $PluginHostBundlePath = "dev-keys/$Run-plugin-host.bundle"
-        if (-not (Test-Path $PluginHostBundlePath)) {
-            & $Cli identity mint --root-key $OrgKey --name plugin-host --groups chat-users --out $PluginHostBundlePath
-            if ($LASTEXITCODE -ne 0) { throw "plugin-host identity mint failed" }
-        }
+        Ensure-Identity 'plugin-host' $PluginHostBundlePath
+        $script:RenewableBundles += @{ Name = 'plugin-host'; Out = $PluginHostBundlePath }
         Write-Host "starting plugin_host controller ..."
         [void]$started.Add( (Start-Node -Exe $Controller -Cfg $PluginHostConfig -OutLog $PluginHostLog -ErrLog $PluginHostErr -RustLog 'relix_runtime=info,relix_runtime::plugin=debug') )
     }
@@ -1646,6 +1653,9 @@ try {
     # on Ctrl-C. Polling every 500ms is cheap and behaves the same
     # across Windows Terminal, ISE, background jobs, and stdin-
     # redirected hosts.
+    # Re-check identity bundles this often while running (seconds). 12h default.
+    $renewIntervalSecs = if ($env:RELIX_IDENTITY_RENEW_INTERVAL_SECS) { [int]$env:RELIX_IDENTITY_RENEW_INTERVAL_SECS } else { 43200 }
+    $lastRenew = Get-Date
     try {
         while ($true) {
             $exited = $started | Where-Object { $_.HasExited } | Select-Object -First 1
@@ -1653,6 +1663,23 @@ try {
                 Write-Host ""
                 Write-Host "$($exited.ProcessName) (pid $($exited.Id)) exited with code $($exited.ExitCode) — tearing down the rest of the mesh."
                 break
+            }
+            # Periodic identity renewal: re-mint any bundle within its
+            # renewal window so a mesh running for months never lapses.
+            # Cheap no-op when healthy. The refreshed bundle on disk is
+            # adopted by a node on its next restart (identity is loaded at
+            # boot; no hot-reload yet) — but with the 365-day lifetime and
+            # boot-time self-heal this keeps a long-running mesh valid with
+            # no operator action.
+            if (((Get-Date) - $lastRenew).TotalSeconds -ge $renewIntervalSecs) {
+                foreach ($b in $script:RenewableBundles) {
+                    try {
+                        & $Cli identity ensure --root-key $OrgKey --name $b.Name `
+                            --groups chat-users --renewal-window-days $RenewalWindowDays `
+                            --out $b.Out *> $null
+                    } catch { }
+                }
+                $lastRenew = Get-Date
             }
             Start-Sleep -Milliseconds 500
         }

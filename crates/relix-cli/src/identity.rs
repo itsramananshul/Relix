@@ -8,7 +8,9 @@ use rand::rngs::OsRng;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use relix_core::bundle::Bundle;
+use relix_core::bundle::{
+    Bundle, BundleError, BundleType, DEFAULT_IDENTITY_LIFETIME_SECS, DEFAULT_RENEWAL_WINDOW_SECS,
+};
 use relix_core::codec;
 use relix_core::identity::{IdentityBundle, issue_identity, validate_identity_bundle};
 use relix_core::types::NodeId;
@@ -44,8 +46,10 @@ pub enum Cmd {
         /// Clearance (default `internal`).
         #[arg(long, default_value = "internal")]
         clearance: String,
-        /// Lifetime in hours (default 24).
-        #[arg(long, default_value_t = 24)]
+        /// Lifetime in hours. Defaults to 365 days (8760h) for self-hosted
+        /// node/service identities — long enough that normal operation never
+        /// hits expiry; expiry still applies as a revocation backstop.
+        #[arg(long, default_value_t = DEFAULT_IDENTITY_LIFETIME_SECS / 3600)]
         hours: i64,
         /// Output path for the signed bundle (raw CBOR bytes).
         #[arg(long)]
@@ -53,6 +57,43 @@ pub enum Cmd {
         /// Optional output path for the subject's signing key. If omitted, a new
         /// key is generated and discarded after computing subject_id (alpha
         /// shortcut for human users whose only signed action is logging in).
+        #[arg(long)]
+        subject_key: Option<PathBuf>,
+    },
+    /// Self-healing mint: ensure a valid, non-expiring identity bundle exists
+    /// at `--out`, (re)minting it when it is missing, unreadable, expired,
+    /// signed by a different/!current org root, or within the renewal window
+    /// of `--not-after`. Idempotent and cheap when the bundle is healthy, so
+    /// it is safe to call on every boot AND on a periodic renewal timer for a
+    /// long-running mesh. This is what keeps a fresh install always bootable
+    /// and a months-long mesh from lapsing.
+    Ensure {
+        /// Org-root signing-key file (from `init-org`).
+        #[arg(long)]
+        root_key: PathBuf,
+        /// Subject name (e.g., `web-bridge`).
+        #[arg(long)]
+        name: String,
+        /// Comma-separated groups (e.g., `chat-users`).
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        groups: Vec<String>,
+        /// Role (default `agent`).
+        #[arg(long, default_value = "agent")]
+        role: String,
+        /// Clearance (default `internal`).
+        #[arg(long, default_value = "internal")]
+        clearance: String,
+        /// Lifetime in hours for a (re)mint. Defaults to 365 days (8760h).
+        #[arg(long, default_value_t = DEFAULT_IDENTITY_LIFETIME_SECS / 3600)]
+        hours: i64,
+        /// Re-mint when the existing bundle is within this many days of
+        /// expiry (renewal window). Defaults to 30 days.
+        #[arg(long, default_value_t = DEFAULT_RENEWAL_WINDOW_SECS / 86_400)]
+        renewal_window_days: i64,
+        /// Output path for the signed bundle (raw CBOR bytes).
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional persisted subject signing-key path (reused across renewals).
         #[arg(long)]
         subject_key: Option<PathBuf>,
     },
@@ -152,6 +193,27 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             &role,
             &clearance,
             hours,
+            &out,
+            subject_key.as_deref(),
+        ),
+        Cmd::Ensure {
+            root_key,
+            name,
+            groups,
+            role,
+            clearance,
+            hours,
+            renewal_window_days,
+            out,
+            subject_key,
+        } => ensure(
+            &root_key,
+            &name,
+            &groups,
+            &role,
+            &clearance,
+            hours,
+            renewal_window_days,
             &out,
             subject_key.as_deref(),
         ),
@@ -576,6 +638,99 @@ fn mint(
     println!("bundle:     {} ({} bytes)", out_path.display(), bytes.len());
     println!("expires-in: {}h", hours);
     Ok(())
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Self-healing / renewing mint. Decides whether the bundle at `out_path`
+/// needs (re)minting and, if so, mints it with the current org root. The
+/// decision uses the same [`relix_core::bundle::BundleHeader::needs_renewal`]
+/// primitive the runtime renewal path relies on, so boot-time self-heal and
+/// periodic renewal share one rule.
+#[allow(clippy::too_many_arguments)]
+fn ensure(
+    root_key_path: &Path,
+    name: &str,
+    groups: &[String],
+    role: &str,
+    clearance: &str,
+    hours: i64,
+    renewal_window_days: i64,
+    out_path: &Path,
+    subject_key_path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let window_secs = renewal_window_days.saturating_mul(86_400);
+    // Determine whether (and why) a (re)mint is required. `None` => healthy.
+    let reason: Option<String> = if !out_path.exists() {
+        Some("missing".to_string())
+    } else {
+        match fs::read(out_path) {
+            Err(e) => Some(format!("unreadable: {e}")),
+            Ok(bytes) => {
+                let decoded: Result<Bundle, _> = codec::decode(&bytes);
+                match decoded {
+                    Err(e) => Some(format!("corrupt: {e}")),
+                    Ok(bundle) => {
+                        // Validate against the CURRENT org root — a bundle
+                        // signed by a stale/foreign root (e.g. a pre-minted
+                        // bundle shipped in a checkout) fails here and is
+                        // self-healed rather than left to break boot.
+                        let root_key = read_secret_key(root_key_path)?;
+                        let now = now_unix_secs();
+                        match bundle.validate(
+                            &root_key.verifying_key(),
+                            BundleType::Identity,
+                            now,
+                        ) {
+                            Ok(()) => {
+                                if bundle.header.needs_renewal(now, window_secs) {
+                                    let days = bundle.header.seconds_until_expiry(now) / 86_400;
+                                    Some(format!("near-expiry ({days}d remaining)"))
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(BundleError::Expired) => Some("expired".to_string()),
+                            Err(e) => Some(format!("invalid for current org root: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match reason {
+        None => {
+            // Healthy and outside the renewal window — report remaining life.
+            if let Ok(bytes) = fs::read(out_path) {
+                if let Ok(bundle) = codec::decode::<Bundle>(&bytes) {
+                    let days = bundle.header.seconds_until_expiry(now_unix_secs()) / 86_400;
+                    println!("ensure: {name} bundle valid ({days}d remaining); no action");
+                    return Ok(());
+                }
+            }
+            println!("ensure: {name} bundle valid; no action");
+            Ok(())
+        }
+        Some(why) => {
+            println!("ensure: (re)minting {name} bundle ({why})");
+            mint(
+                root_key_path,
+                name,
+                groups,
+                role,
+                clearance,
+                hours,
+                out_path,
+                subject_key_path,
+            )
+        }
+    }
 }
 
 fn inspect(bundle_path: &Path, root_key_path: &Path) -> Result<(), Box<dyn std::error::Error>> {

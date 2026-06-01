@@ -43,6 +43,11 @@ dev-data/
 dev-keys/*.key
 dev-keys/*.pub
 dev-keys/*.aic
+# Node identity bundles are minted locally at first boot (self-healing via
+# `relix identity ensure`). Never commit pre-minted bundles — they carry a
+# wall-clock expiry and are signed by a local org root that does not exist
+# on a fresh checkout, so a committed bundle is broken/expired on arrival.
+dev-keys/*.bundle
 
 # Per-operator policy file. The shipped policy lives in
 # configs/policies/dev.toml; `local.toml` is an operator's
