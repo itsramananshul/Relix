@@ -30,7 +30,11 @@
 set -euo pipefail
 
 REPO="itsramananshul/Relix"
+# `/releases/latest` is GitHub's "latest STABLE" — it excludes
+# pre-releases. The plain `/releases` list (newest-first) is what we walk
+# to find the newest beta when RELIX_CHANNEL=beta.
 RELEASES_API="https://api.github.com/repos/${REPO}/releases/latest"
+RELEASES_LIST_API="https://api.github.com/repos/${REPO}/releases?per_page=30"
 RELEASES_DL="https://github.com/${REPO}/releases/download"
 SCRIPT_RAW_BASE="https://raw.githubusercontent.com/${REPO}"
 
@@ -392,11 +396,42 @@ if ! have sha256sum && ! have shasum; then
     err "need sha256sum or shasum for hash verification; please install coreutils"
 fi
 
+# Release channel: "stable" (default, => latest non-prerelease) or
+# "beta" (=> newest pre-release). An explicit RELIX_VERSION always wins
+# over the channel, so you can pin any exact tag (stable or beta).
+CHANNEL="${RELIX_CHANNEL:-stable}"
 TAG=""
 if [ -n "${RELIX_VERSION:-}" ]; then
     TAG="${RELIX_VERSION}"
+    info "Channel:           pinned (${TAG})"
+elif [ "${CHANNEL}" = "beta" ] || [ "${CHANNEL}" = "prerelease" ]; then
+    info "Channel:           beta — resolving newest pre-release from GitHub..."
+    # The releases list is newest-first; pick the first entry that is a
+    # pre-release and not a draft.
+    RELEASE_JSON="$(fetch_metadata "${RELEASES_LIST_API}")" || err "failed to query ${RELEASES_LIST_API}"
+    if have jq; then
+        TAG="$(printf '%s' "${RELEASE_JSON}" \
+            | jq -r 'map(select(.prerelease == true and .draft == false)) | .[0].tag_name // empty')"
+    fi
+    if [ -z "${TAG}" ]; then
+        # jq-less fallback: track the most recent tag_name and emit it at
+        # the first `"prerelease": true` (tag_name precedes prerelease
+        # within each release object; objects are newest-first).
+        TAG="$(printf '%s' "${RELEASE_JSON}" | awk '
+            match($0, /"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"/) {
+                t=substr($0,RSTART,RLENGTH); sub(/.*"/,"",t)
+            }
+            /"tag_name"[[:space:]]*:/ {
+                line=$0; sub(/.*"tag_name"[[:space:]]*:[[:space:]]*"/,"",line); sub(/".*/,"",line); t=line
+            }
+            /"prerelease"[[:space:]]*:[[:space:]]*true/ { print t; exit }
+        ')"
+    fi
+    if [ -z "${TAG}" ]; then
+        err "no beta (pre-release) found for ${REPO}. Pin one with RELIX_VERSION=vX.Y.Z-beta.N, or omit RELIX_CHANNEL for the stable channel."
+    fi
 else
-    info "Resolving latest release tag from GitHub..."
+    info "Channel:           stable — resolving latest release from GitHub..."
     # The release-metadata GET is the only fetch that has no
     # pre-known hash. It's used solely to resolve the tag string;
     # every subsequent download is pinned + verified.

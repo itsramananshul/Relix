@@ -31,7 +31,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Repo        = 'itsramananshul/Relix'
-$ReleasesApi = "https://api.github.com/repos/$Repo/releases/latest"
+# `/releases/latest` is GitHub's "latest STABLE" (excludes pre-releases);
+# the plain `/releases` list (newest-first) is walked to find the newest
+# beta when $env:RELIX_CHANNEL = 'beta'.
+$ReleasesApi     = "https://api.github.com/repos/$Repo/releases/latest"
+$ReleasesListApi = "https://api.github.com/repos/$Repo/releases?per_page=30"
 $ReleasesDl  = "https://github.com/$Repo/releases/download"
 $RawBase     = "https://raw.githubusercontent.com/$Repo"
 
@@ -298,16 +302,36 @@ try {
     # -----------------------------------------------------------------------
     # 3. Resolve version / tag
     # -----------------------------------------------------------------------
+    # Release channel: 'stable' (default, => latest non-prerelease) or
+    # 'beta' (=> newest pre-release). An explicit RELIX_VERSION always wins
+    # so any exact tag (stable or beta) can be pinned.
+    $channel = if ($env:RELIX_CHANNEL) { $env:RELIX_CHANNEL.Trim().ToLower() } else { 'stable' }
+    $headers = @{ 'User-Agent' = 'relix-installer' }
     $tag = $null
     if ($env:RELIX_VERSION -and $env:RELIX_VERSION.Trim().Length -gt 0) {
         $tag = $env:RELIX_VERSION
+        Write-Host "Channel:           pinned ($tag)"
+    } elseif ($channel -eq 'beta' -or $channel -eq 'prerelease') {
+        Write-Host "Channel:           beta - resolving newest pre-release from GitHub..."
+        try {
+            $rels = Invoke-RestMethod -Uri $ReleasesListApi -Headers $headers -UseBasicParsing
+            # List is newest-first; first non-draft pre-release wins.
+            $beta = $rels | Where-Object { $_.prerelease -and -not $_.draft } | Select-Object -First 1
+            if ($beta -and $beta.tag_name) { $tag = [string]$beta.tag_name }
+        } catch {
+            Write-Error "failed to query $ReleasesListApi : $($_.Exception.Message)"
+            return
+        }
+        if (-not $tag) {
+            Write-Error "no beta (pre-release) found for $Repo. Pin one with `$env:RELIX_VERSION = 'vX.Y.Z-beta.N', or omit RELIX_CHANNEL for the stable channel."
+            return
+        }
     } else {
-        Write-Host "Resolving latest release tag from GitHub..."
+        Write-Host "Channel:           stable - resolving latest release from GitHub..."
         # The release-metadata GET is the only fetch with no pre-known
         # hash. It's used solely to resolve the tag string; every
         # subsequent download is pinned + verified.
         try {
-            $headers = @{ 'User-Agent' = 'relix-installer' }
             $rel = Invoke-RestMethod -Uri $ReleasesApi -Headers $headers -UseBasicParsing
             if ($rel -and $rel.tag_name) {
                 $tag = [string]$rel.tag_name

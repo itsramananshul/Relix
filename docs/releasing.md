@@ -50,6 +50,28 @@ the version note in the root `Cargo.toml`.)
 > binaries, so make sure the commit you tag `vX.Y.Z` is the same commit
 > (or a no-op superset of) the beta you validated.
 
+## Installing from each channel
+
+The installers (`install.sh` / `install.ps1`) pick the channel from two
+env vars; an explicit `RELIX_VERSION` always wins over `RELIX_CHANNEL`.
+
+| Want | Mac/Linux | Windows (PowerShell) |
+|---|---|---|
+| Latest **stable** (default) | `curl -fsSL …/install.sh \| bash` | `irm …/install.ps1 \| iex` |
+| Latest **beta** | `curl -fsSL …/install.sh \| RELIX_CHANNEL=beta bash` | `$env:RELIX_CHANNEL='beta'; irm …/install.ps1 \| iex` |
+| **Exact** tag | `curl -fsSL …/install.sh \| RELIX_VERSION=v0.4.2-beta.1 bash` | `$env:RELIX_VERSION='v0.4.2-beta.1'; irm …/install.ps1 \| iex` |
+
+(`…` = `https://raw.githubusercontent.com/itsramananshul/Relix/main`.)
+
+How resolution works: stable hits the GitHub `releases/latest` endpoint
+(which excludes pre-releases); `RELIX_CHANNEL=beta` walks the `releases`
+list and takes the newest non-draft pre-release; `RELIX_VERSION` pins the
+tag verbatim. Every channel downloads the same per-OS binaries (Linux
+x86_64/arm64, macOS x86_64/arm64, Windows x86_64), SHA256- and
+cosign-verified identically — beta builds are not less verified, just not
+marked "Latest". The full per-OS one-liners live in the README **Install**
+section.
+
 ## Manual trigger
 
 You can also (re)run a release from the **Actions → Release** tab with a

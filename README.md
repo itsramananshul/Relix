@@ -41,6 +41,8 @@ operator dashboard.
 
 ## Install
 
+The default install gives you the latest **stable** release.
+
 **Mac / Linux:**
 
 ```sh
@@ -63,7 +65,44 @@ Both installers do the same four things:
    pick provider, paste API key, tick channels, confirm.
 4. Save your choices to `~/.relix/config.toml`.
 
-Set `RELIX_VERSION=v0.4.2` to pin a specific release.
+### Install a beta (pre-release)
+
+`RELIX_CHANNEL=beta` installs the newest pre-release instead of the
+latest stable. Betas are GitHub pre-releases — never shown as "Latest"
+— so the stable install above is unaffected.
+
+**Mac / Linux:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.sh | RELIX_CHANNEL=beta bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+$env:RELIX_CHANNEL = 'beta'; irm https://raw.githubusercontent.com/itsramananshul/Relix/main/install.ps1 | iex
+```
+
+### Pin an exact version
+
+`RELIX_VERSION` installs one specific tag — stable (`v0.4.2`) or beta
+(`v0.4.2-beta.1`) — and always wins over the channel.
+
+**Mac / Linux:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itsramananshul/Relix/main/install.sh | RELIX_VERSION=v0.4.2 bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+$env:RELIX_VERSION = 'v0.4.2'; irm https://raw.githubusercontent.com/itsramananshul/Relix/main/install.ps1 | iex
+```
+
+The same per-OS binaries are built for both channels (Linux x86_64/arm64,
+macOS x86_64/arm64, Windows x86_64); the installer auto-detects yours.
+See [docs/releasing.md](docs/releasing.md) for how channels are cut.
 
 ## Quick start
 
