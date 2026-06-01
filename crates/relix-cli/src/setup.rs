@@ -19,7 +19,7 @@
 //! any page exits 130 with the terminal restored — every render
 //! path runs inside a RAII guard that disables raw mode on drop.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crossterm::{
     cursor,
@@ -44,14 +44,46 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // whatever was broken.
     let prior = RelixConfig::load_default().ok().flatten();
 
-    // Pre-flight: surface missing dependencies BEFORE we
-    // enter raw mode and start the wizard pages. This prints
-    // the dep table + optional install prompts via plain
-    // stdio. `status_for_setup` never panics and always
-    // returns — a missing Docker / Ollama / Qdrant just
-    // leaves the wizard's confirmation page with the
-    // [MISSING] rows so the operator can fix afterwards.
-    let dep_statuses = crate::install::status_for_setup().await;
+    // Pre-flight: surface dependencies and let the operator choose
+    // WITH / WITHOUT memory (Qdrant via Docker) BEFORE we enter raw
+    // mode. This never hangs — a Docker-down "with memory" choice ends
+    // cleanly here with actionable re-run instructions.
+    let dep_statuses = match crate::install::status_for_setup().await {
+        crate::install::SetupPreflight::ExitStartDocker => {
+            // status_for_setup already printed the "Docker is not
+            // running…" message. Exit cleanly so the operator can start
+            // Docker and re-run setup.
+            return Ok(());
+        }
+        crate::install::SetupPreflight::Continue(statuses) => statuses,
+    };
+
+    // The interactive wizard uses crossterm raw-mode key reads. When
+    // stdin is NOT an interactive terminal — e.g. setup launched from a
+    // piped `curl | sh` / `irm | iex` installer, or run under a
+    // redirect — `event::read()` blocks forever (the reported
+    // post-banner "freeze"). Guard it: in a non-interactive shell, skip
+    // the wizard, persist a config (prior values, or defaults), and
+    // exit cleanly with instructions instead of hanging.
+    if !io::stdin().is_terminal() {
+        let cfg = prior.clone().unwrap_or_default();
+        let path = RelixConfig::default_path();
+        cfg.save_to(&path)?;
+        println!();
+        println!(
+            "Non-interactive shell — wrote {} ({}).",
+            path.display(),
+            if prior.is_some() {
+                "kept your existing settings"
+            } else {
+                "defaults: provider = mock, channels off"
+            }
+        );
+        println!(
+            "Run `relix setup` directly in a terminal to choose your provider, API key, and channels."
+        );
+        return Ok(());
+    }
 
     let _raw = RawGuard::new()?;
     let final_cfg = run_wizard(prior.as_ref())?;
@@ -319,6 +351,7 @@ fn welcome() -> io::Result<PageResult<()>> {
     clear_screen(&mut out)?;
     // Build the centred version line into the boxed panel.
     let version_line = pad_box_line(&format!("Exchange  v{}", env!("CARGO_PKG_VERSION")));
+    let action_line = pad_box_line("starting guided setup…");
     let lines: [&str; 9] = [
         "╔══════════════════════════════════════════╗",
         "║      RELIX — Relay Intelligence          ║",
@@ -326,8 +359,8 @@ fn welcome() -> io::Result<PageResult<()>> {
         "║                                          ║",
         "║         The OS for AI Agents             ║",
         "║                                          ║",
-        "║      Press Enter to begin setup          ║",
-        "║      (Ctrl-C to cancel)                  ║",
+        action_line.as_str(),
+        "║      (Ctrl-C anytime to cancel)          ║",
         "╚══════════════════════════════════════════╝",
     ];
     for (i, line) in lines.iter().enumerate() {
@@ -337,13 +370,12 @@ fn welcome() -> io::Result<PageResult<()>> {
     }
     queue!(out, ResetColor)?;
     out.flush()?;
-    loop {
-        match read_key()? {
-            Key::Enter => return Ok(PageResult::Next(())),
-            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
-            _ => {}
-        }
-    }
+    // No blocking "Press Enter to begin" wait. The pre-flight step
+    // already consumed the operator's Enter (cooked-mode memory prompt),
+    // so a second raw-mode key wait here looked like a freeze. Proceed
+    // straight to the first page; the page itself reads keys and Ctrl-C
+    // still cancels there.
+    Ok(PageResult::Next(()))
 }
 
 const PROVIDER_CHOICES: &[(&str, &str)] = &[

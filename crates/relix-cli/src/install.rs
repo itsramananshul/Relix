@@ -628,30 +628,107 @@ pub fn print_table(rows: &[DependencyStatus]) {
 /// install timeout per dependency; on failure it prints the
 /// manual URL and returns without an error so the wizard
 /// always proceeds.
-pub async fn status_for_setup() -> Vec<DependencyStatus> {
-    let statuses = check_all();
-    let missing: Vec<&DependencyStatus> = statuses.iter().filter(|s| !s.found).collect();
-    if missing.is_empty() {
-        return statuses;
-    }
-    println!();
-    print_table(&statuses);
-    println!();
-    if !confirm_or_skip("Install missing dependencies before continuing? [y/N] ") {
-        println!("Skipped. Re-run `relix install --fix` when you're ready. Continuing with setup.");
-        return statuses;
-    }
-    for s in &missing {
-        match install_dependency(s.dependency).await {
-            Ok(note) => println!("[OK]      {:<14}{note}", s.dependency.label()),
-            Err(e) => {
-                println!("[FAILED]  {:<14}{e}", s.dependency.label());
-                println!("           manual install: {}", manual_url(s.dependency));
-            }
+/// Outcome of the pre-flight dependency step the setup wizard runs.
+pub enum SetupPreflight {
+    /// Proceed into the wizard with these (re-checked) dependency
+    /// statuses.
+    Continue(Vec<DependencyStatus>),
+    /// The operator chose to set up WITH memory but Docker is not
+    /// running. The actionable message has already been printed; the
+    /// wizard should exit cleanly so they can start Docker and re-run.
+    ExitStartDocker,
+}
+
+/// Is the Docker DAEMON reachable (not merely the CLI installed)?
+/// `check_docker()` only proves `docker --version` works; `docker info`
+/// succeeds only when the daemon is up. Bounded by a timeout so a hung
+/// or unreachable daemon socket can never stall setup (BUG 1: the old
+/// path ran `docker pull` against a dead daemon and blocked up to the
+/// 300 s install timeout).
+async fn docker_daemon_running() -> bool {
+    let spawned = tokio::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(_) => return false, // docker CLI not installed
+    };
+    match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+        Ok(Ok(status)) => status.success(),
+        _ => {
+            let _ = child.kill().await;
+            false
         }
     }
-    // Re-check after install so the wizard sees the new state.
-    check_all()
+}
+
+/// Read a `1` / `2` memory choice from stdin. Defaults to `2`
+/// (WITHOUT memory) on blank input or a closed stdin — memory is
+/// opt-in, never required.
+fn prompt_memory_choice() -> bool {
+    print!("Enter 1 or 2 [2]: ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "1")
+}
+
+/// Pre-flight dependency step for `relix setup`. Memory (Qdrant via
+/// Docker) is presented as an explicit CHOICE, never a hard
+/// requirement, and never hangs:
+///   * Qdrant already running        → continue, memory available.
+///   * choose WITH memory + Docker up → pull/run Qdrant, continue.
+///   * choose WITH memory + Docker DOWN → print actionable message,
+///                                        return ExitStartDocker.
+///   * choose WITHOUT memory          → continue degraded (no Qdrant).
+pub async fn status_for_setup() -> SetupPreflight {
+    let statuses = check_all();
+    println!();
+    print_table(&statuses);
+
+    let qdrant_running = statuses
+        .iter()
+        .find(|s| s.dependency == Dependency::Qdrant)
+        .map(|s| s.found)
+        .unwrap_or(false);
+    if qdrant_running {
+        // Memory is already available — nothing to decide.
+        return SetupPreflight::Continue(statuses);
+    }
+
+    println!();
+    println!("Memory (semantic recall + vector search) needs a running Qdrant,");
+    println!("which Relix starts via Docker. Qdrant is not running right now.");
+    println!("  [1] Set up WITH memory       — requires Docker running + Qdrant");
+    println!("  [2] Continue WITHOUT memory  — enable later by re-running `relix setup`");
+    if prompt_memory_choice() {
+        // (a) WITH memory.
+        if !docker_daemon_running().await {
+            println!();
+            println!("Docker is not running. Start Docker Desktop, then re-run `relix setup` to enable memory.");
+            return SetupPreflight::ExitStartDocker;
+        }
+        match install_qdrant_via_docker().await {
+            Ok(note) => println!("[OK]      Qdrant        {note}"),
+            Err(e) => {
+                println!("[FAILED]  Qdrant        {e}");
+                println!("          Continuing without memory; re-run `relix setup` to retry.");
+            }
+        }
+        // Re-check so the wizard sees the new state.
+        SetupPreflight::Continue(check_all())
+    } else {
+        // (b) WITHOUT memory.
+        println!();
+        println!("Continuing without memory — vector recall is disabled. Start Docker and");
+        println!("re-run `relix setup`, choosing [1], to enable it later.");
+        SetupPreflight::Continue(statuses)
+    }
 }
 
 // ────────────────────────── tests ───────────────────────────────
