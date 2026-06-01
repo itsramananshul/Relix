@@ -688,6 +688,34 @@ function errorPanel(container, err, retry) {
       el('div', { style: { marginTop: '8px' } },
         el('button', { class: 'btn', onclick: retry }, 'Retry'))));
 }
+// A request failure that means the backing node / feature simply isn't
+// running on this deployment (vs a real error): a 404 unknown alias, or
+// a degraded "no peer" / not-initialized response. These should render
+// a calm "not running" state, never a red error box.
+function isFeatureAbsent(err) {
+  if (!err) return false;
+  if (err.status === 404) return true;
+  var m = ((err && err.message) || '') + ' ' + ((err && err.body) || '');
+  return /unknown alias|no peer|not initialized|not running|not enabled|unavailable/i.test(m);
+}
+// True when a 200 payload is the graceful {available:false} marker.
+function isUnavailablePayload(j) {
+  return !!(j && typeof j === 'object' && j.available === false);
+}
+// Calm muted "not running" state for a panel whose subsystem/node is
+// absent on this deployment.
+function unavailablePanel(container, label) {
+  setKids(container, el('div', { class: 'muted' },
+    (label || 'This feature') + ' is not running on this deployment.'));
+}
+// Coerce any payload into a row array — tolerates {available:false},
+// {<key>:[...]}, a bare array, or an object, never throwing on .filter
+// / .slice downstream.
+function rowsOf(j, key) {
+  if (Array.isArray(j)) return j;
+  if (j && key && Array.isArray(j[key])) return j[key];
+  return [];
+}
 function spinnerInto(container) {
   setKids(container, el('div', { class: 'loading-state' }, el('span', { class: 'spinner' }), ' Loading…'));
 }
@@ -793,7 +821,7 @@ Loaders.overview = function () {
       });
     }
     if (alertsJson) {
-      var rows2 = (alertsJson.alerts || alertsJson) || [];
+      var rows2 = rowsOf(alertsJson, 'alerts');
       cards.push(healthCard('Cost Alerts',
         rows2.length === 0 ? 'ok' : (rows2.length < 3 ? 'warn' : 'err'),
         rows2.length + ' active', ''));
@@ -809,7 +837,7 @@ Loaders.overview = function () {
       });
     }
     if (alertsJson) {
-      var rows3 = (alertsJson.alerts || alertsJson) || [];
+      var rows3 = rowsOf(alertsJson, 'alerts');
       rows3.slice(0, 10).forEach(function (r) {
         events.push({ ts: r.triggered_at_ms || r.started_at || 0,
           kind: r.severity || 'alert', subsystem: r.agent || 'system',
@@ -1479,7 +1507,13 @@ Loaders.credentials = function () {
   var box = document.getElementById('credentials-table');
   spinnerInto(box);
   Bridge.get('/v1/credentials').then(function (j) {
-    var rows = (j && (j.credentials || j)) || [];
+    if (isUnavailablePayload(j)) {
+      setKids(box, el('div', { class: 'muted' }, 'Credential vault not enabled on this deployment.'));
+      setKids(document.getElementById('credentials-rotation'), el('div', { class: 'muted' }, 'No rotation schedules.'));
+      setMeta('credentials', true);
+      return;
+    }
+    var rows = rowsOf(j, 'credentials');
     if (!rows.length) setKids(box, el('div', { class: 'muted' }, 'Vault empty.'));
     else {
       var t = el('table', {}, el('thead', {}, el('tr', {},
@@ -2155,7 +2189,19 @@ Loaders.email = function () {
       t.appendChild(tb); setKids(box, t);
     }
     setMeta('email', true);
-  }).catch(function () { setMeta('email', false); });
+  }).catch(function (e) {
+    // The email channel is opt-in. When its node isn't running the
+    // bridge returns 404 unknown alias 'email' — show a calm "not
+    // running" state in both panels rather than a stuck spinner / red error.
+    if (isFeatureAbsent(e)) {
+      unavailablePanel(document.getElementById('email-status'), 'Email channel');
+      unavailablePanel(document.getElementById('email-messages'), 'Email channel');
+      setMeta('email', true);
+    } else {
+      errorPanel(document.getElementById('email-status'), e, Loaders.email);
+      setMeta('email', false);
+    }
+  });
 };
 function openMessage(r) {
   var panel = document.getElementById('email-detail-panel');
@@ -2172,7 +2218,8 @@ Loaders.plugins = function () {
   var box = document.getElementById('plugins-table');
   spinnerInto(box);
   Bridge.get('/v1/plugins').then(function (j) {
-    var rows = (j && (j.plugins || j)) || [];
+    if (isUnavailablePayload(j)) { unavailablePanel(box, 'Plugin host'); setMeta('plugins', true); return; }
+    var rows = rowsOf(j, 'plugins');
     if (!rows.length) setKids(box, el('div', { class: 'muted' }, 'No plugins installed.'));
     else {
       var t = el('table', {}, el('thead', {}, el('tr', {},
@@ -2207,7 +2254,13 @@ Loaders.plugins = function () {
       t.appendChild(tb); setKids(box, t);
     }
     setMeta('plugins', true);
-  }).catch(function (e) { errorPanel(box, e, Loaders.plugins); setMeta('plugins', false); });
+  }).catch(function (e) {
+    // The plugin host is an opt-in node (RELIX_PLUGINS=1). When it
+    // isn't running the bridge returns 404 unknown alias — render a
+    // calm "not running" state, not a red error box.
+    if (isFeatureAbsent(e)) { unavailablePanel(box, 'Plugin host'); setMeta('plugins', true); }
+    else { errorPanel(box, e, Loaders.plugins); setMeta('plugins', false); }
+  });
 };
 
 Loaders.config = function () {
@@ -2272,8 +2325,19 @@ Loaders.logs = function () {
       } catch (e) { /* ignore */ }
     });
     State.logStream.onerror = function () {
+      // EventSource cannot attach the Authorization: Bearer header, and
+      // the bridge (correctly, per SEC PART 3) does not accept a
+      // ?token= query param — so the SSE log stream can't authenticate
+      // from the browser. Show an honest, calm state instead of looping
+      // a red "disconnected" line, and stop reconnect attempts.
+      if (State.logStream) { try { State.logStream.close(); } catch (e) {} State.logStream = null; }
       var box = document.getElementById('log-stream');
-      if (box && !State.logPaused) box.appendChild(el('div', { class: 'log-line ERROR' }, '-- log stream disconnected --'));
+      if (box && !State.logLines.length) {
+        setKids(box, el('div', { style: { color: '#9ca3af' } },
+          'Live log streaming is not available in the browser dashboard — the ' +
+          'SSE endpoint requires a bearer token the browser cannot attach. ' +
+          'Tail the controller logs under your data dir (e.g. dev-data/<run>/*.log) instead.'));
+      }
     };
   } catch (e) {
     setKids(document.getElementById('log-stream'),
@@ -2545,39 +2609,53 @@ function initApp() {
       return;
     }
     startSessionExpiryProbe();
-    document.getElementById('chat-send').addEventListener('click', chatSend);
-    document.getElementById('chat-clear').addEventListener('click', function () {
-      State.chatHistory = []; renderChatHistory();
-      setKids(document.getElementById('chat-stats'));
-    });
-    document.getElementById('chat-message').addEventListener('keydown', function (e) {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { chatSend(); e.preventDefault(); }
-    });
-    wireMemoryTabs();
-    document.getElementById('skill-create-open').addEventListener('click', openCreateSkillModal);
-    document.getElementById('skill-search').addEventListener('input', function () {
-      if (State.active === 'skills') Loaders.skills();
-    });
-    document.getElementById('sess-search').addEventListener('input', function () {
-      if (State.active === 'sessions') Loaders.sessions();
-    });
-    document.getElementById('belief-load').addEventListener('click', loadBeliefs);
-    document.getElementById('cred-create-open').addEventListener('click', openCreateCredModal);
-    document.getElementById('token-create-open').addEventListener('click', openIssueTokenModal);
-    document.getElementById('research-submit').addEventListener('click', researchSubmit);
-    document.getElementById('plan-submit').addEventListener('click', planSubmit);
-    document.getElementById('workflows-reload-btn').addEventListener('click', function () {
-      Bridge.post('/v1/workflows/reload').then(Loaders.workflows).catch(function (e) { alert(e.message); });
-    });
-    wireLogControls();
+    // Make the dashboard interactive FIRST: show the overview and let
+    // navigation work before wiring any optional controls. Nav-item
+    // click handlers are already bound in buildNav(); activating the
+    // section + loading it here must not depend on the control wiring
+    // below succeeding — a single missing control element must never
+    // abort section setup or block full-width clicks.
+    document.getElementById('section-overview').classList.add('active');
+    loadSection('overview');
     Bridge.get('/v1/info').then(function (j) {
       document.getElementById('sidebar-footer').textContent =
         'Relix ' + ((j && j.version) || '?') + ' · ' + ((j && j.provider) || 'unknown');
     }).catch(function () {
       document.getElementById('sidebar-footer').textContent = 'Relix · unknown';
     });
-    document.getElementById('section-overview').classList.add('active');
-    loadSection('overview');
+    // Optional control wiring. Wrapped so a missing element (a panel
+    // renamed/removed in a future edit) degrades to "that control isn't
+    // wired" instead of aborting the rest of init and leaving the
+    // dashboard looking dead.
+    try {
+      document.getElementById('chat-send').addEventListener('click', chatSend);
+      document.getElementById('chat-clear').addEventListener('click', function () {
+        State.chatHistory = []; renderChatHistory();
+        setKids(document.getElementById('chat-stats'));
+      });
+      document.getElementById('chat-message').addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { chatSend(); e.preventDefault(); }
+      });
+      wireMemoryTabs();
+      document.getElementById('skill-create-open').addEventListener('click', openCreateSkillModal);
+      document.getElementById('skill-search').addEventListener('input', function () {
+        if (State.active === 'skills') Loaders.skills();
+      });
+      document.getElementById('sess-search').addEventListener('input', function () {
+        if (State.active === 'sessions') Loaders.sessions();
+      });
+      document.getElementById('belief-load').addEventListener('click', loadBeliefs);
+      document.getElementById('cred-create-open').addEventListener('click', openCreateCredModal);
+      document.getElementById('token-create-open').addEventListener('click', openIssueTokenModal);
+      document.getElementById('research-submit').addEventListener('click', researchSubmit);
+      document.getElementById('plan-submit').addEventListener('click', planSubmit);
+      document.getElementById('workflows-reload-btn').addEventListener('click', function () {
+        Bridge.post('/v1/workflows/reload').then(Loaders.workflows).catch(function (e) { alert(e.message); });
+      });
+      wireLogControls();
+    } catch (e) {
+      try { console.warn('dashboard: control wiring incomplete:', e && e.message); } catch (e2) {}
+    }
   });
 }
 
