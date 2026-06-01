@@ -47,9 +47,14 @@ The repository ships example configs in `configs/`:
 - `configs/memory-node.toml`
 - `configs/ai-node.toml`
 - `configs/tool-node.toml`
-- `configs/web-bridge-node.toml`
 
 Each declares: node name, type, listen port, peers to dial, policy file path, capability registrations, and identity-key path.
+
+The web bridge is NOT a controller node type — it is a separate
+binary (`relix-web-bridge`) with its own config
+(`configs/web-bridge.toml`). The controller hard-errors on
+`node_type = "web_bridge"`, so do not boot the controller with a
+web-bridge config.
 
 **The AI node config** is the only place the Anthropic API key appears. Edit `configs/ai-node.toml` to set `[ai] api_key_path = "dev-keys/anthropic.key"` and create the file with your real key (gitignored).
 
@@ -70,9 +75,9 @@ RELIX_NODE_KEY=dev-keys/ai.key \
 RELIX_NODE_KEY=dev-keys/tool.key \
     cargo run --release -p relix-controller -- --config configs/tool-node.toml
 
-# Terminal 4 — web bridge node
+# Terminal 4 — web bridge (SEPARATE binary, not the controller)
 RELIX_NODE_KEY=dev-keys/web-bridge.key \
-    cargo run --release -p relix-controller -- --config configs/web-bridge-node.toml
+    cargo run --release -p relix-web-bridge -- --config configs/web-bridge.toml
 ```
 
 Each controller on startup:

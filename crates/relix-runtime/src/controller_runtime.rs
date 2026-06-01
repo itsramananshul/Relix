@@ -5954,13 +5954,50 @@ fn open_layered_memory(
     }))
 }
 
+/// SEC §13: the `node_type` values the controller actually
+/// implements on the non-router path. Each registers a real
+/// capability surface in [`register_node_type_handlers`]. A
+/// `node_type` outside this set registers ZERO node-type
+/// capabilities — booting it yields a process that logs
+/// "controller online" while doing nothing. (Router nodes take a
+/// separate `role = "router"` path and never reach that function;
+/// the web bridge is the separate `relix-web-bridge` binary.)
+pub const SUPPORTED_CONTROLLER_NODE_TYPES: &[&str] = &[
+    "memory",
+    "ai",
+    "coordinator",
+    "telegram",
+    "discord",
+    "slack",
+    "email",
+    "plugin_host",
+    "tool",
+];
+
+/// SEC §13: fail closed on an unhandled / no-op `node_type`.
+/// Previously `node_type = "web_bridge"` / `"demo"` (and any typo)
+/// fell through every branch and the controller booted "online"
+/// with zero capabilities — a dead process that looks healthy.
+/// Now such a `node_type` is a hard error with a clear message.
+fn validate_controller_node_type(node_type: &str) -> Result<(), String> {
+    if SUPPORTED_CONTROLLER_NODE_TYPES.contains(&node_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "node_type=`{node_type}` is not implemented by the controller — it would register zero \
+         capabilities and boot a dead process that merely logs \"controller online\". Supported \
+         controller node types: {}. (A web bridge runs as the separate `relix-web-bridge` binary; \
+         a router node sets `role = \"router\"`.)",
+        SUPPORTED_CONTROLLER_NODE_TYPES.join(", ")
+    ))
+}
+
 /// Register node-type-specific capabilities based on `[controller] node_type`.
 ///
-/// - `memory` → SQLite + FTS5 memory store (M7).
-/// - Other types (`ai`, `tool`, `web_bridge`, `demo`, ...) are no-ops until
-///   their handlers ship in later milestones; the controller still serves
-///   the default `node.health` capability so it can participate in chained
-///   orchestration today.
+/// SEC §13: a `node_type` outside [`SUPPORTED_CONTROLLER_NODE_TYPES`]
+/// is rejected up front (see [`validate_controller_node_type`]) so
+/// the controller never boots a no-op process. Each supported type
+/// below registers its real capability surface.
 #[allow(clippy::too_many_arguments)]
 fn register_node_type_handlers(
     bridge: &mut DispatchBridge,
@@ -5975,6 +6012,10 @@ fn register_node_type_handlers(
     confidence_bundle: Option<&ConfidenceBundle>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use relix_core::capability::CapabilityDescriptor;
+
+    // SEC §13: refuse to boot an unimplemented / no-op node_type
+    // instead of silently coming "online" with zero capabilities.
+    validate_controller_node_type(&cfg.controller.node_type)?;
 
     if cfg.controller.node_type == "memory" {
         let raw = cfg.memory.clone().ok_or_else(|| {
@@ -9854,8 +9895,9 @@ fn register_node_type_handlers(
             "tool node: registered tool.web_fetch + CW3 web_tools"
         );
     }
-    // web_bridge / demo node types are no-ops today; their handlers ship in
-    // later milestones. node.health is always available via builtins.
+    // SEC §13: unreachable for unsupported node_types — they were
+    // rejected by `validate_controller_node_type` at the top of
+    // this function rather than falling through to a no-op boot.
     Ok(())
 }
 
@@ -10214,5 +10256,43 @@ mod gate1_boot_failclosed_tests {
         // regardless of whether a service is wired.
         assert!(session_verification_boot_gate(false, false, false, false, "", 0).is_ok());
         assert!(session_verification_boot_gate(false, true, true, true, "X", 64).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sec13_node_type_failclosed_tests {
+    //! SEC §13: the controller must hard-error on a no-op / unknown
+    //! node_type instead of booting a dead "online" process.
+    use super::{SUPPORTED_CONTROLLER_NODE_TYPES, validate_controller_node_type};
+
+    #[test]
+    fn rejects_noop_and_unknown_node_types() {
+        // The named offenders (web_bridge, demo), a typo, and an
+        // empty node_type all fail closed with a clear message.
+        for nt in ["web_bridge", "demo", "totally-unknown", ""] {
+            let err = validate_controller_node_type(nt)
+                .expect_err(&format!("node_type `{nt}` must be rejected"));
+            assert!(
+                err.contains("not implemented") && err.contains("dead process"),
+                "error must explain the refusal for `{nt}`: {err}"
+            );
+            // The message must point operators at the supported set.
+            assert!(err.contains("memory"), "error should list supported types: {err}");
+        }
+    }
+
+    #[test]
+    fn real_node_types_still_boot() {
+        // Every implemented node_type passes validation (boots
+        // normally) — the gate doesn't overshoot.
+        for nt in SUPPORTED_CONTROLLER_NODE_TYPES {
+            assert!(
+                validate_controller_node_type(nt).is_ok(),
+                "supported node_type `{nt}` must pass validation"
+            );
+        }
+        // Sanity: the named real type from the section criteria.
+        assert!(validate_controller_node_type("ai").is_ok());
+        assert!(validate_controller_node_type("memory").is_ok());
     }
 }
