@@ -73,6 +73,12 @@ pub enum RejectReason {
     /// receiver rejects the observation outright; nothing
     /// lands on disk.
     InvalidSignature { detail: String },
+    /// SECTION 9: the payload's `source_pubkey` does not match
+    /// the key the receiver has configured for the claimed
+    /// `source_node` (or the source node is not in the receiver's
+    /// configured key registry at all). A valid signature alone
+    /// is not enough — the key must BELONG to the claimed node.
+    SourceKeyMismatch { node: String, detail: String },
     /// RELIX-7.16 GAP 3: a remote target's memory node was
     /// unreachable (mesh dispatcher returned an error or the
     /// node isn't wired). The target's copy is rejected
@@ -92,6 +98,7 @@ impl RejectReason {
             Self::WrongLayer { .. } => "wrong_layer",
             Self::NotOwnedBySender { .. } => "not_owned_by_sender",
             Self::InvalidSignature { .. } => "invalid_signature",
+            Self::SourceKeyMismatch { .. } => "source_key_mismatch",
             Self::Unreachable { .. } => "unreachable",
         }
     }

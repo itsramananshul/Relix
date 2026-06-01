@@ -247,6 +247,15 @@ pub struct KnowledgeService {
     /// `knowledge.autoshare_stats` cap returns zeros in that
     /// case.
     autoshare_stats: Option<super::autoshare::AutoShareLifetimeStats>,
+    /// SECTION 9: receiver-side registry binding a source node's
+    /// friendly name to its ED25519 public key (32 raw bytes).
+    /// `accept_shared` rejects any payload whose `source_pubkey`
+    /// does not match the key configured here for the claimed
+    /// `source_node` — a valid signature is not enough, the key
+    /// must BELONG to the claimed node. Empty ⇒ no binding
+    /// configured (signature-only legacy behaviour); the binding
+    /// is enforced the moment any node key is registered.
+    source_node_keys: Arc<std::collections::BTreeMap<String, [u8; 32]>>,
 }
 
 impl KnowledgeService {
@@ -261,7 +270,19 @@ impl KnowledgeService {
             signing_key: None,
             remote: None,
             autoshare_stats: None,
+            source_node_keys: Arc::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// SECTION 9: register the known ED25519 public key (32 raw
+    /// bytes) for a source node's friendly name. Once any key is
+    /// registered, `accept_shared` enforces the source-node
+    /// binding for every inbound payload. Builder-style.
+    pub fn with_source_node_key(mut self, node: impl Into<String>, pubkey: [u8; 32]) -> Self {
+        let mut map = (*self.source_node_keys).clone();
+        map.insert(node.into(), pubkey);
+        self.source_node_keys = Arc::new(map);
+        self
     }
 
     /// Internal cons used by tests that want to inject a
@@ -279,6 +300,7 @@ impl KnowledgeService {
             signing_key: None,
             remote: None,
             autoshare_stats: None,
+            source_node_keys: Arc::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -567,7 +589,37 @@ impl KnowledgeService {
     /// that's the source-node responsibility, updated when
     /// `share()` returns Ok on the sender side.
     pub fn accept_shared(&self, payload: SignedSharePayload) -> Result<(), ShareError> {
-        payload.verify().map_err(ShareError::Rejected)?;
+        // SECTION 9 (1): the signature must validate the canonical
+        // bytes (which now cover every security-relevant field, so
+        // tampering any of them breaks it) against the carried
+        // pubkey.
+        let verifying = payload.verify().map_err(ShareError::Rejected)?;
+        // SECTION 9 (2): BIND the carried pubkey to the claimed
+        // source_node. A valid signature only proves the payload
+        // was signed by SOME keypair; it must be the keypair the
+        // receiver knows for `source_node`, else any node holding
+        // any key could impersonate `memory-node-2`. Enforced once
+        // any node key is registered.
+        if !self.source_node_keys.is_empty() {
+            let presented = verifying.to_bytes();
+            match self.source_node_keys.get(&payload.source_node) {
+                Some(expected) if *expected == presented => { /* bound */ }
+                Some(_) => {
+                    return Err(ShareError::Rejected(RejectReason::SourceKeyMismatch {
+                        node: payload.source_node.clone(),
+                        detail: "source_pubkey does not match the configured key for this node"
+                            .to_string(),
+                    }));
+                }
+                None => {
+                    return Err(ShareError::Rejected(RejectReason::SourceKeyMismatch {
+                        node: payload.source_node.clone(),
+                        detail: "claimed source_node has no configured key on this receiver"
+                            .to_string(),
+                    }));
+                }
+            }
+        }
         let _ok = self
             .trust
             .check_accept(
@@ -1961,5 +2013,109 @@ mod tests {
         assert_eq!(copy.shared_by.as_deref(), Some("alice"));
         assert_eq!(copy.source, "bob");
         assert!(copy.tags.iter().any(|t| t == "share_note:hi"));
+    }
+
+    // ── SECTION 9: source binding + full-field canonical bytes ──
+
+    fn section9_cfg() -> KnowledgeConfig {
+        KnowledgeConfig {
+            groups: vec![SharingGroup {
+                name: "g".into(),
+                members: vec!["alice".into(), "bob".into()],
+                auto_share_layers: vec![],
+                min_quality_score: None,
+                member_nodes: Vec::new(),
+            }],
+            auto_share_interval_secs: 60,
+            max_observations_per_agent: None,
+            quality_scorer: Default::default(),
+            auto_share_per_tick_budget: None,
+            auto_share_per_agent_limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn section9_payload_with_wrong_source_node_key_is_rejected() {
+        // CRITERION 1: a payload signed by a VALID keypair but
+        // claiming a source_node whose configured key DIFFERS is
+        // rejected — the key must belong to the claimed node.
+        use crate::knowledge::remote::SignedSharePayload;
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let configured = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let svc = KnowledgeService::new(store, &section9_cfg())
+            .unwrap()
+            .with_local_node("node-2")
+            .with_source_node_key("node-1", configured.verifying_key().to_bytes());
+        // Attacker signs with a DIFFERENT key, still claims node-1.
+        let attacker = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let payload = SignedSharePayload::sign(
+            &attacker,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a1", "alice", "fact", true),
+            None,
+        );
+        match svc.accept_shared(payload).unwrap_err() {
+            ShareError::Rejected(RejectReason::SourceKeyMismatch { node, .. }) => {
+                assert_eq!(node, "node-1");
+            }
+            o => panic!("expected SourceKeyMismatch, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn section9_tampering_security_fields_breaks_signature() {
+        // CRITERION 2: altering shareable / share_policy /
+        // tenant_id AFTER signing fails verification, because
+        // those fields are now in the signed canonical bytes.
+        use crate::knowledge::remote::SignedSharePayload;
+        use crate::nodes::memory::schema::SharePolicy;
+        let signer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        for mutate in [
+            (|p: &mut SignedSharePayload| p.record.shareable = !p.record.shareable)
+                as fn(&mut SignedSharePayload),
+            |p: &mut SignedSharePayload| p.record.share_policy = SharePolicy::Auto,
+            |p: &mut SignedSharePayload| p.record.tenant_id = Some("evil-tenant".into()),
+        ] {
+            let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+            let svc = KnowledgeService::new(store, &section9_cfg())
+                .unwrap()
+                .with_local_node("node-2");
+            let mut rec = obs("a1", "alice", "fact", false);
+            rec.share_policy = SharePolicy::Explicit;
+            rec.tenant_id = Some("tenant-a".into());
+            let mut payload =
+                SignedSharePayload::sign(&signer, "node-1", "alice", "bob", rec, None);
+            mutate(&mut payload);
+            match svc.accept_shared(payload).unwrap_err() {
+                ShareError::Rejected(RejectReason::InvalidSignature { .. }) => {}
+                o => panic!("tampered field must fail verification, got {o:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn section9_legitimate_payload_with_matching_key_is_accepted() {
+        // CRITERION 3: a legitimately-signed payload from the
+        // correct source_node with a MATCHING configured key
+        // still verifies and is accepted.
+        use crate::knowledge::remote::SignedSharePayload;
+        let store = Arc::new(LayeredMemoryStore::in_memory().unwrap());
+        let signer = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let svc = KnowledgeService::new(store.clone(), &section9_cfg())
+            .unwrap()
+            .with_local_node("node-2")
+            .with_source_node_key("node-1", signer.verifying_key().to_bytes());
+        let payload = SignedSharePayload::sign(
+            &signer,
+            "node-1",
+            "alice",
+            "bob",
+            obs("a1", "alice", "fact", true),
+            Some("ok".into()),
+        );
+        svc.accept_shared(payload).expect("matching key must be accepted");
+        assert!(store.get(&mint_copy_id("a1", "bob")).unwrap().is_some());
     }
 }

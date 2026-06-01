@@ -195,6 +195,22 @@ fn canonical_bytes(
     tags.sort();
     let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
     push_prefixed(&mut out, b"rtg", tags_json.as_bytes());
+    // SECTION 9: cover every security-relevant field so a MITM
+    // that flips, e.g., `shareable` false→true or `tenant_id` on
+    // a poison-tagged row breaks the signature. Order is fixed.
+    push_prefixed(&mut out, b"vfr", &record.valid_from.to_le_bytes());
+    push_opt_i64(&mut out, b"vto", record.valid_to);
+    push_prefixed(&mut out, b"shr", &[record.shareable as u8]);
+    let mut shared = record.shared_with.clone();
+    shared.sort();
+    let shared_json = serde_json::to_string(&shared).unwrap_or_else(|_| "[]".into());
+    push_prefixed(&mut out, b"swt", shared_json.as_bytes());
+    push_prefixed(&mut out, b"spo", record.share_policy.as_str().as_bytes());
+    push_prefixed(&mut out, b"sst", record.source_trust.as_str().as_bytes());
+    push_prefixed(&mut out, b"frz", &[record.frozen as u8]);
+    push_prefixed(&mut out, b"con", &[record.consolidated as u8]);
+    push_opt_str(&mut out, b"tid", record.tenant_id.as_deref());
+    push_opt_str(&mut out, b"sby", record.superseded_by.as_deref());
     out
 }
 
@@ -205,6 +221,34 @@ fn push_prefixed(out: &mut Vec<u8>, label: &[u8], value: &[u8]) {
     out.extend_from_slice(&len);
     out.extend_from_slice(value);
     out.push(b'\n');
+}
+
+/// SECTION 9: encode an optional string with an explicit
+/// presence byte (0 = None, 1 = Some) so `None` and `Some("")`
+/// are distinct in the signed bytes.
+fn push_opt_str(out: &mut Vec<u8>, label: &[u8], value: Option<&str>) {
+    let mut buf = Vec::new();
+    match value {
+        None => buf.push(0u8),
+        Some(s) => {
+            buf.push(1u8);
+            buf.extend_from_slice(s.as_bytes());
+        }
+    }
+    push_prefixed(out, label, &buf);
+}
+
+/// SECTION 9: encode an optional i64 with a presence byte.
+fn push_opt_i64(out: &mut Vec<u8>, label: &[u8], value: Option<i64>) {
+    let mut buf = Vec::new();
+    match value {
+        None => buf.push(0u8),
+        Some(n) => {
+            buf.push(1u8);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+    push_prefixed(out, label, &buf);
 }
 
 /// Error envelope returned by [`RemoteKnowledgeDispatcher`].
