@@ -2077,7 +2077,10 @@ fn init_schema(conn: &Connection) -> Result<(), MemoryError> {
             flushed    INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS turns_session ON turns(session_id, id);
-        CREATE INDEX IF NOT EXISTS turns_session_flushed ON turns(session_id, flushed, id);
+        -- NOTE: `turns_session_flushed` (which references `flushed`)
+        -- is created AFTER the flushed-column backfill below, so it
+        -- never races ahead of the column on a cold boot against a
+        -- pre-`flushed`-era database.
 
         CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
             body,
@@ -2128,6 +2131,18 @@ fn init_schema(conn: &Connection) -> Result<(), MemoryError> {
         )
         .map_err(MemoryError::Db)?;
     }
+    // Cold-boot fix: create the `flushed`-dependent index ONLY now —
+    // after the column is guaranteed present, whether from the
+    // `CREATE TABLE` above (fresh DB) or the backfill just above
+    // (a pre-`flushed`-era DB where `CREATE TABLE IF NOT EXISTS` was a
+    // no-op). Creating it inside the first batch raced ahead of the
+    // backfill and crashed cold boot with "no such column: flushed".
+    // `IF NOT EXISTS` keeps this idempotent for already-migrated DBs.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS turns_session_flushed ON turns(session_id, flushed, id)",
+        [],
+    )
+    .map_err(MemoryError::Db)?;
     Ok(())
 }
 
@@ -3423,5 +3438,99 @@ mod tests {
             recent.is_empty(),
             "poisoned write must not appear in the turns table"
         );
+    }
+
+    // ── cold-boot schema setup: turns.flushed must exist before its index ──
+
+    #[test]
+    fn init_schema_on_fresh_database_completes_without_error() {
+        // Cold start: a brand-new empty database runs the FULL schema
+        // setup — the same path `MemoryStore::open` / the memory
+        // controller boot takes — with no SqlInputError.
+        let conn = Connection::open_in_memory().expect("open");
+        crate::db::ensure_migration_table(&conn).expect("migration table");
+        init_schema(&conn).expect("schema setup must succeed on a fresh database");
+        assert!(
+            turns_column_exists(&conn, "flushed").unwrap(),
+            "flushed column must exist after a cold-boot schema setup"
+        );
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='turns_session_flushed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "turns_session_flushed index must be created");
+    }
+
+    #[test]
+    fn init_schema_on_pre_flushed_era_database_backfills_before_indexing() {
+        // Reproduces the boot crash on a database whose `turns` table
+        // predates the `flushed` column: `CREATE TABLE IF NOT EXISTS
+        // turns` is then a NO-OP, so the `turns_session_flushed` index
+        // must NOT be created before the `flushed` backfill runs (else
+        // SQLite raises "no such column: flushed").
+        let conn = Connection::open_in_memory().expect("open");
+        crate::db::ensure_migration_table(&conn).expect("migration table");
+        // Pre-`flushed`-era turns table (no `flushed` column).
+        conn.execute_batch(
+            "CREATE TABLE turns (
+                id         INTEGER PRIMARY KEY,
+                session_id TEXT    NOT NULL,
+                role       TEXT    NOT NULL,
+                body       TEXT    NOT NULL,
+                ts         INTEGER NOT NULL
+            );",
+        )
+        .expect("seed legacy turns");
+        assert!(
+            !turns_column_exists(&conn, "flushed").unwrap(),
+            "precondition: legacy turns has no flushed column"
+        );
+        // Must complete without the SqlInputError — flushed is
+        // backfilled BEFORE the index that references it.
+        init_schema(&conn).expect("schema setup must backfill flushed before creating its index");
+        assert!(
+            turns_column_exists(&conn, "flushed").unwrap(),
+            "flushed must exist after migration"
+        );
+        let idx: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='turns_session_flushed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "turns_session_flushed index must be created");
+    }
+
+    #[test]
+    fn memory_store_cold_boots_on_fresh_file_data_dir() {
+        // CRITERION 5: the real memory-controller boot path. Open a
+        // FILE-backed store at a fresh, not-yet-existing data dir —
+        // the same `MemoryStore::open` the controller calls for
+        // `node_type = "memory"` (apply_pragmas + ensure_migration_table
+        // + init_schema + embeddings::apply_schema). It must reach
+        // schema-ready (Ok) with no SqlInputError, the failure that
+        // previously brought the whole mesh down.
+        let dir = tempfile::tempdir().unwrap();
+        // Nested, nonexistent path — open() must create the parent dir.
+        let db_path = dir.path().join("memory").join("sessions.db");
+        let cfg = MemoryConfig {
+            db_path,
+            max_n: 100,
+            ..Default::default()
+        };
+        let store =
+            MemoryStore::open(&cfg).expect("cold boot on a fresh data dir must reach schema-ready");
+        // Schema-ready: a query against `turns` (the table + its
+        // flushed index) succeeds post-boot.
+        let recent = store
+            .recent_for_session("cold-boot-session", 1)
+            .expect("turns query must work after a clean cold boot");
+        assert!(recent.is_empty());
     }
 }
