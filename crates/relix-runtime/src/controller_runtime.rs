@@ -9735,162 +9735,19 @@ fn register_node_type_handlers(
         let session_search_handle: crate::nodes::tool::session_search_proxy::MemorySessionSearchProxyHandle =
             std::sync::Arc::new(tokio::sync::OnceCell::new());
         crate::nodes::tool::register(bridge, backend, operator_channel, session_search_handle);
-        let desc = crate::nodes::tool::capability_descriptor();
-        manifest.add_capability(desc.clone());
-        // B1: tool.web_extract — pure HTML parser. Lives on the same
-        // tool node so it shares identity / admission / audit / pool
-        // setup. Distinct from tool.web_fetch (no network surface).
-        manifest.add_capability(crate::nodes::tool::web_extract::capability_descriptor());
-        // CW3: tool.web_get + tool.web_search — composed over the
-        // same web_fetch pipeline. Both always advertise alongside
-        // web_fetch since they share the SSRF/pin/redirect machinery.
-        manifest.add_capability(crate::nodes::tool::web_tools::web_get_descriptor());
-        manifest.add_capability(crate::nodes::tool::web_tools::web_search_descriptor());
-        // PH-WEB-POST: tool.web.post — POST with body + cookie
-        // headers, same SSRF + DNS pin posture as web_fetch.
-        manifest.add_capability(crate::nodes::tool::web_tools::web_post_descriptor());
-        // PH-DASH-BLOCKLIST: tool.web.blocklist_summary — read
-        // the operator-curated `[tool] blocked_hosts` set. Pure
-        // config read, no I/O.
-        manifest.add_capability(crate::nodes::tool::web_tools::web_blocklist_summary_descriptor());
-        // PH-WEB-ROBOTS: tool.web.robots_check — robots.txt sniff.
-        // Same SSRF + pin + redirect machinery as web_fetch.
-        manifest.add_capability(crate::nodes::tool::web_robots::robots_check_descriptor());
-        // PH-PDF-CHUNK: tool.text.chunk — pure CPU text chunker
-        // for retrieval / context-window-fit use cases. Always
-        // advertised when the tool node is up.
-        manifest.add_capability(crate::nodes::tool::text_chunk::capability_descriptor());
-        // tool.ask_human — first-class "ask the operator"
-        // capability. Always advertised; today the handler
-        // surfaces `{"timeout": true}` because no operator
-        // channel is wired yet. The capability descriptor is
-        // honest: risk=Medium, cost=Expensive, idempotency=AtMostOnce.
-        manifest.add_capability(crate::nodes::tool::ask_human::AskHumanTool::descriptor());
-        // memory.session_search — proxy onto the memory peer.
-        // Advertised unconditionally; handler returns
-        // PEER_UNREACHABLE until [tool.memory_peer] wiring lands.
-        manifest.add_capability(crate::nodes::tool::session_search_proxy::descriptor());
-        // B2: jailed filesystem subsystem. Only advertised when
-        // `[tool.fs]` is configured -- node-type tool with no
-        // `[tool.fs]` keeps fs out of the manifest.
-        if tool_cfg.fs.is_some() {
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_read());
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_write());
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_search());
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_patch());
-            // CW2: tool.list_dir — read-side directory
-            // enumeration with stable pagination. Same jail.
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_list());
-            // PH-FS-PARITY1: tool.append_file + tool.patch_preview.
-            // Same jail; append is strictly additive (refuses to
-            // create), patch_preview is read-only dry-run.
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_append());
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_patch_preview());
-            // PH-FS-PARITY2: tool.binary_sniff — classify a file
-            // as text/binary by reading the first 8 KiB. Same jail.
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_binary_sniff());
-            // PH-FS-PARITY4: tool.fs.audit_recent — operator
-            // snapshot of the most recent successful mutations
-            // (write / append / patch) on the jail. Bounded
-            // in-memory ring.
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_audit_recent());
-            // PH-FS-FUZZY: tool.fuzzy_replace — Hermes-style
-            // whitespace-tolerant text edit. Same jail.
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_fuzzy_replace());
-            // PH-FS-TREE: tool.fs.tree — depth-capped recursive
-            // directory walk.
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_tree());
-            // PH-FS-STAT: tool.fs.stat — single-path metadata.
-            manifest.add_capability(crate::nodes::tool::fs::descriptor_stat());
-        }
-        // B3: tool.pdf — only advertised when [tool.pdf] is configured.
-        if tool_cfg.pdf.is_some() {
-            manifest.add_capability(crate::nodes::tool::pdf::capability_descriptor());
-        }
-        // CW1: tool.terminal.run — sandboxed shell. Only advertised
-        // when [tool.terminal] is configured AND construction
-        // succeeds (allowlist validation may fail; the
-        // descriptor advertisement matches the actual
-        // registration so consumers don't see a phantom
-        // capability).
-        if let Some(term_cfg) = tool_cfg.terminal.as_ref()
-            && crate::nodes::tool::terminal::TerminalBackend::new(term_cfg.clone()).is_ok()
-        {
-            manifest.add_capability(crate::nodes::tool::terminal_descriptor());
-            // PH-TERM-SESSIONS: tool.terminal.sessions — live
-            // run registry snapshot. Always co-advertised when
-            // the terminal config validates.
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_sessions());
-            // PH-TERM-AUDIT: tool.terminal.audit_recent — bounded
-            // ring of completed runs (success + timed-out + cancelled).
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_audit_recent());
-            // PH-TERM-CANCEL: tool.terminal.cancel — cooperative
-            // termination of a live run by session id.
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_cancel());
-            // PH-TERM-STREAM1: tool.terminal.tail — polling-cursor
-            // stream tail of a live run's stdout / stderr buffer.
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_tail());
-            // PH-TERM-SPAWN: tool.terminal.spawn — fire-and-forget
-            // background variant of tool.terminal.run.
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_spawn());
-            // PH-TERM-SHELL: tool.terminal.shell.{open,input,close}
-            // — persistent shell sessions. open/input/close are
-            // always advertised when terminal is configured; the
-            // open handler refuses fail-closed when `allowed_shells`
-            // is empty, so the surface is honest about whether
-            // shells are actually usable.
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_open());
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_input());
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_close());
-            // PH-TERM-CONTROL: tool.terminal.shell.control —
-            // convenience writer for named control chars
-            // (etx/eot/tab/enter/esc/backspace/...).
-            manifest.add_capability(crate::nodes::tool::terminal::descriptor_shell_control());
-        }
-        // CW4: tool.browser.* — only advertised when
-        // [tool.browser] is configured. Honest: the descriptors
-        // ship even with backend="none" so operators see the
-        // surface; the runtime returns BackendNotConnected
-        // until a real backend lands.
-        if let Some(br_cfg) = tool_cfg.browser.as_ref()
-            && crate::nodes::tool::browser::build_backend(br_cfg).is_ok()
-        {
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_open_session());
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_close_session());
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_navigate());
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_get_text());
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_screenshot());
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_list_sessions());
-            // W2-002a: click / type_text / wait_for_selector.
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_click());
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_type_text());
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_wait_for_selector());
-            // W2-002f: capture_read serves failure screenshots
-            // back to the dashboard. Advertised even when
-            // `screenshot_on_failure_dir` is None — the
-            // handler returns INVALID_ARGS with a clear
-            // "not configured" message so operators see why.
-            manifest.add_capability(crate::nodes::tool::browser::descriptor_capture_read());
-        }
-        // CW5: tool.mcp.* — registry + discovery surface
-        // advertised when [tool.mcp] is configured AND the
-        // registry validates (duplicate ids, bad transport,
-        // etc. fail-closed). Invoke still returns
-        // RuntimeNotConnected until the live client lands.
-        if let Some(mcp_cfg) = tool_cfg.mcp.as_ref()
-            && crate::nodes::tool::mcp::validate_config(mcp_cfg).is_ok()
-        {
-            manifest.add_capability(crate::nodes::tool::mcp::descriptor_list_servers());
-            manifest.add_capability(crate::nodes::tool::mcp::descriptor_list_tools());
-            manifest.add_capability(crate::nodes::tool::mcp::descriptor_invoke());
+        // SEC §14: advertise EXACTLY the capability set returned by
+        // `crate::nodes::tool::advertised_capabilities` — the single
+        // source of truth the policy-coverage contract test diffs
+        // `configs/policies/tool.toml` against. A new tool capability
+        // added there without a policy rule fails that test.
+        for cap in crate::nodes::tool::advertised_capabilities(&tool_cfg) {
+            manifest.add_capability(cap);
         }
         tracing::info!(
             max_bytes = tool_cfg.max_bytes,
             timeout_secs = tool_cfg.timeout_secs,
             max_redirects = tool_cfg.max_redirects,
             allow_http = tool_cfg.allow_http,
-            method = %desc.method_name,
-            sensitivity = ?desc.sensitivity_tags,
             cw3 = "tool.web_get, tool.web_search",
             "tool node: registered tool.web_fetch + CW3 web_tools"
         );

@@ -75,3 +75,312 @@ allow_groups = ["operators"]
 name = "node_audit_tenant_recent"
 method = "node.audit.tenant_recent"
 allow_groups = ["operators"]
+
+# ── SEC §14: operator-facing families the bridge PROXIES ─────
+# The web bridge presents the caller's identity and proxies the
+# coordinator's task.* / cron.* / agent.* / coord.* / msg.*
+# surface (task list, approval inbox, agent settings, cron jobs,
+# messaging). These rules were missing, so a node loaded with
+# this policy denied the whole operator dashboard (6xx). Synced
+# from configs/policies/default.toml; kept in coverage by the
+# canonical-policy contract test.
+[[rules]]
+name = "task_create"
+method = "task.create"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_update"
+method = "task.update"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_get"
+method = "task.get"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_list"
+method = "task.list"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_list_cursor"
+method = "task.list_cursor"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_count"
+method = "task.count"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_event"
+method = "task.event"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_events"
+method = "task.events"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_recent_events"
+method = "task.recent_events"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_compact_events"
+method = "task.compact_events"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_attempts"
+method = "task.attempts"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_edges"
+method = "task.edges"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_recent_edges"
+method = "task.recent_edges"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_lineage"
+method = "task.lineage"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_subtree_metrics"
+method = "task.subtree_metrics"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_export"
+method = "task.export"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_session_export"
+method = "task.session_export"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_session_search"
+method = "task.session_search"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_recover"
+method = "task.recover"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_retry"
+method = "task.retry"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_replay"
+method = "task.replay"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_pause"
+method = "task.pause"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_resume"
+method = "task.resume"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_freeze"
+method = "task.freeze"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_unfreeze"
+method = "task.unfreeze"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_note"
+method = "task.note"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_mark_investigation"
+method = "task.mark_investigation"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_stuck"
+method = "task.stuck"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "task_interruption_check"
+method = "task.interruption_check"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "task_transition_check"
+method = "task.transition_check"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "task_observe_interruption"
+method = "task.observe_interruption"
+allow_groups = ["operators", "controllers"]
+
+[[rules]]
+name = "task_record_awaited"
+method = "task.record_awaited"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "task_record_delegated"
+method = "task.record_delegated"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "task_record_spawned"
+method = "task.record_spawned"
+allow_groups = ["chat-users", "operators", "controllers"]
+
+[[rules]]
+name = "task_todo_list"
+method = "task.todo_list"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "task_todo_set"
+method = "task.todo_set"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "task_todo_update"
+method = "task.todo_update"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_create"
+method = "cron.create"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_list"
+method = "cron.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_get"
+method = "cron.get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_update"
+method = "cron.update"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "cron_delete"
+method = "cron.delete"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "cron_trigger"
+method = "cron.trigger"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_create"
+method = "agent.create"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_get"
+method = "agent.get"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_list"
+method = "agent.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_update"
+method = "agent.update"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_delete"
+method = "agent.delete"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_effective_capabilities"
+method = "agent.effective_capabilities"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_standing_approval_create"
+method = "agent.standing_approval.create"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "agent_standing_approval_list"
+method = "agent.standing_approval.list"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "agent_standing_approval_revoke"
+method = "agent.standing_approval.revoke"
+allow_groups = ["operators"]
+
+[[rules]]
+name = "coord_approval_pending"
+method = "coord.approval.pending"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "coord_approval_get"
+method = "coord.approval.get"
+allow_groups = ["chat-users", "operators", "web-bridge-svc"]
+
+[[rules]]
+name = "coord_approval_decide"
+method = "coord.approval.decide"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_send"
+method = "msg.send"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_inbox"
+method = "msg.inbox"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_read"
+method = "msg.read"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_thread"
+method = "msg.thread"
+allow_groups = ["chat-users", "operators"]
+
+[[rules]]
+name = "msg_delete"
+method = "msg.delete"
+allow_groups = ["chat-users", "operators"]
+

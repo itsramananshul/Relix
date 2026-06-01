@@ -27,7 +27,10 @@ url_allowlist = [
 # Outbound request timeout in seconds.
 timeout_secs = 15
 
-# Maximum bytes returned per fetch.
-max_body_bytes = 524288
+# Maximum bytes returned per fetch. SEC §14: the runtime field is
+# `max_bytes` — the legacy `max_body_bytes` was parsed by no code,
+# so the operator's SSRF body cap was silently ignored. The config
+# struct now rejects unknown keys, so a typo errors loudly.
+max_bytes = 524288
 
 [peers]

@@ -713,3 +713,44 @@ fn tool_policy_admits_tool_web_read_for_chat_users() {
     let caller = id("alice", &["chat-users"]);
     assert_admits(TOOL_POLICY, "tool.toml", &caller, "tool.web_read");
 }
+
+// ── SEC §14: web-bridge.toml must admit the operator-facing
+// families the bridge proxies. Before the sync this file lacked
+// task.*/cron.*/agent.*/coord.*/msg.* rules, so a node loaded
+// with it returned 6xx on the task list, approval inbox, agent
+// settings, cron jobs, and messaging. ──────────────────────────
+
+#[test]
+fn web_bridge_policy_admits_proxied_operator_families_no_6xx() {
+    // One representative method per family the dashboard exercises.
+    let ops = id("ops", &["operators", "web-bridge-svc"]);
+    for method in [
+        "task.list",
+        "task.create",
+        "task.events",
+        "cron.list",
+        "cron.create",
+        "agent.list",
+        "agent.get",
+        "coord.approval.pending",
+        "coord.approval.get",
+        "msg.send",
+        "msg.inbox",
+    ] {
+        assert_admits(WEB_BRIDGE_POLICY, "web-bridge.toml", &ops, method);
+    }
+}
+
+#[test]
+fn web_bridge_policy_admits_task_and_approval_for_chat_users() {
+    // The common end-user path: a chat-user opening the task list
+    // and approval inbox must not be denied.
+    let alice = id("alice", &["chat-users"]);
+    assert_admits(WEB_BRIDGE_POLICY, "web-bridge.toml", &alice, "task.list");
+    assert_admits(
+        WEB_BRIDGE_POLICY,
+        "web-bridge.toml",
+        &alice,
+        "coord.approval.pending",
+    );
+}

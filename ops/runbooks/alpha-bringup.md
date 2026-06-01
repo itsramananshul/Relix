@@ -118,8 +118,11 @@ RUST_LOG=relix_runtime=info \
 # Terminal 2 — issue an org root and mint identities.
 cargo run -p relix-cli -- identity init-org \
     --root-key dev-keys/org-root.key --org demo-org
-# The org-root public key for trust verification:
-cp dev-keys/org-root.key dev-keys/org-root.pub   # alpha: pub derived from secret-file bytes
+# `init-org` ALSO writes the companion public key to
+# dev-keys/org-root.pub (the 32-byte Ed25519 public key, derived
+# from the keypair). Trust config points at the .pub.
+# NEVER copy the secret .key over the .pub — that would publish
+# the org-root SECRET key as if it were public.
 
 cargo run -p relix-cli -- identity mint \
     --root-key dev-keys/org-root.key \

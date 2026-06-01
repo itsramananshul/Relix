@@ -89,7 +89,14 @@ use crate::dispatch::{DispatchBridge, FnHandler, HandlerOutcome, InvocationCtx};
 use security::{HostBlocklist, SsrfError, resolve_safe_url, resolve_safe_url_blocking};
 
 /// Per-node tool configuration parsed from `[tool]` in the controller TOML.
+///
+/// SEC §14: `deny_unknown_fields` so an operator typo (e.g. the
+/// legacy `max_body_bytes` instead of `max_bytes`) is a hard parse
+/// error rather than a silently-dropped key. A silently-ignored
+/// `max_body_bytes` left the SSRF body cap at its default while
+/// the operator believed they had tightened it.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolConfig {
     /// Maximum response body, bytes. Default 256 KiB; clients may request
     /// less via the `|N` arg form but never more.
@@ -983,6 +990,92 @@ pub fn capability_descriptor() -> CapabilityDescriptor {
     d.environment_requirements = vec!["network:outbound".into()];
     d.risk_level = RiskLevel::Medium;
     d
+}
+
+/// SEC §14: the full set of capability descriptors a tool node
+/// advertises for `cfg`. This is the SINGLE source of truth the
+/// controller iterates when building the manifest (see
+/// `register_node_type_handlers`), and the policy-coverage contract
+/// test diffs `configs/policies/tool.toml` against it — so a tool
+/// capability added here without a matching policy rule fails that
+/// test. The conditional subsystems (fs / pdf / terminal / browser /
+/// mcp) advertise exactly when their config block is present AND
+/// validates, matching the handler registration so consumers never
+/// see a phantom capability.
+pub fn advertised_capabilities(cfg: &ToolConfig) -> Vec<CapabilityDescriptor> {
+    let mut caps = vec![
+        capability_descriptor(),
+        web_extract::capability_descriptor(),
+        web_tools::web_get_descriptor(),
+        web_tools::web_search_descriptor(),
+        web_tools::web_post_descriptor(),
+        web_tools::web_blocklist_summary_descriptor(),
+        web_robots::robots_check_descriptor(),
+        text_chunk::capability_descriptor(),
+        ask_human::AskHumanTool::descriptor(),
+        session_search_proxy::descriptor(),
+    ];
+    if cfg.fs.is_some() {
+        caps.extend([
+            fs::descriptor_read(),
+            fs::descriptor_write(),
+            fs::descriptor_search(),
+            fs::descriptor_patch(),
+            fs::descriptor_list(),
+            fs::descriptor_append(),
+            fs::descriptor_patch_preview(),
+            fs::descriptor_binary_sniff(),
+            fs::descriptor_audit_recent(),
+            fs::descriptor_fuzzy_replace(),
+            fs::descriptor_tree(),
+            fs::descriptor_stat(),
+        ]);
+    }
+    if cfg.pdf.is_some() {
+        caps.push(pdf::capability_descriptor());
+    }
+    if let Some(term_cfg) = cfg.terminal.as_ref()
+        && terminal::TerminalBackend::new(term_cfg.clone()).is_ok()
+    {
+        caps.extend([
+            terminal_descriptor(),
+            terminal::descriptor_sessions(),
+            terminal::descriptor_audit_recent(),
+            terminal::descriptor_cancel(),
+            terminal::descriptor_tail(),
+            terminal::descriptor_spawn(),
+            terminal::descriptor_shell_open(),
+            terminal::descriptor_shell_input(),
+            terminal::descriptor_shell_close(),
+            terminal::descriptor_shell_control(),
+        ]);
+    }
+    if let Some(br_cfg) = cfg.browser.as_ref()
+        && browser::build_backend(br_cfg).is_ok()
+    {
+        caps.extend([
+            browser::descriptor_open_session(),
+            browser::descriptor_close_session(),
+            browser::descriptor_navigate(),
+            browser::descriptor_get_text(),
+            browser::descriptor_screenshot(),
+            browser::descriptor_list_sessions(),
+            browser::descriptor_click(),
+            browser::descriptor_type_text(),
+            browser::descriptor_wait_for_selector(),
+            browser::descriptor_capture_read(),
+        ]);
+    }
+    if let Some(mcp_cfg) = cfg.mcp.as_ref()
+        && mcp::validate_config(mcp_cfg).is_ok()
+    {
+        caps.extend([
+            mcp::descriptor_list_servers(),
+            mcp::descriptor_list_tools(),
+            mcp::descriptor_invoke(),
+        ]);
+    }
+    caps
 }
 
 /// Register tool capabilities on the dispatch bridge. Wires every

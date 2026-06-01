@@ -88,6 +88,21 @@ name = "tool_fs_audit_recent"
 method = "tool.fs.audit_recent"
 allow_groups = ["operators"]
 
+# SEC §14: tool.ask_human + memory.session_search are advertised
+# unconditionally by the tool node (see
+# `crate::nodes::tool::advertised_capabilities`) but were missing
+# rules here, so a caller hit a policy deny. Synced in.
+
+[[rules]]
+name = "tool_ask_human"
+method = "tool.ask_human"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
+[[rules]]
+name = "tool_memory_session_search"
+method = "memory.session_search"
+allow_groups = ["tool-users", "web-bridge-svc", "chat-users", "operators"]
+
 # ── tool.web.* — outbound HTTP ──────────────────────────────
 
 [[rules]]
