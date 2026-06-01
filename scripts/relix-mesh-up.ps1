@@ -1089,9 +1089,26 @@ $peersToml | Set-Content -Encoding utf8 $Peers
 # 7) Bridge config - OpenAI shim on; tool template wired only when the tool
 #    node is up so the bridge fails 404 cleanly when there's no peer.
 $toolTemplateLine = if ($NoTool) { '' } else { "tool_template_path = `"$FlowsToml/chat_with_tool.sol`"" }
+
+# Setup token guarding GET /v1/auth/token (the dashboard's bootstrap
+# exchange). Honour an operator-supplied RELIX_SETUP_TOKEN; otherwise
+# mint a strong random one. Never a hardcoded default — without a real
+# token the dashboard cannot bootstrap. Printed at the end so the
+# operator can paste it into the dashboard's Authentication screen.
+if ($env:RELIX_SETUP_TOKEN) {
+    $SetupToken = $env:RELIX_SETUP_TOKEN
+} else {
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    $tokenBytes = New-Object byte[] 32
+    $rng.GetBytes($tokenBytes)
+    $SetupToken = -join ($tokenBytes | ForEach-Object { $_.ToString('x2') })
+}
 @"
 [bridge]
 listen_addr = "$BridgeHttp"
+
+[auth]
+setup_token = "$SetupToken"
 
 [identity]
 bundle_path     = "$BridgeAic"
@@ -1336,6 +1353,10 @@ try {
     if (-not $NoTool) {
         Write-Host "  http://127.0.0.1:$BridgePort/chat_with_tool   (POST: {session_id, message, url})"
     }
+    Write-Host ""
+    Write-Host "Dashboard:   http://127.0.0.1:$BridgePort/dashboard"
+    Write-Host "Setup token: $SetupToken"
+    Write-Host "  ^ paste this into the dashboard's `"Authentication Required`" screen on first load."
     Write-Host ""
     Write-Host "Open WebUI config:"
     Write-Host "  API Base URL: http://127.0.0.1:$BridgePort/v1"

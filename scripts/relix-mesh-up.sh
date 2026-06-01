@@ -993,6 +993,27 @@ EOF
 
 # ---- 12. Bridge config ----
 
+# Setup token guarding GET /v1/auth/token (the dashboard's
+# bootstrap exchange). Honour an operator-supplied
+# RELIX_SETUP_TOKEN; otherwise mint a strong random one. Never a
+# hardcoded default — without a real token the dashboard cannot
+# bootstrap. The value is written into the bridge config below and
+# printed at the end so the operator can paste it into the
+# dashboard's Authentication screen.
+gen_setup_token() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+    elif [[ -r /dev/urandom ]]; then
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    else
+        # Last resort (no openssl, no /dev/urandom): still random,
+        # just lower-entropy. Better than a fixed default.
+        echo "${RANDOM}${RANDOM}${RANDOM}${RANDOM}$(date +%s%N)" \
+            | sha256sum | cut -d' ' -f1
+    fi
+}
+SETUP_TOKEN="${RELIX_SETUP_TOKEN:-$(gen_setup_token)}"
+
 flow_lines="template_path     = \"$FLOWS_DIR/chat_template.sol\""
 if [[ "$NO_TOOL" -eq 0 ]]; then
     flow_lines+=$'\n'"tool_template_path = \"$FLOWS_DIR/chat_with_tool.sol\""
@@ -1006,6 +1027,9 @@ fi
 cat > "$BRIDGE_CONFIG" <<EOF
 [bridge]
 listen_addr = "127.0.0.1:$BRIDGE_PORT"
+
+[auth]
+setup_token = "$SETUP_TOKEN"
 
 [identity]
 bundle_path     = "$BRIDGE_AIC"
@@ -1166,9 +1190,11 @@ echo "  bridge ready"
 echo
 echo "BRIDGE_UP"
 echo
-echo "Bridge:    http://127.0.0.1:$BRIDGE_PORT/dashboard"
-echo "Health:    http://127.0.0.1:$BRIDGE_PORT/health"
-echo "Provider:  $PROVIDER"
+echo "Dashboard:   http://127.0.0.1:$BRIDGE_PORT/dashboard"
+echo "Health:      http://127.0.0.1:$BRIDGE_PORT/health"
+echo "Provider:    $PROVIDER"
+echo "Setup token: $SETUP_TOKEN"
+echo "  ^ paste this into the dashboard's \"Authentication Required\" screen on first load."
 echo
 echo "Logs:     $DATA_BASE/*.log"
 echo "PIDs:     ${PIDS[*]}"
