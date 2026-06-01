@@ -117,8 +117,62 @@ impl AuditLog {
             std::fs::create_dir_all(parent).map_err(|e| AuditError::Io(e.to_string()))?;
         }
         let responder_node_id = NodeId::from_pubkey(&signer.verifying_key().to_bytes());
+        // Make the resolved backing path explicit. It is derived from
+        // RELIX_DATA_DIR / node name in the controller, so logging it
+        // here keeps boot from *silently* depending on a file that may
+        // live outside the wiped run directory.
+        tracing::info!(
+            audit_path = %path.display(),
+            responder = %responder_node_id,
+            "audit log: opening"
+        );
         let last_hash = if path.exists() {
-            verify_audit_chain(&path, &signer.verifying_key())?
+            match verify_audit_chain(&path, &signer.verifying_key()) {
+                Ok(h) => h,
+                Err(AuditError::Integrity(reason)) => {
+                    // The existing chain does not verify under THIS
+                    // responder's key. Two very different causes, handled
+                    // differently:
+                    //
+                    //   * The faulting record carries a *different*
+                    //     `responder_node_id` — a previous key after
+                    //     rotation, or a log left behind by another node.
+                    //     The current key legitimately cannot verify it.
+                    //     Bricking boot here is wrong (the node could never
+                    //     start again after a key rotation), so quarantine
+                    //     the file and start a fresh chain.
+                    //
+                    //   * The faulting record claims THIS responder but
+                    //     still does not verify — tampering or corruption
+                    //     of our own chain. That MUST stay a hard failure
+                    //     and is never silently discarded.
+                    match first_fault_responder(&path, &signer.verifying_key())? {
+                        Some(claimed) if claimed != responder_node_id => {
+                            let quarantined = quarantine_audit_log(&path)?;
+                            tracing::error!(
+                                audit_path = %path.display(),
+                                quarantined_to = %quarantined.display(),
+                                claimed_responder = %claimed,
+                                current_responder = %responder_node_id,
+                                reason = %reason,
+                                "audit log was written by a DIFFERENT responder identity \
+                                 (key rotation or a foreign/stale log) and cannot verify \
+                                 under the current key; quarantined the old file and \
+                                 started a fresh chain. Review and remove the quarantined \
+                                 file once archived."
+                            );
+                            [0u8; 32]
+                        }
+                        _ => {
+                            // Current-responder tamper/corruption, or the
+                            // re-scan unexpectedly found no fault: fail
+                            // closed to preserve tamper detection.
+                            return Err(AuditError::Integrity(reason));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             [0u8; 32]
         };
@@ -293,6 +347,76 @@ pub fn verify_audit_chain(
     Ok(last_hash)
 }
 
+/// Re-scan a log and return the `responder_node_id` of the first
+/// record that fails the chain or signature check under
+/// `expected_signer_pubkey`, or `None` if the whole log verifies.
+///
+/// Mirrors [`verify_audit_chain`]'s checks exactly so the two never
+/// disagree about *where* a chain first breaks. Used by
+/// [`AuditLog::open`] to tell a benign key rotation / foreign log
+/// (faulting record belongs to a different responder identity) apart
+/// from tampering of a record that claims the current responder.
+fn first_fault_responder(
+    path: impl AsRef<Path>,
+    expected_signer_pubkey: &VerifyingKey,
+) -> Result<Option<NodeId>, AuditError> {
+    let records = read_audit_records(path.as_ref())?;
+    let mut last_hash = [0u8; 32];
+    for rec in &records {
+        if rec.prev_hash != last_hash {
+            return Ok(Some(rec.responder_node_id));
+        }
+        let unsigned = UnsignedAudit {
+            ts: &rec.ts,
+            request_id: &rec.request_id,
+            trace_id: &rec.trace_id,
+            caller_node_id: &rec.caller_node_id,
+            caller_name: &rec.caller_name,
+            caller_groups: &rec.caller_groups,
+            responder_node_id: &rec.responder_node_id,
+            method: &rec.method,
+            policy_decision: &rec.policy_decision,
+            status: &rec.status,
+            flow_id: &rec.flow_id,
+            error_kind: &rec.error_kind,
+            latency_ms: rec.latency_ms,
+            prev_hash: &rec.prev_hash,
+        };
+        let to_verify = codec::encode(&unsigned)?;
+        let sig = ed25519_dalek::Signature::from_bytes(&rec.signature);
+        if expected_signer_pubkey.verify(&to_verify, &sig).is_err() {
+            return Ok(Some(rec.responder_node_id));
+        }
+        let bytes = codec::encode(rec)?;
+        last_hash = codec::content_hash(&bytes);
+    }
+    Ok(None)
+}
+
+/// Move an unverifiable audit log aside (preserving its bytes) so a
+/// fresh chain can start in its place. Returns the quarantine path.
+fn quarantine_audit_log(path: impl AsRef<Path>) -> Result<PathBuf, AuditError> {
+    let path = path.as_ref();
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audit.log");
+    let mut target = path.with_file_name(format!("{file_name}.quarantined-{millis}"));
+    // Never clobber an existing quarantine file (e.g. two opens in the
+    // same millisecond).
+    let mut n: u32 = 0;
+    while target.exists() {
+        n += 1;
+        target = path.with_file_name(format!("{file_name}.quarantined-{millis}-{n}"));
+    }
+    std::fs::rename(path, &target).map_err(|e| AuditError::Io(e.to_string()))?;
+    Ok(target)
+}
+
 /// Audit-layer errors.
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
@@ -384,5 +508,152 @@ mod tests {
                 .expect("b");
         }
         verify_audit_chain(&path, &key.verifying_key()).expect("verify");
+    }
+
+    /// Criterion 4: a freshly signed entry verifies under the same key.
+    /// Proves sign and verify agree on the canonical bytes (rules out a
+    /// sign/verify mismatch — "case 2").
+    #[test]
+    fn sign_then_verify_round_trips() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("audit.log");
+        let key = fresh_key();
+        {
+            let mut log = AuditLog::open(&path, key.clone()).expect("open");
+            log.finalize(fresh_draft(), "allow:x".into(), AuditStatus::Ok, None)
+                .expect("finalize");
+        }
+        // The written record verifies cleanly under the signer's key.
+        verify_audit_chain(&path, &key.verifying_key()).expect("round-trip verify");
+        // And a clean re-open (which re-runs verification) succeeds.
+        AuditLog::open(&path, key.clone()).expect("reopen verifies");
+    }
+
+    /// Criterion 5: a tampered entry still fails verification. We rewrite
+    /// a record's `method` field without re-signing, so the signature no
+    /// longer matches the canonical bytes.
+    #[test]
+    fn tampered_record_fails_verification() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("audit.log");
+        let key = fresh_key();
+        {
+            let mut log = AuditLog::open(&path, key.clone()).expect("open");
+            log.finalize(fresh_draft(), "allow:x".into(), AuditStatus::Ok, None)
+                .expect("finalize");
+        }
+        // Read the single record, mutate a signed field, keep the old
+        // signature + responder_node_id, and rewrite the file.
+        let mut recs = read_audit_records(&path).expect("read");
+        assert_eq!(recs.len(), 1);
+        recs[0].method = "tool.terminal".into(); // was "ai.chat"
+        rewrite_log(&path, &recs);
+        let err = verify_audit_chain(&path, &key.verifying_key())
+            .expect_err("tampered record must fail verification");
+        assert!(
+            matches!(err, AuditError::Integrity(_)),
+            "expected Integrity error, got {err:?}"
+        );
+    }
+
+    /// New behaviour: a log written by a *different* responder key (key
+    /// rotation, or a stale/foreign log) does not brick boot — it is
+    /// quarantined aside and a fresh chain starts in its place.
+    #[test]
+    fn rotated_key_log_is_quarantined_and_boot_recovers() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("audit.log");
+        let old_key = fresh_key();
+        {
+            let mut log = AuditLog::open(&path, old_key.clone()).expect("open old");
+            log.finalize(fresh_draft(), "allow:x".into(), AuditStatus::Ok, None)
+                .expect("finalize old");
+        }
+        let original_bytes = std::fs::read(&path).expect("read original");
+
+        // Open with a DIFFERENT key — simulates the regenerated node key.
+        let new_key = fresh_key();
+        assert_ne!(
+            old_key.verifying_key().to_bytes(),
+            new_key.verifying_key().to_bytes()
+        );
+        let mut log = AuditLog::open(&path, new_key.clone())
+            .expect("open must recover from a foreign/rotated-key log");
+
+        // The fresh chain starts empty and accepts new records.
+        log.finalize(fresh_draft(), "allow:y".into(), AuditStatus::Ok, None)
+            .expect("finalize on fresh chain");
+        let recs = read_audit_records(&path).expect("read fresh");
+        assert_eq!(recs.len(), 1, "fresh chain has exactly the new record");
+        verify_audit_chain(&path, &new_key.verifying_key()).expect("fresh chain verifies");
+
+        // The old log was preserved (renamed), not destroyed.
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("audit.log.quarantined-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine file");
+        assert_eq!(
+            std::fs::read(quarantined[0].path()).expect("read quarantine"),
+            original_bytes,
+            "quarantine preserves the original bytes verbatim"
+        );
+    }
+
+    /// Security: a record claiming the CURRENT responder that fails its
+    /// signature is tampering and MUST hard-fail on open — never
+    /// quarantined-and-recovered. This guards the recovery path from
+    /// becoming a tamper-evasion hole.
+    #[test]
+    fn current_responder_tamper_hard_fails_open() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir.path().join("audit.log");
+        let key = fresh_key();
+        {
+            let mut log = AuditLog::open(&path, key.clone()).expect("open");
+            log.finalize(fresh_draft(), "allow:x".into(), AuditStatus::Ok, None)
+                .expect("finalize");
+        }
+        // Tamper a signed field but leave responder_node_id (== current
+        // key's node id) and the now-stale signature in place.
+        let mut recs = read_audit_records(&path).expect("read");
+        recs[0].method = "tool.terminal".into();
+        rewrite_log(&path, &recs);
+
+        match AuditLog::open(&path, key.clone()) {
+            Err(AuditError::Integrity(_)) => {}
+            Ok(_) => panic!("tamper of a current-responder record must hard-fail open"),
+            Err(other) => panic!("expected Integrity (hard fail), got {other:?}"),
+        }
+        // The tampered file was NOT quarantined away.
+        assert!(path.exists(), "tampered current-key log must not be moved");
+        let still: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("quarantined-")
+            })
+            .collect();
+        assert!(still.is_empty(), "must not quarantine a current-key tamper");
+    }
+
+    /// Test helper: overwrite the log with `recs` using the same
+    /// length-prefixed framing as [`AuditLog::finalize`].
+    fn rewrite_log(path: &std::path::Path, recs: &[AuditRecord]) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).expect("create");
+        for rec in recs {
+            let bytes = codec::encode(rec).expect("encode");
+            f.write_all(&(bytes.len() as u32).to_be_bytes()).expect("len");
+            f.write_all(&bytes).expect("bytes");
+        }
+        f.sync_data().expect("sync");
     }
 }
