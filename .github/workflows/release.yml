@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to (re)release, e.g. v0.1.0'
+        description: 'Tag to (re)release. vX.Y.Z = stable; vX.Y.Z-beta.N = beta pre-release.'
         required: true
 
 permissions:
@@ -38,22 +38,43 @@ jobs:
         shell: bash
         run: |
           if [[ -n "${{ github.event.inputs.tag }}" ]]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ github.event.inputs.tag }}"
           else
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Release channel is derived from the tag shape:
+          #   vMAJOR.MINOR.PATCH            -> STABLE  (marked "Latest")
+          #   anything with a -suffix       -> BETA    (GitHub pre-release;
+          #     e.g. v0.4.2-beta.1, -rc.1, -alpha.1)     never marked Latest)
+          # Promote a beta to stable by cutting the clean vMAJOR.MINOR.PATCH
+          # tag (it rebuilds + signs and publishes to the stable channel).
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "channel=beta" >> "$GITHUB_OUTPUT"
           fi
       - name: Ensure release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.resolve.outputs.tag }}
+          PRERELEASE: ${{ steps.resolve.outputs.prerelease }}
         shell: bash
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists; assets will be added"
+          elif [[ "$PRERELEASE" == "true" ]]; then
+            gh release create "$TAG" \
+              --prerelease \
+              --title "Relix $TAG — Relay Intelligence Exchange (beta)" \
+              --notes "Beta (pre-release) build of Relix $TAG — for testing, not promoted to the stable channel. See [CHANGELOG.md](https://github.com/itsramananshul/Relix/blob/main/CHANGELOG.md)."
           else
             gh release create "$TAG" \
+              --latest \
               --title "Relix $TAG — Relay Intelligence Exchange" \
-              --notes "Release of Relix $TAG. See [CHANGELOG.md](https://github.com/itsramananshul/Relix/blob/main/CHANGELOG.md) for the full feature list."
+              --notes "Stable release of Relix $TAG. See [CHANGELOG.md](https://github.com/itsramananshul/Relix/blob/main/CHANGELOG.md) for the full feature list."
           fi
 
   build:
