@@ -834,11 +834,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            s.count_verifications_for_tenant("tenant-a", "shared-plan").unwrap(),
+            s.count_verifications_for_tenant("tenant-a", "shared-plan")
+                .unwrap(),
             1
         );
         assert_eq!(
-            s.count_verifications_for_tenant("tenant-b", "shared-plan").unwrap(),
+            s.count_verifications_for_tenant("tenant-b", "shared-plan")
+                .unwrap(),
             1
         );
     }

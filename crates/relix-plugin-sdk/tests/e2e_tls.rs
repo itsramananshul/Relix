@@ -135,14 +135,12 @@ async fn unpinned_cert_fails_handshake_against_live_plugin() {
 /// A self-signed cert NOT trusted by the live plugin (different
 /// keypair). Used to prove pinning rejects an impostor cert.
 fn mint_unpinned_cert() -> (Vec<u8>, Vec<u8>) {
-    use rcgen::{CertificateParams, SanType};
-    let mut params = CertificateParams::default();
+    use rcgen::{CertificateParams, KeyPair, SanType};
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::V4(
         std::net::Ipv4Addr::new(127, 0, 0, 1),
     ))];
-    let cert = rcgen::Certificate::from_params(params).unwrap();
-    (
-        cert.serialize_der().unwrap(),
-        cert.serialize_private_key_der(),
-    )
+    let key_pair = KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    (cert.der().to_vec(), key_pair.serialize_der())
 }

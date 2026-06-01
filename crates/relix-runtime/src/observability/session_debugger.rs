@@ -88,7 +88,9 @@ impl SessionDebugger {
         tenant: &str,
         session_id: &str,
     ) -> Result<Option<SessionTimeline>, SinkError> {
-        let events = self.metadata.query_for_tenant(tenant, Some(session_id), 1000)?;
+        let events = self
+            .metadata
+            .query_for_tenant(tenant, Some(session_id), 1000)?;
         self.timeline_from_events(session_id, events)
     }
 
@@ -293,10 +295,16 @@ mod tests {
         // tenant-scoped timeline read must assemble ONLY the
         // calling tenant's events — never the other tenant's.
         let (meta, content) = ctx();
-        meta.record_for_tenant(&evt("a", "shared", "model_call", 100, Some(1), Some(1)), "tenant-a")
-            .unwrap();
-        meta.record_for_tenant(&evt("b", "shared", "model_call", 200, Some(1), Some(1)), "tenant-b")
-            .unwrap();
+        meta.record_for_tenant(
+            &evt("a", "shared", "model_call", 100, Some(1), Some(1)),
+            "tenant-a",
+        )
+        .unwrap();
+        meta.record_for_tenant(
+            &evt("b", "shared", "model_call", 200, Some(1), Some(1)),
+            "tenant-b",
+        )
+        .unwrap();
         let debugger = SessionDebugger::new(meta, content);
         let a = debugger
             .session_timeline_for_tenant("tenant-a", "shared")

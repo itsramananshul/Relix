@@ -115,8 +115,8 @@ pub async fn run(args: ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 fn read_bridge_token() -> Result<String, Box<dyn std::error::Error>> {
     let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    let home =
-        std::env::var_os(home_var).ok_or("no HOME / USERPROFILE — pass --token-file to override")?;
+    let home = std::env::var_os(home_var)
+        .ok_or("no HOME / USERPROFILE — pass --token-file to override")?;
     let path = std::path::PathBuf::from(home)
         .join(".relix")
         .join("bridge-token");

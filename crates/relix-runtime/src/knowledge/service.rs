@@ -2115,7 +2115,8 @@ mod tests {
             obs("a1", "alice", "fact", true),
             Some("ok".into()),
         );
-        svc.accept_shared(payload).expect("matching key must be accepted");
+        svc.accept_shared(payload)
+            .expect("matching key must be accepted");
         assert!(store.get(&mint_copy_id("a1", "bob")).unwrap().is_some());
     }
 }

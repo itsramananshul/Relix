@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// `invoke` request body. Same shape relix-plugin-sdk decodes on
 /// the plugin side; it now travels inside a [`WireRequest`] frame
@@ -234,8 +234,9 @@ impl PluginDispatcher {
 
         let tcp = TcpStream::connect(&self.endpoint.address).await?;
         // The cert carries an IP SAN for 127.0.0.1.
-        let server_name =
-            ServerName::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into());
+        let server_name = ServerName::IpAddress(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
+        );
         let tls = connector
             .connect(server_name, tcp)
             .await
@@ -270,20 +271,22 @@ where
 /// and pins the cert in the dispatcher. A fresh cert per plugin
 /// load means a leaked cert is useless after a restart.
 pub(crate) fn generate_loopback_cert() -> Result<(Vec<u8>, Vec<u8>), String> {
-    use rcgen::{CertificateParams, SanType};
-    let mut params = CertificateParams::default();
+    use rcgen::{CertificateParams, KeyPair, SanType};
+    let mut params = CertificateParams::new(Vec::<String>::new()).map_err(|e| e.to_string())?;
     params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::V4(
         std::net::Ipv4Addr::new(127, 0, 0, 1),
     ))];
-    let cert = rcgen::Certificate::from_params(params).map_err(|e| e.to_string())?;
-    let cert_der = cert.serialize_der().map_err(|e| e.to_string())?;
-    let key_der = cert.serialize_private_key_der();
+    let key_pair = KeyPair::generate().map_err(|e| e.to_string())?;
+    let cert = params.self_signed(&key_pair).map_err(|e| e.to_string())?;
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialize_der();
     Ok((cert_der, key_der))
 }
 
-/// Build a rustls TLS acceptor from a DER cert + PKCS#8 key.
-/// Used by the plugin SDK (server side) and the transport tests
-/// to stand up the matching TLS server.
+/// Build a rustls TLS acceptor from a DER cert + PKCS#8 key. Used
+/// by the transport tests to stand up the matching TLS server; the
+/// plugin SDK (the production server side) builds its own acceptor.
+#[cfg(test)]
 pub(crate) fn tls_acceptor(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
@@ -307,6 +310,7 @@ pub(crate) fn tls_acceptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     fn invoke_req(method: &str) -> InvokeRequest {
         InvokeRequest {
@@ -461,8 +465,11 @@ mod tests {
         // bearer is the secondary defense and must still reject a
         // caller that presents the wrong token.
         let (addr, cert) = spawn_tls_server("the-real-token".to_string(), 8).await;
-        let disp =
-            PluginDispatcher::connect(PluginEndpoint::new(addr, cert), 5, "attacker-guess".to_string());
+        let disp = PluginDispatcher::connect(
+            PluginEndpoint::new(addr, cert),
+            5,
+            "attacker-guess".to_string(),
+        );
         for _ in 0..50 {
             if let Ok(true) = disp.health().await {
                 break;
@@ -485,11 +492,8 @@ mod tests {
         // handshake to the server, so it never reaches health-ok.
         let (addr, _real_cert) = spawn_tls_server("tok".to_string(), 4).await;
         let (wrong_cert, _k) = generate_loopback_cert().unwrap();
-        let disp = PluginDispatcher::connect(
-            PluginEndpoint::new(addr, wrong_cert),
-            2,
-            "tok".to_string(),
-        );
+        let disp =
+            PluginDispatcher::connect(PluginEndpoint::new(addr, wrong_cert), 2, "tok".to_string());
         // Health swallows transport errors as `Ok(false)`; it must
         // never report healthy against an untrusted cert.
         for _ in 0..10 {

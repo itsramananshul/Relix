@@ -322,10 +322,24 @@ mod tests {
         // the data layer.
         let store = MetricsStore::in_memory().unwrap();
         store
-            .insert(&sample_for_tenant("tenant-a", "shared-agent", "ai.chat", 100, 5, true))
+            .insert(&sample_for_tenant(
+                "tenant-a",
+                "shared-agent",
+                "ai.chat",
+                100,
+                5,
+                true,
+            ))
             .unwrap();
         store
-            .insert(&sample_for_tenant("tenant-b", "shared-agent", "ai.chat", 200, 5, true))
+            .insert(&sample_for_tenant(
+                "tenant-b",
+                "shared-agent",
+                "ai.chat",
+                200,
+                5,
+                true,
+            ))
             .unwrap();
         // Both rows exist globally...
         assert_eq!(store.row_count().unwrap(), 2);
@@ -398,7 +412,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cnt, 1, "legacy row must survive the migration");
-        assert_eq!(tenant, "default", "pre-migration rows attributed to 'default'");
+        assert_eq!(
+            tenant, "default",
+            "pre-migration rows attributed to 'default'"
+        );
     }
 
     fn sample(agent: &str, method: &str, ts: i64, latency: u64, success: bool) -> InvocationMetric {

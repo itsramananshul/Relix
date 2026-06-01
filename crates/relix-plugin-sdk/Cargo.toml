@@ -37,6 +37,6 @@ tokio              = { workspace = true, features = ["macros", "rt-multi-thread"
 # the production runtime loader/dispatcher and invokes it over the
 # hardened TLS transport — proving the two halves meet. relix-runtime
 # does NOT depend on relix-plugin-sdk, so this dev-dep is acyclic.
-relix-runtime      = { path = "../relix-runtime" }
-rcgen              = "0.11"
+relix-runtime      = { workspace = true }
+rcgen              = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 tempfile.workspace = true

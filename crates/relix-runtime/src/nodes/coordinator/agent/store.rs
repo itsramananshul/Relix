@@ -1682,12 +1682,32 @@ mod tests {
         // approval_requests: two tenants, tenant-scoped get.
         let a = s
             .create_approval(
-                "ag", "subj", "m", "c", "", "r", &[], None, 9_999_999_999, &[], "tenant-a",
+                "ag",
+                "subj",
+                "m",
+                "c",
+                "",
+                "r",
+                &[],
+                None,
+                9_999_999_999,
+                &[],
+                "tenant-a",
             )
             .unwrap();
         let b = s
             .create_approval(
-                "ag", "subj", "m", "c", "", "r", &[], None, 9_999_999_999, &[], "tenant-b",
+                "ag",
+                "subj",
+                "m",
+                "c",
+                "",
+                "r",
+                &[],
+                None,
+                9_999_999_999,
+                &[],
+                "tenant-b",
             )
             .unwrap();
         assert!(s.get_approval_for_tenant(&a, "tenant-a").unwrap().is_some());
@@ -1696,16 +1716,34 @@ mod tests {
             "tenant A must not read tenant B's approval request"
         );
         // standing_approvals: two tenants for the same agent.
-        s.create_standing("shared-agent", "fetch", None, 9_999_999_999, "op", "n", "tenant-a")
-            .unwrap();
-        s.create_standing("shared-agent", "fetch", None, 9_999_999_999, "op", "n", "tenant-b")
-            .unwrap();
+        s.create_standing(
+            "shared-agent",
+            "fetch",
+            None,
+            9_999_999_999,
+            "op",
+            "n",
+            "tenant-a",
+        )
+        .unwrap();
+        s.create_standing(
+            "shared-agent",
+            "fetch",
+            None,
+            9_999_999_999,
+            "op",
+            "n",
+            "tenant-b",
+        )
+        .unwrap();
         assert_eq!(
-            s.count_standing_for_tenant("tenant-a", "shared-agent").unwrap(),
+            s.count_standing_for_tenant("tenant-a", "shared-agent")
+                .unwrap(),
             1
         );
         assert_eq!(
-            s.count_standing_for_tenant("tenant-b", "shared-agent").unwrap(),
+            s.count_standing_for_tenant("tenant-b", "shared-agent")
+                .unwrap(),
             1
         );
     }
@@ -1871,7 +1909,8 @@ mod tests {
                 Some("task-1"),
                 unix_now() + 86400,
                 &[],
-            "default")
+                "default",
+            )
             .unwrap();
         let r = s.get_approval(&id).unwrap().unwrap();
         assert_eq!(r.method, "tool.web_post");
@@ -1900,7 +1939,8 @@ mod tests {
                 Some("task-7"),
                 unix_now() + 60,
                 &[],
-            "default")
+                "default",
+            )
             .unwrap();
         let meta = s
             .decide_approval(&id, ApprovalStatus::Approved, "alice", "ok")
@@ -1944,7 +1984,19 @@ mod tests {
     fn decide_rejected_returns_no_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                unix_now() + 60,
+                &[],
+                "default",
+            )
             .unwrap();
         let meta = s
             .decide_approval(&id, ApprovalStatus::Rejected, "alice", "nope")
@@ -1960,7 +2012,19 @@ mod tests {
     fn decide_refuses_terminal_approval() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                unix_now() + 60,
+                &[],
+                "default",
+            )
             .unwrap();
         s.decide_approval(&id, ApprovalStatus::Approved, "alice", "")
             .unwrap();
@@ -1975,10 +2039,34 @@ mod tests {
     fn list_pending_returns_only_pending_oldest_first() {
         let s = store();
         let _a = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                unix_now() + 60,
+                &[],
+                "default",
+            )
             .unwrap();
         let b = s
-            .create_approval("b", "s", "m", "c", "", "", &[], None, unix_now() + 60, &[], "default")
+            .create_approval(
+                "b",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                unix_now() + 60,
+                &[],
+                "default",
+            )
             .unwrap();
         // Decide b → not pending.
         s.decide_approval(&b, ApprovalStatus::Approved, "alice", "")
@@ -2091,7 +2179,19 @@ mod tests {
         // migration must NOT touch them.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9_999_999_999, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9_999_999_999,
+                &[],
+                "default",
+            )
             .unwrap();
         let n = s.run_legacy_token_migration_for_test().unwrap();
         assert_eq!(n, 0, "no rows touched: pending row has no token");
@@ -2173,7 +2273,15 @@ mod tests {
     fn create_standing_then_has_active_returns_true() {
         let s = store();
         let _id = s
-            .create_standing("agt-1", "fs", None, unix_now() + 86400, "alice", "", "default")
+            .create_standing(
+                "agt-1",
+                "fs",
+                None,
+                unix_now() + 86400,
+                "alice",
+                "",
+                "default",
+            )
             .unwrap();
         assert!(s.has_active_standing("agt-1", "fs", unix_now()).unwrap());
         assert!(
@@ -2208,12 +2316,36 @@ mod tests {
     #[test]
     fn list_standing_returns_rows_for_agent() {
         let s = store();
-        s.create_standing("agt-1", "fs", None, unix_now() + 60, "alice", "n1", "default")
-            .unwrap();
-        s.create_standing("agt-1", "browser", None, unix_now() + 60, "alice", "n2", "default")
-            .unwrap();
-        s.create_standing("agt-2", "fs", None, unix_now() + 60, "alice", "n3", "default")
-            .unwrap();
+        s.create_standing(
+            "agt-1",
+            "fs",
+            None,
+            unix_now() + 60,
+            "alice",
+            "n1",
+            "default",
+        )
+        .unwrap();
+        s.create_standing(
+            "agt-1",
+            "browser",
+            None,
+            unix_now() + 60,
+            "alice",
+            "n2",
+            "default",
+        )
+        .unwrap();
+        s.create_standing(
+            "agt-2",
+            "fs",
+            None,
+            unix_now() + 60,
+            "alice",
+            "n3",
+            "default",
+        )
+        .unwrap();
         let v = s.list_standing("agt-1").unwrap();
         assert_eq!(v.len(), 2);
     }

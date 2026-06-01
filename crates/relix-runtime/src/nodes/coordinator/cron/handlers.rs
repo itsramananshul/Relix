@@ -206,8 +206,12 @@ mod tests {
 
     fn store_with_jobs() -> (Arc<CronStore>, String, String) {
         let s = Arc::new(CronStore::in_memory().unwrap());
-        let a = s.create("daily", "1d", "f.sol", "p", "subj-1", "default").unwrap();
-        let b = s.create("weekly", "7d", "f.sol", "p2", "subj-2", "default").unwrap();
+        let a = s
+            .create("daily", "1d", "f.sol", "p", "subj-1", "default")
+            .unwrap();
+        let b = s
+            .create("weekly", "7d", "f.sol", "p2", "subj-2", "default")
+            .unwrap();
         (s, a, b)
     }
 

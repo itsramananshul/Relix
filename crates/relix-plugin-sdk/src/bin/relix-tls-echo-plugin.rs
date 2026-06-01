@@ -14,7 +14,9 @@ async fn main() {
     let mut server = PluginServer::new();
     server.register("echo.say", |req: InvokeRequest| async move {
         if req.args.is_empty() {
-            return Err(PluginError::invalid_args("echo.say requires non-empty args"));
+            return Err(PluginError::invalid_args(
+                "echo.say requires non-empty args",
+            ));
         }
         Ok(format!("echo:{}", req.args))
     });

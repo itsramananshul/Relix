@@ -598,9 +598,7 @@ mod tests {
                     );
                     println!("sandbox fail-closed: {detail}");
                 }
-                other => panic!(
-                    "expected SandboxUnenforceable on this platform, got {other:?}"
-                ),
+                other => panic!("expected SandboxUnenforceable on this platform, got {other:?}"),
             }
             // When NO cap is requested there is nothing to
             // enforce, so loading is permitted (no over-refusal).

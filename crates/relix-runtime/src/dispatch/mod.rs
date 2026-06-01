@@ -3500,7 +3500,8 @@ mod tests {
                 None,
                 9_999_999_999,
                 &[],
-            "default")
+                "default",
+            )
             .unwrap();
         let meta = store
             .decide_approval(
@@ -5707,8 +5708,7 @@ mod tests {
         // (within the 5-minute freshness window).
         let issued_past = fake.now_ms();
         fake.set(issued_past + 6_000);
-        let past_envelope =
-            build_request_with_clock("node.health", bundle, 60, issued_past, None);
+        let past_envelope = build_request_with_clock("node.health", bundle, 60, issued_past, None);
         let resp = decode_response(&bridge.handle_inbound(past_envelope).await).unwrap();
         assert!(
             matches!(resp.res, ResponseResult::Ok(_)),
@@ -5805,8 +5805,7 @@ mod tests {
         let issued = unix_now_ms();
 
         // Peer A (alice) admits.
-        let env_a =
-            build_request_with_clock("node.health", bundle_a, 30, issued, Some(shared_rid));
+        let env_a = build_request_with_clock("node.health", bundle_a, 30, issued, Some(shared_rid));
         let resp_a = decode_response(&bridge.handle_inbound(env_a).await).unwrap();
         assert!(
             matches!(resp_a.res, ResponseResult::Ok(_)),
@@ -5827,8 +5826,7 @@ mod tests {
             supervisors: vec![],
         };
         let bundle_b = issue_identity(id_b, &root, 3600).unwrap();
-        let env_b =
-            build_request_with_clock("node.health", bundle_b, 30, issued, Some(shared_rid));
+        let env_b = build_request_with_clock("node.health", bundle_b, 30, issued, Some(shared_rid));
         let resp_b = decode_response(&bridge.handle_inbound(env_b).await).unwrap();
         assert!(
             matches!(resp_b.res, ResponseResult::Ok(_)),

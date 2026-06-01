@@ -1059,8 +1059,16 @@ mod tests {
     fn active_standing_approval_admits_without_approval_request() {
         let (s, id) = setup_with_profile("high", "active", &[], &[], &["payments"]);
         let agent_id = s.list_agents(None).unwrap()[0].agent_id.clone();
-        s.create_standing(&agent_id, "payments", None, 9_999_999_999, "alice", "", "default")
-            .unwrap();
+        s.create_standing(
+            &agent_id,
+            "payments",
+            None,
+            9_999_999_999,
+            "alice",
+            "",
+            "default",
+        )
+        .unwrap();
         let e = env("tool.x", None);
         let c = cap(&["payments"], &[], RiskLevel::Low);
         match run(&s, &id, &e, Some(&c)) {
@@ -1096,7 +1104,8 @@ mod tests {
                 None,
                 9_999_999_999,
                 &[],
-            "default")
+                "default",
+            )
             .unwrap();
         let meta = s
             .decide_approval(&approval_id, ApprovalStatus::Approved, "alice", "")

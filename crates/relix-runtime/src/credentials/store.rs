@@ -2162,10 +2162,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "expected exactly one kdf_migrated audit row");
         assert_eq!(rows[0].0, "__vault__");
         assert_eq!(rows[0].1, "kdf_migrated");
-        assert_eq!(
-            AuditEvent::parse(&rows[0].1),
-            Some(AuditEvent::KdfMigrated)
-        );
+        assert_eq!(AuditEvent::parse(&rows[0].1), Some(AuditEvent::KdfMigrated));
         assert!(
             rows[0]
                 .2

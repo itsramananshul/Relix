@@ -98,16 +98,16 @@ pub async fn send(
     // attachment root.
     let root = attachment_root();
     for att in &req.attachments {
-        if let Some(p) = att.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if let Err(e) = validate_attachment_path(p, &root) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ApiError {
-                        error: format!("attachment path rejected: {e}"),
-                    }),
-                )
-                    .into_response();
-            }
+        if let Some(p) = att.path.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && let Err(e) = validate_attachment_path(p, &root)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("attachment path rejected: {e}"),
+                }),
+            )
+                .into_response();
         }
     }
     let peer = req.peer.clone().unwrap_or_else(|| DEFAULT_PEER.to_string());
@@ -356,7 +356,9 @@ pub fn validate_attachment_path(
     use std::path::Component;
     let p = std::path::Path::new(path);
     if p.is_absolute() {
-        return Err(format!("`{path}` is absolute; only paths relative to the attachment root are allowed"));
+        return Err(format!(
+            "`{path}` is absolute; only paths relative to the attachment root are allowed"
+        ));
     }
     for comp in p.components() {
         match comp {
@@ -373,10 +375,9 @@ pub fn validate_attachment_path(
     let canon_root = root
         .canonicalize()
         .map_err(|e| format!("attachment root `{}` unavailable: {e}", root.display()))?;
-    let canon = root
-        .join(p)
-        .canonicalize()
-        .map_err(|e| format!("`{path}` does not resolve to a file under the attachment root: {e}"))?;
+    let canon = root.join(p).canonicalize().map_err(|e| {
+        format!("`{path}` does not resolve to a file under the attachment root: {e}")
+    })?;
     if !canon.starts_with(&canon_root) {
         return Err(format!("`{path}` escapes the attachment root"));
     }

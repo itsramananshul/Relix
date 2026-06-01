@@ -887,10 +887,34 @@ mod tests {
     #[test]
     fn approval_pending_returns_correct_row_count() {
         let s = store();
-        s.create_approval("a", "s", "m", "c", "", "r1", &[], None, 9999999999, &[], "default")
-            .unwrap();
-        s.create_approval("a", "s", "m", "c", "", "r2", &[], None, 9999999999, &[], "default")
-            .unwrap();
+        s.create_approval(
+            "a",
+            "s",
+            "m",
+            "c",
+            "",
+            "r1",
+            &[],
+            None,
+            9999999999,
+            &[],
+            "default",
+        )
+        .unwrap();
+        s.create_approval(
+            "a",
+            "s",
+            "m",
+            "c",
+            "",
+            "r2",
+            &[],
+            None,
+            9999999999,
+            &[],
+            "default",
+        )
+        .unwrap();
         let body = ok_body(handle_approval_pending(&s, &fake_ctx(b"")));
         assert!(body.contains("count=2"));
     }
@@ -907,7 +931,19 @@ mod tests {
     fn approval_decide_approves_and_mints_structured_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9999999999,
+                &[],
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -940,7 +976,19 @@ mod tests {
         // boot log warning.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9999999999,
+                &[],
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -961,7 +1009,19 @@ mod tests {
     fn approval_decide_rejects_returns_ok_without_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9999999999,
+                &[],
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -996,7 +1056,8 @@ mod tests {
                 Some("task-42"),
                 9999999999,
                 &[],
-            "default")
+                "default",
+            )
             .unwrap();
         let resumed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
@@ -1039,7 +1100,8 @@ mod tests {
                 Some("task-99"),
                 9999999999,
                 &[],
-            "default")
+                "default",
+            )
             .unwrap();
         let failed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1069,7 +1131,19 @@ mod tests {
         // resume / fail closures are never called.
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9999999999,
+                &[],
+                "default",
+            )
             .unwrap();
         let count: Arc<std::sync::atomic::AtomicUsize> =
             Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1149,7 +1223,19 @@ mod tests {
     fn approval_decide_with_60s_ttl_mints_token_with_60s_expiry() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9999999999,
+                &[],
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1180,7 +1266,19 @@ mod tests {
     fn approval_decide_with_3600s_ttl_mints_long_lived_token() {
         let s = store();
         let id = s
-            .create_approval("a", "s", "m", "c", "", "", &[], None, 9999999999, &[], "default")
+            .create_approval(
+                "a",
+                "s",
+                "m",
+                "c",
+                "",
+                "",
+                &[],
+                None,
+                9999999999,
+                &[],
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1224,7 +1322,8 @@ mod tests {
                 None,
                 9_999_999_999,
                 &["subj-op".into()],
-            "default")
+                "default",
+            )
             .unwrap();
         let body = ok_body(handle_approval_get(&s, &fake_ctx(id.as_bytes())));
         let v: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
@@ -1299,7 +1398,8 @@ mod tests {
                 None,
                 9_999_999_999,
                 std::slice::from_ref(&approver_subject),
-            "default")
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1348,7 +1448,8 @@ mod tests {
                 None,
                 9_999_999_999,
                 &[approver_subject],
-            "default")
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));
@@ -1387,7 +1488,8 @@ mod tests {
                 9_999_999_999,
                 // Empty allow-list explicitly.
                 &[],
-            "default")
+                "default",
+            )
             .unwrap();
         let resume: TaskResumeFn = Arc::new(|_| Ok(()));
         let fail: TaskResumeFn = Arc::new(|_| Ok(()));

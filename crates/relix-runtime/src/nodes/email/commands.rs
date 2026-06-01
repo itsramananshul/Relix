@@ -132,9 +132,7 @@ pub fn find_template(name: &str) -> Option<EmailTemplate> {
             },
             (Some(std::path::Component::Normal(_)), None)
         );
-    if is_safe_filename
-        && let Ok(dir) = std::env::var("RELIX_EMAIL_TEMPLATES_DIR")
-    {
+    if is_safe_filename && let Ok(dir) = std::env::var("RELIX_EMAIL_TEMPLATES_DIR") {
         let path = PathBuf::from(dir).join(format!("{name}.toml"));
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(parsed) = toml::from_str::<EmailTemplateToml>(&text)

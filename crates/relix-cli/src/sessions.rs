@@ -183,37 +183,37 @@ async fn build_show_timeline(
     }
     let mut timeline: serde_json::Value = serde_json::from_str(&body)?;
 
-    if let Some(bearer) = bearer {
-        if let Some(events) = timeline.get_mut("events").and_then(|v| v.as_array_mut()) {
-            for evt in events.iter_mut() {
-                let event_id = match evt.get("event_id").and_then(|v| v.as_str()) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                let content_url = format!(
-                    "{base}/v1/sessions/{}/content/{}",
-                    urlencode(session_id),
-                    urlencode(&event_id)
-                );
-                let cr = reqwest::Client::new()
-                    .get(&content_url)
-                    .header("authorization", format!("Bearer {bearer}"))
-                    .send()
-                    .await?;
-                let cstatus = cr.status();
-                let cbody = cr.text().await?;
-                if cstatus.is_success() {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cbody)
-                        && let Some(obj) = evt.as_object_mut()
-                    {
-                        obj.insert("content".into(), parsed);
-                    }
-                } else if let Some(obj) = evt.as_object_mut() {
-                    obj.insert(
-                        "content_error".into(),
-                        serde_json::Value::String(format!("HTTP {cstatus}: {cbody}")),
-                    );
+    if let Some(bearer) = bearer
+        && let Some(events) = timeline.get_mut("events").and_then(|v| v.as_array_mut())
+    {
+        for evt in events.iter_mut() {
+            let event_id = match evt.get("event_id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let content_url = format!(
+                "{base}/v1/sessions/{}/content/{}",
+                urlencode(session_id),
+                urlencode(&event_id)
+            );
+            let cr = reqwest::Client::new()
+                .get(&content_url)
+                .header("authorization", format!("Bearer {bearer}"))
+                .send()
+                .await?;
+            let cstatus = cr.status();
+            let cbody = cr.text().await?;
+            if cstatus.is_success() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cbody)
+                    && let Some(obj) = evt.as_object_mut()
+                {
+                    obj.insert("content".into(), parsed);
                 }
+            } else if let Some(obj) = evt.as_object_mut() {
+                obj.insert(
+                    "content_error".into(),
+                    serde_json::Value::String(format!("HTTP {cstatus}: {cbody}")),
+                );
             }
         }
     }
@@ -236,16 +236,19 @@ async fn show(args: ShowArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let base = args.bridge.trim_end_matches('/');
-    let timeline =
-        match build_show_timeline(base, &args.session_id, bearer.as_deref().map(|b| b.as_str()))
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        };
+    let timeline = match build_show_timeline(
+        base,
+        &args.session_id,
+        bearer.as_deref().map(|b| b.as_str()),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&timeline)?);
@@ -555,7 +558,10 @@ mod tests {
                         if auth_ok && no_elevation {
                             ("200 OK", r#"{"prompt":"the secret prompt"}"#.to_string())
                         } else {
-                            ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_string())
+                            (
+                                "401 Unauthorized",
+                                r#"{"error":"unauthorized"}"#.to_string(),
+                            )
                         }
                     } else {
                         (

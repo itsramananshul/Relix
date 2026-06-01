@@ -174,11 +174,18 @@ impl MetadataSink {
                         token_count, cost_cents, error_type, tool_name, model_name, success \
                  FROM metadata_events WHERE tenant_id = ?2 AND session_id = ?3 \
                  ORDER BY timestamp_unix DESC, event_id ASC LIMIT ?1",
-                vec![limit.into(), tenant.to_string().into(), s.to_string().into()],
+                vec![
+                    limit.into(),
+                    tenant.to_string().into(),
+                    s.to_string().into(),
+                ],
             ),
         };
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), row_to_metadata)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params_vec.iter()),
+            row_to_metadata,
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);

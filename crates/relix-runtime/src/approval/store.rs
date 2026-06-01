@@ -482,8 +482,10 @@ mod tests {
         // tenant-scoped get must return ONLY the caller's
         // tenant's row — never the other tenant's, by id.
         let s = ApprovalRequestStore::open_in_memory().unwrap();
-        s.upsert_for_tenant(&fixture_row("ap-a"), "tenant-a").unwrap();
-        s.upsert_for_tenant(&fixture_row("ap-b"), "tenant-b").unwrap();
+        s.upsert_for_tenant(&fixture_row("ap-a"), "tenant-a")
+            .unwrap();
+        s.upsert_for_tenant(&fixture_row("ap-b"), "tenant-b")
+            .unwrap();
         assert!(s.get_for_tenant("ap-a", "tenant-a").unwrap().is_some());
         assert!(
             s.get_for_tenant("ap-b", "tenant-a").unwrap().is_none(),

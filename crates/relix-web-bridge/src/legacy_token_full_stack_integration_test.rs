@@ -201,6 +201,7 @@ async fn legacy_token_full_stack_real_controller_real_bridge_real_http() {
             Some(&task_id_normal),
             9_999_999_999_i64,
             &["subj-op".into()],
+            "default",
         )
         .expect("create normal approval");
     let _ = agent_store_seed
@@ -406,6 +407,7 @@ async fn legacy_token_full_stack_real_controller_real_bridge_real_http() {
                 "integration-test",
                 &bridge_subject,
                 "critical",
+                "default",
             )
             .expect("register bridge agent");
         agent_store

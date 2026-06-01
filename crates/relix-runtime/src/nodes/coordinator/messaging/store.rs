@@ -494,21 +494,44 @@ mod tests {
         // tenant-scoped inbox read must see ONLY its own tenant's
         // message — never the other tenant's.
         let s = store();
-        s.send("a-sender", "shared-recipient", "", "from a", None, None, 0, "api", "tenant-a")
-            .unwrap();
-        s.send("b-sender", "shared-recipient", "", "from b", None, None, 0, "api", "tenant-b")
-            .unwrap();
+        s.send(
+            "a-sender",
+            "shared-recipient",
+            "",
+            "from a",
+            None,
+            None,
+            0,
+            "api",
+            "tenant-a",
+        )
+        .unwrap();
+        s.send(
+            "b-sender",
+            "shared-recipient",
+            "",
+            "from b",
+            None,
+            None,
+            0,
+            "api",
+            "tenant-b",
+        )
+        .unwrap();
         assert_eq!(
-            s.count_inbox_for_tenant("tenant-a", "shared-recipient").unwrap(),
+            s.count_inbox_for_tenant("tenant-a", "shared-recipient")
+                .unwrap(),
             1,
             "tenant A must see only its own message in the shared recipient's inbox"
         );
         assert_eq!(
-            s.count_inbox_for_tenant("tenant-b", "shared-recipient").unwrap(),
+            s.count_inbox_for_tenant("tenant-b", "shared-recipient")
+                .unwrap(),
             1
         );
         assert_eq!(
-            s.count_inbox_for_tenant("tenant-c", "shared-recipient").unwrap(),
+            s.count_inbox_for_tenant("tenant-c", "shared-recipient")
+                .unwrap(),
             0
         );
     }
@@ -568,7 +591,17 @@ mod tests {
             .send("alice", "bob", "", "hi", None, None, 0, "api", "default")
             .unwrap();
         let m2 = s
-            .send("bob", "alice", "", "hey", Some(&m1), Some(&m1), 0, "api", "default")
+            .send(
+                "bob",
+                "alice",
+                "",
+                "hey",
+                Some(&m1),
+                Some(&m1),
+                0,
+                "api",
+                "default",
+            )
             .unwrap();
         let r2 = s.get(&m2).unwrap().unwrap();
         assert_eq!(r2.thread_id, m1);
@@ -579,10 +612,22 @@ mod tests {
     fn inbox_returns_unread_for_recipient_only() {
         let s = store();
         let _ = s
-            .send("alice", "bob", "", "for bob", None, None, 0, "api", "default")
+            .send(
+                "alice", "bob", "", "for bob", None, None, 0, "api", "default",
+            )
             .unwrap();
         let _ = s
-            .send("alice", "carol", "", "for carol", None, None, 0, "api", "default")
+            .send(
+                "alice",
+                "carol",
+                "",
+                "for carol",
+                None,
+                None,
+                0,
+                "api",
+                "default",
+            )
             .unwrap();
         let bob = s.inbox("bob", 20, false, None).unwrap();
         assert_eq!(bob.len(), 1);
@@ -652,11 +697,31 @@ mod tests {
             .unwrap();
         // bob → alice (same thread)
         let m2 = s
-            .send("bob", "alice", "", "2", Some(&m1), Some(&m1), 0, "api", "default")
+            .send(
+                "bob",
+                "alice",
+                "",
+                "2",
+                Some(&m1),
+                Some(&m1),
+                0,
+                "api",
+                "default",
+            )
             .unwrap();
         // alice → bob again
         let m3 = s
-            .send("alice", "bob", "", "3", Some(&m1), Some(&m2), 0, "api", "default")
+            .send(
+                "alice",
+                "bob",
+                "",
+                "3",
+                Some(&m1),
+                Some(&m2),
+                0,
+                "api",
+                "default",
+            )
             .unwrap();
         let bob_view = s.thread(&m1, "bob").unwrap();
         assert_eq!(bob_view.len(), 3);
@@ -709,7 +774,9 @@ mod tests {
     fn auto_expire_leaves_unexpired_alone() {
         let s = store();
         let id = s
-            .send("alice", "bob", "", "fresh", None, None, 86400, "api", "default")
+            .send(
+                "alice", "bob", "", "fresh", None, None, 86400, "api", "default",
+            )
             .unwrap();
         let n = s.expire_due(unix_now()).unwrap();
         assert_eq!(n, 0);
@@ -752,8 +819,18 @@ mod tests {
     fn inbox_limit_caps_at_100() {
         let s = store();
         for i in 0..50 {
-            s.send("alice", "bob", "", &format!("m{i}"), None, None, 0, "api", "default")
-                .unwrap();
+            s.send(
+                "alice",
+                "bob",
+                "",
+                &format!("m{i}"),
+                None,
+                None,
+                0,
+                "api",
+                "default",
+            )
+            .unwrap();
         }
         // Requesting 999 yields at most 100 (the hard cap).
         let v = s.inbox("bob", 999, false, None).unwrap();

@@ -88,8 +88,8 @@ pub fn validate_url(url: &str) -> Result<(), String> {
 /// host (no brackets) or `None` when the URL is malformed.
 fn host_from_url(url: &str) -> Option<String> {
     let after_scheme = url
-        .splitn(2, "://")
-        .nth(1)
+        .split_once("://")
+        .map(|(_, rest)| rest)
         .filter(|rest| !rest.is_empty())?;
     // Authority ends at the first '/', '?' or '#'.
     let authority = after_scheme
@@ -169,7 +169,9 @@ pub fn validate_url_ssrf(url: &str) -> Result<(), String> {
     // IP literal → classify without DNS.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if ip_is_blocked(ip) {
-            return Err(format!("url: host {ip} is an internal/non-routable address"));
+            return Err(format!(
+                "url: host {ip} is an internal/non-routable address"
+            ));
         }
         return Ok(());
     }

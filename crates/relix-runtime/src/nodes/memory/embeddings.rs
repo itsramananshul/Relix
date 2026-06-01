@@ -411,10 +411,24 @@ mod tests {
         // Two tenants embed (distinct) chunks for the SAME
         // subject. A tenant-scoped count must see ONLY its own.
         let s = store_in_memory();
-        s.insert_for_tenant("subj", "user", "tenant a chunk", &[0.1, 0.2], "m", "tenant-a")
-            .unwrap();
-        s.insert_for_tenant("subj", "user", "tenant b chunk", &[0.3, 0.4], "m", "tenant-b")
-            .unwrap();
+        s.insert_for_tenant(
+            "subj",
+            "user",
+            "tenant a chunk",
+            &[0.1, 0.2],
+            "m",
+            "tenant-a",
+        )
+        .unwrap();
+        s.insert_for_tenant(
+            "subj",
+            "user",
+            "tenant b chunk",
+            &[0.3, 0.4],
+            "m",
+            "tenant-b",
+        )
+        .unwrap();
         assert_eq!(s.count_for_tenant("tenant-a", "subj", "user").unwrap(), 1);
         assert_eq!(s.count_for_tenant("tenant-b", "subj", "user").unwrap(), 1);
         assert_eq!(s.count_for_tenant("tenant-c", "subj", "user").unwrap(), 0);

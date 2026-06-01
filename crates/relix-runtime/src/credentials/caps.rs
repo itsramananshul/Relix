@@ -395,7 +395,11 @@ mod gate2_ownership_failclosed_tests {
             .unwrap();
 
         // Caller is in BOTH legacy-bypass groups — must STILL be denied.
-        let ctx = ctx_for("bob", vec!["operators".into(), "admin".into()], "shared-key");
+        let ctx = ctx_for(
+            "bob",
+            vec!["operators".into(), "admin".into()],
+            "shared-key",
+        );
         let outcome = handle_get(&store, &ctx);
         assert!(
             is_security_denied(&outcome),

@@ -142,9 +142,12 @@ base64.workspace = true
 # the client connector + server acceptor (re-exporting `rustls`,
 # compiled with the aws-lc-rs provider already in the tree);
 # `rcgen` mints the per-plugin self-signed cert the loader pins.
+# SEC §15 / supply-chain: rcgen uses the `aws_lc_rs` backend (already
+# in the tree via rustls) rather than its default `ring` — rcgen 0.11
+# pulled the unmaintained, unlicensed `ring 0.16` (RUSTSEC-2025-0010).
 # All safe Rust — the crate forbids `unsafe_code`.
 tokio-rustls = "0.26"
-rcgen = "0.11"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true

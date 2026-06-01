@@ -784,7 +784,9 @@ impl VM {
                         let eq = if s1 == s2 { 1 } else { 0 };
                         self.push(eq);
                     }
-                    _ => self.fault(format!("EqStr: heap refs {idx1}/{idx2} are not both strings")),
+                    _ => self.fault(format!(
+                        "EqStr: heap refs {idx1}/{idx2} are not both strings"
+                    )),
                 }
             }
 
@@ -1132,19 +1134,19 @@ impl VM {
                 if !self.check_alloc(n, "PushMap") {
                     // Oversized operand — bail before reserving.
                 } else {
-                let mut pairs: Vec<(String, u64)> = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let value = self.pop();
-                    let key_ref = self.pop() as usize;
-                    let key = match self.heap.get(key_ref) {
-                        Some(HeapObject::String(s)) => s.clone(),
-                        _ => String::new(),
-                    };
-                    pairs.push((key, value));
-                }
-                pairs.reverse();
-                self.heap.push(HeapObject::Map(pairs));
-                self.push((self.heap.len() - 1) as u64);
+                    let mut pairs: Vec<(String, u64)> = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let value = self.pop();
+                        let key_ref = self.pop() as usize;
+                        let key = match self.heap.get(key_ref) {
+                            Some(HeapObject::String(s)) => s.clone(),
+                            _ => String::new(),
+                        };
+                        pairs.push((key, value));
+                    }
+                    pairs.reverse();
+                    self.heap.push(HeapObject::Map(pairs));
+                    self.push((self.heap.len() - 1) as u64);
                 }
             }
             Inst::ListLen => {
@@ -1718,10 +1720,7 @@ mod malformed_bytecode_tests {
     fn newarray_with_max_size_returns_error_not_oom() {
         // PushConst(-1) → bits = (-1i128 as u64) = u64::MAX,
         // which NewArray reads as `usize::MAX` on 64-bit.
-        let program = [
-            Inst::PushConst(Ast::ExprInteger(-1)),
-            Inst::NewArray,
-        ];
+        let program = [Inst::PushConst(Ast::ExprInteger(-1)), Inst::NewArray];
         let mut vm = VM::from(&program);
         let exit = vm.run();
         assert_eq!(

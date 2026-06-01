@@ -10134,7 +10134,10 @@ mod sec13_node_type_failclosed_tests {
                 "error must explain the refusal for `{nt}`: {err}"
             );
             // The message must point operators at the supported set.
-            assert!(err.contains("memory"), "error should list supported types: {err}");
+            assert!(
+                err.contains("memory"),
+                "error should list supported types: {err}"
+            );
         }
     }
 

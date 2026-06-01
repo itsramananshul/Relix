@@ -328,6 +328,11 @@ fn chronicle_column_exists(
     Ok(false)
 }
 
+/// Default chronicle path under a data dir.
+pub fn default_chronicle_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("workflows.sqlite")
+}
+
 #[cfg(test)]
 mod group6_tenant_tests {
     use super::*;
@@ -362,9 +367,4 @@ mod group6_tenant_tests {
         );
         assert!(ch.get_for_tenant("exec-B", "tenant-b").unwrap().is_some());
     }
-}
-
-/// Default chronicle path under a data dir.
-pub fn default_chronicle_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("workflows.sqlite")
 }

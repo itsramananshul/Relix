@@ -307,7 +307,9 @@ flow:
             "",
             "/etc/passwd",
         ] {
-            let err = store.get(bad).expect_err(&format!("`{bad}` must be rejected"));
+            let err = store
+                .get(bad)
+                .expect_err(&format!("`{bad}` must be rejected"));
             assert!(
                 matches!(err, StoreError::InvalidName { .. }),
                 "`{bad}` should be InvalidName, got {err:?}"
@@ -336,7 +338,9 @@ flow:
         f.set_len(MAX_WORKFLOW_BYTES + 1).unwrap();
         drop(f);
         let store = WorkflowStore::new(dir.path().to_path_buf());
-        let err = store.get("huge").expect_err("oversize file must be rejected");
+        let err = store
+            .get("huge")
+            .expect_err("oversize file must be rejected");
         match err {
             StoreError::TooLarge { size, limit, .. } => {
                 assert_eq!(limit, MAX_WORKFLOW_BYTES);

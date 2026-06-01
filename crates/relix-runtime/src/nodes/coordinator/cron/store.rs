@@ -516,9 +516,12 @@ mod tests {
     #[test]
     fn list_filters_by_subject_id() {
         let s = CronStore::in_memory().unwrap();
-        s.create("a", "1d", "f.sol", "p", "subj-1", "default").unwrap();
-        s.create("b", "1d", "f.sol", "p", "subj-2", "default").unwrap();
-        s.create("c", "1d", "f.sol", "p", "subj-1", "default").unwrap();
+        s.create("a", "1d", "f.sol", "p", "subj-1", "default")
+            .unwrap();
+        s.create("b", "1d", "f.sol", "p", "subj-2", "default")
+            .unwrap();
+        s.create("c", "1d", "f.sol", "p", "subj-1", "default")
+            .unwrap();
         let one = s.list("default", Some("subj-1")).unwrap();
         assert_eq!(one.len(), 2);
         for r in &one {
@@ -532,15 +535,19 @@ mod tests {
     #[test]
     fn list_with_none_returns_all_subjects() {
         let s = CronStore::in_memory().unwrap();
-        s.create("a", "1d", "f.sol", "p", "subj-1", "default").unwrap();
-        s.create("b", "1d", "f.sol", "p", "subj-2", "default").unwrap();
+        s.create("a", "1d", "f.sol", "p", "subj-1", "default")
+            .unwrap();
+        s.create("b", "1d", "f.sol", "p", "subj-2", "default")
+            .unwrap();
         assert_eq!(s.list("default", None).unwrap().len(), 2);
     }
 
     #[test]
     fn update_enabled_disables_then_reenables() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id = s
+            .create("a", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         s.update_field(&id, "enabled", "0").unwrap();
         assert!(!s.get(&id).unwrap().unwrap().enabled);
         s.update_field(&id, "enabled", "1").unwrap();
@@ -550,7 +557,9 @@ mod tests {
     #[test]
     fn update_schedule_recomputes_next_run_at() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id = s
+            .create("a", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         let before = s.get(&id).unwrap().unwrap().next_run_at;
         s.update_field(&id, "schedule", "30m").unwrap();
         let after = s.get(&id).unwrap().unwrap();
@@ -562,7 +571,9 @@ mod tests {
     #[test]
     fn update_unknown_field_rejected() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id = s
+            .create("a", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         assert!(matches!(
             s.update_field(&id, "name", "different"),
             Err(CronStoreError::BadInput(_))
@@ -581,7 +592,9 @@ mod tests {
     #[test]
     fn delete_removes_row_then_returns_not_found_next_time() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id = s
+            .create("a", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         s.delete(&id).unwrap();
         assert!(s.get(&id).unwrap().is_none());
         assert!(matches!(s.delete(&id), Err(CronStoreError::NotFound(_))));
@@ -591,8 +604,12 @@ mod tests {
     fn due_jobs_returns_only_jobs_whose_next_run_is_past() {
         let s = CronStore::in_memory().unwrap();
         // Create a job, then force its next_run_at into the past.
-        let id_due = s.create("due", "1d", "f.sol", "p", "subj", "default").unwrap();
-        let id_future = s.create("future", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id_due = s
+            .create("due", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
+        let id_future = s
+            .create("future", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         {
             let conn = s.conn.lock().unwrap();
             conn.execute(
@@ -611,7 +628,9 @@ mod tests {
     #[test]
     fn due_jobs_excludes_disabled_rows() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id = s
+            .create("a", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         {
             let conn = s.conn.lock().unwrap();
             conn.execute(
@@ -628,7 +647,14 @@ mod tests {
     fn record_fire_advances_run_count_and_optionally_disables() {
         let s = CronStore::in_memory().unwrap();
         let id = s
-            .create("once", "2026-06-01T00:00:00Z", "f.sol", "p", "subj", "default")
+            .create(
+                "once",
+                "2026-06-01T00:00:00Z",
+                "f.sol",
+                "p",
+                "subj",
+                "default",
+            )
             .unwrap();
         s.record_fire(&id, 5_000, 6_000, "task-1", true).unwrap();
         let j = s.get(&id).unwrap().unwrap();
@@ -642,7 +668,9 @@ mod tests {
     #[test]
     fn record_fire_recurring_keeps_job_enabled() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("daily", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id = s
+            .create("daily", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         s.record_fire(&id, 5_000, 9_000, "task-1", false).unwrap();
         let j = s.get(&id).unwrap().unwrap();
         assert!(j.enabled);
@@ -652,7 +680,9 @@ mod tests {
     #[test]
     fn record_status_updates_last_status_text() {
         let s = CronStore::in_memory().unwrap();
-        let id = s.create("a", "1d", "f.sol", "p", "subj", "default").unwrap();
+        let id = s
+            .create("a", "1d", "f.sol", "p", "subj", "default")
+            .unwrap();
         s.record_status(&id, "completed").unwrap();
         let j = s.get(&id).unwrap().unwrap();
         assert_eq!(j.last_status.as_deref(), Some("completed"));

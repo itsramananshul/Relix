@@ -321,10 +321,14 @@ impl PluginServer {
             (Some(c), Some(k)) => {
                 let cert = base64::engine::general_purpose::STANDARD
                     .decode(c)
-                    .map_err(|e| ServeError::TlsConfig(format!("{PLUGIN_TLS_CERT_ENV} base64: {e}")))?;
+                    .map_err(|e| {
+                        ServeError::TlsConfig(format!("{PLUGIN_TLS_CERT_ENV} base64: {e}"))
+                    })?;
                 let key = base64::engine::general_purpose::STANDARD
                     .decode(k)
-                    .map_err(|e| ServeError::TlsConfig(format!("{PLUGIN_TLS_KEY_ENV} base64: {e}")))?;
+                    .map_err(|e| {
+                        ServeError::TlsConfig(format!("{PLUGIN_TLS_KEY_ENV} base64: {e}"))
+                    })?;
                 Ok((cert, key))
             }
             _ => Err(ServeError::TlsConfigMissing),
@@ -454,7 +458,8 @@ async fn dispatch_frame(line: &str, state: &ServerState) -> WireResponse {
             if bearer.is_empty() || !ct_eq(&bearer, &state.bearer) {
                 return WireResponse::error(
                     error_kind::UNAUTHORIZED,
-                    "invoke requires the per-plugin bearer matching RELIX_PLUGIN_BEARER".to_string(),
+                    "invoke requires the per-plugin bearer matching RELIX_PLUGIN_BEARER"
+                        .to_string(),
                 );
             }
             let Some(handler) = state.handlers.get(&request.method).cloned() else {
@@ -539,18 +544,21 @@ pub enum ServeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relix_runtime::plugin::{InvokeRequest as RtInvokeRequest, PluginDispatcher, PluginEndpoint};
+    use relix_runtime::plugin::{
+        InvokeRequest as RtInvokeRequest, PluginDispatcher, PluginEndpoint,
+    };
 
     /// Mint a self-signed cert + key (DER) bound to 127.0.0.1 —
     /// the shape the host loader produces and pins.
     fn loopback_cert() -> (Vec<u8>, Vec<u8>) {
-        use rcgen::{CertificateParams, SanType};
-        let mut params = CertificateParams::default();
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.subject_alt_names = vec![SanType::IpAddress(std::net::IpAddr::V4(
             std::net::Ipv4Addr::new(127, 0, 0, 1),
         ))];
-        let cert = rcgen::Certificate::from_params(params).unwrap();
-        (cert.serialize_der().unwrap(), cert.serialize_private_key_der())
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        (cert.der().to_vec(), key_pair.serialize_der())
     }
 
     fn parse_announced_port(buf: &[u8]) -> u16 {
