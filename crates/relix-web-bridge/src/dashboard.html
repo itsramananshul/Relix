@@ -2373,6 +2373,73 @@ function showAuthErrorScreen(message) {
     document.body.removeChild(document.body.firstChild);
   }
   var msg = message || 'The bridge refused the bootstrap request.';
+
+  // The setup-token entry form. The operator pastes the value
+  // printed by `relix boot` (or their [auth] setup_token /
+  // RELIX_SETUP_TOKEN); on submit we exchange it at
+  // /v1/auth/token for the bridge session token. A wrong or
+  // empty value is refused by the bridge (401) and surfaced
+  // inline here — the gate is never bypassed client-side.
+  var input = el('input', {
+    type: 'password',
+    id: 'setup-token-input',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    placeholder: 'Paste setup token',
+    style:
+      'width:100%;padding:10px 12px;font-size:14px;box-sizing:border-box;' +
+      'border:1px solid #ccc;border-radius:6px;font-family:monospace;'
+  });
+  var errBox = el('div', {
+    id: 'setup-token-error',
+    style: 'color:#b00020;margin-top:10px;min-height:18px;font-size:13px;'
+  });
+  var btn = el(
+    'button',
+    {
+      class: 'btn primary',
+      id: 'setup-token-submit',
+      style: 'margin-top:12px;width:100%;padding:10px;font-size:14px;cursor:pointer;'
+    },
+    'Authenticate'
+  );
+  function submit() {
+    var v = (input.value || '').trim();
+    setKids(errBox);
+    if (!v) {
+      errBox.appendChild(document.createTextNode('Enter the setup token.'));
+      return;
+    }
+    btn.disabled = true;
+    errBox.appendChild(document.createTextNode('Authenticating…'));
+    exchangeSetupToken(v)
+      .then(function () {
+        // Token cached in sessionStorage; reloading re-runs
+        // Bridge.bootstrap(), which now finds it and proceeds.
+        window.location.reload();
+      })
+      .catch(function (e) {
+        btn.disabled = false;
+        setKids(errBox);
+        errBox.appendChild(
+          document.createTextNode(e && e.message ? e.message : 'Authentication failed.')
+        );
+      });
+  }
+  btn.addEventListener('click', submit);
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submit();
+    }
+  });
+  var form = el(
+    'div',
+    { style: 'max-width:420px;width:100%;margin-top:8px;text-align:left;' },
+    input,
+    btn,
+    errBox
+  );
   var screen = el(
     'div',
     {
@@ -2387,12 +2454,42 @@ function showAuthErrorScreen(message) {
     el('p', { style: 'max-width:520px;margin:0 0 12px;color:#444;' }, msg),
     el(
       'p',
-      { style: 'max-width:520px;margin:0;color:#444;' },
-      'Configure a valid RELIX_SETUP_TOKEN (or [auth] setup_token in ' +
-        'the bridge config), then reload this page.'
-    )
+      { style: 'max-width:520px;margin:0 0 4px;color:#444;' },
+      'Paste the setup token printed by `relix boot` (or your [auth] setup_token / ' +
+        'RELIX_SETUP_TOKEN value) to continue.'
+    ),
+    form
   );
   document.body.appendChild(screen);
+  try { input.focus(); } catch (e) {}
+}
+
+// Exchange an operator-supplied setup token for the bridge
+// session token at /v1/auth/token. Sends the value as
+// `X-Relix-Setup-Token` (the bridge also accepts
+// `Authorization: Bearer`). On success the returned bridge
+// token is cached for `Bridge.bootstrap()` to pick up. The
+// bridge — not this code — decides whether the token is
+// valid: a wrong value yields 401 and rejects here.
+function exchangeSetupToken(setupToken) {
+  return fetch('/v1/auth/token', {
+    credentials: 'same-origin',
+    headers: { 'X-Relix-Setup-Token': setupToken }
+  }).then(function (r) {
+    if (r.ok) return r.json();
+    if (r.status === 401 || r.status === 403) {
+      throw new Error('The bridge rejected that setup token.');
+    }
+    throw new Error('Bootstrap failed (HTTP ' + r.status + ').');
+  }).then(function (j) {
+    if (j && j.token) {
+      Bridge.token = j.token;
+      Bridge.authFailed = false;
+      try { sessionStorage.setItem('relix-bridge-token', j.token); } catch (e) {}
+      return true;
+    }
+    throw new Error('Bootstrap returned no token.');
+  });
 }
 
 // P4 — periodic session probe. Every 5 minutes calls
