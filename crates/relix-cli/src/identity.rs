@@ -85,8 +85,11 @@ pub enum Cmd {
     },
     /// RELIX-7.30 PART 3: verify a wire-encoded session token.
     Verify {
+        /// SEC §12: the wire token is read from this 0600 file, or
+        /// from stdin when omitted — never an argv flag (which
+        /// would be visible in `ps` / shell history / journald).
         #[arg(long)]
-        token: String,
+        token_file: Option<PathBuf>,
         #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
         bridge: String,
         #[arg(long, default_value_t = false)]
@@ -173,7 +176,15 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
-        Cmd::Verify { token, bridge, raw } => verify_token(&bridge, &token, raw).await,
+        Cmd::Verify {
+            token_file,
+            bridge,
+            raw,
+        } => {
+            let token = crate::secret_input::read_secret(token_file.as_deref())
+                .map_err(|e| format!("identity verify: {e}"))?;
+            verify_token(&bridge, token.as_str(), raw).await
+        }
         Cmd::Revoke {
             session,
             bridge,

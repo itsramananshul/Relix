@@ -13,8 +13,11 @@ pub enum Cmd {
     Store {
         #[arg(long)]
         name: String,
+        /// SEC §12: the secret value is read from this 0600 file,
+        /// or from stdin when omitted — never an argv flag (which
+        /// would be visible in `ps` / shell history / journald).
         #[arg(long)]
-        value: String,
+        value_file: Option<PathBuf>,
         #[arg(long, default_value = "api_key")]
         kind: String,
         #[arg(long)]
@@ -45,8 +48,10 @@ pub enum Cmd {
     Rotate {
         #[arg(long)]
         name: String,
+        /// SEC §12: the new secret value is read from this 0600
+        /// file, or from stdin when omitted — never an argv flag.
         #[arg(long)]
-        new_value: String,
+        new_value_file: Option<PathBuf>,
         #[arg(long, default_value = DEFAULT_BRIDGE)]
         bridge: String,
         #[arg(long, default_value_t = false)]
@@ -126,7 +131,7 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Cmd::Store {
             name,
-            value,
+            value_file,
             kind,
             owner,
             expires_at_ms,
@@ -134,10 +139,12 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
             bridge,
             raw,
         } => {
+            let value = crate::secret_input::read_secret(value_file.as_deref())
+                .map_err(|e| format!("credentials store: {e}"))?;
             store(
                 &bridge,
                 &name,
-                &value,
+                value.as_str(),
                 &kind,
                 owner.as_deref(),
                 expires_at_ms,
@@ -149,10 +156,14 @@ pub async fn run(cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::List { owner, bridge, raw } => list(&bridge, owner.as_deref(), raw).await,
         Cmd::Rotate {
             name,
-            new_value,
+            new_value_file,
             bridge,
             raw,
-        } => rotate(&bridge, &name, &new_value, raw).await,
+        } => {
+            let new_value = crate::secret_input::read_secret(new_value_file.as_deref())
+                .map_err(|e| format!("credentials rotate: {e}"))?;
+            rotate(&bridge, &name, new_value.as_str(), raw).await
+        }
         Cmd::Revoke {
             name,
             reason,

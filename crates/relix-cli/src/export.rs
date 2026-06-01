@@ -8,6 +8,8 @@
 //! `task.events` data. The CLI hits that endpoint and renders
 //! locally so the bridge stays the single source of truth.
 
+use std::path::PathBuf;
+
 use clap::{Args, ValueEnum};
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -51,10 +53,12 @@ pub struct ExportArgs {
     /// Bridge HTTP base URL (matches `relix doctor`).
     #[arg(long, default_value = crate::defaults::DEFAULT_BRIDGE_URL)]
     pub bridge: String,
-    /// Bridge bearer token. When absent, the command reads
-    /// `~/.relix/bridge-token`.
+    /// SEC §12: bridge bearer token, read from this 0600 file.
+    /// When absent, the command reads `~/.relix/bridge-token`. The
+    /// token is NEVER taken as an argv value (visible in `ps` /
+    /// shell history / journald).
     #[arg(long)]
-    pub token: Option<String>,
+    pub token_file: Option<PathBuf>,
 }
 
 pub async fn run(args: ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -66,8 +70,11 @@ pub async fn run(args: ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err("specify exactly one of --session <id>, --agent <name>, --all".into());
         }
     };
-    let token = match args.token.clone() {
-        Some(t) => t,
+    let token = match args.token_file.as_deref() {
+        Some(path) => crate::secret_input::read_secret_file(path)
+            .map_err(|e| format!("export: {e}"))?
+            .as_str()
+            .to_string(),
         None => read_bridge_token()?,
     };
     let url = format!(
@@ -109,7 +116,7 @@ pub async fn run(args: ExportArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn read_bridge_token() -> Result<String, Box<dyn std::error::Error>> {
     let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let home =
-        std::env::var_os(home_var).ok_or("no HOME / USERPROFILE — pass --token to override")?;
+        std::env::var_os(home_var).ok_or("no HOME / USERPROFILE — pass --token-file to override")?;
     let path = std::path::PathBuf::from(home)
         .join(".relix")
         .join("bridge-token");

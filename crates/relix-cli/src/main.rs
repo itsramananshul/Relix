@@ -36,6 +36,7 @@ mod provenance;
 mod reasoning;
 mod router;
 mod routing;
+mod secret_input;
 mod sessions;
 mod setup;
 mod skills;
@@ -366,9 +367,9 @@ enum Cmd {
     /// GAP 24: two-sink session debugger. `relix sessions
     /// list` lists sessions (optionally filtered by
     /// `--agent` / `--status`); `… show <id>` prints the
-    /// timeline (`--full --elevated` also pulls each event's
-    /// content body); `… search --query Q` substring-matches
-    /// session_id + agent_id.
+    /// timeline (`--full` with a bearer via `--bearer-file`
+    /// also pulls each event's content body); `… search
+    /// --query Q` substring-matches session_id + agent_id.
     Sessions {
         #[command(subcommand)]
         cmd: sessions::Cmd,
