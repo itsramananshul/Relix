@@ -489,6 +489,27 @@ fn apply_config_env(cmd: &mut Command, cfg: &crate::config::RelixConfig) {
             cmd.env("RELIX_SLACK_CHANNEL_ID", &cfg.channels.slack_channel);
         }
     }
+    // Credential vault. mesh-up emits `[credentials] enabled` when
+    // RELIX_CREDENTIAL_VAULT=1; the coordinator reads the master key
+    // from RELIX_CREDENTIAL_KEY (the vault's default `master_key_env`).
+    // Only forward when a real key is present — an empty key keeps the
+    // vault disabled (never a hardcoded default).
+    if cfg.credentials.enabled && !cfg.credentials.master_key.is_empty() {
+        cmd.env("RELIX_CREDENTIAL_VAULT", "1");
+        cmd.env("RELIX_CREDENTIAL_KEY", &cfg.credentials.master_key);
+    }
+    // Approval delivery. mesh-up emits `[approval]` + `[approval.delivery]`
+    // when RELIX_APPROVALS=1; the channel defaults to the in-process
+    // dashboard (no external secret).
+    if cfg.approvals.enabled {
+        cmd.env("RELIX_APPROVALS", "1");
+        let channel = if cfg.approvals.channel.is_empty() {
+            "dashboard"
+        } else {
+            cfg.approvals.channel.as_str()
+        };
+        cmd.env("RELIX_APPROVAL_CHANNEL", channel);
+    }
 }
 
 /// Map a provider name to the env var the AI node's TOML references

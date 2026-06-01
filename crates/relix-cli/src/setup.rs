@@ -30,7 +30,8 @@ use crossterm::{
 };
 
 use crate::config::{
-    ChannelsConfig, ConfidenceBlock, MeshConfig, ProviderConfig, RelixConfig, mask_api_key,
+    ApprovalsBlock, ChannelsConfig, ConfidenceBlock, CredentialsBlock, MeshConfig, ProviderConfig,
+    RelixConfig, mask_api_key,
 };
 
 /// Top-level entry from `main.rs` for both `relix setup` and
@@ -72,6 +73,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let verb = if prior.is_some() { "Updated" } else { "Saved" };
     println!();
     println!("{verb} configuration at {}", path.display());
+
+    // Surface the credential-vault master key ONCE so the operator can
+    // save it. It is stored in config.toml for `relix boot` to forward,
+    // but we echo it here (like the bridge setup token) because it is a
+    // user secret and is never a hardcoded default.
+    if final_cfg.credentials.enabled && !final_cfg.credentials.master_key.is_empty() {
+        println!();
+        println!("Credential vault ENABLED. Master key (save this — required to decrypt the vault):");
+        println!("    {}", final_cfg.credentials.master_key);
+        println!("  Stored in {} and forwarded to the coordinator on `relix boot`.", path.display());
+    }
+    if final_cfg.approvals.enabled {
+        println!();
+        println!(
+            "Approvals ENABLED (delivery channel: {}).",
+            final_cfg.approvals.channel
+        );
+    }
 
     // Echo the dependency snapshot we captured before the
     // wizard, so the closing screen reminds the operator of
@@ -125,6 +144,10 @@ enum Page {
     /// rolling-window depth + per-cap policies stay
     /// edit-the-toml-yourself.
     Confidence,
+    /// Opt-in credential vault + approval delivery. Both are off by
+    /// default; the credential vault generates a strong master key when
+    /// enabled without one (surfaced at the end to save).
+    Subsystems,
     Confirm,
 }
 
@@ -158,6 +181,13 @@ struct WizardState {
     /// the `enabled` switch; the rolling-window depth +
     /// per-cap policies stay edit-the-toml-yourself.
     confidence: crate::config::ConfidenceBlock,
+    /// Opt-in credential vault. The wizard exposes the on/off switch
+    /// and generates a strong master key when the operator enables it
+    /// without one already saved (surfaced at the end to save).
+    credentials: CredentialsBlock,
+    /// Opt-in approval delivery. The wizard exposes the on/off switch;
+    /// the channel defaults to the in-process dashboard.
+    approvals: ApprovalsBlock,
     /// True when we were initialised from an existing `config.toml`.
     /// Drives diff hints on the confirm page and the "Updated" /
     /// "Saved" verb at the end.
@@ -182,6 +212,8 @@ impl WizardState {
             mesh: p.mesh.clone(),
             coordinator: p.coordinator.clone(),
             confidence: p.confidence.clone(),
+            credentials: p.credentials.clone(),
+            approvals: p.approvals.clone(),
             is_reconfigure: prior.is_some(),
             prior: prior.cloned(),
         }
@@ -209,6 +241,8 @@ impl WizardState {
             mesh: self.mesh.clone(),
             coordinator: self.coordinator.clone(),
             confidence: self.confidence.clone(),
+            credentials: self.credentials.clone(),
+            approvals: self.approvals.clone(),
         }
     }
 }
@@ -254,13 +288,23 @@ fn run_wizard(prior: Option<&RelixConfig>) -> io::Result<RelixConfig> {
             Page::Confidence => match pick_confidence(state.confidence.clone())? {
                 PageResult::Next(updated) => {
                     state.confidence = updated;
-                    page = Page::Confirm;
+                    page = Page::Subsystems;
                 }
                 PageResult::Back => page = Page::Channels,
             },
+            Page::Subsystems => {
+                match pick_subsystems(state.credentials.clone(), state.approvals.clone())? {
+                    PageResult::Next((creds, approvals)) => {
+                        state.credentials = creds;
+                        state.approvals = approvals;
+                        page = Page::Confirm;
+                    }
+                    PageResult::Back => page = Page::Confidence,
+                }
+            }
             Page::Confirm => match confirm(&state)? {
                 PageResult::Next(()) => break,
-                PageResult::Back => page = Page::Confidence,
+                PageResult::Back => page = Page::Subsystems,
             },
         }
     }
@@ -728,6 +772,108 @@ fn prompt_keep_or_replace(
                 }
             }
             Key::Left => return Ok(PageResult::Back),
+            Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
+            _ => {}
+        }
+    }
+}
+
+/// Generate a strong random vault master key (32 bytes, hex-encoded).
+/// Never a hardcoded/predictable value.
+fn generate_master_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Subsystems page — opt-in credential vault + approval delivery. Two
+/// toggle rows; up/down moves, space toggles, Enter continues. When the
+/// vault is turned on without a saved master key, a strong one is
+/// generated (surfaced at the end so the operator can save it). Turning
+/// the vault off clears the key so it is never persisted unused.
+fn pick_subsystems(
+    initial_creds: CredentialsBlock,
+    initial_approvals: ApprovalsBlock,
+) -> io::Result<PageResult<(CredentialsBlock, ApprovalsBlock)>> {
+    let mut vault_on = initial_creds.enabled;
+    let mut approvals_on = initial_approvals.enabled;
+    let mut master_key = initial_creds.master_key.clone();
+    let mut sel: usize = 0; // 0 = vault, 1 = approvals
+    let mut out = io::stdout();
+    loop {
+        clear_screen(&mut out)?;
+        queue!(out, cursor::MoveTo(2, 1))?;
+        queue!(out, SetForegroundColor(Color::Cyan))?;
+        queue!(out, Print("Optional subsystems"))?;
+        queue!(out, ResetColor)?;
+        queue!(out, cursor::MoveTo(2, 2))?;
+        queue!(out, Print("Up/Down to move, Space to toggle, Enter to continue"))?;
+
+        let vmark = if vault_on { 'x' } else { ' ' };
+        let amark = if approvals_on { 'x' } else { ' ' };
+        let vptr = if sel == 0 { '>' } else { ' ' };
+        let aptr = if sel == 1 { '>' } else { ' ' };
+        queue!(out, cursor::MoveTo(2, 4))?;
+        queue!(out, SetForegroundColor(Color::Yellow))?;
+        queue!(out, Print(format!("{vptr} [{vmark}] Credential vault")))?;
+        queue!(out, cursor::MoveTo(2, 5))?;
+        queue!(out, Print(format!("{aptr} [{amark}] Approvals / delivery")))?;
+        queue!(out, ResetColor)?;
+
+        queue!(out, cursor::MoveTo(2, 7))?;
+        queue!(out, SetForegroundColor(Color::DarkGrey))?;
+        queue!(out, Print("Vault: encrypted store for agent credentials. Needs a"))?;
+        queue!(out, cursor::MoveTo(2, 8))?;
+        queue!(out, Print("master key — generated for you when enabled and shown"))?;
+        queue!(out, cursor::MoveTo(2, 9))?;
+        queue!(out, Print("once at the end to save (never recoverable later)."))?;
+        queue!(out, cursor::MoveTo(2, 10))?;
+        queue!(out, Print("Approvals: in-process dashboard delivery (no secret)."))?;
+        if vault_on && !master_key.is_empty() {
+            queue!(out, cursor::MoveTo(2, 12))?;
+            queue!(out, SetForegroundColor(Color::Green))?;
+            queue!(out, Print("Vault master key generated — shown after you save."))?;
+            queue!(out, ResetColor)?;
+        }
+        queue!(out, ResetColor)?;
+
+        draw_nav_hint(&mut out, 14)?;
+        out.flush()?;
+
+        match read_key()? {
+            Key::Up | Key::Down => sel = 1 - sel,
+            Key::Space | Key::Char('y') | Key::Char('Y') | Key::Char('n') | Key::Char('N') => {
+                if sel == 0 {
+                    vault_on = !vault_on;
+                    if vault_on {
+                        if master_key.is_empty() {
+                            master_key = generate_master_key();
+                        }
+                    } else {
+                        // Don't persist an unused key.
+                        master_key.clear();
+                    }
+                } else {
+                    approvals_on = !approvals_on;
+                }
+            }
+            Key::Enter => {
+                let creds = CredentialsBlock {
+                    enabled: vault_on,
+                    master_key: if vault_on { master_key.clone() } else { String::new() },
+                };
+                let approvals = ApprovalsBlock {
+                    enabled: approvals_on,
+                    channel: if initial_approvals.channel.is_empty() {
+                        "dashboard".to_string()
+                    } else {
+                        initial_approvals.channel.clone()
+                    },
+                };
+                return Ok(PageResult::Next((creds, approvals)));
+            }
+            Key::Left | Key::Char('b') | Key::Char('B') => return Ok(PageResult::Back),
             Key::Cancel => cancel("Setup cancelled. Run `relix setup` to configure Relix."),
             _ => {}
         }

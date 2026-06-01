@@ -54,6 +54,59 @@ pub struct RelixConfig {
     /// richer than the wizard's yes/no shape.
     #[serde(default)]
     pub confidence: ConfidenceBlock,
+    /// `[credentials]` — opt-in credential vault. When `enabled`,
+    /// `relix boot` forwards `master_key` to the coordinator (as the
+    /// `RELIX_CREDENTIAL_KEY` env var) and the mesh-up script emits a
+    /// `[credentials] enabled` section so the vault caps register. The
+    /// master key is a USER SECRET: the wizard generates a strong one
+    /// (and surfaces it to save) when the user opts in without
+    /// supplying one. An empty `master_key` keeps the vault disabled —
+    /// there is NO hardcoded default key.
+    #[serde(default)]
+    pub credentials: CredentialsBlock,
+    /// `[approvals]` — opt-in approval delivery. When `enabled` the
+    /// mesh-up script emits `[approval]` + `[approval.delivery]` so the
+    /// approval caps register. `channel` is the default delivery
+    /// channel; `"dashboard"` (the in-process operator console) needs
+    /// no external secret.
+    #[serde(default)]
+    pub approvals: ApprovalsBlock,
+}
+
+/// `[credentials]` block in `~/.relix/config.toml`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialsBlock {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Vault master key (argon2 KDF input). Stored so `relix boot`
+    /// can forward it to the coordinator. Empty ⇒ vault stays off
+    /// (never a hardcoded default).
+    #[serde(default)]
+    pub master_key: String,
+}
+
+/// `[approvals]` block in `~/.relix/config.toml`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalsBlock {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default delivery channel. `"dashboard"` is the in-process
+    /// operator console and needs no external secret.
+    #[serde(default = "default_approval_channel")]
+    pub channel: String,
+}
+
+impl Default for ApprovalsBlock {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel: default_approval_channel(),
+        }
+    }
+}
+
+fn default_approval_channel() -> String {
+    "dashboard".to_string()
 }
 
 /// `[confidence]` block in `~/.relix/config.toml`. Mirrors the
