@@ -982,7 +982,7 @@ EOF
 
 # ---- 12. Bridge config ----
 
-flow_lines="template_path     = \"$FLOWS_DIR/chat.sol\""
+flow_lines="template_path     = \"$FLOWS_DIR/chat_template.sol\""
 if [[ "$NO_TOOL" -eq 0 ]]; then
     flow_lines+=$'\n'"tool_template_path = \"$FLOWS_DIR/chat_with_tool.sol\""
 fi
