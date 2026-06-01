@@ -114,7 +114,27 @@ pub struct EmailTemplate {
 /// first (if `RELIX_EMAIL_TEMPLATES_DIR` is set), then falls
 /// back to the built-in registry.
 pub fn find_template(name: &str) -> Option<EmailTemplate> {
-    if let Ok(dir) = std::env::var("RELIX_EMAIL_TEMPLATES_DIR") {
+    // SECTION 8 (sweep): `name` is the wire `template_name` from
+    // `email.send`. Reject path-traversal names BEFORE joining to
+    // the templates directory — `../../etc/passwd` must not read
+    // an arbitrary host file. Only a plain filename component is
+    // allowed; invalid names fall through to the built-in lookup
+    // (which is a keyed map, not a filesystem read).
+    let is_safe_filename = !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains('\0')
+        && matches!(
+            {
+                let mut c = std::path::Path::new(name).components();
+                (c.next(), c.next())
+            },
+            (Some(std::path::Component::Normal(_)), None)
+        );
+    if is_safe_filename
+        && let Ok(dir) = std::env::var("RELIX_EMAIL_TEMPLATES_DIR")
+    {
         let path = PathBuf::from(dir).join(format!("{name}.toml"));
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(parsed) = toml::from_str::<EmailTemplateToml>(&text)
@@ -322,5 +342,11 @@ mod tests {
         // No env wiring needed — RELIX_EMAIL_TEMPLATES_DIR
         // isn't set by the test harness.
         assert!(find_template("never-defined-template").is_none());
+        // SECTION 8 sweep: a traversal template_name must not
+        // read an arbitrary host file — it falls through to the
+        // built-in (keyed) lookup, which has no such entry.
+        assert!(find_template("../../etc/passwd").is_none());
+        assert!(find_template("a/b").is_none());
+        assert!(find_template("..").is_none());
     }
 }

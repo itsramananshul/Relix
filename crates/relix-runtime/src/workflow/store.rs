@@ -10,11 +10,17 @@
 //! an operator-actionable message.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use super::ast::Workflow;
 use super::parser::{ParseError, parse_str};
+
+/// SECTION 8: hard cap on a `.workflow` file's size. Files above
+/// this are rejected without being read into memory, so a
+/// hostile multi-GB file cannot OOM the controller. 4 MiB is far
+/// beyond any legitimate workflow definition.
+pub const MAX_WORKFLOW_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Store-level errors. Each variant carries enough context
 /// for the coordinator to render a useful error message.
@@ -31,6 +37,18 @@ pub enum StoreError {
 
     #[error("workflow `{name}` not found in `{dir}`")]
     NotFound { name: String, dir: PathBuf },
+
+    /// SECTION 8: the wire-supplied workflow name is not a safe
+    /// single filename — it contains a path separator, `..`, or
+    /// otherwise resolves outside the workflow store directory.
+    #[error("workflow name `{name}` is invalid: {reason}")]
+    InvalidName { name: String, reason: String },
+
+    /// SECTION 8: the `.workflow` file exceeds the size cap. We
+    /// refuse to read it into memory (a multi-GB file would OOM
+    /// the controller).
+    #[error("workflow `{name}` file is too large: {size} bytes exceeds the {limit}-byte limit")]
+    TooLarge { name: String, size: u64, limit: u64 },
 
     #[error(
         "workflow `{name}` in file `{path}` failed to parse: {message} (line {line}, column {column})"
@@ -136,7 +154,13 @@ impl WorkflowStore {
 
     /// Load (or fetch from cache) the workflow named `name`.
     /// The file is expected at `<dir>/<name>.workflow`.
+    ///
+    /// SECTION 8: `name` reaches here from the wire
+    /// (`workflow.run`), so it is validated as a safe single
+    /// filename BEFORE being joined to the store directory — a
+    /// name like `../../etc/shadow` is rejected, not resolved.
     pub fn get(&self, name: &str) -> Result<Arc<Workflow>, StoreError> {
+        Self::validate_name(name)?;
         if let Ok(cache) = self.inner.cache.read()
             && let Some(w) = cache.get(name)
         {
@@ -149,7 +173,52 @@ impl WorkflowStore {
                 dir: self.inner.dir.clone(),
             });
         }
+        // Defense in depth: confirm the CANONICAL resolved path is
+        // still inside the canonical store directory before
+        // opening (defeats a symlink that points outside the
+        // store even when the name itself is a plain filename).
+        if let (Ok(canon_dir), Ok(canon_path)) =
+            (self.inner.dir.canonicalize(), path.canonicalize())
+            && !canon_path.starts_with(&canon_dir)
+        {
+            return Err(StoreError::InvalidName {
+                name: name.to_string(),
+                reason: "resolves outside the workflow store directory".to_string(),
+            });
+        }
         self.load_from_path(&path, name)
+    }
+
+    /// SECTION 8: validate a wire-supplied workflow name. It must
+    /// be a single, normal filename component — no path
+    /// separators (`/` or `\`), no `..`, no NUL, not empty, and
+    /// not root/drive-anchored. This blocks path traversal at the
+    /// name level before any filesystem join happens.
+    fn validate_name(name: &str) -> Result<(), StoreError> {
+        let invalid = |reason: &str| StoreError::InvalidName {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        };
+        if name.trim().is_empty() {
+            return Err(invalid("name is empty"));
+        }
+        if name.contains('/') || name.contains('\\') {
+            return Err(invalid("name contains a path separator"));
+        }
+        if name.contains("..") {
+            return Err(invalid("name contains `..`"));
+        }
+        if name.contains('\0') {
+            return Err(invalid("name contains a NUL byte"));
+        }
+        // Must be exactly one normal path component (catches
+        // platform-specific roots / drive prefixes the substring
+        // checks above might miss).
+        let mut comps = Path::new(name).components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(_)), None) => Ok(()),
+            _ => Err(invalid("name is not a single filename component")),
+        }
     }
 
     fn load_from_path(
@@ -157,6 +226,19 @@ impl WorkflowStore {
         path: &Path,
         expected_name: &str,
     ) -> Result<Arc<Workflow>, StoreError> {
+        // SECTION 8: size-cap BEFORE reading. Stat the file and
+        // refuse to slurp anything over the limit into memory.
+        let meta = std::fs::metadata(path).map_err(|e| StoreError::FileIo {
+            path: path.to_path_buf(),
+            cause: e.to_string(),
+        })?;
+        if meta.len() > MAX_WORKFLOW_BYTES {
+            return Err(StoreError::TooLarge {
+                name: expected_name.to_string(),
+                size: meta.len(),
+                limit: MAX_WORKFLOW_BYTES,
+            });
+        }
         let source = std::fs::read_to_string(path).map_err(|e| StoreError::FileIo {
             path: path.to_path_buf(),
             cause: e.to_string(),
@@ -182,6 +264,85 @@ impl WorkflowStore {
     pub fn clear_cache(&self) {
         if let Ok(mut cache) = self.inner.cache.write() {
             cache.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod section8_tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"
+name: demo
+version: 1
+description: d
+agents:
+  only:
+    peer: ai
+    capability: chat
+    input: "hi"
+    output: out
+flow:
+  start: only
+  result: "{{only.output}}"
+"#;
+
+    fn store_with(name: &str, body: &str) -> (WorkflowStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(format!("{name}.workflow")), body).unwrap();
+        (WorkflowStore::new(dir.path().to_path_buf()), dir)
+    }
+
+    #[test]
+    fn section8_traversal_names_are_rejected_not_resolved() {
+        // CRITERION 1: a traversal name must be rejected BEFORE
+        // it can resolve to a file outside the store dir.
+        let (store, _dir) = store_with("demo", SAMPLE);
+        for bad in [
+            "../../etc/shadow",
+            "../secret",
+            "a/b",
+            "a\\b",
+            "..",
+            "",
+            "/etc/passwd",
+        ] {
+            let err = store.get(bad).expect_err(&format!("`{bad}` must be rejected"));
+            assert!(
+                matches!(err, StoreError::InvalidName { .. }),
+                "`{bad}` should be InvalidName, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn section8_legitimate_in_store_name_loads() {
+        // CRITERION 2: a normal in-store workflow still loads.
+        let (store, _dir) = store_with("demo", SAMPLE);
+        let wf = store.get("demo").expect("legitimate name must load");
+        assert_eq!(wf.name, "demo");
+    }
+
+    #[test]
+    fn section8_oversize_workflow_file_is_rejected_without_oom() {
+        // CRITERION 3: a file over the cap is rejected by stat,
+        // never read into memory.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.workflow");
+        // Write one byte past the cap (sparse-ish; we write a real
+        // buffer just over a small portion — use set_len to avoid
+        // allocating 4MiB in the test).
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_WORKFLOW_BYTES + 1).unwrap();
+        drop(f);
+        let store = WorkflowStore::new(dir.path().to_path_buf());
+        let err = store.get("huge").expect_err("oversize file must be rejected");
+        match err {
+            StoreError::TooLarge { size, limit, .. } => {
+                assert_eq!(limit, MAX_WORKFLOW_BYTES);
+                assert!(size > limit);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
         }
     }
 }

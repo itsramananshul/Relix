@@ -475,6 +475,10 @@ fn store_err_to_outcome(e: &StoreError) -> HandlerOutcome {
         StoreError::NotFound { .. } => invalid(e.to_string()),
         StoreError::Parse { .. } => invalid(e.to_string()),
         StoreError::DirMissing(_) => invalid(e.to_string()),
+        // SECTION 8: a path-traversal name or an oversize file is
+        // a bad-request from the caller — surface as INVALID_ARGS,
+        // never a 500.
+        StoreError::InvalidName { .. } | StoreError::TooLarge { .. } => invalid(e.to_string()),
         StoreError::DirIo { .. } | StoreError::FileIo { .. } => internal(e.to_string()),
     }
 }
