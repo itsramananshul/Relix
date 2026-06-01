@@ -21,7 +21,11 @@ use relix_runtime::transport::envelope::ResponseResult;
 
 use crate::config::AppState;
 
-const DEFAULT_PEER: &str = "coordinator";
+// Skill capabilities (`memory.skill_*`) register on the AI node's
+// dispatch bridge (nodes::ai::skill_caps::register), not the
+// coordinator. Route there so the calls reach the node that serves
+// them once `[skills]` is enabled.
+const DEFAULT_PEER: &str = "ai";
 
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -158,6 +162,16 @@ pub async fn deprecate(
     }
 }
 
+/// Clean "feature not enabled" body (HTTP 200) when the responder
+/// reports UNKNOWN_METHOD (e.g. `[skills]` disabled), so the panel
+/// renders an empty state instead of a 502.
+fn unavailable(method: &str) -> Value {
+    serde_json::json!({
+        "available": false,
+        "reason": format!("capability '{method}' is not enabled on this deployment"),
+    })
+}
+
 async fn call_peer_json(
     state: &AppState,
     alias: &str,
@@ -243,6 +257,9 @@ async fn call_peer_json(
             })
         }
         ResponseResult::Err(env) => {
+            if env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD {
+                return Ok(unavailable(method));
+            }
             let status = if env.kind == relix_core::types::error_kinds::INVALID_ARGS {
                 StatusCode::BAD_REQUEST
             } else if env.kind == relix_core::types::error_kinds::SECURITY_DENIED {

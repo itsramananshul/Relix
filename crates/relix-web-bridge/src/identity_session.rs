@@ -197,6 +197,16 @@ fn bad_request(msg: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Clean "feature not enabled" body (HTTP 200) when the responder
+/// reports UNKNOWN_METHOD (session-identity caps not registered), so
+/// the panel renders an empty state instead of a 502.
+fn unavailable(method: &str) -> Value {
+    serde_json::json!({
+        "available": false,
+        "reason": format!("capability '{method}' is not enabled on this deployment"),
+    })
+}
+
 async fn call_peer_json(
     state: &AppState,
     alias: &str,
@@ -290,6 +300,9 @@ async fn call_peer_json_with_deadline(
             })
         }
         ResponseResult::Err(env) => {
+            if env.kind == relix_core::types::error_kinds::UNKNOWN_METHOD {
+                return Ok(unavailable(method));
+            }
             let status = if env.kind == relix_core::types::error_kinds::INVALID_ARGS {
                 StatusCode::BAD_REQUEST
             } else if env.kind == relix_core::types::error_kinds::SECURITY_DENIED {
