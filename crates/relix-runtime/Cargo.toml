@@ -137,6 +137,14 @@ axum.workspace = true
 diffy.workspace = true
 lopdf.workspace = true
 base64.workspace = true
+# SEC §11: the hardened plugin transport replaces plaintext
+# loopback HTTP with TLS on loopback. `tokio-rustls` provides
+# the client connector + server acceptor (re-exporting `rustls`,
+# compiled with the aws-lc-rs provider already in the tree);
+# `rcgen` mints the per-plugin self-signed cert the loader pins.
+# All safe Rust — the crate forbids `unsafe_code`.
+tokio-rustls = "0.26"
+rcgen = "0.11"
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true

@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-use super::dispatcher::PluginDispatcher;
+use super::dispatcher::{PluginDispatcher, PluginEndpoint};
 use super::manifest::PluginManifest;
 
 /// SEC PART 2: plugin-process sandbox knobs. Carried from
@@ -41,10 +41,66 @@ impl Default for SandboxLimits {
     }
 }
 
+impl SandboxLimits {
+    /// True when any resource cap is actually requested.
+    #[cfg(not(unix))]
+    fn any_configured(&self) -> bool {
+        self.max_memory_mb > 0 || self.max_cpu_secs > 0 || self.max_open_fds > 0
+    }
+
+    /// SEC §11: fail closed where the configured sandbox cannot
+    /// be enforced.
+    ///
+    /// On Unix the loader applies real `RLIMIT_AS` / `RLIMIT_CPU`
+    /// / `RLIMIT_NOFILE` (+ a seccomp allowlist on Linux) via
+    /// `pre_exec`, so the caps are genuinely enforced — this
+    /// returns `Ok`.
+    ///
+    /// On Windows (and any other target) there is no enforcement
+    /// path wired in this build. The previous behavior was a
+    /// `tracing::warn!` followed by spawning the plugin anyway —
+    /// advertising `max_memory_mb` etc. while applying nothing.
+    /// That is replaced by a hard refusal: if any cap is
+    /// configured we return [`LoadError::SandboxUnenforceable`]
+    /// so the operator gets a clear error instead of a false
+    /// sense of containment. When NO cap is configured there is
+    /// nothing to enforce, so the load proceeds.
+    pub fn ensure_enforceable(&self) -> Result<(), LoadError> {
+        #[cfg(unix)]
+        {
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            if self.any_configured() {
+                Err(LoadError::SandboxUnenforceable {
+                    detail: format!(
+                        "configured plugin sandbox (max_memory_mb={}, max_cpu_secs={}, \
+                         max_open_fds={}) cannot be enforced on this platform; refusing to \
+                         load the plugin rather than run it with caps that do not apply",
+                        self.max_memory_mb, self.max_cpu_secs, self.max_open_fds
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 /// SEC PART 2: env var the plugin SDK reads to learn the
 /// per-plugin bearer token it must require on `/invoke`. The
 /// host loader sets this in the spawned child's environment.
 pub const PLUGIN_BEARER_ENV: &str = "RELIX_PLUGIN_BEARER";
+
+/// SEC §11: env vars the plugin SDK reads to serve the hardened
+/// loopback-TLS transport. The host loader mints a fresh
+/// self-signed cert + key bound to `127.0.0.1`, base64-DER-encodes
+/// each, and sets them in the child's environment; the plugin
+/// binds a TLS listener on `127.0.0.1:0` using them and announces
+/// its chosen port on stdout. The dispatcher PINS this same cert.
+pub const PLUGIN_TLS_CERT_ENV: &str = "RELIX_PLUGIN_TLS_CERT_DER_B64";
+pub const PLUGIN_TLS_KEY_ENV: &str = "RELIX_PLUGIN_TLS_KEY_DER_B64";
 
 /// Mint a fresh per-plugin bearer token (32 random bytes
 /// hex-encoded). Used by the host loader and exposed for
@@ -112,6 +168,11 @@ pub enum LoadError {
     PortMalformed(String),
     #[error("health probe did not pass after {secs}s")]
     HealthTimeout { secs: u64 },
+    /// SEC §11: the configured sandbox cannot be enforced on this
+    /// platform; the loader refuses to run the plugin rather than
+    /// advertise caps that do not apply.
+    #[error("plugin sandbox cannot be enforced: {detail}")]
+    SandboxUnenforceable { detail: String },
 }
 
 pub struct PluginLoader;
@@ -162,22 +223,26 @@ impl PluginLoader {
     ///    when the manifest pins a hash, the binary on disk
     ///    must match.
     /// 3. The child process gets a per-plugin random bearer
-    ///    token wired via [`PLUGIN_BEARER_ENV`]; the SDK
-    ///    rejects `/invoke` without it.
+    ///    token wired via [`PLUGIN_BEARER_ENV`] and a hardened
+    ///    loopback-TLS cert + key via [`PLUGIN_TLS_CERT_ENV`] /
+    ///    [`PLUGIN_TLS_KEY_ENV`]; the SDK serves TLS with them
+    ///    and rejects `invoke` without the bearer.
     ///
-    /// On Unix the child is sandboxed via `pre_exec` with
-    /// `RLIMIT_AS` + `RLIMIT_CPU` + `RLIMIT_NOFILE` +
-    /// `RLIMIT_CORE = 0`. On Linux the loader additionally
-    /// applies `prctl(PR_SET_NO_NEW_PRIVS)` + a seccomp
-    /// allowlist via `seccompiler`. On Windows the loader
-    /// logs a startup warning that resource caps are not
-    /// applied (no native equivalent in `std::os::windows`).
+    /// SEC §11 sandbox posture: on Unix the child is sandboxed
+    /// via `pre_exec` with `RLIMIT_AS` + `RLIMIT_CPU` +
+    /// `RLIMIT_NOFILE` + `RLIMIT_CORE = 0`. On Linux the loader
+    /// additionally applies `prctl(PR_SET_NO_NEW_PRIVS)` + a
+    /// seccomp allowlist via `seccompiler`. On Windows (and any
+    /// other non-Unix target) the configured caps cannot be
+    /// enforced, so the loader FAILS CLOSED in
+    /// [`SandboxLimits::ensure_enforceable`] — it refuses to load
+    /// the plugin rather than run it with caps that do not apply.
     ///
     /// Timeouts:
-    /// - `port_announce_secs` waits for the
-    ///   `RELIX_PLUGIN_PORT=<n>` line on stdout. Default 10s.
-    /// - `health_probe_secs` polls /health every 200ms until it
-    ///   returns 200. Default 30s.
+    /// - `port_announce_secs` is folded into the readiness window
+    ///   (extra time for the plugin to bind its endpoint).
+    /// - `health_probe_secs` polls readiness over the hardened
+    ///   transport every 200ms. Default 30s.
     pub async fn spawn(
         manifest: PluginManifest,
         manifest_path: PathBuf,
@@ -197,22 +262,45 @@ impl PluginLoader {
                 bin: bin.display().to_string(),
                 cause: format!("{e}"),
             })?;
-        // (3) per-plugin bearer token.
+        // (3) SEC §11: fail closed if the configured sandbox
+        // cannot be enforced on this platform — never run a
+        // plugin while advertising caps that do not apply.
+        limits.ensure_enforceable()?;
+
+        // (4) per-plugin bearer token (secondary defense behind
+        // the OS-level transport ACL).
         let bearer = mint_plugin_bearer_token();
+
+        // (5) SEC §11: mint a fresh self-signed cert + key bound
+        // to 127.0.0.1 for the loopback-TLS transport. The host
+        // passes both (base64 DER) to the child via env so the
+        // plugin serves TLS with them; the dispatcher PINS this
+        // exact cert (no built-in CAs), so the channel is
+        // confidential + authenticated rather than plaintext HTTP.
+        let (cert_der, key_der) = super::dispatcher::generate_loopback_cert()
+            .map_err(|e| LoadError::Io(format!("mint plugin TLS cert: {e}")))?;
+        use base64::Engine as _;
+        let cert_b64 = base64::engine::general_purpose::STANDARD.encode(&cert_der);
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key_der);
+
         let mut cmd = Command::new(&bin);
         cmd.args(&manifest.plugin.runtime.args)
             .current_dir(&manifest.manifest_dir)
             .env(PLUGIN_BEARER_ENV, &bearer)
+            .env(PLUGIN_TLS_CERT_ENV, &cert_b64)
+            .env(PLUGIN_TLS_KEY_ENV, &key_b64)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        // SEC PART 2: apply Unix resource limits via
-        // pre_exec. The closure runs in the child between
-        // fork() and execve(); it must be async-signal-safe
-        // and avoid heap allocation (we use rlimit's
-        // setrlimit which is a single libc call).
+        // SEC PART 2: apply Unix resource limits via pre_exec
+        // (RLIMITs + seccomp on Linux). The closure runs in the
+        // child between fork() and execve(); it must be
+        // async-signal-safe and avoid heap allocation. Non-Unix
+        // platforms have already failed closed above, so the
+        // sandbox is only wired on Unix.
+        #[cfg(unix)]
         apply_sandbox(&mut cmd, &limits);
 
         let mut child = cmd.spawn().map_err(|e| LoadError::Spawn {
@@ -220,46 +308,33 @@ impl PluginLoader {
             cause: format!("{e}"),
         })?;
 
-        // Read stdout until we either see RELIX_PLUGIN_PORT=<n>
-        // or the timeout fires. After we've captured the port,
-        // spawn a draining task that logs further stdout lines
-        // at trace level so the OS pipe buffer never fills.
+        // Read stdout until the plugin announces its TLS port
+        // (`RELIX_PLUGIN_PORT=<n>`) or the timeout fires; then
+        // drain the rest so the OS pipe buffer never blocks.
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| LoadError::Io("stdout pipe missing".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| LoadError::Io("stderr pipe missing".into()))?;
-
         let plugin_name = manifest.plugin.name.clone();
         let plugin_name_for_drain = plugin_name.clone();
-        let stderr_name = plugin_name.clone();
         let mut reader = BufReader::new(stdout).lines();
         let port_result = tokio::time::timeout(Duration::from_secs(port_announce_secs), async {
             loop {
-                let line = reader.next_line().await;
-                match line {
+                match reader.next_line().await {
                     Ok(Some(l)) => {
                         if let Some(n) = l.trim().strip_prefix("RELIX_PLUGIN_PORT=") {
                             return n
                                 .parse::<u16>()
                                 .map_err(|e| LoadError::PortMalformed(format!("`{l}`: {e}")));
                         }
-                        tracing::debug!(
-                            plugin = %plugin_name,
-                            "plugin pre-port stdout: {l}"
-                        );
+                        tracing::debug!(plugin = %plugin_name, "plugin pre-port stdout: {l}");
                     }
                     Ok(None) => {
                         return Err(LoadError::Io(
                             "plugin closed stdout before announcing port".into(),
                         ));
                     }
-                    Err(e) => {
-                        return Err(LoadError::Io(format!("read stdout: {e}")));
-                    }
+                    Err(e) => return Err(LoadError::Io(format!("read stdout: {e}"))),
                 }
             }
         })
@@ -277,29 +352,34 @@ impl PluginLoader {
                 });
             }
         };
-
-        // Drain remaining stdout/stderr so the pipes don't fill.
         tokio::spawn(async move {
             let mut reader = reader;
             while let Ok(Some(line)) = reader.next_line().await {
                 tracing::debug!(plugin = %plugin_name_for_drain, "stdout: {line}");
             }
         });
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                tracing::info!(plugin = %stderr_name, "stderr: {line}");
-            }
-        });
+        if let Some(stderr) = child.stderr.take() {
+            let name = manifest.plugin.name.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    tracing::info!(plugin = %name, "stderr: {line}");
+                }
+            });
+        }
 
-        let dispatcher = PluginDispatcher::new(
-            port,
+        // Pin the cert we just minted; dial the announced port.
+        let endpoint = PluginEndpoint::new(format!("127.0.0.1:{port}"), cert_der);
+        let dispatcher = PluginDispatcher::connect(
+            endpoint,
             manifest.plugin.runtime.invoke_timeout_secs,
             bearer.clone(),
         );
 
-        // Poll /health until 200 or timeout.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(health_probe_secs);
+        // Poll readiness over the hardened TLS transport until the
+        // plugin's server is up or the probe window elapses.
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(health_probe_secs.saturating_add(port_announce_secs));
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let _ = child.start_kill();
@@ -325,13 +405,12 @@ impl PluginLoader {
 }
 
 /// SEC PART 2: wire the per-plugin resource caps into the
-/// child process. On Unix this hooks `pre_exec` so the
-/// limits apply BEFORE `execve` — the child cannot escape
-/// them. On Linux we additionally set `PR_SET_NO_NEW_PRIVS`
-/// + a seccomp allowlist. On Windows we log a single
-/// startup warning per spawn (no equivalent native API in
-/// `std::os::windows`); operators can add Job Objects in a
-/// future change.
+/// child process. On Unix this hooks `pre_exec` so the limits
+/// apply BEFORE `execve` — the child cannot escape them. On
+/// Linux we additionally set `PR_SET_NO_NEW_PRIVS` + a seccomp
+/// allowlist. SEC §11: this fn is `#[cfg(unix)]` only — non-Unix
+/// targets fail closed in [`SandboxLimits::ensure_enforceable`]
+/// before spawn rather than running unsandboxed.
 #[cfg(unix)]
 fn apply_sandbox(cmd: &mut Command, limits: &SandboxLimits) {
     let limits_copy = *limits;
@@ -480,34 +559,62 @@ const DENIED_LINUX_SYSCALLS: &[i64] = &[
     libc::SYS_swapoff,
 ];
 
-#[cfg(windows)]
-fn apply_sandbox(_cmd: &mut Command, _limits: &SandboxLimits) {
-    // SEC PART 2: Windows has no `pre_exec` and no portable
-    // RLIMIT equivalent in `std::os::windows`. Implementing
-    // an equivalent via Win32 Job Objects
-    // (`SetInformationJobObject` with
-    // `JOB_OBJECT_LIMIT_PROCESS_MEMORY` etc.) requires
-    // attaching the child to the job before its first
-    // instruction, which `std::process::Command` does not
-    // expose. We log a single startup warning per spawn
-    // so operators see the gap; a future Job-Object
-    // integration replaces this without changing the
-    // call-site contract.
-    tracing::warn!(
-        "plugin sandbox: Windows does not apply resource limits to plugin processes; \
-         max_memory_mb / max_cpu_secs / max_open_fds are advisory only on this OS"
-    );
-}
-
-#[cfg(not(any(unix, windows)))]
-fn apply_sandbox(_cmd: &mut Command, _limits: &SandboxLimits) {
-    tracing::warn!("plugin sandbox: unsupported target — no resource limits applied");
-}
+// SEC §11: there is no non-Unix `apply_sandbox`. On Windows and
+// other targets the loader fails closed in
+// `SandboxLimits::ensure_enforceable` BEFORE the child is
+// spawned, rather than warn-and-run with caps that do not apply.
+// The `apply_sandbox` call above is therefore `#[cfg(unix)]`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// SEC §11 criterion 1: on a platform where the configured
+    /// sandbox cannot be enforced, the loader FAILS CLOSED with a
+    /// clear error — it does not warn-and-run. On Unix the
+    /// sandbox IS enforceable (real RLIMITs via pre_exec), so the
+    /// same configured limits are accepted. Either way there is
+    /// no silent "advisory only" path.
+    #[test]
+    fn sandbox_fails_closed_when_unenforceable() {
+        let configured = SandboxLimits::default();
+        let result = configured.ensure_enforceable();
+
+        #[cfg(unix)]
+        {
+            // Unix applies real limits → enforceable → accepted.
+            assert!(result.is_ok(), "unix sandbox should be enforceable");
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-Unix: configured caps cannot be enforced →
+            // refuse, with a message naming the gap.
+            match result {
+                Err(LoadError::SandboxUnenforceable { detail }) => {
+                    assert!(
+                        detail.contains("cannot be enforced"),
+                        "error must explain the refusal: {detail}"
+                    );
+                    println!("sandbox fail-closed: {detail}");
+                }
+                other => panic!(
+                    "expected SandboxUnenforceable on this platform, got {other:?}"
+                ),
+            }
+            // When NO cap is requested there is nothing to
+            // enforce, so loading is permitted (no over-refusal).
+            let none = SandboxLimits {
+                max_memory_mb: 0,
+                max_cpu_secs: 0,
+                max_open_fds: 0,
+            };
+            assert!(
+                none.ensure_enforceable().is_ok(),
+                "no-cap config must not be refused"
+            );
+        }
+    }
 
     #[test]
     fn find_manifests_empty_dir_returns_empty() {

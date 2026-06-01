@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-pub use dispatcher::{InvokeRequest, PluginDispatcher, PluginInvokeError};
+pub use dispatcher::{InvokeRequest, PluginDispatcher, PluginEndpoint, PluginInvokeError};
 pub use loader::{LoadError, LoadedPlugin, PluginLoader, SandboxLimits};
 pub use manifest::{ManifestError, PluginCapability, PluginManifest, PluginRuntime};
 pub use registry::{PluginRegistry, PluginStatus, RegistryError, StoredPlugin};
